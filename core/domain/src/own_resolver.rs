@@ -3,8 +3,9 @@
 //! Rules by name only see what the service's own DNS answers. A program that
 //! asks an encrypted resolver of its own reaches addresses no answer we saw
 //! explains, so a site rule never applies to it; only an application rule
-//! does. Two facts together say so: it talked to a known encrypted-DNS
-//! resolver, and most of the addresses it then reached carry no name.
+//! does. Two facts together say so: it talked to a resolver other than ours
+//! (encrypted DNS, or plain DNS to a server of its own), and most of the
+//! addresses it then reached carry no name.
 
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
@@ -12,6 +13,11 @@ use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 /// resolve on its own. A single unnamed address is a cached answer or a
 /// hard-coded endpoint; three is a pattern.
 pub const OWN_RESOLVER_UNNAMED_CONFIRMATIONS: usize = 3;
+
+/// Plain DNS: ours answers on the loopback, so a lookup anywhere else on this
+/// port is one we never see (`nslookup <server>`, c-ares with its own servers,
+/// a hypervisor's NAT relaying its guests).
+pub const PLAIN_DNS_PORT: u16 = 53;
 
 /// DNS over TLS has a port of its own, so a connection there is a resolver
 /// whoever answers it.
@@ -24,7 +30,7 @@ pub const DNS_OVER_HTTPS_PORT: u16 = 443;
 /// One program's connections over the watching window.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct OwnResolverEvidence {
-    /// It reached an encrypted-DNS resolver, allowed or not.
+    /// It reached a resolver other than ours, allowed or not.
     pub resolver_contacted: bool,
     /// Distinct public addresses it reached that no DNS answer we saw named.
     pub unnamed_addresses: usize,
@@ -44,11 +50,12 @@ pub fn resolves_names_itself(evidence: OwnResolverEvidence) -> bool {
         && evidence.unnamed_addresses > evidence.named_addresses
 }
 
-/// Is a connection to `remote` a lookup over encrypted DNS? `known_resolver`
+/// Is a connection to `remote` a lookup past our resolver? `known_resolver`
 /// says the address, or a name it was answered for, is a listed resolver.
 #[must_use]
-pub fn is_encrypted_dns_contact(remote: SocketAddr, known_resolver: bool) -> bool {
+pub fn is_resolver_contact(remote: SocketAddr, known_resolver: bool) -> bool {
     match remote.port() {
+        PLAIN_DNS_PORT => !remote.ip().is_loopback(),
         DNS_OVER_TLS_PORT => true,
         DNS_OVER_HTTPS_PORT => known_resolver,
         _ => false,
@@ -116,10 +123,25 @@ mod tests {
     #[test]
     fn the_tls_port_is_a_resolver_and_the_web_port_only_when_listed() {
         let at = |port| SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1)), port);
-        assert!(is_encrypted_dns_contact(at(853), false));
-        assert!(is_encrypted_dns_contact(at(443), true));
-        assert!(!is_encrypted_dns_contact(at(443), false));
-        assert!(!is_encrypted_dns_contact(at(80), true));
+        assert!(is_resolver_contact(at(853), false));
+        assert!(is_resolver_contact(at(443), true));
+        assert!(!is_resolver_contact(at(443), false));
+        assert!(!is_resolver_contact(at(80), true));
+    }
+
+    /// A program asking a DNS server of its own by plain DNS resolves past us
+    /// as surely as one using DoH; asking ours on the loopback is the system's
+    /// way.
+    #[test]
+    fn plain_dns_to_any_server_but_ours_is_a_resolver_contact() {
+        let router = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 1)), 53);
+        let public = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 53)), 53);
+        let ours = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 53);
+        let ours_v6 = SocketAddr::new(IpAddr::V6(std::net::Ipv6Addr::LOCALHOST), 53);
+        assert!(is_resolver_contact(router, false));
+        assert!(is_resolver_contact(public, false));
+        assert!(!is_resolver_contact(ours, false));
+        assert!(!is_resolver_contact(ours_v6, false));
     }
 
     #[test]

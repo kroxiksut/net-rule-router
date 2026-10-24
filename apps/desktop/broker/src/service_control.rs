@@ -47,6 +47,21 @@ pub enum DemandStartOutcome {
     NotStartable,
 }
 
+/// What a state seen after the start request settles. `Stopped` is terminal:
+/// the service ran and ended on its own (a start a `stay-stopped` marker
+/// declined, say), and waiting on it would only delay the "unreachable" card.
+fn outcome_after_start_request(
+    state: windows::Win32::System::Services::SERVICE_STATUS_CURRENT_STATE,
+) -> Option<DemandStartOutcome> {
+    if state == SERVICE_RUNNING {
+        Some(DemandStartOutcome::Started)
+    } else if state == SERVICE_STOPPED {
+        Some(DemandStartOutcome::NotStartable)
+    } else {
+        None
+    }
+}
+
 fn to_wide(s: &str) -> Vec<u16> {
     s.encode_utf16().chain(std::iter::once(0)).collect()
 }
@@ -100,6 +115,10 @@ pub fn try_start_demand_service() -> DemandStartOutcome {
         // Stop-pending / paused — don't fight a transition we didn't start.
         return DemandStartOutcome::NotStartable;
     }
+    // An asked-for start outranks a `stop` that found the service crashed.
+    // Best effort: the marker's folder is administrators-only, so only an
+    // elevated launcher reaches it; the elevated verbs go through `start`.
+    nrr_platform_windows::service_control::clear_stay_stopped();
     // SAFETY: `svc` opened with SERVICE_START; no argument vectors.
     if unsafe { StartServiceW(svc.0, None) }.is_err() {
         return DemandStartOutcome::NotStartable;
@@ -110,15 +129,35 @@ pub fn try_start_demand_service() -> DemandStartOutcome {
         std::thread::sleep(POLL);
         let mut s = SERVICE_STATUS::default();
         // SAFETY: `svc` valid; out-param valid.
-        if unsafe { QueryServiceStatus(svc.0, &mut s) }.is_ok()
-            && s.dwCurrentState == SERVICE_RUNNING
-        {
-            return DemandStartOutcome::Started;
+        if unsafe { QueryServiceStatus(svc.0, &mut s) }.is_ok() {
+            if let Some(outcome) = outcome_after_start_request(s.dwCurrentState) {
+                return outcome;
+            }
         }
         if Instant::now() >= deadline {
             // Requested but not yet RUNNING — still report Started; the caller's
             // IPC connect has its own retry/backoff.
             return DemandStartOutcome::Started;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A service that ends after the start was requested is not one the window
+    /// should wait for.
+    #[test]
+    fn a_service_that_stops_after_the_start_request_is_not_startable() {
+        assert_eq!(
+            outcome_after_start_request(SERVICE_RUNNING),
+            Some(DemandStartOutcome::Started)
+        );
+        assert_eq!(
+            outcome_after_start_request(SERVICE_STOPPED),
+            Some(DemandStartOutcome::NotStartable)
+        );
+        assert_eq!(outcome_after_start_request(SERVICE_START_PENDING), None);
     }
 }

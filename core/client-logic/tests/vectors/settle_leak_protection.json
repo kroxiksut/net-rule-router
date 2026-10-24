@@ -1,0 +1,60 @@
+{
+  "description": "pure.js settleLeakProtection / route_policy::settle_leak_protection: the request's leak protection brought in line with its own default route",
+  "cases": [
+    {
+      "name": "sites under the main default route stays",
+      "input": { "request": { "mode": "prefer-primary", "leak-protection": "sites" } },
+      "expected": { "mode": "prefer-primary", "leak-protection": "sites" }
+    },
+    {
+      "name": "sites under the additional default route rises to everything",
+      "input": { "request": { "mode": "prefer-secondary-when-available", "leak-protection": "sites" } },
+      "expected": { "mode": "prefer-secondary-when-available", "leak-protection": "everything" }
+    },
+    {
+      "name": "everything under the additional default route stays",
+      "input": { "request": { "mode": "prefer-secondary-when-available", "leak-protection": "everything" } },
+      "expected": { "mode": "prefer-secondary-when-available", "leak-protection": "everything" }
+    },
+    {
+      "name": "everything under the main default route stays",
+      "input": { "request": { "mode": "prefer-primary", "leak-protection": "everything" } },
+      "expected": { "mode": "prefer-primary", "leak-protection": "everything" }
+    },
+    {
+      "name": "an empty request gains off and no mode",
+      "input": { "request": {} },
+      "expected": { "leak-protection": "off" }
+    },
+    {
+      "name": "an empty mode reads as the main route and keeps sites",
+      "input": { "request": { "mode": "", "leak-protection": "sites" } },
+      "expected": { "mode": "", "leak-protection": "sites" }
+    },
+    {
+      "name": "an unknown level falls to off",
+      "input": { "request": { "mode": "prefer-primary", "leak-protection": "max" } },
+      "expected": { "mode": "prefer-primary", "leak-protection": "off" }
+    },
+    {
+      "name": "an unknown default route is not the main one",
+      "input": { "request": { "mode": "something-new", "leak-protection": "sites" } },
+      "expected": { "mode": "something-new", "leak-protection": "everything" }
+    },
+    {
+      "name": "a non-text level falls to off",
+      "input": { "request": { "mode": "prefer-primary", "leak-protection": true } },
+      "expected": { "mode": "prefer-primary", "leak-protection": "off" }
+    },
+    {
+      "name": "a null level under the additional route is off",
+      "input": { "request": { "mode": "prefer-secondary-when-available", "leak-protection": null } },
+      "expected": { "mode": "prefer-secondary-when-available", "leak-protection": "off" }
+    },
+    {
+      "name": "other keys ride unchanged",
+      "input": { "request": { "mode": "prefer-secondary-when-available", "leak-protection": "off", "kill-switch-protocols": 5, "future-field": "x" } },
+      "expected": { "mode": "prefer-secondary-when-available", "leak-protection": "off", "kill-switch-protocols": 5, "future-field": "x" }
+    }
+  ]
+}

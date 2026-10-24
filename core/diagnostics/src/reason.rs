@@ -138,6 +138,12 @@ pub mod apply {
     pub const BLOCK_INSTALLED: ReasonCode = ReasonCode("apply.block_installed");
     /// A local block rule was removed.
     pub const BLOCK_REMOVED: ReasonCode = ReasonCode("apply.block_removed");
+    /// A user paused their routing.
+    pub const ROUTING_PAUSED: ReasonCode = ReasonCode("apply.routing_paused");
+    /// A user's routing pause ended.
+    pub const ROUTING_RESUMED: ReasonCode = ReasonCode("apply.routing_resumed");
+    /// A user's session connected while their routing stayed paused; nothing was applied.
+    pub const ROUTING_KEPT_PAUSED: ReasonCode = ReasonCode("apply.routing_kept_paused");
 }
 
 /// Reason codes for import operations (`import.*`).
@@ -393,6 +399,24 @@ pub fn reason_code_meta(code: ReasonCode) -> Option<ReasonCodeMeta> {
             "diag.apply.block_removed.summary",
             false,
         ),
+        "apply.routing_paused" => (
+            Lvl::Info,
+            Cat::Apply,
+            "diag.apply.routing_paused.summary",
+            true,
+        ),
+        "apply.routing_resumed" => (
+            Lvl::Info,
+            Cat::Apply,
+            "diag.apply.routing_resumed.summary",
+            true,
+        ),
+        "apply.routing_kept_paused" => (
+            Lvl::Info,
+            Cat::Apply,
+            "diag.apply.routing_kept_paused.summary",
+            true,
+        ),
         // import.*
         "import.candidate_created" => (
             Lvl::Info,
@@ -640,6 +664,9 @@ pub const ALL_REASON_CODES: &[ReasonCode] = &[
     apply::ROLLBACK_COMPLETED,
     apply::BLOCK_INSTALLED,
     apply::BLOCK_REMOVED,
+    apply::ROUTING_PAUSED,
+    apply::ROUTING_RESUMED,
+    apply::ROUTING_KEPT_PAUSED,
     import::CANDIDATE_CREATED,
     import::IDENTICAL_TO_ACTIVE,
     import::VALIDATION_FAILED,
@@ -788,6 +815,9 @@ mod tests {
             integrity::AUDIT_CHAIN_MISMATCH,
             integrity::AUDIT_CHAIN_WARNING,
             integrity::MIGRATION_RESTORE,
+            apply::ROUTING_PAUSED,
+            apply::ROUTING_RESUMED,
+            apply::ROUTING_KEPT_PAUSED,
         ];
         for code in audit_codes {
             let meta = reason_code_meta(code).expect("registered");

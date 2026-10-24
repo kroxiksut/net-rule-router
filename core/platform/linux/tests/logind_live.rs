@@ -1,6 +1,6 @@
-//! Live logind probe. Skips LOUDLY when logind is not the session manager —
-//! a container or a WSL image built without systemd answers nothing, and a
-//! silent pass there would report coverage this test never had.
+//! Live logind probe. `#[ignore]`d out of the default gate because a container
+//! or a WSL image built without systemd has no logind; under `--ignored` a
+//! missing logind fails, so a pass never reports coverage the test did not have.
 //!
 //! Needs no privileges: reading who is logged in is not a privileged question.
 
@@ -9,6 +9,7 @@
 use nrr_platform_linux::logind::{live_users, LogindError};
 
 #[test]
+#[ignore = "needs systemd-logind as the session manager"]
 fn logind_answers_who_is_logged_in() {
     match live_users() {
         Ok(users) => {
@@ -31,7 +32,7 @@ fn logind_answers_who_is_logged_in() {
             eprintln!("logind reported {} live user(s)", users.len());
         }
         Err(LogindError::Unavailable(e)) => {
-            eprintln!("SKIP: logind is not available here ({e}) — nothing was verified");
+            panic!("logind is not available here ({e}): this test needs systemd-logind");
         }
         Err(LogindError::Unreadable(e)) => {
             // Worth failing on: it means this systemd prints a shape we cannot

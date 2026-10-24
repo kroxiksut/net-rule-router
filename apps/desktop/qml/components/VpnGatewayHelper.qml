@@ -15,6 +15,8 @@ ColumnLayout {
     spacing: root.uiTheme.spacingSm
 
     property bool _loading: false
+    // Bumped by every reset: an answer for an earlier program is dropped.
+    property int _findSeq: 0
     property bool _ran: false
     property string _failure: ""
     property bool _observerActive: true
@@ -89,6 +91,8 @@ ColumnLayout {
         return out
     }
     function _reset() {
+        helper._findSeq += 1
+        helper._loading = false
         helper._candidates = []
         helper._selected = ({})
         helper._ran = false
@@ -103,6 +107,7 @@ ColumnLayout {
         if (!root.rpc || typeof root.rpc.rpcVpnGatewayCandidatesList !== "function") return
         helper._reset()
         helper._loading = true
+        var seq = helper._findSeq
         var corr = root.rpc.rpcVpnGatewayCandidatesList(program)
         if (!corr) {
             helper._loading = false
@@ -111,6 +116,7 @@ ColumnLayout {
             return
         }
         root.rpc.registerRpcCallback(corr, function(ok, payload, code, msg) {
+            if (seq !== helper._findSeq || program !== helper._program) return
             helper._loading = false
             helper._ran = true
             if (!ok || !payload) {

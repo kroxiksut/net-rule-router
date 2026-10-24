@@ -41,8 +41,46 @@ const WATCHDOG_SEC: u32 = 30;
 
 /// How often the state after `start` / `stop` is re-checked while waiting.
 const POLL_INTERVAL: Duration = Duration::from_millis(200);
-/// How long a killed unit takes to read as inactive.
+/// How long a killed main process takes to be reaped.
 const KILL_SETTLE: Duration = Duration::from_secs(10);
+/// How long the unit's stop hook (`ExecStopPost`, the DNS restore) is waited
+/// out after a kill. It gets the unit's own stop budget; a hook still running
+/// past it does not make a dead daemon "running".
+const STOP_POST_SETTLE: Duration = Duration::from_secs(crate::systemd::STOP_TIMEOUT_SEC as u64);
+/// How long a `systemctl` verb may wait for the session's polkit agent: a
+/// person typing a password, not a busy bus.
+const PROMPT_BUDGET: Duration = Duration::from_secs(120);
+
+/// Whether a `systemctl` verb may have polkit ask the session for a password.
+///
+/// A caller with a person at a desktop (the terminal UI) wants the session's
+/// agent to pop up, as plain `systemctl start` does. One without — the daemon
+/// itself, a script, the console that elevates the whole verb once through
+/// `pkexec` — needs the refusal back at once as "access denied": `systemctl`
+/// would otherwise ask once per command, and the command budget would cut
+/// the second question off.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PasswordPrompt {
+    /// `--no-ask-password` on every verb.
+    Never,
+    /// Verbs that need authorization may wait for the session's agent.
+    SessionAgent,
+}
+
+/// The waits a kill allows: first for the main process to be reaped, then for
+/// the stop hook. Fields, not constants, so a test does not sit through them.
+#[derive(Clone, Copy, Debug)]
+struct KillSettle {
+    main_process: Duration,
+    stop_post: Duration,
+}
+
+impl KillSettle {
+    const PRODUCTION: Self = Self {
+        main_process: KILL_SETTLE,
+        stop_post: STOP_POST_SETTLE,
+    };
+}
 
 // ── The side-effect seam ─────────────────────────────────────────────────────
 
@@ -93,7 +131,15 @@ pub trait SystemdOps {
 }
 
 /// The real implementation: filesystem writes and `systemctl` spawns.
-pub struct FsOps;
+pub struct FsOps {
+    prompt: PasswordPrompt,
+}
+
+impl FsOps {
+    pub fn new(prompt: PasswordPrompt) -> Self {
+        Self { prompt }
+    }
+}
 
 impl SystemdOps for FsOps {
     fn write_file(&self, path: &Path, contents: &str, mode: u32) -> io::Result<()> {
@@ -171,18 +217,57 @@ impl SystemdOps for FsOps {
         // system bus, and the failure classification below matches ENGLISH
         // text in stderr — on a localised system a translated refusal read as
         // an unclassified mechanism error instead of "access denied".
-        let borrowed: Vec<&str> = rest.iter().map(String::as_str).collect();
-        let out = crate::command::output_with_timeout(
-            exe,
-            &borrowed,
-            crate::command::DEFAULT_COMMAND_TIMEOUT,
-        )?;
+        let (borrowed, budget) = if exe == "systemctl" {
+            systemctl_invocation(rest, self.prompt)
+        } else {
+            (
+                rest.iter().map(String::as_str).collect(),
+                crate::command::DEFAULT_COMMAND_TIMEOUT,
+            )
+        };
+        let out = crate::command::output_with_timeout(exe, &borrowed, budget)?;
         Ok(CommandOutcome {
             exit_code: out.status.code().unwrap_or(-1),
             stdout: String::from_utf8_lossy(&out.stdout).into_owned(),
             stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
         })
     }
+}
+
+const NO_ASK_PASSWORD: &str = "--no-ask-password";
+
+/// The arguments and budget one `systemctl` call gets. Stdin is closed by the
+/// runner, so `systemctl` never starts a text agent of its own: a prompt, when
+/// allowed, is the session agent's, and without one the refusal comes back as
+/// "interactive authentication required".
+fn systemctl_invocation(args: &[String], prompt: PasswordPrompt) -> (Vec<&str>, Duration) {
+    let verb = args.first().map_or("", String::as_str);
+    let asks = prompt == PasswordPrompt::SessionAgent && verb_may_ask(verb);
+    let mut argv: Vec<&str> = Vec::with_capacity(args.len() + 1);
+    if !asks {
+        argv.push(NO_ASK_PASSWORD);
+    }
+    argv.extend(args.iter().map(String::as_str));
+    let budget = if asks {
+        PROMPT_BUDGET
+    } else {
+        crate::command::DEFAULT_COMMAND_TIMEOUT
+    };
+    (argv, budget)
+}
+
+/// Reads never go through polkit; everything else may.
+fn verb_may_ask(verb: &str) -> bool {
+    !matches!(verb, "show" | "is-active" | "is-enabled" | "status")
+}
+
+/// `MainPID` from `systemctl show --property=MainPID`. `None` when the answer
+/// does not carry it, which never reads as "gone".
+fn parse_main_pid(output: &str) -> Option<u32> {
+    output
+        .lines()
+        .find_map(|line| line.strip_prefix("MainPID="))
+        .and_then(|value| value.trim().parse().ok())
 }
 
 // ── Translating systemd's answers ────────────────────────────────────────────
@@ -357,19 +442,28 @@ fn classify_io_failure(err: &io::Error, what: &str) -> ServiceControlError {
 /// systemd-backed [`ServiceControlPort`].
 pub struct LinuxServiceControl {
     ops: Box<dyn SystemdOps>,
+    settle: KillSettle,
 }
 
 impl LinuxServiceControl {
-    /// The production instance: real filesystem, real `systemctl`.
-    pub fn new() -> Self {
-        Self {
-            ops: Box::new(FsOps),
-        }
+    /// The production instance: real filesystem, real `systemctl`, asking for
+    /// a password as `prompt` allows.
+    pub fn new(prompt: PasswordPrompt) -> Self {
+        Self::with_ops(Box::new(FsOps::new(prompt)))
     }
 
     /// Build against a substitute for the host — used by this module's tests.
     pub fn with_ops(ops: Box<dyn SystemdOps>) -> Self {
-        Self { ops }
+        Self {
+            ops,
+            settle: KillSettle::PRODUCTION,
+        }
+    }
+
+    #[cfg(test)]
+    fn with_settle(mut self, settle: KillSettle) -> Self {
+        self.settle = settle;
+        self
     }
 
     /// Run one command, mapping both "could not spawn" and "exited non-zero"
@@ -467,15 +561,23 @@ impl LinuxServiceControl {
         }
     }
 
-    /// Is the unit active right now? `is-active` answers with its exit code, so
-    /// a non-zero one is the answer "no", not a failure.
-    fn is_active(&self) -> Result<bool, ServiceControlError> {
-        let argv = systemctl(&["is-active", "--quiet", SYSTEMD_UNIT_NAME]);
+    /// Is the unit active right now, and has it settled? `is-active` exits 0
+    /// only for `active` and prints the state word either way.
+    fn unit_state(&self) -> Result<UnitState, ServiceControlError> {
+        let argv = systemctl(&["is-active", SYSTEMD_UNIT_NAME]);
         let outcome = self
             .ops
             .run(&argv)
             .map_err(|e| classify_io_failure(&e, "querying the unit state"))?;
-        Ok(outcome.succeeded())
+        if outcome.succeeded() {
+            return Ok(UnitState::Active);
+        }
+        // `deactivating` is not `active`, but the daemon is still taking its
+        // packet policy down: reporting "stopped" then is premature.
+        Ok(match outcome.stdout.trim() {
+            "activating" | "deactivating" | "reloading" | "refreshing" => UnitState::Changing,
+            _ => UnitState::Stopped,
+        })
     }
 
     /// Poll until the unit reaches `want_active`, or the budget runs out.
@@ -487,7 +589,12 @@ impl LinuxServiceControl {
     ) -> Result<(), ServiceControlError> {
         let deadline = Instant::now() + timeout;
         loop {
-            if self.is_active()? == want_active {
+            let reached = match self.unit_state()? {
+                UnitState::Active => want_active,
+                UnitState::Stopped => !want_active,
+                UnitState::Changing => false,
+            };
+            if reached {
                 return Ok(());
             }
             if Instant::now() >= deadline {
@@ -499,12 +606,50 @@ impl LinuxServiceControl {
             std::thread::sleep(POLL_INTERVAL);
         }
     }
+
+    /// Whether the unit's main process has been reaped. A unit in `stop-post`
+    /// is still `deactivating`, but its daemon is already gone.
+    fn main_process_gone(&self) -> Result<bool, ServiceControlError> {
+        let argv = systemctl(&["show", SYSTEMD_UNIT_NAME, "--property=MainPID"]);
+        let outcome = self
+            .ops
+            .run(&argv)
+            .map_err(|e| classify_spawn_failure(&e, &argv))?;
+        if !outcome.succeeded() {
+            return Err(classify_command_failure(&outcome, &argv));
+        }
+        Ok(parse_main_pid(&outcome.stdout) == Some(0))
+    }
+
+    /// Poll until the unit is inactive or its main process is gone.
+    fn await_main_process_gone(&self, timeout: Duration) -> Result<(), ServiceControlError> {
+        let deadline = Instant::now() + timeout;
+        loop {
+            if self.unit_state()? == UnitState::Stopped || self.main_process_gone()? {
+                return Ok(());
+            }
+            if Instant::now() >= deadline {
+                return Err(ServiceControlError::Timeout {
+                    operation: "kill",
+                    seconds: timeout.as_secs(),
+                });
+            }
+            std::thread::sleep(POLL_INTERVAL);
+        }
+    }
 }
 
 impl Default for LinuxServiceControl {
     fn default() -> Self {
-        Self::new()
+        Self::new(PasswordPrompt::Never)
     }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum UnitState {
+    Active,
+    Changing,
+    Stopped,
 }
 
 /// Build a `systemctl` argv. One place, so no call site can misspell it.
@@ -583,14 +728,12 @@ impl ServiceControlPort for LinuxServiceControl {
             });
         }
         self.refuse_if_package_managed()?;
-        // Refused before anything is written: the unit hides the home trees
-        // from the service, so registering a binary that lives in one produces
-        // an install that reports success and a service that can never start.
-        // The message names the way out, because the journal will only say 203.
+        // Refused before anything is written: a root daemon run from a tree
+        // its user can write runs whatever that user puts there.
         if let Err(refusal) = crate::systemd::unit_can_execute(&spec.binary_path) {
             let why = match refusal {
-                crate::systemd::UnitExecRefusal::HiddenByProtectHome => {
-                    "its unit hides the home directories (ProtectHome=yes)"
+                crate::systemd::UnitExecRefusal::UserOwnedTree => {
+                    "it lies in a user's home, which that user can replace"
                 }
                 crate::systemd::UnitExecRefusal::Unrepresentable => {
                     "a unit file cannot name that path (non-UTF-8, a control character or `$`)"
@@ -658,16 +801,18 @@ impl ServiceControlPort for LinuxServiceControl {
         }
         // Only the two directories the unit itself provisions. User rule files
         // live outside them and are never touched; the audit trail inside the
-        // state directory stays unless it was asked for by name.
+        // state directory stays unless it was asked for by name, and so does
+        // the signing key its chain restarts are sealed under: without it a
+        // reinstall reads every restart as forged and the old break again.
         let failed = |e: io::Error| classify_io_failure(&e, "removing the service data directory");
         if spec.remove_audit_trail {
             self.ops.remove_dir_all(&state_dir()).map_err(failed)?;
         } else {
             for (path, is_dir) in self.ops.list_dir(&state_dir()).map_err(failed)? {
-                if path
-                    .file_name()
-                    .is_some_and(|name| name == nrr_platform_api::service_control::AUDIT_SUBDIR)
-                {
+                if path.file_name().is_some_and(|name| {
+                    name == nrr_platform_api::service_control::AUDIT_SUBDIR
+                        || name == crate::key_store::KEY_FILE_NAME
+                }) {
                     continue;
                 }
                 if is_dir {
@@ -708,7 +853,14 @@ impl ServiceControlPort for LinuxServiceControl {
             return Err(ServiceControlError::NotInstalled);
         }
         self.run_checked(&systemctl(&["kill", "--signal=SIGKILL", SYSTEMD_UNIT_NAME]))?;
-        self.await_state(false, KILL_SETTLE, "kill")
+        // Killed means the main process is gone. What may still run is the
+        // unit's stop hook: waited out so the caller's own undo does not race
+        // it, but a hook that overstays never turns the kill into a failure.
+        self.await_main_process_gone(self.settle.main_process)?;
+        match self.await_state(false, self.settle.stop_post, "kill") {
+            Ok(()) | Err(ServiceControlError::Timeout { .. }) => Ok(()),
+            Err(other) => Err(other),
+        }
     }
 
     fn query(&self) -> Result<Option<ServiceStatusReport>, ServiceControlError> {
@@ -752,7 +904,7 @@ pub fn package_install_plan() -> SystemdInstallPlan {
 pub fn stage_package_files(root: &Path) -> io::Result<Vec<PathBuf>> {
     let plan = package_install_plan();
     let reroot = |path: &Path| root.join(path.strip_prefix("/").unwrap_or(path));
-    let ops = FsOps;
+    let ops = FsOps::new(PasswordPrompt::Never);
     let mut written = Vec::new();
     let files = std::iter::once((&plan.unit_path, &plan.unit_contents, 0o644)).chain(
         plan.additional_files
@@ -999,6 +1151,8 @@ mod tests {
                 (path.join("audit"), true),
                 (path.join("backup"), true),
                 (path.join("nrr_service_state.db"), false),
+                (path.join("db-mac-key.bin"), false),
+                (path.join("db-mac-resign-pending.bin"), false),
             ])
         }
         fn symlink(&self, target: &Path, link: &Path) -> io::Result<()> {
@@ -1418,7 +1572,7 @@ mod tests {
         std::fs::write(&target, b"#!/bin/true\n").expect("write target");
         let link = dir.join("nrr-service");
 
-        let fs = FsOps;
+        let fs = FsOps::new(PasswordPrompt::Never);
         fs.symlink(&target, &link).expect("first link");
         fs.symlink(&target, &link)
             .expect("second link must not fail");
@@ -1469,6 +1623,13 @@ mod tests {
             .filter(|o| o.contains("/var/lib/netrulerouter") || o.contains("/var/log/"))
             .collect();
         assert!(removed.iter().all(|o| !o.contains("/audit")), "{removed:?}");
+        // The key the trail's restarts are sealed under stays with the trail.
+        assert!(
+            removed.iter().all(|o| !o.ends_with("/db-mac-key.bin")),
+            "{removed:?}"
+        );
+        let marker = "remove /var/lib/netrulerouter/db-mac-resign-pending.bin";
+        assert!(removed.iter().any(|o| o == marker), "{removed:?}");
         assert!(removed.contains(&"remove-tree /var/lib/netrulerouter/backup".to_string()));
         assert!(removed.contains(&"remove /var/lib/netrulerouter/nrr_service_state.db".to_string()));
         assert!(removed.contains(&"remove-tree /var/log/netrulerouter".to_string()));
@@ -1562,6 +1723,26 @@ mod tests {
     }
 
     #[test]
+    fn a_stop_is_not_done_while_the_unit_is_still_deactivating() {
+        let deactivating = CommandOutcome {
+            exit_code: 3,
+            stdout: "deactivating\n".to_string(),
+            stderr: String::new(),
+        };
+        let (port, _journal) = port_over(vec![
+            ("show", ok(&show_running())),
+            ("is-active", deactivating),
+        ]);
+        assert_eq!(
+            port.stop(Duration::from_millis(0)),
+            Err(ServiceControlError::Timeout {
+                operation: "stop",
+                seconds: 0
+            })
+        );
+    }
+
+    #[test]
     fn a_start_that_never_becomes_active_times_out_with_its_own_error() {
         let (port, _journal) = port_over(vec![
             ("show", ok(&show_running())),
@@ -1591,5 +1772,123 @@ mod tests {
             failed(1, "Interactive authentication required."),
         )]);
         assert_eq!(port.query(), Err(ServiceControlError::AccessDenied));
+    }
+
+    // ── asking for a password ────────────────────────────────────────────────
+
+    /// A caller with a desktop session lets polkit's agent ask; the verb then
+    /// waits for the person, not for the command budget.
+    #[test]
+    fn a_session_caller_lets_the_agent_ask_for_a_start() {
+        let args: Vec<String> = ["start", "--no-block", SYSTEMD_UNIT_NAME]
+            .map(String::from)
+            .to_vec();
+        let (argv, budget) = systemctl_invocation(&args, PasswordPrompt::SessionAgent);
+        assert_eq!(argv, vec!["start", "--no-block", SYSTEMD_UNIT_NAME]);
+        assert_eq!(budget, PROMPT_BUDGET);
+    }
+
+    /// Without a person to ask, every verb refuses at once instead of waiting
+    /// on a prompt nobody will answer.
+    #[test]
+    fn a_silent_caller_never_has_systemctl_ask() {
+        for verb in ["start", "stop", "enable", "daemon-reload", "show"] {
+            let args: Vec<String> = [verb, SYSTEMD_UNIT_NAME].map(String::from).to_vec();
+            let (argv, budget) = systemctl_invocation(&args, PasswordPrompt::Never);
+            assert_eq!(argv.first(), Some(&NO_ASK_PASSWORD), "{verb}");
+            assert_eq!(budget, crate::command::DEFAULT_COMMAND_TIMEOUT, "{verb}");
+        }
+    }
+
+    /// Reads need no authorization, so a session caller's status polls keep
+    /// the short budget: a busy bus must not hang the UI for two minutes.
+    #[test]
+    fn reads_keep_the_short_budget_even_for_a_session_caller() {
+        for verb in ["show", "is-active"] {
+            let args: Vec<String> = [verb, SYSTEMD_UNIT_NAME].map(String::from).to_vec();
+            let (argv, budget) = systemctl_invocation(&args, PasswordPrompt::SessionAgent);
+            assert_eq!(argv.first(), Some(&NO_ASK_PASSWORD), "{verb}");
+            assert_eq!(budget, crate::command::DEFAULT_COMMAND_TIMEOUT, "{verb}");
+        }
+    }
+
+    // ── kill ─────────────────────────────────────────────────────────────────
+
+    fn deactivating() -> CommandOutcome {
+        CommandOutcome {
+            exit_code: 3,
+            stdout: "deactivating\n".to_string(),
+            stderr: String::new(),
+        }
+    }
+
+    fn no_settle() -> KillSettle {
+        KillSettle {
+            main_process: Duration::ZERO,
+            stop_post: Duration::ZERO,
+        }
+    }
+
+    /// After SIGKILL the unit sits in `deactivating` while `ExecStopPost`
+    /// restores DNS. The daemon is gone, and a kill that reports otherwise makes
+    /// an emergency reset answer "nothing was reset".
+    #[test]
+    fn a_kill_is_done_once_the_main_process_is_gone_even_while_the_stop_hook_runs() {
+        let (port, journal) = port_over(vec![
+            ("MainPID", ok("MainPID=0\n")),
+            ("show", ok(&show_running())),
+            ("is-active", deactivating()),
+        ]);
+        let port = port.with_settle(no_settle());
+        port.kill()
+            .expect("the daemon is dead: a kill has done its job");
+        assert!(recorded(&journal)
+            .iter()
+            .any(|o| o == "run systemctl kill --signal=SIGKILL netrulerouter.service"));
+    }
+
+    /// The same, reached the way the reset reaches it: a stop that times out.
+    #[test]
+    fn stop_or_kill_goes_on_to_the_reset_when_the_stop_hook_outlives_the_stop() {
+        let (port, journal) = port_over(vec![
+            ("MainPID", ok("MainPID=0\n")),
+            ("show", ok(&show_running())),
+            ("is-active", deactivating()),
+        ]);
+        let port = port.with_settle(no_settle());
+        port.stop_or_kill(Duration::ZERO)
+            .expect("stopped by the kill");
+        let ops = recorded(&journal);
+        assert!(ops.iter().any(|o| o.contains("systemctl stop")), "{ops:?}");
+        assert!(
+            ops.iter().any(|o| o.contains("--signal=SIGKILL")),
+            "{ops:?}"
+        );
+    }
+
+    /// A main process that survives the signal is a kill that did not work.
+    #[test]
+    fn a_kill_that_leaves_the_main_process_alive_times_out() {
+        let (port, _journal) = port_over(vec![
+            ("MainPID", ok("MainPID=4242\n")),
+            ("show", ok(&show_running())),
+            ("is-active", deactivating()),
+        ]);
+        let port = port.with_settle(no_settle());
+        assert_eq!(
+            port.kill(),
+            Err(ServiceControlError::Timeout {
+                operation: "kill",
+                seconds: 0
+            })
+        );
+    }
+
+    #[test]
+    fn a_main_pid_is_read_only_when_the_answer_carries_it() {
+        assert_eq!(parse_main_pid("MainPID=0\n"), Some(0));
+        assert_eq!(parse_main_pid("MainPID=4242\n"), Some(4242));
+        assert_eq!(parse_main_pid("ActiveState=deactivating\n"), None);
+        assert_eq!(parse_main_pid("MainPID=\n"), None);
     }
 }

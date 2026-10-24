@@ -117,6 +117,13 @@ pub enum RevisionField {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum IpcField {
+    MaxRestarts,
+    BackoffBaseMs,
+    BackoffCapSecs,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TrafficField {
     Enabled,
     Loopback,
@@ -161,6 +168,20 @@ pub enum ItemId {
     LocalNetworkForget(usize),
     LocalNetworkNew,
     LocalNetworkAdd,
+    /// The control channel's failure policy, by its `kind`.
+    IpcPolicy,
+    IpcNumber(IpcField),
+    /// The address cache refresh, in minutes on screen.
+    CacheRefresh,
+    /// Shows or hides the shared addresses leak protection leaves open.
+    SharedExemptionsDetails,
+    /// Opens or closes the machine-wide DoH/DoT resolver list.
+    DohManage,
+    DohResolver(usize),
+    DohResolverRemove(usize),
+    DohNewTarget,
+    DohNewComment,
+    DohAdd,
     ProbeReset,
     /// A field of the service-stability row.
     Stability(&'static str),
@@ -177,6 +198,8 @@ pub enum ItemId {
     ServiceRestart,
     ExportPath,
     ExportRun,
+    /// Who wins when the bound files and the service differ on a rule.
+    MergePolicy,
     SafeDisableReason,
     SafeDisableTerm,
     SafeDisableRun,
@@ -190,6 +213,11 @@ pub enum ItemId {
     Traffic(TrafficField),
     TrafficRetention,
     TrafficReset,
+    /// The answer to the history question: the same connection or not.
+    TrafficMerge(bool),
+    TrafficExportPath,
+    TrafficExportUnit,
+    TrafficExport,
     /// The caller's own connection history.
     HistoryEnabled,
     HistoryRetention,
@@ -296,7 +324,7 @@ pub fn items(app: &AppState, category: Category) -> Vec<Item> {
         Category::Presets => presets(app),
         Category::Logs => logs(app),
         Category::Traffic => traffic(app),
-        Category::Updates => updates(),
+        Category::Updates => about(app),
         Category::Terminal => terminal(app),
     }
 }
@@ -573,6 +601,70 @@ fn local_suffixes(app: &AppState) -> Vec<Item> {
     v
 }
 
+/// The shared list the DoH/DoT block cuts, opened on demand as in the window:
+/// a row per entry to stop blocking it or remove it, and fields to add one.
+fn doh_resolvers(app: &AppState) -> Vec<Item> {
+    let s = &app.settings;
+    let mut v = vec![action(
+        ItemId::DohManage,
+        if s.doh_open {
+            t::DOH_HIDE
+        } else {
+            t::DOH_MANAGE
+        },
+        false,
+    )];
+    if !s.doh_open {
+        return v;
+    }
+    v.push(info(Words::Key(t::DOH_DESCRIPTION)));
+    v.push(info(Words::Key(t::DOH_REQUIRES_ADMIN)));
+    let list = match &s.data.doh_resolvers {
+        Loadable::Ready(list) => list,
+        other => {
+            v.push(pending(app, other));
+            return v;
+        }
+    };
+    if list.resolvers.is_empty() {
+        v.push(info(Words::Key(t::DOH_EMPTY)));
+    }
+    for (index, entry) in list.resolvers.iter().enumerate() {
+        let kind = if entry.target_kind == "ip" {
+            t::DOH_KIND_IP
+        } else {
+            t::DOH_KIND_HOST
+        };
+        let target = display_text(&entry.target).into_owned();
+        let mut label = vec![raw(target.clone()), raw("  "), Words::Key(kind)];
+        if !entry.comment.is_empty() {
+            label.push(raw(format!("  {}", display_text(&entry.comment))));
+        }
+        v.push(Item::new(
+            ItemId::DohResolver(index),
+            Words::Join(label),
+            Kind::Toggle(entry.enabled),
+        ));
+        v.push(Item::new(
+            ItemId::DohResolverRemove(index),
+            Words::Join(vec![Words::Key(t::DELETE), raw(" "), raw(target)]),
+            Kind::Action { confirm: true },
+        ));
+    }
+    v.push(Item::new(
+        ItemId::DohNewTarget,
+        Words::Key(t::DOH_ADD_TARGET),
+        Kind::Text(s.doh_new_target.clone()),
+    ));
+    v.push(Item::new(
+        ItemId::DohNewComment,
+        Words::Key(t::DOH_ADD_COMMENT),
+        Kind::Text(s.doh_new_comment.clone()),
+    ));
+    v.push(action(ItemId::DohAdd, t::ADD, false));
+    v
+}
+
 /// The local networks leak protection may leave reachable, as the window lists
 /// them: an answer per row, a reason where no answer opens one.
 fn local_networks(app: &AppState) -> Vec<Item> {
@@ -825,6 +917,10 @@ fn routing(app: &AppState) -> Vec<Item> {
             ));
         }
     }
+    v.extend(doh_resolvers(app));
+    v.push(
+        policy_toggle(policy, "browser-history-auto-seed", t::AUTO_SEED).note(t::AUTO_SEED_NOTE),
+    );
     v.extend(local_suffixes(app));
     v.push(heading(t::HOSTS_TITLE));
     v.push(policy_toggle(
@@ -832,6 +928,15 @@ fn routing(app: &AppState) -> Vec<Item> {
         "resolve-hosts-bypass",
         t::HOSTS_BYPASS,
     ));
+    // Read only: the program never edits it, the user may.
+    if !s.hosts_file_path.is_empty() {
+        v.push(info(Words::Join(vec![
+            Words::Key(t::HOSTS_FILE),
+            raw(": "),
+            raw(s.hosts_file_path.clone()),
+        ])));
+        v.push(info(Words::Key(t::HOSTS_FILE_NOTE)));
+    }
     let offered = offered_routing_settings(app, stability_row.ok(), level);
     if offered.contains(&routing_settings::LOCAL_NETWORKS) {
         v.push(heading(t::LOCAL_TITLE));
@@ -915,11 +1020,10 @@ fn routing(app: &AppState) -> Vec<Item> {
         v.push(heading(t::SYSTEM_TITLE));
         match stability_row {
             Ok(config) => {
-                v.push(toggle(
-                    ItemId::RuleLock,
-                    t::RULE_LOCK,
-                    rule_edits_allowed(config),
-                ));
+                v.push(
+                    toggle(ItemId::RuleLock, t::RULE_LOCK, rule_edits_allowed(config))
+                        .note(t::RULE_LOCK_NOTE),
+                );
                 v.push(stability_toggle(
                     config,
                     "rule-scope-service-driven",
@@ -1011,7 +1115,11 @@ fn routing_refinements(
             )
             .note(t::SHARED_IP_NOTE),
             routing_settings::STRICT_SHARED_IPS => {
-                policy_toggle(policy, row, t::SHARED_STRICT).note(t::SHARED_STRICT_NOTE)
+                v.push(policy_toggle(policy, row, t::SHARED_STRICT).note(t::SHARED_STRICT_NOTE));
+                if !policy_bool(policy, row) {
+                    v.extend(shared_exemptions(app));
+                }
+                continue;
             }
             routing_settings::STABILITY_UNAVAILABLE => info(Words::Key(t::UNSUPPORTED)),
             _ => {
@@ -1033,6 +1141,118 @@ fn routing_refinements(
         };
         v.push(item);
     }
+    v
+}
+
+/// The shared addresses leak protection left open in its smart mode, as
+/// the window says it: the count, then the addresses on demand.
+fn shared_exemptions(app: &AppState) -> Vec<Item> {
+    let Some(snapshot) = app.snapshot.as_ref().filter(|_| app.link.is_connected()) else {
+        return Vec::new();
+    };
+    let count = snapshot.kill_switch_shared_ip_exemptions;
+    if count == 0 {
+        return Vec::new();
+    }
+    let open = app.settings.shared_exemptions_open;
+    let mut v = vec![
+        info(Words::Join(vec![
+            Words::Key(t::SHARED_SMART_WARNING),
+            raw(count.to_string()),
+        ])),
+        action(
+            ItemId::SharedExemptionsDetails,
+            if open {
+                t::HIDE_DETAILS
+            } else {
+                t::SHOW_DETAILS
+            },
+            false,
+        ),
+    ];
+    if !open {
+        return v;
+    }
+    let addresses = &snapshot.kill_switch_shared_ip_exemption_addresses;
+    if addresses.is_empty() {
+        v.push(info(Words::Key(t::SHARED_SMART_UNAVAILABLE)));
+        return v;
+    }
+    v.push(info(Words::Key(t::SHARED_SMART_LIST)));
+    v.extend(
+        addresses
+            .iter()
+            .map(|address| info(raw(format!("  {}", display_text(address))))),
+    );
+    v
+}
+
+/// The window's control-channel and cache rows of the stability config.
+fn service_stability(config: &Map<String, Value>) -> Vec<Item> {
+    let policy = config.get("ipc-accept-policy").and_then(Value::as_object);
+    let critical = policy.and_then(|p| p.get("kind")).and_then(Value::as_str) == Some("critical");
+    let int = |key: &str| policy.and_then(|p| p.get(key)).and_then(Value::as_i64);
+    let mut v = vec![
+        heading(t::STABILITY_TITLE),
+        info(Words::Key(t::STABILITY_HELP)),
+        stability_toggle(config, "conn-trace-gui", t::TRACE_GUI).note(t::TRACE_GUI_NOTE),
+        choice(
+            ItemId::IpcPolicy,
+            t::IPC_POLICY,
+            vec![
+                opt("recoverable", t::IPC_RECOVERABLE),
+                opt("critical", t::IPC_CRITICAL),
+            ],
+            if critical { "critical" } else { "recoverable" },
+        )
+        .note(if critical {
+            t::IPC_CRITICAL_NOTE
+        } else {
+            t::IPC_RECOVERABLE_NOTE
+        }),
+    ];
+    if !critical {
+        v.push(number(
+            ItemId::IpcNumber(IpcField::MaxRestarts),
+            Words::Key(t::IPC_MAX_RESTARTS),
+            int("max-restarts"),
+            1,
+            100,
+        ));
+        v.push(number(
+            ItemId::IpcNumber(IpcField::BackoffBaseMs),
+            Words::Key(t::IPC_BACKOFF_BASE),
+            int("backoff-base-ms"),
+            50,
+            5000,
+        ));
+        v.push(number(
+            ItemId::IpcNumber(IpcField::BackoffCapSecs),
+            Words::Key(t::IPC_BACKOFF_CAP),
+            int("backoff-cap-ms").map(|ms| (ms + 999) / 1000),
+            1,
+            60,
+        ));
+    }
+    let minutes = config
+        .get("cache-refresh-interval-secs")
+        .and_then(Value::as_i64)
+        .map(|secs| (secs / 60).clamp(1, 1440));
+    v.push(heading(t::CACHE_REFRESH_TITLE));
+    v.push(
+        number(
+            ItemId::CacheRefresh,
+            Words::Join(vec![
+                Words::Key(t::CACHE_REFRESH),
+                raw(", "),
+                Words::Key(t::CACHE_REFRESH_UNIT),
+            ]),
+            minutes,
+            1,
+            1440,
+        )
+        .note(t::CACHE_REFRESH_NOTE),
+    );
     v
 }
 
@@ -1272,6 +1492,17 @@ fn presets(app: &AppState) -> Vec<Item> {
         ),
         action(ItemId::ExportRun, t::EXPORT_RUN, false),
         info(Words::Key(t::RULES_NOTE)),
+        choice(
+            ItemId::MergePolicy,
+            t::MERGE_POLICY,
+            vec![
+                opt("union", t::MERGE_POLICY_UNION),
+                opt("file-wins", t::MERGE_POLICY_FILE_WINS),
+                opt("service-wins", t::MERGE_POLICY_SERVICE_WINS),
+            ],
+            app.settings.merge_policy.slug(),
+        )
+        .note(t::MERGE_POLICY_NOTE),
     ];
     v.extend(reset_rows(app));
     v
@@ -1526,6 +1757,9 @@ fn logs(app: &AppState) -> Vec<Item> {
             other => v.push(pending(app, other)),
         }
     }
+    if let Loadable::Ready(config) = &s.data.stability {
+        v.extend(service_stability(config));
+    }
     v.push(action(ItemId::ClearLogs, t::CLEAR_LOGS, true));
 
     v.push(heading(t::HISTORY_TITLE));
@@ -1675,16 +1909,34 @@ fn traffic(app: &AppState) -> Vec<Item> {
     if periods.iter().all(|(_, rows)| rows.is_empty()) {
         v.push(info(Words::Key(t::TRAFFIC_NO_DATA)));
     }
+    if let Some(question) = &stats.history_merge {
+        v.push(info(Words::Fill(
+            t::TRAFFIC_MERGE_QUESTION,
+            vec![
+                ("old", display_text(&question.old_name).into_owned()),
+                ("new", display_text(&question.new_name).into_owned()),
+            ],
+        )));
+        v.push(info(Words::Key(t::TRAFFIC_MERGE_HINT)));
+        v.push(action(
+            ItemId::TrafficMerge(true),
+            t::TRAFFIC_MERGE_SAME,
+            false,
+        ));
+        v.push(action(
+            ItemId::TrafficMerge(false),
+            t::TRAFFIC_MERGE_DIFFERENT,
+            false,
+        ));
+    }
     for (period, rows) in periods.iter().filter(|(_, rows)| !rows.is_empty()) {
         let (received, sent) = totals(rows);
         v.push(info(Words::Join(vec![
             Words::Key(*period),
             raw(": "),
-            Words::Key(t::TRAFFIC_RECEIVED),
-            raw(format!(" {}, ", format_storage_bytes(received))),
-            Words::Key(t::TRAFFIC_SENT),
-            raw(format!(" {}", format_storage_bytes(sent))),
+            bytes_words(received, sent),
         ])));
+        v.extend(traffic_rows(rows));
     }
     let settings = &stats.settings;
     v.push(toggle(
@@ -1709,20 +1961,121 @@ fn traffic(app: &AppState) -> Vec<Item> {
         7,
         3650,
     ));
+    v.push(Item::new(
+        ItemId::TrafficExportPath,
+        Words::Key(t::EXPORT_PATH),
+        Kind::Text(app.settings.traffic_export_path.clone()),
+    ));
+    v.push(choice(
+        ItemId::TrafficExportUnit,
+        t::TRAFFIC_EXPORT_UNIT,
+        traffic_export_units(),
+        app.settings.traffic_export_unit,
+    ));
+    v.push(action(ItemId::TrafficExport, t::TRAFFIC_EXPORT, false));
     v.push(action(ItemId::TrafficReset, t::TRAFFIC_RESET, true));
     v
 }
 
+/// The units the exported byte columns may use, as the window offers them.
+pub fn traffic_export_units() -> Vec<Opt> {
+    vec![
+        opt("bytes", t::UNIT_BYTES),
+        opt("kb", t::UNIT_KB),
+        opt("mb", t::UNIT_MB),
+        opt("gb", t::UNIT_GB),
+    ]
+}
+
+fn bytes_words(received: u64, sent: u64) -> Words {
+    Words::Join(vec![
+        Words::Key(t::TRAFFIC_RECEIVED),
+        raw(format!(" {}, ", format_storage_bytes(received))),
+        Words::Key(t::TRAFFIC_SENT),
+        raw(format!(" {}", format_storage_bytes(sent))),
+    ])
+}
+
+/// A period's rows by route, in the window's order: the additional adapter
+/// first, then the main one, then the opt-in local and virtual counts.
+fn traffic_rows(rows: &[TrafficRowDto]) -> Vec<Item> {
+    const ORDER: [(&str, Key); 4] = [
+        ("secondary", t::TRAFFIC_THROUGH_SECONDARY),
+        ("primary", t::TRAFFIC_THROUGH_PRIMARY),
+        ("loopback", t::TRAFFIC_ROLE_LOOPBACK),
+        ("virtual", t::TRAFFIC_ROLE_VIRTUAL),
+    ];
+    ORDER
+        .iter()
+        .flat_map(|(role, title)| {
+            rows.iter()
+                .filter(move |row| row.role == *role)
+                .map(move |row| {
+                    info(Words::Join(vec![
+                        raw("  "),
+                        Words::Key(*title),
+                        raw(format!(" — {}: ", display_text(&row.display_name))),
+                        bytes_words(row.in_bytes, row.out_bytes),
+                    ]))
+                })
+        })
+        .collect()
+}
+
 // ── Updates and the terminal itself ──────────────────────────────────────────
 
-fn updates() -> Vec<Item> {
-    vec![
-        info(Words::Join(vec![
-            Words::Key(t::VERSION),
-            raw(format!(": {}", env!("CARGO_PKG_VERSION"))),
-        ])),
+/// What the window's About shows, and the third-party list with each
+/// component's integrity verdict; no list where nothing is shipped.
+fn about(app: &AppState) -> Vec<Item> {
+    let shell = nrr_shared::gui_shell_v1().about;
+    let fact =
+        |label: Key, value: Words| info(Words::Join(vec![Words::Key(label), raw(": "), value]));
+    let mut v = vec![
+        fact(t::VERSION, raw(env!("CARGO_PKG_VERSION"))),
+        fact(t::LICENSE, raw(env!("CARGO_PKG_LICENSE"))),
+        fact(t::AUTHOR, Words::Key(t::AUTHOR_NAME)),
+        fact(t::AUTHOR_EMAIL, raw(shell.author_email)),
+        fact(t::PROJECT, raw(shell.project_url)),
+        fact(t::BUILD_CHANNEL, raw(shell.build_channel)),
         info(Words::Key(t::UPDATES_NOTE)),
-    ]
+    ];
+    match &app.settings.data.third_party {
+        Loadable::Ready(list) if list.components.is_empty() => {}
+        Loadable::Ready(list) => {
+            v.push(heading(t::THIRD_PARTY));
+            for component in &list.components {
+                v.extend(third_party_rows(component));
+            }
+        }
+        other => {
+            v.push(heading(t::THIRD_PARTY));
+            v.push(pending(app, other));
+        }
+    }
+    v
+}
+
+fn third_party_rows(component: &nrr_shared::third_party::ThirdPartyComponentStatus) -> Vec<Item> {
+    use nrr_shared::third_party::IntegrityVerdict;
+    let (verdict, note) = match component.verdict {
+        IntegrityVerdict::Genuine => (t::VERDICT_GENUINE, None),
+        IntegrityVerdict::Untrusted => (t::VERDICT_UNTRUSTED, Some(t::VERDICT_UNTRUSTED_NOTE)),
+        IntegrityVerdict::Missing => (t::VERDICT_MISSING, Some(t::VERDICT_MISSING_NOTE)),
+        IntegrityVerdict::NotApplicable => (t::VERDICT_NOT_APPLICABLE, None),
+    };
+    let mut rows = vec![info(Words::Join(vec![
+        raw(format!(
+            "{} {} ({}) — ",
+            display_text(&component.display_name),
+            display_text(&component.version),
+            display_text(&component.license_name),
+        )),
+        Words::Key(verdict),
+    ]))];
+    if let Some(note) = note {
+        rows.push(info(Words::Key(note)));
+    }
+    rows
 }
 
 fn terminal(app: &AppState) -> Vec<Item> {

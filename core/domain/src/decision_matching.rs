@@ -209,11 +209,10 @@ pub fn match_suffix_domain(hostname: &str, label: &str) -> bool {
 /// rule IS `*.base.<zone>`, so the decision engine, the DNS gate and every
 /// enforcement fan-out treat it as that suffix rule.
 ///
-/// The zone is the host's public suffix as [`registrable_domain`] reads it, so
-/// the site sits right before it: `example.*` covers `www.example.co.uk`, and
-/// never `example.com.attacker.net`, whose site is `attacker`.
-///
-/// [`registrable_domain`]: crate::companion_affinity::registrable_domain
+/// The zone is the end of the host a registrar sells under (see
+/// [`site_zone`]), so the site sits right before it: `example.*` covers
+/// `www.example.co.uk` and `www.example.com.vn`, and never
+/// `example.com.attacker.net`, whose site is `attacker`.
 ///
 /// # Examples
 ///
@@ -222,6 +221,7 @@ pub fn match_suffix_domain(hostname: &str, label: &str) -> bool {
 ///
 /// assert_eq!(match_any_zone_domain("example.com", "example"), Some("example.com"));
 /// assert_eq!(match_any_zone_domain("www.example.co.uk", "example"), Some("example.co.uk"));
+/// assert_eq!(match_any_zone_domain("www.example.com.vn", "example"), Some("example.com.vn"));
 /// assert_eq!(match_any_zone_domain("example.com.attacker.net", "example"), None);
 /// assert_eq!(match_any_zone_domain("notexample.com", "example"), None);
 /// ```
@@ -229,14 +229,51 @@ pub fn match_any_zone_domain<'h>(hostname: &'h str, base: &str) -> Option<&'h st
     if base.is_empty() {
         return None;
     }
-    let registrable = crate::companion_affinity::registrable_domain(hostname)?;
-    let (_, zone) = registrable.split_once('.')?;
+    let zone = site_zone(hostname)?;
     let site_end = hostname.len().checked_sub(zone.len() + 1)?;
     let site = &hostname[..site_end];
     if !match_suffix_domain(site, base) {
         return None;
     }
     Some(&hostname[site_end - base.len()..])
+}
+
+/// Second-level labels country registries sell under (`com.vn`, `co.nz`,
+/// `org.pl`, `ne.jp`). A rule, not a table of countries: a miss here routes a
+/// whole site by default, so the pattern has to reach zones nobody listed.
+const COUNTRY_SECOND_LEVELS: &[&str] = &[
+    "ac", "co", "com", "edu", "go", "gob", "gov", "ltd", "mil", "ne", "net", "nom", "or", "org",
+    "plc", "sch",
+];
+
+/// Two-label zones the country pattern does not reach.
+const OTHER_TWO_LABEL_ZONES: &[&str] = &["msk.ru", "spb.ru"];
+
+/// The zone a `base.*` rule reads at `hostname`: two labels when they are a
+/// generic second level under a two-letter country zone (or a listed
+/// exception), otherwise the last label. `None` for a single label, an empty
+/// last label, or a bare two-label zone (`co.uk` names no site).
+///
+/// Bounded and allocation-free: it sits on the DNS gate's path.
+pub fn site_zone(hostname: &str) -> Option<&str> {
+    let (rest, tld) = hostname.rsplit_once('.')?;
+    if tld.is_empty() {
+        return None;
+    }
+    let sld = rest.rsplit_once('.').map_or(rest, |(_, label)| label);
+    let two_labels = &hostname[hostname.len() - tld.len() - 1 - sld.len()..];
+    let country_pattern = tld.len() == 2
+        && tld.bytes().all(|b| b.is_ascii_alphabetic())
+        && COUNTRY_SECOND_LEVELS
+            .iter()
+            .any(|s| s.eq_ignore_ascii_case(sld));
+    let listed = OTHER_TWO_LABEL_ZONES
+        .iter()
+        .any(|z| z.eq_ignore_ascii_case(two_labels));
+    if !(country_pattern || listed) {
+        return Some(tld);
+    }
+    (two_labels.len() < hostname.len()).then_some(two_labels)
 }
 
 // ── MatchClass ────────────────────────────────────────────────────────────────

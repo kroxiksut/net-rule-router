@@ -89,19 +89,22 @@ fn lower_kill_switch_flows(flows: &[&FlowRule], secondary_luid: u64) -> Vec<WfpF
                     (
                         EgressConstraint::OnlyVia(EgressRef::Secondary),
                         Coverage::ConnectOnly,
-                        DstMatch::Any,
+                        dst @ (DstMatch::Any | DstMatch::SubnetV6 { prefix: 0, .. }),
                         Some(pat),
                     ) => {
+                        let v6 = dst != DstMatch::Any;
                         out.push(ale_app_egress_permit(
                             pat,
                             secondary_luid,
                             KILLSWITCH_PERMIT_BASE + ord,
                             user_sid.clone(),
+                            v6,
                         ));
                         out.push(ale_app_block(
                             pat,
                             APP_KILLSWITCH_BLOCK_BASE + ord,
                             user_sid,
+                            v6,
                         ));
                     }
                     // 4a — ALE egress-conditional pin (proto-agnostic): collect.
@@ -141,11 +144,16 @@ fn lower_kill_switch_flows(flows: &[&FlowRule], secondary_luid: u64) -> Vec<WfpF
             PrecedenceClass::KillSwitchBlock if flow.verdict == Verdict::Block => {
                 match (flow.coverage, flow.flow.dst, app.as_deref()) {
                     // per-app ALE block (proto-agnostic).
-                    (Coverage::ConnectOnly, DstMatch::Any, Some(pat)) => {
+                    (
+                        Coverage::ConnectOnly,
+                        dst @ (DstMatch::Any | DstMatch::SubnetV6 { prefix: 0, .. }),
+                        Some(pat),
+                    ) => {
                         out.push(ale_app_block(
                             pat,
                             APP_KILLSWITCH_BLOCK_BASE + ord,
                             user_sid,
+                            dst != DstMatch::Any,
                         ));
                     }
                     // ALE destination block (narrowed to the ALE protocol): collect.

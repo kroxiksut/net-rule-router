@@ -215,7 +215,7 @@ fn the_rows_counted_for_scrolling_are_the_rows_drawn() {
     for (i, group) in app.suggestions.shown().iter().enumerate() {
         assert_eq!(
             group_line_count(group),
-            group_lines(group, i, false, &texts).len(),
+            group_lines(group, i, false, false, &texts).len(),
             "{}",
             group.domain
         );
@@ -305,6 +305,97 @@ fn keys_answer_the_chosen_group() {
     assert!(wide.contains("Reload the page you were on"), "{wide}");
 }
 
+/// `f` forgets the chosen group's offers and answers, `x` asks before
+/// forgetting every one, and `/` narrows the list to what matches.
+#[test]
+fn forget_clear_all_and_search_act_as_the_window_does() {
+    let fake = service();
+    fake.answer(
+        IpcOperationName::AutoRuleCandidatesForget,
+        json!({ "applied": 2, "unknown": 0, "pending": 1 }),
+    );
+    let mut app = on_screen(&fake);
+    let screen = crate::screens::screen(ScreenId::Suggestions);
+    let view_text = |app: &AppState| render(app, 160, 60);
+
+    assert!(screen.on_line(&mut app, "/ img"));
+    let shown = app.suggestions.shown();
+    assert_eq!(shown.len(), 1, "{shown:?}");
+    assert_eq!(shown[0].domain, "example.com");
+    assert!(screen.on_line(&mut app, "/ nothing-like-this"));
+    assert!(view_text(&app).contains("No addresses match your search."));
+    assert!(screen.on_line(&mut app, "/"));
+    assert!(app.suggestions.shown().len() > 1);
+
+    press(&mut app, KeyCode::Enter);
+    press(&mut app, KeyCode::Char('f'));
+    drain(&mut app, &fake);
+    let sent = fake.sent(IpcOperationName::AutoRuleCandidatesForget);
+    assert_eq!(sent.len(), 1, "{sent:?}");
+    assert!(!sent[0]["ids"].as_array().expect("ids").is_empty());
+    assert!(view_text(&app).contains("Forgotten with their answers: 2."));
+
+    press(&mut app, KeyCode::Char('x'));
+    assert!(
+        view_text(&app).contains("forget all"),
+        "{}",
+        view_text(&app)
+    );
+    press(&mut app, KeyCode::Char('n'));
+    assert_eq!(
+        fake.sent(IpcOperationName::AutoRuleCandidatesForget).len(),
+        1
+    );
+    press(&mut app, KeyCode::Char('x'));
+    press(&mut app, KeyCode::Char('y'));
+    drain(&mut app, &fake);
+    let sent = fake.sent(IpcOperationName::AutoRuleCandidatesForget);
+    assert_eq!(sent.len(), 2);
+    let all = sent[1]["ids"].as_array().expect("ids");
+    assert!(
+        all.iter().any(|id| id == "d1"),
+        "answered ones too: {all:?}"
+    );
+}
+
+/// Marked items take one answer together; `p` narrows the list to what one
+/// site relies on, as clicking a site in the window does.
+#[test]
+fn marked_items_answer_together_and_a_site_filters_the_list() {
+    let fake = service();
+    let mut app = on_screen(&fake);
+    let screen = crate::screens::screen(ScreenId::Suggestions);
+    screen.on_printed(&mut app);
+    let before = app.suggestions.shown().len();
+    assert!(before >= 2, "the fixture lists several groups");
+
+    assert!(screen.on_line(&mut app, "* 1"));
+    assert!(screen.on_line(&mut app, "* 2"));
+    assert!(render(&app, 160, 60).contains("Marked: 2."));
+    assert!(screen.on_line(&mut app, "n 1"));
+    drain(&mut app, &fake);
+    let sent = fake.sent(IpcOperationName::AutoRuleCandidatesDismiss);
+    assert_eq!(sent.len(), 1, "{sent:?}");
+    assert!(
+        sent[0]["ids"].as_array().expect("ids").len() >= 2,
+        "both marked groups: {sent:?}"
+    );
+    assert!(
+        app.suggestions.marked.is_empty(),
+        "an answer clears the marks"
+    );
+
+    assert!(screen.on_line(&mut app, "p news.example"));
+    let filtered = app.suggestions.shown();
+    assert!(!filtered.is_empty());
+    assert!(filtered
+        .iter()
+        .all(|g| g.consumers.iter().any(|c| c.hostname == "news.example")));
+    assert!(render(&app, 160, 60).contains("Showing only what news.example needs"));
+    assert!(screen.on_line(&mut app, "p"));
+    assert!(app.suggestions.consumer.is_empty());
+}
+
 /// An offer in another zone of its site says so, and `z` takes it as the
 /// site in every zone; a group that names no site sends nothing.
 #[test]
@@ -379,7 +470,7 @@ fn a_less_certain_offer_shows_its_mark_and_basis() {
     for (i, group) in app.suggestions.shown().iter().enumerate() {
         assert_eq!(
             group_line_count(group),
-            group_lines(group, i, false, &texts).len(),
+            group_lines(group, i, false, false, &texts).len(),
             "{}",
             group.domain
         );

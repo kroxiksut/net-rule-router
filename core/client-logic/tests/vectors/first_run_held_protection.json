@@ -1,0 +1,45 @@
+{
+  "description": "pure.js firstRunHeldProtection: what the first-run setup starts from for a user already set up; null for a new user",
+  "cases": [
+    {
+      "name": "no saved policy is a new user",
+      "input": { "saved": false, "route": "prefer-primary", "leak": "everything", "auto": true, "enabled": true },
+      "expected": null
+    },
+    {
+      "name": "everything with lockdown off is kept as it is",
+      "input": { "saved": true, "route": "prefer-primary", "leak": "everything", "auto": false, "enabled": false },
+      "expected": { "level": "everything", "doh": false }
+    },
+    {
+      "name": "sites under the main connection",
+      "input": { "saved": true, "route": "prefer-primary", "leak": "sites", "auto": false, "enabled": true },
+      "expected": { "level": "sites", "doh": true }
+    },
+    {
+      "name": "sites under the additional connection reads as everything",
+      "input": { "saved": true, "route": "prefer-secondary", "leak": "sites", "auto": false, "enabled": false },
+      "expected": { "level": "everything", "doh": false }
+    },
+    {
+      "name": "automatic lockdown counts as on",
+      "input": { "saved": true, "route": "prefer-primary", "leak": "off", "auto": true, "enabled": false },
+      "expected": { "level": "off", "doh": true }
+    },
+    {
+      "name": "an unknown level reads as off",
+      "input": { "saved": true, "route": "prefer-primary", "leak": "strict", "auto": false, "enabled": false },
+      "expected": { "level": "off", "doh": false }
+    },
+    {
+      "name": "an empty default route is the main connection",
+      "input": { "saved": true, "route": "", "leak": "sites", "auto": true, "enabled": true },
+      "expected": { "level": "sites", "doh": true }
+    },
+    {
+      "name": "a new user with an empty policy",
+      "input": { "saved": false, "route": "", "leak": "", "auto": false, "enabled": false },
+      "expected": null
+    }
+  ]
+}

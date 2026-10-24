@@ -723,7 +723,9 @@ pub(super) fn build(inputs: PerSidApplyInputs<'_>) -> PerSidApplyStack {
                 .with_primary_behavior_source({
                     let stalls =
                         nrr_service_runtime::primary_stall_registry::global_primary_stalls();
-                    Arc::new(move |hostname: &str| stalls.behavior_of_subtree(hostname))
+                    Arc::new(move |sid: &str, hostname: &str| {
+                        stalls.behavior_of_subtree(sid, hostname)
+                    })
                 }),
             );
             let observe_consumer = Arc::new(
@@ -1238,6 +1240,20 @@ pub(super) fn build(inputs: PerSidApplyInputs<'_>) -> PerSidApplyStack {
         }
     };
 
+    fn routing_pause_audit(
+        writer: Option<&Arc<nrr_diagnostics::AuditWriter>>,
+        ids: &Arc<ProductionIdGenerator>,
+    ) -> Arc<dyn nrr_service_runtime::RoutingPauseAudit> {
+        match writer {
+            Some(writer) => Arc::new(
+                nrr_service_runtime::production_routing_pause_audit::ProductionRoutingPauseAudit::new(
+                    Arc::clone(writer),
+                    Arc::clone(ids),
+                ),
+            ),
+            None => Arc::new(NoopRoutingPauseAudit),
+        }
+    }
     // Routing-pause coordinator, wired to the REAL
     // orchestrator dispatcher now that the orchestrator exists. `pause` /
     // `pause_all_active` (safe-disable) / `resume` therefore actually
@@ -1252,7 +1268,7 @@ pub(super) fn build(inputs: PerSidApplyInputs<'_>) -> PerSidApplyStack {
             Arc::clone(conn),
             Arc::clone(&sid_registry),
             dispatcher,
-            Arc::new(NoopRoutingPauseAudit),
+            routing_pause_audit(artifacts.audit_writer.as_ref(), &id_generator),
             Arc::new(SystemClock),
         );
         // Safe-disable (ROUTE-half) — hand the route coordinator to the pause

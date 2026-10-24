@@ -6,9 +6,8 @@
 # It also puts `nrr-cli` and `nrr-tui` on PATH through links in /usr/bin.
 #
 # Two differences from install-service.ps1:
-#   * the build output is staged into /usr/libexec/netrulerouter first — the unit
-#     sets ProtectHome=yes and `install` refuses a daemon under /home, which
-#     could only ever fail at exec with 203;
+#   * the build output is staged into /usr/libexec/netrulerouter first —
+#     `install` refuses a root daemon under /home, whose owner could replace it;
 #   * `nrr-serviced install` enables AND starts the unit in one step
 #     (`systemctl enable --now`), so there is no separate "start" call.
 #

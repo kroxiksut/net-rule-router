@@ -6,8 +6,12 @@ use nrr_client_logic::placeholders::list_summary;
 use nrr_client_logic::Route;
 use nrr_shared::display_text::display_text;
 use nrr_shared::ipc::ContractSkew;
-use nrr_shared::ipc_payloads::{InterfaceRowDto, RouteBindingDto};
+use nrr_shared::ipc_payloads::{
+    BehaviorModeDto, InterfaceRowDto, LeakProtectionDto, RouteBindingDto, SnapshotInitialResponse,
+};
 use nrr_shared::platform_profile::PlatformProfile;
+
+use std::time::{Duration, Instant};
 
 use crossterm::event::{KeyCode, KeyEvent};
 
@@ -85,8 +89,9 @@ impl Screen for StatusScreen {
         }
         match key.code {
             KeyCode::Char('r') => restore::restore(app),
-            KeyCode::Char('t') => vpn_trust::trust_pending(app),
-            KeyCode::Char('a') => vpn_gateway_trust::allow_pending(app),
+            KeyCode::Char('t') => vpn_trust::trust_first(app, false),
+            KeyCode::Char('T') => vpn_trust::trust_first(app, true),
+            KeyCode::Char('a') => vpn_gateway_trust::allow_first(app),
             KeyCode::Char('p') => primary_suggestion::confirm(app),
             KeyCode::Char('v') => block_route::ask(app),
             _ => false,
@@ -103,8 +108,9 @@ impl Screen for StatusScreen {
         }
         match line {
             "r" => restore::restore(app),
-            "t" => vpn_trust::trust_pending(app),
-            "a" => vpn_gateway_trust::allow_pending(app),
+            "t" => vpn_trust::trust_first(app, false),
+            "T" => vpn_trust::trust_first(app, true),
+            "a" => vpn_gateway_trust::allow_first(app),
             "p" => primary_suggestion::confirm(app),
             "v" => block_route::ask(app),
             _ => false,
@@ -315,12 +321,39 @@ fn routing_lines(app: &AppState, texts: &Texts) -> Vec<ViewLine> {
         && app
             .snapshot
             .as_ref()
-            .is_some_and(|s| s.kill_switch_block_all_armed)
+            .is_some_and(|s| s.kill_switch_holding_for_outage)
     {
         lines.push(ViewLine::new(vec![Segment::state(
             texts.get(keys::BLOCK_ALL_ARMED),
             StateTone::Bad,
         )]));
+    }
+    if let Some(snapshot) = app
+        .snapshot
+        .as_ref()
+        .filter(|s| app.link.is_connected() && s.protection_filters_high)
+    {
+        lines.push(ViewLine::new(vec![Segment::state(
+            texts.get(keys::PROTECTION_VOLUME_HIGH).replace(
+                "{count}",
+                &snapshot.protection_filters_on_machine.to_string(),
+            ),
+            StateTone::Caution,
+        )]));
+    }
+    if let Some(line) = silence_line(app, texts) {
+        lines.push(line);
+    }
+    if app
+        .snapshot
+        .as_ref()
+        .filter(|_| app.link.is_connected())
+        .is_some_and(revision_rejected)
+    {
+        lines.push(ViewLine::new(vec![
+            Segment::state(texts.get(keys::REVISION_INTEGRITY), StateTone::Bad),
+            Segment::plain(format!(" {}", texts.get(keys::SEE_DIAGNOSTICS_HINT))),
+        ]));
     }
     if app.settings_unreadable {
         lines.push(ViewLine::new(vec![
@@ -340,6 +373,92 @@ fn routing_lines(app: &AppState, texts: &Texts) -> Vec<ViewLine> {
     lines.extend(pending_vpn_gateway_lines(app, texts));
     lines.extend(block_route_lines(app, texts));
     lines
+}
+
+/// A rule set changed outside the app was refused and the alert is still
+/// open: the service runs on the last verified one.
+pub(crate) fn revision_rejected(snapshot: &SnapshotInitialResponse) -> bool {
+    snapshot
+        .diagnostics
+        .active_alerts
+        .iter()
+        .any(|alert| alert.state == "active" && alert.kind == "untrusted_revision_rejected")
+}
+
+/// A VPN-like additional adapter is up while only the rules go through it:
+/// its name and the rule count. Users read "VPN on, address unchanged" as
+/// broken, so the window explains selective routing; so does this.
+pub(crate) fn vpn_split(snapshot: &SnapshotInitialResponse) -> Option<(String, usize)> {
+    let policy = snapshot.route_policy.as_ref()?;
+    if policy.mode != BehaviorModeDto::PreferPrimary {
+        return None;
+    }
+    let row = bound_row(&snapshot.adapters.rows, policy.secondary.as_ref()?)?;
+    let vpn_like = matches!(
+        row.derived_assessment.vpn_tunnel_likelihood.as_str(),
+        "likely" | "possible"
+    );
+    let count = usize::try_from(snapshot.active_secondary_rule_count?).ok()?;
+    (row.availability == "available" && vpn_like && count > 0).then(|| (display_name(row), count))
+}
+
+/// How long a service may hold rules and apply none before the line says so:
+/// the window's settle (three 15 s watch ticks), longer than one reconcile
+/// tick plus the binding re-push after a connect, so a service still coming
+/// up stays quiet.
+pub(crate) const POLICY_IDLE_SETTLE: Duration = Duration::from_secs(45);
+
+/// The service holds rules but applies none, and no other line owns the
+/// cause: not paused, not blocking everything, no additional adapter bound
+/// (its own row tells its state).
+fn policy_idle(snapshot: &SnapshotInitialResponse) -> bool {
+    snapshot.active_rule_count.is_some_and(|count| count > 0)
+        && !snapshot.routing_paused
+        && !snapshot.kill_switch_block_all_armed
+        && snapshot
+            .route_policy
+            .as_ref()
+            .is_none_or(|p| p.secondary.is_none())
+}
+
+/// Each snapshot read: when the idle state began, or none once it ended.
+pub(crate) fn track_policy_idle(app: &mut AppState, now: Instant) {
+    let idle = app.link.is_connected() && app.snapshot.as_ref().is_some_and(policy_idle);
+    app.policy_idle_since = match app.policy_idle_since {
+        _ if !idle => None,
+        Some(since) => Some(since),
+        None => Some(now),
+    };
+}
+
+/// A connected service that routes nothing looks healthy from outside; the
+/// window's empty-rules and policy-inactive banners say so, and so does this,
+/// the latter only once the state has held for [`POLICY_IDLE_SETTLE`].
+/// Each stands down where another line already owns the cause.
+fn silence_line(app: &AppState, texts: &Texts) -> Option<ViewLine> {
+    let snapshot = app.snapshot.as_ref().filter(|_| app.link.is_connected())?;
+    let count = snapshot.active_rule_count?;
+    let key = if count == 0 {
+        keys::RULES_EMPTY
+    } else {
+        let settled = app
+            .policy_idle_since
+            .is_some_and(|since| since.elapsed() >= POLICY_IDLE_SETTLE);
+        if !policy_idle(snapshot) || !settled {
+            return None;
+        }
+        let policy = snapshot.route_policy.as_ref();
+        let protected = policy.is_some_and(|p| p.leak_protection != LeakProtectionDto::Off);
+        if protected {
+            keys::POLICY_INACTIVE_BLOCKING
+        } else {
+            keys::POLICY_INACTIVE_NO_ADAPTER
+        }
+    };
+    Some(ViewLine::new(vec![Segment::state(
+        texts.get(key),
+        StateTone::Caution,
+    )]))
 }
 
 /// A blocked site a rule can answer: standing until answered, with the key.
@@ -403,13 +522,24 @@ fn pending_vpn_client_lines(app: &AppState, texts: &Texts) -> Vec<ViewLine> {
         return Vec::new();
     }
     let names = vpn_trust::names(&app.vpn_trust.pending);
+    let Some((name, bundled)) = vpn_trust::first_question(&app.vpn_trust.pending) else {
+        return Vec::new();
+    };
+    let hint = if bundled == 0 {
+        texts.fill(keys::VPN_TRUST_HINT, &[("name", name)])
+    } else {
+        texts.fill(
+            keys::VPN_TRUST_HINT_BUNDLE,
+            &[("name", name), ("count", bundled.to_string())],
+        )
+    };
     vec![
         ViewLine::new(vec![Segment::state(
             texts.get(keys::VPN_TRUST_TITLE),
             StateTone::Caution,
         )]),
         ViewLine::text(texts.fill(keys::VPN_TRUST_BODY, &[("apps", names.join(", "))])),
-        ViewLine::text(texts.get(keys::VPN_TRUST_HINT)),
+        ViewLine::text(hint),
     ]
 }
 
@@ -656,6 +786,61 @@ mod tests {
         assert!(!said(&app));
     }
 
+    /// The window's empty-rules and policy-inactive banners, in the status:
+    /// only once the service's count is known, and silent where another line
+    /// owns the cause.
+    #[test]
+    fn a_service_that_routes_nothing_says_why_under_the_state() {
+        let said = |app: &AppState, needle: &str| shown(app).iter().any(|l| l.contains(needle));
+        let mut app = app_at(Link::Connected, Some(&Fixture::healthy()));
+        app.snapshot.as_mut().expect("snapshot").active_rule_count = None;
+        assert!(
+            !said(&app, "No rules are active"),
+            "a service that does not count"
+        );
+        app.snapshot.as_mut().expect("snapshot").active_rule_count = Some(0);
+        assert!(said(&app, "No rules are active"));
+
+        app.snapshot.as_mut().expect("snapshot").active_rule_count = Some(3);
+        assert!(!said(&app, "No rules are active"));
+        assert!(
+            !said(&app, "not being applied"),
+            "a bound additional adapter tells its own state"
+        );
+
+        let mut app = app_at(
+            Link::Connected,
+            Some(&Fixture {
+                secondary: None,
+                ..Fixture::healthy()
+            }),
+        );
+        app.snapshot.as_mut().expect("snapshot").active_rule_count = Some(3);
+        track_policy_idle(&mut app, Instant::now());
+        assert!(
+            !said(&app, "not being applied"),
+            "a service still coming up stays quiet for the settle window"
+        );
+        app.policy_idle_since = Instant::now().checked_sub(POLICY_IDLE_SETTLE);
+        assert!(app.policy_idle_since.is_some(), "the clock reaches back");
+        assert!(said(&app, "your rules are not being applied"));
+        let policy = app
+            .snapshot
+            .as_mut()
+            .and_then(|s| s.route_policy.as_mut())
+            .expect("route policy");
+        policy.leak_protection = LeakProtectionDto::Sites;
+        assert!(said(&app, "is being blocked"));
+
+        app.snapshot.as_mut().expect("snapshot").routing_paused = true;
+        assert!(!said(&app, "is being blocked"), "the pause owns it");
+        track_policy_idle(&mut app, Instant::now());
+        assert_eq!(app.policy_idle_since, None, "the wait starts over");
+        app.snapshot.as_mut().expect("snapshot").routing_paused = false;
+        app.link = Link::Offline;
+        assert!(!said(&app, "is being blocked"));
+    }
+
     fn shown(app: &AppState) -> Vec<String> {
         routing_lines(app, &texts_en())
             .iter()
@@ -702,9 +887,38 @@ mod tests {
         if let Some(snapshot) = app.snapshot.as_mut() {
             snapshot.kill_switch_block_all_armed = true;
         }
+        assert!(
+            !holding(&app),
+            "the catch-all over a live tunnel holds nothing back"
+        );
+        if let Some(snapshot) = app.snapshot.as_mut() {
+            snapshot.kill_switch_holding_for_outage = true;
+        }
         assert!(holding(&app), "{:?}", shown(&app));
         app.link = Link::Offline;
         assert!(!holding(&app), "a stale snapshot claims nothing");
+    }
+
+    /// Too many network filters on the machine is said with the count, while
+    /// the service says so.
+    #[test]
+    fn too_many_filters_on_the_machine_is_said_with_the_count() {
+        let mut app = app_at(Link::Connected, Some(&Fixture::healthy()));
+        let warned = |app: &AppState| {
+            shown(app)
+                .iter()
+                .any(|l| l.starts_with("Rules on this computer") && l.contains("4100 Windows"))
+        };
+        if let Some(snapshot) = app.snapshot.as_mut() {
+            snapshot.protection_filters_on_machine = 4100;
+        }
+        assert!(!warned(&app), "a count under the line is not a warning");
+        if let Some(snapshot) = app.snapshot.as_mut() {
+            snapshot.protection_filters_high = true;
+        }
+        assert!(warned(&app), "{:?}", shown(&app));
+        app.link = Link::Offline;
+        assert!(!warned(&app), "a stale snapshot claims nothing");
     }
 
     #[test]
@@ -783,12 +997,12 @@ mod tests {
         assert!(lines.iter().any(|l| l.starts_with("t: ")), "{lines:?}");
 
         assert!(
-            vpn_trust::trust_pending(&mut app),
+            vpn_trust::trust_first(&mut app, false),
             "t sends the confirmation"
         );
         assert!(app.vpn_trust.busy);
         assert!(
-            !vpn_trust::trust_pending(&mut app),
+            !vpn_trust::trust_first(&mut app, false),
             "a second press while the write is in flight does nothing"
         );
         assert_eq!(app.outbox.take().len(), 1);
@@ -824,7 +1038,7 @@ mod tests {
         assert!(StatusScreen.on_key(&mut app, a), "a sends the answer");
         assert!(app.vpn_gateway_trust.busy);
         assert!(
-            !vpn_gateway_trust::allow_pending(&mut app),
+            !vpn_gateway_trust::allow_first(&mut app),
             "a second press while the write is in flight does nothing"
         );
         assert_eq!(app.outbox.take().len(), 1);

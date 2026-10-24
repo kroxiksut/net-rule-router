@@ -298,6 +298,9 @@ pub(crate) fn build_ipc_surface(
     block_notice_journal: Arc<
         dyn nrr_service_runtime::block_notice_journal_store::BlockNoticeJournalStore,
     >,
+    // Whether the guard holds a user's traffic, so "check site" sends nothing
+    // in their place.
+    site_check_traffic_held: Option<nrr_service_runtime::site_check::TrafficHeld>,
 ) -> IpcSurface {
     // Cloned before the facade takes ownership: storage usage counts the same
     // log directory the diagnostics reader serves from, and on Linux that lives
@@ -391,7 +394,15 @@ pub(crate) fn build_ipc_surface(
             Arc::new(CyclePauseDispatcher {
                 cycle: Arc::clone(&cycle),
             }),
-            Arc::new(NoopRoutingPauseAudit),
+            match audit_writer.as_ref() {
+                Some(writer) => Arc::new(
+                    nrr_service_runtime::production_routing_pause_audit::ProductionRoutingPauseAudit::new(
+                        Arc::clone(writer),
+                        Arc::new(ProductionIdGenerator::new()),
+                    ),
+                ) as Arc<dyn nrr_service_runtime::RoutingPauseAudit>,
+                None => Arc::new(NoopRoutingPauseAudit),
+            },
             Arc::new(nrr_service_runtime::production_settings::SystemClock),
         )
         .with_presence_source(Arc::new(LogindActivePrincipals)),
@@ -483,10 +494,17 @@ pub(crate) fn build_ipc_surface(
             Arc::clone(&coordinator),
             Arc::clone(&state_conn),
         )),
-        Arc::new(MonitoredAdaptersSnapshotProvider::new(
-            route_table,
-            Arc::new(nrr_platform_linux::interface_rows::LinuxInterfaceRows),
-        )),
+        Arc::new(
+            MonitoredAdaptersSnapshotProvider::new(
+                route_table,
+                Arc::new(nrr_platform_linux::interface_rows::LinuxInterfaceRows),
+            )
+            .with_caller_bindings(
+                nrr_service_runtime::production_handlers_misc::stored_caller_bindings(Arc::clone(
+                    &state_conn,
+                )),
+            ),
+        ),
         Arc::new(
             ProductionRulesSnapshotProvider::new(Arc::clone(&state_conn))
                 .with_main_route_verdicts(Arc::clone(&main_route_verdicts)),
@@ -736,6 +754,7 @@ pub(crate) fn build_ipc_surface(
                 Arc::clone(&probe_route_table),
                 Arc::clone(&conn_trace_ring),
                 deps.diagnostics.clone(),
+                site_check_traffic_held,
             );
             let runner = main_link_probe(
                 Arc::clone(&engine),
@@ -911,6 +930,15 @@ fn main_link_probe(
                 nrr_service_runtime::production_rules_provider::include_subdomains_for(&guard, sid)
             })
         },
+        keeps_names_off_main: {
+            let conn = Arc::clone(&state_conn);
+            Arc::new(move |sid: &str| {
+                let guard = conn.lock().unwrap_or_else(|p| p.into_inner());
+                nrr_service_runtime::production_rules_provider::keeps_names_off_main_for(
+                    &guard, sid,
+                )
+            })
+        },
         reapply: Some(reapply),
     });
     // The user's own bounds, clamped by `ProbeLimits::new`.
@@ -961,6 +989,7 @@ fn site_check(
     route_table: Arc<dyn nrr_platform_api::route_table::RouteTablePort>,
     trace: Arc<nrr_service_runtime::conn_observation_consumer::ConnectionTraceRing>,
     diagnostics: Arc<dyn nrr_diagnostics::facade::service::DiagnosticsFacade>,
+    traffic_held: Option<nrr_service_runtime::site_check::TrafficHeld>,
 ) -> Arc<nrr_service_runtime::site_check::SiteChecker> {
     use nrr_service_runtime::site_check::{ExplainRoutes, SiteCheckWiring, SiteChecker};
 
@@ -983,6 +1012,7 @@ fn site_check(
             LinkBoundPathProbe,
         ))
         .map(|h| Arc::new(h) as Arc<dyn nrr_service_runtime::site_check::HttpsHead>),
+        traffic_held,
     }))
 }
 

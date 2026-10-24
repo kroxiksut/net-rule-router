@@ -122,6 +122,7 @@ fn fresh_deps() -> SupervisedRuntimeDeps {
         sign_in_gate: None,
         fake_ip_shutdown: None,
         conn_observer_shutdown: None,
+        dns_redirect_release: None,
         event_bus: None,
         network_change_observer: None,
         secondary_liveness_hook: None,
@@ -900,6 +901,64 @@ fn a_graceful_stop_writes_the_last_minute_of_connection_history() {
     assert_eq!(reader.read(&read, AT).expect("read").0.len(), 1);
 }
 
+/// A stop step that hangs, a resolver that never let go of its redirect:
+/// the system DNS is still handed back before SCM is told `Stopped`.
+#[test]
+fn the_system_dns_is_handed_back_before_stopped_even_after_a_hung_step() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    struct ReleaseProbe {
+        released: Arc<AtomicBool>,
+        released_at_stopped: Mutex<Option<bool>>,
+    }
+    impl ServiceController for ReleaseProbe {
+        fn report(&self, state: ServiceRuntimeState) {
+            if state == ServiceRuntimeState::Stopped {
+                *self
+                    .released_at_stopped
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner()) =
+                    Some(self.released.load(Ordering::SeqCst));
+            }
+        }
+    }
+    let stop = StopToken::new();
+    let stop_clone = stop.clone();
+    let join = std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(150));
+        stop_clone.request_stop();
+    });
+    let dir = tempfile::tempdir().expect("tempdir");
+    let cfg = BootstrapConfig::new(StorageProfile::TestTemp(dir.path().to_path_buf()));
+    let artifacts = bootstrap(&cfg);
+    let released = Arc::new(AtomicBool::new(false));
+    let mut deps = fresh_deps();
+    // Never returns: the step's budget ends it, not the step.
+    deps.fake_ip_shutdown = Some(Arc::new(|| loop {
+        std::thread::park();
+    }));
+    deps.dns_redirect_release = Some({
+        let released = Arc::clone(&released);
+        Arc::new(move || {
+            released.store(true, Ordering::SeqCst);
+            true
+        })
+    });
+    let probe = ReleaseProbe {
+        released,
+        released_at_stopped: Mutex::new(None),
+    };
+    run_supervised_runtime(&probe, &stop, artifacts, deps);
+    join.join().unwrap();
+    assert_eq!(
+        *probe
+            .released_at_stopped
+            .lock()
+            .unwrap_or_else(|p| p.into_inner()),
+        Some(true),
+        "the stop ended with the system DNS still pointed at us"
+    );
+}
+
 /// The clean-stop mark is on disk before SCM is told `Stopped`, so a process
 /// killed right after the report still counts as a clean stop.
 #[test]
@@ -1031,4 +1090,67 @@ fn a_saved_accept_policy_sets_the_delays_between_rebinds() {
             "restart {attempt} came after {gap:?}, before {floor:?}"
         );
     }
+}
+
+/// A teardown that never ends no longer claims progress past the hard limit:
+/// the re-reports stop, and the limit says the stop overran.
+#[test]
+fn stop_progress_stops_rising_at_the_hard_limit() {
+    let controller = RecordingController::default();
+    let never_done = AtomicBool::new(false);
+    let began = std::time::Instant::now();
+    let overran = report_stop_progress(
+        &controller,
+        &never_done,
+        Duration::from_millis(20),
+        Duration::from_millis(5),
+        Duration::from_millis(200),
+    );
+    assert!(overran);
+    assert!(began.elapsed() < Duration::from_secs(5));
+    let reported = controller.states().len();
+    assert!(reported > 0, "progress was reported before the limit");
+    std::thread::sleep(Duration::from_millis(100));
+    assert_eq!(
+        controller.states().len(),
+        reported,
+        "nothing after the limit"
+    );
+
+    let done = AtomicBool::new(true);
+    assert!(!report_stop_progress(
+        &controller,
+        &done,
+        Duration::from_millis(20),
+        Duration::from_millis(5),
+        Duration::from_millis(200),
+    ));
+}
+
+/// A route teardown wedged on a lock nobody frees costs the stop its budget
+/// and no more; one that finishes is reported as finished.
+#[test]
+fn a_wedged_route_teardown_costs_the_stop_its_budget() {
+    let jammed = Arc::new(Mutex::new(()));
+    let held = jammed.lock().unwrap_or_else(|p| p.into_inner());
+    let wedged: RouteRecomputeHook = {
+        let jammed = Arc::clone(&jammed);
+        Arc::new(move || {
+            let _never = jammed.lock();
+        })
+    };
+    let began = std::time::Instant::now();
+    assert!(!run_route_teardown(&wedged, Duration::from_millis(100)));
+    assert!(began.elapsed() < Duration::from_secs(5));
+    drop(held);
+
+    let ran = Arc::new(AtomicUsize::new(0));
+    let prompt: RouteRecomputeHook = {
+        let ran = Arc::clone(&ran);
+        Arc::new(move || {
+            ran.fetch_add(1, Ordering::SeqCst);
+        })
+    };
+    assert!(run_route_teardown(&prompt, Duration::from_secs(5)));
+    assert_eq!(ran.load(Ordering::SeqCst), 1);
 }

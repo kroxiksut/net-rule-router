@@ -178,6 +178,7 @@ mod tests {
             engine: None,
             trace: None,
             https: None,
+            traffic_held: None,
         }))
     }
 

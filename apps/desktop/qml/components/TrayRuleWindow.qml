@@ -491,7 +491,7 @@ ApplicationWindow {
         }
         trayHost.boundFileWriter.mirrorServiceIntoFiles()
         trayHost.noteAddRuleOutcome(plan.bulk === true ? _bulkOutcomeText(plan) : _outcomeText(plan),
-            Rules.additionUndoRecord(plan))
+            Rules.additionUndoRecord(plan), _awaitsConfirmation(plan))
         _state = ""
         // Lines a pasted list left behind come back into the form to be fixed.
         if (plan.bulk === true && _bulkRemaining !== "" && visible) {
@@ -513,6 +513,18 @@ ApplicationWindow {
                 .replace("{count}", String(plan.changed)))
         }
         return parts.join(" ")
+    }
+
+    /// A program added with `+override` is held by the protection of system
+    /// programs until the user confirms it in the window's rules list.
+    function _awaitsConfirmation(plan) {
+        var rows = plan.addedRows || []
+        for (var i = 0; i < rows.length; i += 1) {
+            if (rows[i].enabled !== false
+                    && Rules.ruleValueAsksOverride(rows[i].ruleType, rows[i].matchValue))
+                return true
+        }
+        return false
     }
 
     function _outcomeText(plan) {
@@ -555,6 +567,9 @@ ApplicationWindow {
         } else if (plan.added > 0) {
             template = toDeny
                 ? tr("tray.add-rule.added-deny", "Rule added: {value} denied.")
+                : _awaitsConfirmation(plan)
+                ? tr("tray.add-rule.added-awaits-confirmation",
+                    "Rule added: {value} → {route}. It is not applied yet: the protection of system programs holds it until you confirm it in the rules list.")
                 : tr("tray.add-rule.added", "Rule added: {value} → {route}")
         } else {
             template = toDeny

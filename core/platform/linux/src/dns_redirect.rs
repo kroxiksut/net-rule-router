@@ -89,6 +89,8 @@ pub struct DnsFiles {
     /// resolved's stub file: where a `resolv.conf` of ours goes back to when
     /// the saved system copy is lost.
     pub resolved_stub: PathBuf,
+    /// Says whether glibc asks resolved (`resolve` on the `hosts:` line).
+    pub nsswitch_conf: PathBuf,
 }
 
 impl DnsFiles {
@@ -99,6 +101,7 @@ impl DnsFiles {
             nm_conf_dir: PathBuf::from("/run/NetworkManager/conf.d"),
             resolvconf_record_dirs: resolvconf::system_record_dirs(),
             resolved_stub: PathBuf::from("/run/systemd/resolve/stub-resolv.conf"),
+            nsswitch_conf: PathBuf::from("/etc/nsswitch.conf"),
         }
     }
 
@@ -241,9 +244,8 @@ pub fn parse_resolvectl_links(text: &str) -> Vec<ResolvedLink> {
         .collect()
 }
 
-/// Does resolved stand between programs and DNS? Only in `stub` and `static`
-/// mode does `/etc/resolv.conf` point at resolved; in `uplink` and `foreign`
-/// mode programs ask the servers directly and a redirect would catch nothing.
+/// Does `/etc/resolv.conf` point programs at resolved? Only in `stub` and
+/// `static` mode; in `uplink` and `foreign` mode it names the servers.
 pub fn resolved_mode_carries_programs(status_output: &str) -> bool {
     status_output.lines().any(|line| {
         line.trim()
@@ -252,19 +254,40 @@ pub fn resolved_mode_carries_programs(status_output: &str) -> bool {
     })
 }
 
-/// Can this machine's DNS be redirected through resolved?
-pub fn resolved_redirect_available(commands: &dyn DnsCommands) -> bool {
-    resolved_carries_programs(commands) == Some(true)
+/// Does glibc ask resolved first? `resolve` among the sources of the `hosts:`
+/// line is nss-resolve: every glibc program then asks resolved over its own
+/// channel, whatever `resolv.conf` says, and never reads that file.
+pub fn nsswitch_hosts_ask_resolved(nsswitch: &str) -> bool {
+    nsswitch
+        .lines()
+        .map(|line| line.split('#').next().unwrap_or("").trim())
+        .find_map(|line| line.strip_prefix("hosts:"))
+        .is_some_and(|sources| {
+            sources
+                .split_whitespace()
+                .filter(|source| !source.starts_with('['))
+                .any(|source| source == "resolve")
+        })
 }
 
-/// Whether resolved stands between programs and DNS; `None` when resolved
-/// does not answer — not installed, or not started yet.
-fn resolved_carries_programs(commands: &dyn DnsCommands) -> Option<bool> {
-    commands
+/// Can this machine's DNS be redirected through resolved?
+pub fn resolved_redirect_available(commands: &dyn DnsCommands, files: &DnsFiles) -> bool {
+    resolved_carries_programs(commands, files) == Some(true)
+}
+
+/// Whether resolved stands between programs and DNS — through `resolv.conf`
+/// or through nss-resolve; `None` when resolved does not answer (not
+/// installed, or not started yet).
+fn resolved_carries_programs(commands: &dyn DnsCommands, files: &DnsFiles) -> Option<bool> {
+    let status = commands
         .run("resolvectl", &["status"])
         .ok()
-        .filter(|reply| reply.success)
-        .map(|reply| resolved_mode_carries_programs(&reply.stdout))
+        .filter(|reply| reply.success)?;
+    Some(
+        resolved_mode_carries_programs(&status.stdout)
+            || std::fs::read_to_string(&files.nsswitch_conf)
+                .is_ok_and(|text| nsswitch_hosts_ask_resolved(&text)),
+    )
 }
 
 /// Does `resolv.conf` send programs to resolved's stub? The file says so

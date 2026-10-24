@@ -33,6 +33,42 @@ pub fn on_attached_segment(ip: IpAddr, v4: &[(Ipv4Addr, u8)], v6: &[(Ipv6Addr, u
     }
 }
 
+/// Addresses a name under a rule never pulls into the tunnel, on either OS.
+///
+/// The tunnel's own servers: a pin or a route there seals its reconnect. The
+/// main link's resolvers: pinned, the machine's DNS dies the moment the tunnel
+/// drops — unless a rule names the address itself, which is the user's call.
+/// An answer from somebody else's server under a zone rule could name either.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct LinkInfrastructure {
+    pub tunnel_servers: Vec<IpAddr>,
+    pub link_resolvers: Vec<IpAddr>,
+}
+
+impl LinkInfrastructure {
+    /// Whether the leak-guard leaves `ip` alone; `named_literally`: an enabled
+    /// rule of the additional route names the address itself.
+    #[must_use]
+    pub fn spares(&self, ip: IpAddr, named_literally: bool) -> bool {
+        self.tunnel_servers.contains(&ip) || (!named_literally && self.link_resolvers.contains(&ip))
+    }
+}
+
+/// Whether an enabled rule of `rules` names `ip` as a literal address.
+#[must_use]
+pub fn names_address_literally(
+    rules: &nrr_domain::canonical::CanonicalRuleSet,
+    ip: IpAddr,
+) -> bool {
+    rules.rules().iter().any(|rule| {
+        rule.enabled
+            && matches!(
+                rule.address_match,
+                Some(nrr_domain::canonical::CanonicalAddressMatch::ExactIp(named)) if named == ip
+            )
+    })
+}
+
 /// The single ALE `ip_protocol` narrowing for a mask (neutral), mirroring
 /// `KillSwitchProtocols::ale_protocol`: `None` when both or neither TCP/UDP are
 /// selected (one proto-agnostic block covers both), else the one selected.
@@ -102,20 +138,32 @@ pub fn plan_app_kill_switch(
         .take(APP_KILLSWITCH_MAX_APPS)
         .enumerate()
     {
-        flows.push(ks_flow(
-            &principal,
-            Verdict::Permit,
-            PrecedenceClass::KillSwitchPermit,
-            DstMatch::Any,
-            app_scope(pattern),
-            EgressConstraint::OnlyVia(EgressRef::Secondary),
-            None,
-            Coverage::ConnectOnly,
-            idx as u32,
-        ));
+        for dst in BOTH_FAMILIES {
+            flows.push(ks_flow(
+                &principal,
+                Verdict::Permit,
+                PrecedenceClass::KillSwitchPermit,
+                dst,
+                app_scope(pattern),
+                EgressConstraint::OnlyVia(EgressRef::Secondary),
+                None,
+                Coverage::ConnectOnly,
+                idx as u32,
+            ));
+        }
     }
     flows
 }
+
+/// Every destination of either family: `Any` lowers to the v4 layer, the
+/// v6 family catch-all `::/0` to the v6 one.
+const BOTH_FAMILIES: [DstMatch; 2] = [
+    DstMatch::Any,
+    DstMatch::SubnetV6 {
+        net: Ipv6Addr::UNSPECIFIED,
+        prefix: 0,
+    },
+];
 
 /// Plan the **primary-app kill-switch exemption** — one
 /// unconditional ALE `Permit` per app pattern in the top exempt band, so a user's
@@ -128,22 +176,34 @@ pub fn plan_app_kill_switch(
 /// band. There is no block half — this is a pure exemption.
 pub fn plan_primary_app_exempt(sid: &str, app_patterns: &[String]) -> Vec<FlowRule> {
     let principal = principal_scope(sid);
+    // Both families, as `killswitch_codegen::primary_app_exempt_filters`: the
+    // whole-v6 match is the family catch-all `::/0`.
+    let families = [
+        DstMatch::Any,
+        DstMatch::SubnetV6 {
+            net: Ipv6Addr::UNSPECIFIED,
+            prefix: 0,
+        },
+    ];
     app_patterns
         .iter()
         .take(KILLSWITCH_MAX_DESTINATIONS)
         .enumerate()
-        .map(|(idx, pattern)| {
-            ks_flow(
-                &principal,
-                Verdict::Permit,
-                PrecedenceClass::CatchAllExempt,
-                DstMatch::Any,
-                app_scope(pattern),
-                EgressConstraint::Any,
-                None,
-                Coverage::ConnectOnly,
-                idx as u32,
-            )
+        .flat_map(|(idx, pattern)| {
+            let principal = &principal;
+            families.into_iter().map(move |dst| {
+                ks_flow(
+                    principal,
+                    Verdict::Permit,
+                    PrecedenceClass::CatchAllExempt,
+                    dst,
+                    app_scope(pattern),
+                    EgressConstraint::Any,
+                    None,
+                    Coverage::ConnectOnly,
+                    idx as u32,
+                )
+            })
         })
         .collect()
 }
@@ -292,18 +352,21 @@ pub fn plan_fail_closed_apps(
         .iter()
         .take(APP_KILLSWITCH_MAX_APPS)
         .enumerate()
-        .map(|(idx, pattern)| {
-            ks_flow(
-                &principal,
-                Verdict::Block,
-                PrecedenceClass::KillSwitchBlock,
-                DstMatch::Any,
-                app_scope(pattern),
-                EgressConstraint::Any,
-                None,
-                Coverage::ConnectOnly,
-                idx as u32,
-            )
+        .flat_map(|(idx, pattern)| {
+            let principal = &principal;
+            BOTH_FAMILIES.into_iter().map(move |dst| {
+                ks_flow(
+                    principal,
+                    Verdict::Block,
+                    PrecedenceClass::KillSwitchBlock,
+                    dst,
+                    app_scope(pattern),
+                    EgressConstraint::Any,
+                    None,
+                    Coverage::ConnectOnly,
+                    idx as u32,
+                )
+            })
         })
         .collect()
 }
@@ -647,4 +710,32 @@ pub fn plan_fail_closed_block_all_with_dns(
     push_ipv6_cut(&principal, &mut flows, v6, protocols);
 
     flows
+}
+
+#[cfg(test)]
+mod link_infrastructure_tests {
+    use super::LinkInfrastructure;
+    use std::net::{IpAddr, Ipv4Addr};
+
+    const SERVER: IpAddr = IpAddr::V4(Ipv4Addr::new(203, 0, 113, 7));
+    const RESOLVER: IpAddr = IpAddr::V4(Ipv4Addr::new(198, 51, 100, 53));
+    const SITE: IpAddr = IpAddr::V4(Ipv4Addr::new(198, 51, 100, 80));
+
+    /// A name another party answers for can point at the main link's resolver;
+    /// pinned to the tunnel, the machine's DNS dies when the tunnel drops. The
+    /// user writing the address as a rule is a choice and is kept.
+    #[test]
+    fn a_resolver_is_spared_unless_a_rule_names_it_literally() {
+        let infra = LinkInfrastructure {
+            tunnel_servers: vec![SERVER],
+            link_resolvers: vec![RESOLVER],
+        };
+        assert!(infra.spares(RESOLVER, false));
+        assert!(!infra.spares(RESOLVER, true));
+        assert!(
+            infra.spares(SERVER, true),
+            "the tunnel's server, whatever names it"
+        );
+        assert!(!infra.spares(SITE, false));
+    }
 }

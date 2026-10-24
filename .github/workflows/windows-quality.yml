@@ -13,8 +13,9 @@ jobs:
   baseline:
     runs-on: windows-latest
 
-    # The Qt host is not built here (Qt is installed for qmllint only), and
-    # every step that touches cargo builds the Qt host's build script —
+    # The Qt host is not built here (Qt is installed for qmllint only; the
+    # package job builds it), and every step that touches cargo builds the
+    # Qt host's build script —
     # bootstrap runs `cargo check --workspace` before the quality gate is
     # reached. Job scope, not step scope: setting it on one step
     # only moves the failure to whichever step runs first.
@@ -70,3 +71,106 @@ jobs:
         # -RequireQmlLint: a missing qmllint here means the Qt step broke, and
         # a gate that skips QML must not pass.
         run: powershell -ExecutionPolicy Bypass -File .\scripts\check.ps1 -RequireCargoDeny -RequireQmlLint
+
+  # The `#[ignore]` tests: WFP, routes, the live machine. They need an
+  # administrator, which this runner is, and a machine nobody uses afterwards,
+  # which it also is — so they run here, never on a developer's desktop.
+  privileged:
+    runs-on: windows-latest
+
+    env:
+      NRR_SKIP_QT_HOST: "1"
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Read pinned toolchain
+        id: toolchain
+        shell: bash
+        run: echo "channel=$(grep '^channel' rust-toolchain.toml | cut -d'"' -f2)" >> "$GITHUB_OUTPUT"
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
+        with:
+          toolchain: ${{ steps.toolchain.outputs.channel }}
+          targets: x86_64-pc-windows-msvc
+
+      - name: Cache Rust artifacts
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+
+      # The same crates and thread count as `check.ps1 -IncludePrivileged`:
+      # one thread, because the tests share the machine-wide filter engine and
+      # route table. `--tests` keeps rustdoc out: under `--ignored` it would
+      # compile `ignore` doc examples. Skipped: ICMP does not leave a
+      # GitHub-hosted runner, and the pump cost is a measurement, not a check.
+      - name: Run privileged tests
+        shell: bash
+        run: >-
+          cargo test --locked -p nrr-platform-windows -p nrr-service-runtime --tests --
+          --ignored --test-threads=1
+          --skip a_hop_limit_of_one_is_answered_by_the_first_router
+          --skip the_pump_cost_at_scale
+
+  # The C++ Qt host and the whole Windows package, installers included, exactly
+  # as release.yml builds them: a script or C++ break otherwise shows only on
+  # the day of a release.
+  package:
+    runs-on: windows-2022
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Read pinned toolchain
+        id: toolchain
+        shell: bash
+        run: echo "channel=$(grep '^channel' rust-toolchain.toml | cut -d'"' -f2)" >> "$GITHUB_OUTPUT"
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
+        with:
+          toolchain: ${{ steps.toolchain.outputs.channel }}
+          targets: x86_64-pc-windows-msvc
+
+      # Unlike the release, CI may reuse a cache: nothing built here ships.
+      - name: Cache Rust artifacts
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+
+      # The documentation component carries the LGPL/GPL texts the package copies.
+      - name: Install Qt
+        uses: jurplel/install-qt-action@a9c63c7c123f3069cff414e7e482d95dfa9d8125 # v4.4.1
+        with:
+          version: "6.8.3"
+          host: windows
+          arch: win64_msvc2022_64
+          documentation: true
+          doc-archives: qtdoc
+          cache: true
+
+      - name: Point the Qt host at Qt
+        shell: bash
+        run: echo "CMAKE_PREFIX_PATH=$QT_ROOT_DIR" >> "$GITHUB_ENV"
+
+      # Same pinned versions as release.yml.
+      - name: Install installer tools
+        shell: pwsh
+        run: |
+          choco install innosetup --version 6.7.3 --no-progress -y
+          dotnet tool install --global wix --version 5.0.2
+          wix extension add -g WixToolset.Util.wixext/5.0.2
+          wix extension add -g WixToolset.UI.wixext/5.0.2
+
+      - name: Package
+        shell: pwsh
+        run: |
+          powershell -ExecutionPolicy Bypass -File .\scripts\package-windows.ps1 `
+            -Arch x64 -OutputRoot "$env:RUNNER_TEMP\dist" -Zip -Installers -Force
+
+      # The MSI is unpacked (msiexec /a), never installed: the service would
+      # change the runner's own network.
+      - name: Check the package contents
+        shell: pwsh
+        run: |
+          powershell -ExecutionPolicy Bypass -File .\scripts\check-windows-package.ps1 `
+            -Dist "$env:RUNNER_TEMP\dist" -Variant full

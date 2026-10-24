@@ -52,7 +52,8 @@ fn phy_device_delivers_an_ingested_packet_once() {
     let mut phy = TunPhyDevice::new(device);
     assert_eq!(phy.mtu(), TunAdapterConfig::default().mtu);
 
-    phy.ingest(vec![0x45, 0x00, 0x00, 0x14]);
+    let mut packet = vec![0x45, 0x00, 0x00, 0x14];
+    phy.ingest(&mut packet, 4);
     let now = SmolInstant::from_millis(0);
     let received = phy.receive(now);
     assert!(received.is_some(), "pending packet is delivered");
@@ -62,6 +63,51 @@ fn phy_device_delivers_an_ingested_packet_once() {
     assert!(
         phy.receive(now).is_none(),
         "the lookahead holds exactly one packet"
+    );
+}
+
+#[test]
+fn phy_ingest_swaps_buffers_and_delivers_only_the_packet_length() {
+    let (device, _state) = open_mock_device();
+    let mut phy = TunPhyDevice::new(device);
+    let now = SmolInstant::from_millis(0);
+
+    let mut first = vec![1, 2, 3, 0, 0, 0];
+    let first_storage = first.as_ptr();
+    phy.ingest(&mut first, 3);
+    assert!(
+        first.is_empty(),
+        "the reader gets the device's spare buffer"
+    );
+    let (rx, _tx) = phy.receive(now).expect("first packet");
+    rx.consume(|bytes| assert_eq!(bytes, &[1, 2, 3]));
+
+    let mut second = vec![7, 8, 0, 0, 0, 0];
+    phy.ingest(&mut second, 2);
+    assert_eq!(
+        second.as_ptr(),
+        first_storage,
+        "the first packet's buffer comes back for the next read, no allocation"
+    );
+    let (rx, _tx) = phy.receive(now).expect("second packet");
+    rx.consume(|bytes| assert_eq!(bytes, &[7, 8]));
+}
+
+#[test]
+fn phy_transmit_reuses_a_zeroed_scratch_buffer() {
+    let (device, state) = open_mock_device();
+    let mut phy = TunPhyDevice::new(device);
+    let now = SmolInstant::from_millis(0);
+    phy.transmit(now)
+        .expect("tx token")
+        .consume(4, |buf| buf.copy_from_slice(&[9, 9, 9, 9]));
+    phy.transmit(now)
+        .expect("tx token")
+        .consume(4, |buf| buf[0] = 1);
+    assert_eq!(
+        state.written_packets(),
+        vec![vec![9, 9, 9, 9], vec![1, 0, 0, 0]],
+        "a short write never resends the previous packet's bytes"
     );
 }
 
@@ -159,6 +205,115 @@ fn upstream_reader_survives_timeouts_and_exits_on_dead() {
             worker.is_finished(),
             "workers must exit promptly once the flow is dead"
         );
+        let _ = worker.join();
+    }
+}
+
+/// A write the server never takes (a tunnel that died, a server that reset
+/// the connection the client is still writing on) reaches the client as a
+/// reset. Before, the flow went dead with no verdict and the client's
+/// connection hung until the program itself gave up.
+#[test]
+fn a_failed_upstream_write_resets_the_client() {
+    use crate::fake_ip::RelayWriteHalf;
+    use std::io;
+    use std::io::{Read, Write};
+
+    struct SilentReader;
+    impl Read for SilentReader {
+        fn read(&mut self, _buf: &mut [u8]) -> io::Result<usize> {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            Err(io::Error::from(io::ErrorKind::TimedOut))
+        }
+    }
+    struct RefusingWriter;
+    impl Write for RefusingWriter {
+        fn write(&mut self, _buf: &[u8]) -> io::Result<usize> {
+            Err(io::Error::from(io::ErrorKind::ConnectionReset))
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+    impl RelayWriteHalf for RefusingWriter {
+        fn shutdown_write(&mut self) -> Result<(), RelayError> {
+            Ok(())
+        }
+    }
+
+    let shared = FlowShared::new(StackWaker::new());
+    let workers = spawn_upstream_workers(
+        Arc::clone(&shared),
+        RelaySplit {
+            reader: Box::new(SilentReader),
+            writer: Box::new(RefusingWriter),
+        },
+    )
+    .expect("spawn workers");
+    shared.push_to_upstream(b"GET / HTTP/1.1\r\n\r\n");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while !shared.upstream_was_reset() && std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    assert!(shared.upstream_was_reset(), "the client must be reset");
+    shared.mark_dead();
+    for worker in workers {
+        let _ = worker.join();
+    }
+}
+
+/// Uploading faster than the tunnel takes it fills the client queue, and a
+/// full queue stops the loop reading the client, whose window then closes.
+/// The writer emptying it is the one event that can reopen it, so it wakes the
+/// loop; before, the next sweep did, a second later, and upload through the
+/// tunnel crawled at one queue a second.
+#[test]
+fn the_writer_wakes_the_loop_when_it_empties_a_full_queue() {
+    use crate::fake_ip::RelayWriteHalf;
+    use std::io;
+    use std::io::{Read, Write};
+
+    struct SilentReader;
+    impl Read for SilentReader {
+        fn read(&mut self, _buf: &mut [u8]) -> io::Result<usize> {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            Err(io::Error::from(io::ErrorKind::TimedOut))
+        }
+    }
+    struct SinkWriter;
+    impl Write for SinkWriter {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+    impl RelayWriteHalf for SinkWriter {
+        fn shutdown_write(&mut self) -> Result<(), RelayError> {
+            Ok(())
+        }
+    }
+
+    let waker = StackWaker::new();
+    let shared = FlowShared::new(Arc::clone(&waker));
+    let workers = spawn_upstream_workers(
+        Arc::clone(&shared),
+        RelaySplit {
+            reader: Box::new(SilentReader),
+            writer: Box::new(SinkWriter),
+        },
+    )
+    .expect("spawn workers");
+    shared.push_to_upstream(&vec![0u8; FLOW_QUEUE_HIGH_WATER_BYTES]);
+    let started = std::time::Instant::now();
+    waker.wait(std::time::Duration::from_millis(800));
+    assert!(
+        started.elapsed() < std::time::Duration::from_millis(400),
+        "the loop must be woken, not left to its sweep"
+    );
+    shared.mark_dead();
+    for worker in workers {
         let _ = worker.join();
     }
 }
@@ -280,6 +435,68 @@ fn at_capacity_a_new_syn_is_refused_and_live_flows_are_kept() {
         before.iter().all(|key| stack.flows.contains_key(key)),
         "no live flow may be evicted to make room"
     );
+}
+
+/// A page opening connection after connection to subdomains of one name
+/// cannot take the whole relay: past its share that site alone is refused, and
+/// another site still gets a flow.
+#[test]
+fn one_site_cannot_take_the_whole_relay() {
+    use nrr_platform_api::fake_ip::{FakeIpAllocator, FakeIpScope};
+    const CAP: usize = 8;
+
+    let health = Arc::new(super::super::health::FakeIpHealth::new());
+    let mut allocator = FakeIpAllocator::default();
+    let flood_a = allocator.allocate("ws1.flood.test").expect("allocate").v4;
+    let flood_b = allocator.allocate("ws2.flood.test").expect("allocate").v4;
+    let other = allocator.allocate("mail.example").expect("allocate").v4;
+    let upstream = std::net::IpAddr::V4(std::net::Ipv4Addr::new(203, 0, 113, 9));
+    let relay = RelayCore::new(
+        Arc::new(std::sync::Mutex::new(allocator)),
+        FakeIpScope::enabled(Vec::<String>::new()),
+        Arc::new(
+            super::super::relay::StaticUpstreamResolver::new()
+                .with("ws1.flood.test", &[upstream])
+                .with("ws2.flood.test", &[upstream])
+                .with("mail.example", &[upstream]),
+        ),
+        Arc::new(super::super::relay::FixedRouteSelector(
+            nrr_shared::RouteRole::Primary,
+        )),
+    );
+    let (device, _state) = open_mock_device();
+    let mut stack = FakeIpStack::new(
+        device,
+        &FakeIpPoolConfig::default(),
+        relay,
+        Arc::new(super::super::dialer::MockRelayDialer::new()),
+        StackWaker::new(),
+    )
+    .with_health(Arc::clone(&health))
+    .with_socket_buffer_bytes(1024)
+    .with_max_flows(CAP);
+
+    let syn = |to: std::net::Ipv4Addr, port: u16| ParsedPacket {
+        key: FlowKey {
+            protocol: FlowProtocol::Tcp,
+            source: SocketAddr::from((std::net::Ipv4Addr::new(10, 0, 0, 1), port)),
+            destination: SocketAddr::from((to, 443)),
+        },
+        is_connection_open: true,
+        payload_offset: 0,
+    };
+    for port in 0..CAP as u16 {
+        let to = if port % 2 == 0 { flood_a } else { flood_b };
+        stack.maybe_open_flow(&syn(to, 40_000 + port), 0);
+    }
+    assert_eq!(
+        stack.flows.len(),
+        6,
+        "the flooding site holds three quarters"
+    );
+    assert!(health.tcp_flows_refused_at_capacity() >= 1);
+    stack.maybe_open_flow(&syn(other, 50_000), 1_000);
+    assert_eq!(stack.flows.len(), 7, "another site still gets a flow");
 }
 
 #[test]
@@ -616,6 +833,7 @@ mod echo_relay;
 mod end_to_end;
 mod hostile_peer;
 mod instant_rst;
+mod policy_recheck;
 mod poll_cost;
 mod port_unreachable;
 mod udp_dial;

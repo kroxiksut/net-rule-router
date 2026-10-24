@@ -245,7 +245,7 @@ QtObject {
                     "Leak protection: everything. If the additional connection drops, the internet waits until it returns.")
                 : level === "sites"
                     ? root.tr("status.leak-protection-sites",
-                        "Leak protection: routed sites. What your rules send through the additional connection never goes out the main one.")
+                        "Leak protection: routed sites. What your rules send through the additional connection never goes out the main one while strict blocking of shared addresses is on.")
                     : root.tr("status.leak-protection-off",
                         "Leak protection is off. If the additional connection drops, traffic continues over your main connection."),
             uac: root.tr("status.kill-switch-uac-declined",
@@ -633,7 +633,7 @@ QtObject {
         }, {
             ok: wantAuto
                 ? root.tr("status.doh-lockdown-auto",
-                    "Browser DoH/DoT blocking now decides itself: on while you have rules for the additional route.")
+                    "Browser DoH/DoT blocking now decides itself: on while your rules need to see site names.")
                 : want
                     ? root.tr("status.doh-lockdown-on",
                         "Browser DoH/DoT blocking enabled: DNS falls back to plaintext so routed sites are seen.")
@@ -645,7 +645,7 @@ QtObject {
                 "Could not update DoH/DoT blocking: ")
         })
     }
-    /// "Allow name resolution over the main connection while blocked" (leak
+    /// "While everything is held, look up site names over the main connection" (leak
     /// protection = everything, additional connection down). ON (default) keeps
     /// DNS working over the main link; OFF cuts it too, a total blackout in
     /// which the FQDN cache can never fill.

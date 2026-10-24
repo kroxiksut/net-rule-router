@@ -99,9 +99,10 @@ pub struct StallReport {
     pub completions: u32,
 }
 
-/// Per-host outcomes on the main link.
+/// Per-host outcomes on the main link, kept per owner: what one user's
+/// connections showed never reads as evidence about another's.
 pub struct PrimaryStallRegistry {
-    hosts: Mutex<HashMap<String, Tally>>,
+    hosts: Mutex<HashMap<(String, String), Tally>>,
     ttl: Duration,
     cap: usize,
 }
@@ -134,26 +135,32 @@ impl PrimaryStallRegistry {
     /// Record one outcome. Returns a report ONLY when the host's verdict just
     /// changed — steady state is silent by construction, so a caller that logs
     /// every report cannot flood.
-    pub fn note(&self, hostname: &str, event: PrimaryHealthEvent) -> Option<StallReport> {
-        self.note_at(hostname, event, Instant::now())
+    pub fn note(
+        &self,
+        owner: &str,
+        hostname: &str,
+        event: PrimaryHealthEvent,
+    ) -> Option<StallReport> {
+        self.note_at(owner, hostname, event, Instant::now())
     }
 
     /// [`Self::note`] with the clock supplied, so ageing is testable without
     /// sleeping.
     pub fn note_at(
         &self,
+        owner: &str,
         hostname: &str,
         event: PrimaryHealthEvent,
         now: Instant,
     ) -> Option<StallReport> {
-        if hostname.is_empty() {
+        if owner.is_empty() || hostname.is_empty() {
             return None;
         }
         let mut hosts = self.hosts.lock().unwrap_or_else(|p| p.into_inner());
         Self::expire(&mut hosts, now, self.ttl);
 
         let entry = hosts
-            .entry(hostname.to_string())
+            .entry((owner.to_string(), hostname.to_string()))
             .or_insert_with(|| Tally::new(now));
         // An entry that sat out the window starts over: its counts describe a
         // path the provider has since re-pointed.
@@ -188,11 +195,11 @@ impl PrimaryStallRegistry {
     /// Current verdict for a host, for a caller that wants to ask rather than
     /// be told. `Unknown` for anything not remembered.
     #[must_use]
-    pub fn behavior_of(&self, hostname: &str) -> PrimaryBehavior {
+    pub fn behavior_of(&self, owner: &str, hostname: &str) -> PrimaryBehavior {
         self.hosts
             .lock()
             .unwrap_or_else(|p| p.into_inner())
-            .get(hostname)
+            .get(&(owner.to_string(), hostname.to_string()))
             .map_or(PrimaryBehavior::Unknown, Tally::behavior)
     }
 
@@ -209,13 +216,13 @@ impl PrimaryStallRegistry {
     /// A member that completed anything counts as working (see
     /// `Tally::subtree_behavior`).
     #[must_use]
-    pub fn behavior_of_subtree(&self, hostname: &str) -> PrimaryBehavior {
+    pub fn behavior_of_subtree(&self, owner: &str, hostname: &str) -> PrimaryBehavior {
         let suffix = format!(".{hostname}");
         self.hosts
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .iter()
-            .filter(|(host, _)| *host == hostname || host.ends_with(&suffix))
+            .filter(|((o, host), _)| o == owner && (host == hostname || host.ends_with(&suffix)))
             .map(|(_, tally)| tally.subtree_behavior())
             .fold(PrimaryBehavior::Unknown, PrimaryBehavior::merge)
     }
@@ -223,11 +230,12 @@ impl PrimaryStallRegistry {
     /// Hosts currently judged to stall, newest sighting first. The diagnostic
     /// answer to "what is not opening right now".
     #[must_use]
-    pub fn stalling(&self) -> Vec<String> {
+    pub fn stalling(&self, owner: &str) -> Vec<String> {
         let hosts = self.hosts.lock().unwrap_or_else(|p| p.into_inner());
         let mut rows: Vec<(&String, &Tally)> = hosts
             .iter()
-            .filter(|(_, t)| t.behavior() == PrimaryBehavior::Stalls)
+            .filter(|((o, _), t)| o == owner && t.behavior() == PrimaryBehavior::Stalls)
+            .map(|((_, h), t)| (h, t))
             .collect();
         rows.sort_by(|a, b| b.1.last_seen.cmp(&a.1.last_seen));
         rows.into_iter().map(|(h, _)| h.clone()).collect()
@@ -243,16 +251,16 @@ impl PrimaryStallRegistry {
         self.len() == 0
     }
 
-    fn expire(hosts: &mut HashMap<String, Tally>, now: Instant, ttl: Duration) {
+    fn expire(hosts: &mut HashMap<(String, String), Tally>, now: Instant, ttl: Duration) {
         hosts.retain(|_, t| now.saturating_duration_since(t.last_seen) < ttl);
     }
 
-    fn evict_to_cap(hosts: &mut HashMap<String, Tally>, cap: usize) {
+    fn evict_to_cap(hosts: &mut HashMap<(String, String), Tally>, cap: usize) {
         while hosts.len() > cap {
             let Some(oldest) = hosts
                 .iter()
                 .min_by_key(|(_, t)| t.last_seen)
-                .map(|(h, _)| h.clone())
+                .map(|(k, _)| k.clone())
             else {
                 return;
             };
@@ -311,12 +319,40 @@ pub fn global_primary_stalls() -> std::sync::Arc<PrimaryStallRegistry> {
 mod tests {
     use super::*;
 
+    const A: &str = "S-1-5-21-1-2-3-1001";
+    const B: &str = "S-1-5-21-1-2-3-1002";
+
     fn stall(reg: &PrimaryStallRegistry, host: &str, times: u32) -> Option<StallReport> {
         let mut last = None;
         for _ in 0..times {
-            last = reg.note(host, PrimaryHealthEvent::Stalled);
+            last = reg.note(A, host, PrimaryHealthEvent::Stalled);
         }
         last
+    }
+
+    /// Two users, one host. B's completed connection is not what withdraws
+    /// A's "stalls" verdict, and A's stalls are not B's evidence.
+    #[test]
+    fn one_users_outcomes_are_not_another_users_verdict() {
+        let reg = PrimaryStallRegistry::new();
+        stall(&reg, "host.example", 3).expect("A's verdict");
+        assert!(reg
+            .note(B, "host.example", PrimaryHealthEvent::Completed)
+            .is_some_and(|r| r.behavior == PrimaryBehavior::Responds));
+        assert_eq!(reg.behavior_of(A, "host.example"), PrimaryBehavior::Stalls);
+        assert_eq!(
+            reg.behavior_of_subtree(A, "example"),
+            PrimaryBehavior::Stalls
+        );
+        assert_eq!(
+            reg.behavior_of(B, "host.example"),
+            PrimaryBehavior::Responds
+        );
+        assert_eq!(reg.stalling(A), vec!["host.example".to_string()]);
+        assert!(reg.stalling(B).is_empty());
+        assert!(reg
+            .note("", "host.example", PrimaryHealthEvent::Stalled)
+            .is_none());
     }
 
     #[test]
@@ -331,7 +367,7 @@ mod tests {
         let report = stall(&reg, "translate.example.ru", 1).expect("the third confirms it");
         assert_eq!(report.behavior, PrimaryBehavior::Stalls);
         assert_eq!(report.stalls, 3);
-        assert_eq!(reg.stalling(), vec!["translate.example.ru".to_string()]);
+        assert_eq!(reg.stalling(A), vec!["translate.example.ru".to_string()]);
     }
 
     #[test]
@@ -342,7 +378,7 @@ mod tests {
         stall(&reg, "host.example", 3).expect("first verdict");
         for _ in 0..50 {
             assert!(
-                reg.note("host.example", PrimaryHealthEvent::Stalled)
+                reg.note(A, "host.example", PrimaryHealthEvent::Stalled)
                     .is_none(),
                 "the same verdict must not be re-reported"
             );
@@ -357,7 +393,7 @@ mod tests {
         stall(&reg, "host.example", 3).expect("stalls");
         // A completion alone leaves the evidence pointing both ways.
         let mixed = reg
-            .note("host.example", PrimaryHealthEvent::Completed)
+            .note(A, "host.example", PrimaryHealthEvent::Completed)
             .expect("verdict changed");
         assert_eq!(mixed.behavior, PrimaryBehavior::Unknown);
     }
@@ -370,14 +406,17 @@ mod tests {
         let reg = PrimaryStallRegistry::new();
         stall(&reg, "img.cdn.example", 3).expect("stalls");
         assert_eq!(
-            reg.behavior_of_subtree("cdn.example"),
+            reg.behavior_of_subtree(A, "cdn.example"),
             PrimaryBehavior::Stalls
         );
 
-        reg.note("img.cdn.example", PrimaryHealthEvent::Completed);
-        assert_eq!(reg.behavior_of("img.cdn.example"), PrimaryBehavior::Unknown);
+        reg.note(A, "img.cdn.example", PrimaryHealthEvent::Completed);
         assert_eq!(
-            reg.behavior_of_subtree("cdn.example"),
+            reg.behavior_of(A, "img.cdn.example"),
+            PrimaryBehavior::Unknown
+        );
+        assert_eq!(
+            reg.behavior_of_subtree(A, "cdn.example"),
             PrimaryBehavior::Responds
         );
     }
@@ -389,26 +428,29 @@ mod tests {
     #[test]
     fn a_domain_is_judged_by_everything_under_it() {
         let reg = PrimaryStallRegistry::new();
-        reg.note("talk.example", PrimaryHealthEvent::Completed);
-        reg.note("www.talk.example", PrimaryHealthEvent::Completed);
+        reg.note(A, "talk.example", PrimaryHealthEvent::Completed);
+        reg.note(A, "www.talk.example", PrimaryHealthEvent::Completed);
         assert_eq!(
-            reg.behavior_of_subtree("talk.example"),
+            reg.behavior_of_subtree(A, "talk.example"),
             PrimaryBehavior::Responds,
         );
 
         stall(&reg, "forum.talk.example", 3).expect("stalls");
         assert_eq!(
-            reg.behavior_of_subtree("talk.example"),
+            reg.behavior_of_subtree(A, "talk.example"),
             PrimaryBehavior::Stalls,
             "one cut name settles the domain",
         );
         // The bare name is unchanged — the two questions are different.
-        assert_eq!(reg.behavior_of("talk.example"), PrimaryBehavior::Responds,);
+        assert_eq!(
+            reg.behavior_of(A, "talk.example"),
+            PrimaryBehavior::Responds,
+        );
         // And a neighbour that merely ENDS with the same letters is not under
         // it: only a dot-separated label boundary counts.
         stall(&reg, "nottalk.example", 3).expect("stalls");
         assert_eq!(
-            reg.behavior_of_subtree("anything.example"),
+            reg.behavior_of_subtree(A, "anything.example"),
             PrimaryBehavior::Unknown
         );
     }
@@ -417,10 +459,10 @@ mod tests {
     fn a_host_that_completes_is_never_called_stalling() {
         let reg = PrimaryStallRegistry::new();
         let report = reg
-            .note("good.example", PrimaryHealthEvent::Completed)
+            .note(A, "good.example", PrimaryHealthEvent::Completed)
             .expect("first verdict");
         assert_eq!(report.behavior, PrimaryBehavior::Responds);
-        assert!(reg.stalling().is_empty());
+        assert!(reg.stalling(A).is_empty());
     }
 
     #[test]
@@ -430,14 +472,14 @@ mod tests {
         let reg = PrimaryStallRegistry::new().with_bounds(Duration::from_secs(60), 64);
         let t0 = Instant::now();
         for _ in 0..3 {
-            reg.note_at("host.example", PrimaryHealthEvent::Stalled, t0);
+            reg.note_at(A, "host.example", PrimaryHealthEvent::Stalled, t0);
         }
-        assert_eq!(reg.behavior_of("host.example"), PrimaryBehavior::Stalls);
+        assert_eq!(reg.behavior_of(A, "host.example"), PrimaryBehavior::Stalls);
 
         let later = t0 + Duration::from_secs(61);
-        reg.note_at("host.example", PrimaryHealthEvent::Stalled, later);
+        reg.note_at(A, "host.example", PrimaryHealthEvent::Stalled, later);
         assert_eq!(
-            reg.behavior_of("host.example"),
+            reg.behavior_of(A, "host.example"),
             PrimaryBehavior::Unknown,
             "the stale counts must not carry the verdict forward"
         );
@@ -447,13 +489,15 @@ mod tests {
     fn the_map_is_bounded_and_the_oldest_gives_way() {
         let reg = PrimaryStallRegistry::new().with_bounds(Duration::from_secs(3600), 2);
         let t0 = Instant::now();
-        reg.note_at("a.example", PrimaryHealthEvent::Stalled, t0);
+        reg.note_at(A, "a.example", PrimaryHealthEvent::Stalled, t0);
         reg.note_at(
+            A,
             "b.example",
             PrimaryHealthEvent::Stalled,
             t0 + Duration::from_secs(1),
         );
         reg.note_at(
+            A,
             "c.example",
             PrimaryHealthEvent::Stalled,
             t0 + Duration::from_secs(2),
@@ -461,7 +505,7 @@ mod tests {
 
         assert_eq!(reg.len(), 2);
         assert_eq!(
-            reg.behavior_of("a.example"),
+            reg.behavior_of(A, "a.example"),
             PrimaryBehavior::Unknown,
             "the least recently seen host gave way"
         );
@@ -470,7 +514,7 @@ mod tests {
     #[test]
     fn an_unnamed_destination_is_not_recorded() {
         let reg = PrimaryStallRegistry::new();
-        assert!(reg.note("", PrimaryHealthEvent::Stalled).is_none());
+        assert!(reg.note(A, "", PrimaryHealthEvent::Stalled).is_none());
         assert!(reg.is_empty());
     }
 }

@@ -190,19 +190,20 @@ mod tests {
         );
     }
 
-    /// Over loopback: a listener answers, a closed port refuses. Skipped where
-    /// the kernel will not let this process bind a device.
+    /// Over loopback: a listener answers, a closed port refuses.
     #[cfg(target_os = "linux")]
     #[test]
+    #[ignore = "needs CAP_NET_RAW (root) for SO_BINDTODEVICE"]
     fn a_pinned_connect_tells_an_answer_from_a_refusal() {
         let listener = std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).expect("listen");
         let open = listener.local_addr().expect("addr").port();
         let budget = Duration::from_secs(2);
         let answered = connect_bound(Ipv4Addr::LOCALHOST, open, Ipv4Addr::LOCALHOST, "lo", budget);
-        if answered == LinkProbeOutcome::NotRun {
-            eprintln!("skipping: SO_BINDTODEVICE is not permitted here");
-            return;
-        }
+        assert_ne!(
+            answered,
+            LinkProbeOutcome::NotRun,
+            "SO_BINDTODEVICE was refused: run this test as root"
+        );
         assert_eq!(answered, LinkProbeOutcome::Connected);
 
         let closed = {

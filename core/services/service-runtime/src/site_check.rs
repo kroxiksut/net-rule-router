@@ -61,6 +61,13 @@ const MAX_RUNNING: usize = 2;
 /// `primary`, `secondary`, `blocked` or `none`.
 pub trait SiteRoutes: Send + Sync {
     fn route_for(&self, sid: &str, name: &str, address: Option<Ipv4Addr>) -> String;
+
+    /// Whether one of `sid`'s own rules names `name`. The machine's name cache
+    /// is everybody's: only such a name, or one the caller's own traffic saw,
+    /// may take an address from it.
+    fn covers(&self, _sid: &str, _name: &str) -> bool {
+        false
+    }
 }
 
 /// The head of an HTTPS answer: `request` sent over TLS to `target:443` from
@@ -90,6 +97,23 @@ pub enum HeadFailure {
 /// The answer for a name whose certificate does not verify on its route.
 const ANSWER_UNTRUSTED: &str = "certificate-untrusted";
 
+/// Whether leak protection currently holds all of one user's traffic.
+pub type TrafficHeld = Arc<dyn Fn(&str) -> bool + Send + Sync>;
+
+/// [`TrafficHeld`] where the guard reports per user whether it holds: only
+/// `everything` holds what no rule names, so `sites` alone does not count.
+pub fn held_under_everything(
+    posture: crate::app_enforcement_status::FailClosedPostureStatus,
+    policies: Arc<dyn crate::RoutePolicySource>,
+) -> TrafficHeld {
+    Arc::new(move |sid: &str| {
+        posture.armed_for(sid)
+            && policies
+                .load_for_sid(sid)
+                .is_some_and(|p| p.leak_protection == nrr_domain::LeakProtection::Everything)
+    })
+}
+
 /// What the check reads and connects with; attached at the composition root.
 pub struct SiteCheckWiring {
     pub probe: Arc<dyn PathProbe>,
@@ -103,6 +127,10 @@ pub struct SiteCheckWiring {
     /// Reads the status code and `Location`; `None` where no TLS client is
     /// linked, and the report then says it did not read them.
     pub https: Option<Arc<dyn HttpsHead>>,
+    /// While the caller's traffic is held, the service's own exempt socket
+    /// must not answer in its place: every route reads as down and nothing
+    /// is sent. `None` where the platform has no such posture.
+    pub traffic_held: Option<TrafficHeld>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -392,17 +420,27 @@ impl SiteChecker {
             .unwrap_or_default();
         let planned = plan_names(site, &traced_names, &seen);
         let address_of = |name: &str| -> Option<Ipv4Addr> {
-            traced
-                .iter()
-                .find(|(n, _)| n == name)
-                .and_then(|(_, a)| *a)
-                .or_else(|| {
-                    crate::dns_wire::only_v4(&w.cache.ips_for_hostname(name))
-                        .first()
-                        .copied()
-                })
+            let own = traced.iter().find(|(n, _)| n == name);
+            if let Some(address) = own.and_then(|(_, a)| *a) {
+                return Some(address);
+            }
+            let known_to_caller =
+                own.is_some() || seen.iter().any(|n| n == name) || w.routes.covers(sid, name);
+            if !known_to_caller {
+                return None;
+            }
+            crate::dns_wire::only_v4(&w.cache.ips_for_hostname(name))
+                .first()
+                .copied()
         };
-        let (main, additional) = w.egress.egress_source_ips(sid);
+        // The probe leaves from the service's own exempt socket: while the
+        // caller's traffic is held it must not reach the site in their place.
+        let held = w.traffic_held.as_ref().is_some_and(|held| held(sid));
+        let (main, additional) = if held {
+            (None, None)
+        } else {
+            w.egress.egress_source_ips(sid)
+        };
         let source_for = |route: &str| match route {
             "secondary" => additional,
             _ => main,
@@ -424,6 +462,9 @@ impl SiteChecker {
         let probe = |e: &Examined| -> &'static str {
             if e.route == "blocked" {
                 return "blocked";
+            }
+            if held {
+                return "route-down";
             }
             let Some(target) = e.address else {
                 return "no-address";
@@ -607,4 +648,32 @@ impl SiteRoutes for ExplainRoutes {
             .map(|r| crate::ipc_handlers::diagnostics_handlers::explained_route(&r))
             .unwrap_or_else(|_| "primary".to_owned())
     }
+
+    fn covers(&self, sid: &str, name: &str) -> bool {
+        use nrr_diagnostics::explain::{ExplainQuery, RuntimeInputSample};
+        // By name alone: an address rule matching a cached address would let
+        // the cache answer for a name no rule of the caller's names.
+        let query = ExplainQuery::Synthetic {
+            input_sample: RuntimeInputSample::new().with_hostname(name.to_owned()),
+        };
+        self.diagnostics
+            .get_explain(
+                &query,
+                nrr_diagnostics::redaction::ExplainDetailLevel::CompactUi,
+                sid,
+            )
+            .ok()
+            .and_then(|r| r.final_action_section)
+            .is_some_and(|f| rule_matched_reason(&f.reason_key))
+    }
+}
+
+/// An explain reason saying a rule on the name itself decided. Address and
+/// network rules match through the cache, so they do not count; a pause
+/// routes by no rule.
+fn rule_matched_reason(reason_key: &str) -> bool {
+    matches!(
+        reason_key.strip_prefix("diag.explain.reason.rule-matched-"),
+        Some("exact-fqdn" | "suffix-domain" | "zone")
+    )
 }

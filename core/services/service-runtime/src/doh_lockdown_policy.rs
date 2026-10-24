@@ -1,11 +1,12 @@
 //! Whether the DoH/DoT lockdown applies to one user right now.
 //!
 //! A browser that resolves names over encrypted DNS resolves the user's
-//! routed sites past the resolver, and their traffic takes the main link with
-//! nobody the wiser. So by default the lockdown decides itself: on while the
-//! user has rules for the additional route, in every mode and whether or not
-//! leak protection is armed. A user who sets the toggle by hand gets what
-//! they set, with the scope they chose.
+//! routed and blocked sites past the resolver, and their traffic follows the
+//! default route with nobody the wiser. So by default the lockdown decides
+//! itself: on while the user's rules need to see site names
+//! ([`crate::rule_book_facts::needs_names_seen`]), whether or not leak
+//! protection is armed. A user who sets the toggle by hand gets what they set,
+//! with the scope they chose.
 
 use nrr_storage::doh_lockdown::DohLockdownScope;
 
@@ -18,10 +19,10 @@ pub fn doh_lockdown_active(
     enabled: bool,
     scope: DohLockdownScope,
     leak_protection_on: bool,
-    has_secondary_rules: bool,
+    rules_need_names: bool,
 ) -> bool {
     if auto {
-        return has_secondary_rules;
+        return rules_need_names;
     }
     enabled && (scope == DohLockdownScope::Always || leak_protection_on)
 }

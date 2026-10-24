@@ -10,10 +10,12 @@
 //! The scan looks for the storage primitives that read the active revision
 //! (or the coordinator's wrappers around them) in production code under
 //! `src/`, test modules excluded. Two module owners may use them freely; every
-//! other file that does is listed below with its exact number of reads, so a
-//! new read fails the test and so does a removed one, until the list says so.
+//! other function that does is listed below by name. A listed function, and
+//! any function calling one, may name the stored row but not read its rules:
+//! a permission for "which revision is committed" must not carry a new read of
+//! rule content through it unnoticed.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -30,31 +32,69 @@ const DIRECT_READS: &[&str] = &[
 /// Raw SQL selecting the active row, compared with whitespace removed.
 const DIRECT_SQL: &str = "status='active'";
 
+/// Rule content of a stored row: the field, the column, the codec module.
+const RULES_CONTENT: &str = "rules_json";
+
+/// Where a line outside every `fn` is booked.
+const OUTSIDE_FN: &str = "(outside any fn)";
+
 /// Modules that own the active revision: the provider itself, and the
 /// coordinator that writes the pointer and publishes the overlay. A module is
 /// its file plus everything under the directory of the same name.
 const OWNERS: &[&str] = &["production_rules_provider", "activation_coordinator"];
 
-/// Readers that need the stored row as such, not the rules in force.
-const STORED_ROW_READERS: &[(&str, usize, &str)] = &[
-    (
-        "production_policy_manager.rs",
-        4,
-        "service health names the committed revision (id, hash, activation time); \
-         a revision mid-activation has no row to name yet",
-    ),
-    (
-        "production_mutation_executor/activation_drive.rs",
-        2,
-        "compares a just-activated id with the stored pointer, and counts the \
-         caller's own stored divergence for the reset preview",
-    ),
-    (
-        "production_diagnostics/internals.rs",
-        2,
-        "the diagnostics card reports the committed revision id and the \
-         candidate count, which are facts about the stored chain",
-    ),
+/// A function that needs the stored row as such, not the rules in force.
+struct StoredRowReader {
+    file: &'static str,
+    function: &'static str,
+    reason: &'static str,
+    /// Set only where the function also reads the stored row's rules, with why
+    /// the stored copy and not the book in force is the right answer.
+    reads_rules: Option<&'static str>,
+}
+
+const STORED_ROW_READERS: &[StoredRowReader] = &[
+    StoredRowReader {
+        file: "production_policy_manager.rs",
+        function: "active_record_for",
+        reason: "service health names the caller's committed revision (id, hash, \
+                 activation time); a revision mid-activation has no row to name yet",
+        reads_rules: None,
+    },
+    StoredRowReader {
+        file: "production_policy_manager.rs",
+        function: "load_active",
+        reason: "service health reports whether any revision is committed",
+        reads_rules: None,
+    },
+    StoredRowReader {
+        file: "production_policy_manager.rs",
+        function: "current_revision",
+        reason: "service health names the committed revision (id, hash, activation time)",
+        reads_rules: None,
+    },
+    StoredRowReader {
+        file: "production_mutation_executor/activation_drive.rs",
+        function: "already_active_noop",
+        reason: "compares a just-activated id with the caller's stored pointer",
+        reads_rules: None,
+    },
+    StoredRowReader {
+        file: "production_mutation_executor/activation_drive.rs",
+        function: "preview_reset_to_baseline",
+        reason: "the reset preview describes the caller's own stored divergence",
+        reads_rules: Some(
+            "counts the rules of the stored row the reset deletes; the book in \
+             force may already be the baseline the reset falls back to",
+        ),
+    },
+    StoredRowReader {
+        file: "production_diagnostics/internals.rs",
+        function: "read_revision_summary",
+        reason: "the diagnostics card reports the committed revision id and the \
+                 candidate count, which are facts about the stored chain",
+        reads_rules: None,
+    },
 ];
 
 fn src_root() -> PathBuf {
@@ -141,8 +181,27 @@ fn production_lines(relative: &str, body: &str) -> (Vec<String>, Vec<String>) {
     (kept, test_modules)
 }
 
+fn code_of(line: &str) -> &str {
+    line.split("//").next().unwrap_or("")
+}
+
+fn is_ident(c: char) -> bool {
+    c.is_ascii_alphanumeric() || c == '_'
+}
+
+/// Occurrences of `word` not glued to a longer identifier.
+fn word_count(code: &str, word: &str) -> usize {
+    code.match_indices(word)
+        .filter(|&(at, _)| {
+            let before = code[..at].chars().next_back();
+            let after = code[at + word.len()..].chars().next();
+            !before.is_some_and(is_ident) && !after.is_some_and(is_ident)
+        })
+        .count()
+}
+
 fn direct_reads_in(line: &str) -> usize {
-    let code = line.split("//").next().unwrap_or("");
+    let code = code_of(line);
     let calls: usize = DIRECT_READS
         .iter()
         .map(|needle| code.matches(needle).count())
@@ -151,8 +210,97 @@ fn direct_reads_in(line: &str) -> usize {
     calls + squashed.matches(DIRECT_SQL).count()
 }
 
-/// Direct reads per production file outside the owners.
-fn direct_readers() -> BTreeMap<String, usize> {
+fn rules_content_reads_in(line: &str) -> usize {
+    word_count(code_of(line), RULES_CONTENT)
+}
+
+/// The function a line declares, when it starts an `fn` item.
+fn declared_fn(code: &str) -> Option<String> {
+    let mut tokens = code.split_whitespace();
+    loop {
+        let token = tokens.next()?;
+        if token == "fn" {
+            let name: String = tokens
+                .next()?
+                .chars()
+                .take_while(|c| is_ident(*c))
+                .collect();
+            return (!name.is_empty()).then_some(name);
+        }
+        if token.starts_with("pub(") && !token.ends_with(')') {
+            // `pub(in path)` spans two tokens.
+            tokens.find(|t| t.ends_with(')'))?;
+            continue;
+        }
+        let qualifier = token == "pub"
+            || token.starts_with("pub(")
+            || matches!(
+                token,
+                "async" | "const" | "unsafe" | "extern" | "default" | "\"C\""
+            );
+        if !qualifier {
+            return None;
+        }
+    }
+}
+
+#[derive(Default, Debug, PartialEq)]
+struct FnReads {
+    active: usize,
+    rules_content: usize,
+    /// Listed readers this function calls as methods.
+    calls: BTreeSet<&'static str>,
+}
+
+/// Reads per function of one file. A function runs from its declaration to
+/// the first line at its indentation or shallower that starts with `}`, or to
+/// the next declaration at that depth (rustfmt layout).
+fn reads_by_function(lines: &[String]) -> BTreeMap<String, FnReads> {
+    let mut open: Vec<(String, usize)> = Vec::new();
+    let mut out: BTreeMap<String, FnReads> = BTreeMap::new();
+    for line in lines {
+        let code = code_of(line);
+        let trimmed = code.trim_start();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let indent = code.len() - trimmed.len();
+        let declares = declared_fn(trimmed);
+        if let Some(name) = &declares {
+            while open.last().is_some_and(|(_, at)| *at >= indent) {
+                open.pop();
+            }
+            open.push((name.clone(), indent));
+        }
+        let active = direct_reads_in(code);
+        let rules_content = rules_content_reads_in(code);
+        let calls: Vec<&'static str> = if declares.is_some() {
+            Vec::new()
+        } else {
+            STORED_ROW_READERS
+                .iter()
+                .map(|r| r.function)
+                .filter(|f| code.contains(&format!(".{f}(")))
+                .collect()
+        };
+        if active > 0 || rules_content > 0 || !calls.is_empty() {
+            let owner = open.last().map_or(OUTSIDE_FN, |(name, _)| name.as_str());
+            let entry = out.entry(owner.to_string()).or_default();
+            entry.active += active;
+            entry.rules_content += rules_content;
+            entry.calls.extend(calls);
+        }
+        if trimmed.starts_with('}') {
+            while open.last().is_some_and(|(_, at)| *at >= indent) {
+                open.pop();
+            }
+        }
+    }
+    out
+}
+
+/// Reads per (file, function) of production code outside the owners.
+fn direct_readers() -> BTreeMap<(String, String), FnReads> {
     let mut files = Vec::new();
     collect_rust_files(&src_root(), &mut files);
     assert!(!files.is_empty(), "no .rs files found under src/");
@@ -177,9 +325,8 @@ fn direct_readers() -> BTreeMap<String, usize> {
         {
             continue;
         }
-        let count: usize = lines.iter().map(|l| direct_reads_in(l)).sum();
-        if count > 0 {
-            readers.insert(rel, count);
+        for (function, reads) in reads_by_function(&lines) {
+            readers.insert((rel.clone(), function), reads);
         }
     }
     readers
@@ -187,38 +334,60 @@ fn direct_readers() -> BTreeMap<String, usize> {
 
 #[test]
 fn rules_are_read_through_the_provider() {
-    let listed: BTreeMap<&str, (usize, &str)> = STORED_ROW_READERS
+    let listed: BTreeMap<(&str, &str), &StoredRowReader> = STORED_ROW_READERS
         .iter()
-        .map(|(file, count, reason)| (*file, (*count, *reason)))
+        .map(|r| ((r.file, r.function), r))
         .collect();
     assert_eq!(
         listed.len(),
         STORED_ROW_READERS.len(),
-        "a file is listed twice"
+        "a function is listed twice"
     );
 
     let found = direct_readers();
     let mut problems = Vec::new();
-    for (file, count) in &found {
-        match listed.get(file.as_str()) {
-            None => problems.push(format!(
-                "src/{file}: {count} direct read(s) of the active revision. Read rules \
-                 through `ProductionRulesProvider` (it serves a revision mid-activation); \
-                 a reader that needs the stored row itself goes in STORED_ROW_READERS \
-                 with its reason"
-            )),
-            Some((expected, _)) if expected != count => problems.push(format!(
-                "src/{file}: {count} direct read(s), the list says {expected}. A new read \
-                 goes through the provider; a removed one updates the count (or the entry)"
-            )),
-            Some(_) => {}
+    for ((file, function), reads) in &found {
+        let entry = listed.get(&(file.as_str(), function.as_str()));
+        if reads.active > 0 && entry.is_none() {
+            problems.push(format!(
+                "src/{file}: `{function}` reads the active revision directly ({} read(s)). \
+                 Read rules through `ProductionRulesProvider` (it serves a revision \
+                 mid-activation); a function that needs the stored row itself goes in \
+                 STORED_ROW_READERS with its reason",
+                reads.active
+            ));
+        }
+        let grants_rules = entry.is_some_and(|r| r.reads_rules.is_some());
+        if reads.rules_content > 0 && !grants_rules && (entry.is_some() || !reads.calls.is_empty())
+        {
+            let via = if entry.is_some() {
+                "a stored-row reader".to_string()
+            } else {
+                let callees: Vec<&str> = reads.calls.iter().copied().collect();
+                format!("it calls the stored-row reader(s) {}", callees.join(", "))
+            };
+            problems.push(format!(
+                "src/{file}: `{function}` reads stored rule content (`{RULES_CONTENT}`) and \
+                 {via}. The rules in force come from `ProductionRulesProvider`; a \
+                 permission to name the committed revision does not cover its rules"
+            ));
         }
     }
-    for file in listed.keys() {
-        if !found.contains_key(*file) {
-            problems.push(format!(
-                "src/{file} no longer reads the active revision directly: drop its entry"
-            ));
+    for reader in STORED_ROW_READERS {
+        let key = (reader.file.to_string(), reader.function.to_string());
+        match found.get(&key) {
+            Some(reads) if reads.active > 0 => {
+                if reader.reads_rules.is_some() && reads.rules_content == 0 {
+                    problems.push(format!(
+                        "src/{}: `{}` no longer reads stored rules: drop its `reads_rules`",
+                        reader.file, reader.function
+                    ));
+                }
+            }
+            _ => problems.push(format!(
+                "src/{}: `{}` no longer reads the active revision directly: drop its entry",
+                reader.file, reader.function
+            )),
         }
     }
     assert!(
@@ -230,9 +399,19 @@ fn rules_are_read_through_the_provider() {
 
 #[test]
 fn every_listed_reader_says_why() {
-    for (file, count, reason) in STORED_ROW_READERS {
-        assert!(*count > 0, "{file}: a zero count is not an entry");
-        assert!(!reason.trim().is_empty(), "{file}: no reason given");
+    for reader in STORED_ROW_READERS {
+        let at = format!("{}::{}", reader.file, reader.function);
+        assert!(
+            !reader.function.trim().is_empty(),
+            "{at}: no function named"
+        );
+        assert!(!reader.reason.trim().is_empty(), "{at}: no reason given");
+        if let Some(why) = reader.reads_rules {
+            assert!(
+                !why.trim().is_empty(),
+                "{at}: rule content read without a reason"
+            );
+        }
     }
 }
 
@@ -250,6 +429,29 @@ fn the_scanner_counts_what_it_claims_to() {
     assert_eq!(direct_reads_in("// repo.get_active_for(p)"), 0);
     assert_eq!(direct_reads_in("self.coordinator.current_active()"), 1);
 
+    assert_eq!(rules_content_reads_in("let n = count(&rec.rules_json);"), 1);
+    assert_eq!(
+        rules_content_reads_in("SELECT revision_id, rules_json FROM"),
+        1
+    );
+    assert_eq!(rules_content_reads_in("c.rules_json_in_force_for(p)"), 0);
+    assert_eq!(rules_content_reads_in("// rec.rules_json"), 0);
+
+    assert_eq!(
+        declared_fn("pub(super) fn execute<T>(").as_deref(),
+        Some("execute")
+    );
+    assert_eq!(
+        declared_fn("pub(in crate::x) async fn go(").as_deref(),
+        Some("go")
+    );
+    assert_eq!(
+        declared_fn("fn load_active(&self);").as_deref(),
+        Some("load_active")
+    );
+    assert_eq!(declared_fn("const LIMIT: usize = 4;"), None);
+    assert_eq!(declared_fn("let f: fn(u8) = g;"), None);
+
     let body = "fn a() { repo.get_active_for(p); }\n\
                 #[cfg(test)]\n\
                 mod helpers;\n\
@@ -264,9 +466,41 @@ fn the_scanner_counts_what_it_claims_to() {
     assert_eq!(child_module_dir("bar/mod.rs"), "bar/");
     assert_eq!(child_module_dir("lib.rs"), "");
 
+    // Reads land on the function that holds them, a nested fn included, and a
+    // caller of a listed reader is seen calling it.
+    let file: Vec<String> = [
+        "impl X {",
+        "    fn current_revision(&self) -> Option<R> {",
+        "        let r = self.c.current_active().ok()?;",
+        "        fn inner() {",
+        "            rec.rules_json;",
+        "        }",
+        "        Some(r)",
+        "    }",
+        "",
+        "    fn counts(&self) -> usize {",
+        "        let rec = self.current_revision()?;",
+        "        count(&rec.rules_json)",
+        "    }",
+        "}",
+        "const SQL: &str = \"WHERE status = 'active'\";",
+    ]
+    .iter()
+    .map(|l| (*l).to_string())
+    .collect();
+    let reads = reads_by_function(&file);
+    let at = |f: &str| reads.get(f).map(|r| (r.active, r.rules_content));
+    assert_eq!(at("current_revision"), Some((1, 0)));
+    assert_eq!(at("inner"), Some((0, 1)));
+    assert_eq!(at("counts"), Some((0, 1)));
+    assert_eq!(at(OUTSIDE_FN), Some((1, 0)));
+    assert!(reads
+        .get("counts")
+        .is_some_and(|r| r.calls.contains("current_revision")));
+
     let found = direct_readers();
     assert!(
-        !found.is_empty(),
-        "the scan found no direct reader at all, while the lists name several"
+        found.values().any(|r| r.active > 0),
+        "the scan found no direct reader at all, while the list names several"
     );
 }

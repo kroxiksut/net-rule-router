@@ -34,6 +34,7 @@ pub(super) fn build_dns_resolver_factory(
     >,
     outage_blocks: Option<Arc<nrr_service_runtime::outage_blocks::OutageBlocks>>,
     liveness: Arc<TaskLiveness>,
+    paused: Option<Arc<nrr_service_runtime::routing_pause::PausedPrincipals>>,
 ) -> Option<nrr_service_runtime::dns_resolver_service::DnsResolverFactory> {
     use nrr_platform_windows::dns_redirect::{
         NrptDnsRedirect, PowerShellRunner, TransactedNrptStore, WindowsSearchList,
@@ -62,6 +63,7 @@ pub(super) fn build_dns_resolver_factory(
         first_contact_v6: None,
         outage_blocks,
         liveness: Some(liveness),
+        paused,
     };
     let platform = DnsStackPlatform {
         system_dns: cached_system_dns(),
@@ -246,6 +248,7 @@ pub(super) fn build_fake_ip_stack_factory(
     auto_rules_engine: Option<&Arc<nrr_service_runtime::auto_rules::AutoRulesEngine>>,
     served_principals: nrr_service_runtime::fake_ip::ServedPrincipalsFn,
     liveness: Arc<TaskLiveness>,
+    paused: Option<Arc<nrr_service_runtime::routing_pause::PausedPrincipals>>,
 ) -> Option<nrr_service_runtime::fake_ip::FakeIpStackFactory> {
     use nrr_platform_api::fake_ip::tun::{TunAdapterConfig, TunAdapterPort};
     use nrr_platform_windows::fake_ip::WintunTunAdapter;
@@ -295,10 +298,14 @@ pub(super) fn build_fake_ip_stack_factory(
         let upstream = Arc::new(
             assembly.direct_aware_resolver(Arc::new(CacheUpstreamResolver::new(cache_lookup))),
         );
-        let routes = Arc::new(RuleBookRouteSelector::new(
+        let mut routes = RuleBookRouteSelector::new(
             Arc::new(ProductionRulesProvider::new(Arc::clone(&settings_conn))),
             Arc::clone(&active_sid),
-        ));
+        );
+        if let Some(paused) = paused.as_ref() {
+            routes = routes.with_paused(Arc::clone(paused));
+        }
+        let routes = Arc::new(routes);
         // Source-bound dialing: without it the SYSTEM relay follows the OS
         // default route (it sits outside the per-user kill-switch scope), so a
         // secondary-bound flow would leak via the primary whenever the tunnel

@@ -598,6 +598,7 @@ mod tests {
         bus.publish(StatusUpdateEvent::RoutingPauseStateChanged {
             sid: "S-1-A".to_string(),
             paused: true,
+            paused_at: None,
             resumes_at_ms: None,
             until_restart: false,
         });

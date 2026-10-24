@@ -6,9 +6,11 @@
 //! pattern covers the program. Secondary retargets the rule that names the
 //! program (an exact spelling beats a pattern that merely covers it) and
 //! enables it when it was off; a new rule is added only when none covers it.
-//! [`group_route`] reads the route a group has now.
+//! [`group_route`] reads the route a group has now. A rule is compared by
+//! what the service matches: its value without `+children` / `+override`.
 
 use nrr_shared::glob::{fold_str, glob_match};
+use nrr_shared::preset_parser::without_rule_flags;
 
 /// An application rule of the open rule set.
 #[derive(Clone, Copy, Debug)]
@@ -57,7 +59,7 @@ pub fn plan_app_route_assignments(
         .filter(|a| a.route == "primary" && !a.value.is_empty())
     {
         for (i, rule) in rules.iter().enumerate() {
-            if !removed[i] && glob_match(rule.value, a.value) {
+            if !removed[i] && glob_match(&without_rule_flags(rule.value), a.value) {
                 removed[i] = true;
             }
         }
@@ -81,11 +83,12 @@ pub fn plan_app_route_assignments(
         let wanted = fold_str(a.value);
         let mut found = None;
         for (k, e) in entries.iter().enumerate() {
-            if fold_str(e.value) == wanted {
+            let bare = without_rule_flags(e.value);
+            if fold_str(&bare) == wanted {
                 found = Some(k);
                 break;
             }
-            if found.is_none() && glob_match(e.value, a.value) {
+            if found.is_none() && glob_match(&bare, a.value) {
                 found = Some(k);
             }
         }
@@ -118,7 +121,7 @@ pub fn plan_app_route_assignments(
 pub fn app_route_of<'a>(rules: &[AppRule<'a>], program: &str) -> &'a str {
     rules
         .iter()
-        .find(|rule| rule.enabled && glob_match(rule.value, program))
+        .find(|rule| rule.enabled && glob_match(&without_rule_flags(rule.value), program))
         .map_or("primary", |rule| rule.route)
 }
 
@@ -200,6 +203,22 @@ mod tests {
         assert_eq!(group_route(&rules, &["off.exe"]), "primary");
         assert_eq!(group_route(&rules, &["vboxsvc.exe", "other.exe"]), "mixed");
         assert_eq!(group_route(&rules, &[]), "primary");
+    }
+
+    #[test]
+    fn flags_on_a_rule_do_not_hide_it() {
+        let rules = [
+            rule("VBoxHeadless.exe +children", "secondary", true),
+            rule("vbox*.exe +override", "primary", false),
+        ];
+        assert_eq!(group_route(&rules, &["vboxheadless.exe"]), "secondary");
+        let plan = plan_app_route_assignments(&rules, &[go("secondary", "vboxheadless.exe")]);
+        assert_eq!(plan, AppRoutePlan::default());
+        let plan = plan_app_route_assignments(&rules, &[go("secondary", "vboxsvc.exe")]);
+        assert_eq!(plan.retarget, vec![1]);
+        assert!(plan.add.is_empty());
+        let plan = plan_app_route_assignments(&rules, &[go("primary", "vboxheadless.exe")]);
+        assert_eq!(plan.remove, vec![0, 1]);
     }
 
     #[test]

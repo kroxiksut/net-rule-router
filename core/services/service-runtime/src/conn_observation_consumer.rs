@@ -459,14 +459,67 @@ pub fn classify_connection(
     }
 }
 
+/// Whether more than one person is served right now.
+pub type SeveralServedFn = Arc<dyn Fn() -> bool + Send + Sync>;
+
 /// Whose suggestion a connection feeds: the account that opened it. A service
 /// account's connection, or one whose owner could not be read, follows the
-/// routing user, whose routes that traffic takes.
-pub fn suggestion_owner(owner: Option<&str>, routing: &ActiveSidFn) -> Option<String> {
+/// routing user, whose routes that traffic takes — but only while that user
+/// is the only one served: with several, an ownerless connection could be
+/// anyone's, and what somebody else went to must not become the routing
+/// user's evidence.
+pub fn suggestion_owner(
+    owner: Option<&str>,
+    routing: &ActiveSidFn,
+    several_served: &SeveralServedFn,
+) -> Option<String> {
     let is_service_account = nrr_platform_api::types::is_service_account_sid;
     match owner.filter(|o| !o.is_empty() && !is_service_account(o)) {
         Some(owner) => Some(owner.to_owned()),
+        None if several_served() => None,
         None => routing(),
+    }
+}
+
+#[cfg(test)]
+mod suggestion_owner_tests {
+    use super::*;
+
+    const ROUTING: &str = "S-1-5-21-1-2-3-1001";
+
+    fn routing() -> ActiveSidFn {
+        Arc::new(|| Some(ROUTING.to_owned()))
+    }
+
+    fn served(several: bool) -> SeveralServedFn {
+        Arc::new(move || several)
+    }
+
+    #[test]
+    fn an_ownerless_connection_follows_the_routing_user_only_while_alone() {
+        assert_eq!(
+            suggestion_owner(None, &routing(), &served(false)).as_deref(),
+            Some(ROUTING)
+        );
+        assert_eq!(suggestion_owner(None, &routing(), &served(true)), None);
+        assert_eq!(
+            suggestion_owner(Some(""), &routing(), &served(true)),
+            None,
+            "an empty owner is no owner"
+        );
+    }
+
+    #[test]
+    fn a_connection_with_an_owner_is_that_owners_whoever_else_is_served() {
+        let other = "S-1-5-21-1-2-3-1002";
+        assert_eq!(
+            suggestion_owner(Some(other), &routing(), &served(true)).as_deref(),
+            Some(other)
+        );
+        assert_eq!(
+            suggestion_owner(Some(other), &routing(), &served(false)).as_deref(),
+            Some(other)
+        );
     }
 }
 

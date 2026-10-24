@@ -21,8 +21,8 @@ Notifications:
   No notifications.
 Commands on this screen:
   r: restore your settings to a service that lost them
-  t: confirm the listed programs as your VPN, so leak protection keeps them working
-  a: allow the listed VPNs to reach their servers, so leak protection lets them connect
+  t: confirm the first listed program as your VPN (T: with the programs it ships with), so leak protection keeps it working
+  a: allow the first listed VPN to reach its server, so leak protection lets it connect
   p: confirm the suggested main connection; another one is chosen under Interfaces and routes
   v: send the blocked site named under the state over the additional route; you are asked first
 Type a screen number, h for help or q to quit, then press Enter.
@@ -31,7 +31,7 @@ Routing state: Routing active
 Routing state: Rules apply on this user session.
 Connections: Main connection: Ethernet — Example Network Adapter — Available — Rules applied
 Connections: Additional connection: Example Tunnel — Example Network Adapter — Available — Rules applied
-Warning: The additional connection is not up — Everything your rules send there is being held until it comes back — that is the protection doing its job, not a fault. Start the connection, or move those rules to the main one.
+Warning: The additional connection is not up — Sites your rules send there go over the main connection until it comes back: leak protection is off. Start the connection, or turn leak protection on to hold them instead.
 Routing state: Routing limited
 Routing state: Some rules are not being applied right now. The notices say why.
 Connections: Additional connection: Example Tunnel — Example Network Adapter — Available — Rules not applied
@@ -49,6 +49,7 @@ Commands on this screen:
   d and a number: delete that rule
   t and a number: switch that rule on or off
   f: choose which route's rules to show
+  S: by state, y: by type, u: only added automatically, E: the rules that will not be applied
   / and text: search, for example / example.com; / alone shows all
   > and <: next and previous page
   s: apply the changes; they are shown first
@@ -78,6 +79,7 @@ Commands on this screen:
   d and a number: delete that rule
   t and a number: switch that rule on or off
   f: choose which route's rules to show
+  S: by state, y: by type, u: only added automatically, E: the rules that will not be applied
   / and text: search, for example / example.com; / alone shows all
   > and <: next and previous page
   s: apply the changes; they are shown first
@@ -122,6 +124,7 @@ Commands on this screen:
   d and a number: delete that rule
   t and a number: switch that rule on or off
   f: choose which route's rules to show
+  S: by state, y: by type, u: only added automatically, E: the rules that will not be applied
   / and text: search, for example / example.com; / alone shows all
   > and <: next and previous page
   s: apply the changes; they are shown first

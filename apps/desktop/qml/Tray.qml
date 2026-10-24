@@ -36,20 +36,18 @@ SystemTrayIcon {
     property var primaryActions: []
     property var quickActions: []
     // User preference "show notifications". The tray is the surface that raises
-    // unsolicited windows, so it has to honour it. A launch-time snapshot, like
-    // `language` and `theme`; missing from an older context file means "on",
-    // which is the shipped default.
+    // unsolicited windows, so it has to honour it. Read from the launch context,
+    // then followed from the window's presence file (`_followWindowNoticePrefs`);
+    // missing from an older context file means "on", the shipped default.
     property bool showNotifications: true
     /// Per-kind mute for the suggestions stripe, under `showNotifications`.
-    /// Same launch-time snapshot rule; absent in an older context file means
-    /// "on", which is the shipped default.
+    /// Same source; absent means "on".
     property bool notifySuggestionChanges: true
     /// Per-kind mute for the "connection blocked" notice, and whether that
-    /// notice may name the destination at all. Same launch-time snapshot rule.
+    /// notice may name the destination at all. Same source.
     property bool notifyBlockNotices: true
     property bool hideBlockNoticeAddresses: false
-    /// Per-kind mute for the "a rule is set on both routes" notice. Same
-    /// launch-time snapshot rule.
+    /// Per-kind mute for the "a rule is set on both routes" notice. Same source.
     property bool notifyRuleDuplicates: true
     /// Whole-window opacity of the notice, in percent (Settings → General).
     property int noticeOpacityPercent: 100
@@ -149,18 +147,16 @@ SystemTrayIcon {
     /// queue, it is a machine that spent the day unattended.
     readonly property int _noticeQueueCap: 4
 
-    /// Show now, or line up behind whatever is on screen.
-    function _presentOrQueue(kind, show) {
+    /// Show now, or line up behind whatever is on screen. `fromUser`: the
+    /// answer to the user's own pick in the menu, which goes ahead of
+    /// background notices and is never the one the cap drops.
+    function _presentOrQueue(kind, show, fromUser) {
         if (!promptWindow || !promptWindow.visible) {
             show()
             return
         }
-        var queued = []
-        for (var i = 0; i < _noticeQueue.length; i += 1) {
-            if (_noticeQueue[i].kind !== kind) queued.push(_noticeQueue[i])
-        }
-        queued.push({ kind: kind, show: show })
-        while (queued.length > _noticeQueueCap) queued.shift()
+        var queued = Pure.noticeQueueWith(_noticeQueue,
+            { kind: kind, show: show, user: fromUser === true }, _noticeQueueCap)
         _noticeQueue = queued
         console.log("tray notice:", kind, "queued behind the notice on screen —",
             queued.length, "waiting")
@@ -343,6 +339,41 @@ SystemTrayIcon {
     property var guiPresence: GuiPresence {}
     property var readableToolTips: ReadableToolTips {}
 
+    // Notification settings changed in the window after this tray started.
+    // A snapshot older than the tray is what the launch context already holds.
+    readonly property double _startedAtMs: Date.now()
+    property double _noticePrefsTakenAt: 0
+    property double _presenceMtime: -1
+    property Timer _noticePrefsWatch: Timer {
+        interval: 5000
+        running: true
+        repeat: true
+        onTriggered: tray._followWindowNoticePrefs()
+    }
+
+    function _followWindowNoticePrefs() {
+        var path = guiPresence._resolvePath()
+        if (path === "" || typeof nrrNativeBridge === "undefined" || nrrNativeBridge === null
+                || typeof nrrNativeBridge.statFile !== "function") return
+        var stat = nrrNativeBridge.statFile(path)
+        var mtime = stat && stat.exists ? Number(stat.mtime) : -1
+        if (mtime === _presenceMtime) return
+        _presenceMtime = mtime
+        _takeNoticePrefs(guiPresence.read())
+    }
+
+    function _takeNoticePrefs(presence) {
+        var n = presence ? presence.notices : null
+        if (!n || presence.at <= _startedAtMs || presence.at <= _noticePrefsTakenAt) return
+        _noticePrefsTakenAt = presence.at
+        showNotifications = n.showNotifications
+        notifySuggestionChanges = n.notifySuggestionChanges
+        notifyBlockNotices = n.notifyBlockNotices
+        notifyRuleDuplicates = n.notifyRuleDuplicates
+        hideBlockNoticeAddresses = n.hideBlockNoticeAddresses
+        noticeOpacityPercent = n.trayNoticeOpacityPercent
+    }
+
     // File-vs-service rules comparison, the tray's own. See `RulesDriftWatch`.
     property var rulesDriftWatch: RulesDriftWatch {
         rpc: tray.rpc
@@ -409,7 +440,9 @@ SystemTrayIcon {
 
     /// What became of a rule added from the tray's own form. `undo`
     /// (`Rules.additionUndoRecord`) puts an "Undo" on the notice.
-    function noteAddRuleOutcome(bodyText, undo) {
+    /// `awaitsConfirmation`: the rule waits in the window's rules list, so the
+    /// notice offers the way there.
+    function noteAddRuleOutcome(bodyText, undo, awaitsConfirmation) {
         var canUndo = !!undo && ((undo.added || []).length + (undo.moved || []).length) > 0
         _presentOrQueue("tray-add-rule", function() {
             tray._addRuleUndo = canUndo ? undo : null
@@ -419,10 +452,13 @@ SystemTrayIcon {
                 primaryAction: canUndo
                     ? { label: tr("action.undo", "Undo"), actionId: "tray-add-rule-undo" }
                     : null,
+                secondaryAction: awaitsConfirmation === true
+                    ? { label: tr("action.open-rules", "Open rules"), actionId: "tray-add-rule-open-rules" }
+                    : null,
                 dismissActionId: "tray-add-rule-dismiss",
                 autoRetireMs: canUndo ? _addRuleUndoMs : _infoNoticeMs
             })
-        })
+        }, true)
     }
 
     /// "Undo" on the notice: one more ordinary apply, made by the add form.
@@ -481,6 +517,9 @@ SystemTrayIcon {
         // A service that just came up has an enforcement state we have not read
         // yet; one that went away invalidates what we read before.
         if (serviceStatus === 4) {
+            // A stored pause is not pushed on connect; a tray that started
+            // before the service would show the rules on until the pause ends.
+            _refreshRoutingPaused()
             _refreshEnforcementState()
             verifyVerdicts.refresh()
             // The service pushes only a count that changed, so a tray that
@@ -1075,6 +1114,8 @@ SystemTrayIcon {
     /// raise it again.
     property var _verifyVerdictShownIds: []
     property bool _verifyVerdictOnScreen: false
+    /// The ids the window on screen counts: the answer covers these only.
+    property var _verifyVerdictOnScreenIds: []
 
     function _onVerifyVerdictsChanged() {
         var notice = verifyVerdicts.notice
@@ -1115,6 +1156,7 @@ SystemTrayIcon {
                 .replace("{count}", String(notice.more))
         }
         _verifyVerdictOnScreen = true
+        _verifyVerdictOnScreenIds = notice.ids.slice()
         promptWindow.present({
             titleText: tr("notifications.verify-verdicts.title",
                     "Addresses that do not open where they are written: {count}")
@@ -1142,7 +1184,7 @@ SystemTrayIcon {
     /// "Move" from the tray. With a rule-set folder the move is made here and
     /// the bound files follow it; without one the folder has to be chosen
     /// first, and that happens in the main window, where the same card waits.
-    function _moveVerifyVerdicts() {
+    function _moveVerifyVerdicts(shownIds) {
         var presence = guiPresence ? guiPresence.read() : { rulesFolder: "" }
         if (String(presence.rulesFolder || "") === "") {
             if (typeof nrrNativeBridge !== "undefined" && nrrNativeBridge
@@ -1155,7 +1197,7 @@ SystemTrayIcon {
         }
         verifyVerdicts.accept(function(ok, code) {
             if (!ok) console.log("tray verify-verdicts: accept failed:", code)
-        })
+        }, shownIds)
     }
 
     // ── Rules in the files vs rules being enforced ───────────────────────────
@@ -1457,7 +1499,8 @@ SystemTrayIcon {
         // must not bring that notice straight back.
         var batch = _blockNoticeBatch.filter(function(e) { return !tray._blockNoticeQuiet(e) })
         _blockNoticeBatch = []
-        if (batch.length === 0) return
+        // Nothing left to show still frees the queue for the next notice.
+        if (batch.length === 0) { _scheduleDrain(); return }
         _blockNoticeShown = batch
         _renderBlockNotice(false, [])
     }
@@ -2125,13 +2168,76 @@ SystemTrayIcon {
         })
     }
 
+    /// The route-policy keys the user is asked about: the protection that goes
+    /// back on its own is not among them.
+    function _settingsLostKeys(state) {
+        var intentPolicy = state.intent["route-policy"] || {}
+        var automatic = Pure.routePolicyProtectionToRestore(intentPolicy, state.policy)
+        return Pure.routePolicyIntentDivergence(intentPolicy, state.policy).filter(function(k) {
+            return automatic.indexOf(k) < 0
+        })
+    }
+
+    /// Protection the record holds on and the service lost goes back on at
+    /// once, unasked, as the window does; only ever switched ON this way.
+    /// `done(ok)` runs after the write, or at once when nothing was lost.
+    function _restoreProtection(state, done) {
+        var intentPolicy = state.intent["route-policy"] || {}
+        var req = Pure.routePolicyProtectionRestore(intentPolicy, state.policy)
+        if (req === null) { done(true); return }
+        var keys = req["apply-only"].slice()
+        if (typeof nrrNativeBridge.rpcRoutePolicyUpdate !== "function") { done(false); return }
+        var corr = nrrNativeBridge.rpcRoutePolicyUpdate(req)
+        if (!corr) { done(false); return }
+        rpc.registerRpcCallback(corr, function(ok, p, code) {
+            if (!ok) {
+                console.log("tray settings-restore: protection not restored:", code)
+                done(false)
+                return
+            }
+            console.log("tray settings-restore: protection switched back on, keys=" + keys.join(","))
+            var merge = {}
+            for (var k = 0; k < keys.length; k += 1) merge[keys[k]] = req[keys[k]]
+            tray._recordIntent({ "namespace": "route-policy", "merge": merge })
+            tray._noteProtectionRestored(keys)
+            done(true)
+        })
+    }
+
+    function _protectionSettingName(key) {
+        if (key === "leak-protection")
+            return tr("settings.routing.kill-switch.title", "Leak protection")
+        if (key === "doh-lockdown-enabled")
+            return tr("settings.routing.doh-lockdown.label", "Block browser DoH/DoT")
+        if (key === "kill-switch-strict-shared-ips")
+            return tr("settings.routing.kill-switch.shared-strict-label",
+                "Block shared addresses too")
+        return tr("notifications.settings-lost.other-setting", "another routing setting")
+    }
+
+    function _noteProtectionRestored(keys) {
+        var names = []
+        for (var i = 0; i < keys.length; i += 1) names.push(_protectionSettingName(keys[i]))
+        _presentOrQueue("protection-restored", function() {
+            promptWindow.present({
+                titleText: tray.tr("notifications.protection-restored.title",
+                    "Protection restored after a service failure"),
+                bodyText: tray.tr("notifications.protection-restored.body",
+                        "The service had lost these settings and they were switched back on: {settings}.")
+                    .replace("{settings}", names.join(", ")),
+                dismissActionId: "settings-restored-dismiss",
+                autoRetireMs: tray._enforcementNoticeMs
+            })
+        })
+    }
+
     function _checkSettingsLost() {
         var presence = guiPresence ? guiPresence.read() : { windowActive: false }
         if (presence.windowActive) return
         _readSettingsState(function(state) {
             if (state === null) return
-            var keys = Pure.routePolicyIntentDivergence(state.intent["route-policy"] || {},
-                                                        state.policy)
+            tray._restoreProtection(state, function() {})
+            var keys = tray._settingsLostKeys(state)
             var mutes = Pure.noticeMutesToRestore(state.intent["notice-mutes"], state.mutes,
                                                   Date.now())
             var count = keys.length + (mutes.length > 0 ? 1 : 0)
@@ -2147,56 +2253,74 @@ SystemTrayIcon {
                         label: tray.tr("notifications.settings-lost.action", "Restore my settings"),
                         actionId: "settings-lost-restore"
                     },
-                    dismissActionId: "settings-lost-dismiss"
+                    dismissActionId: "settings-lost-dismiss",
+                    autoRetireMs: tray._promptAutoRetireMs
                 })
             })
         })
     }
 
-    /// "Restore my settings" from the tray: the window's one write, sent from
-    /// here, then the mutes.
+    /// "Restore my settings" from the tray: the protection first, should its
+    /// unasked write have failed, then the window's one write, then the mutes.
     function _restoreSettings() {
         _readSettingsState(function(state) {
-            if (state === null) { tray._noteSettingsRestored(false, []); return }
-            var plan = Pure.routePolicyRestorePlan(state.intent["route-policy"] || {},
-                                                   state.policy, state.adapters)
-            var mutes = Pure.noticeMutesToRestore(state.intent["notice-mutes"], state.mutes,
-                                                  Date.now())
-            var missing = []
-            for (var i = 0; i < plan.missing.length; i += 1) missing.push(String(plan.missing[i].name))
-            var restoreMutes = function(at) {
-                if (at >= mutes.length) { tray._noteSettingsRestored(true, missing); return }
-                var corr = rpc.rpcBlockNoticeMutesSet(mutes[at])
-                if (!corr) { tray._noteSettingsRestored(false, missing); return }
-                rpc.registerRpcCallback(corr, function(ok, p) {
-                    if (!ok) { tray._noteSettingsRestored(false, missing); return }
-                    if (at === mutes.length - 1)
-                        tray._recordIntent({ "namespace": "notice-mutes",
-                                             "value": (p && p.mutes) || [] })
-                    restoreMutes(at + 1)
-                })
-            }
-            if (plan.request === null) { restoreMutes(0); return }
-            var writeCorr = nrrNativeBridge.rpcRoutePolicyUpdate(plan.request)
-            if (!writeCorr) { tray._noteSettingsRestored(false, missing); return }
-            rpc.registerRpcCallback(writeCorr, function(ok) {
-                if (!ok) { tray._noteSettingsRestored(false, missing); return }
-                var merge = {}
-                for (var k = 0; k < plan.keys.length; k += 1)
-                    merge[plan.keys[k]] = plan.request[plan.keys[k]]
-                tray._recordIntent({ "namespace": "route-policy", "merge": merge })
-                restoreMutes(0)
+            if (state === null) { tray._noteSettingsRestored(false, [], false); return }
+            var protection = Pure.routePolicyProtectionToRestore(state.intent["route-policy"] || {},
+                                                                 state.policy)
+            tray._restoreProtection(state, function(protectedOk) {
+                if (!protectedOk) { tray._noteSettingsRestored(false, [], false); return }
+                tray._restoreAskedSettings(state, protection.length > 0)
             })
         })
     }
 
-    function _noteSettingsRestored(ok, missing) {
-        var body = ok
-            ? tray.tr("status.settings-restored", "Your settings were restored.")
-            : tray.tr("tray.settings-restore-failed",
+    function _restoreAskedSettings(state, restoredAny) {
+        var plan = Pure.routePolicyRestorePlan(state.intent["route-policy"] || {},
+                                               state.policy, state.adapters)
+        var mutes = Pure.noticeMutesToRestore(state.intent["notice-mutes"], state.mutes,
+                                              Date.now())
+        var missing = []
+        for (var i = 0; i < plan.missing.length; i += 1) missing.push(String(plan.missing[i].name))
+        var anything = restoredAny || plan.keys.length > 0 || mutes.length > 0
+        var restoreMutes = function(at) {
+            if (at >= mutes.length) { tray._noteSettingsRestored(true, missing, anything); return }
+            var corr = rpc.rpcBlockNoticeMutesSet(mutes[at])
+            if (!corr) { tray._noteSettingsRestored(false, missing, anything); return }
+            rpc.registerRpcCallback(corr, function(ok, p) {
+                if (!ok) { tray._noteSettingsRestored(false, missing, anything); return }
+                if (at === mutes.length - 1)
+                    tray._recordIntent({ "namespace": "notice-mutes",
+                                         "value": (p && p.mutes) || [] })
+                restoreMutes(at + 1)
+            })
+        }
+        if (plan.request === null) { restoreMutes(0); return }
+        var writeCorr = nrrNativeBridge.rpcRoutePolicyUpdate(plan.request)
+        if (!writeCorr) { tray._noteSettingsRestored(false, missing, anything); return }
+        rpc.registerRpcCallback(writeCorr, function(ok) {
+            if (!ok) { tray._noteSettingsRestored(false, missing, anything); return }
+            var merge = {}
+            for (var k = 0; k < plan.keys.length; k += 1)
+                merge[plan.keys[k]] = plan.request[plan.keys[k]]
+            tray._recordIntent({ "namespace": "route-policy", "merge": merge })
+            restoreMutes(0)
+        })
+    }
+
+    /// `restoredAny` false with `ok`: nothing was sent, because the service
+    /// had it all or the adapters are gone — "restored" would be a lie.
+    function _noteSettingsRestored(ok, missing, restoredAny) {
+        var body = !ok
+            ? tray.tr("tray.settings-restore-failed",
                 "Your settings could not be restored. Open the app to try again.")
+            : restoredAny
+                ? tray.tr("status.settings-restored", "Your settings were restored.")
+                : (missing.length > 0 ? ""
+                    : tray.tr("status.settings-restore-nothing",
+                        "The service already has your settings."))
         if (missing.length > 0) {
-            body += " " + tray.tr("status.settings-restore-adapter-missing",
+            body += (body === "" ? "" : " ")
+                + tray.tr("status.settings-restore-adapter-missing",
                     "Not restored: the adapter {name} is not on this computer now.")
                 .replace("{name}", Pure.displayTextList(missing).join(", "))
         }
@@ -2279,7 +2403,8 @@ SystemTrayIcon {
                         accent: true
                     },
                     secondaryAction: tray._noticeMuteAction("local-networks"),
-                    dismissActionId: "enforcement-dismiss"
+                    dismissActionId: "enforcement-dismiss",
+                    autoRetireMs: tray._promptAutoRetireMs
                 })
             })
         })
@@ -2418,9 +2543,9 @@ SystemTrayIcon {
         })
     }
 
-    /// The push fires on change only: a tray that subscribed later reads the
-    /// standing state from the snapshot.
-    function _checkRulesBook() {
+    /// The pushes fire on change only: a tray that subscribed later, or lost
+    /// frames, reads the standing state from the snapshot.
+    function _readStandingState() {
         if (!bridgeAvailable || typeof nrrNativeBridge === "undefined"
                 || nrrNativeBridge === null
                 || typeof nrrNativeBridge.rpcSnapshotInitialGet !== "function") {
@@ -2431,6 +2556,13 @@ SystemTrayIcon {
         rpc.registerRpcCallback(corr, function(ok, payload) {
             if (!ok || !payload) return
             tray._onRulesBookReading(payload["rules-book-unreadable"] === true)
+            var policy = payload["route-policy"] || {}
+            var level = Pure.routePolicyEffective(policy, "leak-protection")
+            if (level) tray._leakProtection = level
+            tray._onVpnClientAwaitingConfirmation(
+                { clients: payload["pending-vpn-clients"] || [] })
+            tray._onVpnGatewayAwaitingConfirmation(
+                { gateways: payload["pending-vpn-gateways"] || [] })
         })
     }
 
@@ -2537,7 +2669,8 @@ SystemTrayIcon {
                     actionId: "forwarded-traffic-open-settings",
                     accent: true
                 },
-                dismissActionId: "enforcement-dismiss"
+                dismissActionId: "enforcement-dismiss",
+                autoRetireMs: tray._promptAutoRetireMs
             })
         })
     }
@@ -2649,9 +2782,13 @@ SystemTrayIcon {
     /// A VPN-named program leak protection does not trust by place. The
     /// question itself is asked in the window; the tray says it is waiting
     /// there, and only while the window is not on screen.
+    property var _vpnClientsAsked: []
     function _onVpnClientAwaitingConfirmation(event) {
         var offers = Pure.vpnClientTrustOffers(event.clients || [])
-        if (offers.length === 0 || !showNotifications) return
+        var step = Pure.standingOfferStep(_vpnClientsAsked,
+            offers.map(function(o) { return o.exePath }))
+        _vpnClientsAsked = step.shown
+        if (!step.raise || !showNotifications) return
         if (_windowOnScreen()) return
         var names = []
         for (var i = 0; i < offers.length; i += 1) names.push(Pure.displayText(offers[i].name))
@@ -2674,9 +2811,13 @@ SystemTrayIcon {
 
     /// Another VPN's server stopped on the main link: asked in the window,
     /// announced here only while the window is not on screen.
+    property var _vpnGatewaysAsked: []
     function _onVpnGatewayAwaitingConfirmation(event) {
         var offers = Pure.vpnGatewayOffers(event.gateways || [])
-        if (offers.length === 0 || !showNotifications) return
+        var step = Pure.standingOfferStep(_vpnGatewaysAsked,
+            offers.map(function(o) { return o.address }))
+        _vpnGatewaysAsked = step.shown
+        if (!step.raise || !showNotifications) return
         if (_windowOnScreen()) return
         var addresses = []
         for (var i = 0; i < offers.length; i += 1) addresses.push(Pure.displayText(offers[i].address))
@@ -2748,10 +2889,12 @@ SystemTrayIcon {
 
     function _rereadAfterPushGap() {
         _refreshRoutingPaused()
+        // A quick restart into another build leaves the SCM status unchanged.
+        _refreshContractSkew()
         _refreshEnforcementState()
         verifyVerdicts.refresh()
         _checkForwarded()
-        _checkRulesBook()
+        _readStandingState()
         _refreshAutoRulePendingCount()
         // A lost revision change: with the window closed the linked files
         // still follow the rules in force.
@@ -2977,8 +3120,13 @@ SystemTrayIcon {
             } else {
                 title = tr("notifications.enforcement.secondary-down.title",
                     "The additional connection is not up")
-                body = tr("notifications.enforcement.secondary-down.body",
-                    "Everything your rules send there is being held until it comes back — that is the protection doing its job, not a fault. Start the connection, or move those rules to the main one.")
+                var bodyKey = Pure.enforcementSecondaryDownBodyKey(tray._leakProtection)
+                if (bodyKey === "notifications.enforcement.secondary-down.body-off")
+                    body = tr(bodyKey, "Sites your rules send there go over the main connection until it comes back: leak protection is off. Start the connection, or turn leak protection on to hold them instead.")
+                else if (bodyKey === "notifications.enforcement.secondary-down.body-everything")
+                    body = tr(bodyKey, "The internet waits until it comes back, except your local network and what your rules send over the main connection — that is the protection doing its job, not a fault. Start the connection.")
+                else
+                    body = tr(bodyKey, "Everything your rules send there is being held until it comes back — that is the protection doing its job, not a fault. Start the connection, or move those rules to the main one.")
             }
         } else if (status === "adapters-unreadable") {
             title = tr("notifications.enforcement.adapters-unreadable.title",
@@ -3096,7 +3244,9 @@ SystemTrayIcon {
             titleText: targets.length === 1
                 ? tr("tray.block-notice.route-confirm.title",
                     "Route {name} via the additional link?")
-                    .replace("{name}", Pure.displayText(targets[0]))
+                    .replace("{name}", hideBlockNoticeAddresses
+                        ? tr("notifications.block-notice.destination-hidden", "a hidden destination")
+                        : Pure.displayText(targets[0]))
                 : tr("tray.block-notice.route-confirm.title-many",
                     "Route {count} addresses via the additional link?")
                     .replace("{count}", String(targets.length)),
@@ -3349,12 +3499,14 @@ SystemTrayIcon {
         if (action === "verify-verdicts-move" || action === "verify-verdicts-later"
                 || action === "verify-verdicts-close") {
             _verifyVerdictOnScreen = false
+            var shownIds = _verifyVerdictOnScreenIds
+            _verifyVerdictOnScreenIds = []
             if (action === "verify-verdicts-move") {
-                _moveVerifyVerdicts()
+                _moveVerifyVerdicts(shownIds)
             } else if (action === "verify-verdicts-later") {
                 verifyVerdicts.dismiss(function(ok, code) {
                     if (!ok) console.log("tray verify-verdicts: dismiss failed:", code)
-                })
+                }, shownIds)
             }
             _scheduleDrain()
             return
@@ -3520,8 +3672,16 @@ SystemTrayIcon {
             _scheduleDrain()
             return
         }
+        if (action === "tray-add-rule-open-rules") {
+            _addRuleUndo = null
+            triggerAction("rules")
+            _scheduleDrain()
+            return
+        }
         if (action === "enforcement-restored-dismiss"
-                || action === "auto-rules-mode-failed-dismiss") {
+                || action === "auto-rules-mode-failed-dismiss"
+                || action === "leak-protection-failed-dismiss"
+                || action === "pause-failed-dismiss") {
             _scheduleDrain()
             return
         }
@@ -4049,7 +4209,10 @@ SystemTrayIcon {
     /// omitted would silently revert to a default. A level that must be
     /// confirmed first (`leakProtectionConfirmSlug`) is asked about, and only
     /// a yes (`confirmed`) writes it.
-    function _setLeakProtection(level, confirmed) {
+    ///
+    /// A busy service gets the write again; a failure that stays is told to the
+    /// user — the menu has closed and a reverted tick is all it would show.
+    function _setLeakProtection(level, confirmed, attemptsMade) {
         if (!bridgeAvailable || typeof nrrNativeBridge === "undefined"
                 || nrrNativeBridge === null
                 || typeof nrrNativeBridge.rpcSnapshotInitialGet !== "function"
@@ -4057,21 +4220,43 @@ SystemTrayIcon {
             tray._syncLeakMenu()
             return
         }
-        var readCorr = nrrNativeBridge.rpcSnapshotInitialGet()
-        rpc.registerRpcCallback(readCorr, function(ok, payload, code, msg) {
-            if (!ok) {
-                console.warn("tray leak protection: policy read failed:", code, msg)
-                tray._syncLeakMenu()
+        var attempt = Number(attemptsMade || 0)
+        // A new click supersedes a repeat still waiting and any answer still due.
+        if (attempt === 0) {
+            tray._leakProtectionRetryTimer.stop()
+            tray._leakProtectionGeneration += 1
+        }
+        var generation = tray._leakProtectionGeneration
+        var failed = function(stage, code, msg) {
+            if (generation !== tray._leakProtectionGeneration) return
+            var delay = Pure.busyRetryDelayMs(code, attempt)
+            if (delay >= 0) {
+                console.log("tray leak protection", stage, "got no answer in time; again in", delay, "ms")
+                tray._leakProtectionRetry = function() {
+                    tray._setLeakProtection(level, confirmed, attempt + 1)
+                }
+                tray._leakProtectionRetryTimer.interval = delay
+                tray._leakProtectionRetryTimer.restart()
                 return
             }
+            console.warn("tray leak protection", stage, "failed:", code, msg)
+            tray._syncLeakMenu()
+            tray._noteLeakProtectionFailed(code)
+        }
+        var readCorr = nrrNativeBridge.rpcSnapshotInitialGet()
+        if (!readCorr) { failed("read", "bridge-unavailable", ""); return }
+        rpc.registerRpcCallback(readCorr, function(ok, payload, code, msg) {
+            if (!ok) { failed("read", code, msg); return }
+            if (generation !== tray._leakProtectionGeneration) return
             var cur = (payload && (payload["route-policy"] || payload.routePolicy)) || {}
             if (confirmed === true
                     || typeof nrrNativeBridge.rpcSnapshotInterfacesGet !== "function") {
-                tray._writeLeakProtection(cur, level)
+                tray._writeLeakProtection(cur, level, failed)
                 return
             }
             var rowsCorr = nrrNativeBridge.rpcSnapshotInterfacesGet()
             rpc.registerRpcCallback(rowsCorr, function(rowsOk, rowsPayload) {
+                if (generation !== tray._leakProtectionGeneration) return
                 var rows = (rowsOk && rowsPayload && rowsPayload.rows) || []
                 var i = Pure.boundWireRowIndex(rows, cur["secondary"] || null)
                 var row = i >= 0 ? Pure.mapWireInterfaceRow(rows[i]) : null
@@ -4080,13 +4265,37 @@ SystemTrayIcon {
                     Pure.coerceLeakProtection(mode, Pure.routePolicyEffective(cur, "leak-protection")),
                     Pure.coerceLeakProtection(mode, level), row)
                 if (why === "") {
-                    tray._writeLeakProtection(cur, level)
+                    tray._writeLeakProtection(cur, level, failed)
                     return
                 }
                 tray._syncLeakMenu()
                 tray._confirmLeakProtection(level, why, row)
             })
         })
+    }
+
+    property var _leakProtectionRetry: null
+    property int _leakProtectionGeneration: 0
+    property Timer _leakProtectionRetryTimer: Timer {
+        repeat: false
+        onTriggered: {
+            var again = tray._leakProtectionRetry
+            tray._leakProtectionRetry = null
+            if (typeof again === "function") again()
+        }
+    }
+
+    function _noteLeakProtectionFailed(code) {
+        var body = tray.tr("status.kill-switch-enabled-failed", "Could not update leak protection: ")
+            + Pure.ipcErrorLabel(code, null, tray.tr)
+        tray._presentOrQueue("leak-protection-failed", function() {
+            promptWindow.present({
+                titleText: tray.tr("settings.routing.kill-switch.title", "Leak protection"),
+                bodyText: body,
+                dismissActionId: "leak-protection-failed-dismiss",
+                autoRetireMs: tray._infoNoticeMs
+            })
+        }, true)
     }
 
     /// The yes/no before a level that holds traffic, in the tray's own window:
@@ -4127,20 +4336,17 @@ SystemTrayIcon {
                 },
                 autoRetireMs: tray._promptAutoRetireMs
             })
-        })
+        }, true)
     }
 
-    function _writeLeakProtection(cur, level) {
+    function _writeLeakProtection(cur, level, failed) {
         var req = tray._buildFullRoutePolicyReq(cur)
         req["leak-protection"] = Pure.coerceLeakProtection(req["mode"], level)
         req["apply-only"] = ["leak-protection"]
         var writeCorr = nrrNativeBridge.rpcRoutePolicyUpdate(req)
+        if (!writeCorr) { failed("write", "bridge-unavailable", ""); return }
         tray.rpc.registerRpcCallback(writeCorr, function(ok, p, code, msg) {
-            if (!ok) {
-                console.warn("tray leak protection: write failed:", code, msg)
-                tray._syncLeakMenu()
-                return
-            }
+            if (!ok) { failed("write", code, msg); return }
             tray._routeMode = String(req["mode"])
             tray._leakProtection = req["leak-protection"]
             tray._syncLeakMenu()
@@ -4305,7 +4511,7 @@ SystemTrayIcon {
             return
         }
         _silenceChoiceReplacedOffer = false
-        _presentOrQueue("suggestions-silence", show)
+        _presentOrQueue("suggestions-silence", show, true)
     }
 
     /// One entry turns the rules off; how long is asked here, the way the
@@ -4340,7 +4546,7 @@ SystemTrayIcon {
                 dismissActionId: "pause-term-cancel",
                 autoRetireMs: _promptAutoRetireMs
             })
-        })
+        }, true)
     }
 
     function _onPauseTermChoice(action) {
@@ -4354,10 +4560,25 @@ SystemTrayIcon {
                 if (!ok) {
                     console.log("tray pause failed:", code, msg)
                     tray.routingPaused = prev
+                    tray._notePauseFailed(code)
                 }
             })
         }
         _scheduleDrain()
+    }
+
+    /// The menu has closed; a tick that went back is not an answer.
+    function _notePauseFailed(code) {
+        var body = tray.tr("tray.pause.failed", "Could not turn the rules off: ")
+            + Pure.ipcErrorLabel(code, null, tray.tr)
+        tray._presentOrQueue("pause-failed", function() {
+            promptWindow.present({
+                titleText: tray.tr("tray.pause.title", "Turn off rules"),
+                bodyText: body,
+                dismissActionId: "pause-failed-dismiss",
+                autoRetireMs: tray._infoNoticeMs
+            })
+        }, true)
     }
 
     function _onSuggestionsSilenceChoice(action) {
@@ -4799,11 +5020,12 @@ SystemTrayIcon {
             if (ok) {
                 // The event stream is live, so the tray can now say what is
                 // actually being enforced instead of guessing.
+                tray._refreshRoutingPaused()
                 tray._refreshEnforcementState()
                 tray._refreshContractSkew()
                 tray._refreshNoticeMutes(null)
                 tray._scheduleSettingsLostCheck()
-                tray._checkRulesBook()
+                tray._readStandingState()
                 // Both surfaces drain the same backlog, and the main window
                 // does it immediately. Waiting lets its acknowledgement land
                 // first, so a user who has both up is told once, not twice.

@@ -26,7 +26,7 @@ use std::time::{Duration, Instant};
 
 use nrr_platform_api::adapters::{replacement_candidates, AdapterEventSource};
 use nrr_platform_api::enforcement::{
-    ApplyReport, ChannelAvailability, ChannelReport, ChannelState, EgressBindingSource,
+    ApplyNote, ApplyReport, ChannelAvailability, ChannelReport, ChannelState, EgressBindingSource,
     EnforcementFailure, EnforcementPlan, PolicyEnforcer, UserPrincipal,
 };
 use nrr_platform_api::fake_ip::stale_flows::FlowLinks;
@@ -303,7 +303,7 @@ impl PolicyEnforcer for NftPolicyEnforcer {
         let started = Instant::now();
         let lowered = self.lower(plans)?;
         let lowered_at = Instant::now();
-        let notes_for_unsupported = || -> Vec<String> {
+        let notes_for_unsupported = || -> Vec<ApplyNote> {
             lowered
                 .unsupported
                 .iter()
@@ -329,7 +329,7 @@ impl PolicyEnforcer for NftPolicyEnforcer {
                         last.verified_at = Instant::now();
                     }
                     let mut notes = notes_for_unsupported();
-                    notes.extend(last.refused_notes.iter().cloned());
+                    notes.extend(last.refused_notes.iter().cloned().map(ApplyNote::machine));
                     return Ok(ApplyReport {
                         applied: last.rules,
                         skipped: lowered.unsupported.len() + last.refused_notes.len(),
@@ -371,7 +371,7 @@ impl PolicyEnforcer for NftPolicyEnforcer {
         drop(applied);
 
         let mut notes = notes_for_unsupported();
-        notes.extend(refused_notes);
+        notes.extend(refused_notes.into_iter().map(ApplyNote::machine));
 
         Ok(ApplyReport {
             applied: outcome.applied,
@@ -672,7 +672,7 @@ mod tests {
         let report = enforcer.enforce(&[]).expect("unchanged pass");
         assert_eq!(logged(&log, "run"), 1, "an unchanged pass searched again");
         assert_eq!(report.skipped, 1);
-        assert!(report.notes.iter().any(|n| n == "refused"));
+        assert!(report.notes.iter().any(|n| n.text == "refused"));
 
         enforcer.distrust_installed();
         enforcer.enforce(&[]).expect("explicit apply");

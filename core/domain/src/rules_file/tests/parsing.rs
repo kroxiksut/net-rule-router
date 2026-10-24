@@ -774,3 +774,74 @@ fn parse_version_header_only_matched_in_preamble() {
     // file_format_version stays None because the header was not in the preamble.
     assert_eq!(outcome.file_format_version, None);
 }
+
+/// A `#` inside a program value is part of it: only a `#` after whitespace
+/// opens a comment, and the writer quotes a value carrying such a `#`, so
+/// saving and reading the file back keeps every program it names.
+#[test]
+fn a_hash_inside_a_program_value_survives_the_round_trip() {
+    let file = r#"--- Windows
+C:\Projects\C#\tool.exe  # build tool
+# c#tool.exe
+"C:\My #1\app.exe" +children
+C:\My  Tools\app.exe
+"#;
+    let values = |parsed: &RulesFileParsed| -> Vec<(String, bool, Option<String>, bool)> {
+        parsed
+            .entries_for(RulesFileSection::Windows)
+            .iter()
+            .map(|e| {
+                (
+                    e.match_value.clone(),
+                    e.enabled,
+                    e.inline_comment.clone(),
+                    e.children_requested,
+                )
+            })
+            .collect()
+    };
+    let expected = vec![
+        (
+            r"C:\Projects\C#\tool.exe".to_string(),
+            true,
+            Some("build tool".to_string()),
+            false,
+        ),
+        ("c#tool.exe".to_string(), false, None, false),
+        (r"C:\My #1\app.exe".to_string(), true, None, true),
+        (r"C:\My  Tools\app.exe".to_string(), true, None, false),
+    ];
+    let first = parse_rules_file(file).parsed;
+    assert_eq!(values(&first), expected);
+
+    let written = write_rules_file(&first, &[], None);
+    assert!(
+        written.contains("\n\"C:\\My #1\\app.exe\" +children\n"),
+        "{written}"
+    );
+    assert!(
+        written.contains("\nC:\\Projects\\C#\\tool.exe  # build tool\n"),
+        "{written}"
+    );
+    assert_eq!(values(&parse_rules_file(&written).parsed), expected);
+}
+
+/// A one-word note under an address section is a note: read as a disabled
+/// address, the validator refused the whole file over it.
+#[test]
+fn a_one_word_note_in_an_address_section_is_a_comment() {
+    for (section, value) in [
+        (RulesFileSection::Ip, "203.0.113.7"),
+        (RulesFileSection::Cidr, "203.0.113.0/24"),
+        (RulesFileSection::Ranges, "203.0.113.5-203.0.113.9"),
+    ] {
+        let file = format!("--- {}\n# Office\n{value}\n# {value}\n", section.name());
+        let parsed = parse_rules_file(&file).parsed;
+        let entries: Vec<(&str, bool)> = parsed
+            .entries_for(section)
+            .iter()
+            .map(|e| (e.match_value.as_str(), e.enabled))
+            .collect();
+        assert_eq!(entries, vec![(value, true), (value, false)], "{section}");
+    }
+}

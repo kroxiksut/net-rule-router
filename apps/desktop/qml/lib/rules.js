@@ -798,6 +798,87 @@ function mainRouteCheckHosts(rows) {
     return hosts
 }
 
+// ---- the table's filters and order (nrr-client-logic `rules_table::view`) ----
+
+// The filter boxes' choices, in the order the window offers them.
+var RULES_STATUS_FILTERS = ["all", "enabled-only", "disabled-only", "with-errors", "overridden"]
+var RULES_ROUTE_FILTERS = ["all", "primary", "secondary", "block", "unsure"]
+var RULES_TYPE_FILTERS = ["all", "zone", "domain", "exact-ip", "ip-range", "subnet", "application"]
+var RULES_SORT_COLUMNS = ["by-display-order", "by-match-value", "by-type", "by-route", "by-main-route"]
+
+// Whether a table row passes `filters` ({status, type, route, autoOnly,
+// recentOnly, search}). The table, not the row, knows which rules were applied
+// over the protection and which changed lately: `isOverridden()` and
+// `isRecent()` answer those on demand.
+function rulePassesFilters(item, filters, isOverridden, isRecent) {
+    if (!item) return false
+    var f = filters || {}
+    var status = String(f.status || "all")
+    if (status === "enabled-only" && !item.enabled) return false
+    if (status === "disabled-only" && item.enabled) return false
+    if (status === "overridden" && !isOverridden()) return false
+    // A warning does not disable the rule, so it is not an error here.
+    if (status === "with-errors" && String(item.validationStatus || "valid") !== "error") return false
+    var type = String(f.type || "all")
+    if (type !== "all" && canonicalRuleTypeSlug(item.ruleType) !== type) return false
+    var route = String(f.route || "all")
+    if (route === "unsure") {
+        if (!rowIsVerify(item)) return false
+    } else if (route !== "all" && String(item.targetRoute || "") !== route) {
+        return false
+    }
+    if (f.autoOnly && String(item.originReason || "") === "") return false
+    if (f.recentOnly && !isRecent()) return false
+    var search = String(f.search || "")
+    if (search !== "") {
+        // The needle is cleaned like a rule value too, for URL-shaped text
+        // without a scheme (`site.com/page`), which the search box leaves as typed.
+        var typed = search.trim().toLowerCase()
+        var needle = String(normalizeHostInput("domain", typed))
+        // Bare punctuation (`/`) cleans to nothing, which would match all.
+        if (needle === "") needle = typed
+        // Both the Unicode value and its lower-case ACE form, so `xn--p1ai`
+        // finds `рф` and back; the text as typed too, since a subnet's `/`
+        // and an IPv6 address's `:` read as URL punctuation to the cleaner.
+        var hay = (String(item.matchValue || "") + " "
+            + String(item.aceMatchValue || "") + " "
+            + String(item.comment || "")).toLowerCase()
+        if (hay.indexOf(needle) < 0 && hay.indexOf(typed) < 0) return false
+    }
+    return true
+}
+
+function _codeUnitCompare(a, b) {
+    return a < b ? -1 : (a > b ? 1 : 0)
+}
+
+// Text order shared with the terminal: case folded first, then as written, so
+// both clients agree without a locale-aware collator.
+function compareRuleText(a, b) {
+    var x = String(a || "")
+    var y = String(b || "")
+    return _codeUnitCompare(x.toLowerCase(), y.toLowerCase()) || _codeUnitCompare(x, y)
+}
+
+// The order of two rows under `sortBy`; ties on a column fall back to the
+// value. Callers' sorts are stable, so rows equal here keep their order.
+function compareRuleRows(a, b, sortBy, sortDir) {
+    if (!a || !b) return 0
+    var byValue = compareRuleText(a.matchValue, b.matchValue)
+    var cmp
+    switch (String(sortBy || "")) {
+    case "by-match-value": cmp = byValue; break
+    // The spelling the row arrived with, as the column sorts.
+    case "by-type": cmp = compareRuleText(a.ruleType, b.ruleType) || byValue; break
+    case "by-route": cmp = compareRuleText(a.targetRoute, b.targetRoute) || byValue; break
+    case "by-main-route": cmp = (mainRouteRank(a.mainRoute) - mainRouteRank(b.mainRoute)) || byValue; break
+    // Display order: rule ids encode insertion order.
+    default: cmp = compareRuleText(a.id, b.id)
+    }
+    if (cmp === 0) return 0
+    return sortDir === "desc" ? -cmp : cmp
+}
+
 // The file name of a program typed or picked with its path.
 function vpnProgramFileName(raw) {
     var parts = String(raw || "").trim().split(/[\\\/]/)
@@ -1079,19 +1160,20 @@ function planRuleAddition(rows, items, moveElsewhere) {
     for (var i = 0; i < _rowCount(rows); i += 1) out.push(_rowAt(rows, i))
     var plan = { rows: out, added: 0, changed: 0, addedRows: [], movedRows: [],
         duplicates: [], elsewhere: [] }
+    // A program's `+children` / `+override` do not make it a second rule.
+    var identity = function(row) {
+        return _bulkRuleIdentity(canonicalRuleTypeSlug(row.ruleType), String(row.matchValue || ""))
+    }
     for (var k = 0; k < items.length; k += 1) {
         var item = items[k]
-        var key = mergeKey(item)
-        var sameValue = canonicalRuleTypeSlug(item.ruleType) + "|"
-            + String(item.matchValue || "").toLowerCase()
+        var sameValue = identity(item)
+        var key = sameValue + "|" + String(item.targetRoute || "")
         var duplicate = false
         var other = -1
         for (var r = 0; r < out.length; r += 1) {
-            if (mergeKey(out[r]) === key) { duplicate = true; break }
-            if (other < 0 && canonicalRuleTypeSlug(out[r].ruleType) + "|"
-                    + String(out[r].matchValue || "").toLowerCase() === sameValue) {
-                other = r
-            }
+            var there = identity(out[r])
+            if (there + "|" + String(out[r].targetRoute || "") === key) { duplicate = true; break }
+            if (other < 0 && there === sameValue) other = r
         }
         if (duplicate) {
             plan.duplicates.push(item)
@@ -1665,19 +1747,35 @@ function _bulkMarkers(value, readsVerify) {
     return { rest: rest, deny: deny, verify: verify }
 }
 
-// `split_rule_flags`: words rejoined, every later `+children` and
-// `+override` taken off.
+// `split_rule_flags`: every later `+children` and `+override` taken off; the
+// whitespace between kept words stays as written, one space closes a flag's gap.
 function _bulkSplitRuleFlags(value) {
-    var words = _bulkWords(value)
-    var kept = []
+    var s = String(value)
+    var out = ""
     var children = false
     var override = false
-    for (var i = 0; i < words.length; i += 1) {
-        if (i > 0 && words[i] === "+children") children = true
-        else if (i > 0 && words[i] === "+override") override = true
-        else kept.push(words[i])
+    var keptEnd = -1
+    var idx = 0
+    var start = -1
+    for (var i = 0; i <= s.length; i += 1) {
+        var space = i === s.length || _rvcIsSpaceUnit(s.charCodeAt(i))
+        if (!space && start < 0) start = i
+        if (!space || start < 0) continue
+        var word = s.substring(start, i)
+        if (idx > 0 && (word === "+children" || word === "+override")) {
+            if (word === "+children") children = true
+            else override = true
+            keptEnd = -1
+        } else {
+            if (keptEnd >= 0) out += s.substring(keptEnd, start)
+            else if (out !== "") out += " "
+            out += word
+            keptEnd = i
+        }
+        idx += 1
+        start = -1
     }
-    return { value: kept.join(" "), children: children, override: override }
+    return { value: out, children: children, override: override }
 }
 
 // `unquote_program_value`: the value inside one outer pair of quotes,
@@ -1689,12 +1787,39 @@ function _unquoteProgramValue(value) {
     return inner === "" ? null : inner
 }
 
+// `split_inline_comment`: a comment starts at a `#` opening the body or after
+// whitespace, past a leading quoted value; `comment` is null without one.
+function _splitInlineComment(body) {
+    var s = String(body)
+    var marks = 0
+    while (marks < s.length && (s.charAt(marks) === "!" || s.charAt(marks) === "?")) marks += 1
+    var from = 0
+    if (s.charAt(marks) === "\"") {
+        for (var q = marks + 1; q < s.length; q += 1) {
+            if (s.charAt(q) === "\""
+                    && (q + 1 === s.length || _rvcIsSpaceUnit(s.charCodeAt(q + 1)))) {
+                from = q + 1
+                break
+            }
+        }
+    }
+    var prevSpace = from === 0
+    for (var i = from; i < s.length; i += 1) {
+        if (prevSpace && s.charAt(i) === "#") {
+            return { value: s.substring(0, i), comment: s.substring(i + 1) }
+        }
+        prevSpace = _rvcIsSpaceUnit(s.charCodeAt(i))
+    }
+    return { value: s, comment: null }
+}
+
 // `program_value_on_line`: a program's value in quotes where the bare value
 // would not read back; the flags stay outside them.
 function programValueOnLine(value, enabled) {
     var split = _bulkSplitRuleFlags(String(value))
     var bare = split.value
     var misread = _unquoteProgramValue(bare) !== null
+        || _splitInlineComment(bare).comment !== null
         || (!enabled && !_bulkIsDisabledRuleValue("application", bare))
     if (bare === "" || !misread) return value
     return storedRuleValue("application", "\"" + bare + "\"", split.children, split.override)
@@ -1714,12 +1839,19 @@ function withoutRuleFlags(value) {
     return (split.children || split.override) ? split.value : value
 }
 
+// Whether a table's value carries `+override`: the rule waits for the user's
+// confirmation before it applies, on a program only.
+function ruleValueAsksOverride(ruleType, value) {
+    if (String(ruleType || "") !== "application") return false
+    return _bulkSplitRuleFlags(String(value || "")).override
+}
+
 // `app_match_key`: the file name, ASCII lower case, without `.exe`.
 function _appMatchKey(raw) {
     var t = _rvcTrim(String(raw || ""))
     var cut = Math.max(t.lastIndexOf("\\"), t.lastIndexOf("/"))
-    var name = (cut >= 0 ? t.substring(cut + 1) : t)
-        .replace(/[A-Z]/g, function(c) { return c.toLowerCase() })
+    // Folded over all of Unicode, as the service stores names.
+    var name = (cut >= 0 ? t.substring(cut + 1) : t).toLowerCase()
     if (name.length > 4 && name.substring(name.length - 4) === ".exe")
         return name.substring(0, name.length - 4)
     return name
@@ -1736,10 +1868,9 @@ function ruleOverrideKey(ruleType, value, route, os) {
     var o = String(os || "")
     var windows = o !== "linux" && o !== "macos"
     var isPath = bare.indexOf("/") >= 0 || (windows && bare.indexOf("\\") >= 0)
-    var lower = function(s) { return s.replace(/[A-Z]/g, function(c) { return c.toLowerCase() }) }
     var spelled = !isPath ? _appMatchKey(bare)
-        : windows ? lower(bare.replace(/\//g, "\\"))
-        : o === "macos" ? lower(bare)
+        : windows ? bare.replace(/\//g, "\\").toLowerCase()
+        : o === "macos" ? bare.toLowerCase()
         : bare
     return r + "|" + spelled
 }
@@ -1829,11 +1960,31 @@ function _bulkIpBlock(text) {
 }
 
 // `is_disabled_rule_value`: whether a `#` line under `type` is a rule or a note.
+// `looks_like_a_host_value`: one word of letters, digits, `.`, `-`, `_` and
+// `*`, any non-ASCII letter among them.
+function _bulkLooksLikeHost(value) {
+    if (value === "") return false
+    for (var i = 0; i < value.length; i += 1) {
+        var u = value.charCodeAt(i)
+        if (_rvcIsSpaceUnit(u)) return false
+        if (u >= 0x80) continue
+        var c = value.charAt(i)
+        if (!/[A-Za-z0-9._*-]/.test(c)) return false
+    }
+    return true
+}
+
 function _bulkIsDisabledRuleValue(type, value) {
     var unblocked = _bulkWithoutRetiredBlock(value)
     var v = unblocked !== null ? unblocked : value
     var trimmed = _rvcTrim(v)
-    if (trimmed !== "" && _bulkWords(trimmed).length === 1) return true
+    // Marks left on an address (`!?`, which takes neither) do not make it a
+    // note: the validator refuses the pair instead.
+    var unmarked = trimmed.replace(/^[!?]+/, "")
+    // The section's type first: `# Office` under `--- IP` is a note.
+    if (type === "exact-ip") return _bulkIpAddr(unmarked)
+    if (type === "zone" || type === "domain") return _bulkLooksLikeHost(unmarked)
+    if (type === "application" && trimmed !== "" && _bulkWords(trimmed).length === 1) return true
     if (type === "application") {
         // `names_a_place`: a spaced path rule (`C:\Program Files\App\*`).
         if (/^[A-Za-z]:[\\\/]/.test(trimmed) || trimmed.indexOf("\\\\") === 0) return true
@@ -1843,11 +1994,11 @@ function _bulkIsDisabledRuleValue(type, value) {
         var ext = trimmed.substring(dot + 1).replace(/[A-Z]/g, function(c) { return c.toLowerCase() })
         return ext === "exe" || ext === "com" || ext === "app" || ext === "appimage"
     }
-    if (type === "subnet") return _bulkIpBlock(trimmed)
+    if (type === "subnet") return _bulkIpBlock(unmarked)
     if (type === "ip-range") {
-        var dash = trimmed.indexOf("-")
-        return dash >= 0 && _bulkIpAddr(_rvcTrim(trimmed.substring(0, dash)))
-            && _bulkIpAddr(_rvcTrim(trimmed.substring(dash + 1)))
+        var dash = unmarked.indexOf("-")
+        return dash >= 0 && _bulkIpAddr(_rvcTrim(unmarked.substring(0, dash)))
+            && _bulkIpAddr(_rvcTrim(unmarked.substring(dash + 1)))
     }
     return false
 }
@@ -1958,9 +2109,10 @@ function _bulkLine(ctx, raw, lineNo) {
     var hashed = t.charAt(0) === "#"
     var body = t.indexOf("# ") === 0 ? t.substring(2) : hashed ? t.substring(1) : t
     if (hashed && body === "") return null
-    var hash = body.indexOf("#")
-    var comment = hash >= 0 ? _rvcTrim(body.substring(hash + 1)) : ""
-    var collapsed = _bulkWords(hash >= 0 ? body.substring(0, hash) : body).join(" ")
+    var cut = _splitInlineComment(body)
+    var comment = cut.comment !== null ? _rvcTrim(cut.comment) : ""
+    // Trimmed, never collapsed: the file keeps inner spaces of a path whole.
+    var collapsed = _rvcTrim(cut.value)
     if (collapsed === "") return null
     if (sec.name !== "" && sec.type === "") {
         // An import keeps such a section aside and applies none of it.
@@ -2060,9 +2212,15 @@ function _bulkLine(ctx, raw, lineNo) {
     return _bulkPlace(ctx, row, choice)
 }
 
+// Which rule a line names: type and value without `+children` / `+override`
+// (`bulk_rules.rs::rule_identity`).
+function _bulkRuleIdentity(type, value) {
+    return type + "|" + withoutRuleFlags(value).toLowerCase()
+}
+
 // Where a judged row lands against the text so far and the rules there.
 function _bulkPlace(ctx, row, choice) {
-    var same = row.type + "|" + row.value.toLowerCase()
+    var same = _bulkRuleIdentity(row.type, row.value)
     var key = same + "|" + row.route
     if (_bulkOwn(ctx.seen, key)) {
         var earlier = ctx.rows[ctx.seen[key]]
@@ -2140,7 +2298,7 @@ function planBulkRules(input) {
     }
     for (var e = 0; e < ctx.existing.length; e += 1) {
         var ex = ctx.existing[e] || {}
-        var same = canonicalRuleTypeSlug(ex.type) + "|" + String(ex.value || "").toLowerCase()
+        var same = _bulkRuleIdentity(canonicalRuleTypeSlug(ex.type), String(ex.value || ""))
         var key = same + "|" + String(ex.route || "")
         if (!_bulkOwn(ctx.existingKey, key)) ctx.existingKey[key] = e
         if (!_bulkOwn(ctx.existingValue, same)) ctx.existingValue[same] = e

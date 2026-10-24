@@ -1047,8 +1047,13 @@ fn mode_a_prefer_primary_emits_secondary_host_routes_no_overlay() {
 #[test]
 fn the_counter_overlay_is_one_bit_longer_than_whatever_the_tunnel_installed() {
     let ip = |a, b, c, d| Ipv4Addr::new(a, b, c, d);
-    // No visible catch-alls → the classic four /2.
-    assert_eq!(counter_overlay_for(&[]), COUNTER_OVERLAY.to_vec());
+    // A tunnel that takes nothing is answered with nothing; an unread table
+    // is taken to hold the classic pair.
+    assert!(counter_overlay_for(&[]).is_empty());
+    assert_eq!(
+        counter_overlay_for(&crate::route_codegen::ASSUMED_CATCH_ALLS),
+        COUNTER_OVERLAY.to_vec()
+    );
     // A redirect-gateway /1 pair → the same four /2.
     assert_eq!(
         counter_overlay_for(&[(ip(0, 0, 0, 0), 1), (ip(128, 0, 0, 0), 1)]),
@@ -1105,6 +1110,9 @@ fn tunnel_catch_alls_are_the_wide_unicast_routes_on_the_tunnel_that_are_not_ours
         r([224, 0, 0, 0], 3, 66, false), // multicast: every interface has it
         r([10, 88, 0, 191], 32, 66, false), // the tunnel's own address
         r([10, 200, 0, 0], 16, 66, false), // a corporate split-tunnel network
+        r([10, 0, 0, 0], 8, 66, false),  // WireGuard AllowedIPs 10.0.0.0/8
+        r([172, 16, 0, 0], 12, 66, false), // a corporate network, /12
+        r([100, 64, 0, 0], 10, 66, false), // the tunnel numbering its clients
         r([203, 0, 113, 78], 32, 66, true), // our rule route
         r([0, 0, 0, 0], 0, 19, false),   // the primary's default
     ];
@@ -1142,7 +1150,7 @@ fn mode_a_with_primary_adds_counter_overlay_via_primary() {
         &no_apps(),
         &std::collections::HashSet::new(),
         crate::address_ownership::ZoneVsIpOrder::default(),
-        &[],
+        &crate::route_codegen::ASSUMED_CATCH_ALLS,
     );
     // Counter-overlay: four /2 via the primary NIC (ifindex 12) — these
     // out-specific a redirect VPN's /1 so non-rule traffic rides primary.

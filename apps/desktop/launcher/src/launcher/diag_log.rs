@@ -89,16 +89,63 @@ fn append_line(path: &Path, message: &str) {
     static DIR_READY: std::sync::Once = std::sync::Once::new();
     DIR_READY.call_once(|| {
         if let Some(parent) = path.parent() {
-            let _ = fs::create_dir_all(parent);
+            prepare_log_dir(parent);
         }
+        narrow_to_owner(path);
     });
-    if let Ok(mut file) = fs::OpenOptions::new().create(true).append(true).open(path) {
+    let mut options = fs::OpenOptions::new();
+    options.create(true).append(true);
+    // The host's lines and arguments land here; on Unix nobody else reads them.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    if let Ok(mut file) = options.open(path) {
         // Best-effort timestamp using std::time. chrono is not a dep.
         let ts = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_millis())
             .unwrap_or(0);
         let _ = writeln!(file, "{ts} pid={} {message}", std::process::id());
+    }
+}
+
+#[cfg(not(test))]
+fn prepare_log_dir(dir: &Path) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        if let Some(parent) = dir.parent() {
+            let _ = fs::create_dir_all(parent);
+        }
+        let _ = fs::DirBuilder::new().mode(0o700).create(dir);
+        narrow_to_owner(dir);
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = fs::create_dir_all(dir);
+    }
+}
+
+/// Owner-only on Unix for a directory or file an older version left readable
+/// by others. A link is left alone: what it points at is not ours to change.
+#[cfg(not(test))]
+fn narrow_to_owner(path: &Path) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let Ok(meta) = fs::symlink_metadata(path) else {
+            return;
+        };
+        let owner_only = if meta.is_dir() { 0o700 } else { 0o600 };
+        if !meta.file_type().is_symlink() && meta.permissions().mode() & 0o077 != 0 {
+            let _ = fs::set_permissions(path, fs::Permissions::from_mode(owner_only));
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
     }
 }
 

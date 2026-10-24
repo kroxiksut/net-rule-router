@@ -27,7 +27,8 @@
 use std::sync::Arc;
 
 use nrr_platform_api::enforcement::{
-    ApplyReport, EnforcementBackend, EnforcementCapabilities, EnforcementPlan, PrincipalScope,
+    ApplyNote, ApplyReport, EnforcementBackend, EnforcementCapabilities, EnforcementPlan,
+    PrincipalScope,
 };
 use nrr_platform_api::error::PlatformError;
 use nrr_platform_api::types::{WfpFilterId, WfpPrincipal};
@@ -141,7 +142,7 @@ impl EnforcementBackend for WfpEnforcement {
             applied: requested.saturating_sub(outcome.skipped.len()),
             skipped: outcome.skipped.len(),
             failed: 0,
-            notes,
+            notes: notes.into_iter().map(ApplyNote::machine).collect(),
         })
     }
 

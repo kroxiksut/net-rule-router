@@ -51,7 +51,7 @@ pub const FIELD_DEFAULTS: [(&str, FieldDefault); 25] = [
     ),
     ("doh-lockdown-auto", FieldDefault::Bool(true)),
     ("browser-history-auto-seed", FieldDefault::Bool(false)),
-    ("kill-switch-strict-shared-ips", FieldDefault::Bool(false)),
+    ("kill-switch-strict-shared-ips", FieldDefault::Bool(true)),
     ("auto-rules-mode", FieldDefault::Text("suggest")),
     ("auto-rules-eager-delivery-names", FieldDefault::Bool(false)),
     ("primary-probe-auto", FieldDefault::Bool(false)),
@@ -190,6 +190,49 @@ pub fn raise_leak_protection(default_route: &str, level: &str, floor: &str) -> &
     }
 }
 
+/// The protection a user already set up holds, as the first-run setup starts
+/// from it: `(level, lockdown)`, `None` while the service holds no policy for
+/// them (a new user starts from the offer). A saved policy is a choice even
+/// with no connection bound: the window's setup sends it before any binding.
+/// Lockdown counts as on when automatic or chosen.
+pub fn first_run_held_protection(
+    policy_saved: bool,
+    default_route: &str,
+    leak_protection: &str,
+    doh_lockdown_auto: bool,
+    doh_lockdown_enabled: bool,
+) -> Option<(&'static str, bool)> {
+    policy_saved.then(|| {
+        (
+            coerce_leak_protection(default_route, leak_protection),
+            doh_lockdown_auto || doh_lockdown_enabled,
+        )
+    })
+}
+
+/// What the first-run setup writes when it ends, however it ends.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FirstRunWrites {
+    /// Leak protection and lockdown, as one write.
+    pub protection: bool,
+    /// The machine-wide answers (fake-IP, diagnostic logs).
+    pub stability: bool,
+}
+
+/// A new user's answers always go; a user already set up keeps what the
+/// service holds unless a choice was changed in the setup. Closing it
+/// untouched must never lower protection someone chose elsewhere.
+pub fn first_run_writes(
+    held: Option<(&str, bool)>,
+    chosen: (&str, bool),
+    stability_touched: bool,
+) -> FirstRunWrites {
+    FirstRunWrites {
+        protection: held != Some(chosen),
+        stability: held.is_none() || stability_touched,
+    }
+}
+
 /// Why a change of leak protection needs a yes before it is sent.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum LeakProtectionConfirm {
@@ -249,6 +292,17 @@ pub fn leak_protection_holds_now(
 ) -> bool {
     leak_protection_confirm(LEAK_PROTECTION_OFF, level, secondary)
         == Some(LeakProtectionConfirm::HoldsNow)
+}
+
+/// Whether moving the additional role from `before` to `after` (`None`:
+/// unbound) is what makes `level` hold the internet. Asked before a role is
+/// removed or reassigned; a change that leaves it as it was asks nothing.
+pub fn secondary_change_holds_now(
+    level: &str,
+    before: Option<&nrr_shared::ipc_payloads::InterfaceRowDto>,
+    after: Option<&nrr_shared::ipc_payloads::InterfaceRowDto>,
+) -> bool {
+    leak_protection_holds_now(level, after) && !leak_protection_holds_now(level, before)
 }
 
 /// How strong a level is, for "only ever switched on" comparisons.

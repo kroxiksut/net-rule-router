@@ -9,6 +9,70 @@ pub const CONN_HISTORY_MAX_PROGRAM_FILTER: usize = 1024;
 /// The verdicts a `conn-history.list` request may filter by.
 pub const CONN_HISTORY_VERDICTS: [&str; 3] = ["permit", "block", "unknown"];
 
+/// The longest `conn-history.list` cursor a client may echo back: the period's
+/// end, a time and six bounded fields, JSON-escaped.
+pub const CONN_HISTORY_MAX_CURSOR_BYTES: usize = 16 * 1024;
+
+/// Where a `conn-history.list` page ended: the period's end the walk is
+/// pinned to, and the sort key of the page's last entry. Continuing pages
+/// start after it, so rows written meanwhile neither repeat nor hide one.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ConnHistoryPageKey {
+    pub to_ms: i64,
+    pub last_ms: i64,
+    pub program: String,
+    pub host: String,
+    pub remote_ip: String,
+    pub route: String,
+    pub verdict: String,
+    pub blocked_by: String,
+}
+
+type PageKeyFields = (i64, String, String, String, String, String, String);
+type PageKeyFieldsRef<'a> = (i64, &'a str, &'a str, &'a str, &'a str, &'a str, &'a str);
+
+impl ConnHistoryPageKey {
+    /// The opaque cursor a client echoes back.
+    pub fn encode(&self) -> crate::pagination::PageCursor {
+        let fields: PageKeyFieldsRef<'_> = (
+            self.last_ms,
+            self.program.as_str(),
+            self.host.as_str(),
+            self.remote_ip.as_str(),
+            self.route.as_str(),
+            self.verdict.as_str(),
+            self.blocked_by.as_str(),
+        );
+        // A tuple of strings always serialises.
+        let id = serde_json::to_string(&fields).unwrap_or_default();
+        crate::pagination::PageCursor::from_position(self.to_ms, &id)
+    }
+
+    /// `None` for anything this service did not hand out: too long, not the
+    /// shape [`Self::encode`] writes, or a negative period end.
+    pub fn decode(cursor: &crate::pagination::PageCursor) -> Option<Self> {
+        if cursor.as_str().len() > CONN_HISTORY_MAX_CURSOR_BYTES {
+            return None;
+        }
+        let (to_ms, id) = cursor.parse()?;
+        if to_ms < 0 {
+            return None;
+        }
+        let (last_ms, program, host, remote_ip, route, verdict, blocked_by): PageKeyFields =
+            serde_json::from_str(id).ok()?;
+        Some(Self {
+            to_ms,
+            last_ms,
+            program,
+            host,
+            remote_ip,
+            route,
+            verdict,
+            blocked_by,
+        })
+    }
+}
+
 /// `conn-history.list` — the caller's connections over a period, one row per
 /// program and destination with the attempts added up.
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]

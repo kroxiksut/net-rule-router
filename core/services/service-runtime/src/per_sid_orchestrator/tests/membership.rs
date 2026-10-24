@@ -262,3 +262,38 @@ fn without_a_decider_the_snapshot_and_the_recompile_behave_as_before() {
     orch.settle_and_recompile().unwrap();
     assert_eq!(orch.installed_sids(), sids(&["A"]));
 }
+
+/// One user's unreadable policy is that user's failure alone: the pass still
+/// installs the user after them, takes down the one who left, reports the
+/// failure after the full pass, and names the failed user to health.
+#[test]
+fn one_unreadable_user_does_not_stall_the_rest_of_the_pass() {
+    let (api, orch, src, _rules, audit) = fixture();
+    src.set("B", snap_primary_only("Wi-Fi"));
+    src.set("C", snap_primary_only("Wi-Fi"));
+    orch.reconcile(&sids(&["C"])).unwrap();
+    assert_eq!(orch.installed_sids(), sids(&["C"]));
+
+    // "A" sorts first, so the old pass stopped on it before reaching anyone.
+    src.fail_reads_of("A");
+    assert!(matches!(
+        orch.reconcile(&sids(&["A", "B"])),
+        Err(OrchestratorError::PolicyUnreadable(_))
+    ));
+    assert_eq!(
+        orch.installed_sids(),
+        sids(&["B"]),
+        "B installed, C removed"
+    );
+    let filters = api.wfp_filters.lock().unwrap();
+    assert_eq!(filters.len(), 2);
+    assert!(filters.iter().all(|f| f.user_sid.as_deref() == Some("B")));
+    drop(filters);
+    assert!(
+        audit
+            .snapshot()
+            .iter()
+            .any(|r| r.sid == "A" && r.kind == PerSidApplyAuditKind::Failed),
+        "the failed user is reported to health"
+    );
+}

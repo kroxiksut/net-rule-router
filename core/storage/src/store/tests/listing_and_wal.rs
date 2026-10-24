@@ -486,3 +486,73 @@ fn the_active_revision_comes_from_the_pointer_the_activation_path_writes() {
         Some("rev-live".to_string()),
     );
 }
+
+/// A page with thousands of `nNNN.attacker.ru` images fills a busy zone's
+/// window with one site and pushes out the user's real `.ru` hosts, whose
+/// traffic then loses its pins and routes. Under that pressure one site holds
+/// a share of the window, not all of it.
+#[test]
+fn one_site_cannot_push_the_zones_other_hosts_out_of_the_window() {
+    let dir = tempfile::tempdir().expect("tmp");
+    let store = migrated_cache_store(&dir);
+    let earlier = SystemTime::now() - std::time::Duration::from_secs(3 * 3600);
+    let now = SystemTime::now();
+    for i in 0..10u8 {
+        seed_resolution(
+            &store,
+            &format!("site{i}.ru"),
+            Ipv4Addr::new(198, 51, 100, i + 1),
+            StorageResolutionSource::Dns,
+            earlier,
+            300,
+        );
+    }
+    for i in 0..300u16 {
+        seed_resolution(
+            &store,
+            &format!("n{i}.attacker.ru"),
+            Ipv4Addr::new(203, 0, 113, 7),
+            StorageResolutionSource::Dns,
+            now,
+            300,
+        );
+    }
+    let window = store.list_hostnames_under_suffix("ru", 64).expect("list");
+    assert_eq!(window.len(), 64);
+    for i in 0..10 {
+        assert!(
+            window.contains(&format!("site{i}.ru")),
+            "site{i}.ru was pushed out: {window:?}"
+        );
+    }
+}
+
+/// Seeing a host again within the hour does not reorder the window: a window
+/// rebuilt on every visit adds and removes filters on every pass.
+#[test]
+fn a_repeat_visit_within_the_hour_keeps_the_window() {
+    let dir = tempfile::tempdir().expect("tmp");
+    let store = migrated_cache_store(&dir);
+    let base = SystemTime::now();
+    for i in 0..8u8 {
+        seed_resolution(
+            &store,
+            &format!("h{i}.example.ru"),
+            Ipv4Addr::new(198, 51, 100, i + 1),
+            StorageResolutionSource::Dns,
+            base,
+            300,
+        );
+    }
+    let before = store.list_hostnames_under_suffix("ru", 4).expect("list");
+    seed_resolution(
+        &store,
+        "h7.example.ru",
+        Ipv4Addr::new(198, 51, 100, 8),
+        StorageResolutionSource::Dns,
+        SystemTime::now(),
+        300,
+    );
+    let after = store.list_hostnames_under_suffix("ru", 4).expect("list");
+    assert_eq!(before, after);
+}

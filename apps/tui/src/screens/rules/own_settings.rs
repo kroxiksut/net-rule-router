@@ -1,5 +1,5 @@
 //! The user's settings file the GUI shares: the rule-set folder, the bound
-//! rules files and the chosen set. Read on each use, so a choice made in the
+//! rules files, the chosen set and the merge policy. Read on each use, so a choice made in the
 //! window meanwhile is the one this screen sees; written per key, so the
 //! window's other keys survive.
 
@@ -7,6 +7,7 @@ use std::path::{Component, Path, PathBuf};
 
 use nrr_client_logic::rule_sets::is_path_under_dir;
 use nrr_client_logic::Route;
+use nrr_shared::merge_dto::MergePolicyDto;
 use nrr_shared::user_settings::{
     portable_path, read_rules_file_bytes, UserSettings, UserSettingsError, UserSettingsStore,
 };
@@ -35,6 +36,18 @@ pub fn own_folder(settings: &UserSettings) -> Option<PathBuf> {
 pub fn remember_set(file: &Path, selection_key: &str) -> Result<(), UserSettingsError> {
     UserSettingsStore::at(file.to_path_buf())
         .update(|settings| settings.selected_set = selection_key.to_string())
+        .map(drop)
+}
+
+/// Who wins a rule the bound files and the service hold differently, as both
+/// clients read it from here.
+pub fn merge_policy(file: &Path) -> Result<MergePolicyDto, UserSettingsError> {
+    read(file).map(|settings| MergePolicyDto::from_slug(&settings.merge_policy))
+}
+
+pub fn set_merge_policy(file: &Path, policy: MergePolicyDto) -> Result<(), UserSettingsError> {
+    UserSettingsStore::at(file.to_path_buf())
+        .update(|settings| settings.merge_policy = policy.slug().to_owned())
         .map(drop)
 }
 
@@ -161,6 +174,18 @@ fn rules_file_sha256(path: &Path) -> std::io::Result<Option<String>> {
     Ok(Some(hex))
 }
 
+/// The user merged these texts of the bound files into the rules in force:
+/// a file still holding the text it was merged from is the program's version.
+/// One changed since is the user's again, and is asked about.
+pub fn note_taken(file: &Path, taken: &[(PathBuf, String)]) -> Result<(), UserSettingsError> {
+    let unchanged: Vec<PathBuf> = taken
+        .iter()
+        .filter(|(path, text)| files::read_text(path).ok().flatten().as_deref() == Some(text))
+        .map(|(path, _)| path.clone())
+        .collect();
+    note_written(file, &unchanged)
+}
+
 /// This program just wrote `paths`: what they hold now is its version, so a
 /// later change there is the user's hand.
 pub fn note_written(file: &Path, paths: &[PathBuf]) -> Result<(), UserSettingsError> {
@@ -233,7 +258,10 @@ mod tests {
         let file = dir.settings_file();
         let rules = dir.path().join("rules_primary.txt");
         std::fs::write(&rules, "example.com\n").expect("write");
-        assert!(!hand_edited(&file, &rules), "nothing on record yet");
+        assert!(
+            hand_edited(&file, &rules),
+            "text the program has no record of writing is the user's"
+        );
         note_written(&file, std::slice::from_ref(&rules)).expect("record");
         assert!(!hand_edited(&file, &rules));
         std::fs::write(&rules, "example.org\n").expect("hand edit");

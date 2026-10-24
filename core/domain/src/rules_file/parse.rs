@@ -370,23 +370,12 @@ fn take_provenance_if_any(entry: &mut RulesFileEntry) {
     }
 }
 
-/// Splits a rule line at the first `#`, returning `(value, inline_comment)`.
-///
-/// Both parts are trimmed. `inline_comment` is `None` when there is no `#`.
+/// `(value, inline_comment)` by the reading the GUI's parser shares; both
+/// trimmed, the comment `None` when absent or blank.
 fn split_inline_comment(s: &str) -> (String, Option<String>) {
-    match s.find('#') {
-        None => (s.to_string(), None),
-        Some(pos) => {
-            let value = s[..pos].trim().to_string();
-            let comment = s[pos + 1..].trim().to_string();
-            let comment = if comment.is_empty() {
-                None
-            } else {
-                Some(comment)
-            };
-            (value, comment)
-        }
-    }
+    let (value, comment) = nrr_shared::preset_parser::split_inline_comment(s);
+    let comment = comment.map(str::trim).filter(|c| !c.is_empty());
+    (value.trim().to_string(), comment.map(str::to_string))
 }
 
 /// The value with its words rejoined and `+children` and `+override` taken

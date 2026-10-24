@@ -13,7 +13,7 @@
 //!
 //! Every principal string is exactly one of:
 //! - [`BASELINE_PRINCIPAL`] — the admin baseline sentinel.
-//! - A **Windows** user SID: `S-1-5-21-…` (today's only real OS form).
+//! - A **Windows** user SID: `S-1-5-21-…` or an Entra ID one `S-1-12-1-…`.
 //! - *(reserved, not yet wired)* a **Linux** user: [`LINUX_PRINCIPAL_SCHEME`]
 //!   + numeric uid, e.g. `unix:uid:1000`.
 //! - *(reserved, not yet wired)* a **macOS** user: [`MACOS_PRINCIPAL_SCHEME`]

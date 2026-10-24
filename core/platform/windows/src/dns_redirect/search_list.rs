@@ -196,7 +196,7 @@ mod live {
     use crate::error::PlatformError;
 
     /// Note of the list we wrote, beside the service's other state.
-    const NOTE_FILE: &str = "dns-search-list.owned";
+    pub(super) const NOTE_FILE: &str = "dns-search-list.owned";
 
     fn note_path() -> Option<std::path::PathBuf> {
         nrr_platform_api::paths::production_data_root().map(|root| root.join(NOTE_FILE))
@@ -575,5 +575,14 @@ mod tests {
             "a.example,b-c.example"
         );
         assert_eq!(comma_list(&[]).expect("list"), "");
+    }
+
+    /// The reset script takes the list back without the binary, by this note.
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn the_reset_script_reads_the_same_note() {
+        let lib = include_str!("../../../../../scripts/lib/service-paths.ps1");
+        let line = format!("$NrrSearchListNote = '{}'", live::NOTE_FILE);
+        assert!(lib.lines().any(|l| l == line), "{line}");
     }
 }

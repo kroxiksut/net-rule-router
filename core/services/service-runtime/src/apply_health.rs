@@ -21,10 +21,21 @@ pub const APPLY_PASS_SOURCE: &str = "apply-pass";
 /// Fold one pass of the neutral cycle into health.
 pub fn report_cycle_outcome(health: &HealthAggregator, outcome: &CycleOutcome) {
     let degraded = match outcome {
-        CycleOutcome::Applied { routes, .. } => routes
+        CycleOutcome::Applied {
+            routes, held_back, ..
+        } => routes
             .as_ref()
             .and_then(|r| r.failure.as_deref())
-            .map(|why| format!("filters applied but routes were not: {why}")),
+            .map(|why| format!("filters applied but routes were not: {why}"))
+            .or_else(|| {
+                // Counted, never named: the message reaches every client.
+                (!held_back.is_empty()).then(|| {
+                    format!(
+                        "the rules of {} user(s) could not be read; their last applied policy, if any, is kept",
+                        held_back.len()
+                    )
+                })
+            }),
         CycleOutcome::Unchanged => None,
         CycleOutcome::AuthorityUnavailable { reason } => {
             Some(format!("who is signed in could not be read: {reason}"))
@@ -169,6 +180,7 @@ mod tests {
             unprotected: Vec::new(),
             guarded: 0,
             routes,
+            held_back: Vec::new(),
         }
     }
 
@@ -266,6 +278,22 @@ mod tests {
         let (severity, message) = apply(&health).expect("apply");
         assert_eq!(severity, ServiceHealthSeverity::Degraded);
         assert!(message.contains("no gateway"), "{message}");
+    }
+
+    #[test]
+    fn a_held_back_user_degrades_apply_without_being_named() {
+        let health = health();
+        let mut outcome = applied(None);
+        if let CycleOutcome::Applied { held_back, .. } = &mut outcome {
+            held_back.push("1001".to_owned());
+        }
+        report_cycle_outcome(&health, &outcome);
+        let (severity, message) = apply(&health).expect("apply");
+        assert_eq!(severity, ServiceHealthSeverity::Degraded);
+        assert!(message.contains("1 user(s)"), "{message}");
+        assert!(!message.contains("1001"), "no user named: {message}");
+        report_cycle_outcome(&health, &applied(None));
+        assert_eq!(apply(&health), None);
     }
 
     #[test]

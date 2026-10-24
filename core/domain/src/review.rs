@@ -567,18 +567,28 @@ pub fn rule_identity_key_under(rule: &CanonicalRule, coverage: SubdomainCoverage
         }
         (_, other) => other.clone(),
     };
-    format!("{:?}\u{1}{:?}", address, rule.app_match)
+    // The program, not its flags: `x.exe +override` is `x.exe` with a request
+    // attached, and keyed apart the two read as different rules, so a flag
+    // added in the file was dropped as a duplicate.
+    let program = rule.app_match.as_ref().map(|m| &m.pattern);
+    format!("{:?}\u{1}{:?}", address, program)
 }
 
 /// True when two rules with the same [`rule_identity_key`] and route differ
-/// in any user-visible attribute (`enabled` / `comment` / `action`). The match
-/// conditions are equal by construction (same identity key), so this only
-/// inspects the mutable attributes — a change here is a `Modified`. Including
-/// `action` here makes both review Modified-detection and merge
-/// conflict-detection block-aware: toggling a rule between route and block is
-/// a `Modified`, not an Add/Remove (identity stays match-only).
+/// in any user-visible attribute: `enabled`, `comment`, `action`, or a
+/// program's `+children` / `+override`. The match is equal by construction
+/// (same identity key), so a change here is a `Modified` in review and a
+/// conflict in a merge, never an Add/Remove.
 pub(crate) fn rule_attributes_differ(prev: &CanonicalRule, next: &CanonicalRule) -> bool {
-    prev.enabled != next.enabled || prev.comment != next.comment || prev.action != next.action
+    let flags = |rule: &CanonicalRule| {
+        rule.app_match
+            .as_ref()
+            .map(|m| (m.include_child_processes, m.override_requested))
+    };
+    prev.enabled != next.enabled
+        || prev.comment != next.comment
+        || prev.action != next.action
+        || flags(prev) != flags(next)
 }
 
 /// Pairs the rules of one identity group (same [`rule_identity_key`]) across

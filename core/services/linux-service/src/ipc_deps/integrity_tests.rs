@@ -145,6 +145,7 @@ impl Machine {
             Arc::new(
                 nrr_service_runtime::block_notice_journal_store::InMemoryBlockNoticeJournalStore::new(),
             ),
+            None,
         )
     }
 

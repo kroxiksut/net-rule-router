@@ -256,6 +256,7 @@ pub fn names_indicate_virtual_machine_network(description: &str, friendly_name: 
     }
     description_matches_virtual_software(description)
         || description_matches_virtual_software(friendly_name)
+        || nrr_shared::is_linux_bridge_name(friendly_name)
 }
 
 // ── AdapterAvailability ───────────────────────────────────────────────────────

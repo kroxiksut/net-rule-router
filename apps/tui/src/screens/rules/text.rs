@@ -758,9 +758,44 @@ pub const CHECK_FAILED: Key = key("tui.suggestions.failed", "Not done: {error}")
 pub const SORT: Key = key("rules.sort.label", "Sort");
 pub const SORT_DISPLAY: Key = key("rules.sort.by-display-order", "Display order");
 pub const SORT_MAIN_ROUTE: Key = key("rules.sort.by-main-route", "Main route check");
+pub const SORT_MATCH_VALUE: Key = key("rules.sort.by-match-value", "Match value (A–Z)");
+pub const SORT_TYPE: Key = key("rules.sort.by-type", "Rule type");
+pub const SORT_ROUTE: Key = key("rules.sort.by-route", "Target route");
+pub const STATUS_FILTER: Key = key("rules.filter.enabled.label", "Status");
+pub const STATUS_ALL: Key = key("rules.filter.enabled.all", "All");
+pub const STATUS_ENABLED: Key = key("rules.filter.enabled.enabled-only", "Enabled only");
+pub const STATUS_DISABLED: Key = key("rules.filter.enabled.disabled-only", "Disabled only");
+pub const STATUS_ERRORS: Key = key("rules.filter.enabled.with-errors", "With errors");
+pub const STATUS_QUESTION: Key = key(
+    "tui.rules.status-question",
+    "Show which rules by their state?",
+);
+pub const TYPE_FILTER: Key = key("rules.filter.type.label", "Type");
+pub const TYPE_FILTER_ALL: Key = key("rules.filter.type.all", "All types");
+pub const TYPE_FILTER_ZONE: Key = key("rules.filter.type.zone", "Zone");
+pub const TYPE_FILTER_DOMAIN: Key = key("rules.filter.type.domain", "Domain");
+pub const TYPE_FILTER_EXACT_IP: Key = key("rules.filter.type.exact-ip", "Exact IP");
+pub const TYPE_FILTER_IP_RANGE: Key = key("rules.type.ip-range", "IP range");
+pub const TYPE_FILTER_SUBNET: Key = key("rules.type.subnet", "Subnet (CIDR)");
+pub const TYPE_FILTER_APPLICATION: Key = key("rules.filter.type.application", "Application");
+pub const TYPE_QUESTION: Key = key("tui.rules.type-question", "Show the rules of which type?");
+pub const AUTO_ONLY: Key = key("rules.filter.auto-added", "Auto-added only");
+pub const INVALID_COUNT: Key = key(
+    "rules.invalid-count",
+    "{n} rule(s) will not be applied: the value is not valid.",
+);
+pub const INVALID_SHOW: Key = key("tui.rules.invalid-show", "E: show them");
+pub const HELP_FILTERS: Key = key(
+    "tui.rules.help.filters",
+    "S: rules by state (enabled, disabled, with errors). y: by type. u: only the ones added automatically. E: the rules that will not be applied",
+);
+pub const PLAIN_FILTERS: Key = key(
+    "tui.rules.plain.filters",
+    "S: by state, y: by type, u: only added automatically, E: the rules that will not be applied",
+);
 pub const HELP_MAIN_ROUTE: Key = key(
     "tui.rules.help.main-route",
-    "c: check whether the main route reaches the sites of your additional-route rules; the answer shows beside each rule. Shift+O: list what the main route does not reach first, or back",
+    "c: check whether the main route reaches the sites of your additional-route rules; the answer shows beside each rule. Shift+O: the next order — by value, type, route, main route check, as kept",
 );
 pub const PLAIN_MAIN_ROUTE: Key = key(
     "tui.rules.plain.main-route",
@@ -936,6 +971,10 @@ pub const BULK_TEXT: Key = key(
     "Rules, one per line ({count} lines):",
 );
 pub const BULK_MORE_ABOVE: Key = key("tui.rules.bulk.more-above", "{count} more lines above");
+pub const BULK_PASTE_CUT: Key = key(
+    "tui.rules.bulk.paste-cut",
+    "The field is full: the last {count} pasted lines did not fit and were not taken. Add these rules first, then paste the rest.",
+);
 pub const BULK_HINT: Key = key(
     "tui.rules.bulk.hint",
     "Tab: next part. In the text Enter starts a new line; the preview follows each finished line. In the preview: t picks a type, m moves a rule found on another route. Ctrl+S: add. F2: one rule. Esc: cancel.",
@@ -1028,6 +1067,10 @@ pub const RECENT_RESTORE_HINT: Key = key(
 pub const RECENT_NOTHING_DELETED: Key = key(
     "tui.rules.recent-nothing-deleted",
     "No deleted rules to put back. Shift+R shows the recent changes.",
+);
+pub const RECENT_RESTORE_WAIT: Key = key(
+    "tui.rules.recent-restore-wait",
+    "The recent changes are being read again. Press U once they are shown and choose the rule again.",
 );
 pub const RESTORE_QUESTION: Key = key("tui.rules.restore-question", "Which rule to put back?");
 pub const HELP_RECENT: Key = key(
@@ -1463,6 +1506,29 @@ pub const ALL: &[Key] = &[
     SORT,
     SORT_DISPLAY,
     SORT_MAIN_ROUTE,
+    SORT_MATCH_VALUE,
+    SORT_TYPE,
+    SORT_ROUTE,
+    STATUS_FILTER,
+    STATUS_ALL,
+    STATUS_ENABLED,
+    STATUS_DISABLED,
+    STATUS_ERRORS,
+    STATUS_QUESTION,
+    TYPE_FILTER,
+    TYPE_FILTER_ALL,
+    TYPE_FILTER_ZONE,
+    TYPE_FILTER_DOMAIN,
+    TYPE_FILTER_EXACT_IP,
+    TYPE_FILTER_IP_RANGE,
+    TYPE_FILTER_SUBNET,
+    TYPE_FILTER_APPLICATION,
+    TYPE_QUESTION,
+    AUTO_ONLY,
+    INVALID_COUNT,
+    INVALID_SHOW,
+    HELP_FILTERS,
+    PLAIN_FILTERS,
     HELP_MAIN_ROUTE,
     PLAIN_MAIN_ROUTE,
     GATEWAY_TITLE,
@@ -1504,6 +1570,7 @@ pub const ALL: &[Key] = &[
     LIST_LEFT,
     BULK_TEXT,
     BULK_MORE_ABOVE,
+    BULK_PASTE_CUT,
     BULK_HINT,
     BULK_TYPE_KEY,
     BULK_MOVE_KEY,
@@ -1545,6 +1612,7 @@ pub const ALL: &[Key] = &[
     RECENT_PRESENT,
     RECENT_RESTORE_HINT,
     RECENT_NOTHING_DELETED,
+    RECENT_RESTORE_WAIT,
     RESTORE_QUESTION,
     HELP_RECENT,
     PLAIN_RECENT,

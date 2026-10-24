@@ -23,7 +23,9 @@ fn run_node(program: &str) -> Option<String> {
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
-        .ok()?;
+        .unwrap_or_else(|e| {
+            panic!("this check runs the QML JavaScript through node; install Node.js ({e})")
+        });
     let Some(stdin) = child.stdin.as_mut() else {
         panic!("stdin was piped")
     };
@@ -84,4 +86,38 @@ fn the_tray_repeats_a_busy_write_and_tells_a_failure() {
         tray.matches("\"auto-rules-mode-failed-dismiss\"").count() >= 2,
         "the failure notice is raised but its dismissal is not handled"
     );
+}
+
+#[test]
+fn the_tray_leak_protection_pick_repeats_a_busy_write_and_tells_a_failure() {
+    let tray = repo_file("apps/desktop/qml/Tray.qml");
+    let body = tray
+        .split("function _setLeakProtection(")
+        .nth(1)
+        .and_then(|rest| rest.split("\n    property var ").next())
+        .unwrap_or_else(|| panic!("_setLeakProtection not found"));
+    assert!(
+        body.contains("Pure.busyRetryDelayMs("),
+        "a busy service does not get the leak-protection write again"
+    );
+    assert!(
+        body.contains("_noteLeakProtectionFailed("),
+        "a failed leak-protection write is not told to the user"
+    );
+    let write = tray
+        .split("function _writeLeakProtection(")
+        .nth(1)
+        .and_then(|rest| rest.split("\n    function ").next())
+        .unwrap_or_else(|| panic!("_writeLeakProtection not found"));
+    assert!(
+        write.contains("if (!ok) { failed(\"write\", code, msg); return }"),
+        "the write's failure must reach the retry path:\n{write}"
+    );
+    assert!(
+        tray.matches("\"leak-protection-failed-dismiss\"").count() >= 2,
+        "the failure notice is raised but its dismissal is not handled"
+    );
+    // Same class: "Turn off rules" from the menu.
+    assert!(tray.contains("tray._notePauseFailed(code)"));
+    assert!(tray.matches("\"pause-failed-dismiss\"").count() >= 2);
 }

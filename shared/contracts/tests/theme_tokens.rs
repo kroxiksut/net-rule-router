@@ -115,3 +115,63 @@ fn workspace_root() -> PathBuf {
             )
         })
 }
+
+/// Status text a reader with low vision can read: every warning, error,
+/// success and muted line clears WCAG AA (4.5:1) on every surface of every
+/// theme. The light theme's amber warning read at 2.8:1 on its base.
+#[test]
+fn status_text_is_readable_on_every_surface_of_every_theme() {
+    let tokens = read_file("apps/desktop/qml/theme/ThemeTokens.qml");
+    let three = |name: &str| -> [String; 3] {
+        let head = format!("readonly property color {name}: isHighContrast ? \"");
+        let at = tokens
+            .find(&head)
+            .unwrap_or_else(|| panic!("{name} is not a three-theme token"));
+        let line = tokens[at..].lines().next().unwrap_or_default();
+        let colors: Vec<String> = line
+            .split('"')
+            .skip(1)
+            .step_by(2)
+            .map(str::to_owned)
+            .collect();
+        assert_eq!(colors.len(), 3, "{line}");
+        [colors[0].clone(), colors[1].clone(), colors[2].clone()]
+    };
+    let luminance = |hex: &str| -> f64 {
+        let v = u32::from_str_radix(hex.trim_start_matches('#'), 16)
+            .unwrap_or_else(|e| panic!("{hex}: {e}"));
+        let channel = |shift: u32| {
+            let c = f64::from((v >> shift) & 0xff) / 255.0;
+            if c <= 0.039_28 {
+                c / 12.92
+            } else {
+                ((c + 0.055) / 1.055).powf(2.4)
+            }
+        };
+        0.2126 * channel(16) + 0.7152 * channel(8) + 0.0722 * channel(0)
+    };
+    let contrast = |a: &str, b: &str| {
+        let (la, lb) = (luminance(a), luminance(b));
+        (la.max(lb) + 0.05) / (la.min(lb) + 0.05)
+    };
+    let themes = ["high contrast", "dark", "light"];
+    for text in [
+        "colorWarning",
+        "colorDanger",
+        "colorSuccess",
+        "colorTextMuted",
+    ] {
+        for surface in ["colorWindow", "colorPanel", "colorBase"] {
+            let (fg, bg) = (three(text), three(surface));
+            for (i, theme) in themes.iter().enumerate() {
+                let ratio = contrast(&fg[i], &bg[i]);
+                assert!(
+                    ratio >= 4.5,
+                    "{theme}: {text} {} on {surface} {} reads at {ratio:.2}:1",
+                    fg[i],
+                    bg[i]
+                );
+            }
+        }
+    }
+}

@@ -16,7 +16,7 @@ mod gateway;
 mod main_route;
 mod merge;
 pub mod overrides;
-mod own_settings;
+pub(crate) mod own_settings;
 mod recent;
 mod render;
 mod spare;
@@ -40,7 +40,7 @@ use nrr_shared::user_settings::UserSettingsError;
 use self::apply::{Failure, Finished, Previewed, Review};
 use self::files::{Preset, RuleSet};
 use self::form::{offered_types, Field, Form, Saved};
-use self::table::{RouteFilter, Table, PAGE};
+use self::table::{RouteFilter, StatusFilter, Table, PAGE, TYPE_FILTERS};
 use super::{overlaps, Screen, ScreenId};
 use crate::i18n::{Key, Plural, Texts};
 use crate::paste::TextTarget;
@@ -85,6 +85,8 @@ pub struct Input {
 #[derive(Debug)]
 pub enum ChoicePurpose {
     Filter,
+    StatusFilter,
+    TypeFilter,
     Delete(usize),
     Reload,
     Quit,
@@ -271,6 +273,9 @@ pub struct RulesState {
     /// merged with the service's rules): once it is in force the rows are
     /// read back instead of being marked applied.
     reload_after_apply: bool,
+    /// The bound files and the texts that merge was built from: once it is in
+    /// force, those versions are the program's to follow.
+    merged_from: Vec<(PathBuf, String)>,
 }
 
 impl RulesState {
@@ -308,6 +313,7 @@ impl Screen for RulesScreen {
             text::HELP_EDIT,
             text::HELP_DELETE,
             text::HELP_FILTER,
+            text::HELP_FILTERS,
             text::HELP_APPLY,
             text::HELP_FILES,
             text::HELP_FOLDER,
@@ -334,6 +340,7 @@ impl Screen for RulesScreen {
             text::PLAIN_DELETE,
             text::PLAIN_TOGGLE,
             text::PLAIN_FILTER,
+            text::PLAIN_FILTERS,
             text::PLAIN_SEARCH,
             text::PLAIN_PAGES,
             text::PLAIN_APPLY,
@@ -376,6 +383,23 @@ impl Screen for RulesScreen {
             Mode::Bulk(form) if form.field == bulk::BulkField::Text => TextTarget::Lines,
             _ => TextTarget::None,
         }
+    }
+
+    fn on_paste(&self, app: &mut AppState, pasted: &str) -> bool {
+        let Mode::Bulk(form) = &mut app.rules.mode else {
+            return false;
+        };
+        if form.field != bulk::BulkField::Text {
+            return false;
+        }
+        let left = form.paste(pasted);
+        if left > 0 {
+            app.rules.note = Some(Note::with(
+                text::BULK_PASTE_CUT,
+                vec![("count", left.to_string())],
+            ));
+        }
+        true
     }
 
     fn on_key(&self, app: &mut AppState, key: KeyEvent) -> bool {
@@ -764,6 +788,7 @@ fn previewed(app: &mut AppState, previewed: Previewed) {
     rules.busy = None;
     if !matches!(previewed, Previewed::Review(_)) {
         rules.reload_after_apply = false;
+        rules.merged_from.clear();
     }
     match previewed {
         Previewed::Review(review) => rules.mode = Mode::Review(review),
@@ -792,6 +817,13 @@ fn finished(app: &mut AppState, finished: Finished) {
     let quit = std::mem::take(&mut rules.quit_after_apply);
     let applied = matches!(finished, Finished::Applied { .. });
     let reload = std::mem::take(&mut rules.reload_after_apply);
+    let merged_from = std::mem::take(&mut rules.merged_from);
+    if applied && reload {
+        // The user merged these files into the rules now in force.
+        if let Some(file) = rules.settings_file.as_deref() {
+            let _ = own_settings::note_taken(file, &merged_from);
+        }
+    }
     rules.note = Some(match finished {
         Finished::Applied { base } => {
             // The next apply is built on what this one left in force.
@@ -827,6 +859,9 @@ fn finished(app: &mut AppState, finished: Finished) {
         let note = app.rules.note.take();
         verdicts::write_bound_files_now(app);
         app.rules.note = app.rules.note.take().or(note);
+        // What was applied is read back in the service's own spelling: a set
+        // remembered as typed cannot name the rule the next edit deletes.
+        app.rules.reread_due = true;
     }
     settle(app);
 }
@@ -971,6 +1006,14 @@ fn ask(app: &mut AppState, purpose: ChoicePurpose) {
         ChoicePurpose::Filter => RouteFilter::ALL
             .iter()
             .position(|f| *f == app.rules.table.filter)
+            .unwrap_or(0),
+        ChoicePurpose::StatusFilter => StatusFilter::ALL
+            .iter()
+            .position(|f| *f == app.rules.table.status)
+            .unwrap_or(0),
+        ChoicePurpose::TypeFilter => TYPE_FILTERS
+            .iter()
+            .position(|f| *f == app.rules.table.type_filter)
             .unwrap_or(0),
         ChoicePurpose::Preset(list) => list
             .sets
@@ -1239,8 +1282,7 @@ fn import(app: &mut AppState, set: RuleSet, path: String, replace: bool) {
     let table = &mut app.rules.table;
     let added = table.import(set.rows, replace);
     table.passthrough = set.passthrough;
-    table.filter = RouteFilter::All;
-    table.search.clear();
+    table.clear_filters();
     table.set_cursor(0);
     let mut note = Note::with(
         text::IMPORTED,
@@ -1317,6 +1359,16 @@ fn pick(app: &mut AppState, choice: Choice) {
             table.filter = RouteFilter::ALL.get(at).copied().unwrap_or_default();
             table.set_cursor(0);
         }
+        ChoicePurpose::StatusFilter => {
+            let table = &mut app.rules.table;
+            table.status = StatusFilter::ALL.get(at).copied().unwrap_or_default();
+            table.set_cursor(0);
+        }
+        ChoicePurpose::TypeFilter => {
+            let table = &mut app.rules.table;
+            table.type_filter = TYPE_FILTERS.get(at).copied().unwrap_or(TYPE_FILTERS[0]);
+            table.set_cursor(0);
+        }
         ChoicePurpose::Delete(i) if at == 0 => {
             let table = &mut app.rules.table;
             if i < table.rows.len() {
@@ -1387,6 +1439,10 @@ fn list_key(app: &mut AppState, key: KeyEvent) -> bool {
             }
             ' ' | 't' => toggle(app, selected),
             'f' => ask(app, ChoicePurpose::Filter),
+            'S' => ask(app, ChoicePurpose::StatusFilter),
+            'y' => ask(app, ChoicePurpose::TypeFilter),
+            'u' => toggle_auto_only(app),
+            'E' => show_invalid(app),
             '/' => start_input(app, InputPurpose::Search),
             's' => start_apply(app),
             'r' => reload(app),
@@ -1474,7 +1530,21 @@ pub fn add_prefilled(app: &mut AppState, rule_type: RuleType, value: String) -> 
     true
 }
 
-/// The other order; the cursor goes back to the top, as a new filter does.
+/// `u`: only the rules the app added, or every rule again.
+fn toggle_auto_only(app: &mut AppState) {
+    let table = &mut app.rules.table;
+    table.auto_only = !table.auto_only;
+    table.set_cursor(0);
+}
+
+/// `E`: the rules that will not be applied (the window's «Show them»).
+fn show_invalid(app: &mut AppState) {
+    let table = &mut app.rules.table;
+    table.status = StatusFilter::WithErrors;
+    table.set_cursor(0);
+}
+
+/// The next order; the cursor goes back to the top, as a new filter does.
 fn change_order(app: &mut AppState) {
     let table = &mut app.rules.table;
     table.sort = table.sort.next();
@@ -1662,6 +1732,10 @@ fn list_line(app: &mut AppState, line: &str) -> bool {
             toggle(app, master);
         }
         "f" => ask(app, ChoicePurpose::Filter),
+        "S" => ask(app, ChoicePurpose::StatusFilter),
+        "y" => ask(app, ChoicePurpose::TypeFilter),
+        "u" => toggle_auto_only(app),
+        "E" => show_invalid(app),
         "/" => {
             commit_input(
                 app,

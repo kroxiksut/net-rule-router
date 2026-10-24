@@ -58,6 +58,9 @@ pub struct RoutePass<'a> {
     pub present: &'a [UserPrincipal],
     /// Whose routes the service accounts follow.
     pub owner: Option<&'a UserPrincipal>,
+    /// [`PlannedRouteApplier::plan_origin`] read before the plans' inputs: a
+    /// route installed ahead after it is newer than the plans and stays.
+    pub planned_at: u64,
 }
 
 /// Installs the routes a set of plans asks for, and removes the ones we own that
@@ -135,6 +138,20 @@ impl PlannedRouteApplier {
     /// against two different readings of the machine would produce a table that
     /// never matched either of them.
     pub fn apply(&self, plans: &[EnforcementPlan]) -> Result<RouteApplyReport, String> {
+        self.apply_planned(plans, None)
+    }
+
+    /// The write count a pass reads before the inputs it plans from, so the
+    /// reconcile tells a route installed ahead of it from one its plan dropped.
+    pub fn plan_origin(&self) -> u64 {
+        self.reconciler.write_count()
+    }
+
+    fn apply_planned(
+        &self,
+        plans: &[EnforcementPlan],
+        planned_at: Option<u64>,
+    ) -> Result<RouteApplyReport, String> {
         let adapters = self.read_adapters()?;
         self.adopt_leftovers();
         let mut desired = Vec::new();
@@ -142,7 +159,7 @@ impl PlannedRouteApplier {
         for plan in plans {
             desired.extend(self.lowered(plan, &adapters, &mut unresolved));
         }
-        self.reconcile(&desired, unresolved)
+        self.reconcile(&desired, unresolved, planned_at)
     }
 
     /// One pass: every present user's routes in their own table, the owner's
@@ -158,7 +175,7 @@ impl PlannedRouteApplier {
                 .owner
                 .and_then(|o| pass.plans.iter().position(|p| &p.principal == o))
                 .map_or(0..0, |i| i..i + 1);
-            return self.apply(&pass.plans[owned]);
+            return self.apply_planned(&pass.plans[owned], Some(pass.planned_at));
         };
 
         let adapters = self.read_adapters()?;
@@ -219,7 +236,7 @@ impl PlannedRouteApplier {
                 None
             }
         };
-        let mut report = self.reconcile(&desired, unresolved)?;
+        let mut report = self.reconcile(&desired, unresolved, Some(pass.planned_at))?;
         report.failure = selected;
         Ok(report)
     }
@@ -297,11 +314,13 @@ impl PlannedRouteApplier {
         &self,
         desired: &[RouteEntry],
         unresolved: Vec<String>,
+        planned_at: Option<u64>,
     ) -> Result<RouteApplyReport, String> {
-        let delta = self
-            .reconciler
-            .reconcile(desired)
-            .map_err(|e| format!("route table could not be reconciled: {e}"))?;
+        let delta = match planned_at {
+            Some(at) => self.reconciler.reconcile_planned(desired, at),
+            None => self.reconciler.reconcile(desired),
+        }
+        .map_err(|e| format!("route table could not be reconciled: {e}"))?;
         Ok(RouteApplyReport {
             added: delta.added,
             removed: delta.removed,
@@ -711,6 +730,8 @@ mod tests {
                 plans,
                 present,
                 owner: present.get(owner),
+                // Planned after every install: the pass owns the whole table.
+                planned_at: u64::MAX,
             }
         }
 
@@ -914,6 +935,46 @@ mod tests {
                 "the pass redid what was already in place"
             );
             assert_eq!(tables.links_of(table_of(1000)), vec![TUN]);
+        }
+
+        /// A pass already planned when the DNS answer installs a route ahead
+        /// of it must leave that route in place: its plan predates the
+        /// address. The pass planned after it, without the address, drops it.
+        #[test]
+        fn a_route_installed_ahead_outlives_the_pass_planned_before_it() {
+            let (applier, tables, _) = rig(false);
+            let present = users(&[1000]);
+            let mut without = plan(1000);
+            without.routes.clear();
+            let plans = [without];
+
+            // The pass reads its origin, then its inputs (no routes)...
+            let planned_at = applier.plan_origin();
+            // ...and the DNS answer installs the host in between.
+            assert_eq!(applier.install_ahead(&plan(1000), true).expect("ahead"), 2);
+            let report = applier
+                .apply_pass(RoutePass {
+                    plans: &plans,
+                    present: &present,
+                    owner: present.first(),
+                    planned_at,
+                })
+                .expect("pass");
+            assert_eq!((report.added, report.removed), (0, 0), "{report:?}");
+            assert_eq!(tables.links_of(table_of(1000)), vec![TUN]);
+            assert_eq!(tables.links_of(RouteTableRef::Tagged(SYSTEM)), vec![TUN]);
+
+            // A pass planned after the install, without the host, takes it out.
+            let report = applier
+                .apply_pass(RoutePass {
+                    plans: &plans,
+                    present: &present,
+                    owner: present.first(),
+                    planned_at: applier.plan_origin(),
+                })
+                .expect("pass");
+            assert_eq!(report.removed, 2, "{report:?}");
+            assert!(tables.links_of(table_of(1000)).is_empty());
         }
 
         /// Without per-user routing only the owner has a table to be early in.

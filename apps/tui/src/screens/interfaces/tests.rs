@@ -288,6 +288,75 @@ fn an_adapter_with_no_way_out_is_bound_only_after_the_warning() {
     assert_eq!(request["primary"]["stable-id"], json!(HOST_ONLY));
 }
 
+fn with_leak_protection(mode: &str, level: &str) -> Value {
+    let mut snapshot = machine();
+    snapshot["route-policy"]["mode"] = json!(mode);
+    snapshot["route-policy"]["leak-protection"] = json!(level);
+    snapshot
+}
+
+#[test]
+fn removing_the_additional_role_under_everything_asks_first() {
+    let fake = service();
+    let mut app = app_with(with_leak_protection("prefer-primary", "everything"));
+    choose(&mut app, "Example Tunnel");
+    press(&mut app, 's');
+    assert!(matches!(
+        app.interfaces.question,
+        Some(Question::HoldsNow { .. })
+    ));
+    assert!(app.outbox.take().is_empty(), "nothing was sent yet");
+    let picture = render(&app, 140, 50);
+    assert!(
+        picture.contains("Leak protection will hold all traffic"),
+        "{picture}"
+    );
+
+    // The safe answer is highlighted: Enter alone changes nothing.
+    handle_key(
+        &mut app,
+        KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+        &texts_en(),
+    );
+    assert_eq!(app.interfaces.outcome, Some(Outcome::Cancelled));
+    assert!(app.outbox.take().is_empty(), "nothing was sent");
+
+    press(&mut app, 's');
+    for code in [KeyCode::Up, KeyCode::Enter] {
+        handle_key(
+            &mut app,
+            KeyEvent::new(code, KeyModifiers::NONE),
+            &texts_en(),
+        );
+    }
+    assert_eq!(run_jobs(&mut app, &fake), 1);
+    let request = &fake.sent(IpcOperationName::RoutePolicyUpdate)[0];
+    assert!(request.get("secondary").is_none(), "the role was removed");
+}
+
+#[test]
+fn routed_sites_under_the_additional_default_route_asks_as_everything() {
+    let mut app = app_with(with_leak_protection(
+        "prefer-secondary-when-available",
+        "sites",
+    ));
+    choose(&mut app, "Example Tunnel");
+    press(&mut app, 's');
+    assert!(matches!(
+        app.interfaces.question,
+        Some(Question::HoldsNow { .. })
+    ));
+}
+
+#[test]
+fn removing_the_additional_role_under_routed_sites_asks_nothing() {
+    let mut app = app_with(with_leak_protection("prefer-primary", "sites"));
+    choose(&mut app, "Example Tunnel");
+    press(&mut app, 's');
+    assert_eq!(app.interfaces.question, None);
+    assert_eq!(app.outbox.take().len(), 1, "the write went out at once");
+}
+
 #[test]
 fn without_the_service_nothing_is_written() {
     let texts = texts_en();

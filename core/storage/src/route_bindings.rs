@@ -271,7 +271,7 @@ impl RoutePolicyRecord {
             doh_lockdown_scope: DohLockdownScope::default(),
             doh_lockdown_auto: true,
             browser_history_auto_seed: false,
-            kill_switch_strict_shared_ips: false,
+            kill_switch_strict_shared_ips: true,
             // Collect companion-domain findings and offer them; apply nothing
             // unattended until the discovery mechanism is field-verified.
             auto_rules_mode: AutoRulesMode::default(),
@@ -389,7 +389,7 @@ impl Default for BlockPolicyRow {
             doh_lockdown_scope: DohLockdownScope::default(),
             doh_lockdown_auto: true,
             browser_history_auto_seed: false,
-            kill_switch_strict_shared_ips: false,
+            kill_switch_strict_shared_ips: true,
             auto_rules_mode: AutoRulesMode::default(),
             auto_rules_eager_delivery_names: AUTO_RULES_EAGER_DELIVERY_NAMES_DEFAULT,
             primary_probe_auto: false,

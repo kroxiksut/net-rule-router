@@ -8,11 +8,13 @@ TextField {
     id: root
     property var theme
 
-    // Accessible baseline — see the note in `ThemedComboBox.qml`. The name
-    // falls back to the placeholder because that is the one label a field
-    // without a visible one still carries.
+    // The visible label beside the field. The placeholder is often an
+    // example ("hostname or IP"), not a name. See `ThemedComboBox.qml`.
+    property string accessibleLabel: ""
+
     Accessible.role: Accessible.EditableText
-    Accessible.name: root.placeholderText
+    Accessible.name: root.accessibleLabel !== ""
+        ? root.accessibleLabel.replace(/:\s*$/, "") : root.placeholderText
     Accessible.description: root.ToolTip.text
 
     color: theme.colorText

@@ -15,6 +15,8 @@
 //                    adapter is already bound.
 //   "holds-now"   -- the user is about to choose "Everything" while the
 //                    additional connection is not available; no adapter named.
+//   "holds-now-role" -- under "Everything", the user is about to remove or move
+//                    the additional role so that no available adapter holds it.
 //
 // The dialog is "dumb": it emits `confirmed()` / `cancelled()` and the caller
 // owns the action. Shared state arrives through `ownerRoot` (the
@@ -33,7 +35,8 @@ Dialog {
     /// Reason slug from `Pure.unroutableInterfaceReasonSlug`:
     /// "virtual-host-only" | "no-forwarding-path".
     property string reasonSlug: ""
-    /// "assign" | "assign-primary" | "leak-protection" | "holds-now".
+    /// "assign" | "assign-primary" | "leak-protection" | "holds-now" |
+    /// "holds-now-role".
     property string contextSlug: "assign"
     /// Whether leak protection is armed right now (only read in the "assign"
     /// direction, where it decides between "not routed" and "blocked").
@@ -59,7 +62,8 @@ Dialog {
             "It has no gateway and no route out, so there is nowhere for it to send traffic.")
 
     readonly property bool _primary: contextSlug === "assign-primary"
-    readonly property bool _holdsNow: contextSlug === "holds-now"
+    readonly property bool _roleChange: contextSlug === "holds-now-role"
+    readonly property bool _holdsNow: contextSlug === "holds-now" || _roleChange
 
     readonly property string _situationText: contextSlug === "leak-protection"
         ? tr("dialog.unroutable-secondary.body-kill-switch",
@@ -83,7 +87,9 @@ Dialog {
     popupType: Popup.Item
     anchors.centerIn: parent
     width: 520
-    title: _holdsNow
+    title: _roleChange
+        ? tr("dialog.leak-holds-now.role-title", "Leak protection will hold all traffic")
+        : _holdsNow
         ? tr("dialog.leak-holds-now.title", "The additional connection is not available")
         : tr("dialog.unroutable-secondary.title", "This adapter cannot carry traffic out")
     standardButtons: Dialog.NoButton
@@ -120,7 +126,10 @@ Dialog {
             Layout.fillWidth: true
             wrapMode: Text.Wrap
             color: root.ownerRoot ? root.ownerRoot.textColor : palette.text
-            text: root._holdsNow
+            text: root._roleChange
+                ? root.tr("dialog.leak-holds-now.role-body",
+                    "Leak protection is set to Everything. Without an available additional connection, traffic is held right away: the internet stops until an available adapter is the additional connection again.")
+                : root._holdsNow
                 ? root.tr("dialog.leak-holds-now.body",
                     "With leak protection set to Everything, traffic is held right away: the internet stops until the additional connection returns.")
                 : root._situationText + " " + root._reasonText
@@ -172,7 +181,9 @@ Dialog {
             ThemedButton {
                 theme: root.ownerRoot ? root.ownerRoot.uiTheme : null
                 highlighted: true
-                text: root.contextSlug === "leak-protection" || root._holdsNow
+                text: root._roleChange
+                    ? root.tr("dialog.leak-holds-now.role-confirm", "Change anyway")
+                    : root.contextSlug === "leak-protection" || root._holdsNow
                     ? root.tr("dialog.unroutable-secondary.confirm-kill-switch",
                         "Turn it on anyway")
                     : root.tr("dialog.unroutable-secondary.confirm-assign",

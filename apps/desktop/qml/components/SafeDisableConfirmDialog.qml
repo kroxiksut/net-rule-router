@@ -129,7 +129,7 @@ Dialog {
                 font.pixelSize: 11
                 color: dialog.ownerRoot
                     ? dialog.ownerRoot.uiTheme.colorWarning
-                    : "#d97706"
+                    : "#b05207"
                 wrapMode: Text.Wrap
             }
         }

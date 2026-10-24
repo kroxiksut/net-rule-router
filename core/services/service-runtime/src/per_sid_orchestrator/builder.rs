@@ -20,6 +20,7 @@ impl PerSidApplyOrchestrator {
         Self {
             apply_locks: Mutex::new(std::collections::HashMap::new()),
             membership_lock: Mutex::new(()),
+            quiet_since_noop: Mutex::new(std::collections::HashSet::new()),
             enforced_sids: None,
             // The process-wide stop latch. Tests override it rather than flip a
             // static every other test in the binary would see.
@@ -78,6 +79,7 @@ impl PerSidApplyOrchestrator {
             // via `with_dns_cache_control`.
             dns_cache_control: Arc::new(nrr_platform_api::NoopDnsCacheControl),
             block_all_flush_state: Mutex::new(HashMap::new()),
+            outage_hold_state: Mutex::new(std::collections::HashSet::new()),
             standing_volume_alarmed: Mutex::new(std::collections::HashMap::new()),
             fail_closed_state: Mutex::new(HashMap::new()),
             fail_closed_posture_status: None,
@@ -349,6 +351,15 @@ impl PerSidApplyOrchestrator {
             .unwrap_or_else(|p| p.into_inner())
             .values()
             .any(|armed| *armed)
+    }
+
+    /// [`Self::any_block_all_armed`] for one SID: that user's traffic is held.
+    pub fn block_all_armed_for(&self, sid: &str) -> bool {
+        self.block_all_flush_state
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .get(sid)
+            .is_some_and(|armed| *armed)
     }
 
     /// Whether a principal other than `sid` holds a block-all: the IPv6 packet

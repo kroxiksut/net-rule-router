@@ -123,7 +123,7 @@ fn filetime_ticks_to_unix_ms(ticks: u64) -> Option<u64> {
 }
 
 /// When the machine last booted, as Unix milliseconds on today's clock.
-fn current_boot_started_at_ms() -> Option<u64> {
+pub(crate) fn current_boot_started_at_ms() -> Option<u64> {
     use windows::Win32::System::SystemInformation::GetTickCount64;
     let now_ms = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)

@@ -687,6 +687,9 @@ impl NftCliEnforcement {
     ///
     /// Only a refused apply pays for it: a clean one is still one `nft` run.
     ///
+    /// A refused drop is never skipped: the rest would be wider than the plan,
+    /// so it is `Rejected` and the previous table stays ([`widening_refusals`]).
+    ///
     /// An environment failure (no `nft`, no privilege, no `nf_tables`, a hung
     /// `nft`) is returned as-is: every subset would fail the same way.
     #[cfg(target_os = "linux")]
@@ -726,6 +729,14 @@ impl NftCliEnforcement {
             self.apply_in_probe(ruleset, idx)
         })
         .and_then(|offenders| {
+            // Skipping is safe only when it narrows: without a refused drop the
+            // set is wider, so the previous table stays instead.
+            let widening = widening_refusals(ruleset, &offenders);
+            if !widening.is_empty() {
+                return Err(NftApplyError::Rejected {
+                    detail: refused_block_detail(&widening),
+                });
+            }
             let (kept, skipped) = without_rules(ruleset, &offenders);
             if let Err(refused) = self.apply(&kept) {
                 if !self.retry_silent(&kept, reporting, &refused) {
@@ -1097,6 +1108,56 @@ fn without_rules(ruleset: &NftRuleset, offenders: &[usize]) -> (NftRuleset, Vec<
     (kept, skipped)
 }
 
+/// The refused rules whose absence would let traffic through: what a dropped
+/// drop cut falls to the chain's accept policy. An IPsec drop is spared only
+/// when every IPsec permit is refused with it — a kernel without `rt ipsec`
+/// refuses them as one, and the networks they spared stay under the block.
+///
+/// Indexes both chains as [`without_rules`] does.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn widening_refusals<'r>(ruleset: &'r NftRuleset, offenders: &[usize]) -> Vec<&'r NftRule> {
+    let ipsec = |rule: &NftRule| rule.matches.contains(&NftMatch::RouteIpsec);
+    let all = || indexed_rules(ruleset);
+    let every_ipsec_permit_refused =
+        all().all(|(i, rule)| rule.verdict.is_drop() || !ipsec(rule) || offenders.contains(&i));
+    all()
+        .filter(|(i, rule)| {
+            offenders.contains(i)
+                && rule.verdict.is_drop()
+                && !(ipsec(rule) && every_ipsec_permit_refused)
+        })
+        .map(|(_, rule)| rule)
+        .collect()
+}
+
+/// Both chains, numbered as the search numbers them.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn indexed_rules(ruleset: &NftRuleset) -> impl Iterator<Item = (usize, &NftRule)> {
+    ruleset.rules.iter().chain(&ruleset.forward).enumerate()
+}
+
+/// Names the refused block rules, bounded: the detail reaches a report.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn refused_block_detail(widening: &[&NftRule]) -> String {
+    const NAMED: usize = 8;
+    let names: Vec<&str> = widening
+        .iter()
+        .take(NAMED)
+        .map(|rule| rule.comment.as_str())
+        .collect();
+    let more = widening.len().saturating_sub(NAMED);
+    let more = if more > 0 {
+        format!(" and {more} more")
+    } else {
+        String::new()
+    };
+    format!(
+        "the kernel refused a block rule ({}{more}); applying the rest would let its \
+         traffic through, so the previous ruleset stays",
+        names.join(", ")
+    )
+}
+
 /// Does this `nft` failure say the object was not there to begin with?
 ///
 /// `nft` answers a delete of an absent table with `No such file or directory`
@@ -1388,6 +1449,63 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![(1, "b"), (3, "f1")],
         );
+    }
+
+    fn dropping(comment: &str, matches: Vec<NftMatch>) -> NftRule {
+        NftRule {
+            matches,
+            verdict: NftVerdict::Drop,
+            comment: comment.to_owned(),
+        }
+    }
+
+    fn widening_of(set: &NftRuleset, offenders: &[usize]) -> Vec<String> {
+        widening_refusals(set, offenders)
+            .iter()
+            .map(|r| r.comment.clone())
+            .collect()
+    }
+
+    #[test]
+    fn a_refused_drop_widens_the_set_and_a_refused_accept_does_not() {
+        let mut set = ruleset(vec![plain("a"), dropping("cut", Vec::new())]);
+        set.forward = vec![dropping("fwd-cut", Vec::new())];
+        assert!(widening_of(&set, &[0]).is_empty());
+        assert_eq!(widening_of(&set, &[1]), vec!["cut"]);
+        assert_eq!(widening_of(&set, &[0, 2]), vec!["fwd-cut"]);
+    }
+
+    /// A kernel without `rt ipsec` refuses every IPsec rule at once; with the
+    /// permits gone too, what the IPsec drop cut stays under the block.
+    #[test]
+    fn a_refused_ipsec_drop_widens_only_while_an_ipsec_permit_survives() {
+        let ipsec_permit = NftRule {
+            matches: vec![NftMatch::RouteIpsec],
+            verdict: NftVerdict::Accept,
+            comment: "ipsec-permit".into(),
+        };
+        let set = ruleset(vec![
+            dropping("ipsec-cut", vec![NftMatch::RouteIpsec]),
+            ipsec_permit,
+            dropping("cut", Vec::new()),
+        ]);
+        assert!(widening_of(&set, &[0, 1]).is_empty());
+        assert_eq!(widening_of(&set, &[0]), vec!["ipsec-cut"]);
+        assert_eq!(widening_of(&set, &[0, 1, 2]), vec!["cut"]);
+    }
+
+    #[test]
+    fn the_refusal_names_a_bounded_number_of_block_rules() {
+        let rules: Vec<NftRule> = (0..20)
+            .map(|i| dropping(&format!("cut-{i}"), Vec::new()))
+            .collect();
+        let refused: Vec<&NftRule> = rules.iter().collect();
+        let detail = refused_block_detail(&refused);
+        assert!(
+            detail.contains("cut-7") && !detail.contains("cut-8"),
+            "{detail}"
+        );
+        assert!(detail.contains("and 12 more"), "{detail}");
     }
 
     #[test]
@@ -1994,14 +2112,18 @@ mod cli_tests {
             r#"case "$input" in *kernel-refuses*) echo 'Error: Could not process rule: Invalid argument' >&2; exit 1;; esac"#,
         );
         let mut set = set_of(&["a", "b"]);
-        set.forward = ["f0", "kernel-refuses", "f2"]
-            .iter()
-            .map(|c| NftRule {
-                matches: Vec::new(),
-                verdict: crate::nft_ir::NftVerdict::Drop,
-                comment: (*c).to_owned(),
-            })
-            .collect();
+        set.forward = [
+            ("f0", NftVerdict::Drop),
+            ("kernel-refuses", NftVerdict::Accept),
+            ("f2", NftVerdict::Drop),
+        ]
+        .iter()
+        .map(|&(c, verdict)| NftRule {
+            matches: Vec::new(),
+            verdict,
+            comment: c.to_owned(),
+        })
+        .collect();
         assert_eq!(
             cli.apply_best_effort(&set),
             Ok(NftApplyOutcome {
@@ -2017,6 +2139,41 @@ mod cli_tests {
         assert!(!last.contains("kernel-refuses"), "{last}");
         assert!(last.contains(r#""comment":"f0""#), "{last}");
         assert!(last.contains(r#""comment":"f2""#), "{last}");
+        let _ = std::fs::remove_file(&log);
+    }
+
+    /// A refused drop is not skipped: without it the set would let through
+    /// what it cut. The live table is never touched and the twin is removed.
+    #[test]
+    fn a_refused_block_rule_keeps_the_previous_table() {
+        let (cli, log) = recording(
+            "refused-drop",
+            r#"case "$input" in *kernel-refuses*) echo 'Error: Could not process rule: Invalid argument' >&2; exit 1;; esac"#,
+        );
+        let mut set = set_of(&["a", "c"]);
+        set.rules.insert(
+            1,
+            NftRule {
+                matches: vec![NftMatch::SkUid(1000)],
+                verdict: NftVerdict::Drop,
+                comment: "kernel-refuses".into(),
+            },
+        );
+        let outcome = cli.apply_best_effort(&set);
+        assert!(
+            matches!(&outcome, Err(NftApplyError::Rejected { detail }) if detail.contains("kernel-refuses")),
+            "{outcome:?}"
+        );
+        let runs = batches(&log);
+        for later in &runs[1..] {
+            assert!(!later.contains(r#""table":"nrr""#), "{later}");
+            assert!(!later.contains(r#""name":"nrr""#), "{later}");
+        }
+        let cleanup = runs.last().expect("a cleanup run");
+        assert!(
+            cleanup.contains(r#""delete":{"table":{"family":"inet","name":"nrr_probe""#),
+            "{cleanup}"
+        );
         let _ = std::fs::remove_file(&log);
     }
 
@@ -2215,12 +2372,13 @@ mod cli_tests {
         let cli = fake(
             r#"sed 's/{"payload":{"protocol":"ip","field":"daddr"}},"right":"192.0.2.99"/{"fib":{"result":"oif","flags":["daddr","iif"]}},"right":0/' | nft "$@""#,
         );
+        // Accepts: a refused drop is not skipped but refuses the whole set.
         let host = |last: u8, comment: &str| NftRule {
             matches: vec![NftMatch::DstV4 {
                 net: std::net::Ipv4Addr::new(192, 0, 2, last),
                 prefix: 32,
             }],
-            verdict: crate::nft_ir::NftVerdict::Drop,
+            verdict: crate::nft_ir::NftVerdict::Accept,
             comment: comment.to_owned(),
         };
         let set = NftRuleset {

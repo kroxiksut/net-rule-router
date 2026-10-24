@@ -42,8 +42,9 @@ pub struct OverlapPair {
     pub covered_route: String,
     /// Id of the covered exact rule — what a cleanup deletes.
     pub covered_rule_id: String,
-    /// The exact rule changes nothing: same route, same action, and the
-    /// suffix rule is enabled, so removing it leaves routing identical.
+    /// The exact rule changes nothing: same route, same action, the suffix
+    /// rule is enabled, and no narrower rule elsewhere would take the host,
+    /// so removing it leaves routing identical.
     pub redundant: bool,
 }
 
@@ -56,6 +57,10 @@ pub fn find_overlaps(dto: &CanonicalRulesJsonV1) -> Vec<OverlapPair> {
     });
     let exacts = collect(dto, |m| match m {
         AddressMatchDto::ExactFqdn { value } => Some(value.as_str()),
+        _ => None,
+    });
+    let any_zones = collect(dto, |m| match m {
+        AddressMatchDto::AnyZoneDomain { base } => Some(base.as_str()),
         _ => None,
     });
     let suffixes_by_name = index_by_name(&suffixes, |s| s.name.as_str());
@@ -81,7 +86,8 @@ pub fn find_overlaps(dto: &CanonicalRulesJsonV1) -> Vec<OverlapPair> {
                 redundant: same_app
                     && apex.rule.action == covered.rule.action
                     && apex.rule.enabled
-                    && covered.rule.enabled,
+                    && covered.rule.enabled
+                    && host_falls_to(apex, covered, &exacts, &suffixes_by_name, &any_zones),
             });
         }
     }
@@ -92,6 +98,46 @@ pub fn find_overlaps(dto: &CanonicalRulesJsonV1) -> Vec<OverlapPair> {
             .then_with(|| a.covered_rule_id.cmp(&b.covered_rule_id))
     });
     out
+}
+
+/// Whether, without `covered`, its host still takes `apex`'s route and action:
+/// no other rule as narrow as `apex` or narrower, on another route or with
+/// another action, claims the host. A `site.*` rule naming the host's labels
+/// counts as such a rule, which may keep a spare rule but never offers one
+/// whose removal moves the host.
+fn host_falls_to(
+    apex: &Named<'_>,
+    covered: &Named<'_>,
+    exacts: &[Named<'_>],
+    suffixes_by_name: &HashMap<&str, Vec<&Named<'_>>>,
+    any_zones: &[Named<'_>],
+) -> bool {
+    let rival = |other: &Named<'_>| {
+        !std::ptr::eq(other.rule, covered.rule)
+            && !std::ptr::eq(other.rule, apex.rule)
+            && other.rule.enabled
+            && (other.rule.app_match.is_none() || other.rule.app_match == covered.rule.app_match)
+            && (other.route != apex.route || other.rule.action != apex.rule.action)
+    };
+    let host = covered.name.as_str();
+    let exact_rival = exacts.iter().any(|o| o.name == host && rival(o));
+    let suffix_rival = ancestors_in(host, suffixes_by_name)
+        .into_iter()
+        .any(|o| o.name.len() >= apex.name.len() && rival(o));
+    let site_rival = any_zones
+        .iter()
+        .any(|o| names_site(host, &o.name) && rival(o));
+    !(exact_rival || suffix_rival || site_rival)
+}
+
+/// `base`'s labels run inside `host`'s, followed by at least one more label.
+fn names_site(host: &str, base: &str) -> bool {
+    let host: Vec<&str> = host.split('.').collect();
+    let base: Vec<&str> = base.split('.').collect();
+    host.len() > base.len()
+        && host[..host.len() - 1]
+            .windows(base.len())
+            .any(|window| window == base.as_slice())
 }
 
 /// Rules grouped by their folded name, so an ancestor walk finds the rules
@@ -246,6 +292,44 @@ mod tests {
         let found = find_overlaps(&dto);
         assert_eq!(found.len(), 1);
         assert!(!found[0].redundant);
+    }
+
+    /// Without the exact rule the host would take the longest suffix of
+    /// either route, so a narrower one on the other route keeps it.
+    #[test]
+    fn a_narrower_rule_on_the_other_route_keeps_the_exact_rule() {
+        let site = rule(
+            "s-site",
+            AddressMatchDto::AnyZoneDomain {
+                base: "www.example.*".into(),
+            },
+        );
+        for rival in [suffix("s-1", "www.example.com"), site] {
+            let dto = book(
+                vec![
+                    suffix("p-1", "example.com"),
+                    exact("p-2", "www.example.com"),
+                ],
+                vec![rival],
+            );
+            let found = find_overlaps(&dto);
+            assert_eq!(found.len(), 1, "{found:?}");
+            assert!(!found[0].redundant, "{found:?}");
+        }
+
+        // A rival that does not claim the host, or one on the same route with
+        // the same action, leaves the exact rule spare.
+        let dto = book(
+            vec![
+                suffix("p-1", "example.com"),
+                suffix("p-3", "www.example.com"),
+                exact("p-2", "www.example.com"),
+            ],
+            vec![suffix("s-1", "api.example.com")],
+        );
+        let found = find_overlaps(&dto);
+        assert_eq!(found.len(), 2, "{found:?}");
+        assert!(found.iter().all(|pair| pair.redundant), "{found:?}");
     }
 
     #[test]

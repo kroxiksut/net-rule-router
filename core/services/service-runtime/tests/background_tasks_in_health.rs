@@ -221,6 +221,15 @@ const THREADS: &[(&str, &str, usize, Verdict)] = &[
         Verdict::Supervisor,
     ),
     (
+        "service-runtime/src/task_liveness.rs",
+        "nrr-hang-watchdog",
+        1,
+        Verdict::Invisible(
+            "the watcher of every lease; health still shows the hung task it \
+             would restart for, and a watcher of the watcher is its own item",
+        ),
+    ),
+    (
         "service-runtime/src/supervised_runtime.rs",
         "nrr-stop-",
         1,

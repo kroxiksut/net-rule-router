@@ -215,6 +215,7 @@ Frame {
             spacing: root.uiTheme.spacingSm
             ThemedTextField {
                 id: probeInput
+                accessibleLabel: root.tr("diag.explain.title", "Explain sample")
                 theme: root.uiTheme
                 Layout.fillWidth: true
                 placeholderText: root.tr("diag.explain.probe-placeholder",

@@ -1,0 +1,83 @@
+{
+  "description": "pure.js secondaryChangeHoldsNow: whether moving the additional role from `before` to `after` is what makes a level hold the internet (asked before a role is removed or reassigned). `before`/`after` patch the adapters base row; null means nothing is bound",
+  "cases": [
+    {
+      "name": "removing an available additional connection under everything",
+      "input": {
+        "level": "everything",
+        "before": {},
+        "after": null
+      },
+      "expected": true
+    },
+    {
+      "name": "moving the role to an adapter that is down under everything",
+      "input": {
+        "level": "everything",
+        "before": {},
+        "after": {
+          "availability": "unavailable"
+        }
+      },
+      "expected": true
+    },
+    {
+      "name": "moving the role to an adapter not yet checked under everything",
+      "input": {
+        "level": "everything",
+        "before": {},
+        "after": {
+          "availability": "requires-check"
+        }
+      },
+      "expected": true
+    },
+    {
+      "name": "removing an additional connection that is already down asks nothing",
+      "input": {
+        "level": "everything",
+        "before": {
+          "availability": "unavailable"
+        },
+        "after": null
+      },
+      "expected": false
+    },
+    {
+      "name": "binding an available adapter where none was bound",
+      "input": {
+        "level": "everything",
+        "before": null,
+        "after": {}
+      },
+      "expected": false
+    },
+    {
+      "name": "moving the role between two available adapters",
+      "input": {
+        "level": "everything",
+        "before": {},
+        "after": {}
+      },
+      "expected": false
+    },
+    {
+      "name": "removing it under routed sites",
+      "input": {
+        "level": "sites",
+        "before": {},
+        "after": null
+      },
+      "expected": false
+    },
+    {
+      "name": "removing it with leak protection off",
+      "input": {
+        "level": "off",
+        "before": {},
+        "after": null
+      },
+      "expected": false
+    }
+  ]
+}

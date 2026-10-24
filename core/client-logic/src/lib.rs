@@ -29,10 +29,13 @@
 //!   line.
 //! - [`block_notices`] — the summary of blocks kept while no surface was
 //!   open.
+//! - [`cache_view`] — the cache list's three filters.
 //! - [`conn_trace`] — the connection trace's view filters and its grouping
 //!   by program or folder.
 //! - [`diagnostics`] — security alert lists, whether an acknowledgement took,
 //!   and when to say the user's saved rules cannot be read.
+//! - [`doh_resolvers`] — the user's resolver-list edits laid over a fresh
+//!   read of the machine's list.
 //! - [`enforcement_notice`] — when the rules applying again is worth a line.
 //! - [`forwarded`] — whether WSL runs, and asking what it gets when the
 //!   tunnel is down.
@@ -57,9 +60,11 @@ pub mod app_routes;
 pub mod auto_rules;
 pub mod block_notices;
 pub mod bulk_rules;
+pub mod cache_view;
 pub mod conn_trace;
 pub mod contract;
 pub mod diagnostics;
+pub mod doh_resolvers;
 pub mod enforcement_notice;
 pub mod forwarded;
 pub mod full_reset;

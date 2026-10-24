@@ -10,7 +10,10 @@ use serde_json::Value;
 
 use super::apply::Review;
 use super::form::{offered_types, route_options, Field, Form};
-use super::table::{route_label, RouteFilter, Row, SortMode, Verdict, VerdictStatus, PAGE};
+use super::table::{
+    route_label, type_filter_label, RouteFilter, Row, SortMode, StatusFilter, Verdict,
+    VerdictStatus, PAGE, TYPE_FILTERS,
+};
 
 /// Lines of the changes view's entry list one window shows.
 pub const REVIEW_PAGE: usize = 12;
@@ -166,6 +169,25 @@ fn state_lines(app: &AppState, texts: &Texts) -> Vec<ViewLine> {
         Segment::strong(format!("{}: ", texts.get(text::ROUTE_FILTER))),
         Segment::plain(texts.get(table.filter.label())),
     ];
+    if table.status != StatusFilter::All {
+        filter.push(Segment::strong(format!(
+            " · {}: ",
+            texts.get(text::STATUS_FILTER)
+        )));
+        filter.push(Segment::plain(texts.get(table.status.label())));
+    }
+    if !matches!(table.type_filter, "" | "all") {
+        filter.push(Segment::strong(format!(
+            " · {}: ",
+            texts.get(text::TYPE_FILTER)
+        )));
+        filter.push(Segment::plain(
+            texts.get(type_filter_label(table.type_filter)),
+        ));
+    }
+    if table.auto_only {
+        filter.push(Segment::plain(format!(" · {}", texts.get(text::AUTO_ONLY))));
+    }
     if !table.search.is_empty() {
         filter.push(Segment::strong(format!(" · {}: ", texts.get(text::SEARCH))));
         filter.push(Segment::plain(table.search.clone()));
@@ -180,6 +202,15 @@ fn state_lines(app: &AppState, texts: &Texts) -> Vec<ViewLine> {
         filter.push(Segment::plain(texts.get(table.sort.label())));
     }
     lines.push(ViewLine::new(filter));
+    let invalid = table.invalid_count();
+    if invalid > 0 {
+        let mut said = texts.fill(text::INVALID_COUNT, &[("n", invalid.to_string())]);
+        if table.status != StatusFilter::WithErrors {
+            said.push(' ');
+            said.push_str(&texts.get(text::INVALID_SHOW));
+        }
+        lines.push(ViewLine::new(vec![Segment::state(said, StateTone::Bad)]));
+    }
     if let Some(check) = &rules.main_route.check {
         lines.push(ViewLine::text(main_route::progress_text(check, texts)));
     }
@@ -762,6 +793,8 @@ fn overlap_lines(form: &Form, texts: &Texts) -> Vec<ViewLine> {
 pub fn choice_len(purpose: &ChoicePurpose) -> usize {
     match purpose {
         ChoicePurpose::Filter => RouteFilter::ALL.len(),
+        ChoicePurpose::StatusFilter => StatusFilter::ALL.len(),
+        ChoicePurpose::TypeFilter => TYPE_FILTERS.len(),
         ChoicePurpose::Quit | ChoicePurpose::ImportMode { .. } => 3,
         ChoicePurpose::Preset(list) => list.sets.len(),
         ChoicePurpose::Recent => 4,
@@ -782,6 +815,19 @@ fn choice_lines(app: &AppState, choice: &Choice, texts: &Texts) -> Vec<ViewLine>
             get(text::FILTER_QUESTION),
             Vec::new(),
             RouteFilter::ALL.iter().map(|f| get(f.label())).collect(),
+        ),
+        ChoicePurpose::StatusFilter => (
+            get(text::STATUS_QUESTION),
+            Vec::new(),
+            StatusFilter::ALL.iter().map(|f| get(f.label())).collect(),
+        ),
+        ChoicePurpose::TypeFilter => (
+            get(text::TYPE_QUESTION),
+            Vec::new(),
+            TYPE_FILTERS
+                .iter()
+                .map(|slug| get(type_filter_label(slug)))
+                .collect(),
         ),
         ChoicePurpose::Delete(i) => {
             let what = app

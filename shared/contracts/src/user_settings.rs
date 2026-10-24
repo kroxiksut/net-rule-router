@@ -49,6 +49,7 @@ const KEY_RULES_FILES: &str = "rules-files";
 const KEY_SELECTED_SET: &str = "selected-set";
 const KEY_SERVICE_INTENT: &str = "service-intent";
 const KEY_ACCEPTED_EULA: &str = "accepted-eula";
+const KEY_MERGE_POLICY: &str = "merge-policy";
 const KEY_PRIMARY: &str = "primary";
 const KEY_SECONDARY: &str = "secondary";
 const KEY_WRITTEN: &str = "written";
@@ -90,6 +91,9 @@ pub struct UserSettings {
     /// The agreement revision this user accepted in either client;
     /// `eula::EULA_NOT_ACCEPTED` (0) when none.
     pub accepted_eula: u32,
+    /// Who wins a rule the bound files and the service both hold but differ
+    /// on: a merge-policy slug, `""` for none chosen (ask per rule).
+    pub merge_policy: String,
     /// Top-level keys this build does not know, written back unchanged.
     pub other: Map<String, Value>,
 }
@@ -103,10 +107,15 @@ impl Default for UserSettings {
             selected_set: String::new(),
             service_intent: Map::new(),
             accepted_eula: crate::eula::EULA_NOT_ACCEPTED,
+            merge_policy: String::new(),
             other: Map::new(),
         }
     }
 }
+
+/// SHA-256 of zero bytes: an empty rules file, which holds nothing to lose.
+pub const EMPTY_FILE_SHA256: &str =
+    "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
 
 /// A path as the file stores it: `/` separators, so two clients spell one
 /// folder alike (Windows accepts `/`), and no trailing separator except on a
@@ -174,18 +183,20 @@ impl UserSettings {
         }
     }
 
-    /// Whether `path` was edited by hand since the program last wrote it:
-    /// its bytes (`on_disk`, their SHA-256; `None` when the file is absent)
-    /// differ from the version on record. A file never written by the program
-    /// has no record to differ from, and an absent one has nothing to lose.
+    /// Whether `path` holds text the program did not put there: its bytes
+    /// (`on_disk`, their SHA-256; `None` when the file is absent) differ from
+    /// the version on record, or there is no record and the file is not empty.
+    /// The user's rules are never overwritten unasked, so a file the program
+    /// never wrote, or wrote without recording it, counts as the user's. An
+    /// absent or empty file has nothing to lose.
     pub fn rules_file_hand_edited(&self, path: &str, on_disk: Option<&str>) -> bool {
         let Some(on_disk) = on_disk else {
             return false;
         };
-        self.rules_files
-            .written
-            .get(&portable_path(path))
-            .is_some_and(|recorded| !recorded.eq_ignore_ascii_case(on_disk))
+        match self.rules_files.written.get(&portable_path(path)) {
+            Some(recorded) => !recorded.eq_ignore_ascii_case(on_disk),
+            None => !on_disk.eq_ignore_ascii_case(EMPTY_FILE_SHA256),
+        }
     }
 
     /// Takes into `self` — the file as it is now — every known key `mine`
@@ -222,6 +233,12 @@ impl UserSettings {
             &mut self.selected_set,
             &base.selected_set,
             &mine.selected_set,
+            &mut changed,
+        );
+        adopt(
+            &mut self.merge_policy,
+            &base.merge_policy,
+            &mine.merge_policy,
             &mut changed,
         );
         changed |= adopt_map(
@@ -334,6 +351,7 @@ pub fn parse_user_settings(text: &str) -> Result<UserSettings, String> {
     };
     let rules_folder = take_string(&mut object, KEY_RULES_FOLDER)?;
     let selected_set = take_string(&mut object, KEY_SELECTED_SET)?;
+    let merge_policy = take_string(&mut object, KEY_MERGE_POLICY)?;
     let rules_files = match object.remove(KEY_RULES_FILES) {
         None | Some(Value::Null) => RulesFiles::default(),
         Some(Value::Object(mut files)) => {
@@ -366,6 +384,7 @@ pub fn parse_user_settings(text: &str) -> Result<UserSettings, String> {
         selected_set,
         service_intent,
         accepted_eula,
+        merge_policy,
         other: object,
     })
 }
@@ -415,6 +434,12 @@ pub fn format_user_settings(settings: &UserSettings) -> serde_json::Result<Strin
         object.insert(
             KEY_ACCEPTED_EULA.to_string(),
             Value::from(settings.accepted_eula),
+        );
+    }
+    if !settings.merge_policy.is_empty() {
+        object.insert(
+            KEY_MERGE_POLICY.to_string(),
+            Value::String(settings.merge_policy.clone()),
         );
     }
     // A known key wins over a same-named entry a caller put among the others.
@@ -853,6 +878,7 @@ mod tests {
                 other: Map::new(),
             },
             selected_set: "user:home".to_string(),
+            merge_policy: "file-wins".to_string(),
             service_intent: json!({"stability": {"verbose-logging": true}})
                 .as_object()
                 .cloned()
@@ -923,6 +949,10 @@ mod tests {
             json!("/home/user/rule-sets/home/rules_primary.txt")
         );
         assert_eq!(value["selected-set"], json!("user:home"));
+        assert_eq!(value["merge-policy"], json!("file-wins"));
+        assert!(rewritten(&UserSettings::default())
+            .get("merge-policy")
+            .is_none());
         assert_eq!(
             value["service-intent"]["stability"]["verbose-logging"],
             json!(true)
@@ -1116,8 +1146,12 @@ mod tests {
         let sep = std::path::MAIN_SEPARATOR;
         let path = &format!("C:{sep}Sets{sep}home{sep}rules_primary.txt");
         assert!(
-            !settings.rules_file_hand_edited(path, Some("00")),
-            "never written by the program: nothing to differ from"
+            settings.rules_file_hand_edited(path, Some("00")),
+            "never written by the program: the text there is the user's"
+        );
+        assert!(
+            !settings.rules_file_hand_edited(path, Some(EMPTY_FILE_SHA256)),
+            "an empty file has nothing to lose"
         );
         settings.record_rules_file_written(path, "AB12");
         let spelled = "C:/Sets/home/rules_primary.txt";

@@ -58,6 +58,10 @@ const MAX_ANSWER_RECORDS: usize = 512;
 /// A longer line is skipped unread: a DNS answer is at most 64 KiB on the
 /// wire, and its JSON rendering stays far below this.
 pub const MAX_MONITOR_LINE_BYTES: usize = 1024 * 1024;
+/// Observations held between drains (the consumer drains every few seconds).
+/// Any local process can make resolved answer tens of thousands of cached
+/// queries a second; past the cap they are dropped, as the ETW source does.
+const MAX_BUFFERED_OBSERVATIONS: usize = 4096;
 
 /// A resolved restart takes seconds; a resolved that stays down is asked
 /// about once a minute rather than spawned against every second.
@@ -267,7 +271,8 @@ fn run_monitor(
 }
 
 /// Read monitor lines into `sink` until the stream ends; `true` when at least
-/// one line was read. An oversized or non-UTF-8 line costs only itself.
+/// one line was read. An oversized or non-UTF-8 line costs only itself, and
+/// `sink` never grows past [`MAX_BUFFERED_OBSERVATIONS`] between drains.
 fn pump_lines(output: impl Read, sink: &Mutex<Vec<DnsObservation>>) -> bool {
     let mut reader = BufReader::new(output);
     let mut buf = Vec::new();
@@ -279,9 +284,9 @@ fn pump_lines(output: impl Read, sink: &Mutex<Vec<DnsObservation>>) -> bool {
         };
         let mut observations = parse_monitor_line(text).peekable();
         if observations.peek().is_some() {
-            sink.lock()
-                .unwrap_or_else(|p| p.into_inner())
-                .extend(observations);
+            let mut buffered = sink.lock().unwrap_or_else(|p| p.into_inner());
+            let room = MAX_BUFFERED_OBSERVATIONS.saturating_sub(buffered.len());
+            buffered.extend(observations.take(room));
         }
     }
     saw_line
@@ -661,6 +666,25 @@ mod tests {
 
         let observations = sink.into_inner().expect("not poisoned");
         assert_eq!(hostnames(&observations), vec!["example.com"]);
+    }
+
+    /// A stream faster than the drain is cut at the cap, never buffered whole:
+    /// a local process can make resolved print tens of thousands of lines a
+    /// second, and the consumer drains every few seconds.
+    #[test]
+    fn a_storm_of_lines_is_held_to_the_buffer_cap_between_drains() {
+        let mut stream = Vec::new();
+        for _ in 0..(MAX_BUFFERED_OBSERVATIONS + 100) {
+            stream.extend_from_slice(LIVE_LINE.as_bytes());
+            stream.push(b'\n');
+        }
+        let sink = Mutex::new(Vec::new());
+
+        assert!(pump_lines(stream.as_slice(), &sink));
+
+        let observations = sink.into_inner().expect("not poisoned");
+        assert_eq!(observations.len(), MAX_BUFFERED_OBSERVATIONS);
+        assert!(observations.iter().all(|o| o.hostname == "example.com"));
     }
 
     #[test]

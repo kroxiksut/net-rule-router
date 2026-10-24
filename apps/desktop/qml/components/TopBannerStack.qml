@@ -30,7 +30,7 @@ Item {
         + blockAllBanner.height
         + rulesFolderSuggestionBanner.height + revisionIntegrityBanner.height
         + localNetworkOfferBanner.height + appGroupsOfferBanner.height
-        + bindingDivergenceBanner.height
+        + bindingDivergenceBanner.height + protectionVolumeBanner.height
     height: totalHeight
 
     // The service stopped though nobody asked for it: the banner says so and
@@ -71,7 +71,9 @@ Item {
         anchors.right: parent.right
         height: root.previewDataBannerVisible ? Math.max(36, previewDataLabel.implicitHeight + 2 * root.uiTheme.spacingSm) : 0
         visible: root.previewDataBannerVisible
-        color: "#475569"     // slate — not an alarm, and not the informational blue
+        color: root.uiTheme.bannerNeutralFill     // slate — not an alarm, and not the informational blue
+        border.width: root.uiTheme.bannerBorderWidth
+        border.color: root.uiTheme.bannerBorder
         z: 101
 
         Label {
@@ -81,7 +83,7 @@ Item {
             anchors.rightMargin: root.uiTheme.spacingLg
             verticalAlignment: Text.AlignVCenter
             wrapMode: Text.WordWrap
-            color: "#ffffff"
+            color: root.uiTheme.bannerText
             text: root.uiRevision >= 0
                 ? root.tr("status.preview-data-banner",
                     "Sample data: this window shows an example, not your service's data, and nothing changed here reaches the service.")
@@ -94,9 +96,13 @@ Item {
         anchors.top: previewDataBanner.bottom
         anchors.left: parent.left
         anchors.right: parent.right
-        height: root.backendBannerHeight
+        height: root.backendBannerHeight > 0
+            ? Math.max(root.backendBannerHeight, backendRow.implicitHeight + 2 * root.uiTheme.spacingXs)
+            : 0
         visible: root.backendBannerVisible
         color: root.backendStatusBannerColor()
+        border.width: root.uiTheme.bannerBorderWidth
+        border.color: root.uiTheme.bannerBorder
         z: 100
         // Refresh the live SCM status whenever the banner appears so the
         // Start/Install button label is accurate (refreshStatus() is otherwise
@@ -109,6 +115,7 @@ Item {
             }
         }
         RowLayout {
+            id: backendRow
             anchors.fill: parent
             anchors.leftMargin: root.uiTheme.spacingMd
             anchors.rightMargin: root.uiTheme.spacingMd
@@ -121,13 +128,13 @@ Item {
             }
             Label {
                 Layout.fillWidth: true
-                color: "white"
+                color: root.uiTheme.bannerText
                 text: topBannerStack.serviceLossActions.length > 0
                     ? root.tr("connection.banner.service-lost",
                         "The NetRuleRouter service stopped unexpectedly, so your rules are not applied")
                     : root.backendStatusBannerText()
                 verticalAlignment: Text.AlignVCenter
-                elide: Text.ElideRight
+                wrapMode: Text.WordWrap
             }
             // One-click Start/Install service. Label and
             // action come from the live SCM status (_bannerServiceAction), not
@@ -189,7 +196,9 @@ Item {
             ? Math.max(36, combinedAmberColumn.implicitHeight + 2 * root.uiTheme.spacingSm)
             : 0
         visible: root.combinedAmberBannerVisible
-        color: "#d4a017"     // amber — the colour both merged banners used
+        color: root.uiTheme.bannerWarningFill     // amber — the colour both merged banners used
+        border.width: root.uiTheme.bannerBorderWidth
+        border.color: root.uiTheme.bannerBorder
         z: 99
         // Collapse again once the pair stops applying, so the next time the
         // two warnings coincide the compact form is what appears.
@@ -210,13 +219,13 @@ Item {
                 spacing: root.uiTheme.spacingSm
                 Label {
                     text: "⚠"
-                    color: "white"
+                    color: root.uiTheme.bannerText
                     Layout.alignment: Qt.AlignTop
                     Accessible.ignored: true
                 }
                 Label {
                     Layout.fillWidth: true
-                    color: "white"
+                    color: root.uiTheme.bannerText
                     text: root._serviceRulesEmpty
                         ? root.tr("status.drift-banner-empty-service",
                             "The service has none of your rules — nothing is being routed yet.")
@@ -289,13 +298,13 @@ Item {
                 spacing: root.uiTheme.spacingSm
                 Label {
                     text: "⚠"
-                    color: "white"
+                    color: root.uiTheme.bannerText
                     Layout.alignment: Qt.AlignTop
                     Accessible.ignored: true
                 }
                 Label {
                     Layout.fillWidth: true
-                    color: "white"
+                    color: root.uiTheme.bannerText
                     // Same direct `uiRevision` read as the standalone banner:
                     // the adapter name comes from a JS call whose property
                     // reads Qt does not track.
@@ -362,10 +371,12 @@ Item {
                         color: combinedSecondaryCloseButton.hovered
                             ? Qt.rgba(1, 1, 1, 0.2) : "transparent"
                         radius: root.uiTheme.radiusSm
+                        border.width: combinedSecondaryCloseButton.visualFocus ? 2 : 0
+                        border.color: root.uiTheme.bannerText
                     }
                     contentItem: Label {
                         text: combinedSecondaryCloseButton.text
-                        color: "white"
+                        color: root.uiTheme.bannerText
                         font: combinedSecondaryCloseButton.font
                         horizontalAlignment: Text.AlignHCenter
                         verticalAlignment: Text.AlignVCenter
@@ -384,18 +395,23 @@ Item {
         anchors.top: combinedAmberBanner.bottom
         anchors.left: parent.left
         anchors.right: parent.right
-        height: root.driftBannerHeight
+        height: root.driftBannerHeight > 0
+            ? Math.max(root.driftBannerHeight, driftRow.implicitHeight + 2 * root.uiTheme.spacingXs)
+            : 0
         visible: root.driftBannerVisible && !root.combinedAmberBannerVisible
-        color: "#d4a017"     // amber — same family as ReviewDiff lacks-elevation
+        color: root.uiTheme.bannerWarningFill     // amber — same family as ReviewDiff lacks-elevation
+        border.width: root.uiTheme.bannerBorderWidth
+        border.color: root.uiTheme.bannerBorder
         z: 99
         RowLayout {
+            id: driftRow
             anchors.fill: parent
             anchors.leftMargin: root.uiTheme.spacingMd
             anchors.rightMargin: root.uiTheme.spacingMd
             spacing: root.uiTheme.spacingSm
             Label {
                 Layout.fillWidth: true
-                color: "white"
+                color: root.uiTheme.bannerText
                 // An empty service rulebook (fresh install /
                 // wiped service DB) gets its own honest wording; the generic
                 // "do not all agree" text sent the user diffing three legs
@@ -406,7 +422,7 @@ Item {
                     : root.tr("status.drift-banner",
                         "Rules in the file, the app, and the service do not all agree.")
                 verticalAlignment: Text.AlignVCenter
-                elide: Text.ElideRight
+                wrapMode: Text.WordWrap
                 Accessible.role: Accessible.StaticText
                 Accessible.name: text
             }
@@ -441,22 +457,27 @@ Item {
         anchors.top: driftBanner.bottom
         anchors.left: parent.left
         anchors.right: parent.right
-        height: root.mergeBannerHeight
+        height: root.mergeBannerHeight > 0
+            ? Math.max(root.mergeBannerHeight, mergeRow.implicitHeight + 2 * root.uiTheme.spacingXs)
+            : 0
         visible: root.mergeBannerVisible
-        color: "#2d6a4f"     // muted green — informational
+        color: root.uiTheme.bannerSuccessFill     // muted green — informational
+        border.width: root.uiTheme.bannerBorderWidth
+        border.color: root.uiTheme.bannerBorder
         z: 98
         RowLayout {
+            id: mergeRow
             anchors.fill: parent
             anchors.leftMargin: root.uiTheme.spacingMd
             anchors.rightMargin: root.uiTheme.spacingMd
             spacing: root.uiTheme.spacingSm
             Label {
                 Layout.fillWidth: true
-                color: "white"
+                color: root.uiTheme.bannerText
                 text: root.tr("status.merge-banner",
                     "The rules in your files are not the ones being applied — you can compare and merge them.")
                 verticalAlignment: Text.AlignVCenter
-                elide: Text.ElideRight
+                wrapMode: Text.WordWrap
                 Accessible.role: Accessible.StaticText
                 Accessible.name: text
             }
@@ -486,7 +507,9 @@ Item {
             ? Math.max(root.compatBannerHeight, compatRow.implicitHeight + 2 * root.uiTheme.spacingXs)
             : 0
         visible: root.compatBannerVisible
-        color: "#c0392b"
+        color: root.uiTheme.bannerDangerFill
+        border.width: root.uiTheme.bannerBorderWidth
+        border.color: root.uiTheme.bannerBorder
         z: 98
         RowLayout {
             id: compatRow
@@ -496,7 +519,7 @@ Item {
             spacing: root.uiTheme.spacingSm
             Label {
                 Layout.fillWidth: true
-                color: "white"
+                color: root.uiTheme.bannerText
                 text: root.contractSkew !== ""
                     ? root.tr("status.contract-skew." + root.contractSkew,
                         root.contractSkew === "service-older"
@@ -554,7 +577,9 @@ Item {
             : 0
         visible: root.secondaryBannerVisible && !root.combinedAmberBannerVisible
         color: (root.secondaryReconfirmVisible || root.secondaryUnresolvedVisible)
-            ? "#d4a017" : "#2c6fbb"
+            ? root.uiTheme.bannerWarningFill : root.uiTheme.bannerInfoFill
+        border.width: root.uiTheme.bannerBorderWidth
+        border.color: root.uiTheme.bannerBorder
         z: 96
         RowLayout {
             id: secondaryBannerRow
@@ -566,7 +591,7 @@ Item {
             spacing: root.uiTheme.spacingSm
             Label {
                 Layout.fillWidth: true
-                color: "white"
+                color: root.uiTheme.bannerText
                 // VPN-split case: informational ONLY — no forced
                 // mode switch. The routing-mode choice (prefer-secondary /
                 // strict) lives in Settings → Routing; the earlier one-click
@@ -689,10 +714,12 @@ Item {
                     color: secondaryUnresolvedCloseButton.hovered
                         ? Qt.rgba(1, 1, 1, 0.2) : "transparent"
                     radius: root.uiTheme.radiusSm
+                    border.width: secondaryUnresolvedCloseButton.visualFocus ? 2 : 0
+                    border.color: root.uiTheme.bannerText
                 }
                 contentItem: Label {
                     text: secondaryUnresolvedCloseButton.text
-                    color: "white"
+                    color: root.uiTheme.bannerText
                     font: secondaryUnresolvedCloseButton.font
                     horizontalAlignment: Text.AlignHCenter
                     verticalAlignment: Text.AlignVCenter
@@ -711,25 +738,30 @@ Item {
         anchors.top: secondaryAdapterBanner.bottom
         anchors.left: parent.left
         anchors.right: parent.right
-        height: root.emptyRulesBannerHeight
+        height: root.emptyRulesBannerHeight > 0
+            ? Math.max(root.emptyRulesBannerHeight, emptyRulesRow.implicitHeight + 2 * root.uiTheme.spacingXs)
+            : 0
         visible: root.emptyRulesBannerVisible
-        color: "#2c6fbb"     // info blue — informational, not an error
+        color: root.uiTheme.bannerInfoFill     // info blue — informational, not an error
+        border.width: root.uiTheme.bannerBorderWidth
+        border.color: root.uiTheme.bannerBorder
         z: 95
         RowLayout {
+            id: emptyRulesRow
             anchors.fill: parent
             anchors.leftMargin: root.uiTheme.spacingMd
             anchors.rightMargin: root.uiTheme.spacingMd
             spacing: root.uiTheme.spacingSm
             Label {
                 Layout.fillWidth: true
-                color: "white"
+                color: root.uiTheme.bannerText
                 text: root.emptyRulesBannerHasLocalRules
                     ? root.tr("status.unapplied-rules-banner",
                         "The app has rules that aren't applied yet — the service is enforcing none. Apply them now.")
                     : root.tr("status.empty-rules-banner",
                         "No rules are active — the service isn't routing anything. The rule set is empty (it may have been reset). Add rules or import a preset.")
                 verticalAlignment: Text.AlignVCenter
-                elide: Text.ElideRight
+                wrapMode: Text.WordWrap
                 Accessible.role: Accessible.StaticText
                 Accessible.name: text
             }
@@ -785,7 +817,9 @@ Item {
             ? Math.max(36, policyInactiveRow.implicitHeight + 2 * root.uiTheme.spacingSm)
             : 0
         visible: root.policyInactiveBannerVisible
-        color: "#d4a017"     // amber — same family as the other warning banners
+        color: root.uiTheme.bannerWarningFill     // amber — same family as the other warning banners
+        border.width: root.uiTheme.bannerBorderWidth
+        border.color: root.uiTheme.bannerBorder
         z: 94
         RowLayout {
             id: policyInactiveRow
@@ -797,13 +831,13 @@ Item {
             spacing: root.uiTheme.spacingSm
             Label {
                 text: "⚠"
-                color: "white"
+                color: root.uiTheme.bannerText
                 Layout.alignment: Qt.AlignTop
                 Accessible.ignored: true
             }
             Label {
                 Layout.fillWidth: true
-                color: "white"
+                color: root.uiTheme.bannerText
                 // Three readings of one silence: the app holds an adapter the
                 // service never received (fixable here); no adapter and leak
                 // protection on (that traffic is being blocked); no adapter and
@@ -855,7 +889,9 @@ Item {
             ? Math.max(36, blockAllBannerRow.implicitHeight + 2 * root.uiTheme.spacingSm)
             : 0
         visible: root.blockAllBannerVisible
-        color: "#d4a017"     // amber — same family as the other warning banners
+        color: root.uiTheme.bannerWarningFill     // amber — same family as the other warning banners
+        border.width: root.uiTheme.bannerBorderWidth
+        border.color: root.uiTheme.bannerBorder
         z: 94
         RowLayout {
             id: blockAllBannerRow
@@ -867,7 +903,7 @@ Item {
             spacing: root.uiTheme.spacingSm
             Label {
                 Layout.fillWidth: true
-                color: "white"
+                color: root.uiTheme.bannerText
                 text: root.tr("settings.routing.kill-switch.block-all-active-banner",
                     "Leak protection is holding all traffic: the additional connection can't be found (down, not started, or reinstalled under a new ID). The internet waits until it returns; reconnect the VPN or assign the adapter again.")
                 verticalAlignment: Text.AlignVCenter
@@ -909,10 +945,12 @@ Item {
                     color: blockAllBannerCloseButton.hovered
                         ? Qt.rgba(1, 1, 1, 0.2) : "transparent"
                     radius: root.uiTheme.radiusSm
+                    border.width: blockAllBannerCloseButton.visualFocus ? 2 : 0
+                    border.color: root.uiTheme.bannerText
                 }
                 contentItem: Label {
                     text: blockAllBannerCloseButton.text
-                    color: "white"
+                    color: root.uiTheme.bannerText
                     font: blockAllBannerCloseButton.font
                     horizontalAlignment: Text.AlignHCenter
                     verticalAlignment: Text.AlignVCenter
@@ -937,7 +975,9 @@ Item {
             ? Math.max(36, rulesFolderSuggestionRow.implicitHeight + 2 * root.uiTheme.spacingSm)
             : 0
         visible: root.rulesFolderSuggestionVisible
-        color: "#2f7d5b"     // muted green — informational, same family as merge
+        color: root.uiTheme.bannerSuccessFill     // muted green — informational, same family as merge
+        border.width: root.uiTheme.bannerBorderWidth
+        border.color: root.uiTheme.bannerBorder
         z: 93
         RowLayout {
             id: rulesFolderSuggestionRow
@@ -949,7 +989,7 @@ Item {
             spacing: root.uiTheme.spacingSm
             Label {
                 Layout.fillWidth: true
-                color: "white"
+                color: root.uiTheme.bannerText
                 text: root.tr("status.rules-folder-suggestion",
                     "Keep your rule sets in this folder? It then becomes the place the app loads and saves rule sets from.")
                     + " " + root.rulesFolderSuggestionPath
@@ -981,10 +1021,12 @@ Item {
                     color: rulesFolderSuggestionCloseButton.hovered
                         ? Qt.rgba(1, 1, 1, 0.2) : "transparent"
                     radius: root.uiTheme.radiusSm
+                    border.width: rulesFolderSuggestionCloseButton.visualFocus ? 2 : 0
+                    border.color: root.uiTheme.bannerText
                 }
                 contentItem: Label {
                     text: rulesFolderSuggestionCloseButton.text
-                    color: "white"
+                    color: root.uiTheme.bannerText
                     font: rulesFolderSuggestionCloseButton.font
                     horizontalAlignment: Text.AlignHCenter
                     verticalAlignment: Text.AlignVCenter
@@ -1007,7 +1049,9 @@ Item {
             ? Math.max(36, revisionIntegrityRow.implicitHeight + 2 * root.uiTheme.spacingSm)
             : 0
         visible: root.revisionIntegrityAlertActive
-        color: "#c0392b"
+        color: root.uiTheme.bannerDangerFill
+        border.width: root.uiTheme.bannerBorderWidth
+        border.color: root.uiTheme.bannerBorder
         z: 92
         RowLayout {
             id: revisionIntegrityRow
@@ -1019,7 +1063,7 @@ Item {
             spacing: root.uiTheme.spacingSm
             Label {
                 Layout.fillWidth: true
-                color: "white"
+                color: root.uiTheme.bannerText
                 text: root.tr("status.revision-integrity-banner",
                     "The rule set was changed outside the app, so it was not applied — the service is running on the last verified version.")
                 verticalAlignment: Text.AlignVCenter
@@ -1055,7 +1099,9 @@ Item {
             ? Math.max(36, localNetworkOfferRow.implicitHeight + 2 * root.uiTheme.spacingSm)
             : 0
         visible: root.localNetworkOfferVisible
-        color: "#2f7d5b"
+        color: root.uiTheme.bannerSuccessFill
+        border.width: root.uiTheme.bannerBorderWidth
+        border.color: root.uiTheme.bannerBorder
         z: 91
         RowLayout {
             id: localNetworkOfferRow
@@ -1068,7 +1114,7 @@ Item {
             Label {
                 Layout.fillWidth: true
                 Layout.preferredWidth: 0
-                color: "white"
+                color: root.uiTheme.bannerText
                 text: root.localNetworkOfferText
                 textFormat: Text.PlainText
                 verticalAlignment: Text.AlignVCenter
@@ -1119,7 +1165,9 @@ Item {
             ? Math.max(36, appGroupsOfferRow.implicitHeight + 2 * root.uiTheme.spacingSm)
             : 0
         visible: root.appGroupsOfferVisible
-        color: "#2f7d5b"
+        color: root.uiTheme.bannerSuccessFill
+        border.width: root.uiTheme.bannerBorderWidth
+        border.color: root.uiTheme.bannerBorder
         z: 90
         RowLayout {
             id: appGroupsOfferRow
@@ -1132,7 +1180,7 @@ Item {
             Label {
                 Layout.fillWidth: true
                 Layout.preferredWidth: 0
-                color: "white"
+                color: root.uiTheme.bannerText
                 text: root.appGroupsOfferText
                 textFormat: Text.PlainText
                 verticalAlignment: Text.AlignVCenter
@@ -1171,7 +1219,9 @@ Item {
             ? Math.max(36, bindingDivergenceRow.implicitHeight + 2 * root.uiTheme.spacingSm)
             : 0
         visible: root.routeBindingDivergenceVisible
-        color: "#d4a017"
+        color: root.uiTheme.bannerWarningFill
+        border.width: root.uiTheme.bannerBorderWidth
+        border.color: root.uiTheme.bannerBorder
         z: 90
         RowLayout {
             id: bindingDivergenceRow
@@ -1183,14 +1233,14 @@ Item {
             spacing: root.uiTheme.spacingSm
             Label {
                 text: "⚠"
-                color: "white"
+                color: root.uiTheme.bannerText
                 Layout.alignment: Qt.AlignTop
                 Accessible.ignored: true
             }
             Label {
                 Layout.fillWidth: true
                 Layout.preferredWidth: 0
-                color: "white"
+                color: root.uiTheme.bannerText
                 text: root.routeBindingDivergenceText
                 verticalAlignment: Text.AlignVCenter
                 wrapMode: Text.WordWrap
@@ -1215,6 +1265,49 @@ Item {
                 Accessible.description: root.tr("status.route-binding-keep-mine-description",
                     "Send the connections shown here to the background service, replacing the ones it is applying.")
                 onClicked: root.resendRouteBindingToService()
+            }
+        }
+    }
+
+    // The machine holds more network filters than the filtering service stays
+    // stable under, every user's rules together. No close button: the advice
+    // stays while the cause does.
+    Rectangle {
+        id: protectionVolumeBanner
+        anchors.top: bindingDivergenceBanner.bottom
+        anchors.left: parent.left
+        anchors.right: parent.right
+        height: root.protectionVolumeBannerVisible
+            ? Math.max(36, protectionVolumeRow.implicitHeight + 2 * root.uiTheme.spacingSm)
+            : 0
+        visible: root.protectionVolumeBannerVisible
+        color: root.uiTheme.bannerWarningFill
+        border.width: root.uiTheme.bannerBorderWidth
+        border.color: root.uiTheme.bannerBorder
+        z: 90
+        RowLayout {
+            id: protectionVolumeRow
+            anchors.left: parent.left
+            anchors.right: parent.right
+            anchors.verticalCenter: parent.verticalCenter
+            anchors.leftMargin: root.uiTheme.spacingMd
+            anchors.rightMargin: root.uiTheme.spacingMd
+            spacing: root.uiTheme.spacingSm
+            Label {
+                text: "⚠"
+                color: root.uiTheme.bannerText
+                Layout.alignment: Qt.AlignTop
+                Accessible.ignored: true
+            }
+            Label {
+                Layout.fillWidth: true
+                Layout.preferredWidth: 0
+                color: root.uiTheme.bannerText
+                text: root.protectionVolumeBannerText
+                verticalAlignment: Text.AlignVCenter
+                wrapMode: Text.WordWrap
+                Accessible.role: Accessible.StaticText
+                Accessible.name: text
             }
         }
     }

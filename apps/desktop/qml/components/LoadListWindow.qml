@@ -209,6 +209,9 @@ Window {
             Layout.fillWidth: true
             checked: root.importOnlyActiveSession
             onToggled: root.importOnlyActiveSession = checked
+            // The text sits in a custom contentItem, which Qt does not name the box by.
+            Accessible.name: root.tr("rules.import-only-active.label", "Import only active rules")
+            Accessible.description: ToolTip.text
             ToolTip.visible: hovered
             ToolTip.text: root.tr("rules.import-only-active.tooltip",
                 "When loading a preset, skip rules that are turned off in it (for example application rules, which can't route yet). Default comes from Settings → General; changing it here applies to this import only.")

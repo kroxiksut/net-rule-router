@@ -260,8 +260,33 @@ fn answered(
             }
         }
     }
+    // The put-back question numbers the deleted rules as listed; a different
+    // list would put back another one.
+    let moved = recent.deleted.len() != fresh.deleted.len()
+        || recent
+            .deleted
+            .iter()
+            .zip(&fresh.deleted)
+            .any(|(was, now)| was.at != now.at || was.rule.value_key() != now.rule.value_key());
     *recent = fresh;
     app.rules.table.clamp_cursor();
+    let asking = matches!(
+        &app.rules.mode,
+        Mode::Choice(choice) if matches!(choice.purpose, ChoicePurpose::Restore(_))
+    );
+    if moved && asking {
+        app.rules.mode = Mode::List;
+        app.rules.note = Some(Note::new(text::RECENT_RESTORE_WAIT));
+    }
+}
+
+/// Whether «Recent» is being read again, so its numbers may be about to move.
+fn rereading(app: &mut AppState) -> bool {
+    let loading = app.rules.table.recent.as_ref().is_some_and(|r| r.loading);
+    if loading {
+        app.rules.note = Some(Note::new(text::RECENT_RESTORE_WAIT));
+    }
+    loading
 }
 
 /// Whether a rule with this type and value is in the list now.
@@ -282,6 +307,9 @@ pub fn ask_restore(app: &mut AppState) -> bool {
         .recent
         .as_ref()
         .is_some_and(|r| !r.deleted.is_empty());
+    if rereading(app) {
+        return true;
+    }
     if !any {
         app.rules.note = Some(Note::new(text::RECENT_NOTHING_DELETED));
         return true;
@@ -324,6 +352,9 @@ pub fn restore_labels(app: &AppState, texts: &Texts) -> Vec<String> {
 
 /// The deleted rule `at` goes back as it was: route, switch, `?` and note.
 pub fn restore(app: &mut AppState, at: usize) {
+    if rereading(app) {
+        return;
+    }
     let Some(rule) = app
         .rules
         .table

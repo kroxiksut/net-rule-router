@@ -110,7 +110,7 @@ impl SecondaryRouteCoordinator {
             .as_deref()
             .ok()
             .map(|rows| crate::route_reconciler::TableReading { writes, rows });
-        let delta = self.reconciler.reconcile_seen(&out_routes, seen)?;
+        let delta = self.reconciler.reconcile_seen(&out_routes, writes, seen)?;
         // ADD-ONLY, settled on hardware: we never remove the VPN's own
         // routes. Stripping its redirect `/1` pair made the client treat the
         // removal as a fault and reconnect, and in mode A it dropped

@@ -909,6 +909,98 @@ fn a_machine_wide_cut_is_announced_to_the_principal_who_did_not_ask_for_it() {
     );
 }
 
+/// A user who armed a machine-wide cut and then left cuts nobody: the next
+/// user to sign in is not told that someone else is taking their IPv6.
+// Windows: the packet-layer cut reaches every account there; a Linux cut is
+// one account's and announces nothing (`principal_enforcement` tests its side).
+#[cfg(windows)]
+#[test]
+fn a_cut_left_behind_by_a_departed_user_is_not_announced_to_the_next_one() {
+    use nrr_shared::ipc_payloads::StatusUpdateEvent;
+
+    let bus = Arc::new(crate::ipc_handlers::event_bus::EventBus::new());
+    let newcomer = bus.subscribe_as("gui-b".into(), Some("S-1-5-21-B".into()), Some(0));
+
+    let api = Arc::new(MockWindowsApi::new());
+    let session = Arc::new(WfpSession::open(Arc::clone(&api) as Arc<dyn WindowsApiPort>).unwrap());
+    let src = Arc::new(ScriptedSource::default());
+    let rules = Arc::new(ScriptedRules::default());
+    let resolution = Some(full_ks_resolution());
+    let orch = PerSidApplyOrchestrator::new(
+        session,
+        Arc::clone(&src) as Arc<dyn RoutePolicySource>,
+        Arc::clone(&rules) as Arc<dyn RulesProvider>,
+        Arc::new(MockFqdnCacheLookup::new()) as Arc<dyn FqdnCacheLookup>,
+        Arc::new(CollectAudit::default()) as Arc<dyn PerSidApplyAudit>,
+    )
+    .with_kill_switch_resolver(Arc::new(move |_, _| resolution.clone()))
+    .with_events(Arc::clone(&bus));
+    rules.set(rules_with_secondary_ip(Ipv4Addr::new(198, 51, 100, 8)));
+
+    src.set("S-1-5-21-A", snap_block_mode_b("Wi-Fi", "TAP"));
+    orch.install_for_sid("S-1-5-21-A").unwrap();
+    orch.remove_for_sid("S-1-5-21-A").unwrap();
+    src.set("S-1-5-21-B", snap_primary_only("Wi-Fi"));
+    orch.install_for_sid("S-1-5-21-B").unwrap();
+
+    assert!(
+        !bus.peek_pending_for(&newcomer.subscription_id, 8)
+            .iter()
+            .any(|e| matches!(
+                &e.event,
+                StatusUpdateEvent::ProtectionCoverageChanged { reason }
+                    if reason == "machine-wide-cut-by-another-user"
+            )),
+        "nobody present cuts anything",
+    );
+}
+
+/// The control for the test above: while the user who cut stays, the next one
+/// to sign in IS told. Without it, "not announced" would pass on a build that
+/// never announces anything.
+// Windows: the packet-layer cut reaches every account there; a Linux cut is
+// one account's and announces nothing (`principal_enforcement` tests its side).
+#[cfg(windows)]
+#[test]
+fn a_cut_held_by_a_present_user_is_announced_to_the_next_one() {
+    use nrr_shared::ipc_payloads::StatusUpdateEvent;
+
+    let bus = Arc::new(crate::ipc_handlers::event_bus::EventBus::new());
+    let newcomer = bus.subscribe_as("gui-b".into(), Some("S-1-5-21-B".into()), Some(0));
+
+    let api = Arc::new(MockWindowsApi::new());
+    let session = Arc::new(WfpSession::open(Arc::clone(&api) as Arc<dyn WindowsApiPort>).unwrap());
+    let src = Arc::new(ScriptedSource::default());
+    let rules = Arc::new(ScriptedRules::default());
+    let resolution = Some(full_ks_resolution());
+    let orch = PerSidApplyOrchestrator::new(
+        session,
+        Arc::clone(&src) as Arc<dyn RoutePolicySource>,
+        Arc::clone(&rules) as Arc<dyn RulesProvider>,
+        Arc::new(MockFqdnCacheLookup::new()) as Arc<dyn FqdnCacheLookup>,
+        Arc::new(CollectAudit::default()) as Arc<dyn PerSidApplyAudit>,
+    )
+    .with_kill_switch_resolver(Arc::new(move |_, _| resolution.clone()))
+    .with_events(Arc::clone(&bus));
+    rules.set(rules_with_secondary_ip(Ipv4Addr::new(198, 51, 100, 8)));
+
+    src.set("S-1-5-21-A", snap_block_mode_b("Wi-Fi", "TAP"));
+    orch.install_for_sid("S-1-5-21-A").unwrap();
+    src.set("S-1-5-21-B", snap_primary_only("Wi-Fi"));
+    orch.install_for_sid("S-1-5-21-B").unwrap();
+
+    assert!(
+        bus.peek_pending_for(&newcomer.subscription_id, 8)
+            .iter()
+            .any(|e| matches!(
+                &e.event,
+                StatusUpdateEvent::ProtectionCoverageChanged { reason }
+                    if reason == "machine-wide-cut-by-another-user"
+            )),
+        "a present user's cut is not announced",
+    );
+}
+
 /// The machine-wide IPv6 packet cut is held only while one user alone blocks
 /// everything. Its holder's own inputs do not move when a second user arms or
 /// leaves, so that edge has to ask for the pass that re-plans the holder.
@@ -1123,6 +1215,43 @@ fn a_device_on_the_machines_own_lan_is_never_pinned_to_the_tunnel() {
             .iter()
             .any(|f| f.covers_v4(NAS) && f.action == WfpAction::Block),
         "a host on the machine's own subnet must not be blocked when the tunnel drops",
+    );
+    assert!(
+        filters
+            .iter()
+            .any(|f| f.covers_v4(REMOTE) && f.action == WfpAction::Block),
+        "an ordinary remote destination is still protected",
+    );
+}
+
+/// A rule host whose name resolves to the tunnel's own server (an answer from
+/// somebody else's server under a zone rule) is not pinned: the pin would let
+/// it out only through the tunnel, and a VPN client running as the user dials
+/// its server outside it.
+#[test]
+fn the_tunnels_server_is_never_pinned_to_the_tunnel() {
+    const SERVER: Ipv4Addr = Ipv4Addr::new(198, 51, 100, 9);
+    const REMOTE: Ipv4Addr = Ipv4Addr::new(203, 0, 113, 9);
+    let resolution = KillSwitchResolution {
+        secondary_luid: KS_LUID,
+        bootstrap_server_ips: vec![SERVER],
+        bootstrap_server_ips_v6: Vec::new(),
+        local_subnets: vec![(Ipv4Addr::new(192, 168, 1, 0), 24)],
+        local_subnets_v6: Vec::new(),
+        foreign_tunnel_luids: Vec::new(),
+        foreign_tunnel_networks: Vec::new(),
+    };
+    let (api, orch, src, rules) = fixture_with_resolution(Some(resolution));
+    rules.set(rules_with_secondary_ips(&[SERVER, REMOTE]));
+    src.set("S-1-5-21-A", snap_block("Wi-Fi", "TAP"));
+
+    orch.install_for_sid("S-1-5-21-A").unwrap();
+    let filters = api.wfp_filters.lock().unwrap();
+    assert!(
+        !filters
+            .iter()
+            .any(|f| f.covers_v4(SERVER) && f.action == WfpAction::Block),
+        "the tunnel's server must not be held to the tunnel",
     );
     assert!(
         filters
@@ -1662,6 +1791,31 @@ fn recompile_with_unchanged_rules_touches_nothing() {
         "no-op diff is audited as such, got: {}",
         last.message
     );
+}
+
+/// A process repeating an apply that changes nothing writes one record, not
+/// one per request; the next pass after a real change is recorded again.
+#[test]
+fn a_repeated_unchanged_apply_is_audited_once() {
+    let (_api, orch, src, _rules, audit) = fixture();
+    src.set("A", snap_full("Wi-Fi", "TAP"));
+    orch.install_for_sid("A").unwrap();
+    let noops = || {
+        audit
+            .snapshot()
+            .iter()
+            .filter(|r| r.message.contains("+0 -0"))
+            .count()
+    };
+    for _ in 0..5 {
+        orch.recompile_for_sid("A").unwrap();
+    }
+    assert_eq!(noops(), 1);
+
+    orch.remove_for_sid("A").unwrap();
+    orch.install_for_sid("A").unwrap();
+    orch.recompile_for_sid("A").unwrap();
+    assert_eq!(noops(), 2, "a change in between makes it news again");
 }
 
 #[test]

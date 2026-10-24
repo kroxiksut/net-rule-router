@@ -44,6 +44,7 @@ discord.gg  # Discord and community platforms
 redd.it  # Discord and community platforms
 *.redditstatic.com  # Discord and community platforms
 *.redditmedia.com  # Discord and community platforms
+*.redditmail.com  # Discord and community platforms
 
 *.linkedin.com  # Professional and streaming social platforms
 *.licdn.com  # Professional and streaming social platforms

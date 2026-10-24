@@ -10,7 +10,8 @@
 //! needed (mirroring `nrr-storage`'s sync-only contract).
 
 use crate::state::{
-    ActiveRevisionState, ServiceHealthSeverity, ServicePolicyState, ServiceRuntimeState,
+    ActiveRevisionState, ActiveRuleCounts, ServiceHealthSeverity, ServicePolicyState,
+    ServiceRuntimeState,
 };
 
 /// Result of a single bootstrap phase.
@@ -126,6 +127,20 @@ pub trait PolicyManager: Send + Sync {
     /// Default forwards for mocks that keep no per-principal state.
     fn current_revision_for(&self, _principal: &str) -> Option<ActiveRevisionState> {
         self.current_revision()
+    }
+
+    /// Rule counts of what `principal` has in force: zero when nothing is,
+    /// `None` when that could not be read. The default trusts the summary's
+    /// count, which mocks fill in.
+    fn active_rule_counts_for(&self, principal: &str) -> Option<ActiveRuleCounts> {
+        Some(
+            self.current_revision_for(principal)
+                .map(|revision| ActiveRuleCounts {
+                    total: revision.rule_count,
+                    enabled_secondary: 0,
+                })
+                .unwrap_or_default(),
+        )
     }
 
     /// Pending / superseded revision summaries surfaced

@@ -183,6 +183,7 @@ GroupBox {
         }
         ThemedComboBox {
             id: mergeConflictCombo
+            accessibleLabel: root.uiRevision >= 0 ? root.tr("settings.general.merge-conflict.title", "Merging file and app rules") : ""
             theme: root.uiTheme
             Layout.fillWidth: true
             model: [ "union", "file-wins", "service-wins" ]

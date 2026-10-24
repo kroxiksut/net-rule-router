@@ -53,6 +53,7 @@ impl ActivationCoordinator {
         }
 
         self.audit.emit(ActivationAuditEvent::TokenConsumed {
+            principal: principal.to_string(),
             revision_id: revision_id.as_str().to_string(),
             token: token.as_str().to_string(),
         });
@@ -267,6 +268,7 @@ impl ActivationCoordinator {
         if pre_flight_passed_but_apply_failed {
             self.audit
                 .emit(ActivationAuditEvent::PreFlightPassedButApplyFailed {
+                    principal: principal.to_string(),
                     revision_id: revision_id.as_str().to_string(),
                     sid_failures: drift.clone(),
                 });
@@ -344,6 +346,7 @@ impl ActivationCoordinator {
         if pre_flight_passed {
             self.audit
                 .emit(ActivationAuditEvent::PreFlightPassedButApplyFailed {
+                    principal: principal.to_string(),
                     revision_id: revision_id.as_str().to_string(),
                     sid_failures: phase2.failed.clone(),
                 });

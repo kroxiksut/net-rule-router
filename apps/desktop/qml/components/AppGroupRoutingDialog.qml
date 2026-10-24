@@ -58,6 +58,16 @@ Window {
     /// Fired when the user cancels or closes the window without applying.
     signal skipped()
 
+    // Escape is the Cancel button, as in the tray's own windows.
+    Shortcut {
+        sequences: ["Esc"]
+        context: Qt.WindowShortcut
+        onActivated: {
+            root.close()
+            root.skipped()
+        }
+    }
+
     function tr(key, fallback) {
         return ownerRoot && typeof ownerRoot.tr === "function"
             ? ownerRoot.tr(key, fallback)

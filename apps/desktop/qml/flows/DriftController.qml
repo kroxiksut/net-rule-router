@@ -280,6 +280,8 @@ QtObject {
             root._filesSyncDirtySecondary = true
         }
         root._mergeApplyPendingWrite = true
+        root._mergeTakenTexts = mergeFromEdits ? null
+            : { primary: root._mergePrimaryText, secondary: root._mergeSecondaryText }
         root.reviewFlowController.startRulesReviewFlow(
             mergedRulesJson, contentHash, false,
             mergeFromEdits ? "edits-merge" : "drift-merge", base)

@@ -248,3 +248,17 @@ path = "fuzz_targets/resolvectl_monitor_line.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "dns_suffix"
+path = "fuzz_targets/dns_suffix.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "rule_value_validation"
+path = "fuzz_targets/rule_value_validation.rs"
+test = false
+doc = false
+bench = false

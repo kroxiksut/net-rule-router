@@ -53,7 +53,7 @@ fn qml_files() -> Vec<PathBuf> {
 fn buffered_keys() -> BTreeSet<String> {
     let main = read(&qml_root().join("Main.qml"));
     let start = main
-        .find("_bufferedPrefKeys")
+        .find("property var _bufferedPrefKeys:")
         .expect("Main.qml declares _bufferedPrefKeys");
     let block = &main[start..];
     let end = block

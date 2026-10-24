@@ -475,10 +475,23 @@ QtObject {
         }
         return -1
     }
-    function unassignRole(index, role) {
+    /// `holdsNowConfirmed` is set by the leak-protection question's proceed
+    /// callback; every other caller omits it.
+    function unassignRole(index, role, holdsNowConfirmed) {
         var selected = root.interfacesModel.get(index)
         var selectedId = String(selected.persistentId || "")
         var selectedName = String(selected.name || "")
+        if (role === "secondary" && holdsNowConfirmed !== true
+                && _askHoldsNow(null, selectedId, selectedName, function(now) {
+                    if (now < 0) {
+                        root.statusLine = root.tr("status.role-adapter-gone-unassign",
+                            "That adapter is no longer on this computer, so its role was left as it was.")
+                        return
+                    }
+                    interfacesRolesController.unassignRole(now, role, true)
+                })) {
+            return
+        }
         for (var i = 0; i < root.interfacesRowsAll.length; i += 1) {
             var row = root.interfacesRowsAll[i]
             var matchesSelected = (selectedId !== "" && String(row.persistentId || "") === selectedId)
@@ -532,6 +545,23 @@ QtObject {
         return null
     }
 
+    /// Under "Everything", asks before a role change after which no available
+    /// adapter holds the additional role: the internet would stop at once.
+    /// `nextSecondary` is the additional adapter's row after the change (null:
+    /// none). True when the question is open; on yes `retry` gets the asked-about
+    /// adapter's index now (-1 when it is gone).
+    function _askHoldsNow(nextSecondary, selectedId, selectedName, retry) {
+        if (typeof root.confirmLeakHoldsNow !== "function"
+                || !Pure.secondaryChangeHoldsNow(root.routingState.leakProtection,
+                    boundSecondaryRow(), nextSecondary)) {
+            return false
+        }
+        root.confirmLeakHoldsNow(function() {
+            retry(interfacesRolesController._modelIndexOf(selectedId, selectedName))
+        }, null, "holds-now-role")
+        return true
+    }
+
     /// The adapter's row in `interfacesModel` now, by its id (by name when it
     /// has none); -1 when it is gone.
     function _modelIndexOf(id, name) {
@@ -543,12 +573,33 @@ QtObject {
         return -1
     }
 
-    /// `unroutableConfirmed` is set by the confirm dialog's proceed callback so
-    /// the second pass skips the guardrail. Every other caller omits it.
-    function assignRole(index, role, unroutableConfirmed) {
+    /// `unroutableConfirmed` / `holdsNowConfirmed` are set by the confirm
+    /// dialogs' proceed callbacks so the next pass skips that question. Every
+    /// other caller omits them.
+    function assignRole(index, role, unroutableConfirmed, holdsNowConfirmed) {
         var selected = root.interfacesModel.get(index)
         var selectedId = String(selected.persistentId || "")
         var selectedName = String(selected.name || "")
+        if (holdsNowConfirmed !== true && unroutableConfirmed !== true) {
+            var current = boundSecondaryRow()
+            var picked = _liveRowByIdOrName(selectedId, selectedName)
+            // The additional role moves to the picked adapter, or leaves it when
+            // it becomes the main one.
+            var nextSecondary = role === "secondary" ? picked
+                : (current && String(current.persistentId || "") === selectedId
+                    && (selectedId !== "" || String(current.name || "") === selectedName)
+                    ? null : current)
+            if (_askHoldsNow(nextSecondary, selectedId, selectedName, function(now) {
+                    if (now < 0) {
+                        root.statusLine = root.tr("status.role-adapter-gone",
+                            "That adapter is no longer on this computer, so no role was assigned.")
+                        return
+                    }
+                    interfacesRolesController.assignRole(now, role, false, true)
+                })) {
+                return
+            }
+        }
         // An adapter with no way out to the network is a legal choice, but as
         // the additional route its rules stop being routed (blocked once leak
         // protection is armed), and as the main one the service passes it over.

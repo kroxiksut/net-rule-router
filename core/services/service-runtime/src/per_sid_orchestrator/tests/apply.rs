@@ -90,6 +90,64 @@ fn doh_lockdown_emits_blocks_when_enabled_and_in_scope() {
     assert_eq!(build(DohLockdownScope::LeakProtectionOnly, false), 0);
 }
 
+/// With the additional route as the default, the main-route rules are the
+/// exceptions, and a DoH browser sends them down the tunnel: the automatic
+/// lockdown counts them, as it counts additional-route rules otherwise.
+#[test]
+fn the_automatic_lockdown_counts_the_exceptions_to_a_tunnel_default() {
+    let doh_ports = |mode: PerSidBehaviorMode| {
+        let api = Arc::new(MockWindowsApi::new());
+        let session =
+            Arc::new(WfpSession::open(Arc::clone(&api) as Arc<dyn WindowsApiPort>).unwrap());
+        let source = Arc::new(ScriptedSource::default());
+        let mut snap = snap_primary_only("Wi-Fi");
+        snap.mode = mode;
+        snap.doh_lockdown_auto = true;
+        snap.leak_protection = nrr_domain::LeakProtection::Off;
+        snap.doh_resolver_ips = vec![Ipv4Addr::new(198, 51, 100, 8).into()];
+        source.set("S-1-5-21-DOH", snap);
+        let rules = Arc::new(ScriptedRules::default());
+        rules.set(ActiveRulesSnapshot {
+            rule_book: CanonicalRuleBook {
+                primary: CanonicalRuleSet::from_rules(vec![CanonicalRule {
+                    id: RuleId("bank".into()),
+                    enabled: true,
+                    address_match: Some(CanonicalAddressMatch::ExactFqdn("bank.example".into())),
+                    app_match: None,
+                    comment: String::new(),
+                    action: nrr_domain::RuleAction::Route,
+                    origin: None,
+                }]),
+                secondary: CanonicalRuleSet::default(),
+            },
+        });
+        let orch = PerSidApplyOrchestrator::new(
+            session,
+            Arc::clone(&source) as Arc<dyn RoutePolicySource>,
+            Arc::clone(&rules) as Arc<dyn RulesProvider>,
+            Arc::new(MockFqdnCacheLookup::new()) as Arc<dyn FqdnCacheLookup>,
+            Arc::new(CollectAudit::default()) as Arc<dyn PerSidApplyAudit>,
+        );
+        match orch
+            .compute_filters_for_sid("S-1-5-21-DOH", false, None, ComputeIntent::Apply)
+            .unwrap()
+        {
+            ComputedFilterSet::Install(plan) => plan
+                .filters
+                .iter()
+                .filter(|f| f.remote_port == Some(443) || f.remote_port == Some(853))
+                .count(),
+            _ => 0,
+        }
+    };
+    assert_eq!(
+        doh_ports(PerSidBehaviorMode::PreferPrimary),
+        0,
+        "nothing leaves the default"
+    );
+    assert!(doh_ports(PerSidBehaviorMode::PreferSecondaryWhenAvailable) > 0);
+}
+
 /// A resolver drop must be explainable as the lockdown that caused it. The
 /// notice path can only tell it from a rule by id, so the band has to be
 /// published — and published SEPARATELY: landing in `all` would role-verify
@@ -188,6 +246,7 @@ fn the_neutral_plan_agrees_with_the_filters_the_orchestrator_computes() {
             orch.fqdn_cache.as_ref(),
             &std::collections::HashSet::new(),
             false,
+            false,
             crate::enforcement_planner::Ipv6Guard::Off,
             &live,
         )
@@ -237,6 +296,7 @@ fn the_shadow_compare_runs_once_per_distinct_input() {
             orch.fqdn_cache.as_ref(),
             &std::collections::HashSet::new(),
             false,
+            false,
             crate::enforcement_planner::Ipv6Guard::Off,
             &live,
         ),
@@ -251,6 +311,7 @@ fn the_shadow_compare_runs_once_per_distinct_input() {
             orch.fqdn_cache.as_ref(),
             &std::collections::HashSet::new(),
             false,
+            false,
             crate::enforcement_planner::Ipv6Guard::Off,
             &live
         ),
@@ -262,6 +323,7 @@ fn the_shadow_compare_runs_once_per_distinct_input() {
             &book.rule_book,
             orch.fqdn_cache.as_ref(),
             &std::collections::HashSet::new(),
+            false,
             false,
             crate::enforcement_planner::Ipv6Guard::Off,
             &live
@@ -277,6 +339,7 @@ fn the_shadow_compare_runs_once_per_distinct_input() {
             &book.rule_book,
             orch.fqdn_cache.as_ref(),
             &std::collections::HashSet::new(),
+            false,
             false,
             crate::enforcement_planner::Ipv6Guard::Off,
             narrower
@@ -306,6 +369,7 @@ fn the_shadow_compare_runs_once_per_distinct_input() {
             &book.rule_book,
             orch.fqdn_cache.as_ref(),
             &std::collections::HashSet::new(),
+            false,
             false,
             crate::enforcement_planner::Ipv6Guard::Off,
             narrower
@@ -342,6 +406,7 @@ fn the_shadow_compare_is_remembered_per_user() {
         orch.fqdn_cache.as_ref(),
         &std::collections::HashSet::new(),
         false,
+        false,
         crate::enforcement_planner::Ipv6Guard::Off,
         &live
     ));
@@ -350,6 +415,7 @@ fn the_shadow_compare_is_remembered_per_user() {
         &book.rule_book,
         orch.fqdn_cache.as_ref(),
         &std::collections::HashSet::new(),
+        false,
         false,
         crate::enforcement_planner::Ipv6Guard::Off,
         &live
@@ -362,6 +428,7 @@ fn the_shadow_compare_is_remembered_per_user() {
             &book.rule_book,
             orch.fqdn_cache.as_ref(),
             &std::collections::HashSet::new(),
+            false,
             false,
             crate::enforcement_planner::Ipv6Guard::Off,
             &live
@@ -950,4 +1017,67 @@ fn a_failed_apply_still_journals_the_filters_it_planned() {
         "the planned ids must be on disk before the engine is asked"
     );
     assert!(orch.installed_sids().is_empty(), "nothing is tracked");
+}
+
+/// The stored zone-versus-address order reaches the filters, as it reaches
+/// the routes and the address arbiter: a zone on the main link and an exact
+/// address on the additional one name the same host, and which link the
+/// filters give it follows the user's setting.
+#[test]
+fn the_stored_zone_priority_reaches_the_filters() {
+    let ip = Ipv4Addr::new(203, 0, 113, 7);
+    let installed = |zone_first: bool| {
+        let api = Arc::new(MockWindowsApi::new());
+        let session =
+            Arc::new(WfpSession::open(Arc::clone(&api) as Arc<dyn WindowsApiPort>).unwrap());
+        let src = Arc::new(ScriptedSource::default());
+        let rules = Arc::new(ScriptedRules::default());
+        let cache = Arc::new(MockFqdnCacheLookup::new());
+        cache.set_ips("shop.example.com", vec![ip]);
+        let orch = PerSidApplyOrchestrator::new(
+            session,
+            Arc::clone(&src) as Arc<dyn RoutePolicySource>,
+            Arc::clone(&rules) as Arc<dyn RulesProvider>,
+            cache,
+            Arc::new(CollectAudit::default()) as Arc<dyn PerSidApplyAudit>,
+        );
+        let zone = CanonicalRule {
+            id: RuleId("p-zone".into()),
+            enabled: true,
+            address_match: Some(CanonicalAddressMatch::Zone("com".into())),
+            app_match: None,
+            comment: String::new(),
+            action: nrr_domain::RuleAction::Route,
+            origin: None,
+        };
+        rules.set(ActiveRulesSnapshot {
+            rule_book: CanonicalRuleBook {
+                primary: CanonicalRuleSet::from_rules(vec![zone]),
+                secondary: CanonicalRuleSet::from_rules(vec![primary_ip_rule("s-ip", ip)]),
+            },
+        });
+        src.set(
+            "S-1-5-21-A",
+            PerSidPolicySnapshot {
+                zone_priority_over_ip: zone_first,
+                ..snap_full("Wi-Fi", "TAP")
+            },
+        );
+        orch.install_for_sid("S-1-5-21-A").unwrap();
+        let mut shape: Vec<String> = api
+            .wfp_filters
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|f| f.remote_ip == Some(ip) || f.remote_ip_set.contains(&ip))
+            .map(|f| format!("{:?} {:?} {}", f.layer, f.action, f.weight))
+            .collect();
+        shape.sort();
+        shape
+    };
+    assert_ne!(
+        installed(false),
+        installed(true),
+        "the filters ignore the user's zone-versus-address order"
+    );
 }

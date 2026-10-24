@@ -70,6 +70,7 @@ use smoltcp::wire::{
 use super::dialer::{RelayDatagram, RelayDialer, RelayError, RelaySplit};
 use super::flow::{parse_echo_request, parse_packet, FlowKey, FlowProtocol, ParsedPacket};
 use super::relay::{RelayCore, RelayDecision, DEFAULT_SESSION_IDLE_MS};
+use nrr_shared::RouteRole;
 
 /// Per-socket receive/transmit buffer (64 KiB each). Large enough for a full
 /// TLS record burst without stalling the splice, small enough that a few
@@ -84,6 +85,22 @@ pub const DEFAULT_SOCKET_BUFFER_BYTES: usize = 64 * 1024;
 /// Evicting a live flow to admit a new one would trade a working download for
 /// a connection that may be a port scan.
 const MAX_ACTIVE_TCP_FLOWS: usize = 512;
+
+/// The most of the flow cap one site may hold: a quarter of it always stays
+/// for every other site. A page that opened hundreds of connections to
+/// subdomains of one name took the whole relay, and every site carried by name
+/// was reset until the tab closed.
+fn site_flow_share(max_flows: usize) -> usize {
+    max_flows - max_flows / 4
+}
+
+/// The registrable domain of `hostname`, lowercase; the name itself when it
+/// has none.
+fn site_of(hostname: &str) -> String {
+    nrr_domain::companion_affinity::registrable_domain(hostname)
+        .unwrap_or(hostname)
+        .to_ascii_lowercase()
+}
 
 /// Idle window before a relayed TCP flow is torn down, and the keep-alive
 /// interval that keeps a genuinely live-but-quiet connection out of it. A
@@ -197,19 +214,27 @@ impl StackWaker {
 ///
 /// It is an accelerator, never the authority: a periodic full sweep still
 /// visits everything (see `FLOW_SWEEP_INTERVAL_MS`), so a wake-up that never
-/// arrives costs latency, never a stuck flow.
-#[derive(Default)]
-struct ReadyFlows {
-    keys: Mutex<HashSet<FlowKey>>,
+/// arrives costs latency, never a stuck flow. UDP binds use it too, keyed by
+/// their fake endpoint.
+struct ReadyFlows<K = FlowKey> {
+    keys: Mutex<HashSet<K>>,
 }
 
-impl ReadyFlows {
-    fn mark(&self, key: FlowKey) {
+impl<K> Default for ReadyFlows<K> {
+    fn default() -> Self {
+        Self {
+            keys: Mutex::new(HashSet::new()),
+        }
+    }
+}
+
+impl<K: Eq + std::hash::Hash> ReadyFlows<K> {
+    fn mark(&self, key: K) {
         guard(&self.keys).insert(key);
     }
 
     /// Take the marked flows, leaving the set empty.
-    fn take(&self) -> Vec<FlowKey> {
+    fn take(&self) -> Vec<K> {
         guard(&self.keys).drain().collect()
     }
 
@@ -423,9 +448,72 @@ impl FlowShared {
 
 // ── A live flow ──────────────────────────────────────────────────────────────
 
+/// What the books said when a flow was opened, kept so a later book can be
+/// asked whether it still agrees.
+struct FlowPolicy {
+    hostname: String,
+    /// The registrable domain the flow is counted against ([`site_of`]).
+    site: String,
+    book_route: Option<RouteRole>,
+    owner: Option<String>,
+}
+
+impl FlowPolicy {
+    fn of(hostname: &str, target: &super::dialer::UpstreamTarget) -> Self {
+        Self {
+            hostname: hostname.to_owned(),
+            site: site_of(hostname),
+            book_route: target.book_route,
+            owner: target.owner.clone(),
+        }
+    }
+
+    /// Whether the books still give this flow the route it was opened with.
+    /// A literal address (the in-tunnel rescue) is named by no book and keeps
+    /// its route.
+    fn still_holds(&self, books: &mut BookRoutes<'_>) -> bool {
+        self.hostname.parse::<std::net::IpAddr>().is_ok()
+            || books.route(self.owner.as_deref(), &self.hostname) == self.book_route
+    }
+}
+
+/// The books asked about every live flow after a rule change: each owner's
+/// book is read once, each hostname matched once per owner.
+struct BookRoutes<'a> {
+    relay: &'a RelayCore,
+    books: HashMap<Option<String>, super::relay::BookRoute<'a>>,
+    answers: HashMap<(Option<String>, String), Option<RouteRole>>,
+}
+
+impl<'a> BookRoutes<'a> {
+    fn new(relay: &'a RelayCore) -> Self {
+        Self {
+            relay,
+            books: HashMap::new(),
+            answers: HashMap::new(),
+        }
+    }
+
+    fn route(&mut self, owner: Option<&str>, hostname: &str) -> Option<RouteRole> {
+        let key = (owner.map(str::to_owned), hostname.to_owned());
+        if let Some(answer) = self.answers.get(&key) {
+            return *answer;
+        }
+        let relay = self.relay;
+        let book = self
+            .books
+            .entry(key.0.clone())
+            .or_insert_with(|| relay.book_routes(owner));
+        let answer = book(hostname);
+        self.answers.insert(key, answer);
+        answer
+    }
+}
+
 struct FlowConn {
     handle: SocketHandle,
     shared: Arc<FlowShared>,
+    policy: FlowPolicy,
     /// Set once the upstream half-close has been mirrored to the client, so we
     /// only call `close()` on the smoltcp socket a single time.
     client_close_sent: bool,
@@ -463,6 +551,8 @@ struct UdpReplies {
     queue: Mutex<UdpReplyQueue>,
     dead: AtomicBool,
     waker: Arc<StackWaker>,
+    /// The bind to mark ready when a reply lands or the upstream goes.
+    bind: Option<(Arc<ReadyFlows<UdpBindKey>>, UdpBindKey)>,
     health: Arc<super::health::FakeIpHealth>,
 }
 
@@ -472,7 +562,25 @@ struct UdpReplyQueue {
 }
 
 impl UdpReplies {
+    #[cfg(test)]
     fn new(waker: Arc<StackWaker>, health: Arc<super::health::FakeIpHealth>) -> Arc<Self> {
+        Self::build(waker, None, health)
+    }
+
+    fn for_bind(
+        waker: Arc<StackWaker>,
+        ready: Arc<ReadyFlows<UdpBindKey>>,
+        key: UdpBindKey,
+        health: Arc<super::health::FakeIpHealth>,
+    ) -> Arc<Self> {
+        Self::build(waker, Some((ready, key)), health)
+    }
+
+    fn build(
+        waker: Arc<StackWaker>,
+        bind: Option<(Arc<ReadyFlows<UdpBindKey>>, UdpBindKey)>,
+        health: Arc<super::health::FakeIpHealth>,
+    ) -> Arc<Self> {
         Arc::new(Self {
             queue: Mutex::new(UdpReplyQueue {
                 datagrams: VecDeque::with_capacity(UDP_REPLY_QUEUE_MAX_DATAGRAMS),
@@ -480,8 +588,16 @@ impl UdpReplies {
             }),
             dead: AtomicBool::new(false),
             waker,
+            bind,
             health,
         })
+    }
+
+    fn notify(&self) {
+        if let Some((ready, key)) = &self.bind {
+            ready.mark(*key);
+        }
+        self.waker.wake();
     }
     /// Queue a reply for the client; `false` when it was dropped at the bound.
     /// The copy is made only once admitted, so a flood past the bound costs no
@@ -499,7 +615,7 @@ impl UdpReplies {
             queue.bytes += datagram.len();
             queue.datagrams.push_back(datagram.to_vec());
         }
-        self.waker.wake();
+        self.notify();
         true
     }
     fn drain(&self) -> Vec<Vec<u8>> {
@@ -518,6 +634,11 @@ impl UdpReplies {
     fn mark_dead(&self) {
         self.dead.store(true, Ordering::SeqCst);
     }
+    /// The reader's own end: the poll loop must come and retire the flow.
+    fn upstream_gone(&self) {
+        self.mark_dead();
+        self.notify();
+    }
 }
 
 /// One client talking to a bound fake endpoint, and its own upstream socket.
@@ -526,7 +647,14 @@ struct UdpClientFlow {
     replies: Arc<UdpReplies>,
     worker: JoinHandle<()>,
     last_seen_at: u64,
+    /// The book's route and the owner the flow was dialled for; the bind
+    /// holds the name.
+    book_route: Option<RouteRole>,
+    owner: Option<String>,
 }
+
+/// A UDP bind's fake endpoint.
+type UdpBindKey = (std::net::IpAddr, u16);
 
 /// One bound fake endpoint (`fake_ip:port`) and every client using it.
 struct UdpBind {
@@ -548,6 +676,8 @@ type UdpDialOutcome = Result<Box<dyn RelayDatagram>, RelayError>;
 /// poll thread.
 struct PendingUdpDial {
     outcome: Arc<Mutex<Option<UdpDialOutcome>>>,
+    book_route: Option<RouteRole>,
+    owner: Option<String>,
     /// The client's datagrams held until the dial lands, oldest first.
     queued: VecDeque<Vec<u8>>,
     /// Length of the first datagram — what a port-unreachable quotes.
@@ -664,6 +794,11 @@ pub struct FakeIpStack {
     /// Flows with work pending, and when every flow was last visited anyway.
     ready: Arc<ReadyFlows>,
     last_flow_sweep_ms: u64,
+    /// The same for UDP binds.
+    ready_udp: Arc<ReadyFlows<UdpBindKey>>,
+    last_udp_sweep_ms: u64,
+    /// The relay's policy stamp at the last re-decision of every live flow.
+    policy_stamp: u64,
     /// Reusable MTU-sized landing area for the device read.
     ///
     /// This is the data path: a fresh `vec![0u8; mtu]` per `step()` meant an
@@ -721,6 +856,7 @@ impl FakeIpStack {
         }
 
         let health = Arc::new(super::health::FakeIpHealth::new());
+        let policy_stamp = relay.policy_stamp();
         Self {
             iface,
             device,
@@ -750,6 +886,9 @@ impl FakeIpStack {
             last_dial_refused_warn: None,
             ready: Arc::new(ReadyFlows::default()),
             last_flow_sweep_ms: 0,
+            ready_udp: Arc::new(ReadyFlows::default()),
+            last_udp_sweep_ms: 0,
+            policy_stamp,
             read_buffer: Vec::new(),
             echo_answers: Arc::default(),
         }
@@ -938,10 +1077,7 @@ impl FakeIpStack {
                 None => false,
             };
             if !carried {
-                // `smoltcp` consumes the packet buffer, so this copy is the one the
-                // device hand-off needs — sized to the PACKET rather than the MTU.
-                let buf = self.read_buffer[..read].to_vec();
-                if let Some(parsed) = parse_packet(&buf) {
+                if let Some(parsed) = parse_packet(&self.read_buffer[..read]) {
                     match parsed.key.protocol {
                         FlowProtocol::Tcp => {
                             // The packet is about to move this flow's socket, so it
@@ -949,10 +1085,14 @@ impl FakeIpStack {
                             self.ready.mark(parsed.key);
                             self.maybe_open_flow(&parsed, now_ms);
                         }
-                        FlowProtocol::Udp => self.maybe_open_udp(&parsed),
+                        FlowProtocol::Udp => {
+                            let local = parsed.key.destination;
+                            self.ready_udp.mark((local.ip(), local.port()));
+                            self.maybe_open_udp(&parsed);
+                        }
                     }
                 }
-                self.device.ingest(buf);
+                self.device.ingest(&mut self.read_buffer, read);
                 let now = SmolInstant::from_millis(i64::try_from(now_ms).unwrap_or(i64::MAX));
                 self.iface.poll(now, &mut self.device, &mut self.sockets);
             }
@@ -963,6 +1103,15 @@ impl FakeIpStack {
         self.iface.poll(now, &mut self.device, &mut self.sockets);
         self.service_flows(now_ms);
         self.service_udp(now_ms);
+        // A rule change outlives no flow: the client is reset and reconnects
+        // under the new book. After the service pass, so the reset is sent by
+        // the next poll before the reap. Atomic reads until a book moves.
+        let stamp = self.relay.policy_stamp();
+        if stamp != self.policy_stamp {
+            self.policy_stamp = stamp;
+            self.recheck_tcp_policy();
+            self.recheck_udp_policy();
+        }
         self.flush_echo_answers();
         self.sweep_worker_graveyard();
 
@@ -1192,7 +1341,7 @@ fn spawn_udp_reader(
                     // client bound to a flow nothing reads, and its `send` keeps
                     // succeeding, so the idle reap never comes for it either.
                     Err(_) => {
-                        replies.mark_dead();
+                        replies.upstream_gone();
                         return;
                     }
                 }
@@ -1207,11 +1356,18 @@ fn spawn_udp_reader(
 struct UdpDialReport {
     outcome: Arc<Mutex<Option<UdpDialOutcome>>>,
     waker: Arc<StackWaker>,
+    ready: Arc<ReadyFlows<UdpBindKey>>,
+    key: UdpBindKey,
 }
 
 impl UdpDialReport {
     fn land(&self, dialed: UdpDialOutcome) {
         *guard(&self.outcome) = Some(dialed);
+        self.wake();
+    }
+
+    fn wake(&self) {
+        self.ready.mark(self.key);
         self.waker.wake();
     }
 }
@@ -1226,7 +1382,7 @@ impl Drop for UdpDialReport {
             detail: "dial worker did not complete".to_owned(),
         }));
         drop(outcome);
-        self.waker.wake();
+        self.wake();
     }
 }
 
@@ -1238,8 +1394,14 @@ fn submit_udp_dial(
     target: super::dialer::UpstreamTarget,
     outcome: Arc<Mutex<Option<UdpDialOutcome>>>,
     waker: Arc<StackWaker>,
+    (ready, key): (Arc<ReadyFlows<UdpBindKey>>, UdpBindKey),
 ) -> Result<(), DialRefusal> {
-    let report = UdpDialReport { outcome, waker };
+    let report = UdpDialReport {
+        outcome,
+        waker,
+        ready,
+        key,
+    };
     pool.submit(Box::new(move || {
         let dialed = dialer.connect_udp(&target);
         report.land(dialed);
@@ -1640,14 +1802,15 @@ fn spawn_upstream_workers(
     let writer_spawned = std::thread::Builder::new()
         .name("nrr-fakeip-up-write".to_string())
         .spawn(move || loop {
-            let pending: Vec<u8> = {
+            let (pending, was_full): (Vec<u8>, bool) = {
                 let mut buffer = guard(&writer_shared.to_upstream);
                 loop {
                     if writer_shared.is_dead() {
                         return;
                     }
                     if !buffer.is_empty() {
-                        break buffer.drain(..).collect();
+                        let was_full = buffer.len() >= FLOW_QUEUE_HIGH_WATER_BYTES;
+                        break (buffer.drain(..).collect(), was_full);
                     }
                     if writer_shared.client_fin.load(Ordering::SeqCst) {
                         drop(buffer);
@@ -1663,7 +1826,17 @@ fn spawn_upstream_workers(
                     buffer = next;
                 }
             };
+            // A full queue stopped the poll loop draining the client, whose
+            // window then closed: with nothing else to wake the loop, upload
+            // through the tunnel ran at one queue per sweep.
+            if was_full {
+                writer_shared.wake_poll();
+            }
+            // The client must hear it, as from a socket of its own: without
+            // the reset its connection stayed open, its bytes went nowhere,
+            // and its own keepalives held the flow up for good.
             if writer.write_all(&pending).is_err() {
+                writer_shared.signal_upstream_reset();
                 writer_shared.mark_dead();
                 return;
             }

@@ -41,7 +41,7 @@ impl InterfacesRefreshHandler {
 }
 
 impl IpcHandler for InterfacesRefreshHandler {
-    fn handle(&self, request: &IpcRequestEnvelope, _ctx: &IpcRequestContext) -> HandlerOutcome {
+    fn handle(&self, request: &IpcRequestEnvelope, ctx: &IpcRequestContext) -> HandlerOutcome {
         if request.operation_class != IpcOperationClass::DiagnosticQuery {
             return Err(IpcError {
                 code: IpcErrorCode::MalformedRequest,
@@ -68,7 +68,9 @@ impl IpcHandler for InterfacesRefreshHandler {
             "external-address refresh requested — re-enumerating adapters and probing",
         );
         let started = std::time::Instant::now();
-        let resp: InterfacesRefreshResponse = self.adapters.adapters_snapshot_probing_external_ip();
+        let resp: InterfacesRefreshResponse = self
+            .adapters
+            .adapters_snapshot_probing_external_ip_for(ctx.caller_stored());
         let (resolved, attempted) =
             resp.rows
                 .iter()

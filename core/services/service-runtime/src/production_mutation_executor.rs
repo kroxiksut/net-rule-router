@@ -928,6 +928,7 @@ impl MutationExecutor for ProductionMutationExecutor {
                                 StatusUpdateEvent::RoutingPauseStateChanged {
                                     sid: principal.to_string(),
                                     paused: true,
+                                    paused_at: Some(disabled_at_epoch_secs),
                                     resumes_at_ms,
                                     until_restart: end
                                         == nrr_storage::pause_state::PauseEnd::Restart,

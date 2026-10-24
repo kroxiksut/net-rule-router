@@ -262,12 +262,15 @@ ApplicationWindow {
     // what the install-time choices make of that first save.
     property string _serviceDefaultRoute: ""
     property string _serviceLeakFloor: "off"
+    /// The route policy the service last reported, null for a user with none.
+    property var _serviceRoutePolicy: null
     /// Follow the service's answer: `rpRaw` is its route policy (absent for a
     /// user with none), `first` its `first-policy`.
     function _noteServicePolicy(rpRaw, first) {
         var rp = rpRaw || {}
         var start = (!rpRaw && first && typeof first === "object") ? first : null
         _servicePolicySecondaryBound = !!(rpRaw && rp.secondary)
+        _serviceRoutePolicy = rpRaw || null
         _serviceDefaultRoute = rpRaw ? _routePolicyEffective(rp, "mode")
             : (start ? Pure.routePolicyCoerce("mode", start.mode) : "")
         _serviceLeakFloor = start
@@ -370,7 +373,7 @@ ApplicationWindow {
 
     // Top-of-window warning that leak protection is holding all traffic
     // (protection "everything" and the additional adapter can't be
-    // resolved). `killSwitchBlockAllArmed`
+    // resolved). `killSwitchHoldingForOutage`
     // mirrors the connect-time snapshot posture (see `refreshUnenforcedAppRules`);
     // the `warnKillSwitchBlockAll` pref (default on) is the opt-out, toggled from
     // Settings -> Routing behavior. The `uiRevision >= 0` guard makes the binding
@@ -378,7 +381,7 @@ ApplicationWindow {
     // content-driven (wrapping text), never shorter than the 36px single line.
     readonly property bool blockAllBannerVisible:
         uiRevision >= 0
-        && routingState.killSwitchBlockAllArmed === true
+        && routingState.killSwitchHoldingForOutage === true
         && prefs.warnKillSwitchBlockAll !== false
         && prefs.killSwitchBannerAcknowledged !== true
 
@@ -390,7 +393,7 @@ ApplicationWindow {
     // posture arms the banner reappears. Guarded by `uiRevision >= 0` so the
     // binding re-evaluates on every routingState refresh.
     readonly property bool blockAllPostureArmed:
-        uiRevision >= 0 && routingState.killSwitchBlockAllArmed === true
+        uiRevision >= 0 && routingState.killSwitchHoldingForOutage === true
     // Deferred, not inline: the binding above READS `uiRevision` and
     // `updatePrefs` BUMPS it, so writing the pref straight from the change
     // handler re-enters the binding while it is still settling — Qt reports
@@ -554,6 +557,24 @@ ApplicationWindow {
         // Guarded because prefs can be reassigned before the component tree is
         // finished, and a throw here would take the kill-switch mirror with it.
         if (typeof guiPresence !== "undefined" && guiPresence) guiPresence.publish()
+    }
+    // Apply commits buffered notification settings without touching `prefs`.
+    onPrefsSnapshotChanged: {
+        if (typeof guiPresence !== "undefined" && guiPresence) guiPresence.publish()
+    }
+
+    /// The notification settings as committed: a buffered edit awaiting Apply
+    /// is not the user's choice yet.
+    function _committedNoticePrefs() {
+        var keys = ["showNotifications", "notifySuggestionChanges", "notifyBlockNotices",
+                    "notifyRuleDuplicates", "hideBlockNoticeAddresses", "trayNoticeOpacityPercent"]
+        var out = {}
+        for (var i = 0; i < keys.length; i += 1) {
+            var key = keys[i]
+            var source = prefsSnapshot !== null && _bufferedPrefKeys[key] ? prefsSnapshot : prefs
+            out[key] = source[key]
+        }
+        return out
     }
 
     // Compatibility banner (GUI ↔ service version).
@@ -755,7 +776,7 @@ ApplicationWindow {
     }
     function backendStatusBannerColor() {
         var kind = (backendStatus || {}).kind || ""
-        return kind === "connecting" ? "#d4a017" : "#c0392b"
+        return kind === "connecting" ? uiTheme.bannerWarningFill : uiTheme.bannerDangerFill
     }
     // Footer "Service: …" indicator, derived from the LIVE backend connection
     // state.
@@ -2417,7 +2438,7 @@ ApplicationWindow {
         leakProtection: "off",
         // Mirror of the per-SID shared-IP strictness of leak protection
         // (false = "smart": census-shared IPs are not pinned).
-        killSwitchStrictSharedIps: false,
+        killSwitchStrictSharedIps: true,
         // How many secondary IPs smart leak protection excluded from its
         // pin/block set this compute (0 = no warning).
         killSwitchSharedIpExemptions: 0,
@@ -2430,6 +2451,11 @@ ApplicationWindow {
         // adapter unresolved). Drives the warning banner; refreshed from the
         // connect snapshot.
         killSwitchBlockAllArmed: false,
+        killSwitchHoldingForOutage: false,
+        // Network filters on the machine, all users together, and whether
+        // that is more than the filtering service stays stable under.
+        protectionFiltersOnMachine: 0,
+        protectionFiltersHigh: false,
         // What forwarded traffic gets while the tunnel is down ("" until answered).
         forwardedOutage: "",
         // Where the applied rules are enforced differently from how they
@@ -2504,6 +2530,13 @@ ApplicationWindow {
                 // traffic" state.
                 killSwitchBlockAllArmed:
                     p["kill-switch-block-all-armed"] === true,
+                // Only a lost additional connection: the catch-all over a
+                // live tunnel is armed and holds nothing back.
+                killSwitchHoldingForOutage:
+                    p["kill-switch-holding-for-outage"] === true,
+                protectionFiltersOnMachine:
+                    Number(p["protection-filters-on-machine"]) || 0,
+                protectionFiltersHigh: p["protection-filters-high"] === true,
                 ruleConflicts: (p["rule-conflicts"] instanceof Array)
                     ? p["rule-conflicts"] : [],
                 ruleOverrides: (p["rule-overrides"] instanceof Array)
@@ -2539,23 +2572,19 @@ ApplicationWindow {
             if (typeof onSnapshot === "function") onSnapshot(p)
         })
     }
-    // Heal the service-side link-provider SSOT after a
-    // service-DB wipe. The confirmed-VPN prefs mirror survives (registry),
-    // but the per-SID `route_link_provider_apps` table does not; without it
-    // the VPN client earns no APP_EXEMPT permit and its own handshake is
-    // caught by leak protection. When the connect
-    // snapshot reports an EMPTY service set while the prefs mirror holds
-    // confirmed paths, push the mirror back through route.link-provider.set.
-    // Once per GUI session: the write triggers a server-side recompile, so
-    // the next snapshot already shows a non-empty set; the flag also keeps a
-    // failing write from being retried on every reconnect tick.
+    // Heal the service-side link-provider set after a service-DB wipe: the
+    // prefs mirror survives, the per-SID table does not, and without it the
+    // VPN client's own handshake is caught by leak protection. Only a service
+    // that holds no route policy at all for this user has lost its data; an
+    // empty set beside a stored policy is the user's own (the TUI may have
+    // removed the last program), and writing the mirror over it would bring
+    // the program back. Once per session, so a failing write is not retried
+    // on every reconnect.
     property bool _linkProviderResyncAttempted: false
     function _resyncLinkProvidersFromPrefs(snapshot) {
         if (_linkProviderResyncAttempted) return
-        var rp = (snapshot
-                && (snapshot["route-policy"] || snapshot.routePolicy)) || {}
-        var svc = rp["secondary-link-provider-apps"] || []
-        if (svc.length > 0) {
+        var rpRaw = snapshot && (snapshot["route-policy"] || snapshot.routePolicy)
+        if (rpRaw) {
             _linkProviderResyncAttempted = true
             return
         }
@@ -2668,7 +2697,9 @@ ApplicationWindow {
                 rulesFolder: window.userPresetsDir,
                 // So the tray writes the linked files the way this window does.
                 includeComments: (typeof boundFilesController !== "undefined" && boundFilesController)
-                    ? boundFilesController._emitComments() : true
+                    ? boundFilesController._emitComments() : true,
+                // The tray reads these once at start; this keeps it current.
+                notices: window._committedNoticePrefs()
             }
         }
     }
@@ -2835,6 +2866,15 @@ ApplicationWindow {
     // The service refused to enforce a rule set that reached the database
     // outside the app and fell back to the last verified one. Neutral by
     // design — a restored backup or a moved installation looks the same.
+    // Too many network filters on the machine: not dismissible, it stands down
+    // once the rules shrink.
+    readonly property bool protectionVolumeBannerVisible:
+        uiRevision >= 0 && routingState.protectionFiltersHigh === true
+    readonly property string protectionVolumeBannerText: uiRevision >= 0
+        ? tr("status.protection-volume-high", "Rules on this computer, yours and other users' together, take {count} Windows network filters. That many can make the Windows filtering service unstable. Narrow wide rules (a domain with all its subdomains, a zone) or remove the ones you no longer need.")
+            .replace("{count}", String(routingState.protectionFiltersOnMachine))
+        : ""
+
     readonly property bool revisionIntegrityAlertActive: {
         for (var i = 0; i < securityAlertItems.length; i++) {
             var a = securityAlertItems[i]
@@ -3058,6 +3098,17 @@ ApplicationWindow {
     // folders, keyed by path: the service lists them, the notice asks, and a
     // yes replaces the link provider set with everything confirmed so far
     // plus the answer (the write is a full replacement).
+    /// What the additional connection being down means for this user's leak
+    /// protection; the fallbacks follow the key `Pure` picks.
+    function _secondaryDownBody(level) {
+        var key = Pure.enforcementSecondaryDownBodyKey(level)
+        if (key === "notifications.enforcement.secondary-down.body-off")
+            return tr(key, "Sites your rules send there go over the main connection until it comes back: leak protection is off. Start the connection, or turn leak protection on to hold them instead.")
+        if (key === "notifications.enforcement.secondary-down.body-everything")
+            return tr(key, "The internet waits until it comes back, except your local network and what your rules send over the main connection — that is the protection doing its job, not a fault. Start the connection.")
+        return tr(key, "Everything your rules send there is being held until it comes back — that is the protection doing its job, not a fault. Start the connection, or move those rules to the main one.")
+    }
+
     property var _pendingVpnOffers: ({})
     function _offerPendingVpnClients(clients) {
         var offers = Pure.vpnClientTrustOffers(clients || [])
@@ -3157,8 +3208,8 @@ ApplicationWindow {
     // The service replaces the set whole, so every change is worked out over
     // a fresh read: `build(existing)` gives the new set, `say(stored)` the
     // status line once the service holds it. Without the service only the
-    // prefs copy changes, and the next start that finds the service set empty
-    // sends it. False while another change is in flight.
+    // prefs copy changes; it goes back only to a service that lost this
+    // user's policy. False while another change is in flight.
     function _replaceLinkProviders(build, say, onDone) {
         if (_linkProvidersWriting) return false
         var read = _linkProvidersRead()
@@ -3264,33 +3315,43 @@ ApplicationWindow {
             delete _pendingVpnGatewayOffers[old]
         }
     }
-    // Writes `list` as the caller's whole confirmed set; `onSaved` runs after
+    // The set is replaced whole, so `build(existing)` runs on a fresh read, not
+    // on the copy shown (the TUI may have changed it); `onSaved` runs after
     // `confirmedVpnGateways` follows the stored answer.
-    function _writeVpnGateways(list, onSaved) {
+    function _writeVpnGateways(build, onSaved) {
         if (_vpnGatewaysWriting) return
-        var corr = rpcTransport.rpcRouteVpnGatewaysSet({ "gateways": list })
-        if (!corr) return
-        _vpnGatewaysWriting = true
-        rpcTransport.registerRpcCallback(corr, function(ok, p, code) {
+        var failed = function(code) {
             _vpnGatewaysWriting = false
-            if (!ok) {
-                var label = (typeof ipcErrorLabel === "function")
-                    ? ipcErrorLabel(String(code || "unknown")) : String(code || "")
-                // Nothing retries this write; the list stays as it was.
-                statusLine = tr("vpn-onboarding.gateway-save-failed",
-                        "Could not save the change to the allowed VPN servers, so nothing changed. Try again.")
-                    + (label ? (" (" + label + ")") : "")
-                return
-            }
-            confirmedVpnGateways = (p && p["gateways"]) || list
-            onSaved()
+            var label = (typeof ipcErrorLabel === "function")
+                ? ipcErrorLabel(String(code || "unknown")) : String(code || "")
+            // Nothing retries this write; the list stays as it was.
+            statusLine = tr("vpn-onboarding.gateway-save-failed",
+                    "Could not save the change to the allowed VPN servers, so nothing changed. Try again.")
+                + (label ? (" (" + label + ")") : "")
+        }
+        var read = _linkProvidersRead()
+        if (!read) { failed(""); return }
+        _vpnGatewaysWriting = true
+        rpcTransport.registerRpcCallback(read, function(readOk, snap, readCode) {
+            if (!readOk) { failed(readCode); return }
+            var list = build((snap && snap["confirmed-vpn-gateways"]) || [])
+            var corr = rpcTransport.rpcRouteVpnGatewaysSet({ "gateways": list })
+            if (!corr) { failed(""); return }
+            rpcTransport.registerRpcCallback(corr, function(ok, p, code) {
+                if (!ok) { failed(code); return }
+                _vpnGatewaysWriting = false
+                confirmedVpnGateways = (p && p["gateways"]) || list
+                onSaved()
+            })
         })
     }
     function _trustVpnGateway(noticeId) {
         var id = String(noticeId || "")
         var offer = _pendingVpnGatewayOffers[id]
         if (!offer) return
-        _writeVpnGateways(Pure.vpnGatewaysConfirmed(confirmedVpnGateways, offer), function() {
+        _writeVpnGateways(function(existing) {
+            return Pure.vpnGatewaysConfirmed(existing, offer)
+        }, function() {
             notificationsController._dropPushNotice(id)
             delete _pendingVpnGatewayOffers[id]
             statusLine = tr("vpn-onboarding.gateway-allowed-status",
@@ -3777,6 +3838,14 @@ ApplicationWindow {
         pushGapReread()
     }
 
+    /// The service's pause start (epoch seconds) as ISO; "" without one, so the
+    /// window never shows the moment it merely learned of the pause.
+    function _pausedAtIso(epochSecs) {
+        if (epochSecs === undefined || epochSecs === null) return ""
+        var n = Number(epochSecs)
+        return (isFinite(n) && n > 0) ? new Date(n * 1000).toISOString() : ""
+    }
+
     /// The settings whose pushes fire on change only: a window that started or
     /// lost pushes after the change learns them from every snapshot.
     function _applyPushedSettingsFromSnapshot(p) {
@@ -3784,9 +3853,9 @@ ApplicationWindow {
         var paused = p["routing-paused"] === true
         if (paused !== (routingState.routingPaused === true)) {
             patch.routingPaused = paused
-            patch.routingPausedAt = paused ? new Date().toISOString() : ""
             patch.routingPauseReason = ""
         }
+        patch.routingPausedAt = paused ? _pausedAtIso(p["routing-paused-at"]) : ""
         patch.routingPauseResumesAtMs = paused && p["routing-pause-resumes-at-ms"] !== undefined
             && p["routing-pause-resumes-at-ms"] !== null
             ? Number(p["routing-pause-resumes-at-ms"]) : -1
@@ -3913,8 +3982,7 @@ ApplicationWindow {
             case "routing-pause-state-changed":
                 updateRoutingState({
                     routingPaused: !!event.paused,
-                    routingPausedAt: event.paused ? new Date().toISOString()
-                                                  : "",
+                    routingPausedAt: event.paused ? _pausedAtIso(event["paused-at"]) : "",
                     routingPauseReason: "",
                     routingPauseResumesAtMs: event.paused && event["resumes-at-ms"] !== undefined
                         && event["resumes-at-ms"] !== null ? Number(event["resumes-at-ms"]) : -1,
@@ -4552,8 +4620,7 @@ ApplicationWindow {
                 body = tr("notifications.enforcement.primary-down.body",
                     "Traffic that is not routed to the additional connection has nowhere to go until it comes back. Check the cable, the Wi-Fi, or pick another main connection.")
             } else {
-                body = tr("notifications.enforcement.secondary-down.body",
-                    "Everything your rules send there is being held until it comes back — that is the protection doing its job, not a fault. Start the connection, or move those rules to the main one.")
+                body = _secondaryDownBody(routingState.leakProtection)
             }
         } else if (status === "adapters-unreadable") {
             body = tr("notifications.enforcement.adapters-unreadable.body",
@@ -4806,22 +4873,35 @@ ApplicationWindow {
         })
     }
 
+    // The write replaces every field, so `values` (only what the user changed)
+    // goes over a fresh read, not over a copy that may be defaults never read.
     function setRetentionSettings(values) {
-        var merged = Object.assign({}, routingState.retentionSettings, values || {})
-        // Optimistic local update — UI stays responsive while the
-        // round-trip resolves.
-        updateRoutingState({ retentionSettings: merged })
-        if (!bridgeAvailable) return
-        var corr = nrrNativeBridge.rpcRetentionSettingsSet({
-            "superseded-days": merged.supersededDays,
-            "superseded-count-cap": merged.supersededCountCap,
-            "rejected-days": merged.rejectedDays,
-            "rolledback-days": merged.rolledbackDays,
-            "rolledback-count-cap": merged.rolledbackCountCap,
-            "pin-lkg": merged.pinLkg
-        })
-        rpcTransport.registerRpcCallback(corr, function(ok, p, code, msg) {
-            if (!ok) console.log("retention-set failed:", code, msg)
+        if (!bridgeAvailable) {
+            updateRoutingState({
+                retentionSettings: Object.assign({}, routingState.retentionSettings, values || {})
+            })
+            return
+        }
+        var readCorr = nrrNativeBridge.rpcRetentionSettingsGet()
+        if (!readCorr) return
+        rpcTransport.registerRpcCallback(readCorr, function(readOk, fresh, readCode, readMsg) {
+            if (!readOk || !fresh) {
+                console.log("retention-set skipped, read failed:", readCode, readMsg)
+                return
+            }
+            var merged = Object.assign({}, _retentionSettingsFromWire(fresh), values || {})
+            updateRoutingState({ retentionSettings: merged })
+            var corr = nrrNativeBridge.rpcRetentionSettingsSet({
+                "superseded-days": merged.supersededDays,
+                "superseded-count-cap": merged.supersededCountCap,
+                "rejected-days": merged.rejectedDays,
+                "rolledback-days": merged.rolledbackDays,
+                "rolledback-count-cap": merged.rolledbackCountCap,
+                "pin-lkg": merged.pinLkg
+            })
+            rpcTransport.registerRpcCallback(corr, function(ok, p, code, msg) {
+                if (!ok) console.log("retention-set failed:", code, msg)
+            })
         })
     }
     function setApplyFailurePolicy(slug) {
@@ -4944,6 +5024,14 @@ ApplicationWindow {
     // Anchor against Main.qml — without `Qt.resolvedUrl`, relative
     // paths get re-resolved by the consumer (e.g. ThemedButton in
     // components/) and point to apps/assets/... which doesn't exist.
+    // A folder the window computed; the bridge opens it only as a directory.
+    function openOwnFolder(url) {
+        var path = Pure.ownFolderPath(url)
+        if (path !== "" && typeof nrrNativeBridge !== "undefined"
+                && typeof nrrNativeBridge.openFolder === "function") {
+            nrrNativeBridge.openFolder(path)
+        }
+    }
     function uiIconSource(name) { return Qt.resolvedUrl("../../../assets/icons/" + (highContrastIcons ? "ui-hc/" : "ui/") + name + ".svg") }
     // The same icon for a control painted with the accent fill. The normal
     // set is a blue/indigo gradient, which on that fill is invisible; the
@@ -5221,16 +5309,21 @@ ApplicationWindow {
     }
 
     // Open the VPN-client picker over a fresh read of the stored set, so it
-    // opens with exactly what the service holds ticked.
+    // opens with exactly what the service holds ticked; a failed read says so
+    // rather than offering the prefs copy for saving.
     function openVpnOnboarding() {
         if (typeof vpnOnboardingDialog === "undefined" || !vpnOnboardingDialog) return
         var read = _linkProvidersRead()
         if (!read) {
-            vpnOnboardingDialog.open(currentLinkProviders())
+            vpnOnboardingDialog.openUnread()
             return
         }
         rpcTransport.registerRpcCallback(read, function(ok, p) {
-            if (ok) _recordLinkProvidersFrom(p)
+            if (!ok) {
+                vpnOnboardingDialog.openUnread()
+                return
+            }
+            _recordLinkProvidersFrom(p)
             vpnOnboardingDialog.open(currentLinkProviders())
         })
     }
@@ -6628,7 +6721,7 @@ ApplicationWindow {
     // The release check exists only in a build that has it (`updateCheckAvailable`).
     readonly property bool updateCheckAvailable: context.updateCheckAvailable === true
     Action { id: checkForUpdatesAction; text: tr("action.check-for-updates", "Check for updates"); shortcut: "Ctrl+U"; enabled: window.updateCheckAvailable; onTriggered: updateCheckController.checkNow() }
-    Action { id: logsFolderAction; text: tr("action.open-logs-folder", "Open logs folder"); shortcut: "Ctrl+Shift+O"; icon.source: uiIconSource("open-file"); enabled: String(((context.about || {}).logsFolderUrl) || "") !== ""; onTriggered: Pure.openExternalUrl(((context.about || {}).logsFolderUrl || "")) }
+    Action { id: logsFolderAction; text: tr("action.open-logs-folder", "Open logs folder"); shortcut: "Ctrl+Shift+O"; icon.source: uiIconSource("open-file"); enabled: String(((context.about || {}).logsFolderUrl) || "") !== ""; onTriggered: openOwnFolder((context.about || {}).logsFolderUrl) }
     Action { id: interfacesAction; text: sectionTitle("interfaces-routes"); shortcut: "Ctrl+1"; icon.source: sectionIconSource("interfaces-routes"); onTriggered: requestSectionChange("interfaces-routes") }
     Action { id: rulesAction; text: sectionTitle("rules"); shortcut: "Ctrl+2"; icon.source: sectionIconSource("rules"); onTriggered: requestSectionChange("rules") }
     Action { id: diagnosticsAction; text: sectionTitle("diagnostics"); shortcut: "Ctrl+3"; icon.source: sectionIconSource("diagnostics"); onTriggered: requestSectionChange("diagnostics") }
@@ -7629,8 +7722,8 @@ ApplicationWindow {
                 implicitWidth: progressPillRow.implicitWidth + uiTheme.spacingSm * 2
                 radius: uiTheme.radiusSm
                 color: startupLogPopup.visible ? uiTheme.stateHoverFill : "transparent"
-                border.width: uiTheme.borderWidth
-                border.color: uiTheme.stateDefaultBorder
+                border.width: activeFocus ? uiTheme.focusBorderWidth : uiTheme.borderWidth
+                border.color: activeFocus ? uiTheme.stateFocusedBorder : uiTheme.stateDefaultBorder
                 RowLayout {
                     id: progressPillRow
                     anchors.fill: parent
@@ -7651,15 +7744,23 @@ ApplicationWindow {
                         font.pixelSize: Math.max(11, window.font.pixelSize - 1)
                     }
                 }
+                function toggle() {
+                    if (startupLogPopup.visible) startupLogPopup.close()
+                    else startupLogPopup.open()
+                }
                 MouseArea {
                     anchors.fill: parent
                     cursorShape: Qt.PointingHandCursor
-                    onClicked: startupLogPopup.visible
-                        ? startupLogPopup.close() : startupLogPopup.open()
+                    onClicked: progressPill.toggle()
                 }
+                activeFocusOnTab: visible
+                Keys.onSpacePressed: progressPill.toggle()
+                Keys.onReturnPressed: progressPill.toggle()
+                Keys.onEnterPressed: progressPill.toggle()
                 Accessible.role: Accessible.Button
                 Accessible.name: window.tr("progress.show-log", "Connection log")
                     + ": " + window.lastProgressMessage
+                Accessible.onPressAction: progressPill.toggle()
             }
             Label {
                 id: statusLineLabel
@@ -7691,9 +7792,11 @@ ApplicationWindow {
                 radius: uiTheme.radiusSm
                 color: Qt.rgba(uiTheme.colorWarning.r, uiTheme.colorWarning.g,
                     uiTheme.colorWarning.b, 0.16)
-                border.width: uiTheme.borderWidth
-                border.color: Qt.rgba(uiTheme.colorWarning.r, uiTheme.colorWarning.g,
-                    uiTheme.colorWarning.b, 0.55)
+                border.width: activeFocus ? uiTheme.focusBorderWidth : uiTheme.borderWidth
+                border.color: activeFocus
+                    ? uiTheme.stateFocusedBorder
+                    : Qt.rgba(uiTheme.colorWarning.r, uiTheme.colorWarning.g,
+                        uiTheme.colorWarning.b, 0.55)
                 RowLayout {
                     id: boundFileChipRow
                     anchors.fill: parent
@@ -7721,6 +7824,11 @@ ApplicationWindow {
                     ToolTip.delay: 400
                     ToolTip.text: window.boundFilesController._boundFileChipTooltip()
                 }
+                activeFocusOnTab: visible
+                Keys.onSpacePressed: window.boundFilesController._saveBoundFilesNow()
+                Keys.onReturnPressed: window.boundFilesController._saveBoundFilesNow()
+                Keys.onEnterPressed: window.boundFilesController._saveBoundFilesNow()
+                Accessible.onPressAction: window.boundFilesController._saveBoundFilesNow()
                 Accessible.role: Accessible.Button
                 Accessible.name: window.tr("status.bound-file-out-of-date",
                     "The bound rules file is out of date. Save it to keep your export in sync.")
@@ -7744,8 +7852,10 @@ ApplicationWindow {
                         ? Qt.rgba(uiTheme.colorWarning.r, uiTheme.colorWarning.g,
                             uiTheme.colorWarning.b, 0.16)
                         : "transparent")
-                border.width: uiTheme.borderWidth
-                border.color: notificationsChip.warn
+                border.width: activeFocus ? uiTheme.focusBorderWidth : uiTheme.borderWidth
+                border.color: activeFocus
+                    ? uiTheme.stateFocusedBorder
+                    : notificationsChip.warn
                     ? Qt.rgba(uiTheme.colorWarning.r, uiTheme.colorWarning.g,
                         uiTheme.colorWarning.b, 0.55)
                     : uiTheme.stateDefaultBorder
@@ -7768,12 +7878,20 @@ ApplicationWindow {
                         font.pixelSize: Math.max(11, window.font.pixelSize - 1)
                     }
                 }
+                function toggle() {
+                    if (notificationCenterPopup.visible) notificationCenterPopup.close()
+                    else notificationCenterPopup.open()
+                }
+                activeFocusOnTab: visible
+                Keys.onSpacePressed: notificationsChip.toggle()
+                Keys.onReturnPressed: notificationsChip.toggle()
+                Keys.onEnterPressed: notificationsChip.toggle()
+                Accessible.onPressAction: notificationsChip.toggle()
                 MouseArea {
                     anchors.fill: parent
                     cursorShape: Qt.PointingHandCursor
                     hoverEnabled: true
-                    onClicked: notificationCenterPopup.visible
-                        ? notificationCenterPopup.close() : notificationCenterPopup.open()
+                    onClicked: notificationsChip.toggle()
                     ToolTip.visible: containsMouse && prefs.tooltipsEnabled
                     ToolTip.delay: 400
                     ToolTip.text: window.tr("notifications.chip-tooltip",
@@ -8586,6 +8704,7 @@ ApplicationWindow {
     function _writeOfflineRulesMarker() {
         if (_routingBackendConnected()) return
         if (!rulesNotAppliedToService) return
+        if (boundFilesController.tableMissesBoundRules()) return
         var json = _buildRulesJsonFromModel()
         if (!json) return
         var hash = (typeof nrrNativeBridge !== "undefined" && nrrNativeBridge
@@ -9087,10 +9206,12 @@ ApplicationWindow {
 
     /// Ask before "Everything" while the additional connection is not
     /// available: the internet stops at once. Same dialog, no adapter named.
-    function confirmLeakHoldsNow(onProceed, onCancel) {
+    /// `contextSlug` "holds-now-role" words it for a role removal or move.
+    function confirmLeakHoldsNow(onProceed, onCancel, contextSlug) {
         unroutableSecondaryConfirmDialog.adapterName = ""
         unroutableSecondaryConfirmDialog.reasonSlug = ""
-        unroutableSecondaryConfirmDialog.contextSlug = "holds-now"
+        unroutableSecondaryConfirmDialog.contextSlug =
+            contextSlug === "holds-now-role" ? "holds-now-role" : "holds-now"
         unroutableSecondaryConfirmDialog.pendingAction = onProceed || null
         unroutableSecondaryConfirmDialog.pendingCancelAction = onCancel || null
         unroutableSecondaryConfirmDialog.open()
@@ -9100,13 +9221,34 @@ ApplicationWindow {
     /// while the additional connection is not available asks first; any
     /// other change runs `onProceed` at once.
     function confirmDefaultRoute(level, nextRoute, onProceed, onCancel) {
-        var why = Pure.defaultRouteChangeConfirmSlug(level, nextRoute,
-            interfacesRolesController.boundSecondaryRow())
-        if (why === "holds-now") {
-            confirmLeakHoldsNow(onProceed, onCancel)
+        var decide = function(inForce) {
+            var why = Pure.defaultRouteChangeConfirmSlug(inForce, nextRoute,
+                interfacesRolesController.boundSecondaryRow())
+            if (why === "holds-now") {
+                confirmLeakHoldsNow(onProceed, onCancel)
+                return
+            }
+            if (onProceed) onProceed()
+        }
+        // The tray changes the level without telling this window: ask against
+        // the level the service holds now, `level` only when it cannot be read.
+        if (!bridgeAvailable || typeof nrrNativeBridge === "undefined" || nrrNativeBridge === null
+                || typeof nrrNativeBridge.rpcSnapshotInitialGet !== "function") {
+            decide(level)
             return
         }
-        if (onProceed) onProceed()
+        var corr = nrrNativeBridge.rpcSnapshotInitialGet()
+        if (!corr) { decide(level); return }
+        rpc.registerRpcCallback(corr, function(ok, p) {
+            if (!ok || !p) { decide(level); return }
+            var rpRaw = p["route-policy"] || p.routePolicy
+            _noteServicePolicy(rpRaw, p["first-policy"])
+            var rp = rpRaw || {}
+            var fresh = Pure.coerceLeakProtection(_routePolicyEffective(rp, "mode"),
+                _routePolicyEffective(rp, "leak-protection"))
+            updateRoutingState({ leakProtection: fresh })
+            decide(fresh)
+        })
     }
 
     /// True when a dry-run review summary
@@ -9277,6 +9419,10 @@ ApplicationWindow {
     /// When `true`, the next successful rules-update activation was a merge
     /// apply — re-export the merged revision to the bound files so file==service.
     property bool _mergeApplyPendingWrite: false
+    /// The bound files' texts the merge under review was built from
+    /// (`{ primary, secondary }`), taken as the program's once it is in force;
+    /// null for any other review.
+    property var _mergeTakenTexts: null
 
     /// Mutex against overlapping poll runs. The 30 s timer + manual
     /// "Recheck" button + edit hooks all funnel through

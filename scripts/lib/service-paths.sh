@@ -16,7 +16,7 @@ NRR_UNIT_NAME="$NRR_PRODUCT_NAME_UNIX.service"
 NRR_SERVICE_EXE_NAME="nrr-serviced"
 NRR_SERVICE_ALIAS_NAME="nrr-service"
 
-# The unit sets ProtectHome=yes, so a daemon under /home can never exec — the
+# A root daemon is never run from /home, whose owner could replace it — the
 # scripts stage the build-tree binary here and register it from this copy.
 # The Windows scripts register the build output in place; nothing hides it there.
 NRR_SERVICE_INSTALL_DIR="/usr/libexec/$NRR_PRODUCT_NAME_UNIX"
@@ -37,6 +37,8 @@ NRR_STAGED_LOCALES_DIR="$NRR_SERVICE_INSTALL_DIR/locales"
 # platform/linux (systemd unit, logrotate drop-in, polkit actions), the systemd
 # State/Logs/Runtime directories, and the enforcement table in lower_linux.rs.
 NRR_UNIT_FILE="/etc/systemd/system/$NRR_UNIT_NAME"
+# The oneshot the unit's OnFailure= starts (systemd.rs after_crash_unit_name).
+NRR_AFTER_CRASH_UNIT_FILE="/etc/systemd/system/$NRR_PRODUCT_NAME_UNIX-after-crash.service"
 # Where a distribution package puts the unit (systemd.rs PACKAGE_UNIT_DIRS).
 # One there means the package manager owns the install; these scripts stand down.
 NRR_PACKAGE_UNIT_FILES=("/usr/lib/systemd/system/$NRR_UNIT_NAME" "/lib/systemd/system/$NRR_UNIT_NAME")
@@ -46,6 +48,9 @@ NRR_STATE_DIR="/var/lib/$NRR_PRODUCT_NAME_UNIX"
 NRR_AUDIT_DIR="$NRR_STATE_DIR/audit"
 NRR_LOG_DIR="/var/log/$NRR_PRODUCT_NAME_UNIX"
 NRR_RUNTIME_DIR="/run/$NRR_PRODUCT_NAME_UNIX"
+# First-start rules and settings a package or `install.sh --provision` leaves
+# (platform/api paths.rs production_provision_dir).
+NRR_PROVISION_DIR="/etc/$NRR_PRODUCT_NAME_UNIX/provision"
 NRR_NFT_FAMILY="inet"
 NRR_NFT_TABLE="nrr"
 

@@ -22,8 +22,8 @@ Notifications:
   No notifications.
 Commands on this screen:
   r: restore your settings to a service that lost them
-  t: confirm the listed programs as your VPN, so leak protection keeps them working
-  a: allow the listed VPNs to reach their servers, so leak protection lets them connect
+  t: confirm the first listed program as your VPN (T: with the programs it ships with), so leak protection keeps it working
+  a: allow the first listed VPN to reach its server, so leak protection lets it connect
   p: confirm the suggested main connection; another one is chosen under Interfaces and routes
   v: send the blocked site named under the state over the additional route; you are asked first
 Type a screen number, h for help or q to quit, then press Enter.
@@ -40,6 +40,7 @@ Commands on this screen:
   d and a number: delete that rule
   t and a number: switch that rule on or off
   f: choose which route's rules to show
+  S: by state, y: by type, u: only added automatically, E: the rules that will not be applied
   / and text: search, for example / example.com; / alone shows all
   > and <: next and previous page
   s: apply the changes; they are shown first
@@ -75,6 +76,7 @@ Commands on this screen:
   d and a number: delete that rule
   t and a number: switch that rule on or off
   f: choose which route's rules to show
+  S: by state, y: by type, u: only added automatically, E: the rules that will not be applied
   / and text: search, for example / example.com; / alone shows all
   > and <: next and previous page
   s: apply the changes; they are shown first
@@ -110,6 +112,115 @@ Commands on this screen:
   d and a number: delete that rule
   t and a number: switch that rule on or off
   f: choose which route's rules to show
+  S: by state, y: by type, u: only added automatically, E: the rules that will not be applied
+  / and text: search, for example / example.com; / alone shows all
+  > and <: next and previous page
+  s: apply the changes; they are shown first
+  i: import files. x: export files. p: load a country rule set
+  o: choose the folder with your rule sets
+  r: show the rules the service applies
+  b: switch between your own rules and the baseline
+  m: move the rules that work only on the other route. n: not now
+  c: check whether the main route reaches the sites of your additional-route rules. O: list what it does not reach first, or back
+  v: add a rule for a VPN's gateway
+  g: application and device routes
+  F: compare your linked rules files with the rules in force and merge them
+  C: remove the rules a wildcard rule of the same route already covers
+  A: add several rules at once
+  T and a number: give that rule the type its value is, for example T 3. M: do it for every such rule
+  R: recent changes. U: put a deleted rule back
+  P and a rule number: confirm a protected rule, or take the confirmation back
+Type a screen number, h for help or q to quit, then press Enter.
+
+Screen: Rules
+Service: OK
+Rule list:
+  Changes: Same as in the service
+  Route: All routes · Sort: Match value (A–Z)
+  Main route check finished: reaches 0, does not reach 1, not checked 0.
+Rules:
+  Rules 1 to 2 of 2; 2 in all.
+    1. [on] R-0002  Zone  ru — Additional · Main route: not checked
+    2. [on] R-0001  Domain  shop.example — Additional · Main route: does not reach
+Commands on this screen:
+  a: add a rule
+  e and a number: edit that rule, for example e 3
+  d and a number: delete that rule
+  t and a number: switch that rule on or off
+  f: choose which route's rules to show
+  S: by state, y: by type, u: only added automatically, E: the rules that will not be applied
+  / and text: search, for example / example.com; / alone shows all
+  > and <: next and previous page
+  s: apply the changes; they are shown first
+  i: import files. x: export files. p: load a country rule set
+  o: choose the folder with your rule sets
+  r: show the rules the service applies
+  b: switch between your own rules and the baseline
+  m: move the rules that work only on the other route. n: not now
+  c: check whether the main route reaches the sites of your additional-route rules. O: list what it does not reach first, or back
+  v: add a rule for a VPN's gateway
+  g: application and device routes
+  F: compare your linked rules files with the rules in force and merge them
+  C: remove the rules a wildcard rule of the same route already covers
+  A: add several rules at once
+  T and a number: give that rule the type its value is, for example T 3. M: do it for every such rule
+  R: recent changes. U: put a deleted rule back
+  P and a rule number: confirm a protected rule, or take the confirmation back
+Type a screen number, h for help or q to quit, then press Enter.
+
+Screen: Rules
+Service: OK
+Rule list:
+  Changes: Same as in the service
+  Route: All routes · Sort: Rule type
+  Main route check finished: reaches 0, does not reach 1, not checked 0.
+Rules:
+  Rules 1 to 2 of 2; 2 in all.
+    1. [on] R-0001  Domain  shop.example — Additional · Main route: does not reach
+    2. [on] R-0002  Zone  ru — Additional · Main route: not checked
+Commands on this screen:
+  a: add a rule
+  e and a number: edit that rule, for example e 3
+  d and a number: delete that rule
+  t and a number: switch that rule on or off
+  f: choose which route's rules to show
+  S: by state, y: by type, u: only added automatically, E: the rules that will not be applied
+  / and text: search, for example / example.com; / alone shows all
+  > and <: next and previous page
+  s: apply the changes; they are shown first
+  i: import files. x: export files. p: load a country rule set
+  o: choose the folder with your rule sets
+  r: show the rules the service applies
+  b: switch between your own rules and the baseline
+  m: move the rules that work only on the other route. n: not now
+  c: check whether the main route reaches the sites of your additional-route rules. O: list what it does not reach first, or back
+  v: add a rule for a VPN's gateway
+  g: application and device routes
+  F: compare your linked rules files with the rules in force and merge them
+  C: remove the rules a wildcard rule of the same route already covers
+  A: add several rules at once
+  T and a number: give that rule the type its value is, for example T 3. M: do it for every such rule
+  R: recent changes. U: put a deleted rule back
+  P and a rule number: confirm a protected rule, or take the confirmation back
+Type a screen number, h for help or q to quit, then press Enter.
+
+Screen: Rules
+Service: OK
+Rule list:
+  Changes: Same as in the service
+  Route: All routes · Sort: Target route
+  Main route check finished: reaches 0, does not reach 1, not checked 0.
+Rules:
+  Rules 1 to 2 of 2; 2 in all.
+    1. [on] R-0002  Zone  ru — Additional · Main route: not checked
+    2. [on] R-0001  Domain  shop.example — Additional · Main route: does not reach
+Commands on this screen:
+  a: add a rule
+  e and a number: edit that rule, for example e 3
+  d and a number: delete that rule
+  t and a number: switch that rule on or off
+  f: choose which route's rules to show
+  S: by state, y: by type, u: only added automatically, E: the rules that will not be applied
   / and text: search, for example / example.com; / alone shows all
   > and <: next and previous page
   s: apply the changes; they are shown first
@@ -145,6 +256,7 @@ Commands on this screen:
   d and a number: delete that rule
   t and a number: switch that rule on or off
   f: choose which route's rules to show
+  S: by state, y: by type, u: only added automatically, E: the rules that will not be applied
   / and text: search, for example / example.com; / alone shows all
   > and <: next and previous page
   s: apply the changes; they are shown first

@@ -558,12 +558,14 @@ impl RoutingPauseWriter for ProductionRoutingPause {
             self.coordinator.resume(sid)
         };
         outcome.map_err(|e| SettingsWriteError::Storage(e.to_string()))?;
+        let stored = self.read_for_sid(sid);
         if let Some(bus) = self.event_bus.as_ref() {
             bus.publish_for(
                 sid,
                 StatusUpdateEvent::RoutingPauseStateChanged {
                     sid: sid.to_string(),
                     paused,
+                    paused_at: stored.paused_at,
                     resumes_at_ms: match end {
                         nrr_storage::pause_state::PauseEnd::At(at) => Some(at),
                         _ => None,
@@ -572,7 +574,7 @@ impl RoutingPauseWriter for ProductionRoutingPause {
                 },
             );
         }
-        Ok(self.read_for_sid(sid))
+        Ok(stored)
     }
 }
 

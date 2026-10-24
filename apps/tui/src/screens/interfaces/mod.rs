@@ -13,8 +13,8 @@ use nrr_shared::ipc_payloads::InterfaceRowDto;
 
 use self::keys as k;
 use super::binding::{
-    adapters, adapters_read, availability, binding, error_text, find, hint_text, holds,
-    kill_switch_on, kind_text, positional, role_label, role_write, row_key, rows_are_live,
+    adapters, adapters_read, availability, binding, change_holds_now, error_text, find, hint_text,
+    holds, kill_switch_on, kind_text, positional, role_label, role_write, row_key, rows_are_live,
     unroutable_lines, RoleChange, WriteFailure,
 };
 use super::choice;
@@ -50,6 +50,12 @@ enum Question {
     },
     /// The adapter has no way out; the GUI asks before binding it.
     Unroutable {
+        key: String,
+        change: RoleChange,
+    },
+    /// Under "Everything" the change leaves no available additional
+    /// connection, so the internet stops; the GUI asks first.
+    HoldsNow {
         key: String,
         change: RoleChange,
     },
@@ -142,24 +148,41 @@ fn toggle(app: &mut AppState, key: &str, route: Route) {
     } else if !rows_are_live(app) {
         Some(Outcome::Placeholder)
     } else if holds(row, route) {
-        start(app, RoleChange::Unassign { route });
+        proceed(app, key, RoleChange::Unassign { route }, false);
         None
     } else if held_other_role(row, route).is_some() {
         Some(Outcome::Exclusive)
-    } else if unroutable_reason(row).is_some() {
-        app.interfaces.question = Some(Question::Unroutable {
-            key: key.to_string(),
-            change: RoleChange::assign(row, route),
-        });
-        app.interfaces.answer = 1;
-        None
     } else {
-        start(app, RoleChange::assign(row, route));
+        proceed(app, key, RoleChange::assign(row, route), false);
         None
     };
     if outcome.is_some() {
         app.interfaces.outcome = outcome;
     }
+}
+
+/// The GUI's questions in its order, then the write: whether the internet
+/// would stop under "Everything", then whether the adapter has no way out.
+fn proceed(app: &mut AppState, key: &str, change: RoleChange, holds_now_asked: bool) {
+    if !holds_now_asked && change_holds_now(app, key, &change) {
+        app.interfaces.question = Some(Question::HoldsNow {
+            key: key.to_string(),
+            change,
+        });
+        app.interfaces.answer = 1;
+        return;
+    }
+    let unroutable = matches!(change, RoleChange::Assign { .. })
+        && find(&rows(app), key).is_some_and(|row| unroutable_reason(row).is_some());
+    if unroutable {
+        app.interfaces.question = Some(Question::Unroutable {
+            key: key.to_string(),
+            change,
+        });
+        app.interfaces.answer = 1;
+        return;
+    }
+    start(app, change);
 }
 
 fn start(app: &mut AppState, change: RoleChange) {
@@ -200,7 +223,7 @@ fn answer_count(app: &AppState, question: &Question) -> usize {
     match question {
         Question::Adapter => rows(app).len(),
         Question::Role { .. } => ROLE_ANSWERS.len(),
-        Question::Unroutable { .. } => 2,
+        Question::Unroutable { .. } | Question::HoldsNow { .. } => 2,
     }
 }
 
@@ -227,6 +250,14 @@ fn answer(app: &mut AppState, index: usize) {
         Question::Unroutable { change, .. } => {
             if index == 0 {
                 start(app, change);
+            } else {
+                cancel(app);
+            }
+        }
+        Question::HoldsNow { key, change } => {
+            if index == 0 {
+                app.interfaces.question = None;
+                proceed(app, &key, change, true);
             } else {
                 cancel(app);
             }
@@ -611,6 +642,14 @@ fn question_lines(
                 vec![texts.get(k::UNROUTABLE_CONFIRM), texts.get(k::CANCEL)],
             )
         }
+        Question::HoldsNow { .. } => (
+            texts.get(k::HOLDS_NOW_TITLE),
+            vec![
+                ViewLine::text(texts.get(k::HOLDS_NOW_BODY)),
+                ViewLine::text(texts.get(k::HOLDS_NOW_EFFECT)),
+            ],
+            vec![texts.get(k::HOLDS_NOW_CONFIRM), texts.get(k::CANCEL)],
+        ),
     };
     lines.extend(choice::lines(&answers, cursor));
     lines.push(ViewLine::text(texts.get(k::CHOICE_HINT)));

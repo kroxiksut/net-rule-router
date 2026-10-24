@@ -1182,6 +1182,28 @@ fn a_split_tunnel_keeps_its_public_networks_beside_a_full_one() {
     );
 }
 
+/// Tailscale keeps every route in table 52 and nothing in `main`; under
+/// "everything" its tailnet must stay reachable, as any corporate VPN's
+/// networks do. The kernel's own local table names addresses, not networks.
+#[test]
+fn a_foreign_tunnel_keeps_networks_it_routes_in_a_table_of_its_own() {
+    let mut routes: Vec<RouteEntry> = tunnel_rows(&["100.64.0.0/10"], 9)
+        .into_iter()
+        .chain([row("fd7a:115c:a1e0::", 48, "::", 9, 1)])
+        .map(|mut r| {
+            r.table = RouteTableRef::Tagged(52);
+            r
+        })
+        .collect();
+    let mut local = row("100.101.102.103", 32, "0.0.0.0", 9, 0);
+    local.table = RouteTableRef::Tagged(255);
+    routes.push(local);
+    assert_eq!(
+        foreign_tunnel_blocks(&routes, &[9]),
+        vec![net("100.64.0.0/10"), net("fd7a:115c:a1e0::/48")]
+    );
+}
+
 /// Each family is judged on its own: a full IPv6 tunnel keeps its IPv4
 /// corporate networks.
 #[test]
@@ -1194,4 +1216,21 @@ fn a_full_ipv6_tunnel_keeps_its_ipv4_networks() {
         foreign_tunnel_blocks(&routes, &[9]),
         vec![net("203.0.113.0/24"), net("fd00:5::/32")]
     );
+}
+
+/// A name under a rule that resolves to the tunnel's own server gets no host
+/// route into the tunnel, even written as a literal: routed there, the server
+/// seals the tunnel's reconnect.
+#[test]
+fn the_tunnels_server_never_gets_a_host_route_into_the_tunnel() {
+    let facts = NetworkRouteFacts {
+        tunnel_servers: vec![addr("203.0.113.7")],
+        ..NetworkRouteFacts::default()
+    };
+    let secondary = CanonicalRuleSet::from_rules(vec![rule(
+        "R-literal",
+        CanonicalAddressMatch::ExactIp(addr("203.0.113.7")),
+    )]);
+    assert!(facts.keeps_host_direct(&secondary, addr("203.0.113.7")));
+    assert!(!facts.keeps_host_direct(&secondary, addr("203.0.113.8")));
 }

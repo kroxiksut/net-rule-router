@@ -271,6 +271,71 @@ fn raise_leak_protection_matches_js() {
 }
 
 #[test]
+fn first_run_held_protection_matches_js() {
+    check(
+        "first_run_held_protection",
+        &mut JsLib::pure(),
+        |input| {
+            format!(
+                "firstRunHeldProtection({}, {}, {}, {}, {})",
+                arg(input, "saved"),
+                arg(input, "route"),
+                arg(input, "leak"),
+                arg(input, "auto"),
+                arg(input, "enabled")
+            )
+        },
+        |input| {
+            let flag = |key: &str| input[key].as_bool().unwrap_or(false);
+            route_policy::first_run_held_protection(
+                flag("saved"),
+                text(input, "route"),
+                text(input, "leak"),
+                flag("auto"),
+                flag("enabled"),
+            )
+            .map_or(
+                Value::Null,
+                |(level, doh)| json!({ "level": level, "doh": doh }),
+            )
+        },
+    );
+}
+
+#[test]
+fn first_run_writes_match_js() {
+    check(
+        "first_run_writes",
+        &mut JsLib::pure(),
+        |input| {
+            format!(
+                "firstRunWrites({}, {}, {}, {})",
+                arg(input, "held"),
+                arg(input, "level"),
+                arg(input, "doh"),
+                arg(input, "touched")
+            )
+        },
+        |input| {
+            let held = &input["held"];
+            let held = held
+                .is_object()
+                .then(|| (text(held, "level"), held["doh"].as_bool().unwrap_or(false)));
+            let chosen = (
+                text(input, "level"),
+                input["doh"].as_bool().unwrap_or(false),
+            );
+            let writes = route_policy::first_run_writes(
+                held,
+                chosen,
+                input["touched"].as_bool().unwrap_or(false),
+            );
+            json!({ "protection": writes.protection, "stability": writes.stability })
+        },
+    );
+}
+
+#[test]
 fn leak_protection_confirm_matches_js() {
     let (adapters_document, _) = load_vectors("adapters");
     let base = &adapters_document["base-row"];
@@ -384,6 +449,57 @@ fn leak_protection_holds_now_matches_js() {
             Value::from(route_policy::leak_protection_holds_now(
                 text(input, "level"),
                 secondary_row(input).as_ref(),
+            ))
+        },
+    );
+}
+
+/// The interface row `input[slot]` merged over the adapters base row, or null.
+fn row_slot(base: &Value, input: &Value, slot: &str) -> Value {
+    if input[slot].is_null() {
+        Value::Null
+    } else {
+        merged(base, &input[slot])
+    }
+}
+
+fn row_of(input: &Value, slot: &str) -> Option<InterfaceRowDto> {
+    (!input[slot].is_null())
+        .then(|| serde_json::from_value(input[slot].clone()).expect("vector is an InterfaceRowDto"))
+}
+
+#[test]
+fn secondary_change_holds_now_matches_js() {
+    let (adapters_document, _) = load_vectors("adapters");
+    let base = &adapters_document["base-row"];
+    let (_, cases) = load_vectors("secondary_change_holds_now");
+    let cases: Vec<Case> = cases
+        .into_iter()
+        .map(|case| {
+            let mut input = case.input.clone();
+            input["before"] = row_slot(base, &case.input, "before");
+            input["after"] = row_slot(base, &case.input, "after");
+            Case { input, ..case }
+        })
+        .collect();
+    check_cases(
+        "secondary_change_holds_now",
+        &cases,
+        &mut JsLib::pure(),
+        |input| {
+            format!(
+                "(function (b, a) {{ return secondaryChangeHoldsNow({}, \
+                 b ? mapWireInterfaceRow(b) : null, a ? mapWireInterfaceRow(a) : null) }})({}, {})",
+                arg(input, "level"),
+                lit(&input["before"]),
+                lit(&input["after"])
+            )
+        },
+        |input| {
+            Value::from(route_policy::secondary_change_holds_now(
+                text(input, "level"),
+                row_of(input, "before").as_ref(),
+                row_of(input, "after").as_ref(),
             ))
         },
     );

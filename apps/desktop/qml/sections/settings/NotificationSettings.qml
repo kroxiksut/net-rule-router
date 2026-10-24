@@ -297,6 +297,7 @@ GroupBox {
                 color: root.textColor
             }
             ThemedSpinBox {
+                accessibleLabel: root.uiRevision >= 0 ? root.tr("settings.field.tray-notice-opacity", "Tray notification opacity, %") : ""
                 theme: root.uiTheme
                 Layout.preferredWidth: 140
                 Layout.minimumWidth: 140

@@ -5,6 +5,10 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+mod version_rank {
+    include!("../../../packaging/windows/version_rank.rs");
+}
+
 fn main() {
     let manifest_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR").expect("manifest dir"));
     let native_dir = manifest_dir.join("native");
@@ -144,6 +148,16 @@ fn main() {
     configure.arg(format!(
         "-DNRR_VERSION={}",
         env::var("CARGO_PKG_VERSION").expect("CARGO_PKG_VERSION")
+    ));
+    // The same four numbers as every Rust executable, pre-release included.
+    let rank =
+        version_rank::prerelease_rank(&env::var("CARGO_PKG_VERSION_PRE").unwrap_or_default())
+            .expect("a pre-release the installers can order");
+    configure.arg(format!(
+        "-DNRR_VERSION_COMMAS={},{},{},{rank}",
+        env::var("CARGO_PKG_VERSION_MAJOR").expect("CARGO_PKG_VERSION_MAJOR"),
+        env::var("CARGO_PKG_VERSION_MINOR").expect("CARGO_PKG_VERSION_MINOR"),
+        env::var("CARGO_PKG_VERSION_PATCH").expect("CARGO_PKG_VERSION_PATCH"),
     ));
     // The C++ build type is RelWithDebInfo in both profiles, so NDEBUG cannot
     // tell a dev host from a shipped one; the cargo profile can. Passed either

@@ -8,10 +8,13 @@ SpinBox {
     id: root
     property var theme
 
-    // Accessible baseline — see the note in `ThemedComboBox.qml`. A spin box
-    // has no `text` either, so the value is the only thing there is to say.
+    // The visible label beside the box; the reader takes the value from the
+    // spin box itself. See `ThemedComboBox.qml`.
+    property string accessibleLabel: ""
+
     Accessible.role: Accessible.SpinBox
-    Accessible.name: root.displayText
+    Accessible.name: root.accessibleLabel !== ""
+        ? root.accessibleLabel.replace(/:\s*$/, "") : root.displayText
     Accessible.description: root.ToolTip.text
 
     // Compact, fixed height so Fusion's default (~36 px) does not bloat

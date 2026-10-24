@@ -25,12 +25,14 @@ pub fn service_control() -> Option<Box<dyn ServiceControlPort>> {
     ))
 }
 
-/// The host's service manager, asked only "installed? running?".
+/// The host's service manager. A person sits at this terminal, so a start or
+/// stop may have the session's polkit agent ask them for a password.
 #[cfg(target_os = "linux")]
 pub fn service_control() -> Option<Box<dyn ServiceControlPort>> {
-    Some(Box::new(
-        nrr_platform_linux::service_control::LinuxServiceControl::new(),
-    ))
+    use nrr_platform_linux::service_control::{LinuxServiceControl, PasswordPrompt};
+    Some(Box::new(LinuxServiceControl::new(
+        PasswordPrompt::SessionAgent,
+    )))
 }
 
 /// No service manager this build can ask.

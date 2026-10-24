@@ -472,6 +472,7 @@ ColumnLayout {
         Label { text: root.tr("diag.logs.filter-time-range", "Time range"); color: root.textColor }
         ThemedComboBox {
             id: rangeCombo
+            accessibleLabel: root.uiRevision >= 0 ? root.tr("diag.logs.filter-time-range", "Time range") : ""
             theme: root.uiTheme
             Layout.fillWidth: true
             Layout.minimumWidth: 110
@@ -492,6 +493,7 @@ ColumnLayout {
         Label { text: root.tr("diag.logs.filter-level", "Level"); color: root.textColor }
         ThemedComboBox {
             id: levelCombo
+            accessibleLabel: root.uiRevision >= 0 ? root.tr("diag.logs.filter-level", "Level") : ""
             theme: root.uiTheme
             Layout.fillWidth: true
             Layout.minimumWidth: 100
@@ -511,6 +513,7 @@ ColumnLayout {
         }
         Label { text: root.tr("diag.logs.filter-category", "Category"); color: root.textColor }
         ThemedTextField {
+            accessibleLabel: root.uiRevision >= 0 ? root.tr("diag.logs.filter-category", "Category") : ""
             theme: root.uiTheme
             Layout.fillWidth: true
             Layout.minimumWidth: 90
@@ -521,6 +524,7 @@ ColumnLayout {
         }
         Label { text: root.tr("diag.logs.filter-kind", "Event type"); color: root.textColor }
         ThemedTextField {
+            accessibleLabel: root.uiRevision >= 0 ? root.tr("diag.logs.filter-kind", "Event type") : ""
             theme: root.uiTheme
             Layout.fillWidth: true
             Layout.minimumWidth: 110

@@ -778,3 +778,31 @@ fn browsing_cannot_starve_a_named_host_out_of_the_refresh() {
         .expect("list");
     assert_eq!(idle.len(), 3);
 }
+
+/// A page can point any number of names of its own domain at a rule host's
+/// address; counted as tenants, they outvote the rule host and take its route
+/// away. The census counts sites: one domain's names are one tenant.
+#[test]
+fn names_of_one_domain_are_one_tenant_of_an_address() {
+    let dir = tempfile::tempdir().expect("tmp");
+    let store = migrated_cache_store(&dir);
+    let ip = Ipv4Addr::new(203, 0, 113, 7);
+    for name in ["a.attacker.test", "b.attacker.test", "c.cdn.attacker.test"] {
+        store
+            .record_shared_ip_direct_host(ip, name, 1, false)
+            .expect("census");
+    }
+    assert_eq!(store.direct_host_count_for_ip(ip).expect("count"), 1);
+    assert_eq!(
+        store.shared_ip_direct_host_counts().expect("counts"),
+        vec![(ip, 1)]
+    );
+    store
+        .record_shared_ip_direct_host(ip, "shop.other.test", 1, false)
+        .expect("census");
+    assert_eq!(
+        store.direct_host_count_for_ip(ip).expect("count"),
+        2,
+        "a second site does share the address"
+    );
+}

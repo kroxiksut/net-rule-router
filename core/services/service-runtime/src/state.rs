@@ -66,6 +66,16 @@ pub enum ServicePolicyState {
     Disabled,
 }
 
+/// How many rules a principal's revision in force holds, for the client's
+/// status. Counted on request only: decoding the rule book is not free.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ActiveRuleCounts {
+    /// Every rule of both routes.
+    pub total: usize,
+    /// Enabled rules of the additional route.
+    pub enabled_secondary: usize,
+}
+
 /// Per-revision summary surfaced via `HealthReporter` and the IPC status
 /// snapshot. Field shapes match the contract in `nrr-shared`; the struct
 /// here is a transport-neutral mirror so the runtime never touches GUI

@@ -11,8 +11,9 @@ const HOUR_MS: i64 = 60 * MINUTE_MS;
 const DAY_MS: i64 = 24 * HOUR_MS;
 
 /// The key a confirmation and its rule share: the route and the value as the
-/// service compares it — flags off, a name by its match key, a path without
-/// case where `os` ignores it. `""` for anything no confirmation can be about.
+/// service compares it — flags off, a name by its match key, a path folded
+/// over all of Unicode where `os` ignores case, as the service spells its
+/// canonical value. `""` for anything no confirmation can be about.
 #[must_use]
 pub fn rule_override_key(rule_type: &str, value: &str, route: &str, os: &str) -> String {
     if rule_type != "application" || !matches!(route, "secondary" | "block") {
@@ -28,9 +29,9 @@ pub fn rule_override_key(rule_type: &str, value: &str, route: &str, os: &str) ->
     let spelled = if !is_path {
         app_match_key(bare)
     } else if windows {
-        bare.replace('/', "\\").to_ascii_lowercase()
+        bare.replace('/', "\\").to_lowercase()
     } else if os == "macos" {
-        bare.to_ascii_lowercase()
+        bare.to_lowercase()
     } else {
         bare.to_owned()
     };
@@ -71,6 +72,24 @@ mod tests {
         assert_eq!(
             rule_override_key("application", "svchost +override", "secondary", "windows"),
             rule_override_key("application", "svchost.exe", "secondary", "windows")
+        );
+        assert_eq!(
+            rule_override_key(
+                "application",
+                r"C:\Program Files\Мой Софт\* +override",
+                "secondary",
+                "windows"
+            ),
+            rule_override_key(
+                "application",
+                r"c:\program files\мой софт\*",
+                "secondary",
+                "windows"
+            )
+        );
+        assert_eq!(
+            rule_override_key("application", "Программа.EXE +override", "block", "windows"),
+            rule_override_key("application", "программа", "block", "windows")
         );
         assert_ne!(
             rule_override_key("application", "/var/WWW/*", "block", "linux"),

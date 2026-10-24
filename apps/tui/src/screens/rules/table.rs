@@ -5,8 +5,9 @@ use std::collections::{BTreeMap, HashMap};
 
 use nrr_client_logic::rebase::{merge_view, rebase_edits, MergeView};
 use nrr_client_logic::rules_table::{
-    file_row_from_service_wire, main_route_check_hosts, main_route_rank, row_matches_search,
-    RowOrigin, RuleRow, RuleType, TargetRoute,
+    self as logic, compare_rule_rows, file_row_from_service_wire, main_route_check_hosts,
+    rule_passes_filters, RowOrigin, RuleRow, RuleRowView, RuleType, RulesFilters, SortDir,
+    TargetRoute,
 };
 use nrr_client_logic::Route;
 use nrr_domain::rule_value_validation::{
@@ -118,8 +119,18 @@ impl Row {
         }
     }
 
-    fn main_route_rank(&self) -> u8 {
-        main_route_rank(self.main_route.as_deref().unwrap_or_default())
+    /// What the shared filters and order read of this row.
+    fn view(&self) -> RuleRowView<'_> {
+        RuleRowView {
+            rule: &self.rule,
+            ace_lower: &self.ace_lower,
+            validation_status: match self.verdict.status {
+                VerdictStatus::Valid => "valid",
+                VerdictStatus::Warning => "warning",
+                VerdictStatus::Error => "error",
+            },
+            main_route: self.main_route.as_deref().unwrap_or_default(),
+        }
     }
 
     /// The host a main-route check asks about for this rule, if any.
@@ -190,34 +201,102 @@ impl RouteFilter {
         }
     }
 
-    fn passes(self, rule: &RuleRow) -> bool {
-        let route = &rule.target_route;
+    /// The shared route filter; «overridden» is the shared status filter,
+    /// offered here so that it combines with a status.
+    fn shared(self) -> logic::RouteFilter {
         match self {
-            Self::All => true,
-            Self::Primary => *route == TargetRoute::Primary,
-            Self::Secondary => *route == TargetRoute::Secondary,
-            Self::Block => *route == TargetRoute::Block,
-            Self::Unsure => rule.is_verify(),
-            // Judged by the table, which holds the confirmations.
-            Self::Overridden => true,
+            Self::All | Self::Overridden => logic::RouteFilter::All,
+            Self::Primary => logic::RouteFilter::Primary,
+            Self::Secondary => logic::RouteFilter::Secondary,
+            Self::Block => logic::RouteFilter::Block,
+            Self::Unsure => logic::RouteFilter::Unsure,
         }
     }
 }
 
-/// The list's order.
+/// Which rules by their state, as the window's «Status» filter.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum StatusFilter {
+    #[default]
+    All,
+    EnabledOnly,
+    DisabledOnly,
+    /// Rules whose value the validator refuses: they are not applied.
+    WithErrors,
+}
+
+impl StatusFilter {
+    pub const ALL: [Self; 4] = [
+        Self::All,
+        Self::EnabledOnly,
+        Self::DisabledOnly,
+        Self::WithErrors,
+    ];
+
+    pub fn label(self) -> Key {
+        match self {
+            Self::All => text::STATUS_ALL,
+            Self::EnabledOnly => text::STATUS_ENABLED,
+            Self::DisabledOnly => text::STATUS_DISABLED,
+            Self::WithErrors => text::STATUS_ERRORS,
+        }
+    }
+
+    fn shared(self) -> logic::StatusFilter {
+        match self {
+            Self::All => logic::StatusFilter::All,
+            Self::EnabledOnly => logic::StatusFilter::EnabledOnly,
+            Self::DisabledOnly => logic::StatusFilter::DisabledOnly,
+            Self::WithErrors => logic::StatusFilter::WithErrors,
+        }
+    }
+}
+
+pub use logic::TYPE_FILTERS;
+
+pub fn type_filter_label(slug: &str) -> Key {
+    match slug {
+        "zone" => text::TYPE_FILTER_ZONE,
+        "domain" => text::TYPE_FILTER_DOMAIN,
+        "exact-ip" => text::TYPE_FILTER_EXACT_IP,
+        "ip-range" => text::TYPE_FILTER_IP_RANGE,
+        "subnet" => text::TYPE_FILTER_SUBNET,
+        "application" => text::TYPE_FILTER_APPLICATION,
+        _ => text::TYPE_FILTER_ALL,
+    }
+}
+
+/// The list's order, the window's sort choices in their order.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum SortMode {
     /// As the rules are kept.
     #[default]
     Display,
+    MatchValue,
+    Type,
+    Route,
     /// What the main route does not reach first, unchecked rules last.
     MainRoute,
 }
 
 impl SortMode {
+    /// The shared column; `None` keeps the rules as they are kept.
+    fn shared(self) -> Option<logic::SortBy> {
+        match self {
+            Self::Display => None,
+            Self::MatchValue => Some(logic::SortBy::MatchValue),
+            Self::Type => Some(logic::SortBy::Type),
+            Self::Route => Some(logic::SortBy::Route),
+            Self::MainRoute => Some(logic::SortBy::MainRoute),
+        }
+    }
+
     pub fn next(self) -> Self {
         match self {
-            Self::Display => Self::MainRoute,
+            Self::Display => Self::MatchValue,
+            Self::MatchValue => Self::Type,
+            Self::Type => Self::Route,
+            Self::Route => Self::MainRoute,
             Self::MainRoute => Self::Display,
         }
     }
@@ -225,6 +304,9 @@ impl SortMode {
     pub fn label(self) -> Key {
         match self {
             Self::Display => text::SORT_DISPLAY,
+            Self::MatchValue => text::SORT_MATCH_VALUE,
+            Self::Type => text::SORT_TYPE,
+            Self::Route => text::SORT_ROUTE,
             Self::MainRoute => text::SORT_MAIN_ROUTE,
         }
     }
@@ -281,6 +363,11 @@ pub struct Table {
     /// What the service applies, as last read; `None` before the first read.
     baseline: Option<Vec<RuleRow>>,
     pub filter: RouteFilter,
+    pub status: StatusFilter,
+    /// One of [`TYPE_FILTERS`].
+    pub type_filter: &'static str,
+    /// Only the rules the app added itself.
+    pub auto_only: bool,
     pub search: String,
     pub sort: SortMode,
     /// Position of the chosen row among the visible ones, as last put; read
@@ -305,21 +392,32 @@ impl Table {
     /// Master indices of the rows the filter and the search let through, in
     /// the chosen order.
     pub fn visible(&self) -> Vec<usize> {
+        let filters = RulesFilters {
+            status: self.status.shared(),
+            rule_type: self.type_filter,
+            route: self.filter.shared(),
+            auto_only: self.auto_only,
+            recent_only: self.recent.is_some(),
+            search: &self.search,
+        };
+        let is_overridden =
+            |rule: &RuleRow| self.overridden.contains(&super::overrides::key_of(rule));
         let mut shown: Vec<usize> = self
             .rows
             .iter()
             .enumerate()
             .filter(|(_, row)| {
-                self.filter.passes(&row.rule)
-                    && (self.filter != RouteFilter::Overridden
-                        || self
-                            .overridden
-                            .contains(&super::overrides::key_of(&row.rule)))
-                    && row_matches_search(&row.rule, &row.ace_lower, &self.search)
-                    && self
-                        .recent
-                        .as_ref()
-                        .is_none_or(|recent| recent.at_of(&row.rule).is_some())
+                (self.filter != RouteFilter::Overridden || is_overridden(&row.rule))
+                    && rule_passes_filters(
+                        &row.view(),
+                        &filters,
+                        || is_overridden(&row.rule),
+                        || {
+                            self.recent
+                                .as_ref()
+                                .is_some_and(|recent| recent.at_of(&row.rule).is_some())
+                        },
+                    )
             })
             .map(|(i, _)| i)
             .collect();
@@ -328,14 +426,35 @@ impl Table {
             shown.sort_by_key(|&i| std::cmp::Reverse(recent.at_of(&self.rows[i].rule)));
             return shown;
         }
-        if self.sort == SortMode::MainRoute {
-            // Stable: equal verdicts keep the value order, as the GUI's sort.
-            shown.sort_by_cached_key(|&i| {
-                let row = &self.rows[i];
-                (row.main_route_rank(), row.rule.match_value.to_lowercase())
+        if let Some(sort) = self.sort.shared() {
+            // Stable, so rows the order calls equal keep theirs.
+            shown.sort_by(|&a, &b| {
+                compare_rule_rows(
+                    &self.rows[a].view(),
+                    &self.rows[b].view(),
+                    sort,
+                    SortDir::Asc,
+                )
             });
         }
         shown
+    }
+
+    /// Rules whose value is refused, so they are not applied.
+    pub fn invalid_count(&self) -> usize {
+        self.rows
+            .iter()
+            .filter(|row| row.verdict.status == VerdictStatus::Error)
+            .count()
+    }
+
+    /// Back to every rule, as after an import.
+    pub fn clear_filters(&mut self) {
+        self.filter = RouteFilter::All;
+        self.status = StatusFilter::All;
+        self.type_filter = TYPE_FILTERS[0];
+        self.auto_only = false;
+        self.search.clear();
     }
 
     pub fn selected(&self) -> Option<usize> {

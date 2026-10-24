@@ -717,6 +717,9 @@ pub enum StatusUpdateEvent {
     RoutingPauseStateChanged {
         sid: String,
         paused: bool,
+        /// When the pause began (epoch seconds); absent on resume.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        paused_at: Option<u64>,
         /// When a temporary pause ends by itself (wall clock, UTC ms).
         #[serde(default, skip_serializing_if = "Option::is_none")]
         resumes_at_ms: Option<i64>,
@@ -1165,6 +1168,9 @@ pub struct SnapshotInitialResponse {
     /// Whether the calling SID is currently routing-paused.
     #[serde(default)]
     pub routing_paused: bool,
+    /// When the caller's pause began (epoch seconds); absent while not paused.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub routing_paused_at: Option<u64>,
     /// When the caller's temporary pause ends by itself (wall clock, UTC ms).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub routing_pause_resumes_at_ms: Option<i64>,
@@ -1218,6 +1224,21 @@ pub struct SnapshotInitialResponse {
     /// setup. Wire key: `kill-switch-block-all-armed`.
     #[serde(default)]
     pub kill_switch_block_all_armed: bool,
+    /// Everything is held because the additional link cannot be found: what
+    /// the "the internet waits" banner shows. The catch-all over a live tunnel
+    /// arms the block-all above but is not this. Wire key:
+    /// `kill-switch-holding-for-outage`.
+    #[serde(default)]
+    pub kill_switch_holding_for_outage: bool,
+    /// Standing network filters on the machine, every signed-in user's
+    /// together. Wire key: `protection-filters-on-machine`.
+    #[serde(default)]
+    pub protection_filters_on_machine: u32,
+    /// The machine holds more filters than the platform's filtering service
+    /// is known to stay stable under; the window and the terminal warn. Wire
+    /// key: `protection-filters-high`.
+    #[serde(default)]
+    pub protection_filters_high: bool,
     /// Where the caller's APPLIED rules are enforced differently from how they
     /// read, as the last filter compute found it. Empty when nothing
     /// conflicts. Wire key: `rule-conflicts`.
@@ -1244,6 +1265,15 @@ pub struct SnapshotInitialResponse {
     /// `RulesBookUnreadable`. Wire key: `rules-book-unreadable`.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub rules_book_unreadable: bool,
+    /// Rules in the caller's revision in force, 0 when none is; absent from a
+    /// service that does not count them. Wire key: `active-rule-count`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub active_rule_count: Option<u32>,
+    /// Enabled rules of the additional route in that revision; absent from a
+    /// service that does not count them. Wire key:
+    /// `active-secondary-rule-count`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub active_secondary_rule_count: Option<u32>,
     /// The caller's programs named like a VPN client that leak protection does
     /// not trust by place, awaiting confirmation as the link provider — the
     /// standing twin of `VpnClientAwaitingConfirmation`. Wire key:

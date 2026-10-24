@@ -293,6 +293,9 @@ pub struct SecondaryRouteCoordinator {
     /// The resolution each principal's last full recompute used. A first
     /// contact plans from it instead of re-reading the adapters on the DNS path.
     last_resolution: Mutex<HashMap<String, RouteResolution>>,
+    /// Principals whose last pass read the machine, so their kept-direct
+    /// segments stand. A first contact for anyone else would plan blind.
+    machine_read: Mutex<std::collections::HashSet<String>>,
     /// How long each served user has been served; the longer-served one keeps
     /// a contested destination.
     served_ranks: Mutex<served::ServedRanks>,

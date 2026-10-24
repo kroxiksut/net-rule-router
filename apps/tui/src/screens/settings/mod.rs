@@ -24,17 +24,21 @@ use nrr_client_logic::route_policy;
 use nrr_ipc_client::IpcClientError;
 use nrr_platform_api::service_control::ServiceStatusReport;
 use nrr_shared::ipc_payloads::{
-    BlockNoticeMuteDto, BlockNoticeMuteScopeDto, ConnHistoryListResponse,
-    LocalDnsSuffixesGetResponse, LocalNetworksGetResponse, LogRetentionConfigDto,
-    LogRetentionConfigSetRequest, RetentionSettingsDto, RetentionSettingsSetRequest,
-    RollbackTargetDto, StorageUsageDto, TrafficStatsGetResponse, TrafficStatsSettingsDto,
+    BlockNoticeMuteDto, BlockNoticeMuteScopeDto, ConnHistoryListResponse, DohResolverEntryDto,
+    DohResolversGetResponse, LocalDnsSuffixesGetResponse, LocalNetworksGetResponse,
+    LogRetentionConfigDto, LogRetentionConfigSetRequest, RetentionSettingsDto,
+    RetentionSettingsSetRequest, RollbackTargetDto, StorageUsageDto,
+    ThirdPartyComponentsListResponse, TrafficStatsGetResponse, TrafficStatsSettingsDto,
 };
 use nrr_shared::ipc_transport::IpcErrorCode;
+use nrr_shared::merge_dto::MergePolicyDto;
 use nrr_shared::platform_profile::{PlatformProfile, PlatformSupports};
 use serde_json::{json, Map, Value};
 
 pub use clock::Clock;
-use items::{Item, ItemId, Kind, LogField, PrefField, RevisionField, TrafficField, Words};
+use items::{
+    IpcField, Item, ItemId, Kind, LogField, PrefField, RevisionField, TrafficField, Words,
+};
 pub use prefs::TuiPrefs;
 
 use super::Screen;
@@ -79,7 +83,7 @@ impl Category {
             Self::Presets => text::PRESETS,
             Self::Logs => text::LOGS,
             Self::Traffic => text::TRAFFIC,
-            Self::Updates => text::UPDATES,
+            Self::Updates => text::ABOUT,
             Self::Terminal => text::TERMINAL,
         }
     }
@@ -200,12 +204,16 @@ pub struct Data {
     pub local_suffixes: Loadable<LocalDnsSuffixesGetResponse>,
     /// The local networks leak protection may leave reachable.
     pub local_networks: Loadable<LocalNetworksGetResponse>,
+    /// The machine-wide DoH/DoT resolver list, read when it is opened.
+    pub doh_resolvers: Loadable<DohResolversGetResponse>,
     pub mutes: Loadable<Vec<BlockNoticeMuteDto>>,
     pub failure_policy: Loadable<String>,
     pub retention: Loadable<RetentionSettingsDto>,
     pub log_retention: Loadable<LogRetentionConfigDto>,
     pub storage: Loadable<StorageUsageDto>,
     pub traffic: Loadable<TrafficStatsGetResponse>,
+    /// The shipped third-party binaries and how they check out.
+    pub third_party: Loadable<ThirdPartyComponentsListResponse>,
     /// The caller's own connection-history choices.
     pub conn_history: Loadable<ConnHistoryListResponse>,
     pub service: Loadable<ServiceInfo>,
@@ -286,11 +294,13 @@ pub enum Mode {
     Picking { option: usize },
     /// Typing a value.
     Editing { buffer: String },
-    /// An action that cannot be undone waits for a second yes.
-    Confirming,
+    /// An action that cannot be undone waits for a second yes. The row is
+    /// kept as asked: a list read meanwhile may move it.
+    Confirming { item: Box<Item> },
     /// A pick that would hold traffic (a leak-protection level, or a default
-    /// route that raises it) waits for a yes.
+    /// route that raises it) waits for a yes, for the row `id`.
     ConfirmingPick {
+        id: ItemId,
         slug: &'static str,
         why: route_policy::LeakProtectionConfirm,
     },
@@ -328,7 +338,16 @@ pub struct SettingsState {
     /// The suffix typed and not yet added.
     pub local_suffix_new: String,
     pub local_network_new: String,
+    /// The list of shared addresses left open is shown.
+    pub shared_exemptions_open: bool,
+    /// The resolver list is open, and the entry being typed for it.
+    pub doh_open: bool,
+    pub doh_new_target: String,
+    pub doh_new_comment: String,
     pub export_path: String,
+    /// Where the traffic CSV goes, and the unit of its byte columns.
+    pub traffic_export_path: String,
+    pub traffic_export_unit: &'static str,
     /// Why protection is being switched off, kept in the audit trail.
     pub safe_disable_reason: String,
     /// The term picked for the next safe disable.
@@ -342,6 +361,11 @@ pub struct SettingsState {
     pub clock: Clock,
     pub service_probe: RegistrationProbe,
     pub supports: PlatformSupports,
+    /// Where this OS keeps its hosts file, shown beside the bypass toggle.
+    pub hosts_file_path: String,
+    /// Who wins a rule the bound files and the service hold differently;
+    /// read from the shared settings file when Rule sets opens.
+    pub merge_policy: MergePolicyDto,
     pub reset: reset::ResetState,
     pub providers: providers::ProvidersState,
 }
@@ -357,7 +381,13 @@ impl Default for SettingsState {
             mute_form: MuteForm::default(),
             local_suffix_new: String::new(),
             local_network_new: String::new(),
+            shared_exemptions_open: false,
+            doh_open: false,
+            doh_new_target: String::new(),
+            doh_new_comment: String::new(),
             export_path: String::new(),
+            traffic_export_path: String::new(),
+            traffic_export_unit: "mb",
             safe_disable_reason: String::new(),
             safe_disable_term: "until-restart",
             pause_term: "until-resumed",
@@ -367,6 +397,8 @@ impl Default for SettingsState {
             clock: Clock::default(),
             service_probe: crate::platform::service_control,
             supports: PlatformProfile::current().supports,
+            hosts_file_path: PlatformProfile::current().hosts_file_path,
+            merge_policy: MergePolicyDto::Union,
             reset: reset::ResetState::default(),
             providers: providers::ProvidersState::default(),
         }
@@ -474,7 +506,7 @@ impl Screen for SettingsScreen {
             Mode::Browse => None,
             Mode::Picking { .. } => Some(text::PLAIN_PICK),
             Mode::Editing { .. } => Some(text::PLAIN_EDIT),
-            Mode::Confirming | Mode::ConfirmingPick { .. } => Some(text::PLAIN_CONFIRM),
+            Mode::Confirming { .. } | Mode::ConfirmingPick { .. } => Some(text::PLAIN_CONFIRM),
         }
     }
 }
@@ -593,7 +625,7 @@ fn detail_lines(app: &AppState, item: &Item, focused: bool, texts: &Texts) -> Ve
             }
             lines
         }
-        (Mode::Confirming, _) if focused => vec![indent(texts.get(text::CONFIRM))],
+        (Mode::Confirming { .. }, _) if focused => vec![indent(texts.get(text::CONFIRM))],
         (Mode::ConfirmingPick { why, .. }, _) if focused => {
             let mut lines = leak_confirm_lines(app, *why, texts);
             lines.push(indent(texts.get(text::CONFIRM)));
@@ -718,7 +750,9 @@ fn begin(app: &mut AppState, item: &Item) {
         Kind::Text(text) => Mode::Editing {
             buffer: text.clone(),
         },
-        Kind::Action { confirm: true } => Mode::Confirming,
+        Kind::Action { confirm: true } => Mode::Confirming {
+            item: Box::new(item.clone()),
+        },
         Kind::Action { confirm: false } => {
             activate(app, item, Input::Run);
             return;
@@ -752,13 +786,45 @@ fn pick(app: &mut AppState, option: usize) {
     };
     if let Kind::Choice { options, .. } = &item.kind {
         if let Some(slug) = options.get(option).map(|o| o.slug) {
+            let asks_about_protection = matches!(
+                item.id,
+                ItemId::Policy(route_policy::LEAK_PROTECTION_KEY) | ItemId::Policy("mode")
+            );
+            if asks_about_protection && app.link.is_connected() {
+                let id = item.id;
+                app.outbox.push(jobs::reread_policy_then(move |app| {
+                    decide_pick(app, id, slug)
+                }));
+                return;
+            }
             if let Some(why) = leak_confirm(app, &item, slug) {
-                app.settings.mode = Mode::ConfirmingPick { slug, why };
+                app.settings.mode = Mode::ConfirmingPick {
+                    id: item.id,
+                    slug,
+                    why,
+                };
                 return;
             }
             activate(app, &item, Input::Pick(slug));
         }
     }
+}
+
+/// The confirmation decision over the policy just read again.
+fn decide_pick(app: &mut AppState, id: ItemId, slug: &'static str) {
+    let found = app
+        .settings
+        .open
+        .and_then(|category| items::items(app, category).into_iter().find(|i| i.id == id));
+    let Some(item) = found else {
+        app.settings.refuse(Words::Key(text::CONFIRM_GONE));
+        return;
+    };
+    if let Some(why) = leak_confirm(app, &item, slug) {
+        app.settings.mode = Mode::ConfirmingPick { id, slug, why };
+        return;
+    }
+    activate(app, &item, Input::Pick(slug));
 }
 
 /// What a pick must be confirmed for, as the window and the tray decide it:
@@ -820,15 +886,31 @@ fn leak_confirm_lines(
         .collect()
 }
 
-fn run_confirmed(app: &mut AppState) {
-    if let Some(item) = focused_item(app) {
-        activate(app, &item, Input::Run);
+/// The row a question was about, found again by what it says rather than by
+/// the cursor: a list read while the question was up may have moved it, and
+/// a row by number would then be another one. Gone or changed, nothing runs.
+fn run_confirmed(app: &mut AppState, asked: &Item) {
+    let found = app.settings.open.and_then(|category| {
+        items::items(app, category).into_iter().find(|i| {
+            std::mem::discriminant(&i.id) == std::mem::discriminant(&asked.id)
+                && i.label == asked.label
+                && i.kind == asked.kind
+        })
+    });
+    match found {
+        Some(item) => activate(app, &item, Input::Run),
+        None => app.settings.refuse(Words::Key(text::CONFIRM_GONE)),
     }
 }
 
-fn run_confirmed_pick(app: &mut AppState, slug: &'static str) {
-    if let Some(item) = focused_item(app) {
-        activate(app, &item, Input::Pick(slug));
+fn run_confirmed_pick(app: &mut AppState, id: ItemId, slug: &'static str) {
+    let found = app
+        .settings
+        .open
+        .and_then(|category| items::items(app, category).into_iter().find(|i| i.id == id));
+    match found {
+        Some(item) => activate(app, &item, Input::Pick(slug)),
+        None => app.settings.refuse(Words::Key(text::CONFIRM_GONE)),
     }
 }
 
@@ -873,15 +955,15 @@ fn on_key(app: &mut AppState, key: KeyEvent) -> bool {
             }
             true
         }
-        Mode::Confirming => {
+        Mode::Confirming { item } => {
             if key.code == KeyCode::Enter {
-                run_confirmed(app);
+                run_confirmed(app, &item);
             }
             true
         }
-        Mode::ConfirmingPick { slug, .. } => {
+        Mode::ConfirmingPick { id, slug, .. } => {
             if key.code == KeyCode::Enter {
-                run_confirmed_pick(app, slug);
+                run_confirmed_pick(app, id, slug);
             }
             true
         }
@@ -933,15 +1015,15 @@ fn on_line(app: &mut AppState, line: &str) -> bool {
             }
             return true;
         }
-        Mode::Confirming => {
+        Mode::Confirming { item } => {
             if is_yes(line) {
-                run_confirmed(app);
+                run_confirmed(app, &item);
             }
             return true;
         }
-        Mode::ConfirmingPick { slug, .. } => {
+        Mode::ConfirmingPick { id, slug, .. } => {
             if is_yes(line) {
-                run_confirmed_pick(app, slug);
+                run_confirmed_pick(app, id, slug);
             }
             return true;
         }
@@ -990,7 +1072,7 @@ fn on_line(app: &mut AppState, line: &str) -> bool {
             }
         }
         Kind::Number { .. } | Kind::Text(_) => commit(app, rest),
-        Kind::Action { confirm: true } if is_yes(rest) => run_confirmed(app),
+        Kind::Action { confirm: true } if is_yes(rest) => run_confirmed(app, &item),
         _ => begin(app, &item),
     }
     true
@@ -1004,6 +1086,14 @@ fn load(app: &mut AppState) {
     let Some(category) = app.settings.open else {
         return;
     };
+    if category == Category::Presets {
+        app.settings.merge_policy = app
+            .rules
+            .settings_file
+            .as_deref()
+            .and_then(|file| crate::screens::rules::own_settings::merge_policy(file).ok())
+            .unwrap_or_default();
+    }
     if category == Category::Service {
         app.settings.data.service.start();
         app.outbox
@@ -1062,7 +1152,11 @@ fn load(app: &mut AppState) {
             s.reset.others.start();
             queue.push(reset::load_others());
         }
-        Category::Service | Category::Updates | Category::Terminal => {}
+        Category::Updates => {
+            s.data.third_party.start();
+            queue.push(jobs::load_third_party());
+        }
+        Category::Service | Category::Terminal => {}
     }
     for job in queue {
         app.outbox.push(job);
@@ -1091,10 +1185,16 @@ fn needs_service(id: ItemId) -> bool {
             | ItemId::MuteUnit
             | ItemId::LocalSuffixNew
             | ItemId::LocalNetworkNew
+            | ItemId::DohNewTarget
+            | ItemId::SharedExemptionsDetails
+            | ItemId::DohNewComment
             | ItemId::Provider(providers::ProviderRow::New)
             | ItemId::Provider(providers::ProviderRow::Scan)
             | ItemId::Reset(reset::ResetRow::Scope)
             | ItemId::ExportPath
+            | ItemId::MergePolicy
+            | ItemId::TrafficExportPath
+            | ItemId::TrafficExportUnit
             | ItemId::SafeDisableReason
             | ItemId::SafeDisableTerm
             | ItemId::RulesPauseTerm
@@ -1162,6 +1262,78 @@ fn activate(app: &mut AppState, item: &Item, input: Input) {
             .map(|cidr| jobs::write_local_networks(vec![(cidr, toggled)], Vec::new())),
         (ItemId::LocalNetworkForget(index), Input::Run) => local_network_cidr(app, index)
             .map(|cidr| jobs::write_local_networks(Vec::new(), vec![cidr])),
+        (ItemId::IpcPolicy, Input::Pick(kind)) => ipc_policy_change(app, |policy| {
+            if kind == "critical" {
+                *policy = json!({ "kind": "critical" });
+            } else if policy.get("kind").and_then(Value::as_str) != Some("recoverable") {
+                *policy = json!({ "kind": "recoverable", "max-restarts": 20,
+                                  "backoff-base-ms": 100, "backoff-cap-ms": 5000 });
+            }
+            Ok(())
+        }),
+        (ItemId::IpcNumber(field), Input::Number(n)) => ipc_policy_change(app, |policy| {
+            let (key, value) = match field {
+                IpcField::MaxRestarts => ("max-restarts", n),
+                IpcField::BackoffBaseMs => ("backoff-base-ms", n),
+                IpcField::BackoffCapSecs => ("backoff-cap-ms", n.saturating_mul(1000)),
+            };
+            policy[key] = json!(value);
+            let base = policy
+                .get("backoff-base-ms")
+                .and_then(Value::as_i64)
+                .unwrap_or(0);
+            let cap = policy
+                .get("backoff-cap-ms")
+                .and_then(Value::as_i64)
+                .unwrap_or(0);
+            if cap < base {
+                return Err(text::IPC_CAP_BELOW_BASE);
+            }
+            Ok(())
+        }),
+        (ItemId::CacheRefresh, Input::Number(minutes)) => stability_change(
+            app,
+            "cache-refresh-interval-secs",
+            json!(minutes.saturating_mul(60)),
+        ),
+        (ItemId::SharedExemptionsDetails, Input::Run) => {
+            app.settings.shared_exemptions_open = !app.settings.shared_exemptions_open;
+            None
+        }
+        (ItemId::DohManage, Input::Run) => {
+            app.settings.doh_open = !app.settings.doh_open;
+            app.settings.doh_open.then(|| {
+                app.settings.data.doh_resolvers.start();
+                jobs::load_doh_resolvers()
+            })
+        }
+        (ItemId::DohResolver(index), Input::Toggle) => doh_change(app, |list| {
+            if let Some(entry) = list.get_mut(index) {
+                entry.enabled = toggled;
+            }
+        }),
+        (ItemId::DohResolverRemove(index), Input::Run) => doh_change(app, |list| {
+            if index < list.len() {
+                list.remove(index);
+            }
+        }),
+        (ItemId::DohNewTarget, Input::Text(target)) => {
+            app.settings.doh_new_target = target;
+            None
+        }
+        (ItemId::DohNewComment, Input::Text(comment)) => {
+            app.settings.doh_new_comment = comment;
+            None
+        }
+        (ItemId::DohAdd, Input::Run) => {
+            let target = app.settings.doh_new_target.trim().to_owned();
+            if target.is_empty() {
+                app.settings.refuse(Words::Key(text::NEED_RESOLVER));
+                return;
+            }
+            let comment = app.settings.doh_new_comment.trim().to_owned();
+            doh_change(app, |list| list.push(doh_entry(target, comment)))
+        }
         (ItemId::LocalNetworkNew, Input::Text(cidr)) => {
             app.settings.local_network_new = cidr;
             None
@@ -1179,6 +1351,9 @@ fn activate(app: &mut AppState, item: &Item, input: Input) {
                 list.remove(index);
             }
         }),
+        (ItemId::Policy("browser-history-auto-seed"), Input::Toggle) if toggled => {
+            Some(jobs::write_auto_seed_on())
+        }
         (ItemId::Policy(key), input) => {
             let value = match input {
                 Input::Toggle => Value::Bool(toggled),
@@ -1304,14 +1479,51 @@ fn activate(app: &mut AppState, item: &Item, input: Input) {
         (ItemId::RevisionsReset, Input::Run) => {
             Some(jobs::set_retention(RetentionSettingsSetRequest::DEFAULT))
         }
-        (ItemId::Traffic(field), Input::Toggle) => traffic(app, |s| match field {
+        (ItemId::Traffic(field), Input::Toggle) => traffic(app, move |s| match field {
             TrafficField::Enabled => s.enabled = toggled,
             TrafficField::Loopback => s.count_loopback = toggled,
             TrafficField::Virtual => s.count_virtual = toggled,
         }),
-        (ItemId::TrafficRetention, Input::Number(n)) => traffic(app, |s| {
+        (ItemId::TrafficRetention, Input::Number(n)) => traffic(app, move |s| {
             s.retention_days = u32::try_from(n).unwrap_or(s.retention_days);
         }),
+        (ItemId::TrafficMerge(merged), Input::Run) => {
+            let day = app.settings.clock.local_day();
+            app.settings
+                .data
+                .traffic
+                .ready()
+                .and_then(|stats| stats.history_merge.clone())
+                .map(|q| jobs::answer_traffic_merge(q.old_key, q.new_key, merged, day))
+        }
+        (ItemId::TrafficExportPath, Input::Text(path)) => {
+            app.settings.traffic_export_path = path;
+            None
+        }
+        (ItemId::TrafficExportUnit, Input::Pick(unit)) => {
+            app.settings.traffic_export_unit = unit;
+            None
+        }
+        (ItemId::TrafficExport, Input::Run) => {
+            let path = app.settings.traffic_export_path.trim().to_owned();
+            if path.is_empty() {
+                app.settings.refuse(Words::Key(text::EXPORT_NEED_PATH));
+                return;
+            }
+            let day = app.settings.clock.local_day();
+            let retention = app
+                .settings
+                .data
+                .traffic
+                .ready()
+                .map_or(365, |stats| i64::from(stats.settings.retention_days));
+            Some(jobs::export_traffic_csv(
+                PathBuf::from(path),
+                day - retention,
+                day,
+                app.settings.traffic_export_unit,
+            ))
+        }
         (ItemId::TrafficReset, Input::Run) => {
             Some(jobs::clear_traffic(app.settings.clock.local_day()))
         }
@@ -1358,6 +1570,10 @@ fn activate(app: &mut AppState, item: &Item, input: Input) {
         }
         (ItemId::Pref(field), Input::Toggle) => {
             save_pref(app, field, toggled);
+            None
+        }
+        (ItemId::MergePolicy, Input::Pick(slug)) => {
+            save_merge_policy(app, MergePolicyDto::from_slug(slug));
             None
         }
         _ => None,
@@ -1409,6 +1625,27 @@ fn protocol(app: &mut AppState, bit: i32) -> Option<crate::backend::Job> {
 }
 
 /// A stability change, cut to what this system's service applies.
+/// The whole control-channel policy, as stored now with `edit` applied: the
+/// service validates the object as one.
+fn ipc_policy_change(
+    app: &mut AppState,
+    edit: impl FnOnce(&mut Value) -> Result<(), Key>,
+) -> Option<crate::backend::Job> {
+    let mut policy = app
+        .settings
+        .data
+        .stability
+        .ready()?
+        .get("ipc-accept-policy")
+        .cloned()
+        .unwrap_or_else(|| json!({ "kind": "recoverable" }));
+    if let Err(refusal) = edit(&mut policy) {
+        app.settings.refuse(Words::Key(refusal));
+        return None;
+    }
+    stability_change(app, "ipc-accept-policy", policy)
+}
+
 fn stability_change(
     app: &mut AppState,
     key: &'static str,
@@ -1466,12 +1703,39 @@ fn local_network_cidr(app: &AppState, index: usize) -> Option<String> {
         .map(|network| network.cidr.clone())
 }
 
+/// A typed resolver, its kind told by whether it reads as an address, as the
+/// window tells it.
+fn doh_entry(target: String, comment: String) -> DohResolverEntryDto {
+    let target_kind = if target.parse::<std::net::IpAddr>().is_ok() {
+        "ip"
+    } else {
+        "host"
+    };
+    DohResolverEntryDto {
+        target_kind: target_kind.to_owned(),
+        target,
+        comment,
+        enabled: true,
+    }
+}
+
+/// The whole resolver list, as stored now plus `edit`: the service replaces it.
+fn doh_change(
+    app: &mut AppState,
+    edit: impl FnOnce(&mut Vec<DohResolverEntryDto>),
+) -> Option<crate::backend::Job> {
+    let base = app.settings.data.doh_resolvers.ready()?.resolvers.clone();
+    let mut list = base.clone();
+    edit(&mut list);
+    Some(jobs::write_doh_resolvers(base, list))
+}
+
 /// The whole list is sent, as stored now plus `edit`: the service replaces it.
 fn local_suffix_change(
     app: &mut AppState,
     edit: impl FnOnce(&mut Vec<String>),
 ) -> Option<crate::backend::Job> {
-    let mut list: Vec<String> = app
+    let base: Vec<String> = app
         .settings
         .data
         .local_suffixes
@@ -1480,8 +1744,9 @@ fn local_suffix_change(
         .iter()
         .map(|entry| entry.suffix.clone())
         .collect();
+    let mut list = base.clone();
     edit(&mut list);
-    Some(jobs::write_local_suffixes(list))
+    Some(jobs::write_local_suffixes(base, list))
 }
 
 fn add_mute(app: &mut AppState) -> Option<crate::backend::Job> {
@@ -1510,23 +1775,19 @@ fn add_mute(app: &mut AppState) -> Option<crate::backend::Job> {
 
 const MIB: u64 = 1024 * 1024;
 
+/// Only after a successful load, and only the one field the user changed.
 fn log_retention(app: &mut AppState, field: LogField, n: i64) -> Option<crate::backend::Job> {
-    let current = app.settings.data.log_retention.ready()?.clone();
-    let mut request = LogRetentionConfigSetRequest {
-        log_max_age_days: current.log_max_age_days,
-        log_max_size_bytes: current.log_max_size_bytes,
-        audit_max_age_days: current.audit_max_age_days,
-        audit_max_size_bytes: current.audit_max_size_bytes,
-    };
+    app.settings.data.log_retention.ready()?;
     let days = u32::try_from(n).ok()?;
     let bytes = u64::try_from(n).ok()?.saturating_mul(MIB);
-    match field {
-        LogField::LogsAge => request.log_max_age_days = days,
-        LogField::LogsSize => request.log_max_size_bytes = bytes,
-        LogField::AuditAge => request.audit_max_age_days = days,
-        LogField::AuditSize => request.audit_max_size_bytes = bytes,
-    }
-    Some(jobs::set_log_retention(request))
+    Some(jobs::change_log_retention(
+        move |request: &mut LogRetentionConfigSetRequest| match field {
+            LogField::LogsAge => request.log_max_age_days = days,
+            LogField::LogsSize => request.log_max_size_bytes = bytes,
+            LogField::AuditAge => request.audit_max_age_days = days,
+            LogField::AuditSize => request.audit_max_size_bytes = bytes,
+        },
+    ))
 }
 
 fn revisions(
@@ -1534,35 +1795,53 @@ fn revisions(
     number: Option<(RevisionField, i64)>,
     pin: Option<bool>,
 ) -> Option<crate::backend::Job> {
-    let current = app.settings.data.retention.ready()?.clone();
-    let mut request = RetentionSettingsSetRequest {
-        superseded_days: current.superseded_days,
-        superseded_count_cap: current.superseded_count_cap,
-        rejected_days: current.rejected_days,
-        rolledback_days: current.rolledback_days,
-        rolledback_count_cap: current.rolledback_count_cap,
-        pin_lkg: pin.unwrap_or(current.pin_lkg),
+    app.settings.data.retention.ready()?;
+    let number = match number {
+        Some((field, n)) => Some((field, u32::try_from(n).ok()?)),
+        None => None,
     };
-    if let Some((field, n)) = number {
-        let n = u32::try_from(n).ok()?;
-        match field {
-            RevisionField::SupersededDays => request.superseded_days = n,
-            RevisionField::SupersededCount => request.superseded_count_cap = n,
-            RevisionField::RejectedDays => request.rejected_days = n,
-            RevisionField::RolledbackDays => request.rolledback_days = n,
-            RevisionField::RolledbackCount => request.rolledback_count_cap = n,
-        }
-    }
-    Some(jobs::set_retention(request))
+    Some(jobs::change_retention(
+        move |request: &mut RetentionSettingsSetRequest| {
+            if let Some(pin) = pin {
+                request.pin_lkg = pin;
+            }
+            if let Some((field, n)) = number {
+                match field {
+                    RevisionField::SupersededDays => request.superseded_days = n,
+                    RevisionField::SupersededCount => request.superseded_count_cap = n,
+                    RevisionField::RejectedDays => request.rejected_days = n,
+                    RevisionField::RolledbackDays => request.rolledback_days = n,
+                    RevisionField::RolledbackCount => request.rolledback_count_cap = n,
+                }
+            }
+        },
+    ))
 }
 
 fn traffic(
     app: &mut AppState,
-    change: impl FnOnce(&mut TrafficStatsSettingsDto),
+    change: impl FnOnce(&mut TrafficStatsSettingsDto) + Send + 'static,
 ) -> Option<crate::backend::Job> {
-    let mut settings = app.settings.data.traffic.ready()?.settings.clone();
-    change(&mut settings);
-    Some(jobs::set_traffic(settings, app.settings.clock.local_day()))
+    app.settings.data.traffic.ready()?;
+    Some(jobs::change_traffic(change, app.settings.clock.local_day()))
+}
+
+fn save_merge_policy(app: &mut AppState, policy: MergePolicyDto) {
+    let Some(file) = app.rules.settings_file.clone() else {
+        app.settings.refuse(Words::Key(text::MERGE_POLICY_NO_FILE));
+        return;
+    };
+    let s = &mut app.settings;
+    match crate::screens::rules::own_settings::set_merge_policy(&file, policy) {
+        Ok(()) => {
+            s.merge_policy = policy;
+            s.done(Words::Key(text::SAVED));
+        }
+        Err(error) => s.failed(
+            text::MERGE_POLICY_SAVE_FAILED,
+            Failure::detail(error.to_string()),
+        ),
+    }
 }
 
 fn save_pref(app: &mut AppState, field: PrefField, on: bool) {

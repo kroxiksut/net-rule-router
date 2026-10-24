@@ -15,15 +15,13 @@ use std::cell::OnceCell;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use nrr_client_logic::adapters::{display_name, held_other_role, unroutable_reason};
 use nrr_client_logic::route_policy::{
-    coerce_leak_protection, leak_protection_choices_at_least, leak_protection_holds_now,
-    raise_leak_protection,
+    first_run_held_protection, first_run_writes, leak_protection_choices_at_least,
+    leak_protection_holds_now, raise_leak_protection,
 };
 use nrr_client_logic::Route;
 use nrr_shared::display_text::display_text;
 use nrr_shared::first_run_sheet::ProvisioningAnswers;
-use nrr_shared::ipc_payloads::{
-    BehaviorModeDto, InterfaceRowDto, RoutePolicyDto, SnapshotInitialResponse,
-};
+use nrr_shared::ipc_payloads::{BehaviorModeDto, InterfaceRowDto, SnapshotInitialResponse};
 use nrr_shared::AppSection;
 use serde_json::Value;
 
@@ -853,11 +851,6 @@ fn route_slug(mode: BehaviorModeDto) -> &'static str {
     }
 }
 
-/// The level a policy holds, as its default route offers it.
-fn held_level(p: &RoutePolicyDto) -> &'static str {
-    coerce_leak_protection(route_slug(p.mode), p.leak_protection.as_slug())
-}
-
 /// The chosen level as the current default route offers it, never below the
 /// first save's floor.
 fn shown_level(app: &AppState) -> &'static str {
@@ -896,11 +889,16 @@ fn seed_protection(app: &mut AppState) {
     let Some(snapshot) = app.snapshot.as_ref() else {
         return;
     };
-    let held = snapshot
-        .route_policy
-        .as_ref()
-        .filter(|_| !needs_setup(snapshot))
-        .map(|p| (held_level(p), p.doh_lockdown_auto || p.doh_lockdown_enabled));
+    // Any saved policy is a choice, bound connections or not.
+    let held = snapshot.route_policy.as_ref().and_then(|p| {
+        first_run_held_protection(
+            true,
+            route_slug(p.mode),
+            p.leak_protection.as_slug(),
+            p.doh_lockdown_auto,
+            p.doh_lockdown_enabled,
+        )
+    });
     let state = &mut app.wizard;
     state.seeded = true;
     state.protection_at_start = held;
@@ -924,7 +922,8 @@ fn send_protection(app: &mut AppState) {
     }
     // Nothing changed for a user already set up: nothing to write.
     let chosen = (shown_level(app), app.wizard.doh_lockdown);
-    if app.wizard.protection_at_start == Some(chosen) {
+    let held = app.wizard.protection_at_start;
+    if !first_run_writes(held, chosen, app.wizard.stability_touched).protection {
         return;
     }
     if !app.link.is_connected() {

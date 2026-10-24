@@ -125,6 +125,11 @@ Text after `#` on a non-commented line is an inline comment. It is displayed
 as a label/description in the GUI rule list and is preserved in exports. The
 `#` and everything after it are not part of the match value.
 
+The comment starts at a `#` that follows a space or a tab. A `#` inside a
+value stays part of it, so `C:\Projects\C#\tool.exe` names that program. A
+program whose name has a `#` right after a space is written in double quotes
+(`"C:\Tools\Build #2\tool.exe"  # note`), the same quotes as below.
+
 **Inline comment length limit: 200 characters** (after the `#` separator,
 trimmed of leading/trailing whitespace). The GUI's Add/Edit Rule dialog
 truncates input at this limit and shows a `used/max` counter. The rules-file
@@ -441,7 +446,7 @@ subdomains one way and the bare domain the other.
 name a registrar sells under — `com`, `ru`, or two parts such as `co.uk` — so
 `example.com.other.net` belongs to `other.net` and does not match. `*.example.*`
 is read as the same rule. To send one zone of the site the other way, add a
-rule for it (`example.by`): a rule that names the zone always wins. The `?`
+rule for it (`*.example.by`): a rule that names the zone always wins. The `?`
 check (§1.15) needs one host and does not apply to `example.*`.
 
 #### IP (`--- IP`)
@@ -771,6 +776,8 @@ Key properties:
   default route is consulted.
 - **An address deny wins over every other rule for that address.** A site whose
   name you route is still stopped while it answers on an address you denied.
+- **An application deny wins over every address rule.** A denied application
+  is stopped even on a destination another rule routes by name or address.
 - **A deny wins a tie.** When a deny and a route name the same destination
   equally narrowly — even from different files — the destination is denied.
   The Overlaps screen points out such pairs.

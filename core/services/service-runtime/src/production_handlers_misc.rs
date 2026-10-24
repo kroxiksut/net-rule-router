@@ -783,17 +783,22 @@ fn stored_policy(conn: &Arc<Mutex<Connection>>, sid: &str) -> Option<RoutePolicy
         (record, providers)
     };
     // Read after the lock is released: the rules provider takes it itself.
-    let has_secondary_rules = has_secondary_rules_for(conn, sid);
-    Some(record_to_dto(record, providers, has_secondary_rules))
+    let rules_need_names = rules_need_names_for(conn, sid, record.mode);
+    Some(record_to_dto(record, providers, rules_need_names))
 }
 
-/// Whether the caller routes anything down the additional link, through the
-/// one rules provider the service reads rules by.
-fn has_secondary_rules_for(conn: &Arc<Mutex<Connection>>, sid: &str) -> bool {
+/// Whether the caller's rules need to see site names, read through the one
+/// rules provider the service reads rules by.
+fn rules_need_names_for(conn: &Arc<Mutex<Connection>>, sid: &str, mode: BehaviorMode) -> bool {
     use crate::per_sid_orchestrator::RulesProvider;
     crate::production_rules_provider::ProductionRulesProvider::new(Arc::clone(conn))
         .active_rules_for(sid)
-        .is_some_and(|snapshot| crate::rule_book_facts::has_secondary_rules(&snapshot.rule_book))
+        .is_some_and(|snapshot| {
+            crate::rule_book_facts::needs_names_seen(
+                &snapshot.rule_book,
+                mode == BehaviorMode::PreferSecondaryWhenAvailable,
+            )
+        })
 }
 
 pub struct ProductionRoutePolicyWriter {
@@ -890,8 +895,8 @@ impl RoutePolicyWriter for ProductionRoutePolicyWriter {
             (written, providers)
         };
         // After the lock is released: the rules provider takes it itself.
-        let has_secondary_rules = has_secondary_rules_for(&self.conn, sid);
-        Ok(record_to_dto(written, providers, has_secondary_rules))
+        let rules_need_names = rules_need_names_for(&self.conn, sid, written.mode);
+        Ok(record_to_dto(written, providers, rules_need_names))
     }
 }
 
@@ -1095,14 +1100,14 @@ fn provider_record_to_dto(rec: LinkProviderAppRecord) -> LinkProviderAppDto {
 fn record_to_dto(
     rec: RoutePolicyRecord,
     secondary_link_providers: Vec<LinkProviderAppRecord>,
-    has_secondary_rules: bool,
+    rules_need_names: bool,
 ) -> RoutePolicyDto {
     let doh_lockdown_effective = crate::doh_lockdown_policy::doh_lockdown_active(
         rec.doh_lockdown_auto,
         rec.doh_lockdown_enabled,
         rec.doh_lockdown_scope,
         rec.leak_protection.is_on(),
-        has_secondary_rules,
+        rules_need_names,
     );
     RoutePolicyDto {
         primary: rec.primary.map(record_binding_to_dto),
@@ -1398,6 +1403,18 @@ fn now_ms() -> i64 {
         .unwrap_or(0)
 }
 
+/// The adapter ids `sid` has bound (current and earlier ones); empty when
+/// nothing is bound yet, `None` when the store could not say.
+pub type CallerBindings = Arc<dyn Fn(&str) -> Option<Vec<String>> + Send + Sync>;
+
+type RowFilter = dyn Fn(&nrr_platform_api::InterfaceRouteRow) -> bool;
+
+/// Sends the external-address probe for the rows the filter picks.
+type ExternalProbe = fn(
+    &mut [nrr_platform_api::InterfaceRouteRow],
+    &dyn Fn(&nrr_platform_api::InterfaceRouteRow) -> bool,
+);
+
 pub struct MonitoredAdaptersSnapshotProvider {
     api: Arc<dyn nrr_platform_api::route_table::RouteTablePort>,
     interface_rows: Arc<dyn nrr_platform_api::InterfaceRowsPort>,
@@ -1416,11 +1433,48 @@ pub struct MonitoredAdaptersSnapshotProvider {
     /// [`Self::fold_cached_external`]). `None` keeps `new()` a pure
     /// preview-safe constructor that never touches the traffic DB.
     address_recorder: Option<Arc<dyn AdapterAddressRecorder>>,
+    /// Whose connections a user's external-address check may leave by.
+    caller_bindings: Option<CallerBindings>,
+    external_probe: ExternalProbe,
 }
 
 struct CachedExternalAddress {
     external_ip: String,
     local_ip: String,
+    /// Whose check obtained it: another user is not shown it.
+    probed_by: String,
+}
+
+/// [`CallerBindings`] over the stored route bindings.
+pub fn stored_caller_bindings(conn: Arc<Mutex<Connection>>) -> CallerBindings {
+    Arc::new(move |sid: &str| {
+        if sid.is_empty() {
+            return Some(Vec::new());
+        }
+        let guard = conn.lock().unwrap_or_else(|p| p.into_inner());
+        let policy = RouteBindingsRepository::new(&guard)
+            .load_for_sid(sid)
+            .ok()?;
+        Some(
+            policy
+                .primary
+                .into_iter()
+                .chain(policy.secondary)
+                .flat_map(|b| std::iter::once(b.stable_id).chain(b.known_stable_ids))
+                .collect(),
+        )
+    })
+}
+
+/// Whether `row` is the adapter a binding id names: the GUI binds by the
+/// row's persistent id, or by its name where the OS reports no id.
+fn row_is_bound(row: &nrr_platform_api::InterfaceRouteRow, ids: &[String]) -> bool {
+    ids.iter().any(|id| {
+        !id.is_empty()
+            && [&row.persistent_id, &row.adapter_name, &row.name]
+                .iter()
+                .any(|own| !own.is_empty() && own.eq_ignore_ascii_case(id))
+    })
 }
 
 /// The adapter's persistent id, or its name where the OS reports no id.
@@ -1442,6 +1496,37 @@ impl MonitoredAdaptersSnapshotProvider {
             interface_rows,
             last_external: Mutex::new(std::collections::HashMap::new()),
             address_recorder: None,
+            caller_bindings: None,
+            external_probe: nrr_platform_api::interface_rows::apply_external_ip_probes_where,
+        }
+    }
+
+    /// Wires the reader of each user's bindings, so a user's check probes only
+    /// the connections they bound. Unwired, every adapter is probed.
+    pub fn with_caller_bindings(mut self, bindings: CallerBindings) -> Self {
+        self.caller_bindings = Some(bindings);
+        self
+    }
+
+    #[cfg(test)]
+    fn with_external_probe(mut self, probe: ExternalProbe) -> Self {
+        self.external_probe = probe;
+        self
+    }
+
+    /// Which rows `caller`'s check may probe: their bound connections, every
+    /// connection while they have bound none, nothing when the store cannot
+    /// say whose they are.
+    fn probe_filter(&self, caller: &str) -> Box<RowFilter> {
+        let Some(bindings) = self.caller_bindings.as_ref() else {
+            return Box::new(|_: &nrr_platform_api::InterfaceRouteRow| true);
+        };
+        match bindings(caller) {
+            None => Box::new(|_: &nrr_platform_api::InterfaceRouteRow| false),
+            Some(ids) if ids.is_empty() => Box::new(|_: &nrr_platform_api::InterfaceRouteRow| true),
+            Some(ids) => {
+                Box::new(move |row: &nrr_platform_api::InterfaceRouteRow| row_is_bound(row, &ids))
+            }
         }
     }
 
@@ -1462,7 +1547,20 @@ impl MonitoredAdaptersSnapshotProvider {
     /// A link that is down, or gone from a `live` enumeration, loses what was
     /// remembered for it: a tunnel that comes back may leave by another exit,
     /// so its address is shown again only once it is checked again.
+    #[cfg(test)]
     fn fold_cached_external(&self, rows: &mut [nrr_platform_api::InterfaceRouteRow], live: bool) {
+        self.fold_cached_external_for(rows, live, None);
+    }
+
+    /// [`Self::fold_cached_external`] for `viewer`: a fresh result is filed
+    /// under them, and only what their own check obtained is replayed. No
+    /// viewer is the machine's view.
+    fn fold_cached_external_for(
+        &self,
+        rows: &mut [nrr_platform_api::InterfaceRouteRow],
+        live: bool,
+        viewer: Option<&str>,
+    ) {
         let Ok(mut cache) = self.last_external.lock() else {
             return;
         };
@@ -1483,6 +1581,7 @@ impl MonitoredAdaptersSnapshotProvider {
                     CachedExternalAddress {
                         external_ip: ip.clone(),
                         local_ip: row.local_ip.clone(),
+                        probed_by: viewer.unwrap_or_default().to_owned(),
                     },
                 );
                 // Only a FRESH resolution is persisted. Keyed by `row.name`,
@@ -1514,6 +1613,9 @@ impl MonitoredAdaptersSnapshotProvider {
             }
             match cache.get(&key) {
                 Some(entry) if entry.local_ip == row.local_ip => {
+                    if viewer.is_some_and(|viewer| viewer != entry.probed_by) {
+                        continue;
+                    }
                     row.observed_facts.external_ip = Some(entry.external_ip.clone());
                     row.observed_facts.external_probe_note =
                         "Last observed external address from an earlier probe; \
@@ -1528,7 +1630,13 @@ impl MonitoredAdaptersSnapshotProvider {
         }
     }
 
-    fn snapshot(&self, probe_external_ip: bool) -> SnapshotInterfacesResponse {
+    /// `probe_for`: whose check runs with this snapshot, if any. `viewer`:
+    /// who reads it, `None` for the machine's view.
+    fn snapshot(
+        &self,
+        probe_for: Option<&str>,
+        viewer: Option<&str>,
+    ) -> SnapshotInterfacesResponse {
         let adapters = match self.api.get_adapter_infos() {
             Ok(v) => v,
             Err(e) => {
@@ -1545,7 +1653,12 @@ impl MonitoredAdaptersSnapshotProvider {
         // interfaces" shows adapters that appeared at runtime (VPN up, USB
         // dongle, VM NIC). The external-address probe runs only when the user
         // asked for it.
-        let (source, mut rich_rows) = self.interface_rows.collect_rows(probe_external_ip);
+        let (source, mut rich_rows) = self.interface_rows.collect_rows(false);
+        // Placeholder rows are offline by contract: nothing behind them to ask.
+        if let Some(caller) = probe_for.filter(|_| source.is_live()) {
+            let wanted = self.probe_filter(caller);
+            (self.external_probe)(&mut rich_rows, &*wanted);
+        }
         // Report the provenance the enumeration actually reached, not the one
         // this path hopes for. The rows are a deterministic PLACEHOLDER
         // whenever the live enumeration came back empty, and a placeholder
@@ -1560,7 +1673,7 @@ impl MonitoredAdaptersSnapshotProvider {
                 "live adapter enumeration produced nothing — answering with the deterministic placeholder dataset, marked as such",
             );
         }
-        self.fold_cached_external(&mut rich_rows, source.is_live());
+        self.fold_cached_external_for(&mut rich_rows, source.is_live(), viewer);
         // After the fold: a remembered external address is part of the score.
         nrr_platform_api::interface_rows::assign_recommendations(&mut rich_rows);
         let rows = rich_rows
@@ -1582,11 +1695,26 @@ impl MonitoredAdaptersSnapshotProvider {
 
 impl AdaptersSnapshotProvider for MonitoredAdaptersSnapshotProvider {
     fn adapters_snapshot(&self, _force_refresh: bool) -> SnapshotInterfacesResponse {
-        self.snapshot(false)
+        self.snapshot(None, None)
     }
 
     fn adapters_snapshot_probing_external_ip(&self) -> SnapshotInterfacesResponse {
-        self.snapshot(true)
+        self.snapshot(Some(""), None)
+    }
+
+    fn adapters_snapshot_for(
+        &self,
+        _force_refresh: bool,
+        caller: &str,
+    ) -> SnapshotInterfacesResponse {
+        self.snapshot(None, Some(caller))
+    }
+
+    fn adapters_snapshot_probing_external_ip_for(
+        &self,
+        caller: &str,
+    ) -> SnapshotInterfacesResponse {
+        self.snapshot(Some(caller), Some(caller))
     }
 }
 

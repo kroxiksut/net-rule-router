@@ -166,7 +166,9 @@ const DIAGNOSTIC_SUFFIXES: &[&str] = &[
 ];
 
 /// Fields holding free text a call site formats an error or a cause into.
-const FREE_TEXT_FIELDS: &[&str] = &["detail", "details", "error", "errors", "message", "reason"];
+const FREE_TEXT_FIELDS: &[&str] = &[
+    "detail", "details", "error", "errors", "message", "note", "reason",
+];
 
 const FREE_TEXT_SUFFIXES: &[&str] = &["_detail", "_error", "_message", "_reason"];
 
@@ -583,6 +585,7 @@ mod tests {
             "detail": "ok",
             "flush_error": "/var/lib/nrr/x.db: disk full",
             "errors": ["/home/alice/a/b failed", "timeout"],
+            "note": "rule 3 is scoped to application `/home/alice/.local/bin/x`: observed",
             "count": 2,
         });
         assert!(mask_paths_in_free_text(&mut payload));
@@ -600,6 +603,10 @@ mod tests {
         assert_eq!(
             payload["errors"],
             json!(["<masked-path> failed", "timeout"])
+        );
+        assert_eq!(
+            payload["note"],
+            json!("rule 3 is scoped to application `<masked-path>`: observed")
         );
         assert_eq!(payload["count"], json!(2));
     }

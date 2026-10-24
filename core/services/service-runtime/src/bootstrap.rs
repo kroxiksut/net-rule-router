@@ -182,6 +182,16 @@ impl BootstrapArtifacts {
     pub fn is_ready_to_run(&self) -> bool {
         !self.report.blocking
     }
+
+    /// The state database, when this boot may open it: only one bootstrap
+    /// opened and migrated. Every component built on it writes, and one a newer
+    /// build wrote or a migration left half-done must be left as it is.
+    #[must_use]
+    pub fn usable_state_db(&self) -> Option<&Path> {
+        self.state_store
+            .as_ref()
+            .map(|_| self.topology.state_db_path.as_path())
+    }
 }
 
 // ── Pipeline driver ──────────────────────────────────────────────────────────
@@ -370,6 +380,14 @@ pub fn bootstrap(config: &BootstrapConfig) -> BootstrapArtifacts {
             if matches!(failure, StateOpenFailure::NewerSchema(_)) {
                 return Err(failure);
             }
+            // Nor is a failure on a file SQLite reads as whole (a full disk, a
+            // busy lock, a step the user's rows do not fit): it holds the newest
+            // rules, which an older backup would lose. The next start retries.
+            if !matches!(failure, StateOpenFailure::Schema(_))
+                && state_db_file_is_whole(&topology.state_db_path)
+            {
+                return Err(failure.kept_whole());
+            }
             match restore_state_db_from_backup(&topology, &config.retry) {
                 Ok((store, restored)) => {
                     tracing::error!(
@@ -436,7 +454,11 @@ pub fn bootstrap(config: &BootstrapConfig) -> BootstrapArtifacts {
                     "state DB unavailable",
                 );
             }
-            Err(StateOpenFailure::Migrate(msg) | StateOpenFailure::NewerSchema(msg)) => {
+            Err(
+                StateOpenFailure::Migrate(msg)
+                | StateOpenFailure::Schema(msg)
+                | StateOpenFailure::NewerSchema(msg),
+            ) => {
                 push(
                     &mut report,
                     phases::STORAGE_STATE,
@@ -740,6 +762,8 @@ fn push(
 enum StateOpenFailure {
     Open(String),
     Migrate(String),
+    /// Migrated, but tables or indexes are missing: an interrupted migration.
+    Schema(String),
     /// Written by a newer build; nothing to repair.
     NewerSchema(String),
 }
@@ -747,7 +771,18 @@ enum StateOpenFailure {
 impl StateOpenFailure {
     fn message(&self) -> &str {
         match self {
-            Self::Open(m) | Self::Migrate(m) | Self::NewerSchema(m) => m,
+            Self::Open(m) | Self::Migrate(m) | Self::Schema(m) | Self::NewerSchema(m) => m,
+        }
+    }
+
+    /// The same failure on a file that is whole, so it was kept.
+    fn kept_whole(self) -> Self {
+        const KEPT: &str =
+            "the database file is whole, so it is kept and the next start tries again";
+        match self {
+            Self::Open(m) => Self::Open(format!("{m}; {KEPT}")),
+            Self::Migrate(m) => Self::Migrate(format!("{m}; {KEPT}")),
+            other => other,
         }
     }
 
@@ -756,6 +791,7 @@ impl StateOpenFailure {
         match self {
             Self::Open(m) => Self::Open(format!("{m}; backup restore: {restore}")),
             Self::Migrate(m) => Self::Migrate(format!("{m}; backup restore: {restore}")),
+            Self::Schema(m) => Self::Schema(format!("{m}; backup restore: {restore}")),
             Self::NewerSchema(m) => Self::NewerSchema(m),
         }
     }
@@ -914,6 +950,30 @@ fn with_suffix(path: &Path, suffix: &str) -> PathBuf {
     PathBuf::from(name)
 }
 
+/// Whether SQLite reads the file at `path` as an intact database. Only a file
+/// it calls corrupt, or not a database, is damage; one it cannot read for
+/// another reason is kept rather than replaced on a guess.
+fn state_db_file_is_whole(path: &Path) -> bool {
+    use rusqlite::{ErrorCode, OpenFlags};
+    let damage = |e: &rusqlite::Error| {
+        matches!(
+            e.sqlite_error_code(),
+            Some(ErrorCode::DatabaseCorrupt | ErrorCode::NotADatabase)
+        )
+    };
+    let conn = match rusqlite::Connection::open_with_flags(
+        path,
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    ) {
+        Ok(conn) => conn,
+        Err(e) => return !damage(&e),
+    };
+    match conn.query_row("PRAGMA quick_check", [], |r| r.get::<_, String>(0)) {
+        Ok(verdict) => verdict == "ok",
+        Err(e) => !damage(&e),
+    }
+}
+
 fn open_and_migrate_state(
     path: &Path,
     retry: &RetryPolicy,
@@ -931,12 +991,12 @@ fn open_and_migrate_state(
     })?;
     let verification = runner
         .verify_schema()
-        .map_err(|e| StateOpenFailure::Migrate(format!("verify_schema: {e}")))?;
+        .map_err(|e| StateOpenFailure::Schema(format!("verify_schema: {e}")))?;
     // The verdict must actually be checked: an interrupted migration — a
     // missing table, a missing index — would otherwise report a clean start
     // and fail only on the first query.
     if !verification.is_ok() {
-        return Err(StateOpenFailure::Migrate(describe_schema_failure(
+        return Err(StateOpenFailure::Schema(describe_schema_failure(
             "state",
             &verification,
         )));
@@ -1069,7 +1129,7 @@ fn open_and_migrate_cache(
     thresholds: &FreshnessThresholds,
     retry: &RetryPolicy,
 ) -> Result<SqliteCacheStore, CacheOpenFailure> {
-    let conn = retry_io(retry, || open_connection(path))
+    let conn = retry_io(retry, || nrr_storage::open_cache_connection(path))
         .map_err(|e| CacheOpenFailure::Other(e.to_string()))?;
     let runner = SqliteMigrationRunner::for_cache_db(conn);
     runner.run_pending_migrations().map_err(|e| match e {
@@ -1191,6 +1251,16 @@ mod tests {
                 phases::IPC_START,
                 phases::RUNTIME_LOOP_START,
             ]
+        );
+    }
+
+    #[test]
+    fn a_whole_current_state_db_is_usable() {
+        let (_dir, cfg) = temp_profile();
+        let artifacts = bootstrap(&cfg);
+        assert_eq!(
+            artifacts.usable_state_db(),
+            Some(artifacts.topology.state_db_path.as_path())
         );
     }
 
@@ -1388,6 +1458,54 @@ mod tests {
         assert_eq!(parked, 0, "nothing is left parked once it is put back");
     }
 
+    /// A migration that fails on a database whose file is whole (a full disk,
+    /// a busy lock, a step the user's rows do not fit) is not damage: the newest
+    /// rules are in that file, and an older backup in its place would lose them.
+    /// The start waits for the next attempt instead.
+    #[test]
+    fn a_migration_that_fails_on_a_whole_database_does_not_trade_it_for_a_backup() {
+        let (_dir, cfg) = temp_profile();
+        let first = bootstrap(&cfg);
+        let topology = first.topology.clone();
+        drop(first);
+        std::fs::create_dir_all(&topology.backup_dir).expect("backup dir");
+        nrr_storage::backup_database(
+            &topology.state_db_path,
+            &topology.backup_dir,
+            &nrr_storage::BackupReason::ManualExport,
+        )
+        .expect("backup");
+        {
+            let conn = rusqlite::Connection::open(&topology.state_db_path).expect("open");
+            // The step is run again over columns it already added and fails;
+            // the file itself is intact, with everything written after the backup.
+            conn.execute("DELETE FROM schema_migrations WHERE version = 83", [])
+                .expect("forget one step");
+        }
+
+        let second = bootstrap(&cfg);
+        assert!(!second.is_ready_to_run(), "report = {:?}", second.report);
+        drop(second);
+        let parked = std::fs::read_dir(&topology.backup_dir)
+            .expect("read backups")
+            .flatten()
+            .filter(|e| e.file_name().to_string_lossy().contains(".damaged-"))
+            .count();
+        assert_eq!(
+            parked, 0,
+            "the whole database was traded for an older backup"
+        );
+        let conn = rusqlite::Connection::open(&topology.state_db_path).expect("reopen");
+        let steps: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM schema_migrations WHERE version = 83",
+                [],
+                |r| r.get(0),
+            )
+            .expect("count");
+        assert_eq!(steps, 0, "the database is left as it was");
+    }
+
     /// A database a newer build wrote is not damaged: no backup replaces it,
     /// or a rollback to an older build would quietly undo every later change.
     #[test]
@@ -1414,6 +1532,11 @@ mod tests {
 
         let second = bootstrap(&cfg);
         assert!(!second.is_ready_to_run());
+        assert_eq!(
+            second.usable_state_db(),
+            None,
+            "the service builds nothing on a database it cannot read"
+        );
         drop(second);
         let conn = rusqlite::Connection::open(&topology.state_db_path).expect("reopen");
         let newest: i64 = conn

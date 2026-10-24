@@ -21,6 +21,7 @@ use crate::view::ScreenView;
 #[cfg(test)]
 pub use status::state_word_keys;
 pub use status::{connection_lines, recovery_hints};
+pub(crate) use status::{revision_rejected, track_policy_idle, vpn_split};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ScreenId {
@@ -198,6 +199,12 @@ pub trait Screen {
     /// Whether a text field has the focus, so a paste can go into it.
     fn text_target(&self, _app: &AppState) -> crate::paste::TextTarget {
         crate::paste::TextTarget::None
+    }
+
+    /// A paste into a field that takes lines, taken whole; `true` when used.
+    /// Otherwise the paste is typed key by key.
+    fn on_paste(&self, _app: &mut AppState, _pasted: &str) -> bool {
+        false
     }
 
     /// A key for the screen; `true` when it was used.

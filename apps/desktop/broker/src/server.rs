@@ -150,13 +150,25 @@ fn broker_log_path() -> Option<PathBuf> {
 
 /// Creates `dir` if needed, checking before and after that no component is a
 /// link and that our own directories are owned by SYSTEM or Administrators.
+///
+/// Only the last component is ever created, under a parent that already
+/// exists: a missing ancestor could be claimed as a junction between the
+/// check and the create, and the elevated create would follow it.
 fn prepare_trusted_log_dir(dir: &Path, owned_from: &Path) -> Result<(), String> {
+    let parent = dir.parent().unwrap_or(dir);
+    if let Some(reason) = log_dir_refusal(parent, owned_from, false, probe_log_path) {
+        return Err(reason);
+    }
     if let Some(reason) = log_dir_refusal(dir, owned_from, true, probe_log_path) {
         return Err(reason);
     }
-    std::fs::create_dir_all(dir).map_err(|e| format!("create {}: {e}", dir.display()))?;
-    // Again after creating: a missing directory could have been claimed by
-    // the user between the check and the create.
+    match std::fs::create_dir(dir) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+        Err(e) => return Err(format!("create {}: {e}", dir.display())),
+    }
+    // Again after creating: the leaf could have been claimed by the user
+    // between the check and the create.
     if let Some(reason) = log_dir_refusal(dir, owned_from, false, probe_log_path) {
         return Err(reason);
     }
@@ -304,28 +316,33 @@ fn check_service_binary(candidate: &Path, broker_dir: Option<&Path>) -> Result<(
     Ok(())
 }
 
-/// Whether two paths name the same directory.
+/// Whether the client's `hint` spells our own directory `own`.
 ///
-/// String equality is wrong here and refused every legitimate request: the
-/// caller is Qt, which spells paths with `/`, while this process derives its
-/// own directory from Windows with `\`. Canonicalising both is also the
-/// stricter check — it resolves `..`, short names and links before comparing,
-/// so nothing can dress up a foreign directory as this one. The separator
-/// fallback keeps a directory that cannot be canonicalised (removed, no rights)
-/// from being silently accepted on a technicality.
-fn same_directory(left: &Path, right: &Path) -> bool {
-    if let (Ok(left), Ok(right)) = (std::fs::canonicalize(left), std::fs::canonicalize(right)) {
-        return left == right;
+/// Compared as text: the hint is never opened, so a UNC or pipe path cannot
+/// make the elevated broker connect anywhere. Only our own directory is
+/// resolved on disk, for a caller that spells it canonically.
+fn same_directory(hint: &Path, own: &Path) -> bool {
+    let hint = normalised_dir(hint);
+    if hint == normalised_dir(own) {
+        return true;
     }
-    normalised_dir(left) == normalised_dir(right)
+    std::fs::canonicalize(own).is_ok_and(|resolved| normalised_dir(&resolved) == hint)
 }
 
-/// Comparable spelling of a directory: one separator, no trailing one, and —
-/// on Windows, where the file system is case-insensitive — one case.
+/// Comparable spelling of a directory: one separator, no trailing one, no
+/// verbatim prefix, and — on Windows, where the file system is
+/// case-insensitive — one case.
 fn normalised_dir(path: &Path) -> String {
     let text = path.to_string_lossy();
     let unified = if cfg!(windows) {
-        text.replace('/', "\\")
+        let text = text.replace('/', "\\");
+        if let Some(unc) = text.strip_prefix(r"\\?\UNC\") {
+            format!(r"\\{unc}")
+        } else if let Some(local) = text.strip_prefix(r"\\?\") {
+            local.to_owned()
+        } else {
+            text
+        }
     } else {
         text.into_owned()
     };
@@ -822,6 +839,29 @@ install failed: no PROGRAMDATA
         assert!(check_service_binary(&candidate, Some(&broker_dir)).is_ok());
     }
 
+    /// The hint is compared as text, never resolved on disk: a spelling that
+    /// only the file system would equate with ours (here `..`) is refused,
+    /// which is what keeps a UNC or pipe hint from being opened elevated.
+    #[test]
+    fn the_hint_is_never_resolved_on_disk() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        fs::create_dir(dir.path().join("sub")).expect("sub dir");
+        let roundabout = dir.path().join("sub").join("..").join(service_name());
+        let err = check_service_binary(&roundabout, Some(dir.path())).expect_err("must refuse");
+        assert!(err.contains("must sit next to"), "{err}");
+        let unc = Path::new(r"\\attacker.example\share").join(service_name());
+        assert!(check_service_binary(&unc, Some(dir.path())).is_err());
+    }
+
+    /// Our own directory may be resolved: a caller spelling it canonically,
+    /// verbatim prefix and all, still agrees.
+    #[test]
+    fn our_own_directory_spelled_canonically_is_accepted() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let canonical = fs::canonicalize(dir.path()).expect("canonical");
+        assert!(check_service_binary(&canonical.join(service_name()), Some(dir.path())).is_ok());
+    }
+
     #[test]
     fn an_unknown_install_directory_refuses_even_the_right_name() {
         let candidate = Path::new("C:/anywhere").join(service_name());
@@ -986,6 +1026,20 @@ install failed: no PROGRAMDATA
         assert!(
             refused.is_err(),
             "a directory an ordinary account owns must not take elevated writes"
+        );
+    }
+
+    /// A missing ancestor is never created: between a check and an elevated
+    /// `create_dir_all` the user could have planted it as a junction.
+    #[test]
+    fn a_missing_parent_of_the_log_directory_is_not_created() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let product = dir.path().join("NetRuleRouter");
+        let refused = super::prepare_trusted_log_dir(&product.join("logs"), &product);
+        assert!(refused.is_err(), "nothing to log into without the parent");
+        assert!(
+            !product.exists(),
+            "the elevated broker created a missing ancestor"
         );
     }
 

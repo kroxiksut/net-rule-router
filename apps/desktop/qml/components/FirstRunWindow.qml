@@ -143,15 +143,64 @@ Window {
     function _applyProtectionChoices() {
         if (_protectionApplied) return
         _protectionApplied = true
-        if (root.routePolicyController) {
-            root.routePolicyController.applyFirstRunProtections(leakProtectionChoice, wantDohLockdown)
-        }
         if (wantBlockNoticesMuted) {
             root.commitPrefs({ notifyBlockNotices: false })
         }
         if (wantTrayAutostart && root.supports("autostart")) {
             root.setAutostartEnabled(true)
         }
+        _seedProtection()
+        // Until the service answers, a user already set up cannot be told
+        // from a new one: the write waits for its first policy read.
+        if (!_protectionSeeded) {
+            _serviceWritePending = true
+            return
+        }
+        _writeServiceChoices()
+    }
+
+    // A user already set up (in the terminal, say) starts from what the
+    // service holds and keeps it unless a choice changes here, as the
+    // terminal setup does. Taken once, from the first policy read; a choice
+    // the user made before it stands.
+    readonly property bool servicePolicyKnown: root._servicePolicyRead === true
+    property var _heldProtection: null
+    property bool _protectionSeeded: false
+    property bool _protectionTouched: false
+    property bool _stabilityTouched: false
+    property bool _serviceWritePending: false
+    onServicePolicyKnownChanged: {
+        _seedProtection()
+        if (_serviceWritePending && _protectionSeeded) _writeServiceChoices()
+    }
+
+    function chooseLeakProtection(level) {
+        _protectionTouched = true
+        wantLeakProtection = level
+    }
+
+    function _seedProtection() {
+        if (_protectionSeeded || !servicePolicyKnown) return
+        _protectionSeeded = true
+        var rp = root._serviceRoutePolicy
+        var policy = rp || {}
+        _heldProtection = Pure.firstRunHeldProtection(!!rp,
+            defaultRoute, String(policy["leak-protection"] || ""),
+            policy["doh-lockdown-auto"] === true, policy["doh-lockdown-enabled"] === true)
+        if (_heldProtection && !_protectionTouched) {
+            wantLeakProtection = _heldProtection.level
+            wantDohLockdown = _heldProtection.doh
+        }
+    }
+
+    function _writeServiceChoices() {
+        _serviceWritePending = false
+        var writes = Pure.firstRunWrites(_heldProtection, leakProtectionChoice, wantDohLockdown,
+            _stabilityTouched)
+        if (writes.protection && root.routePolicyController) {
+            root.routePolicyController.applyFirstRunProtections(leakProtectionChoice, wantDohLockdown)
+        }
+        if (!writes.stability) return
         var patch = { "fake-ip-enabled": wantFakeIp }
         if (wantDiagnosticLogs) {
             patch["verbose-logging-change"] = diagnosticLogsDuration
@@ -227,6 +276,7 @@ Window {
             root.centerChildWindow(firstRunWindow)
             root.applyTitleBarTo(firstRunWindow)
             _detectCountryPreset()
+            _seedProtection()
             pickedPrimaryPath = ""
             pickedSecondaryPath = ""
             // The adapter list is what the main-connection question offers; the
@@ -767,7 +817,7 @@ Window {
                         text: root.tr("settings.routing.leak-protection.option-off", "Off")
                             + " — " + root.tr("settings.routing.leak-protection.note-off",
                                 "If the additional connection drops, traffic continues over your main connection.")
-                        onToggled: if (checked) firstRunWindow.wantLeakProtection = "off"
+                        onToggled: if (checked) firstRunWindow.chooseLeakProtection("off")
                     }
                     ThemedRadioButton {
                         theme: root.uiTheme
@@ -776,8 +826,8 @@ Window {
                         checked: firstRunWindow.leakProtectionChoice === "sites"
                         text: root.tr("settings.routing.leak-protection.option-sites", "Routed sites")
                             + " — " + root.tr("settings.routing.leak-protection.note-sites",
-                                "What your rules send through the additional connection never goes out the main one. Everything else keeps working.")
-                        onToggled: if (checked) firstRunWindow.wantLeakProtection = "sites"
+                                "What your rules send through the additional connection never goes out the main one while strict blocking of shared addresses is on, as it is by default. Everything else keeps working, except sites that share an address with a routed one.")
+                        onToggled: if (checked) firstRunWindow.chooseLeakProtection("sites")
                     }
                     ThemedRadioButton {
                         theme: root.uiTheme
@@ -786,7 +836,7 @@ Window {
                         text: root.tr("settings.routing.leak-protection.option-everything", "Everything")
                             + " — " + root.tr("settings.routing.leak-protection.note-everything",
                                 "Nothing leaves except through the additional connection, your local network and what your rules send over the main connection. If the additional connection drops, the internet waits until it returns.")
-                        onToggled: if (checked) firstRunWindow.wantLeakProtection = "everything"
+                        onToggled: if (checked) firstRunWindow.chooseLeakProtection("everything")
                     }
                 }
                 Label {
@@ -813,7 +863,10 @@ Window {
                         wrapMode: Text.WordWrap
                         verticalAlignment: Text.AlignVCenter
                     }
-                    onToggled: firstRunWindow.wantDohLockdown = checked
+                    onToggled: {
+                        firstRunWindow._protectionTouched = true
+                        firstRunWindow.wantDohLockdown = checked
+                    }
                 }
                 CheckBox {
                     id: firstRunFakeIpCheck
@@ -829,7 +882,10 @@ Window {
                         wrapMode: Text.WordWrap
                         verticalAlignment: Text.AlignVCenter
                     }
-                    onToggled: firstRunWindow.wantFakeIp = checked
+                    onToggled: {
+                        firstRunWindow._stabilityTouched = true
+                        firstRunWindow.wantFakeIp = checked
+                    }
                 }
                 CheckBox {
                     id: firstRunDiagLogsCheck
@@ -845,7 +901,10 @@ Window {
                         wrapMode: Text.WordWrap
                         verticalAlignment: Text.AlignVCenter
                     }
-                    onToggled: firstRunWindow.wantDiagnosticLogs = checked
+                    onToggled: {
+                        firstRunWindow._stabilityTouched = true
+                        firstRunWindow.wantDiagnosticLogs = checked
+                    }
                 }
                 RowLayout {
                     Layout.fillWidth: true
@@ -866,6 +925,7 @@ Window {
                         currentIndex: options.indexOf(firstRunWindow.diagnosticLogsDuration)
                         displayText: firstRunWindow.root.verboseLoggingChangeLabel(firstRunWindow.diagnosticLogsDuration)
                         onActivated: function(index) {
+                            firstRunWindow._stabilityTouched = true
                             firstRunWindow.diagnosticLogsDuration = options[index]
                         }
                         Accessible.name: firstRunWindow.root.tr(

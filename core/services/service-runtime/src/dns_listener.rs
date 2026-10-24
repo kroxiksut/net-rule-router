@@ -21,7 +21,7 @@
 //! costs that query alone.
 
 use std::collections::{HashMap, HashSet};
-use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, TcpListener, TcpStream, UdpSocket};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, TcpListener, TcpStream, UdpSocket};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc::TrySendError;
 use std::sync::{Arc, Mutex};
@@ -222,7 +222,7 @@ pub enum ListenerAction {
     Forward,
     /// a DIRECT (non-rule) host `A` query: forward
     /// upstream, then steer the reply through
-    /// [`DnsInterceptListener::steer_direct_answer`] so the client never gets
+    /// [`DnsInterceptListener::steer_parsed`] so the client never gets
     /// an address the kill-switch pins to the secondary (shared-CDN
     /// collateral). Degrades to a plain relay whenever steering has nothing
     /// to do or cannot produce a clean answer.
@@ -1402,17 +1402,21 @@ impl DnsInterceptListener {
         upstream_reply: Vec<u8>,
         budget: Duration,
     ) -> Vec<u8> {
-        let (steered, still_pinned) = self.steer_direct_answer(query, q, upstream_reply, budget);
+        // One parse of the upstream answer; every step below reads its addresses.
+        let answers = direct_answers(query, q, &upstream_reply);
+        let (steered, answers, still_pinned) =
+            self.steer_parsed(query, q, upstream_reply, answers, budget);
+        let answers = answers.as_deref();
         // under the armed block-all with
         // fake-IP active, hand the client a virtual address instead:
         // the relay carries the flow out the primary, nothing is
         // compiled on the answer path, no race to lose.
-        if let Some(fake) = self.fake_direct_response(query, q, &steered) {
+        if let Some(fake) = self.fake_direct_from(query, q, answers) {
             // Gate before answering: the app may already hold these
             // real addresses (own cache / in-app DoH) and will not
             // re-resolve, so the virtual answer never reaches it and
             // its first connect meets the armed block-all.
-            self.gate_direct_answer(query, q, &steered);
+            self.gate_direct_from(q, answers);
             return fake;
         }
         // Collateral rescue — steering could not produce a clean
@@ -1426,10 +1430,10 @@ impl DnsInterceptListener {
             // is the same with or without the fake-IP stack.
             self.note_collateral_host(q);
             if !self.companion_is_pending(q) {
-                if let Some(fake) = self.fake_collateral_response(query, q, &steered) {
+                if let Some(fake) = self.fake_collateral_from(query, q, answers) {
                     // Same reason as above: a cached real address
                     // bypasses the virtual answer entirely.
-                    self.gate_direct_answer(query, q, &steered);
+                    self.gate_direct_from(q, answers);
                     return fake;
                 }
             }
@@ -1438,7 +1442,7 @@ impl DnsInterceptListener {
         // known-direct exemption BEFORE the client learns these
         // addresses (its first connect would otherwise race
         // the catch-all and be dropped with no retry).
-        self.gate_direct_answer(query, q, &steered);
+        self.gate_direct_from(q, answers);
         steered
     }
 
@@ -1456,6 +1460,7 @@ impl DnsInterceptListener {
     /// "this reply still carries nothing but secondary-pinned addresses" — so
     /// the caller can offer the host to the collateral fake-IP rescue instead
     /// of relaying an answer that egresses the wrong link.
+    #[cfg(test)]
     fn steer_direct_answer(
         &self,
         query: &[u8],
@@ -1463,16 +1468,30 @@ impl DnsInterceptListener {
         reply: Vec<u8>,
         budget: Duration,
     ) -> (Vec<u8>, bool) {
+        let answers = direct_answers(query, q, &reply);
+        let (reply, _, still_pinned) = self.steer_parsed(query, q, reply, answers, budget);
+        (reply, still_pinned)
+    }
+
+    /// The steering above over an answer already parsed into
+    /// `answers`; hands back the addresses of the reply it returns, so the
+    /// fake-IP and gate steps never parse it again.
+    fn steer_parsed(
+        &self,
+        query: &[u8],
+        q: &ParsedQuestion,
+        reply: Vec<u8>,
+        answers: Option<Vec<IpAddr>>,
+        budget: Duration,
+    ) -> (Vec<u8>, Option<Vec<IpAddr>>, bool) {
+        // NXDOMAIN / error / truncated / mismatch → relay as-is
+        let Some(addresses) = answers else {
+            return (reply, None, false);
+        };
         let owned = self.secondary_owned.secondary_owned_ips();
         if owned.is_empty() {
-            return (reply, false);
+            return (reply, Some(addresses), false);
         }
-        let id = u16::from_be_bytes([query[0], query[1]]);
-        let AddressResponseOutcome::Answers { addresses, .. } =
-            parse_address_response(id, &q.qname, QTYPE_A, &reply)
-        else {
-            return (reply, false); // NXDOMAIN / error / truncated / mismatch → relay as-is
-        };
         let answered = only_v4(&addresses);
         let clean: Vec<Ipv4Addr> = answered
             .iter()
@@ -1480,7 +1499,7 @@ impl DnsInterceptListener {
             .filter(|ip| !owned.contains(ip))
             .collect();
         if clean.len() == answered.len() {
-            return (reply, false); // nothing shared → untouched upstream answer
+            return (reply, Some(addresses), false); // nothing shared → untouched upstream answer
         }
         if !clean.is_empty() {
             tracing::debug!(
@@ -1490,23 +1509,21 @@ impl DnsInterceptListener {
                 kept = clean.len(),
                 "Mode B: steered a direct-host answer away from secondary-pinned addresses",
             );
-            return (
-                build_a_response(query, &clean, self.response_ttl).unwrap_or(reply),
-                false,
-            );
+            return match build_a_response(query, &clean, self.response_ttl) {
+                Some(rebuilt) => (rebuilt, Some(v4_addresses(&clean)), false),
+                None => (reply, Some(addresses), false),
+            };
         }
         // Every address lies in a network the user routes over the additional
         // link: the rule asked for this host, so there is no co-tenant to
         // rescue and no re-query worth its round trip.
         if answered.iter().all(|ip| owned.owned_by_network_only(ip)) {
-            return (reply, false);
+            return (reply, Some(addresses), false);
         }
         // Whole answer pinned — try ONE fresh upstream answer (pools rotate).
         if let Some(retry) = self.forward_within(query, budget, Transport::Udp) {
-            if let AddressResponseOutcome::Answers { addresses, .. } =
-                parse_address_response(id, &q.qname, QTYPE_A, &retry)
-            {
-                let clean: Vec<Ipv4Addr> = only_v4(&addresses)
+            if let Some(retried) = direct_answers(query, q, &retry) {
+                let clean: Vec<Ipv4Addr> = only_v4(&retried)
                     .into_iter()
                     .filter(|ip| !owned.contains(ip))
                     .collect();
@@ -1517,10 +1534,10 @@ impl DnsInterceptListener {
                         kept = clean.len(),
                         "Mode B: direct-host answer fully pinned — re-query yielded clean addresses",
                     );
-                    return (
-                        build_a_response(query, &clean, self.response_ttl).unwrap_or(reply),
-                        false,
-                    );
+                    return match build_a_response(query, &clean, self.response_ttl) {
+                        Some(rebuilt) => (rebuilt, Some(v4_addresses(&clean)), false),
+                        None => (reply, Some(addresses), false),
+                    };
                 }
             }
         }
@@ -1529,7 +1546,7 @@ impl DnsInterceptListener {
             host = %q.qname,
             "Mode B: direct-host answer fully secondary-pinned even after re-query — relaying unchanged (fail-open; smart kill-switch covers)",
         );
-        (reply, true)
+        (reply, Some(addresses), true)
     }
 
     /// hand the FINAL direct-host answer's addresses to the
@@ -1540,15 +1557,9 @@ impl DnsInterceptListener {
     /// additionally subtracts secondary-destined IPs (defense in depth for the
     /// fully-pinned fail-open path). Parse failures are a silent no-op — the
     /// reply is relayed regardless.
-    fn gate_direct_answer(&self, query: &[u8], q: &ParsedQuestion, reply: &[u8]) {
-        let id = u16::from_be_bytes([query[0], query[1]]);
-        let AddressResponseOutcome::Answers { addresses, .. } =
-            parse_address_response(id, &q.qname, QTYPE_A, reply)
-        else {
-            return;
-        };
-        if !addresses.is_empty() {
-            self.direct_gate.gate(&q.qname, &only_v4(&addresses));
+    fn gate_direct_from(&self, q: &ParsedQuestion, answers: Option<&[IpAddr]>) {
+        if let Some(addresses) = answers.filter(|a| !a.is_empty()) {
+            self.direct_gate.gate(&q.qname, &only_v4(addresses));
         }
     }
 
@@ -1559,24 +1570,28 @@ impl DnsInterceptListener {
     /// response around the fake address. `None` on any parse failure or when
     /// the answerer declines (feature off / disarmed / exclusion / pool full)
     /// — the caller then falls back to the gate + steered-reply path.
+    #[cfg(test)]
     fn fake_direct_response(
         &self,
         query: &[u8],
         q: &ParsedQuestion,
         reply: &[u8],
     ) -> Option<Vec<u8>> {
-        let id = u16::from_be_bytes([query[0], query[1]]);
-        let AddressResponseOutcome::Answers { addresses, .. } =
-            parse_address_response(id, &q.qname, QTYPE_A, reply)
-        else {
-            return None; // NXDOMAIN / error / truncated → not ours to rewrite
-        };
-        if addresses.is_empty() {
-            return None;
-        }
+        let answers = direct_answers(query, q, reply);
+        self.fake_direct_from(query, q, answers.as_deref())
+    }
+
+    fn fake_direct_from(
+        &self,
+        query: &[u8],
+        q: &ParsedQuestion,
+        answers: Option<&[IpAddr]>,
+    ) -> Option<Vec<u8>> {
+        // NXDOMAIN / error / truncated → not ours to rewrite
+        let addresses = answers.filter(|a| !a.is_empty())?;
         let fake = self
             .direct_fake
-            .fake_direct_answer(&q.qname, &only_v4(&addresses))?;
+            .fake_direct_answer(&q.qname, &only_v4(addresses))?;
         let resp = build_a_response(query, &fake, self.response_ttl)?;
         tracing::debug!(
             target: "nrr::dns-resolver",
@@ -1622,24 +1637,27 @@ impl DnsInterceptListener {
         true
     }
 
+    #[cfg(test)]
     fn fake_collateral_response(
         &self,
         query: &[u8],
         q: &ParsedQuestion,
         reply: &[u8],
     ) -> Option<Vec<u8>> {
-        let id = u16::from_be_bytes([query[0], query[1]]);
-        let AddressResponseOutcome::Answers { addresses, .. } =
-            parse_address_response(id, &q.qname, QTYPE_A, reply)
-        else {
-            return None;
-        };
-        if addresses.is_empty() {
-            return None;
-        }
+        let answers = direct_answers(query, q, reply);
+        self.fake_collateral_from(query, q, answers.as_deref())
+    }
+
+    fn fake_collateral_from(
+        &self,
+        query: &[u8],
+        q: &ParsedQuestion,
+        answers: Option<&[IpAddr]>,
+    ) -> Option<Vec<u8>> {
+        let addresses = answers.filter(|a| !a.is_empty())?;
         let fake = self
             .collateral_fake
-            .fake_direct_answer(&q.qname, &only_v4(&addresses))?;
+            .fake_direct_answer(&q.qname, &only_v4(addresses))?;
         let resp = build_a_response(query, &fake, self.response_ttl)?;
         tracing::info!(
             target: "nrr::dns-resolver",
@@ -1818,10 +1836,19 @@ impl DnsInterceptListener {
     /// client's stub resolver, so an accepted forgery poisons the OS cache and,
     /// through it, the rule host cache that routes and pins are derived from.
     fn forward_to(&self, query: &[u8], upstream: SocketAddr, window: Duration) -> Option<Vec<u8>> {
-        let sock = UdpSocket::bind(unspecified_for(upstream)).ok()?;
-        nrr_platform_api::own_traffic::mark_own_socket(&sock);
-        sock.set_read_timeout(Some(window)).ok()?;
-        sock.connect(upstream).ok()?;
+        let key = crate::dns_upstream_sockets::UpstreamKey {
+            bind: None,
+            server: upstream,
+        };
+        let lease = crate::dns_upstream_sockets::shared()
+            .checkout(key, || -> std::io::Result<UdpSocket> {
+                let sock = UdpSocket::bind(unspecified_for(upstream))?;
+                nrr_platform_api::own_traffic::mark_own_socket(&sock);
+                sock.connect(upstream)?;
+                Ok(sock)
+            })
+            .ok()?;
+        let sock = lease.socket();
         sock.send(query).ok()?;
         let mut buf = [0u8; DNS_DATAGRAM_BUFFER_BYTES];
         let started = std::time::Instant::now();
@@ -1833,7 +1860,9 @@ impl DnsInterceptListener {
             sock.set_read_timeout(Some(remaining)).ok()?;
             let n = sock.recv(&mut buf).ok()?;
             if reply_answers_query(query, &buf[..n]) {
-                return Some(buf[..n].to_vec());
+                let reply = buf[..n].to_vec();
+                lease.release();
+                return Some(reply);
             }
             // A late reply to an earlier query, or noise the kernel could not
             // filter. Keep waiting for ours rather than relaying somebody
@@ -1945,9 +1974,13 @@ fn reply_answers_query(query: &[u8], reply: &[u8]) -> bool {
         (Some(_), None) => {
             u16::from_be_bytes([reply[4], reply[5]]) == 0 && (reply[3] & 0x0F) != RCODE_NOERROR
         }
-        // Our own query has no readable question: there is nothing to match
-        // beyond the id and the connected socket.
-        (None, _) => true,
+        // Our own query has no readable question, so the server cannot echo a
+        // readable one: a reply that carries one answers an earlier query of
+        // the same id, whatever its rcode, and the id is the client's to repeat.
+        (None, Some(_)) => false,
+        (None, None) => {
+            u16::from_be_bytes([reply[4], reply[5]]) == 0 || (reply[3] & 0x0F) != RCODE_NOERROR
+        }
     }
 }
 
@@ -1997,6 +2030,21 @@ fn first_occurrences(servers: Vec<SocketAddr>) -> Vec<SocketAddr> {
         }
     }
     unique
+}
+
+/// The addresses of an `A` reply to `q`, or `None` when it is not an answer
+/// (NXDOMAIN, error, truncated, another question) and so is relayed as-is.
+fn direct_answers(query: &[u8], q: &ParsedQuestion, reply: &[u8]) -> Option<Vec<IpAddr>> {
+    let id = u16::from_be_bytes([query[0], query[1]]);
+    match parse_address_response(id, &q.qname, QTYPE_A, reply) {
+        AddressResponseOutcome::Answers { addresses, .. } => Some(addresses),
+        _ => None,
+    }
+}
+
+/// What parsing a reply built from `v4` would give back.
+fn v4_addresses(v4: &[Ipv4Addr]) -> Vec<IpAddr> {
+    v4.iter().copied().map(IpAddr::V4).collect()
 }
 
 #[cfg(test)]

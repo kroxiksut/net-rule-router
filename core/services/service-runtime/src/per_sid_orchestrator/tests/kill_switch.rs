@@ -102,6 +102,40 @@ fn mode_b_arms_catch_all_kill_switch() {
     );
 }
 
+/// The "internet waits for the additional connection" banner stands only while
+/// that connection is gone: the catch-all over a live tunnel is armed but holds
+/// nothing back, and the banner there said the VPN was down while it worked.
+#[test]
+fn only_a_lost_tunnel_reads_as_holding_everything() {
+    let posture = crate::app_enforcement_status::BlockAllPostureStatus::new();
+    let run = |resolution: Option<KillSwitchResolution>| {
+        let api = Arc::new(MockWindowsApi::new());
+        let session =
+            Arc::new(WfpSession::open(Arc::clone(&api) as Arc<dyn WindowsApiPort>).unwrap());
+        let source = Arc::new(ScriptedSource::default());
+        let rules = Arc::new(ScriptedRules::default());
+        rules.set(rules_with_secondary_ip(Ipv4Addr::new(198, 51, 100, 8)));
+        source.set("S-1-5-21-A", snap_block_mode_b("Wi-Fi", "TAP"));
+        let orch = PerSidApplyOrchestrator::new(
+            session,
+            Arc::clone(&source) as Arc<dyn RoutePolicySource>,
+            Arc::clone(&rules) as Arc<dyn RulesProvider>,
+            Arc::new(MockFqdnCacheLookup::new()) as Arc<dyn FqdnCacheLookup>,
+            Arc::new(CollectAudit::default()) as Arc<dyn PerSidApplyAudit>,
+        )
+        .with_kill_switch_resolver(Arc::new(move |_, _| resolution.clone()))
+        .with_block_all_posture_status(posture.clone());
+        orch.install_for_sid("S-1-5-21-A").unwrap();
+        (posture.armed(), posture.holding_for_outage())
+    };
+    assert_eq!(
+        run(Some(full_ks_resolution())),
+        (true, false),
+        "a live tunnel"
+    );
+    assert_eq!(run(None), (true, true), "the tunnel is gone");
+}
+
 #[test]
 fn killswitch_registry_publishes_exactly_the_armed_block_ids() {
     let (api, orch, src, rules, registry) =
@@ -1543,6 +1577,51 @@ fn a_rule_address_on_the_home_network_is_not_blocked_while_the_tunnel_is_unresol
         !blocked(nas),
         "the home device is cut while the tunnel is down"
     );
+}
+
+/// Narrow beats wide in protection too: a tunnel host inside a main-link
+/// network is held while the tunnel is unresolved, and the network's other
+/// addresses are not.
+#[test]
+fn a_tunnel_host_inside_a_main_link_network_is_held_while_the_tunnel_is_unresolved() {
+    let host = Ipv4Addr::new(203, 0, 113, 5);
+    let neighbour = Ipv4Addr::new(203, 0, 113, 9);
+    let api = Arc::new(MockWindowsApi::new());
+    let session = Arc::new(WfpSession::open(Arc::clone(&api) as Arc<dyn WindowsApiPort>).unwrap());
+    let src = Arc::new(ScriptedSource::default());
+    let rules = Arc::new(ScriptedRules::default());
+    let cache = Arc::new(MockFqdnCacheLookup::new());
+    cache.set_ips("secret.example", vec![host]);
+    let orch = PerSidApplyOrchestrator::new(
+        session,
+        Arc::clone(&src) as Arc<dyn RoutePolicySource>,
+        Arc::clone(&rules) as Arc<dyn RulesProvider>,
+        cache,
+        Arc::new(CollectAudit::default()) as Arc<dyn PerSidApplyAudit>,
+    )
+    .with_kill_switch_resolver(Arc::new(|_, _| None));
+    let network = nrr_shared::ip_block::IpBlock::parse("203.0.113.0/24").unwrap();
+    let mut main_network = primary_ip_rule("p-net", host);
+    main_network.address_match = Some(CanonicalAddressMatch::Subnet(network));
+    let mut tunnel_host = primary_ip_rule("s-host", host);
+    tunnel_host.address_match = Some(CanonicalAddressMatch::ExactFqdn("secret.example".into()));
+    rules.set(ActiveRulesSnapshot {
+        rule_book: CanonicalRuleBook {
+            primary: CanonicalRuleSet::from_rules(vec![main_network]),
+            secondary: CanonicalRuleSet::from_rules(vec![tunnel_host]),
+        },
+    });
+    src.set("S-1-5-21-A", snap_block("Wi-Fi", "TAP"));
+
+    orch.install_for_sid("S-1-5-21-A").unwrap();
+    let filters = api.wfp_filters.lock().unwrap();
+    let blocked = |ip: Ipv4Addr| {
+        filters
+            .iter()
+            .any(|f| record_is_destination_block(f) && f.covers_v4(ip))
+    };
+    assert!(blocked(host), "the tunnel host leaks over the main link");
+    assert!(!blocked(neighbour), "the main link's network is cut");
 }
 
 fn deny_ids(api: &MockWindowsApi, denied: Ipv4Addr) -> Vec<u64> {

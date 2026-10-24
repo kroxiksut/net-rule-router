@@ -174,6 +174,11 @@ impl NetworkRouteFacts {
     /// and is honoured as written.
     #[must_use]
     pub fn keeps_host_direct(&self, rules: &CanonicalRuleSet, ip: IpAddr) -> bool {
+        // Routed into the tunnel, the tunnel's own server seals its reconnect,
+        // whatever names it.
+        if self.tunnel_servers.contains(&ip) {
+            return true;
+        }
         self.kept_direct_reason(ip).is_some()
             && !rules.rules().iter().any(|rule| {
                 rule.enabled
@@ -211,7 +216,7 @@ const FULL_TUNNEL_SHARE: u128 = 16;
 fn one_tunnels_networks(routes: &[RouteEntry], index: u32) -> Vec<IpBlock> {
     let blocks: Vec<IpBlock> = routes
         .iter()
-        .filter(|r| r.interface_index == index && is_foreign_main(r))
+        .filter(|r| r.interface_index == index && is_foreign_any_table(r))
         .filter_map(|r| IpBlock::new(r.destination, r.prefix_length))
         .filter(|b| is_unicast(*b))
         .collect();
@@ -257,6 +262,18 @@ fn addresses_in_prefix(prefix: u8, v4: bool) -> u128 {
 /// A route the system or another program installed in the main table.
 fn is_foreign_main(route: &RouteEntry) -> bool {
     route.table == RouteTableRef::Main && !route.is_ours && !is_owned_route(route)
+}
+
+/// The kernel's table of local and broadcast addresses (Linux `local`).
+const LOCAL_ADDRESS_TABLE: u32 = 255;
+
+/// [`is_foreign_main`] in any table but the kernel's local one: a VPN client
+/// may keep every route of its own in a table of its own (Tailscale's 52,
+/// wg-quick's `Table=`), reached by a rule of its own.
+fn is_foreign_any_table(route: &RouteEntry) -> bool {
+    route.table != RouteTableRef::Tagged(LOCAL_ADDRESS_TABLE)
+        && !route.is_ours
+        && !is_owned_route(route)
 }
 
 /// For each own address of each adapter, the narrowest on-link route holding

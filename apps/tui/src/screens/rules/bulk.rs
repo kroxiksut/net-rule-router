@@ -31,9 +31,10 @@ const ROWS_SHOWN: usize = 8;
 const TEXT_SHOWN: usize = 5;
 /// Verdicts kept between keystrokes before the cache starts over.
 const VERDICT_CACHE: usize = 5000;
-/// What the field takes; typing or pasting past it is ignored. The planner
-/// reads far less, and keeps the rest in the field.
-const TEXT_MAX: usize = 1024 * 1024;
+/// What the field takes, in bytes; typing past it is ignored, a paste stops at
+/// the last whole line that fits. The planner reads far less, and keeps the
+/// rest in the field.
+pub(super) const TEXT_MAX: usize = 1024 * 1024;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum BulkField {
@@ -223,6 +224,28 @@ impl BulkForm {
         if self.text.len() < TEXT_MAX {
             self.text.push(c);
         }
+    }
+
+    /// A paste into the text, whole: lines are taken while they fit the field
+    /// and the preview is read once. Returns how many non-empty lines did not
+    /// fit; none is cut in the middle.
+    pub fn paste(&mut self, pasted: &str) -> usize {
+        let pasted = pasted.replace("\r\n", "\n").replace('\r', "\n");
+        let mut left = 0usize;
+        for (at, line) in pasted.split('\n').enumerate() {
+            let line: String = line.chars().filter(|c| !c.is_control()).collect();
+            let need = line.len() + usize::from(at > 0);
+            if left > 0 || self.text.len() + need > TEXT_MAX {
+                left += usize::from(!line.trim().is_empty());
+                continue;
+            }
+            if at > 0 {
+                self.text.push('\n');
+            }
+            self.text.push_str(&line);
+        }
+        self.replan();
+        left
     }
 }
 

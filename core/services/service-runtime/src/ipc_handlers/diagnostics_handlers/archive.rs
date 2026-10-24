@@ -203,7 +203,7 @@ impl DiagnosticsExportArchiveHandler {
         // current cached snapshot rather than forcing a synchronous
         // re-enumeration, keeping export latency independent of adapter
         // enumeration cost.
-        let adapters_snapshot = Some(self.adapters.adapters_snapshot(false));
+        let adapters_snapshot = Some(self.adapters.adapters_snapshot_for(false, caller_sid));
         DiagnosticArchiveHealthEnrichmentDto {
             behavior_mode,
             state_schema_version: self.state_schema_version,

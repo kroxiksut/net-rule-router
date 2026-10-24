@@ -377,6 +377,8 @@ check_doubled_words
 check_public_docs_terms
 cyan "[check] panic strategy: panics unwind"
 check_panic_strategy
+cyan "[check] maintainer scripts: an upgrade brings a failed unit back"
+sh "$script_dir/tests/maintainer/run.sh"
 
 if [ "$comment_hygiene_only" -eq 1 ]; then
   green "[check] comment hygiene only: passed"
@@ -465,6 +467,15 @@ else
     export CARGO_HOME="$local_cargo_home"
     cargo-deny check advisories licenses bans sources
   )
+fi
+
+# A parser API change must not break a fuzz target unnoticed until the next
+# soak. Compile only, never run, and only where nightly is already present.
+if rustup run nightly cargo --version >/dev/null 2>&1; then
+  cyan "[check] fuzz targets compile: cargo +nightly check --manifest-path fuzz/Cargo.toml --bins"
+  cargo +nightly check --manifest-path "$repo_root/fuzz/Cargo.toml" --bins
+else
+  yellow "[check] nightly toolchain absent: fuzz targets not compiled"
 fi
 
 # Opt-in: the parsers of bytes another party shapes, each under libFuzzer for

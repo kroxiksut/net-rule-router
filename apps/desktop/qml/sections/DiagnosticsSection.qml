@@ -854,6 +854,7 @@ ScrollView {
                     Item { Layout.fillWidth: true }
                 }
                 ThemedTextField {
+                    accessibleLabel: root.tr("diag.archive.path-label", "Last exported archive")
                     theme: root.uiTheme
                     Layout.fillWidth: true
                     // Read-only but enabled so the path stays selectable/copyable.
@@ -884,8 +885,7 @@ ScrollView {
                         text: root.tr("action.open-folder", "Open folder")
                         onClicked: {
                             if (section._exportArchiveDir === "") return
-                            Pure.openExternalUrl(
-                                "file:///" + section._exportArchiveDir.replace(/\\/g, "/"))
+                            root.openOwnFolder(Pure.localFolderUrl(section._exportArchiveDir))
                         }
                     }
                     Label {

@@ -59,8 +59,8 @@ pub struct NetworkPieces {
     /// The blocks its filters carry, in address order per rule block.
     pub pieces: Vec<IpBlock>,
     /// `Some(n)` when carving would have needed more than
-    /// [`NETWORK_PIECE_CAP`] pieces: the rule then covers its own blocks
-    /// uncarved and narrower rules inside it lose to it.
+    /// [`NETWORK_PIECE_CAP`] pieces: the rule is then skipped (no pieces), as
+    /// covering its blocks uncarved would widen it over the narrower rules.
     pub over_cap: Option<usize>,
 }
 
@@ -133,10 +133,9 @@ impl NetworkCarving {
         for block in &blocks {
             let holes = self.holes(*block, link, action);
             if !carve(*block, &holes, &mut pieces, NETWORK_PIECE_CAP) {
-                let needed = pieces.len();
                 return NetworkPieces {
-                    pieces: blocks,
-                    over_cap: Some(needed),
+                    pieces: Vec::new(),
+                    over_cap: Some(pieces.len()),
                 };
             }
         }

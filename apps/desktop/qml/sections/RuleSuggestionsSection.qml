@@ -670,7 +670,7 @@ ColumnLayout {
                         : (section.visibleCheckedState === 2 ? Qt.PartiallyChecked : Qt.Unchecked)
                     onClicked: section._toggleSelectAllVisible()
                     Accessible.role: Accessible.CheckBox
-                    Accessible.name: root.tr("rules.suggestions.inbox.select-all", "Select all")
+                    Accessible.name: root.tr("action.select-all", "Select all")
                     ToolTip.visible: hovered
                     ToolTip.delay: 400
                     ToolTip.text: root.tr("rules.suggestions.inbox.select-all-tooltip",
@@ -678,7 +678,7 @@ ColumnLayout {
                 }
                 Label {
                     anchors.verticalCenter: parent.verticalCenter
-                    text: root.tr("rules.suggestions.inbox.select-all", "Select all")
+                    text: root.tr("action.select-all", "Select all")
                     color: root.textColor
                 }
             }

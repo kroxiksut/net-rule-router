@@ -79,7 +79,9 @@ ColumnLayout {
             : root.tr("settings.vpn-gateways.system", "built into the system")) + ")"
     }
     function removeGateway(address) {
-        root._writeVpnGateways(Pure.vpnGatewaysRemoved(root.confirmedVpnGateways || [], address), function() {
+        root._writeVpnGateways(function(existing) {
+            return Pure.vpnGatewaysRemoved(existing, address)
+        }, function() {
             panel._confirmingGateway = ""
             root.statusLine = root.tr("settings.vpn-gateways.removed-status",
                 "The VPN server {address} is no longer let through.")

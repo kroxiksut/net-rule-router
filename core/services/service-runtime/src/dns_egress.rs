@@ -21,14 +21,12 @@
 //! degraded-but-working answer wins; the caller can see which path was used in
 //! the trace.
 //!
-//! The fallback is also PER QUERY: only the
-//! first attempt of a query rides the tunnel; every retry goes to the caller's
-//! own primary upstream. An adapter can hold its address while the tunnel
-//! behind it is dead — the dead verdict has a whole hysteresis window of lag —
-//! and during that lag a tunnel-only policy turns every resolution into a
-//! guaranteed timeout. Worse, a VPN client needs working DNS to bring the
-//! tunnel UP, so tunnel-only DNS deadlocks the very recovery it waits for.
-//! One timed-out attempt is the price of purity; the retry must deliver.
+//! A retry stays in the tunnel, at the next operator: sent to the provider, it
+//! let anyone who could delay one tunnel packet put the provider's answer back
+//! (a stub address, pinned into the tunnel, ties the user's address to the
+//! tunnel's exit). The tunnel is left only once it is judged dead: a run of
+//! failed attempts opens the breaker below, and a tunnel with no address (down,
+//! a VPN client still bringing it up) is never asked at all.
 //!
 //! ## Source binding needs a route
 //!
@@ -59,13 +57,6 @@ pub const PUBLIC_DNS_SERVERS: &[Ipv4Addr] = &[
 
 /// The DNS port every entry in [`PUBLIC_DNS_SERVERS`] is asked on.
 pub const DNS_PORT: u16 = 53;
-
-/// How many attempts of one query are sent through the secondary link before
-/// the policy steps aside and lets the retry use the caller's own primary
-/// upstream. Exactly one: the production resolvers run two attempts per
-/// query, and the second attempt is the availability guarantee — it must
-/// succeed even when the tunnel silently eats packets.
-pub const SECONDARY_ATTEMPTS_PER_QUERY: u32 = 1;
 
 /// Consecutive tunnel failures before the secondary is skipped for a while.
 ///
@@ -120,9 +111,7 @@ pub trait DnsEgressPolicy: Send + Sync {
     /// callers re-capture it periodically — so a policy carrying its own copy
     /// would answer with a stale address after a network change.
     ///
-    /// `attempt` is the zero-based retry counter of ONE query. Attempts past
-    /// [`SECONDARY_ATTEMPTS_PER_QUERY`] must fall back to the caller's own
-    /// upstream so a silently-dead tunnel costs one timeout, never the query.
+    /// `attempt` is the zero-based retry counter of ONE query.
     fn decide(&self, attempt: u32) -> Option<DnsEgress>;
 
     /// Report how an attempt this policy chose actually went.
@@ -169,13 +158,9 @@ pub struct SecondaryPreferredEgress {
     /// Consecutive failures of attempts this policy sent over the tunnel.
     consecutive_failures: AtomicU32,
     /// While set and unexpired, the tunnel is skipped: `decide` answers `None`
-    /// and the caller uses its own upstream immediately.
-    ///
-    /// This costs no privacy. The caller ALREADY falls back to its own upstream
-    /// on the next attempt — that is what `SECONDARY_ATTEMPTS_PER_QUERY = 1`
-    /// means — so the query reaches the same server either way. All the breaker
-    /// removes is the timeout in front of it, which is what makes every name on
-    /// the machine slow while the tunnel is down.
+    /// and the caller uses its own upstream immediately. The one way out of
+    /// the tunnel for an address-holding link: a dead tunnel must not make
+    /// every name on the machine time out.
     open_until: Mutex<Option<Instant>>,
     cooldown: Duration,
 }
@@ -231,14 +216,8 @@ impl SecondaryPreferredEgress {
 }
 
 impl DnsEgressPolicy for SecondaryPreferredEgress {
-    fn decide(&self, attempt: u32) -> Option<DnsEgress> {
+    fn decide(&self, _attempt: u32) -> Option<DnsEgress> {
         if !self.enabled.load(Ordering::Relaxed) || self.servers.is_empty() {
-            return None;
-        }
-        // Retries belong to the primary fallback — see the module doc. A
-        // tunnel that silently swallows the first attempt costs one timeout,
-        // not the whole resolution (and not a VPN client's bootstrap).
-        if attempt >= SECONDARY_ATTEMPTS_PER_QUERY {
             return None;
         }
         if self.skipping_tunnel() {
@@ -392,16 +371,32 @@ mod tests {
         }));
     }
 
+    /// A retry sent to the provider let anyone who delayed one tunnel packet
+    /// put the provider's answer back. It stays in the tunnel, at another
+    /// operator, until the tunnel is judged dead.
     #[test]
-    fn retries_fall_back_to_the_callers_primary_upstream() {
+    fn a_retry_stays_in_the_tunnel_until_the_tunnel_is_judged_dead() {
         let src = Ipv4Addr::new(10, 0, 0, 2);
         let p = policy(true, Some(src));
-        assert!(p.decide(0).is_some_and(|d| d.via_secondary));
-        // Every attempt past the tunnel quota is the availability guarantee:
-        // it must reach the caller's own upstream even while the adapter
-        // still holds an address on a silently-dead tunnel.
-        assert_eq!(p.decide(SECONDARY_ATTEMPTS_PER_QUERY), None);
-        assert_eq!(p.decide(SECONDARY_ATTEMPTS_PER_QUERY + 5), None);
+        let first = p.decide(0).expect("first attempt");
+        let retry = p.decide(1).expect("the retry stays in the tunnel");
+        assert!(first.via_secondary && retry.via_secondary);
+        assert_ne!(
+            first.server, retry.server,
+            "the retry asks another operator"
+        );
+        fail(&p, SECONDARY_FAILURE_THRESHOLD);
+        assert_eq!(
+            p.decide(1),
+            None,
+            "a dead tunnel is left for the caller's upstream"
+        );
+        let unbound = policy(true, None);
+        assert_eq!(
+            unbound.decide(1),
+            None,
+            "a tunnel with no address is never asked"
+        );
     }
 
     #[test]

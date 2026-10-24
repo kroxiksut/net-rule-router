@@ -65,21 +65,23 @@ impl SecondaryRouteCoordinator {
         // The tunnel's own redirect prefixes shape mode A's counter-overlay,
         // from this pass's table: a client that reconnects may lay them out
         // differently, and the reconcile that follows must answer that layout.
-        let tunnel_catch_alls = table
-            .as_ref()
-            .map(|t| crate::route_codegen::tunnel_catch_all_prefixes(t, secondary.interface_index))
-            .unwrap_or_default();
+        let tunnel_catch_alls = table.as_ref().map_or_else(
+            |_| crate::route_codegen::ASSUMED_CATCH_ALLS.to_vec(),
+            |t| crate::route_codegen::tunnel_catch_all_prefixes(t, secondary.interface_index),
+        );
         // Host routes keep off attached networks and foreign tunnels, so the
         // links are read with the table, whatever the book holds.
         let (networks, foreign) = match table {
             Ok(t) => {
                 let (facts, foreign) =
                     self.network_facts_from(sid, resolution, policy, t, adapters, false);
+                self.note_machine_read(sid, true);
                 (facts, Some(foreign))
             }
             _ => {
                 // Unreadable table: nothing is named foreign or local.
                 crate::kept_direct::forget(sid);
+                self.note_machine_read(sid, false);
                 (
                     crate::route_codegen::network_routes::NetworkRouteFacts::from_catch_alls(
                         &tunnel_catch_alls,
@@ -185,6 +187,7 @@ impl SecondaryRouteCoordinator {
         let snapshot = self.fqdn_cache.snapshot_for_compute();
         let cache = snapshot_or_live(snapshot.as_ref(), self.fqdn_cache.as_ref());
         crate::kept_direct::retain_only(served);
+        self.keep_machine_reads(served);
         let mut foreign: Vec<Vec<u32>> = Vec::with_capacity(served.len());
         let mut own_links: Vec<u32> = Vec::new();
         let mut plans: Vec<(String, Vec<RouteEntry>)> = Vec::with_capacity(served.len());
@@ -295,7 +298,9 @@ impl SecondaryRouteCoordinator {
             .as_deref()
             .ok()
             .map(|rows| crate::route_reconciler::TableReading { writes, rows });
-        let delta = self.reconciler.reconcile_seen(&merged.routes, seen)?;
+        let delta = self
+            .reconciler
+            .reconcile_seen(&merged.routes, writes, seen)?;
         if delta.is_noop() {
             tracing::debug!(
                 target: "nrr::route-coordinator",

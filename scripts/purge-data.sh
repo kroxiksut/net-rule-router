@@ -134,7 +134,8 @@ purge_path() {
   fi
 }
 
-# The state tree minus the audit directory, which a user cleanup never takes.
+# The state tree minus the audit directory, which a user cleanup never takes,
+# and the key that signs it: without the key a kept trail no longer verifies.
 purge_state_dir() {
   assert_purgeable "$NRR_STATE_DIR"
   if [ "$purge_audit" -eq 1 ]; then
@@ -151,7 +152,7 @@ purge_state_dir() {
     return
   fi
   if nrr_run_privileged find "$NRR_STATE_DIR" -mindepth 1 -maxdepth 1 \
-    ! -name audit -exec rm -rf -- {} +; then
+    ! -name audit ! -name db-mac-key.bin -exec rm -rf -- {} +; then
     nrr_green "  removed      $NRR_STATE_DIR/* (kept $NRR_AUDIT_DIR)"
     mark_removed "$NRR_STATE_DIR/* (audit kept)"
   else
@@ -271,8 +272,10 @@ if [ "$user_only" -eq 0 ]; then
 
   nrr_cyan "==> machine-wide footprint"
   purge_path "$NRR_UNIT_FILE" system
+  purge_path "$NRR_AFTER_CRASH_UNIT_FILE" system
   purge_path "$NRR_LOGROTATE_CONFIG" system
   purge_path "$NRR_POLKIT_POLICY" system
+  purge_path "$NRR_PROVISION_DIR" system
   purge_path "$NRR_SERVICE_INSTALL_DIR" system
   purge_path "$NRR_LEGACY_SERVICE_INSTALL_DIR" system
   # Only a link into the install directory is ours; a same-named program is not.

@@ -94,6 +94,7 @@ enum Note {
     Added(u32),
     Declined(u32),
     Restored(u32),
+    Forgotten(u32),
     AutoOn,
     CheckStarted(u32),
     CheckNothing,
@@ -115,6 +116,8 @@ enum Action {
     AddAnyZone,
     Never,
     Restore,
+    /// Forget the item and its answer, so it can be offered again.
+    Forget,
     /// Add, and from now on add without asking — after a yes.
     Always,
 }
@@ -145,6 +148,15 @@ pub struct Suggestions {
     sort: SortMode,
     /// The domain whose "add automatically from now on" waits for a yes.
     confirm: Option<String>,
+    /// "Forget them all" waits for a yes.
+    clearing: bool,
+    /// What the list is narrowed to, and a search being typed.
+    query: String,
+    typing: Option<String>,
+    /// Only what this site relies on, by its exact name; empty shows all.
+    consumer: String,
+    /// Groups marked for one answer to all, by [`group_key`].
+    marked: std::collections::BTreeSet<String>,
     probing: bool,
     note: Option<Note>,
     reload_hint: bool,
@@ -155,10 +167,14 @@ impl Suggestions {
     fn shown(&self) -> Vec<SuggestionGroup> {
         let merged = group_rows(&self.candidates, &self.dismissed);
         let by_status = filter_by_status(&merged, self.show_dismissed);
-        sort_groups(
-            &filter_served_by_main_link(&by_status, self.show_served),
-            self.sort,
-        )
+        let served = filter_served_by_main_link(&by_status, self.show_served);
+        let by_consumer = nrr_client_logic::auto_rules::filter_by_consumer(&served, &self.consumer);
+        let found = if self.query.is_empty() {
+            by_consumer
+        } else {
+            nrr_client_logic::auto_rules::search(&by_consumer, &self.query)
+        };
+        sort_groups(&found, self.sort)
     }
 
     /// Where the chosen group stands in `shown`; a group that has left the
@@ -231,10 +247,36 @@ impl Screen for SuggestionsScreen {
     }
 
     fn captures_keys(&self, app: &AppState) -> bool {
-        app.suggestions.confirm.is_some()
+        let s = &app.suggestions;
+        s.confirm.is_some() || s.clearing || s.typing.is_some()
     }
 
     fn on_key(&self, app: &mut AppState, key: KeyEvent) -> bool {
+        if let Some(buffer) = app.suggestions.typing.as_mut() {
+            match crate::screens::inspect::edit(buffer, key) {
+                crate::screens::inspect::Edit::Typing => {}
+                crate::screens::inspect::Edit::Done(text) => {
+                    app.suggestions.typing = None;
+                    set_query(app, &text);
+                }
+                crate::screens::inspect::Edit::Cancelled => app.suggestions.typing = None,
+            }
+            return true;
+        }
+        if app.suggestions.clearing {
+            return match key.code {
+                KeyCode::Char('y') => {
+                    forget_all(app);
+                    true
+                }
+                KeyCode::Enter | KeyCode::Esc | KeyCode::Char('n') => {
+                    app.suggestions.clearing = false;
+                    app.suggestions.note = Some(Note::Cancelled);
+                    true
+                }
+                _ => false,
+            };
+        }
         if app.suggestions.confirm.is_some() {
             return match key.code {
                 KeyCode::Char('y') => {
@@ -263,6 +305,27 @@ impl Screen for SuggestionsScreen {
     }
 
     fn on_line(&self, app: &mut AppState, line: &str) -> bool {
+        if app.suggestions.clearing {
+            match line.trim() {
+                "y" => forget_all(app),
+                "n" => {
+                    app.suggestions.clearing = false;
+                    app.suggestions.note = Some(Note::Cancelled);
+                }
+                _ => return false,
+            }
+            return true;
+        }
+        if let Some(query) = line.trim().strip_prefix('/') {
+            set_query(app, query);
+            return true;
+        }
+        if let Some(rest) = line.trim().strip_prefix('p') {
+            if rest.is_empty() || rest.starts_with(' ') {
+                set_consumer(app, rest.trim());
+                return true;
+            }
+        }
         if app.suggestions.confirm.is_some() {
             match line.trim() {
                 "y" => confirm_always(app),
@@ -277,9 +340,9 @@ impl Screen for SuggestionsScreen {
         };
         let rest = chars.as_str().trim();
         if rest.is_empty() {
-            return matches!(letter, 'c' | 's' | 'v' | 'o') && command(app, letter, 0);
+            return matches!(letter, 'c' | 's' | 'v' | 'o' | 'x') && command(app, letter, 0);
         }
-        if !matches!(letter, 'a' | 'z' | 'n' | 'r' | 'm' | 'k') {
+        if !matches!(letter, 'a' | 'z' | 'n' | 'r' | 'm' | 'k' | 'f' | '*') {
             return false;
         }
         let Ok(number) = rest.parse::<usize>() else {
@@ -304,6 +367,9 @@ impl Screen for SuggestionsScreen {
     }
 
     fn plain_prompt(&self, app: &AppState) -> Option<Key> {
+        if app.suggestions.clearing {
+            return Some(keys::CLEAR_PROMPT);
+        }
         app.suggestions
             .confirm
             .as_ref()
@@ -339,7 +405,33 @@ fn command(app: &mut AppState, letter: char, index: usize) -> bool {
         'z' => Action::AddAnyZone,
         'n' => Action::Never,
         'r' => Action::Restore,
+        'f' => Action::Forget,
         'm' => Action::Always,
+        'x' => {
+            start_clearing(app);
+            return true;
+        }
+        ' ' | '*' => {
+            toggle_mark(app, index);
+            return true;
+        }
+        'p' => {
+            let shown = app.suggestions.shown();
+            let first = shown
+                .get(index)
+                .and_then(|g| g.consumers.first())
+                .map(|c| c.hostname.clone());
+            match (app.suggestions.consumer.is_empty(), first) {
+                (false, _) => set_consumer(app, ""),
+                (true, Some(site)) => set_consumer(app, &site),
+                (true, None) => app.suggestions.note = Some(Note::NothingToDo(index + 1)),
+            }
+            return true;
+        }
+        '/' => {
+            app.suggestions.typing = Some(app.suggestions.query.clone());
+            return true;
+        }
         'c' => {
             probe(app);
             return true;
@@ -400,19 +492,31 @@ fn act(app: &mut AppState, action: Action, index: usize) {
         app.suggestions.note = Some(Note::NoItem(index + 1));
         return;
     };
-    let ids = match action {
-        Action::Restore => group.dismissed_ids.clone(),
-        _ => group.pending_ids.clone(),
+    let marked = &app.suggestions.marked;
+    let batch: Vec<SuggestionGroup> = if marked.is_empty() || action == Action::Always {
+        vec![group.clone()]
+    } else {
+        app.suggestions
+            .shown()
+            .into_iter()
+            .filter(|g| marked.contains(&group_key(g)))
+            .collect()
     };
-    let no_site = matches!(action, Action::AddAnyZone)
-        && nrr_client_logic::auto_rules::any_zone_site(&group).is_empty();
-    if ids.is_empty() || no_site {
+    let ids: Vec<String> = batch
+        .iter()
+        .flat_map(|group| ids_for(action, group))
+        .collect();
+    let any_site_missing = matches!(action, Action::AddAnyZone)
+        && batch
+            .iter()
+            .any(|g| nrr_client_logic::auto_rules::any_zone_site(g).is_empty());
+    if ids.is_empty() || any_site_missing {
         app.suggestions.note = Some(Note::NothingToDo(index + 1));
         return;
     }
     // Additions land in the caller's own rules; with the baseline on the Rules
     // screen the set written would not be the set shown.
-    if app.rules.baseline && !matches!(action, Action::Never | Action::Restore) {
+    if app.rules.baseline && !matches!(action, Action::Never | Action::Restore | Action::Forget) {
         app.suggestions.note = Some(Note::OwnRulesOnly);
         return;
     }
@@ -426,7 +530,81 @@ fn act(app: &mut AppState, action: Action, index: usize) {
         Action::AddAnyZone => app.outbox.push(accept_job(ids, true)),
         Action::Never => app.outbox.push(dismiss_job(ids)),
         Action::Restore => app.outbox.push(restore_job(ids)),
+        Action::Forget => app.outbox.push(forget_job(ids)),
     }
+    app.suggestions.marked.clear();
+}
+
+/// The ids one answer sends for a group.
+fn ids_for(action: Action, group: &SuggestionGroup) -> Vec<String> {
+    match action {
+        Action::Restore => group.dismissed_ids.clone(),
+        Action::Forget => group
+            .pending_ids
+            .iter()
+            .chain(&group.dismissed_ids)
+            .cloned()
+            .collect(),
+        _ => group.pending_ids.clone(),
+    }
+}
+
+/// Space, or `*` and a number: the item joins or leaves the marked set.
+fn toggle_mark(app: &mut AppState, index: usize) {
+    let shown = app.suggestions.shown();
+    let Some(group) = shown.get(index) else {
+        app.suggestions.note = Some(Note::NoItem(index + 1));
+        return;
+    };
+    let key = group_key(group);
+    if !app.suggestions.marked.remove(&key) {
+        app.suggestions.marked.insert(key);
+    }
+    app.suggestions.note = None;
+}
+
+/// Only what `site` relies on; an empty name shows everything again.
+fn set_consumer(app: &mut AppState, site: &str) {
+    app.suggestions.consumer = site.to_owned();
+    reselect(app);
+}
+
+/// A new search; the list starts again from its first item.
+fn set_query(app: &mut AppState, query: &str) {
+    app.suggestions.query = query.trim().to_owned();
+    reselect(app);
+}
+
+/// "Forget them all" asks first: every suggestion the service holds goes,
+/// not only what a search or a filter shows.
+fn start_clearing(app: &mut AppState) {
+    if !app.link.is_connected() {
+        app.suggestions.note = Some(Note::Offline);
+        return;
+    }
+    if all_ids(&app.suggestions).is_empty() {
+        app.suggestions.note = Some(Note::NothingToDo(0));
+        return;
+    }
+    app.suggestions.clearing = true;
+    app.suggestions.note = None;
+}
+
+fn all_ids(state: &Suggestions) -> Vec<String> {
+    group_rows(&state.candidates, &state.dismissed)
+        .into_iter()
+        .flat_map(|g| g.pending_ids.into_iter().chain(g.dismissed_ids))
+        .collect()
+}
+
+fn forget_all(app: &mut AppState) {
+    app.suggestions.clearing = false;
+    let ids = all_ids(&app.suggestions);
+    if ids.is_empty() || !app.link.is_connected() {
+        app.suggestions.note = Some(Note::Offline);
+        return;
+    }
+    app.outbox.push(forget_job(ids));
 }
 
 fn confirm_always(app: &mut AppState) {
@@ -536,6 +714,25 @@ fn accept(
         IpcOperationName::AutoRuleCandidatesAccept,
         &AutoRuleCandidatesActionRequest { ids, as_any_zone },
     )
+}
+
+fn forget_job(ids: Vec<String>) -> Job {
+    Box::new(move |client: &dyn IpcClient| {
+        let answer: Result<AutoRuleCandidatesActionResponse, _> = call(
+            client,
+            IpcOperationName::AutoRuleCandidatesForget,
+            &AutoRuleCandidatesActionRequest {
+                ids,
+                as_any_zone: false,
+            },
+        );
+        Reply::new(move |app| {
+            if let Ok(answer) = &answer {
+                app.suggestions.pending_count = answer.pending;
+            }
+            finish(app, answer.map(|a| Note::Forgotten(a.applied)));
+        })
+    })
 }
 
 fn dismiss_job(ids: Vec<String>) -> Job {
@@ -772,6 +969,32 @@ fn head_lines(app: &AppState, texts: &Texts) -> Vec<ViewLine> {
     if state.reload_hint {
         lines.push(ViewLine::text(texts.get(keys::RELOAD_PAGE)));
     }
+    if let Some(buffer) = &state.typing {
+        lines.extend(crate::screens::inspect::typing_lines(
+            texts,
+            &texts.get(keys::SEARCH),
+            buffer,
+        ));
+    } else if !state.query.is_empty() {
+        lines.push(labelled(texts.get(keys::SEARCH), state.query.clone()));
+    }
+    if !state.consumer.is_empty() {
+        lines.push(ViewLine::new(vec![Segment::strong(texts.fill(
+            keys::FILTER_ACTIVE,
+            &[("name", display_text(&state.consumer).into_owned())],
+        ))]));
+    }
+    if !state.marked.is_empty() {
+        lines.push(ViewLine::text(
+            texts.fill(keys::MARKED, &[("count", state.marked.len().to_string())]),
+        ));
+    }
+    if state.clearing {
+        lines.push(ViewLine::new(vec![Segment::strong(texts.fill(
+            keys::CLEAR_CONFIRM,
+            &[("count", all_ids(state).len().to_string())],
+        ))]));
+    }
     if let Some(domain) = &state.confirm {
         let number = state
             .shown()
@@ -812,6 +1035,7 @@ fn note_text(note: &Note, texts: &Texts) -> String {
         Note::Added(n) => count(keys::ADDED, *n),
         Note::Declined(n) => count(keys::DECLINED, *n),
         Note::Restored(n) => count(keys::RESTORED, *n),
+        Note::Forgotten(n) => count(keys::FORGOTTEN, *n),
         Note::AutoOn => texts.get(keys::AUTO_ON),
         Note::CheckStarted(n) => count(keys::CHECK_STARTED, *n),
         Note::CheckNothing => texts.get(keys::CHECK_NOTHING),
@@ -839,12 +1063,18 @@ fn list_lines(app: &AppState, texts: &Texts) -> Vec<ViewLine> {
     shown
         .iter()
         .enumerate()
-        .flat_map(|(i, group)| group_lines(group, i, focused && i == chosen, texts))
+        .flat_map(|(i, group)| {
+            let marked = state.marked.contains(&group_key(group));
+            group_lines(group, i, focused && i == chosen, marked, texts)
+        })
         .collect()
 }
 
 /// Why the list is empty, the most specific reason first, as the GUI says it.
 fn empty_text(state: &Suggestions, texts: &Texts) -> String {
+    if !state.query.is_empty() {
+        return texts.get(keys::SEARCH_EMPTY);
+    }
     let merged = group_rows(&state.candidates, &state.dismissed);
     if merged.is_empty() && state.inert_dropped > 0 {
         let sample: Vec<&str> = state
@@ -892,6 +1122,7 @@ fn group_lines(
     group: &SuggestionGroup,
     index: usize,
     selected: bool,
+    marked: bool,
     texts: &Texts,
 ) -> Vec<ViewLine> {
     let name = if group.is_app {
@@ -916,7 +1147,8 @@ fn group_lines(
         ));
     }
     let marker = if selected { "> " } else { "" };
-    let number = format!("{marker}{}. ", index + 1);
+    let tick = if marked { "[x] " } else { "" };
+    let number = format!("{marker}{}. {tick}", index + 1);
     let counts = format!(" — {}", counts.join(", "));
     let mut lines = vec![ViewLine::new(if selected {
         vec![Segment::selected(format!("{number}{name}{counts}"))]

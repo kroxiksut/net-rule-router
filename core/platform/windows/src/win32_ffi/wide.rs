@@ -34,16 +34,8 @@ pub unsafe fn pwstr_lossy(ptr: *const u16) -> String {
     if ptr.is_null() {
         return String::new();
     }
-    let mut len = 0usize;
-    // SAFETY: caller invariant — `ptr` is null-terminated within
-    // `MAX_WIDE_LEN` code units. We bound the scan defensively to avoid
-    // a runaway loop if the buffer is malformed.
-    while len < MAX_WIDE_LEN {
-        if unsafe { *ptr.add(len) } == 0 {
-            break;
-        }
-        len += 1;
-    }
+    // SAFETY: caller invariant — `ptr` is null-terminated within `MAX_WIDE_LEN`.
+    let len = unsafe { terminated_len(ptr, MAX_WIDE_LEN) };
     // SAFETY: same invariant; the slice covers exactly `len` valid `u16`s.
     let slice = unsafe { std::slice::from_raw_parts(ptr, len) };
     String::from_utf16_lossy(slice)
@@ -67,17 +59,28 @@ pub unsafe fn pcstr_lossy(ptr: *const u8) -> String {
     if ptr.is_null() {
         return String::new();
     }
-    let mut len = 0usize;
     // SAFETY: caller invariant — null-terminated within `MAX_NARROW_LEN`.
-    while len < MAX_NARROW_LEN {
-        if unsafe { *ptr.add(len) } == 0 {
-            break;
-        }
-        len += 1;
-    }
+    let len = unsafe { terminated_len(ptr, MAX_NARROW_LEN) };
     // SAFETY: slice spans `len` valid bytes that the caller owns.
     let slice = unsafe { std::slice::from_raw_parts(ptr, len) };
     String::from_utf8_lossy(slice).into_owned()
+}
+
+/// Units before the first zero, never more than `cap`: a missing terminator
+/// stops the scan at the bound instead of running off the buffer.
+///
+/// # Safety
+///
+/// `ptr` must be valid for reads up to its first zero or `cap` elements,
+/// whichever comes first.
+unsafe fn terminated_len<T: Copy + PartialEq + Default>(ptr: *const T, cap: usize) -> usize {
+    let zero = T::default();
+    let mut len = 0usize;
+    // SAFETY: every read is below `cap` and at or before the first zero.
+    while len < cap && unsafe { *ptr.add(len) } != zero {
+        len += 1;
+    }
+    len
 }
 
 /// Defensive upper bound for `pwstr_lossy` scans. Adapter descriptions
@@ -167,15 +170,26 @@ mod tests {
     }
 
     #[test]
+    fn a_missing_terminator_stops_the_scan_at_the_bound() {
+        let no_nul: Vec<u16> = vec![0x41; 8];
+        assert_eq!(unsafe { terminated_len(no_nul.as_ptr(), 8) }, 8);
+        assert_eq!(unsafe { terminated_len(no_nul.as_ptr(), 3) }, 3);
+        let early_nul: Vec<u8> = vec![b'a', b'b', 0, b'c'];
+        assert_eq!(unsafe { terminated_len(early_nul.as_ptr(), 4) }, 2);
+        assert_eq!(unsafe { terminated_len(early_nul.as_ptr(), 1) }, 1);
+    }
+
+    #[test]
     fn pwstr_respects_max_len_when_terminator_missing() {
-        // Construct a buffer that has no NUL within MAX_WIDE_LEN — this
-        // is a malformed Win32 contract, the helper must not loop forever.
-        // We can't easily build a 64 KiB+ buffer in a test; instead test
-        // that the loop terminates when len reaches the cap by using a
-        // shorter cap via a separate codepath isn't available, so we
-        // settle for the structural check — `len < MAX_WIDE_LEN` is the
-        // loop guard and `len += 1` per iteration, so the worst case is
-        // MAX_WIDE_LEN reads. This is exercised in production by
-        // GetAdaptersAddresses always producing terminators.
+        let no_nul: Vec<u16> = vec![0x41; MAX_WIDE_LEN];
+        let s = unsafe { pwstr_lossy(no_nul.as_ptr()) };
+        assert_eq!(s.len(), MAX_WIDE_LEN);
+    }
+
+    #[test]
+    fn pcstr_respects_max_len_when_terminator_missing() {
+        let no_nul: Vec<u8> = vec![b'a'; MAX_NARROW_LEN];
+        let s = unsafe { pcstr_lossy(no_nul.as_ptr()) };
+        assert_eq!(s.len(), MAX_NARROW_LEN);
     }
 }

@@ -36,14 +36,50 @@ Rectangle {
         return root.tr("routing.status.active", "Routing active")
     }
 
+    // What the state means, for the tooltip and the screen reader alike: a
+    // tooltip is never the only place an explanation lives.
+    readonly property string detailText: {
+        if (chip.statusKey === "paused")
+            return root.tr("routing.status.detail-paused",
+                "Rules are disabled until you re-enable them.")
+        if (chip.statusKey === "no-tray")
+            return root.tr("routing.status.detail-no-tray",
+                "Run the tray icon to apply rules on this session.")
+        if (chip.statusKey === "no-rules")
+            return root.tr("routing.status.detail-no-rules",
+                "Add rules in the Rules section, then click Save and review.")
+        if (chip.statusKey === "disconnected")
+            return root.tr("routing.status.detail-disconnected",
+                "Showing preview data. Install and start the NetRuleRouter service to apply rules.")
+        // The notices' own headlines: what happens to the traffic differs
+        // per status, and only the notice beside the chip says which.
+        if (chip.statusKey === "limited")
+            return root.enforcementDownDetail()
+                || root.tr("routing.status.detail-limited",
+                    "Some rules are not being applied right now. The notices say why.")
+        return root.tr("routing.status.detail-active",
+            "Rules apply on this user session.")
+    }
+
     implicitHeight: 26
     implicitWidth: chipRow.implicitWidth + theme.spacingMd * 2
     radius: theme.radiusSm
     color: Qt.rgba(statusColor.r, statusColor.g, statusColor.b, 0.16)
-    border.width: theme.borderWidth
-    border.color: Qt.rgba(statusColor.r, statusColor.g, statusColor.b, 0.55)
+    border.width: activeFocus ? theme.focusBorderWidth : theme.borderWidth
+    border.color: activeFocus
+        ? theme.stateFocusedBorder
+        : Qt.rgba(statusColor.r, statusColor.g, statusColor.b, 0.55)
 
     signal clicked()
+
+    activeFocusOnTab: visible
+    Keys.onSpacePressed: chip.clicked()
+    Keys.onReturnPressed: chip.clicked()
+    Keys.onEnterPressed: chip.clicked()
+    Accessible.role: Accessible.Button
+    Accessible.name: chip.labelText
+    Accessible.description: chip.detailText
+    Accessible.onPressAction: chip.clicked()
 
     Row {
         id: chipRow
@@ -68,27 +104,6 @@ Rectangle {
         onClicked: chip.clicked()
         hoverEnabled: true
         ToolTip.visible: containsMouse && root.prefs.tooltipsEnabled
-        ToolTip.text: {
-            if (chip.statusKey === "paused")
-                return root.tr("routing.status.detail-paused",
-                    "Rules are disabled until you re-enable them.")
-            if (chip.statusKey === "no-tray")
-                return root.tr("routing.status.detail-no-tray",
-                    "Run the tray icon to apply rules on this session.")
-            if (chip.statusKey === "no-rules")
-                return root.tr("routing.status.detail-no-rules",
-                    "Add rules in the Rules section, then click Save and review.")
-            if (chip.statusKey === "disconnected")
-                return root.tr("routing.status.detail-disconnected",
-                    "Showing preview data. Install and start the NetRuleRouter service to apply rules.")
-            // The notices' own headlines: what happens to the traffic differs
-            // per status, and only the notice beside the chip says which.
-            if (chip.statusKey === "limited")
-                return root.enforcementDownDetail()
-                    || root.tr("routing.status.detail-limited",
-                        "Some rules are not being applied right now. The notices say why.")
-            return root.tr("routing.status.detail-active",
-                "Rules apply on this user session.")
-        }
+        ToolTip.text: chip.detailText
     }
 }

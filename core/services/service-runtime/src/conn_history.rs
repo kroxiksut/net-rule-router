@@ -5,8 +5,12 @@
 //! path. The map is folded per user, program, destination, route, verdict and
 //! hour, and written in one transaction at most once a minute on the flush
 //! task's own thread (`nrr_conn_history.db`). Expiry follows each user's chosen
-//! period; a byte cap for the whole machine removes the oldest hours first and
-//! the reader is told how much went.
+//! period; a byte cap for the whole machine removes the oldest hours of whoever
+//! holds the most first, and the reader is told how much went.
+//!
+//! Lock order: the store before the pending map. A writer that took the rows
+//! out first and then waited for the file could put back what a clear in
+//! between had erased.
 //!
 //! Only people have a history: service accounts and connections nobody owns
 //! are skipped, and a user who switched it off is not recorded at all.
@@ -22,6 +26,8 @@ use nrr_storage::{
     ConnHistoryEntry, ConnHistoryQuery, ConnHistoryRow, SqliteConnHistoryStore, StorageError,
 };
 
+pub use nrr_storage::conn_history::ConnHistoryCursor;
+
 use crate::conn_observation_consumer::{role_str, verdict_str, ConnectionTraceRecord};
 
 /// The size the whole machine's history may reach.
@@ -30,6 +36,10 @@ pub const MAX_HISTORY_BYTES: u64 = 50 * 1024 * 1024;
 /// Folded rows held between two flushes. A minute of a busy machine folds to a
 /// few hundred; past this, a new row is skipped and counted, never queued.
 pub const MAX_PENDING_ROWS: usize = 20_000;
+
+/// One user's share of the map: a scanner run by one account fills their
+/// share and is counted against them, while everyone else is still recorded.
+pub const MAX_PENDING_ROWS_PER_USER: usize = MAX_PENDING_ROWS / 4;
 
 /// Longest program path or host name kept; a longer one is cut at a character
 /// boundary. Both come from the OS or a DNS answer, and neither needs more.
@@ -67,8 +77,24 @@ struct Fold {
 #[derive(Default)]
 struct Pending {
     rows: HashMap<FoldKey, Fold>,
+    /// Rows in the map per user, kept beside it so a share check is O(1).
+    held: HashMap<String, usize>,
     /// Per user, rows the full map turned away since the service started.
     skipped: HashMap<String, u64>,
+}
+
+impl Pending {
+    fn take_rows(&mut self) -> HashMap<FoldKey, Fold> {
+        self.held.clear();
+        std::mem::take(&mut self.rows)
+    }
+
+    fn drop_rows_of(&mut self, principal: &str) -> usize {
+        let before = self.rows.len();
+        self.rows.retain(|k, _| k.principal != principal);
+        self.held.remove(principal);
+        before - self.rows.len()
+    }
 }
 
 /// Why a read or a write of the history failed.
@@ -103,7 +129,9 @@ pub struct HistoryRead<'a> {
     pub to_ms: u64,
     pub program: Option<&'a str>,
     pub verdict: Option<&'a str>,
-    pub offset: u32,
+    /// Continue after this entry of an earlier page; `None` starts from the
+    /// newest, flushing first so the last minute is in the answer.
+    pub after: Option<&'a ConnHistoryCursor>,
     pub limit: u32,
 }
 
@@ -233,7 +261,9 @@ impl ConnHistory {
         if !self.prefs_for(owner).enabled {
             return;
         }
-        let at_ms = rec.observed_unix_ms.unwrap_or(now_ms);
+        // Never ahead of the clock: a row stamped in the future would outlive
+        // its period once the clock is set right.
+        let at_ms = rec.observed_unix_ms.unwrap_or(now_ms).min(now_ms);
         let key = FoldKey {
             principal: owner.to_owned(),
             hour: at_ms / HOUR_MS,
@@ -264,10 +294,12 @@ impl ConnHistory {
             }
             return;
         }
-        if pending.rows.len() >= MAX_PENDING_ROWS {
+        let held = pending.held.get(owner).copied().unwrap_or(0);
+        if pending.rows.len() >= MAX_PENDING_ROWS || held >= MAX_PENDING_ROWS_PER_USER {
             *pending.skipped.entry(key.principal).or_default() += 1;
             return;
         }
+        *pending.held.entry(key.principal.clone()).or_default() += 1;
         pending.rows.insert(
             key,
             Fold {
@@ -294,9 +326,13 @@ impl ConnHistory {
 
     /// `prune_at` is the clock a due prune runs against; `None` never prunes.
     fn write(&self, prune_at: Option<u64>) {
+        // The file first, then the rows: taken the other way round, rows a
+        // clear erased meanwhile would be written back.
+        let mut guard = self.store.lock().unwrap_or_else(|p| p.into_inner());
         let rows: Vec<ConnHistoryRow> = {
             let mut pending = self.pending.lock().unwrap_or_else(|p| p.into_inner());
-            std::mem::take(&mut pending.rows)
+            pending
+                .take_rows()
                 .into_iter()
                 .map(|(k, f)| ConnHistoryRow {
                     principal: k.principal,
@@ -314,13 +350,15 @@ impl ConnHistory {
                 })
                 .collect()
         };
-        let mut guard = self.store.lock().unwrap_or_else(|p| p.into_inner());
         let Some(store) = guard.as_ref() else {
             return;
         };
         let mut outcome = store.upsert(&rows);
-        let due = prune_at.filter(|now_ms| {
-            now_ms.saturating_sub(self.last_prune_ms.load(Ordering::Relaxed)) >= PRUNE_INTERVAL_MS
+        // A clock set back is due at once: waiting for it to catch up with
+        // the old reading would stop expiry and the cap meanwhile.
+        let due = prune_at.filter(|&now_ms| {
+            let last = self.last_prune_ms.load(Ordering::Relaxed);
+            now_ms < last || now_ms - last >= PRUNE_INTERVAL_MS
         });
         if let (true, Some(now_ms)) = (outcome.is_ok(), due) {
             self.last_prune_ms.store(now_ms, Ordering::Relaxed);
@@ -401,14 +439,17 @@ impl ConnHistory {
     }
 
     /// The asked period, newest first, with what the cap removed and what
-    /// the full map turned away for the same audience. Flushes first, so the
-    /// last minute is in the answer.
+    /// the full map turned away for the same audience. A first page flushes
+    /// first, so the last minute is in the answer; a continuing one does not,
+    /// so the walk sees the file its first page saw.
     pub fn read(
         &self,
         q: &HistoryRead<'_>,
         now_ms: u64,
     ) -> Result<(Vec<ConnHistoryEntry>, u64, u64), HistoryError> {
-        self.flush(now_ms);
+        if q.after.is_none() {
+            self.flush(now_ms);
+        }
         let skipped = {
             let pending = self.pending.lock().unwrap_or_else(|p| p.into_inner());
             match q.principal {
@@ -426,7 +467,7 @@ impl ConnHistory {
                 to_ms: wire_i64(q.to_ms),
                 program: q.program,
                 verdict: q.verdict,
-                offset: q.offset,
+                after: q.after,
                 limit: q.limit,
             })
             .map_err(storage)?;
@@ -437,14 +478,12 @@ impl ConnHistory {
     /// Erase `principal`'s history: what is waiting to be written, what the
     /// file holds and what was counted against it. Returns rows erased.
     pub fn clear(&self, principal: &str) -> Result<u64, HistoryError> {
+        let guard = self.store.lock().unwrap_or_else(|p| p.into_inner());
         let waiting = {
             let mut pending = self.pending.lock().unwrap_or_else(|p| p.into_inner());
-            let before = pending.rows.len();
-            pending.rows.retain(|k, _| k.principal != principal);
             pending.skipped.remove(principal);
-            (before - pending.rows.len()) as u64
+            pending.drop_rows_of(principal) as u64
         };
-        let guard = self.store.lock().unwrap_or_else(|p| p.into_inner());
         let store = guard.as_ref().ok_or(HistoryError::Unavailable)?;
         let erased = store
             .clear_principal(principal)
@@ -469,12 +508,12 @@ impl ConnHistory {
         if let Ok(mut map) = self.prefs.write() {
             map.clear();
         }
+        let guard = self.store.lock().unwrap_or_else(|p| p.into_inner());
         {
             let mut pending = self.pending.lock().unwrap_or_else(|p| p.into_inner());
-            pending.rows.clear();
+            pending.take_rows();
             pending.skipped.clear();
         }
-        let guard = self.store.lock().unwrap_or_else(|p| p.into_inner());
         let store = guard.as_ref().ok_or(HistoryError::Unavailable)?;
         let erased = store
             .clear_all()
@@ -511,7 +550,7 @@ impl ConnHistory {
         }
         if !next.enabled {
             let mut pending = self.pending.lock().unwrap_or_else(|p| p.into_inner());
-            pending.rows.retain(|k, _| k.principal != principal);
+            pending.drop_rows_of(principal);
         }
         Ok(next)
     }
@@ -527,10 +566,16 @@ pub fn open_for_service(
 ) -> Arc<ConnHistory> {
     use nrr_storage::ConnHistoryPrefsRepository;
 
+    // Without the state DB nobody's "off" can be read or kept, so nobody is
+    // recorded.
     let Some(state) = state else {
-        return Arc::new(ConnHistory::open(path).with_prefs_persist(Arc::new(|_, _| {
-            Err("no service state database to keep the choice in".to_string())
-        })));
+        tracing::warn!(
+            target: "nrr::conn-history",
+            msg_key = "conn-history-prefs-unreadable",
+            error = "no service state database",
+            "connection history choices cannot be read; no history is kept",
+        );
+        return Arc::new(ConnHistory::new(None, None));
     };
     let prefs = {
         let conn = state.lock().unwrap_or_else(|p| p.into_inner());
@@ -625,11 +670,14 @@ mod tests {
         {
             let h = ConnHistory::open(path.clone());
             for n in 0..5 {
-                h.record(&rec(Some(ALICE), r"C:\Apps\browser.exe", 10, T0 + n), T0);
+                h.record(
+                    &rec(Some(ALICE), r"C:\Apps\browser.exe", 10, T0 + n),
+                    T0 + n,
+                );
             }
             h.record(
                 &rec(Some(ALICE), r"C:\Apps\browser.exe", 10, T0 + HOUR_MS),
-                T0,
+                T0 + HOUR_MS,
             );
             h.flush(T0 + HOUR_MS);
         }
@@ -760,17 +808,127 @@ mod tests {
         );
     }
 
+    fn record_distinct(h: &ConnHistory, owner: &str, count: usize) {
+        for n in 0..count {
+            let mut r = rec(Some(owner), "app.exe", 1, T0);
+            r.remote = SocketAddr::new(IpAddr::V4(Ipv4Addr::from(0x0A00_0000 + n as u32)), 443);
+            h.record(&r, T0);
+        }
+    }
+
     #[test]
     fn a_full_map_skips_and_counts_instead_of_growing() {
         let (_dir, h) = history();
-        for n in 0..=MAX_PENDING_ROWS {
-            let at = T0 + n as u64;
-            let mut r = rec(Some(ALICE), "app.exe", 1, at);
-            r.remote = SocketAddr::new(IpAddr::V4(Ipv4Addr::from(0x0A00_0000 + n as u32)), 443);
-            h.record(&r, at);
+        let users: Vec<String> = (0..MAX_PENDING_ROWS / MAX_PENDING_ROWS_PER_USER)
+            .map(|n| format!("S-1-5-21-1-2-3-{}", 2000 + n))
+            .collect();
+        for user in &users {
+            record_distinct(&h, user, MAX_PENDING_ROWS_PER_USER);
         }
+        record_distinct(&h, ALICE, 1);
         let (_, _, skipped) = h.read(&mine(ALICE), T0).expect("read");
-        assert_eq!(skipped, 1);
+        assert_eq!(skipped, 1, "the whole map is full");
+    }
+
+    #[test]
+    fn one_user_filling_their_share_does_not_stop_the_others() {
+        let (_dir, h) = history();
+        record_distinct(&h, BOB, MAX_PENDING_ROWS_PER_USER + 3);
+        h.record(&rec(Some(ALICE), "alice.exe", 1, T0), T0);
+        let (alice, _, alice_skipped) = h.read(&mine(ALICE), T0).expect("alice");
+        assert_eq!(alice.len(), 1, "Alice is still recorded");
+        assert_eq!(alice_skipped, 0);
+        let (_, _, bob_skipped) = h.read(&mine(BOB), T0).expect("bob");
+        assert_eq!(bob_skipped, 3, "only what passed Bob's own share");
+        // The flush emptied the map, so Bob's share is free again.
+        record_distinct(&h, BOB, 1);
+        let (_, _, bob_skipped) = h.read(&mine(BOB), T0).expect("bob");
+        assert_eq!(bob_skipped, 3);
+    }
+
+    #[test]
+    fn a_flush_waiting_for_the_file_leaves_the_rows_for_a_clear_to_take() {
+        let (_dir, h) = history();
+        let h = Arc::new(h);
+        h.record(&rec(Some(ALICE), "a.exe", 1, T0), T0);
+        let held = h.store.lock().expect("store");
+        let writer = {
+            let h = Arc::clone(&h);
+            std::thread::spawn(move || h.flush_pending())
+        };
+        std::thread::sleep(std::time::Duration::from_millis(150));
+        assert_eq!(
+            h.pending.lock().expect("pending").rows.len(),
+            1,
+            "a writer must not take the rows before it holds the file"
+        );
+        drop(held);
+        writer.join().expect("writer");
+        h.clear(ALICE).expect("clear");
+        assert!(h.read(&mine(ALICE), T0).expect("read").0.is_empty());
+    }
+
+    #[test]
+    fn a_clock_set_back_prunes_at_once() {
+        let (_dir, h) = history();
+        let h = h.with_prefs(vec![(
+            ALICE.to_owned(),
+            ConnHistoryPrefs {
+                enabled: true,
+                retention_days: 1,
+            },
+        )]);
+        // The clock ran a month ahead and a prune ran then.
+        h.flush(T0 + 30 * DAY_MS);
+        let old = T0 - 3 * DAY_MS;
+        h.record(&rec(Some(ALICE), "old.exe", 1, old), old);
+        // Set right again: expiry must not wait for the month to pass.
+        h.flush(T0);
+        assert!(h.read(&mine(ALICE), T0).expect("read").0.is_empty());
+    }
+
+    #[test]
+    fn a_row_stamped_ahead_of_the_clock_is_kept_at_the_clock() {
+        let (_dir, h) = history();
+        h.record(&rec(Some(ALICE), "a.exe", 1, T0 + DAY_MS), T0);
+        let (rows, _, _) = h.read(&mine(ALICE), T0).expect("read");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].last_ms, T0 as i64);
+    }
+
+    #[test]
+    fn a_continuing_page_reads_the_file_its_first_page_saw() {
+        let (_dir, h) = history();
+        h.record(&rec(Some(ALICE), "a.exe", 1, T0), T0);
+        h.record(&rec(Some(ALICE), "b.exe", 2, T0), T0);
+        let first_page = HistoryRead {
+            limit: 1,
+            ..mine(ALICE)
+        };
+        let (first, _, _) = h.read(&first_page, T0).expect("first");
+        assert_eq!(first.len(), 1);
+        let cursor = ConnHistoryCursor::after(&first[0]);
+        h.record(&rec(Some(ALICE), "c.exe", 3, T0), T0);
+        let next = HistoryRead {
+            after: Some(&cursor),
+            limit: 10,
+            ..mine(ALICE)
+        };
+        let (rest, _, _) = h.read(&next, T0).expect("rest");
+        assert_eq!(rest.len(), 1, "the row folded after page one waits");
+        assert_eq!(h.pending.lock().expect("pending").rows.len(), 1);
+    }
+
+    #[test]
+    fn without_the_state_database_nobody_is_recorded() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let h = open_for_service(dir.path().join("nrr_conn_history.db"), None);
+        assert!(!h.is_available());
+        h.record(&rec(Some(ALICE), "a.exe", 1, T0), T0);
+        assert!(matches!(
+            h.read(&mine(ALICE), T0),
+            Err(HistoryError::Unavailable)
+        ));
     }
 
     #[test]

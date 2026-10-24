@@ -47,8 +47,10 @@ pub use nrr_platform_api::key_store::{
     generate_signing_key, InMemKeyStore, KeyStore, SIGNING_KEY_BYTE_LEN,
 };
 
-/// File name for the persisted key. Stable across versions.
-const KEY_FILE_NAME: &str = "db-mac-key.bin";
+/// File name for the persisted key. Stable across versions. A purge that keeps
+/// the audit trail keeps this file too: the trail's chain restarts are sealed
+/// under a key derived from it.
+pub const KEY_FILE_NAME: &str = "db-mac-key.bin";
 
 /// The re-sign-pending marker, kept beside the key under the same mode.
 const RESIGN_MARKER_FILE_NAME: &str = "db-mac-resign-pending.bin";

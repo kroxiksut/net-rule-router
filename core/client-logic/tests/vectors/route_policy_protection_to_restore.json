@@ -132,7 +132,7 @@
           "resolve-hosts-bypass": false,
           "kill-switch-strict-shared-ips": true
         },
-        "service": {}
+        "service": { "kill-switch-strict-shared-ips": false }
       },
       "expected": [
         "kill-switch-strict-shared-ips"
@@ -146,7 +146,7 @@
           "kill-switch-strict-shared-ips": true,
           "doh-lockdown-enabled": true
         },
-        "service": {
+        "service": { "kill-switch-strict-shared-ips": false,
           "doh-lockdown-enabled": false
         }
       },

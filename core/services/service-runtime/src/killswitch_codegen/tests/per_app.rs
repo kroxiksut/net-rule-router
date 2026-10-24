@@ -39,8 +39,19 @@ fn app_kill_switch_emits_ale_pair_pinned_to_app_and_luid() {
         LUID,
         KillSwitchProtocols::ALL,
     );
-    // ALE only (no per-app packet layer): exactly one permit + one block.
-    assert_eq!(out.len(), 2);
+    // ALE only (no per-app packet layer): one permit + one block PER FAMILY.
+    // The v4-only pair let a dual-stack site take the program's IPv6 out of
+    // the main link, the tunnel up or down.
+    assert_eq!(out.len(), 4);
+    for layer in [WfpLayerKey::AleAuthConnectV4, WfpLayerKey::AleAuthConnectV6] {
+        let of = |action| {
+            out.iter()
+                .filter(|f| f.layer == layer && f.action == action)
+                .count()
+        };
+        assert_eq!(of(WfpAction::Permit), 1, "{layer:?}");
+        assert_eq!(of(WfpAction::Block), 1, "{layer:?}");
+    }
     let permit = &out[0];
     let block = &out[1];
     assert_eq!(permit.action, WfpAction::Permit);
@@ -74,14 +85,33 @@ fn primary_app_exempt_emits_unconditional_permit_above_all_bands() {
     // one unconditional ALE Permit per pattern, at the exempt band, outranking
     // every block. No interface/IP condition so it permits egress over the
     // primary even while the secondary adapter is down and block-all is engaged.
+    //
+    // In BOTH families: a tunnel client whose server has an IPv6 address met
+    // the v6 block-all with no permit of its own, and under "everything" with
+    // the tunnel down could not reconnect.
     let out = primary_app_exempt_filters(
         "S",
         &["ExampleVPN 3.0.exe".to_string(), "*vpn*".to_string()],
     );
-    assert_eq!(out.len(), 2, "one exempt permit per pattern, no block half");
+    assert_eq!(
+        out.len(),
+        4,
+        "one exempt permit per pattern and family, no block half"
+    );
+    for pattern in ["ExampleVPN 3.0.exe", "*vpn*"] {
+        let layers: Vec<WfpLayerKey> = out
+            .iter()
+            .filter(|f| f.app_pattern.as_deref() == Some(pattern))
+            .map(|f| f.layer)
+            .collect();
+        assert_eq!(
+            layers,
+            vec![WfpLayerKey::AleAuthConnectV4, WfpLayerKey::AleAuthConnectV6],
+            "{pattern}"
+        );
+    }
     for f in &out {
         assert_eq!(f.action, WfpAction::Permit);
-        assert_eq!(f.layer, WfpLayerKey::AleAuthConnectV4);
         assert_eq!(
             f.local_interface_luid, None,
             "unconditional — allowed over any link, incl. primary"
@@ -93,8 +123,10 @@ fn primary_app_exempt_emits_unconditional_permit_above_all_bands() {
             "exempt permit must sit in the top exempt band"
         );
     }
-    assert_eq!(out[0].app_pattern.as_deref(), Some("ExampleVPN 3.0.exe"));
-    assert_eq!(out[1].app_pattern.as_deref(), Some("*vpn*"));
+    assert!(out
+        .iter()
+        .filter(|f| f.layer == WfpLayerKey::AleAuthConnectV6)
+        .all(|f| f.weight > CATCHALL_BLOCK_WEIGHT && f.remote_subnet_v6.is_none()));
 }
 
 #[test]
@@ -141,9 +173,12 @@ fn default_vpn_exempt_patterns_present_and_each_emits_an_exempt_permit() {
         .map(|s| (*s).to_string())
         .collect();
     let out = primary_app_exempt_filters("S", &pats);
-    assert_eq!(out.len(), DEFAULT_VPN_EXEMPT_PATTERNS.len());
+    assert_eq!(out.len(), 2 * DEFAULT_VPN_EXEMPT_PATTERNS.len());
     assert!(out.iter().all(|f| f.action == WfpAction::Permit
-        && f.layer == WfpLayerKey::AleAuthConnectV4
+        && matches!(
+            f.layer,
+            WfpLayerKey::AleAuthConnectV4 | WfpLayerKey::AleAuthConnectV6
+        )
         && f.local_interface_luid.is_none()
         && f.remote_ip.is_none()));
 }
@@ -153,7 +188,10 @@ fn app_kill_switch_never_touches_packet_layer() {
     // ALE_APP_ID is not available at the packet layer — a per-app ICMP gate
     // is impossible, so nothing must land there.
     let out = app_kill_switch_filters("S", &["a.exe".to_string()], LUID, KillSwitchProtocols::ALL);
-    assert!(out.iter().all(|f| f.layer == WfpLayerKey::AleAuthConnectV4));
+    assert!(out.iter().all(|f| matches!(
+        f.layer,
+        WfpLayerKey::AleAuthConnectV4 | WfpLayerKey::AleAuthConnectV6
+    )));
 }
 
 #[test]
@@ -190,9 +228,12 @@ fn fail_closed_block_apps_blocks_each_protected_app() {
         &["a.exe".to_string(), "b.exe".to_string()],
         KillSwitchProtocols::ALL,
     );
-    assert_eq!(out.len(), 2);
+    assert_eq!(out.len(), 4, "each app, both families");
     assert!(out.iter().all(|f| f.action == WfpAction::Block
-        && f.layer == WfpLayerKey::AleAuthConnectV4
+        && matches!(
+            f.layer,
+            WfpLayerKey::AleAuthConnectV4 | WfpLayerKey::AleAuthConnectV6
+        )
         && f.app_pattern.is_some()));
 }
 
@@ -374,7 +415,7 @@ fn under_the_takeover_the_app_block_outranks_the_primary_rule_permits() {
         .iter()
         .filter(|f| f.action == WfpAction::Block)
         .collect();
-    assert_eq!(blocks.len(), 2);
+    assert_eq!(blocks.len(), 4, "two apps, both families");
     for block in &blocks {
         assert!(
             block.weight >= BASE_PRIMARY + BAND_WIDTH,
@@ -383,8 +424,8 @@ fn under_the_takeover_the_app_block_outranks_the_primary_rule_permits() {
         );
         let own_permit = permits
             .iter()
-            .find(|p| p.app_pattern == block.app_pattern)
-            .expect("each app has its permit");
+            .find(|p| p.app_pattern == block.app_pattern && p.layer == block.layer)
+            .expect("each app has its permit in each family");
         assert!(
             own_permit.weight > block.weight,
             "the app's own egress-conditional permit must still win while the tunnel is up"

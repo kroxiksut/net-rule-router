@@ -270,6 +270,9 @@ pub(super) fn build(inputs: IpcSurfaceInputs<'_>) -> IpcSurface {
             Arc::clone(&api) as Arc<dyn nrr_platform_api::route_table::RouteTablePort>,
             Arc::new(nrr_platform_windows::WindowsInterfaceRows)
                 as Arc<dyn nrr_platform_api::InterfaceRowsPort>,
+        )
+        .with_caller_bindings(
+            nrr_service_runtime::production_handlers_misc::stored_caller_bindings(Arc::clone(conn)),
         );
         if let Some(sampler) = traffic_sampler.as_ref() {
             adapters_snapshot_provider = adapters_snapshot_provider.with_address_recorder(
@@ -803,6 +806,15 @@ pub(super) fn build(inputs: IpcSurfaceInputs<'_>) -> IpcSurface {
                         )
                     })
                 },
+                keeps_names_off_main: {
+                    let conn = Arc::clone(conn_for_probe);
+                    Arc::new(move |sid: &str| {
+                        let guard = conn.lock().unwrap_or_else(|p| p.into_inner());
+                        nrr_service_runtime::production_rules_provider::keeps_names_off_main_for(
+                            &guard, sid,
+                        )
+                    })
+                },
                 reapply: policy_trigger.clone().map(|trigger| {
                     Arc::new(move |sid: &str| trigger.on_policy_changed(sid))
                         as Arc<dyn Fn(&str) + Send + Sync>
@@ -887,6 +899,11 @@ pub(super) fn build(inputs: IpcSurfaceInputs<'_>) -> IpcSurface {
                     nrr_service_runtime::path_probe::SystemPathProbe,
                 ))
                 .map(|h| Arc::new(h) as Arc<dyn nrr_service_runtime::site_check::HttpsHead>),
+                traffic_held: per_sid_orchestrator.as_ref().map(|orch| {
+                    let orch = Arc::clone(orch);
+                    Arc::new(move |sid: &str| orch.block_all_armed_for(sid))
+                        as nrr_service_runtime::site_check::TrafficHeld
+                }),
             };
             deps = deps.with_site_check(Arc::new(
                 nrr_service_runtime::site_check::SiteChecker::new(site_check),

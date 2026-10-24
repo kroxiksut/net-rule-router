@@ -245,7 +245,8 @@ impl IpcHandler for ExplainGetHandler {
         if let ExplainQuery::Synthetic { input_sample } = &query {
             if let Some(host) = input_sample.hostname.as_deref() {
                 let unmatched = compact.route == "none"
-                    || compact.reason_key == "diag.explain.reason.no-rule-match";
+                    || compact.reason_key == "diag.explain.reason.no-rule-match"
+                    || compact.reason_key == "diag.explain.reason.rule-withheld";
                 let (slug, shared, total) =
                     self.enforcement_verdict(ctx.caller_stored(), host, &compact.route, unmatched);
                 compact.enforcement = slug;

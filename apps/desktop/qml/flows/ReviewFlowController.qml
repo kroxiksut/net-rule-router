@@ -62,6 +62,17 @@ QtObject {
             // rules files (which needs no service) and let the navigation
             // through. Refusing to navigate was a dead end — the same dialog
             // that offered to save was unreachable from here.
+            // A table that never loaded the rules is neither saved nor kept
+            // as the set to apply: it would replace them with the edits alone.
+            if (root.boundFilesController.tableMissesBoundRules()) {
+                root.setStatus(
+                    root.tr("status.rules-not-loaded-not-saved-short",
+                        "Rules not loaded — nothing saved"),
+                    root.tr("status.rules-not-loaded-not-saved",
+                        "Your rules file was not loaded, so nothing was saved over it. Load your rules first, then save."))
+                _resolveGuardRulesApply(false)
+                return
+            }
             root.setStatus(
                 root.tr("status.rules-saved-service-stopped-short",
                     "Service stopped — saving to your rules file"),
@@ -176,6 +187,10 @@ QtObject {
             _resolveGuardRulesApply(false)
             return
         }
+        // A merge's file versions belong to that review alone: any other one
+        // must not take them, or its follow-up write would replace the files
+        // with rules that never included them.
+        if (origin !== "drift-merge" && origin !== "edits-merge") _forgetMergeInFlight()
         var startedAtMs = Date.now()
         // The origin travels on the wire (`correlation_id` in the service log),
         // so the next duplicate names its own caller instead of leaving us to
@@ -185,6 +200,7 @@ QtObject {
         var sent = submitter.dryRun(rulesJson, opts, function(ok, r) {
             if (!ok) {
                 console.log("review-flow: dry-run failed:", r.code, r.message)
+                _forgetMergeInFlight()
                 // Release the guard without navigating.
                 _resolveGuardRulesApply(false)
                 return
@@ -396,8 +412,14 @@ QtObject {
         return true
     }
 
+    function _forgetMergeInFlight() {
+        root._mergeApplyPendingWrite = false
+        root._mergeTakenTexts = null
+    }
+
     // `args` are this refusal's own values; null words it by its code alone.
     function _announceRulesActivationFailed(code, args) {
+        _forgetMergeInFlight()
         root.statusLine = submitter.describeFailure(
             { failure: String(code || "unknown"), failureArgs: args || null }, root.tr)
     }
@@ -453,13 +475,17 @@ QtObject {
         // out of a merge diverged again. Pull the activated revision into
         // the table first, then export from it.
         if (root._mergeApplyPendingWrite) {
-            root._mergeApplyPendingWrite = false
+            var taken = root._mergeTakenTexts
+            _forgetMergeInFlight()
             root._refreshRulesFromService({ silent: true, onComplete: function() {
                 // The refresh already re-captured the drift baseline off the
-                // freshly loaded model.
-                root.boundFilesController._reconcileBoundFileDirty()
-                root.boundFilesController._persistBoundFilesAfterApply()
-                Qt.callLater(root.driftController._driftRecheckNow)
+                // freshly loaded model. The files merged in are the program's
+                // now, unless they changed since the merge read them.
+                root.boundFilesController.noteMergedFrom(taken, function() {
+                    root.boundFilesController._reconcileBoundFileDirty()
+                    root.boundFilesController._persistBoundFilesAfterApply()
+                    Qt.callLater(root.driftController._driftRecheckNow)
+                })
             } })
         } else {
             root.boundFilesController._reconcileBoundFileDirty()
@@ -467,6 +493,14 @@ QtObject {
             // just-activated rules so it never goes stale and the next
             // launch's auto-open is never a false-delete.
             root.boundFilesController._persistBoundFilesAfterApply()
+            // What was applied is read back in the service's own spelling: a
+            // set remembered as typed cannot name the rule the next edit
+            // deletes, and a merge then brings it back. Never over edits begun
+            // since.
+            Qt.callLater(function() {
+                if (!root.unsavedChangesRegistry["rules"])
+                    root._refreshRulesFromService({ silent: true })
+            })
         }
         // Successful activation supersedes any
         // parked changeset. Clear sidecar so the post-connect

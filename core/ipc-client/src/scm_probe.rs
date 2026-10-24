@@ -202,16 +202,6 @@ mod tests {
     }
 
     #[test]
-    fn probe_returns_some_variant() {
-        // On a CI machine without the service installed we expect
-        // `NotFound`. On a developer box with the service installed, any
-        // of the other variants is valid. Either way the call must
-        // return without panicking.
-        let r = probe();
-        let _ = r;
-    }
-
-    #[test]
     fn service_probe_variants_distinct_in_match() {
         // Sanity that match exhaustiveness for every variant compiles.
         let variants = [

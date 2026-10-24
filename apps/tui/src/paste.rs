@@ -5,7 +5,8 @@
 
 use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 
-/// Most characters a paste hands to a screen; the rest is dropped.
+/// Most characters a paste types key by key; the rest is dropped. A field of
+/// lines takes a paste whole instead (`Screen::on_paste`).
 pub const MAX_PASTE_CHARS: usize = 16 * 1024;
 
 #[derive(Debug, PartialEq, Eq)]

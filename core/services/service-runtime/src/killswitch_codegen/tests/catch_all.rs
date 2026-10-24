@@ -782,8 +782,8 @@ fn the_dns_lockdown_outranks_a_foreign_permit_for_what_leaves_through_it() {
     }
 }
 
-/// No permit through a tunnel, nothing to restate; our own tunnel and an
-/// unusable LUID are never given a restatement either.
+/// No permit through a tunnel, nothing to restate; an unusable LUID is never
+/// given a restatement, and our own tunnel only beside a permit through it.
 #[test]
 fn the_dns_lockdown_is_restated_only_where_a_foreign_permit_exists() {
     const FOREIGN: u64 = 0x00AB_CDEF_0000_0006;
@@ -798,6 +798,25 @@ fn the_dns_lockdown_is_restated_only_where_a_foreign_permit_exists() {
     let mut emitted = pins;
     emitted.extend(permits);
     assert!(doh_foreign_vetoes(sid, &doh, &emitted, &[LUID, 0], LUID).is_empty());
+}
+
+/// "Everything" with our tunnel up: the block-all lets the user's traffic out
+/// through our tunnel at the exemption band, above the lockdown's own band. A
+/// browser's DoH then leaves through the tunnel, names never reach the
+/// resolver, and the rules on names stop working for that browser. The lockdown
+/// is restated for our tunnel too, above that permit.
+#[test]
+fn the_dns_lockdown_outranks_the_permit_for_our_own_tunnel() {
+    let sid = "S-1-5-21-F";
+    let own_egress = exempt_egress(sid, LUID, crate::wfp_bands::CATCHALL_EXEMPT_BASE);
+    let doh = doh_for(sid);
+    let vetoes = doh_foreign_vetoes(sid, &doh, std::slice::from_ref(&own_egress), &[], LUID);
+    assert!(
+        vetoes
+            .iter()
+            .any(|v| v.local_interface_luid == Some(LUID) && v.weight > own_egress.weight),
+        "DoH leaves through our own tunnel past the lockdown"
+    );
 }
 
 /// An address pinned to our tunnel inside a foreign network is cut for egress

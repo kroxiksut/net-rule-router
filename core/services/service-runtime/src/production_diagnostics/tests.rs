@@ -1301,6 +1301,74 @@ fn a_winner_enforcement_cannot_carry_out_is_not_reported_as_enforced() {
     );
 }
 
+/// Enforcement keeps a protected program's rule out; the routing check must
+/// not report it as the winner.
+#[test]
+fn a_withheld_protected_program_rule_does_not_win_the_routing_check() {
+    use nrr_shared::rules_json::{
+        to_canonical_string, AppMatchDto, AppPatternDto, CanonicalRulesJsonV1, RuleDto,
+        RULES_JSON_SCHEMA_VERSION,
+    };
+    use nrr_storage::migration::{open_connection, SqliteMigrationRunner};
+    use nrr_storage::repository::MigrationRunner;
+
+    let critical = match nrr_domain::rules_file::HostPlatform::compiled() {
+        nrr_domain::rules_file::HostPlatform::Windows => "svchost.exe",
+        nrr_domain::rules_file::HostPlatform::Linux => "networkmanager",
+        nrr_domain::rules_file::HostPlatform::MacOS => "configd",
+    };
+    let dir = TempDir::new().expect("tmp");
+    let conn = open_connection(&dir.path().join("state.db")).expect("open");
+    let runner = SqliteMigrationRunner::for_state_db(conn);
+    runner.run_pending_migrations().expect("migrate");
+    let conn = Arc::new(std::sync::Mutex::new(runner.into_connection()));
+    let rules_json = to_canonical_string(&CanonicalRulesJsonV1 {
+        schema_version: RULES_JSON_SCHEMA_VERSION,
+        primary: vec![],
+        secondary: vec![RuleDto {
+            id: "R-0001".into(),
+            enabled: true,
+            address_match: None,
+            app_match: Some(AppMatchDto {
+                pattern: AppPatternDto::Exact {
+                    value: critical.into(),
+                },
+                include_child_processes: false,
+                override_requested: false,
+            }),
+            comment: String::new(),
+            action: nrr_shared::rules_json::RuleAction::Route,
+            origin: None,
+        }],
+    })
+    .expect("serialise");
+    conn.lock()
+        .expect("lock")
+        .execute(
+            "INSERT INTO revisions (
+                principal, revision_id, content_hash, rules_json, status, source,
+                correlation_id, created_at, activated_at
+             ) VALUES (?1, 'rev-1', 'h', ?2, 'active', 'gui-rules-edit', 'c', 1, 1)",
+            rusqlite::params![nrr_storage::BASELINE_PRINCIPAL, rules_json],
+        )
+        .expect("seed active revision");
+    let alerts: Arc<dyn SecurityAlertsRepository> =
+        Arc::new(InMemorySecurityAlertsRepository::new());
+    let facade = ProductionDiagnosticsFacade::new(dir.path(), dir.path(), None, alerts, Some(conn));
+    let q = ExplainQuery::Synthetic {
+        input_sample: nrr_diagnostics::explain::RuntimeInputSample::new()
+            .with_hostname("host.example")
+            .with_process(critical),
+    };
+    let answer = facade
+        .get_explain(&q, ExplainDetailLevel::Diagnostics, "")
+        .expect("explain")
+        .final_action_section
+        .expect("final action");
+    assert_eq!(answer.route_role.as_deref(), Some("primary"));
+    assert_eq!(answer.reason_key, "diag.explain.reason.rule-withheld");
+}
+
 /// The writer opens a new file on every start, so checking only the newest
 /// file shrank the window to "since the last boot": an edit in the middle of
 /// yesterday's file went unnoticed. The whole chain in retention is checked.

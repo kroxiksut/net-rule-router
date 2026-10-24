@@ -32,8 +32,9 @@
 //!   [`ParsedRule::children`] and [`ParsedRule::override_requested`] before a
 //!   `#` line is judged rule or prose ([`split_rule_flags`], shared with the
 //!   service's reader).
-//! * The first unescaped `#` past the value content starts an inline
-//!   comment that becomes the rule's `comment` field.
+//! * The first `#` after whitespace, past a leading quoted program value,
+//!   starts an inline comment that becomes the rule's `comment` field
+//!   ([`split_inline_comment`]).
 //! * Lines preceding any `--- ` header are file-level prelude and are
 //!   silently dropped (header preservation is out of scope for v1).
 //! * A line starting with `#:` is the writer's syntax hint and is skipped

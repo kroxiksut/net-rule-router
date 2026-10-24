@@ -20,13 +20,14 @@ use std::collections::{BTreeMap, HashMap};
 use nrr_shared::auto_rule::{parse_provenance_comment, AUTO_SECTION_NAME};
 use nrr_shared::preset_parser::{
     carries_retired_block_flag, is_disabled_rule_value, is_syntax_hint_line, parse_section_header,
-    split_deny, split_rule_flags, split_rule_markers, split_verify_primary, stored_rule_value,
-    unquote_program_value, without_retired_block_flag, RuleFlags,
+    split_deny, split_inline_comment, split_rule_flags, split_rule_markers, split_verify_primary,
+    stored_rule_value, unquote_program_value, without_retired_block_flag, without_rule_flags,
+    RuleFlags,
 };
 use nrr_shared::rule_value_class::{classify_rule_value, rule_type_from_slug, RuleValueClass};
 
 use crate::rule_value_class::misplaced_target_type;
-use crate::rules_table::RuleType;
+use crate::rules_table::{value_is_ipv6_literal, RuleType};
 
 /// Lines read; the rest stay in the field.
 pub const MAX_LINES: usize = 1000;
@@ -396,15 +397,21 @@ struct Planner<'a> {
     adding: usize,
 }
 
+/// Which rule a line names: its type and value, without `+children` /
+/// `+override` — `x.exe +override` is `x.exe` with a request attached, not a
+/// second rule beside it.
+fn rule_identity(rule_type: &str, value: &str) -> String {
+    format!("{rule_type}|{}", without_rule_flags(value).to_lowercase())
+}
+
 impl<'a> Planner<'a> {
     fn new(input: &'a BulkInput<'a>) -> Self {
         let mut existing_key = HashMap::new();
         let mut existing_value = HashMap::new();
         for (i, rule) in input.existing.iter().enumerate() {
-            let same = format!(
-                "{}|{}",
-                RuleType::from_slug(rule.rule_type).canonical_slug(),
-                rule.value.to_lowercase()
+            let same = rule_identity(
+                &RuleType::from_slug(rule.rule_type).canonical_slug(),
+                rule.value,
             );
             existing_key
                 .entry(format!("{same}|{}", rule.route))
@@ -457,11 +464,10 @@ impl<'a> Planner<'a> {
             (None, Some(rest)) => (rest, true),
             (None, None) => (t, false),
         };
-        let (value_part, comment) = match body.find('#') {
-            Some(at) => (&body[..at], body[at + 1..].trim()),
-            None => (body, ""),
-        };
-        let collapsed = value_part.split_whitespace().collect::<Vec<_>>().join(" ");
+        let (value_part, comment) = split_inline_comment(body);
+        let comment = comment.map_or("", str::trim);
+        // Trimmed, never collapsed: the file keeps inner spaces of a path whole.
+        let collapsed = value_part.trim().to_owned();
         if collapsed.is_empty() {
             return None;
         }
@@ -589,6 +595,15 @@ impl<'a> Planner<'a> {
                 row.status = RowStatus::Warning;
                 row.message_key = "dialog.rule.verify-deny".to_owned();
             }
+            // The check leaves over IPv4: a `?` on an IPv6 literal is dropped.
+            VerdictLevel::Valid
+                if row.verify
+                    && value_is_ipv6_literal(&RuleType::from_slug(row.rule_type), &row.value) =>
+            {
+                row.verify = false;
+                row.status = RowStatus::Warning;
+                row.message_key = "dialog.rule.verify-ipv6".to_owned();
+            }
             VerdictLevel::Valid => row.status = RowStatus::Ok,
         }
         Some(self.place(row, choice))
@@ -610,7 +625,7 @@ impl<'a> Planner<'a> {
 
     /// Where a judged row lands against the text so far and the rules there.
     fn place(&mut self, mut row: BulkRow, choice: Option<&LineChoice>) -> BulkRow {
-        let same = format!("{}|{}", row.rule_type, row.value.to_lowercase());
+        let same = rule_identity(row.rule_type, &row.value);
         let key = format!("{same}|{}", row.route);
         if let Some(&at) = self.seen.get(&key) {
             // `?x` and `x` on one route are one rule, and the plain one wins,
@@ -753,6 +768,13 @@ mod tests {
         assert_eq!(planned.bound, Some(Bound::Size));
         assert_eq!(planned.excess, 1);
         assert_eq!(planned.remaining, text);
+    }
+
+    #[test]
+    fn spaces_inside_a_program_value_are_kept_as_the_file_keeps_them() {
+        let planned = plan("--- Windows\nC:\\My  Tools\\app.exe\n", "primary");
+        let row = planned.rows.first().expect("one row");
+        assert_eq!(row.value, r"C:\My  Tools\app.exe");
     }
 
     #[test]

@@ -87,11 +87,13 @@ impl Period {
             Self::Hour => now.saturating_sub(3_600_000),
             Self::Week => now.saturating_sub(7 * 86_400_000),
             Self::Today => {
-                let offset_ms = i64::from((clock.utc_offset)(now)).saturating_mul(1000);
-                clock
-                    .local_day()
-                    .saturating_mul(86_400_000)
-                    .saturating_sub(offset_ms)
+                // The offset in force at midnight, not now: on the day the
+                // clocks change they differ, and the GUI counts from the real
+                // midnight.
+                let offset_ms = |at: i64| i64::from((clock.utc_offset)(at)).saturating_mul(1000);
+                let day_start = clock.local_day().saturating_mul(86_400_000);
+                let guess = day_start.saturating_sub(offset_ms(now));
+                day_start.saturating_sub(offset_ms(guess))
             }
         }
     }
@@ -1139,4 +1141,35 @@ fn detail_lines(texts: &Texts, e: &ConnTraceEntryDto, kept: Option<&(u64, i64)>)
         texts.get(keys::TRACE_WHY)
     )));
     lines
+}
+
+#[cfg(test)]
+mod period_tests {
+    use super::*;
+
+    /// 2024-03-31T01:00Z, when central Europe moves from UTC+1 to UTC+2.
+    const SPRING_FORWARD: i64 = 1_711_846_800_000;
+
+    fn central_europe(ms: i64) -> i32 {
+        if ms < SPRING_FORWARD {
+            3_600
+        } else {
+            7_200
+        }
+    }
+
+    /// Noon local time on the day of the change.
+    fn noon_after_the_change() -> i64 {
+        1_711_879_200_000
+    }
+
+    #[test]
+    fn today_starts_at_the_real_local_midnight_on_the_day_the_clocks_change() {
+        let clock = Clock {
+            now_ms: noon_after_the_change,
+            utc_offset: central_europe,
+        };
+        // 00:00 at UTC+1, the offset still in force at midnight.
+        assert_eq!(Period::Today.start_ms(&clock), 1_711_839_600_000);
+    }
 }

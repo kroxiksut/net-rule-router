@@ -171,6 +171,7 @@ GroupBox {
             spacing: root.uiTheme.spacingSm
             ThemedTextField {
                 id: userPresetsDirField
+                accessibleLabel: root.tr("settings.presets.user-folder.title", "My rule sets")
                 theme: root.uiTheme
                 Layout.fillWidth: true
                 readOnly: true

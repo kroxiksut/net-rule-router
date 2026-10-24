@@ -15,19 +15,6 @@ use crate::system_dns::NoticeStep;
 /// `vEthernet (WSL (Hyper-V firewall))` on newer builds. Lower case.
 const WSL_ADAPTER_PREFIX: &str = "vethernet (wsl";
 
-/// The bridges Linux container and VM managers create: Docker (`docker0`,
-/// `br-<id>`), libvirt, LXC, LXD, Incus and Podman. Exact case: Linux names.
-const LINUX_BRIDGE_PREFIXES: [&str; 8] = [
-    "docker",
-    "br-",
-    "virbr",
-    "lxcbr",
-    "lxdbr",
-    "incusbr",
-    "cni-podman",
-    "podman",
-];
-
 /// Whether an adapter `name` is a network the computer forwards for
 /// (`isForwardingAdapterName`).
 pub fn is_forwarding_adapter_name(name: &str) -> bool {
@@ -35,7 +22,7 @@ pub fn is_forwarding_adapter_name(name: &str) -> bool {
         .as_bytes()
         .get(..WSL_ADAPTER_PREFIX.len())
         .is_some_and(|head| head.eq_ignore_ascii_case(WSL_ADAPTER_PREFIX.as_bytes()));
-    wsl || LINUX_BRIDGE_PREFIXES.iter().any(|p| name.starts_with(p))
+    wsl || nrr_shared::is_linux_bridge_name(name)
 }
 
 /// Whether any of the adapter `names` is such a network (`forwardingPresent`).

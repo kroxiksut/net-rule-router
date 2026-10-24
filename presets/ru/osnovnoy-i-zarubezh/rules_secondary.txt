@@ -66,6 +66,7 @@ facebook.*
 *.reddit.com
 *.redditmedia.com
 *.redditstatic.com
+*.redditmail.com
 *.replicate.com
 *.runwayml.com
 *.sc-cdn.net
@@ -109,11 +110,30 @@ whatsapp.*
 *.qt.io  # Developer and IT services measured as unreachable from this country
 *.releases.hashicorp.com  # Developer and IT services measured as unreachable from this country
 *.sentry.io  # Developer and IT services measured as unreachable from this country
+
+*.atl-paas.net  # Atlassian services refuse users in this country
+*.atlassian-3p.com  # Atlassian services refuse users in this country
+*.atlassian-dev.net  # Atlassian services refuse users in this country
+*.atlassian.com  # Atlassian services refuse users in this country
+*.atlassian.net  # Atlassian services refuse users in this country
+*.bitbucket.io  # Atlassian services refuse users in this country
+*.bitbucket.org  # Atlassian services refuse users in this country
+*.jira.com  # Atlassian services refuse users in this country
+*.loom.com  # Atlassian services refuse users in this country
+*.opsgenie.com  # Atlassian services refuse users in this country
+*.ss-inf.net  # Atlassian services refuse users in this country
+*.statuspage.io  # Atlassian services refuse users in this country
+*.teamworkgraph.ai  # Atlassian services refuse users in this country
+*.teamworkgraph.com  # Atlassian services refuse users in this country
+*.trello.com  # Atlassian services refuse users in this country
+*.trellocdn.com  # Atlassian services refuse users in this country
 autodesk.*  # Design and engineering software unavailable from this country
 
 --- Windows
 Cursor.exe
+Loom.exe  # Atlassian services refuse users in this country
 MaintenanceTool.exe  # Qt installer and updater (Qt account and downloads are refused from this country)
+SourceTree.exe  # Atlassian services refuse users in this country
 WhatsAp*.exe
 Windsurf.exe
 aqua.exe

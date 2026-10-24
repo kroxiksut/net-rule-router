@@ -529,7 +529,12 @@ type SignalCallback = Box<dyn Fn(LogindSignal) + Send>;
 struct Connection {
     frames: Box<dyn std::io::Read + Send>,
     interrupt: Interrupt,
+    /// Edges read while the setup calls waited for their answers.
+    early: Vec<LogindSignal>,
 }
+
+/// Edges kept from the setup calls; a burst past it is the periodic checks'.
+const MAX_EARLY_SIGNALS: usize = 32;
 
 /// A bus restart takes seconds; the periodic presence checks cover the gap.
 const RECONNECT_BACKOFF: Backoff = Backoff {
@@ -577,11 +582,49 @@ fn read_signals(
             Ok(true) => {}
             Err(e) => return e,
         }
-        let signal = parse_message(&buf).and_then(|fields| decode_logind_signal(&fields));
-        if let Some(signal) = signal.filter(|s| members.contains(&s.member())) {
-            on_signal(signal);
+        if let Some(signal) = parse_message(&buf).and_then(|fields| decode_logind_signal(&fields)) {
+            deliver(signal, members, on_signal);
         }
     }
+}
+
+fn deliver(signal: LogindSignal, members: &[&'static str], on_signal: &SignalCallback) {
+    if members.contains(&signal.member()) {
+        on_signal(signal);
+    }
+}
+
+/// Read until the bus driver answers call `serial`, at most `max_messages`
+/// frames: `Some(Ok(answer))`, `Some(Err(()))` for a refusal, `None` for no
+/// answer. A logind edge read meanwhile is kept in `early`: once a match is
+/// in, its signals may arrive ahead of the answers still awaited.
+fn await_reply<R: std::io::Read + ?Sized>(
+    stream: &mut R,
+    serial: u32,
+    max_messages: usize,
+    early: &mut Vec<LogindSignal>,
+) -> std::io::Result<Option<Result<bool, ()>>> {
+    let mut buf = Vec::new();
+    for _ in 0..max_messages {
+        if !read_frame(stream, &mut buf)? {
+            continue;
+        }
+        let Some(fields) = parse_message(&buf) else {
+            continue;
+        };
+        if let Some(signal) = decode_logind_signal(&fields) {
+            if early.len() < MAX_EARLY_SIGNALS {
+                early.push(signal);
+            }
+            continue;
+        }
+        match reply_to(fields, serial) {
+            None => continue,
+            Some(Ok(reply)) => return Ok(Some(Ok(body_bool(&reply).unwrap_or(true)))),
+            Some(Err(())) => return Ok(Some(Err(()))),
+        }
+    }
+    Ok(None)
 }
 
 /// Follow the subscription across bus restarts until `stop`. Only signals
@@ -601,10 +644,14 @@ fn run_reconnecting(
         if let Some(Connection {
             mut frames,
             interrupt,
+            early,
         }) = connection.take()
         {
             if !stop.arm(interrupt) {
                 return;
+            }
+            for signal in early {
+                deliver(signal, members, on_signal);
             }
             let ended = read_signals(frames.as_mut(), members, on_signal);
             stop.disarm();
@@ -769,17 +816,25 @@ mod watch {
         authenticate(&mut stream)?;
 
         let mut serial = 0u32;
-        call(&mut stream, &mut serial, "Hello", None)?;
+        let mut early = Vec::new();
+        call(&mut stream, &mut serial, "Hello", None, &mut early)?;
         for member in members {
             call(
                 &mut stream,
                 &mut serial,
                 "AddMatch",
                 Some(&match_rule(member)),
+                &mut early,
             )?;
         }
         // Asked after the matches, so an edge between the two is not lost.
-        let logind_running = call(&mut stream, &mut serial, "NameHasOwner", Some(LOGIND_NAME))?;
+        let logind_running = call(
+            &mut stream,
+            &mut serial,
+            "NameHasOwner",
+            Some(LOGIND_NAME),
+            &mut early,
+        )?;
         // A systemd boot gets logind even when it is not up yet: the match
         // follows the name to whoever takes it.
         if !logind_running && !systemd_booted() {
@@ -798,6 +853,7 @@ mod watch {
             interrupt: Box::new(move || {
                 let _ = socket.shutdown(std::net::Shutdown::Both);
             }),
+            early,
         })
     }
 
@@ -837,37 +893,29 @@ mod watch {
     }
 
     /// Send a bus-driver call and wait for its answer: `Hello` and `AddMatch`
-    /// only need to succeed, `NameHasOwner` answers with a boolean.
+    /// only need to succeed, `NameHasOwner` answers with a boolean. Edges read
+    /// meanwhile land in `early`.
     fn call(
         stream: &mut UnixStream,
         serial: &mut u32,
         member: &'static str,
         arg: Option<&str>,
+        early: &mut Vec<LogindSignal>,
     ) -> Result<bool, PlatformError> {
         *serial += 1;
         stream
             .write_all(&bus_call(*serial, member, arg))
             .map_err(|e| transient("call the system bus", e))?;
-        let mut buf = Vec::new();
-        for _ in 0..SETUP_MAX_MESSAGES {
-            if !read_frame(stream, &mut buf).map_err(|e| transient("read the system bus", e))? {
-                continue;
-            }
-            let Some(fields) = parse_message(&buf) else {
-                continue;
-            };
-            match reply_to(fields, *serial) {
-                None => continue,
-                Some(Ok(reply)) => return Ok(body_bool(&reply).unwrap_or(true)),
-                Some(Err(())) => {
-                    return Err(PlatformError::Transient {
-                        operation: "call the system bus",
-                        detail: format!("{member} was refused"),
-                    })
-                }
-            }
+        match await_reply(stream, *serial, SETUP_MAX_MESSAGES, early)
+            .map_err(|e| transient("read the system bus", e))?
+        {
+            Some(Ok(answer)) => Ok(answer),
+            Some(Err(())) => Err(PlatformError::Transient {
+                operation: "call the system bus",
+                detail: format!("{member} was refused"),
+            }),
+            None => Err(transient("call the system bus", "no reply")),
         }
-        Err(transient("call the system bus", "no reply"))
     }
 }
 
@@ -1171,6 +1219,7 @@ mod tests {
             interrupt: Box::new(move || {
                 held.lock().expect("not poisoned").take();
             }),
+            early: Vec::new(),
         }
     }
 
@@ -1310,6 +1359,61 @@ mod tests {
         assert_eq!(
             decode(&buf),
             Some(LogindSignal::PrepareForSleep { starting: false })
+        );
+    }
+
+    /// A sign-in that lands between the matches and the last setup answer is
+    /// kept and delivered first, not read past as "not our reply".
+    #[test]
+    fn an_edge_read_during_setup_is_delivered_first() {
+        let reply = encode_message(
+            METHOD_RETURN,
+            9,
+            &[
+                (FIELD_REPLY_SERIAL, FieldValue::Serial(4)),
+                (FIELD_SENDER, FieldValue::Text(BUS_NAME)),
+                (FIELD_SIGNATURE, FieldValue::Signature("b")),
+            ],
+            &bool_body(1, false),
+            false,
+        );
+        let mut bytes = user_new_frame();
+        bytes.extend(reply);
+        let mut early = Vec::new();
+        let answer =
+            await_reply(&mut std::io::Cursor::new(bytes), 4, 8, &mut early).expect("readable");
+        assert_eq!(answer, Some(Ok(true)));
+        assert_eq!(early, [LogindSignal::UserNew]);
+
+        let (seen_tx, seen_rx) = mpsc::channel();
+        let on_signal: SignalCallback = Box::new(move |signal| {
+            let _ = seen_tx.send(signal);
+        });
+        let stop = StopSignal::default();
+        let mut setup = connection(vec![wake_frame()], false);
+        setup.early = early;
+        let mut connect = || -> Result<Connection, PlatformError> {
+            stop.stop();
+            Err(PlatformError::Transient {
+                operation: "connect to the system bus",
+                detail: "done".into(),
+            })
+        };
+        run_reconnecting(
+            Some(setup),
+            &mut connect,
+            &[PREPARE_FOR_SLEEP, USER_NEW],
+            &on_signal,
+            &stop,
+            FAST,
+        );
+        let seen: Vec<LogindSignal> = seen_rx.try_iter().collect();
+        assert_eq!(
+            seen,
+            [
+                LogindSignal::UserNew,
+                LogindSignal::PrepareForSleep { starting: false }
+            ]
         );
     }
 }

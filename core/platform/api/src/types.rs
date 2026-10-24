@@ -288,6 +288,14 @@ pub fn is_service_account_sid(principal: &str) -> bool {
         || principal.starts_with("S-1-5-80-")
 }
 
+/// Whether `sid` names a person: a local or domain account (`S-1-5-21-…`)
+/// or a cloud (Entra ID) account (`S-1-12-1-…`). The one definition every
+/// "is this a signed-in user" filter uses; service identities never match.
+#[must_use]
+pub fn is_user_account_sid(sid: &str) -> bool {
+    sid.starts_with("S-1-5-21-") || sid.starts_with("S-1-12-1-")
+}
+
 /// Who an ALE filter applies to, read from [`WfpFilterSpec::user_sid`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum WfpPrincipal<'a> {
@@ -693,6 +701,24 @@ mod service_account_tests {
         }
         for sid in ["S-1-5-21-1-2-3-1001", "S-1-12-1-5", "", "unix:uid:0"] {
             assert!(!is_service_account_sid(sid), "{sid}");
+        }
+    }
+
+    #[test]
+    fn local_domain_and_cloud_accounts_are_people() {
+        for sid in ["S-1-5-21-1-2-3-1001", "S-1-12-1-1-2-3-4"] {
+            assert!(is_user_account_sid(sid), "{sid}");
+        }
+        for sid in [
+            "S-1-5-18",
+            "S-1-5-19",
+            "S-1-5-20",
+            "S-1-5-80-1",
+            "S-1-5-6",
+            "",
+            "S-1-12-",
+        ] {
+            assert!(!is_user_account_sid(sid), "{sid}");
         }
     }
 }

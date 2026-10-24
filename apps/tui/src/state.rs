@@ -114,6 +114,10 @@ pub struct AppState {
     pub system_dns_notice_raised: bool,
     /// The notice that this user's saved rules do not read is up.
     pub rules_book_notice_raised: bool,
+    /// The notice that a rule set changed outside the app was refused is up.
+    pub revision_integrity_raised: bool,
+    /// Selective routing over a VPN-like adapter has been explained this run.
+    pub vpn_split_told: bool,
     /// The notice that a work VPN lets only its own DNS answer is up.
     pub dns_foreign_notice_raised: bool,
     /// The service has been seen running since this program started.
@@ -160,6 +164,9 @@ pub struct AppState {
     /// Something the service reports in the snapshot (conflicts, enforcement)
     /// changed under this session; the loop reads the snapshot again.
     pub snapshot_refresh_due: bool,
+    /// Since when the snapshots have said the service holds rules but applies
+    /// none; the Status line waits for it to hold.
+    pub policy_idle_since: Option<Instant>,
     /// "Restore my settings": what a service that lost them lacks.
     pub restore: crate::restore::RestoreState,
     /// The Settings screen's sections, what they read and the terminal's own
@@ -192,6 +199,8 @@ impl AppState {
             traffic_carried: None,
             system_dns_notice_raised: false,
             rules_book_notice_raised: false,
+            revision_integrity_raised: false,
+            vpn_split_told: false,
             dns_foreign_notice_raised: false,
             service_was_running: false,
             service_loss_raised: false,
@@ -218,6 +227,7 @@ impl AppState {
             rules: crate::screens::rules::RulesState::default(),
             language_change: None,
             snapshot_refresh_due: false,
+            policy_idle_since: None,
             restore: crate::restore::RestoreState::default(),
             settings: crate::screens::settings::SettingsState::default(),
             vpn_trust: crate::vpn_trust::VpnTrustState::default(),
@@ -279,6 +289,10 @@ impl AppState {
             // read on reconnect brings them up to date.
             BackendEvent::Link(link) => {
                 let reconnected = link.is_connected() && !self.link.is_connected();
+                if !link.is_connected() {
+                    // A service coming back gets the whole settle window again.
+                    self.policy_idle_since = None;
+                }
                 self.link = link;
                 let loss = self.service_loss_reading(texts, now);
                 if reconnected {
@@ -323,10 +337,13 @@ impl AppState {
                     .filter(|report| report.carried)
                     .map(|report| report.link.clone());
                 let rules_book_unreadable = snapshot.rules_book_unreadable;
+                let revision_rejected = crate::screens::revision_rejected(&snapshot);
+                let vpn_split = crate::screens::vpn_split(&snapshot);
                 self.vpn_trust.pending = snapshot.pending_vpn_clients.clone();
                 self.vpn_gateway_trust.pending = snapshot.pending_vpn_gateways.clone();
                 self.vpn_gateway_trust.confirmed = snapshot.confirmed_vpn_gateways.clone();
                 self.snapshot = Some(*snapshot);
+                crate::screens::track_policy_idle(self, now);
                 crate::screens::rules::overrides::on_snapshot(self);
                 self.fetch_error = None;
                 crate::screens::wizard::snapshot_arrived(self);
@@ -350,6 +367,8 @@ impl AppState {
                     .chain(self.traffic_carried_changed(carried, texts, now))
                     .chain(self.system_dns_reading(dns_not_restored, texts, now))
                     .chain(self.rules_book_reading(rules_book_unreadable, texts, now))
+                    .chain(self.revision_integrity_reading(revision_rejected, texts, now))
+                    .chain(self.vpn_split_reading(vpn_split, texts, now))
                     .chain(self.dns_foreign_reading(dns_foreign_only, texts, now))
                     .chain(crate::forwarded_traffic::reading(self, texts, now))
                 {
@@ -796,6 +815,52 @@ impl AppState {
         Vec::new()
     }
 
+    /// A rule set refused for changing outside the app: said when the alert
+    /// appears; the status keeps it standing until it is acknowledged.
+    fn revision_integrity_reading(
+        &mut self,
+        rejected: bool,
+        texts: &Texts,
+        now: Instant,
+    ) -> Vec<Effect> {
+        let was_raised = std::mem::replace(&mut self.revision_integrity_raised, rejected);
+        if !rejected || was_raised {
+            return Vec::new();
+        }
+        let mut body = texts.get(keys::REVISION_INTEGRITY);
+        body.push(' ');
+        body.push_str(&texts.get(keys::SEE_DIAGNOSTICS_HINT));
+        self.notify(
+            NoticeLevel::Warning,
+            texts.get(keys::REVISION_INTEGRITY_TITLE),
+            body,
+            now,
+        )
+    }
+
+    /// Explained once a run: it describes routing working as asked.
+    fn vpn_split_reading(
+        &mut self,
+        split: Option<(String, usize)>,
+        texts: &Texts,
+        now: Instant,
+    ) -> Vec<Effect> {
+        let Some((name, count)) = split.filter(|_| !self.vpn_split_told) else {
+            return Vec::new();
+        };
+        self.vpn_split_told = true;
+        let body = nrr_client_logic::placeholders::fill_placeholders(
+            &texts.counted(keys::VPN_SPLIT_COUNTED, count),
+            [("name", name.as_str())],
+        );
+        self.notify(
+            NoticeLevel::Info,
+            texts.get(keys::VPN_SPLIT_TITLE),
+            body,
+            now,
+        )
+    }
+
     /// A work VPN that lets only its own DNS answer: said when it appears, not
     /// repeated while it lasts.
     fn dns_foreign_reading(
@@ -915,7 +980,13 @@ impl AppState {
             }
             return Vec::new();
         }
-        let (title, body) = enforcement_text(&status, &role, &candidates, texts);
+        let leak_protection = self
+            .snapshot
+            .as_ref()
+            .and_then(|snapshot| snapshot.route_policy.as_ref())
+            .map_or("", |policy| policy.leak_protection.as_slug());
+        let (title, body) =
+            enforcement_text_for(&status, &role, &candidates, leak_protection, texts);
         // A switched-off tunnel is the one fault here the user may silence.
         let routine = status == "secondary-down" && role != "primary";
         self.enforcement_down.insert(
@@ -1002,6 +1073,18 @@ pub fn enforcement_text(
     candidates: &[String],
     texts: &Texts,
 ) -> (String, String) {
+    enforcement_text_for(status, role, candidates, "", texts)
+}
+
+/// [`enforcement_text`] with the user's leak protection, which decides what a
+/// tunnel being down means for their traffic.
+pub fn enforcement_text_for(
+    status: &str,
+    role: &str,
+    candidates: &[String],
+    leak_protection: &str,
+    texts: &Texts,
+) -> (String, String) {
     let list = shown_list(candidates);
     let with_list = |title: Key, body: Key, empty: Key| {
         let body = if candidates.is_empty() {
@@ -1051,7 +1134,18 @@ pub fn enforcement_text(
         ),
         "secondary-down" => (
             texts.get(keys::ENF_SECONDARY_DOWN_TITLE),
-            texts.get(keys::ENF_SECONDARY_DOWN_BODY),
+            texts.get(
+                match nrr_client_logic::enforcement_notice::secondary_down_body_key(leak_protection)
+                {
+                    "notifications.enforcement.secondary-down.body-off" => {
+                        keys::ENF_SECONDARY_DOWN_BODY_OFF
+                    }
+                    "notifications.enforcement.secondary-down.body-everything" => {
+                        keys::ENF_SECONDARY_DOWN_BODY_EVERYTHING
+                    }
+                    _ => keys::ENF_SECONDARY_DOWN_BODY,
+                },
+            ),
         ),
         "adapters-unreadable" => (
             texts.get(keys::ENF_UNREADABLE_TITLE),
@@ -1068,7 +1162,7 @@ pub fn enforcement_text(
 mod tests {
     use super::*;
     use crate::testing::Fixture;
-    use nrr_shared::ipc_payloads::TrafficCarriedDto;
+    use nrr_shared::ipc_payloads::{BehaviorModeDto, TrafficCarriedDto};
 
     fn texts() -> Texts {
         Texts::load(Some("en"), &[])
@@ -1173,6 +1267,18 @@ mod tests {
         assert!(title.contains("Ethernet"), "{title}");
         assert!(!body.is_empty());
         let (plain, _) = enforcement_text("no-policy", "", &[], &t);
+        let held = |level| enforcement_text_for("secondary-down", "secondary", &[], level, &t).1;
+        assert_eq!(held("sites"), t.get(keys::ENF_SECONDARY_DOWN_BODY));
+        assert_eq!(
+            held("off"),
+            t.get(keys::ENF_SECONDARY_DOWN_BODY_OFF),
+            "nothing is held"
+        );
+        assert_eq!(
+            held("everything"),
+            t.get(keys::ENF_SECONDARY_DOWN_BODY_EVERYTHING),
+            "the whole internet waits"
+        );
         assert!(!plain.contains("Ethernet"));
         assert_ne!(plain, title);
     }
@@ -1813,6 +1919,91 @@ mod tests {
             app.apply(enforcement("adapter-gone", "primary"), &t, Instant::now()),
             vec![Effect::Bell]
         );
+    }
+
+    /// A rule set refused for changing outside the app reaches the feed once
+    /// per appearance, not on every snapshot that still lists the alert.
+    #[test]
+    fn a_refused_rule_set_is_told_once_while_its_alert_stays_open() {
+        let t = texts();
+        let mut app = AppState::new(ScreenId::Status, false);
+        app.apply(BackendEvent::Link(Link::Connected), &t, Instant::now());
+        let with_alert = |state: &str| {
+            let mut snapshot = Fixture::healthy().snapshot();
+            snapshot.diagnostics.active_alerts =
+                vec![nrr_shared::diagnostics_dto::SecurityAlertDto {
+                    alert_id: "a-1".into(),
+                    kind: "untrusted_revision_rejected".into(),
+                    state: state.into(),
+                    created_at: 0,
+                    updated_at: 0,
+                    reason_code: String::new(),
+                    raised_file: String::new(),
+                    requires_action: true,
+                }];
+            BackendEvent::Snapshot(Box::new(snapshot))
+        };
+
+        app.apply(with_alert("active"), &t, Instant::now());
+        app.apply(with_alert("active"), &t, Instant::now());
+        assert_eq!(app.notices.len(), 1, "{:?}", app.notices);
+        assert_eq!(app.notices[0].level, NoticeLevel::Warning);
+        assert_eq!(app.notices[0].title, "Rule set changed outside the app");
+        assert!(app.notices[0].body.contains("Diagnostics and logs"));
+
+        app.apply(with_alert("acknowledged"), &t, Instant::now());
+        app.apply(with_alert("active"), &t, Instant::now());
+        assert_eq!(app.notices.len(), 2, "a new appearance is told again");
+    }
+
+    /// Selective routing over a VPN-like adapter is routing as asked: told
+    /// once a run, and only while the rules actually go through it.
+    #[test]
+    fn selective_routing_over_a_vpn_is_explained_once_a_run() {
+        let t = texts();
+        let mut app = AppState::new(ScreenId::Status, false);
+        app.apply(BackendEvent::Link(Link::Connected), &t, Instant::now());
+        let split = |vpn: &str, rules: u32, mode: BehaviorModeDto| {
+            let mut snapshot = Fixture::healthy().snapshot();
+            snapshot.adapters.rows[1]
+                .derived_assessment
+                .vpn_tunnel_likelihood = vpn.into();
+            snapshot.active_secondary_rule_count = Some(rules);
+            if let Some(policy) = snapshot.route_policy.as_mut() {
+                policy.mode = mode;
+            }
+            BackendEvent::Snapshot(Box::new(snapshot))
+        };
+        let full = BehaviorModeDto::PreferSecondaryWhenAvailable;
+        for quiet in [
+            split("unlikely", 2, BehaviorModeDto::PreferPrimary),
+            split("likely", 0, BehaviorModeDto::PreferPrimary),
+            split("likely", 2, full),
+        ] {
+            app.apply(quiet, &t, Instant::now());
+        }
+        assert!(app.notices.is_empty(), "{:?}", app.notices);
+
+        app.apply(
+            split("possible", 2, BehaviorModeDto::PreferPrimary),
+            &t,
+            Instant::now(),
+        );
+        app.apply(
+            split("likely", 3, BehaviorModeDto::PreferPrimary),
+            &t,
+            Instant::now(),
+        );
+        assert_eq!(app.notices.len(), 1, "{:?}", app.notices);
+        assert_eq!(app.notices[0].level, NoticeLevel::Info);
+        assert!(
+            app.notices[0]
+                .body
+                .contains("\"Example Tunnel — Example Network Adapter\""),
+            "{:?}",
+            app.notices[0]
+        );
+        assert!(app.notices[0].body.contains("your 2 rules go through it"));
     }
 
     fn snapshot_reporting(reports: &[(&str, &str)]) -> BackendEvent {

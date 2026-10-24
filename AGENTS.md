@@ -43,6 +43,8 @@ The gate wraps the standard `cargo fmt --check` / `cargo clippy -D warnings` / `
 
 A `.ps1` holding any non-ASCII character is saved as UTF-8 with BOM: Windows PowerShell 5.1 reads a BOM-less file as ANSI, and nothing in the gate catches it.
 
+**HARD RULE — tests are written from a failure.** A test names what can break and how — hostile bytes, a failing port, a race, a clock jump, a full disk, a second user, a tunnel that drops or comes back on a new adapter — and asserts the promise to the user, not what the code does today. A test that breaks the code is fixed in the code; an expectation changes only when the owner changes the expectation, never to turn the gate green. A test that catches no breakage is deleted, not kept as coverage. A fix comes with its test written first, and that test is seen failing on the old code: a test that never failed proves nothing.
+
 ## Architecture
 
 ### Runtime Decomposition

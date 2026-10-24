@@ -52,8 +52,10 @@ const SIBLING_MAX_PATHS: usize = 12;
 const OWNERSHIP_CACHE_CAP: usize = 256;
 
 /// Windows [`AppPathResolver`]: unions three sources (App Paths registry,
-/// running-process images, install-root walks), case-insensitively dedups,
-/// keeps only existing exe files, and caches the result briefly.
+/// running-process images, install-root walks), case-insensitively dedups and
+/// keeps only existing exe files. Each source keeps its own clock: the
+/// registry answer is remembered briefly, the process list for a pass, the
+/// walks for long and refreshed in the background.
 pub struct WindowsAppPathResolver {
     cache: Arc<ResolveCache>,
     /// The bounded disk walks, remembered far longer than the answer they
@@ -73,9 +75,10 @@ pub struct WindowsAppPathResolver {
 }
 
 impl WindowsAppPathResolver {
-    /// Resolve-cache TTL. 30 s keeps `resolve` off the registry/process/FS
-    /// scan on back-to-back policy recomputes while staying fresh enough to
-    /// pick up an app the user just installed or launched.
+    /// Registry-answer TTL. 30 s keeps `resolve` off the registry on
+    /// back-to-back policy recomputes while staying fresh enough to pick up an
+    /// app the user just installed. A program just launched is seen through
+    /// the process list, which is never held this long.
     pub const DEFAULT_CACHE_TTL: Duration = Duration::from_secs(30);
 
     /// How long a DISK WALK is remembered — far longer than the resolve
@@ -169,11 +172,15 @@ impl WindowsAppPathResolver {
         self.walks.known_at(key, std::time::Instant::now())
     }
 
-    /// Union of every source, with the walks served from their own cache.
-    fn resolve_uncached(&self, key: &str) -> Vec<PathBuf> {
+    /// Union of every source, each served from its own cache. The process
+    /// list is merged on every call: inside the registry's 30 s a program just
+    /// launched would otherwise get no filter for its first connections.
+    fn resolve_now(&self, key: &str) -> Vec<PathBuf> {
         let is_glob = key.contains('*');
 
-        let mut out = resolve_from_app_paths(key, is_glob);
+        let mut out = self
+            .cache
+            .get_or_compute(key, || resolve_from_app_paths(key, is_glob));
         out.extend(matching_images(
             key,
             &self.processes.at(std::time::Instant::now()),
@@ -217,8 +224,7 @@ impl AppPathResolver for WindowsAppPathResolver {
         if key.is_empty() {
             return Vec::new();
         }
-        self.cache
-            .get_or_compute(&key, || self.resolve_uncached(&key))
+        self.resolve_now(&key)
     }
 
     fn sibling_executables(&self, exe: &Path) -> Vec<PathBuf> {
@@ -900,6 +906,38 @@ mod tests {
         // "%%" collapses to a literal '%'.
         assert_eq!(expand_env("a%%b"), "a%b");
         std::env::remove_var("NRR_APR_TEST_ROOT");
+    }
+
+    /// A rule naming a program reaches it from its first connections: the
+    /// name resolves to the running image as soon as the process list is
+    /// read again, however recently the name was resolved before.
+    #[test]
+    fn a_program_launched_after_a_resolve_is_found_on_the_next_pass() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let name = format!("nrr-probe-{}.exe", std::process::id());
+        let image = dir.path().join(&name);
+        let system = std::env::var("SystemRoot").unwrap_or_else(|_| r"C:\Windows".into());
+        std::fs::copy(Path::new(&system).join(r"System32\PING.EXE"), &image).expect("copy");
+
+        let resolver = WindowsAppPathResolver::new();
+        assert!(resolver.resolve(&name).is_empty(), "not running yet");
+        let mut child = std::process::Command::new(&image)
+            .args(["-n", "30", "127.0.0.1"])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("launch");
+        std::thread::sleep(WindowsAppPathResolver::PROCESS_LIST_TTL + Duration::from_millis(300));
+        let found = resolver.resolve(&name);
+        let _ = child.kill();
+        let _ = child.wait();
+        assert!(
+            found.iter().any(|p| p
+                .file_name()
+                .is_some_and(|n| n.to_string_lossy().eq_ignore_ascii_case(&name))),
+            "{found:?}"
+        );
     }
 
     #[test]

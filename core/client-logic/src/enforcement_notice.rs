@@ -15,3 +15,15 @@ pub const NO_POLICY: &str = "no-policy";
 pub fn restore_is_news(previous: &str) -> bool {
     previous != NO_POLICY
 }
+
+/// The locale key that says what happens while the additional connection is
+/// down, by the user's leak protection (`enforcementSecondaryDownBodyKey`):
+/// with it off the rules' sites go over the main one, under `everything` the
+/// whole internet waits. An unknown level keeps the `sites` wording.
+pub fn secondary_down_body_key(leak_protection: &str) -> &'static str {
+    match leak_protection {
+        "off" => "notifications.enforcement.secondary-down.body-off",
+        "everything" => "notifications.enforcement.secondary-down.body-everything",
+        _ => "notifications.enforcement.secondary-down.body",
+    }
+}

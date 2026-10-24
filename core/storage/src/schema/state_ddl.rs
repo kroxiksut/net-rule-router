@@ -1604,6 +1604,13 @@ pub const STATE_DB_V82_DDL: &[&str] = &["CREATE TABLE IF NOT EXISTS vpn_gateway_
 
 /// A pause can end on its own: at a wall-clock moment, or with the service's
 /// next start. Existing pauses keep lasting until the user lifts them.
+/// Shared addresses stay pinned by default: a page can point a name of its
+/// own at a rule host's address, and with the smart exemption one such name
+/// took that address out of the leak protection. Every row turns strict once;
+/// the user may turn it off again.
+pub const STATE_DB_V84_DDL: &[&str] =
+    &["UPDATE secondary_block_policy SET kill_switch_strict_shared_ips = 1"];
+
 pub const STATE_DB_V83_DDL: &[&str] = &[
     "ALTER TABLE routing_pause_state ADD COLUMN resumes_at_ms INTEGER",
     "ALTER TABLE routing_pause_state ADD COLUMN until_restart INTEGER NOT NULL DEFAULT 0 CHECK(until_restart IN (0, 1))",

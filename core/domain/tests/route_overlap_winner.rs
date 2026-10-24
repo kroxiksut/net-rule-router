@@ -239,3 +239,49 @@ fn every_reported_address_winner_is_the_engines_winner() {
         );
     }
 }
+
+fn route_of(route: &str) -> RouteRole {
+    if route == "primary" {
+        RouteRole::Primary
+    } else {
+        RouteRole::Secondary
+    }
+}
+
+/// Under "cover subdomains" a name beside the other route's suffix of the same
+/// name keeps only its own host: the screen reports a nesting, and the engine
+/// routes the name by the exact rule and a subdomain by the suffix.
+#[test]
+fn under_coverage_the_screen_agrees_with_the_engine() {
+    for (primary, secondary) in [
+        (exact("P1", "site.example"), suffix("S1", "site.example")),
+        (suffix("P1", "site.example"), exact("S1", "site.example")),
+    ] {
+        let dto = CanonicalRulesJsonV1 {
+            schema_version: RULES_JSON_SCHEMA_VERSION,
+            primary: vec![primary],
+            secondary: vec![secondary],
+        };
+        let found = find_route_overlaps(&dto, true);
+        assert_eq!(found.len(), 1, "{found:?}");
+        let overlap = &found[0];
+        assert_eq!(overlap.winner.rule_type, "exact-fqdn", "{overlap:?}");
+        let book = decode(dto.clone(), HostPlatform::Windows)
+            .expect("book decodes")
+            .rule_book
+            .with_subdomain_coverage();
+        let engine = |host: &str| match match_sample(
+            &book,
+            Some(host),
+            None,
+            None,
+            ZonePriorityPolicy::default(),
+            RouteBehaviorMode::PreferPrimary,
+        ) {
+            RequestedRouteDecision::MatchedRoute { candidate } => candidate.route_role,
+            RequestedRouteDecision::DefaultRoute { .. } => panic!("{host} matched nothing"),
+        };
+        assert_eq!(engine("site.example"), route_of(&overlap.winner.route));
+        assert_eq!(engine("www.site.example"), route_of(&overlap.loser.route));
+    }
+}

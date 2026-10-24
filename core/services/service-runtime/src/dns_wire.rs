@@ -529,33 +529,36 @@ fn read_answer_records(packet: &[u8], mut off: usize, ancount: usize) -> Vec<Ans
     out
 }
 
+/// Longest alias chain followed. Resolvers stop well below this; the bound
+/// keeps a hostile answer full of aliases from costing a pass per record.
+const MAX_CNAME_CHAIN: usize = 16;
+
 /// The names an `A` record in this response may legitimately be an answer for:
 /// the question name plus every target reachable from it through the response's
 /// own `CNAME` records. Closed by iteration, so a server that emits the alias
 /// after the address record is handled the same as one that emits it before.
+/// Targets are decoded once: a 64 KiB answer of reverse-ordered aliases must
+/// cost a few thousand decodes, not a few million.
 fn answer_owner_closure(
     packet: &[u8],
     records: &[AnswerRr],
     qname: &str,
 ) -> std::collections::HashSet<String> {
-    let mut names = std::collections::HashSet::new();
-    names.insert(qname.to_string());
-    // Every pass adds at least one link or stops; a chain cannot be longer than
-    // the record count.
-    for _ in 0..records.len() {
+    let aliases: Vec<(&str, String)> = records
+        .iter()
+        .filter(|r| r.rtype == QTYPE_CNAME && r.rclass == CLASS_IN)
+        .filter_map(|r| {
+            let owner = r.owner.as_deref()?;
+            decode_name(packet, r.rdata_start).map(|target| (owner, target))
+        })
+        .collect();
+    let mut names = std::collections::HashSet::from([qname.to_string()]);
+    for _ in 0..MAX_CNAME_CHAIN {
         let mut grew = false;
-        for rr in records
-            .iter()
-            .filter(|r| r.rtype == QTYPE_CNAME && r.rclass == CLASS_IN)
-        {
-            let Some(owner) = rr.owner.as_deref() else {
-                continue;
-            };
-            if !names.contains(owner) {
-                continue;
-            }
-            if let Some(target) = decode_name(packet, rr.rdata_start) {
-                grew |= names.insert(target);
+        for (owner, target) in &aliases {
+            if names.contains(*owner) && !names.contains(target) {
+                names.insert(target.clone());
+                grew = true;
             }
         }
         if !grew {
@@ -1295,6 +1298,104 @@ mod tests {
             AddressResponseOutcome::Answers { addresses, min_ttl } => {
                 assert_eq!(addresses, vec![ip(100, 64, 9, 9)]);
                 assert_eq!(min_ttl, 45);
+            }
+            other => panic!("expected answers, got {other:?}"),
+        }
+    }
+
+    /// Append one `CNAME`/`IN` RR: `owner` as given, the target as a 3-letter
+    /// label plus a pointer to the suffix at `suffix_at`. 18 bytes with a
+    /// pointer owner, so a 64 KiB datagram holds ~3600 of them.
+    fn push_cname_rr(resp: &mut Vec<u8>, owner: &[u8], label: &[u8; 3], suffix_at: u16) {
+        resp.extend_from_slice(owner);
+        resp.extend_from_slice(&QTYPE_CNAME.to_be_bytes());
+        resp.extend_from_slice(&[0x00, 0x01]);
+        resp.extend_from_slice(&30u32.to_be_bytes());
+        resp.extend_from_slice(&[0x00, 0x06]); // RDLENGTH: 1 + 3 + pointer
+        resp.push(3);
+        resp.extend_from_slice(label);
+        resp.extend_from_slice(&(0xC000 | suffix_at).to_be_bytes());
+    }
+
+    fn label3(i: usize) -> [u8; 3] {
+        let a = b'a' + (i % 26) as u8;
+        let b = b'a' + ((i / 26) % 26) as u8;
+        let c = b'a' + ((i / 676) % 26) as u8;
+        [a, b, c]
+    }
+
+    /// An upstream (or an on-path spoofer with the id and question) answers with
+    /// a 64 KiB datagram of aliases: an alias chain written in reverse order so
+    /// every pass closes one link, plus thousands of aliases filed under the
+    /// question name so every pass re-reads them all. The closure must decode
+    /// each target once and stop after a bounded number of passes; re-decoding
+    /// every alias on every pass cost millions of allocations per reply and
+    /// held a resolver worker for seconds.
+    #[test]
+    fn a_reply_full_of_aliases_is_closed_in_linear_time() {
+        // Question "q.example": header 12 + name 11 + type/class 4 = 27.
+        let q = build_address_query(14, "q.example", QTYPE_A).expect("query");
+        let question_end = parse_question(&q).expect("question").question_end;
+        assert_eq!(question_end, 27);
+        let suffix_at = 14u16; // the "example" label inside the question
+        const CHAIN: usize = 800; // reverse-ordered links, all within pointer reach
+        const RR_LEN: usize = 18;
+        let total = (65_535 - question_end) / RR_LEN;
+        let mut resp = response_frame(&q, total as u16);
+        // Record j (j < CHAIN) says name_{CHAIN-1-j} -> name_{CHAIN-j}; its owner
+        // points at the target written by record j + 1, the last owner is the
+        // question name itself. Every pass therefore adds exactly one link.
+        for j in 0..CHAIN {
+            let owner: [u8; 2] = if j + 1 == CHAIN {
+                [0xC0, 0x0C]
+            } else {
+                let next_rdata = question_end + (j + 1) * RR_LEN + 12;
+                (0xC000 | next_rdata as u16).to_be_bytes()
+            };
+            push_cname_rr(&mut resp, &owner, &label3(CHAIN - j), suffix_at);
+        }
+        // Fillers under the question name: in the set from pass one onwards.
+        for i in CHAIN..total {
+            push_cname_rr(&mut resp, &[0xC0, 0x0C], &label3(CHAIN + 1 + i), suffix_at);
+        }
+        assert!(resp.len() <= 65_535, "fits one datagram: {}", resp.len());
+        let started = std::time::Instant::now();
+        let outcome = parse_address_response(14, "q.example", QTYPE_A, &resp);
+        let elapsed = started.elapsed();
+        assert_eq!(outcome, AddressResponseOutcome::NoRecords);
+        assert!(
+            elapsed < std::time::Duration::from_secs(1),
+            "closing {total} aliases took {elapsed:?}"
+        );
+    }
+
+    /// A chain as deep as the bound still reaches its address; deeper ones are
+    /// a server's problem, as every real resolver also cuts them.
+    #[test]
+    fn an_alias_chain_at_the_bound_still_reaches_its_address() {
+        let q = build_address_query(15, "q.example", QTYPE_A).expect("query");
+        let question_end = parse_question(&q).expect("question").question_end;
+        let mut resp = response_frame(&q, (MAX_CNAME_CHAIN + 1) as u16);
+        // Forward order: name_0 = question, link i: name_i -> name_{i+1}.
+        for i in 0..MAX_CNAME_CHAIN {
+            let owner: [u8; 2] = if i == 0 {
+                [0xC0, 0x0C]
+            } else {
+                let prev_rdata = question_end + (i - 1) * 18 + 12;
+                (0xC000 | prev_rdata as u16).to_be_bytes()
+            };
+            push_cname_rr(&mut resp, &owner, &label3(i + 1), 14);
+        }
+        let last_rdata = question_end + (MAX_CNAME_CHAIN - 1) * 18 + 12;
+        push_a_rr(
+            &mut resp,
+            &(0xC000 | last_rdata as u16).to_be_bytes(),
+            ip(100, 64, 1, 1),
+            45,
+        );
+        match parse_address_response(15, "q.example", QTYPE_A, &resp) {
+            AddressResponseOutcome::Answers { addresses, .. } => {
+                assert_eq!(addresses, vec![ip(100, 64, 1, 1)]);
             }
             other => panic!("expected answers, got {other:?}"),
         }

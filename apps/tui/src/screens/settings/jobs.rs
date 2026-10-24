@@ -8,18 +8,19 @@ use std::time::Duration;
 use base64::Engine as _;
 use nrr_client_logic::review::{operation_outcome, Outcome};
 use nrr_client_logic::rollback::{rollback_verdict, RollbackPhase};
-use nrr_client_logic::{route_policy, stability};
+use nrr_client_logic::{doh_resolvers, route_policy, stability};
 use nrr_ipc_client::{ipc_operation_timeout, IpcClient};
 use nrr_platform_api::service_control::ServiceControlError;
 use nrr_shared::ipc::IpcOperationName as Op;
 use nrr_shared::ipc_payloads::{
     ApplyFailurePolicyDto, BlockNoticeMuteDto, BlockNoticeMuteScopeDto,
     BlockNoticeMutesListResponse, ConnHistoryClearResponse, ConnHistoryListResponse,
-    LocalDnsSuffixesGetResponse, LocalNetworksGetResponse, LocalNetworksSetResponse,
-    LogRetentionConfigDto, LogRetentionConfigSetRequest, LogsClearResponse,
-    ProductImpactDisableDryRunResponse, RetentionSettingsDto, RetentionSettingsSetRequest,
-    RollbackTargetDto, SettingsExportFullResponse, StorageUsageDto, TrafficStatsGetResponse,
-    TrafficStatsSettingsDto,
+    DohResolverEntryDto, DohResolversGetResponse, LocalDnsSuffixesGetResponse,
+    LocalNetworksGetResponse, LocalNetworksSetResponse, LogRetentionConfigDto,
+    LogRetentionConfigSetRequest, LogsClearResponse, ProductImpactDisableDryRunResponse,
+    RetentionSettingsDto, RetentionSettingsSetRequest, RollbackTargetDto,
+    SettingsExportFullResponse, StorageUsageDto, ThirdPartyComponentsListResponse,
+    TrafficStatsGetResponse, TrafficStatsSettingsDto,
 };
 use serde::de::DeserializeOwned;
 use serde_json::{json, Map, Value};
@@ -101,6 +102,21 @@ pub fn load_policy() -> Job {
     })
 }
 
+/// Reads the live policy, then runs `then` over it: a pick that asks about
+/// protection must not decide on a level the tray changed since the section
+/// loaded. An unreadable policy keeps the one already shown.
+pub fn reread_policy_then(then: impl FnOnce(&mut AppState) + Send + 'static) -> Job {
+    job(move |client| {
+        let fresh = policy_of(client).ok();
+        Reply::new(move |app| {
+            if let Some(policy) = fresh {
+                app.settings.data.policy = Loadable::Ready(policy);
+            }
+            then(app);
+        })
+    })
+}
+
 pub fn load_local_suffixes() -> Job {
     job(|client| {
         let result = loaded(read::<LocalDnsSuffixesGetResponse>(
@@ -112,17 +128,105 @@ pub fn load_local_suffixes() -> Job {
     })
 }
 
-/// The whole list, replaced; the answer is the list as stored.
-pub fn write_local_suffixes(suffixes: Vec<String>) -> Job {
+/// The whole list, replaced; the answer is the list as stored. The list is the
+/// machine's, so the edit (`base` -> `edited`) goes over a fresh read by name.
+pub fn write_local_suffixes(base: Vec<String>, edited: Vec<String>) -> Job {
     job(move |client| {
-        let result = read::<LocalDnsSuffixesGetResponse>(
-            client,
-            Op::LocalDnsSuffixesSet,
-            json!({ "suffixes": suffixes }),
-        );
+        let result =
+            read::<LocalDnsSuffixesGetResponse>(client, Op::LocalDnsSuffixesGet, json!({}))
+                .and_then(|fresh| {
+                    let fresh: Vec<String> = fresh.suffixes.into_iter().map(|e| e.suffix).collect();
+                    read::<LocalDnsSuffixesGetResponse>(
+                        client,
+                        Op::LocalDnsSuffixesSet,
+                        json!({ "suffixes": rebase_names(&base, &edited, &fresh) }),
+                    )
+                });
         written(result, Words::Key(text::SAVED), |app, list| {
             app.settings.data.local_suffixes = Loadable::Ready(list);
             app.settings.local_suffix_new.clear();
+        })
+    })
+}
+
+fn same_name(a: &str, b: &str) -> bool {
+    a.trim().eq_ignore_ascii_case(b.trim())
+}
+
+/// `fresh` without the names the edit took out, then the names it added.
+fn rebase_names(base: &[String], edited: &[String], fresh: &[String]) -> Vec<String> {
+    let removed =
+        |n: &str| base.iter().any(|b| same_name(b, n)) && !edited.iter().any(|e| same_name(e, n));
+    let mut out: Vec<String> = fresh
+        .iter()
+        .filter(|n| !removed(n.as_str()))
+        .cloned()
+        .collect();
+    for name in edited {
+        let new = !base.iter().any(|b| same_name(b, name));
+        if new && !out.iter().any(|o| same_name(o, name)) {
+            out.push(name.clone());
+        }
+    }
+    out
+}
+
+fn to_rows(list: &[DohResolverEntryDto]) -> Vec<doh_resolvers::Resolver> {
+    list.iter()
+        .map(|e| doh_resolvers::Resolver {
+            kind: e.target_kind.clone(),
+            target: e.target.clone(),
+            comment: e.comment.clone(),
+            enabled: e.enabled,
+        })
+        .collect()
+}
+
+pub fn load_doh_resolvers() -> Job {
+    job(|client| {
+        let result = loaded(read::<DohResolversGetResponse>(
+            client,
+            Op::DohResolversGet,
+            json!({}),
+        ));
+        Reply::new(move |app| app.settings.data.doh_resolvers = result)
+    })
+}
+
+/// The whole resolver list, replaced; the answer is the list as stored. The
+/// edit (`base` -> `edited`) goes over a fresh read, as the window's save does.
+pub fn write_doh_resolvers(
+    base: Vec<DohResolverEntryDto>,
+    edited: Vec<DohResolverEntryDto>,
+) -> Job {
+    job(move |client| {
+        let result = read::<DohResolversGetResponse>(client, Op::DohResolversGet, json!({}))
+            .and_then(|fresh| {
+                let next = doh_resolvers::rebase(
+                    &to_rows(&base),
+                    &to_rows(&edited),
+                    &to_rows(&fresh.resolvers),
+                );
+                let resolvers: Vec<DohResolverEntryDto> = next
+                    .resolvers
+                    .into_iter()
+                    .map(|r| DohResolverEntryDto {
+                        target_kind: r.kind,
+                        target: r.target,
+                        comment: r.comment,
+                        enabled: r.enabled,
+                    })
+                    .collect();
+                let mut payload = json!({ "resolvers": resolvers });
+                if next.removed {
+                    payload["drop-seeded"] = json!(true);
+                }
+                read::<DohResolversGetResponse>(client, Op::DohResolversSet, payload)
+            });
+        written(result, Words::Key(text::SAVED), |app, list| {
+            app.settings.data.doh_resolvers = Loadable::Ready(list);
+            app.settings.doh_new_target.clear();
+            app.settings.doh_new_comment.clear();
         })
     })
 }
@@ -241,6 +345,17 @@ fn traffic_of(client: &dyn IpcClient, day: i64) -> Result<TrafficStatsGetRespons
     read(client, Op::TrafficStatsGet, json!({ "day": day }))
 }
 
+pub fn load_third_party() -> Job {
+    job(|client| {
+        let result = loaded(read::<ThirdPartyComponentsListResponse>(
+            client,
+            Op::ThirdPartyComponentsList,
+            json!({}),
+        ));
+        Reply::new(move |app| app.settings.data.third_party = result)
+    })
+}
+
 pub fn load_traffic(day: i64) -> Job {
     job(move |client| {
         let result = loaded(traffic_of(client, day));
@@ -346,6 +461,19 @@ fn default_mode() -> &'static str {
 /// read; a failed read sends nothing, since the defaults would switch the
 /// user's protections off.
 pub fn write_policy(changes: Map<String, Value>) -> Job {
+    write_policy_then(changes, false)
+}
+
+/// The automatic browser-history seed switched on, and one seed run now so the
+/// cache fills before the next service start — only once the service holds
+/// the setting, as the window does.
+pub fn write_auto_seed_on() -> Job {
+    let mut changes = Map::new();
+    changes.insert("browser-history-auto-seed".to_owned(), Value::Bool(true));
+    write_policy_then(changes, true)
+}
+
+fn write_policy_then(changes: Map<String, Value>, seed: bool) -> Job {
     job(move |client| {
         let mut sent = None;
         let result = (|| {
@@ -363,6 +491,9 @@ pub fn write_policy(changes: Map<String, Value>) -> Job {
             sent = Some(named);
             Ok(policy_of(client).unwrap_or(request))
         })();
+        if seed && result.is_ok() {
+            let _ = call(client, Op::SeedFromBrowserHistory, json!({}));
+        }
         written(result, Words::Key(text::SAVED), move |app, policy| {
             if let Some(sent) = &sent {
                 crate::restore::record_route_policy(app, sent);
@@ -456,10 +587,43 @@ pub fn set_failure_policy(policy: &'static str) -> Job {
     })
 }
 
+fn encode<T: serde::Serialize>(request: &T) -> Result<Value, Failure> {
+    serde_json::to_value(request).map_err(|e| Failure::detail(e.to_string()))
+}
+
+/// Writes the whole set as given: only for "reset to defaults".
 pub fn set_retention(request: RetentionSettingsSetRequest) -> Job {
     job(move |client| {
-        let result = serde_json::to_value(&request)
-            .map_err(|e| Failure::detail(e.to_string()))
+        let result = encode(&request).and_then(|payload| {
+            read::<RetentionSettingsDto>(client, Op::RetentionSettingsSet, payload)
+        });
+        written(result, Words::Key(text::SAVED), |app, settings| {
+            app.settings.data.retention = Loadable::Ready(settings);
+        })
+    })
+}
+
+// The set operations replace every field, so each edit below is laid over a
+// fresh read: a field another client changed since this screen loaded is not
+// written back with the old value.
+
+pub fn change_retention(
+    change: impl FnOnce(&mut RetentionSettingsSetRequest) + Send + 'static,
+) -> Job {
+    job(move |client| {
+        let result = read::<RetentionSettingsDto>(client, Op::RetentionSettingsGet, json!({}))
+            .and_then(|fresh| {
+                let mut request = RetentionSettingsSetRequest {
+                    superseded_days: fresh.superseded_days,
+                    superseded_count_cap: fresh.superseded_count_cap,
+                    rejected_days: fresh.rejected_days,
+                    rolledback_days: fresh.rolledback_days,
+                    rolledback_count_cap: fresh.rolledback_count_cap,
+                    pin_lkg: fresh.pin_lkg,
+                };
+                change(&mut request);
+                encode(&request)
+            })
             .and_then(|payload| {
                 read::<RetentionSettingsDto>(client, Op::RetentionSettingsSet, payload)
             });
@@ -469,10 +633,21 @@ pub fn set_retention(request: RetentionSettingsSetRequest) -> Job {
     })
 }
 
-pub fn set_log_retention(request: LogRetentionConfigSetRequest) -> Job {
+pub fn change_log_retention(
+    change: impl FnOnce(&mut LogRetentionConfigSetRequest) + Send + 'static,
+) -> Job {
     job(move |client| {
-        let result = serde_json::to_value(&request)
-            .map_err(|e| Failure::detail(e.to_string()))
+        let result = read::<LogRetentionConfigDto>(client, Op::LogRetentionConfigGet, json!({}))
+            .and_then(|fresh| {
+                let mut request = LogRetentionConfigSetRequest {
+                    log_max_age_days: fresh.log_max_age_days,
+                    log_max_size_bytes: fresh.log_max_size_bytes,
+                    audit_max_age_days: fresh.audit_max_age_days,
+                    audit_max_size_bytes: fresh.audit_max_size_bytes,
+                };
+                change(&mut request);
+                encode(&request)
+            })
             .and_then(|payload| {
                 read::<LogRetentionConfigDto>(client, Op::LogRetentionConfigSet, payload)
             });
@@ -644,9 +819,72 @@ pub fn clear_logs() -> Job {
     })
 }
 
-pub fn set_traffic(settings: TrafficStatsSettingsDto, day: i64) -> Job {
+/// The answer to the history question, then the screen read again: the
+/// answered question is gone from it.
+pub fn answer_traffic_merge(old_key: String, new_key: String, merged: bool, day: i64) -> Job {
     job(move |client| {
-        let result = call(client, Op::TrafficStatsSet, json!({ "settings": settings }))
+        let result = call(
+            client,
+            Op::TrafficHistoryMergeSet,
+            json!({ "old-key": old_key, "new-key": new_key, "merged": merged }),
+        )
+        .and_then(|_| traffic_of(client, day));
+        written(result, Words::Key(text::SAVED), |app, stats| {
+            app.settings.data.traffic = Loadable::Ready(stats);
+        })
+    })
+}
+
+/// The CSV the service builds for the range, written to a new file; an
+/// existing file is never overwritten.
+pub fn export_traffic_csv(path: PathBuf, from_day: i64, to_day: i64, unit: &'static str) -> Job {
+    job(move |client| {
+        let outcome = (|| {
+            let stats: TrafficStatsGetResponse = read(
+                client,
+                Op::TrafficStatsGet,
+                json!({
+                    "day": to_day,
+                    "export-from-day": from_day,
+                    "export-to-day": to_day,
+                    "export-unit": unit,
+                }),
+            )
+            .map_err(ExportError::Service)?;
+            write_new_file(&path, stats.csv.unwrap_or_default().as_bytes())
+        })();
+        let shown = path.display().to_string();
+        Reply::new(move |app| match outcome {
+            Ok(()) => app.settings.done(Words::Fill(
+                text::TRAFFIC_CSV_WRITTEN,
+                vec![("path", shown)],
+            )),
+            Err(ExportError::Exists) => app
+                .settings
+                .refuse(Words::Fill(text::EXPORT_EXISTS, vec![("path", shown)])),
+            Err(ExportError::Write(error)) => app.settings.say(
+                Words::Fill(
+                    text::EXPORT_WRITE_FAILED,
+                    vec![("path", shown), ("error", error)],
+                ),
+                Some(StateTone::Bad),
+            ),
+            Err(ExportError::Service(failure)) => app.settings.failed(text::NOT_SAVED, failure),
+        })
+    })
+}
+
+pub fn change_traffic(
+    change: impl FnOnce(&mut TrafficStatsSettingsDto) + Send + 'static,
+    day: i64,
+) -> Job {
+    job(move |client| {
+        let result = traffic_of(client, day)
+            .and_then(|fresh| {
+                let mut settings = fresh.settings;
+                change(&mut settings);
+                call(client, Op::TrafficStatsSet, json!({ "settings": settings }))
+            })
             .and_then(|_| traffic_of(client, day));
         written(result, Words::Key(text::SAVED), |app, stats| {
             app.settings.data.traffic = Loadable::Ready(stats);
@@ -733,6 +971,10 @@ fn export_to(client: &dyn IpcClient, path: &std::path::Path) -> Result<(), Expor
                 detail: e.to_string(),
             })
         })?;
+    write_new_file(path, &bytes)
+}
+
+fn write_new_file(path: &std::path::Path, bytes: &[u8]) -> Result<(), ExportError> {
     let mut file = std::fs::OpenOptions::new()
         .write(true)
         .create_new(true)
@@ -744,7 +986,7 @@ fn export_to(client: &dyn IpcClient, path: &std::path::Path) -> Result<(), Expor
                 ExportError::Write(e.to_string())
             }
         })?;
-    file.write_all(&bytes)
+    file.write_all(bytes)
         .and_then(|()| file.flush())
         .map_err(|e| ExportError::Write(e.to_string()))
 }

@@ -96,6 +96,8 @@ pub struct DnsStackInputs {
     pub outage_blocks: Option<Arc<crate::outage_blocks::OutageBlocks>>,
     /// Where the resolver's threads report their liveness.
     pub liveness: Option<Arc<crate::task_liveness::TaskLiveness>>,
+    /// Who paused their routing: their rule hosts resolve as ordinary names.
+    pub paused: Option<Arc<crate::routing_pause::PausedPrincipals>>,
 }
 
 /// The factory the [`DnsResolverController`] calls on each start. The
@@ -293,10 +295,12 @@ fn build_dns_resolver_instance(
     let principals = inputs.served_sids.clone().unwrap_or_else(|| {
         crate::dns_resolver_ports::principals_of_routing_user(Arc::clone(active_sid))
     });
-    let oracle = Arc::new(
-        ActiveRuleHostOracle::new(rules(), Arc::clone(active_sid))
-            .with_served(Arc::clone(&principals)),
-    );
+    let mut oracle = ActiveRuleHostOracle::new(rules(), Arc::clone(active_sid))
+        .with_served(Arc::clone(&principals));
+    if let Some(paused) = inputs.paused.as_ref() {
+        oracle = oracle.with_paused(Arc::clone(paused));
+    }
+    let oracle = Arc::new(oracle);
     // Rule hosts go straight to the upstream over a raw socket: the system
     // resolver would honour the very redirect installed here and loop back.
     let mut direct_upstream =

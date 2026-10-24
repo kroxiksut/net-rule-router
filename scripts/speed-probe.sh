@@ -3,13 +3,15 @@
 # Per-adapter reachability and download-speed probe (Linux / WSL twin of
 # scripts/speed-probe.ps1).
 #
-# NetRuleRouter routes traffic across existing interfaces by source IP
-# (e.g. a primary NIC plus a secondary VPN tunnel adapter). This script
-# answers "how does site X behave over adapter A vs adapter B" by shelling
-# out to curl with `--interface <source-ip>` per probe, which pins the
-# outbound source address and therefore the egress path — it does not touch
-# NetRuleRouter's own routing tables, it just measures what the OS routing
-# table + NRR policy currently produce.
+# NetRuleRouter routes traffic across existing interfaces (e.g. a primary NIC
+# plus a secondary VPN tunnel adapter). This script answers "how does site X
+# behave over adapter A vs adapter B" by shelling out to curl with
+# `--interface if!<name>` per probe, which binds the socket to that device and
+# therefore pins the egress path. Linux picks a route by destination, not by
+# source address, so binding a source address alone (what the Windows twin
+# does) would still leave by whatever the routing table says. Binding to a
+# device needs no privilege on kernel 5.7+; on older kernels run it with sudo.
+# It does not touch NetRuleRouter's own routing tables.
 #
 # Requires curl. Read-only: issues plain HTTP(S) GET requests, discards
 # response bodies, does not modify network state.
@@ -41,8 +43,10 @@
 # name or an interface with no IPv4 address is a hard usage error (exit 2).
 #
 # --adapter entries are "alias=source-ip" (alias is only a display label) or
-# a bare IP (used as its own label) — a manual escape hatch for source IPs
-# not visible as a named interface. -a and --adapter are mutually exclusive.
+# a bare IP (used as its own label). The interface holding that address is
+# looked up and bound; an address no interface holds is bound as a source
+# address only and marked so, since its egress then follows the routing
+# table. -a and --adapter are mutually exclusive.
 
 set -uo pipefail
 
@@ -200,10 +204,22 @@ is_virtual_adapter() {
 
 ADAPTER_ALIASES=()
 ADAPTER_IPS=()
+# The device each probe is bound to; empty binds the source address only.
+ADAPTER_IFNAMES=()
+
+# The interface holding an IPv4 address, or nothing.
+interface_of_address() {
+    ip -o -4 addr show 2>/dev/null | awk -v want="$1" '{
+        split($4, parts, "/")
+        # A veth reads "eth0@if5"; the device is the part before "@".
+        if (parts[1] == want) { name = $2; sub(/@.*/, "", name); print name; exit }
+    }'
+}
 
 add_adapter() {
     local alias_name="$1"
     local ip="$2"
+    local ifname="${3-}"
     local existing
     if is_loopback_or_link_local "$ip"; then
         return
@@ -213,8 +229,12 @@ add_adapter() {
             return
         fi
     done
+    if [ -z "$ifname" ]; then
+        ifname=$(interface_of_address "$ip")
+    fi
     ADAPTER_ALIASES+=("$alias_name")
     ADAPTER_IPS+=("$ip")
+    ADAPTER_IFNAMES+=("$ifname")
 }
 
 # Resolve one interface name to its IPv4 address(es), bypassing the
@@ -240,7 +260,7 @@ add_named_adapter() {
     while read -r addr; do
         [ -n "$addr" ] || continue
         ip_only="${addr%%/*}"
-        add_adapter "$name" "$ip_only"
+        add_adapter "$name" "$ip_only" "$name"
     done <<< "$addrs"
 }
 
@@ -278,7 +298,7 @@ else
         if is_fake_ip_range "$ip_only"; then
             continue
         fi
-        add_adapter "$ifname" "$ip_only"
+        add_adapter "$ifname" "$ip_only" "$ifname"
     done
 fi
 
@@ -289,7 +309,12 @@ fi
 
 echo "==> Adapters under test"
 for i in "${!ADAPTER_IPS[@]}"; do
-    printf '  %-20s %s\n' "${ADAPTER_ALIASES[$i]}" "${ADAPTER_IPS[$i]}"
+    if [ -n "${ADAPTER_IFNAMES[$i]}" ]; then
+        bound="bound to ${ADAPTER_IFNAMES[$i]}"
+    else
+        bound="no interface holds it: source address only, egress follows the routing table"
+    fi
+    printf '  %-20s %-15s %s\n' "${ADAPTER_ALIASES[$i]}" "${ADAPTER_IPS[$i]}" "$bound"
 done
 echo "==> Timeout: ${TIMEOUT}s, per-probe max download: ${MAX_BYTES} bytes"
 
@@ -314,6 +339,7 @@ curl_failure_reason() {
         7)  echo "failed to connect" ;;
         28) echo "timeout" ;;
         35) echo "SSL connect error" ;;
+        45) echo "could not bind to the interface (before kernel 5.7: run with sudo)" ;;
         52) echo "empty reply from server" ;;
         56) echo "recv failure (connection reset)" ;;
         63) echo "exceeded max download size" ;;
@@ -334,9 +360,13 @@ for url in "${URLS[@]}"; do
     for i in "${!ADAPTER_IPS[@]}"; do
         alias_name="${ADAPTER_ALIASES[$i]}"
         ip="${ADAPTER_IPS[$i]}"
+        bind="$ip"
+        if [ -n "${ADAPTER_IFNAMES[$i]}" ]; then
+            bind="if!${ADAPTER_IFNAMES[$i]}"
+        fi
 
         output=$(curl -4 -L -s -o /dev/null \
-            --interface "$ip" \
+            --interface "$bind" \
             --max-time "$TIMEOUT" \
             --max-filesize "$MAX_BYTES" \
             -w "$CURL_FMT" \

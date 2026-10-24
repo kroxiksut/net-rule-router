@@ -57,6 +57,7 @@ pub fn principals_of_routing_user(
 pub struct ActiveRuleHostOracle {
     rules_provider: Arc<dyn RulesProvider>,
     principals: ResolverPrincipalsFn,
+    paused: Option<Arc<crate::routing_pause::PausedPrincipals>>,
 }
 
 impl ActiveRuleHostOracle {
@@ -67,7 +68,23 @@ impl ActiveRuleHostOracle {
         Self {
             rules_provider,
             principals: principals_of_routing_user(active_sid),
+            paused: None,
         }
+    }
+
+    /// Leave paused users out: their rule hosts resolve like any other name.
+    #[must_use]
+    pub fn with_paused(mut self, paused: Arc<crate::routing_pause::PausedPrincipals>) -> Self {
+        self.paused = Some(paused);
+        self
+    }
+
+    fn routing_principals(&self) -> Vec<String> {
+        let mut principals = (self.principals)();
+        if let Some(paused) = self.paused.as_ref() {
+            principals.retain(|sid| !paused.contains(sid));
+        }
+        principals
     }
 
     /// Answer for every user in `served`, not only the routing one.
@@ -79,7 +96,7 @@ impl ActiveRuleHostOracle {
 
     /// The served users whose secondary rules name `hostname`.
     pub fn owners_of(&self, hostname: &str) -> Vec<String> {
-        (self.principals)()
+        self.routing_principals()
             .into_iter()
             .filter(|sid| {
                 self.rules_provider
@@ -92,7 +109,7 @@ impl ActiveRuleHostOracle {
 
 impl RuleHostOracle for ActiveRuleHostOracle {
     fn is_rule_host(&self, hostname: &str) -> bool {
-        (self.principals)().iter().any(|sid| {
+        self.routing_principals().iter().any(|sid| {
             self.rules_provider
                 .active_rules_for(sid)
                 .is_some_and(|s| rule_set_matches(hostname, &s.rule_book.secondary))
@@ -432,7 +449,13 @@ impl DirectUdpUpstreamResolver {
         egress: &crate::dns_egress::DnsEgress,
         window: Duration,
     ) -> Result<ResolvedAddresses, ResolveError> {
-        let sock = Self::open_socket(egress)?;
+        let key = crate::dns_upstream_sockets::UpstreamKey {
+            bind: egress.bind,
+            server: egress.server,
+        };
+        let lease =
+            crate::dns_upstream_sockets::shared().checkout(key, || Self::open_socket(egress))?;
+        let sock = lease.socket();
         sock.send(query)
             .map_err(|e| ResolveError::Unavailable(format!("send: {e}")))?;
         let started = std::time::Instant::now();
@@ -470,12 +493,16 @@ impl DirectUdpUpstreamResolver {
             };
             match Self::interpret(id, hostname, qtype, &buf[..n]) {
                 Some(Err(ResolveError::Unavailable(reason))) if reason == TRUNCATED => {
+                    lease.release();
                     // The answer did not fit a datagram: ask again over TCP,
                     // on the same link, within what is left of the window.
                     let left = window.saturating_sub(started.elapsed());
                     return Self::attempt_tcp(query, id, hostname, qtype, egress, left);
                 }
-                Some(outcome) => return outcome,
+                Some(outcome) => {
+                    lease.release();
+                    return outcome;
+                }
                 None => continue,
             }
         }
@@ -571,7 +598,7 @@ const TRUNCATED: &str = "truncated (TC=1)";
 
 /// The largest datagram an upstream can send. A smaller buffer fails the
 /// receive on Windows, and an oversized answer counted against the server.
-const MAX_REPLY_DATAGRAM: usize = 65_535;
+pub(crate) const MAX_REPLY_DATAGRAM: usize = 65_535;
 
 impl DirectUdpUpstreamResolver {
     /// one PTR send + receive window for `ip`.
@@ -588,7 +615,7 @@ impl DirectUdpUpstreamResolver {
         sock.send(query)
             .map_err(|e| ResolveError::Unavailable(format!("send: {e}")))?;
         let started = std::time::Instant::now();
-        let mut buf = [0u8; 2048];
+        let mut buf = [0u8; MAX_REPLY_DATAGRAM];
         loop {
             let remaining = self.timeout.saturating_sub(started.elapsed());
             if remaining.is_zero() {

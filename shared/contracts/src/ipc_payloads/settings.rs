@@ -215,12 +215,16 @@ pub struct RoutingPauseGetRequest {}
 
 pub type RoutingPauseGetResponse = RoutingPauseDto;
 
+/// The longest pause reason the service accepts, in characters.
+pub const ROUTING_PAUSE_REASON_MAX_CHARS: usize = 64;
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub struct RoutingPauseToggleRequest {
     pub paused: bool,
-    /// Free-form annotation persisted alongside the pause row. Audit
-    /// quotes it verbatim. `None` clears the previous reason on resume.
+    /// Annotation persisted alongside the pause row and quoted by the audit:
+    /// at most [`ROUTING_PAUSE_REASON_MAX_CHARS`], no control characters.
+    /// `None` clears the previous reason on resume.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
     /// How long a pause lasts; none is until the user resumes.

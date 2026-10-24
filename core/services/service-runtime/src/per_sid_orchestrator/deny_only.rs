@@ -40,7 +40,7 @@ impl PerSidApplyOrchestrator {
             nrr_domain::shared_ip::SharedIpPolicy::default(),
         );
         let machine = (self.machine_reader)();
-        let ipv6 = Ipv6Guard::from_links(machine.adapters().unwrap_or_default(), None);
+        let ipv6 = Ipv6Guard::from_links(machine.adapters().unwrap_or_default(), None, &[]);
         let out = generate_filters(CodegenInput {
             sid,
             rule_book: &rules.rule_book,
@@ -88,15 +88,17 @@ impl PerSidApplyOrchestrator {
             ));
             status.set_rule_conflicts(sid, conflicts);
         }
-        // Permits exist to ride a route or to carve a hole in a guard; neither
-        // is here. A narrower rule inside a deny is already cut out of it by
-        // the codegen, so dropping the permits loses no exception.
+        // Route permits ride a route, and there is none here; a narrower rule
+        // inside a deny is already cut out of it by the codegen. A program
+        // deny's loopback permit is a hole in its own block, so it stays.
         let filters: Vec<WfpFilterSpec> = out
             .filters
             .into_iter()
-            .filter(|f| f.action == WfpAction::Block)
+            .filter(|f| {
+                f.action == WfpAction::Block || crate::wfp_codegen::is_deny_loopback_permit(f)
+            })
             .collect();
-        if filters.is_empty() {
+        if !filters.iter().any(|f| f.action == WfpAction::Block) {
             return Ok(ComputedFilterSet::NoPolicy);
         }
         if intent.publishes() {

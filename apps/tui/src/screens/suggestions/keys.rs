@@ -267,6 +267,25 @@ pub const CONFIRM_PROMPT: Key = key(
     "Type y to turn it on or n to cancel, then press Enter.",
 );
 pub const CANCELLED: Key = key("tui.suggestions.cancelled", "Nothing was changed.");
+pub const MARKED: Key = key("tui.suggestions.marked", "Marked: {count}.");
+pub const FILTER_ACTIVE: Key = key(
+    "rules.suggestions.inbox.filter-active",
+    "Showing only what {name} needs",
+);
+pub const FORGOTTEN: Key = key("tui.suggestions.forgotten", "Forgotten with their answers: {count}. They can be offered again if they turn up beside your sites.");
+pub const CLEAR_CONFIRM: Key = key(
+    "tui.suggestions.clear-confirm",
+    "y: forget all {count} suggestions together with your answers. n: cancel.",
+);
+pub const CLEAR_PROMPT: Key = key(
+    "tui.suggestions.clear-prompt",
+    "Type y to forget them all or n to cancel, then press Enter.",
+);
+pub const SEARCH: Key = key("tui.suggestions.search", "Search");
+pub const SEARCH_EMPTY: Key = key(
+    "rules.suggestions.inbox.search-empty",
+    "No addresses match your search.",
+);
 
 pub const HELP_KEYS: &[Key] = &[
     key(
@@ -309,6 +328,18 @@ pub const HELP_KEYS: &[Key] = &[
         "tui.suggestions.help.order",
         "o: change the order of the list",
     ),
+    key(
+        "tui.suggestions.help.forget",
+        "f: forget the chosen item with its answer, so it can be offered again; x: forget them all (asks first)",
+    ),
+    key(
+        "tui.suggestions.help.search",
+        "/: search by domain, host or site; an empty search shows everything",
+    ),
+    key(
+        "tui.suggestions.help.filter-mark",
+        "p: show only what the chosen item's first site needs, or everything again; Space: mark items, then a, n, r or f acts on every marked one",
+    ),
 ];
 
 pub const PLAIN_KEYS: &[Key] = &[
@@ -345,6 +376,18 @@ pub const PLAIN_KEYS: &[Key] = &[
         "s: show or hide answered addresses; v: show or hide addresses the main connection handles",
     ),
     key("tui.suggestions.plain.order", "o: change the order of the list"),
+    key(
+        "tui.suggestions.plain.forget",
+        "f and an item number: forget that item with its answer; x: forget them all (asks first)",
+    ),
+    key(
+        "tui.suggestions.plain.search",
+        "/ and text: show only what matches; / on its own shows everything",
+    ),
+    key(
+        "tui.suggestions.plain.filter-mark",
+        "p and a site name: show only what that site needs; p on its own shows everything; * and an item number: mark or unmark it, then a, n, r or f and any marked number acts on every marked one",
+    ),
 ];
 
 /// Every key above, for the test that holds both locale files to them.
@@ -422,6 +465,13 @@ pub fn all() -> Vec<Key> {
         CONFIRM,
         CONFIRM_PROMPT,
         CANCELLED,
+        FORGOTTEN,
+        CLEAR_CONFIRM,
+        CLEAR_PROMPT,
+        SEARCH,
+        SEARCH_EMPTY,
+        MARKED,
+        FILTER_ACTIVE,
     ];
     keys.extend(SIGNALS);
     keys.extend(LESS_CERTAIN_BASES);

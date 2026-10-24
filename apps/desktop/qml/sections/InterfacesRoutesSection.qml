@@ -321,6 +321,7 @@ ColumnLayout {
                 }
                 ThemedComboBox {
                     id: behaviorCombo
+                    accessibleLabel: root.uiRevision >= 0 ? root.tr("label.mode", "Mode") : ""
                     theme: root.uiTheme
                     width: 340
                     model: root.behaviorModeModel
@@ -341,10 +342,17 @@ ColumnLayout {
                             ? ""
                             : root.tr("settings.routing-behavior.mode." + id + ".description", "")
                     }
+                    // The route the service holds; the launch context is only
+                    // the fallback before the first read, since it never updates.
+                    readonly property string serviceRoute: root.uiRevision >= 0
+                        ? String(root._serviceDefaultRoute || root.prefs.routeBehaviorMode
+                            || (root.context.interfaces || {}).selectedBehaviorMode || "")
+                        : ""
+                    onServiceRouteChanged: if (serviceRoute !== "") _showMode(serviceRoute)
                     Component.onCompleted: {
                         currentIndex = Pure.optionIndexById(
                             ((root.context.interfaces || {}).supportedBehaviorModes) || [],
-                            (root.context.interfaces || {}).selectedBehaviorMode || "", 0)
+                            serviceRoute, 0)
                         if (currentIndex >= 0 && currentIndex < root.behaviorModeModel.count) {
                             _shownMode = String(root.behaviorModeModel.get(currentIndex).id)
                             displayText = root.behaviorModeLabel(_shownMode)
@@ -409,6 +417,7 @@ ColumnLayout {
                 }
                 ThemedComboBox {
                     id: autoRulesModeCombo
+                    accessibleLabel: root.uiRevision >= 0 ? root.tr("settings.routing.auto-rules.label", "Missing companion domains") : ""
                     theme: root.uiTheme
                     width: 260
                     anchors.verticalCenter: parent.verticalCenter
@@ -560,6 +569,7 @@ ColumnLayout {
                 }
                 ThemedComboBox {
                     id: adapterSortCombo
+                    accessibleLabel: root.uiRevision >= 0 ? root.tr("interfaces.sort.label", "Sort") : ""
                     theme: root.uiTheme
                     width: 240
                     model: [ "default", "vpn-like", "primary-candidate" ]

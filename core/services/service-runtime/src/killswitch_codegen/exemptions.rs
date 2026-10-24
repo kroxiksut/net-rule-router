@@ -559,15 +559,16 @@ pub fn foreign_luids_of(luids: &[u64], networks: &[ForeignTunnelNetwork]) -> Vec
     all
 }
 
-/// The DoH/DoT lockdown restated for each foreign tunnel that holds a permit at
-/// the same layer: a copy of every lockdown block, narrowed to egress through
-/// that tunnel and placed above the tunnel's permits. A corporate tunnel can
-/// route a public resolver, and without this the lockdown would end at its edge.
-/// Past [`DOH_FOREIGN_VETO_MAX`] the rest are left out (the lockdown itself
-/// still stands on every other egress).
+/// The DoH/DoT lockdown restated for each tunnel that holds a permit at the
+/// same layer, ours included: a copy of every lockdown block, narrowed to
+/// egress through that tunnel and placed above the tunnel's permits. A
+/// corporate tunnel can route a public resolver, and the block-all lets the
+/// user's traffic out through ours above the lockdown's band; without this the
+/// lockdown would end at either edge. Past [`DOH_FOREIGN_VETO_MAX`] the rest
+/// are left out (the lockdown itself still stands on every other egress).
 ///
-/// `foreign_luids` are the tunnels beside ours, `emitted` holds their permits
-/// and `doh` the lockdown blocks of `sid`.
+/// `foreign_luids` are the tunnels beside ours, `own` ours, `emitted` holds
+/// their permits and `doh` the lockdown blocks of `sid`.
 #[must_use]
 pub fn doh_foreign_vetoes(
     sid: &str,
@@ -581,13 +582,21 @@ pub fn doh_foreign_vetoes(
         let mut luids: Vec<u64> = foreign_luids
             .iter()
             .copied()
-            .filter(|l| *l != 0 && *l != own)
+            .chain(std::iter::once(own))
+            .filter(|l| *l != 0)
             .filter(|l| {
                 emitted.iter().any(|f| {
                     f.layer == layer
                         && f.action == WfpAction::Permit
                         && f.local_interface_luid == Some(*l)
                         && f.user_sid.as_deref().is_none_or(|s| s == sid)
+                        // Ours only beside the block-all's egress to any address:
+                        // a pin names its own address and opens nothing else.
+                        && (*l != own
+                            || (f.remote_ip.is_none()
+                                && f.remote_ip_set.is_empty()
+                                && f.remote_ip_set_v6.is_empty()
+                                && f.remote_subnet.is_none()))
                 })
             })
             .collect();
@@ -610,7 +619,11 @@ pub fn doh_foreign_vetoes(
                     sid,
                     KILLSWITCH_ROLE,
                     &permit_luid_seg(luid),
-                    "ks-doh-foreign",
+                    if luid == own {
+                        "ks-doh-own"
+                    } else {
+                        "ks-doh-foreign"
+                    },
                     &format!("{:016x}", block.id.raw),
                 );
                 out.push(veto);

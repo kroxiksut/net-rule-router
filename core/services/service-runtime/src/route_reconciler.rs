@@ -84,6 +84,74 @@ pub struct TableReading<'a> {
     pub rows: &'a [RouteEntry],
 }
 
+/// The routes we own, and which of them went in ahead of a pass.
+#[derive(Default)]
+struct OwnedRoutes {
+    routes: Vec<RouteEntry>,
+    /// A route installed ahead of the pass that will plan it, with the write
+    /// count its install brought the table to. A pass planned before that
+    /// write never wanted it and must not take it out.
+    ahead: Vec<(RouteKey, u64)>,
+    /// Routes another program keeps removing, keyed by route.
+    contested: std::collections::HashMap<RouteKey, Contest>,
+}
+
+/// Put-backs of one route within [`CONTEST_WINDOW`] after which the program
+/// removing it is left alone: a client that enforces its own routes would
+/// otherwise trade deletes with us every pass, and the route's traffic would
+/// flap between links.
+const CONTEST_LIMIT: usize = 3;
+const CONTEST_WINDOW: std::time::Duration = std::time::Duration::from_secs(60);
+/// How long a contested route stays out before it is tried again.
+const CONTEST_BACKOFF: std::time::Duration = std::time::Duration::from_secs(300);
+
+#[derive(Debug, Default)]
+struct Contest {
+    put_back: Vec<std::time::Instant>,
+    held_until: Option<std::time::Instant>,
+}
+
+impl OwnedRoutes {
+    fn installed_after(&self, key: &RouteKey, planned_at: u64) -> bool {
+        self.ahead
+            .iter()
+            .any(|(k, at)| k == key && *at > planned_at)
+    }
+
+    /// A route of ours went missing; `true` when that makes it contested.
+    fn note_vanished(&mut self, key: RouteKey, now: std::time::Instant) -> bool {
+        let contest = self.contested.entry(key).or_default();
+        contest
+            .put_back
+            .retain(|at| now.saturating_duration_since(*at) < CONTEST_WINDOW);
+        contest.put_back.push(now);
+        if contest.put_back.len() < CONTEST_LIMIT {
+            return false;
+        }
+        contest.put_back.clear();
+        contest.held_until = Some(now + CONTEST_BACKOFF);
+        true
+    }
+
+    fn held_out(&self, key: &RouteKey, now: std::time::Instant) -> bool {
+        self.contested
+            .get(key)
+            .and_then(|c| c.held_until)
+            .is_some_and(|until| now < until)
+    }
+
+    /// Only what the plan still wants is remembered, and a hold that ran out
+    /// is tried again.
+    fn settle_contests(&mut self, desired: &HashSet<RouteKey>, now: std::time::Instant) {
+        self.contested.retain(|key, _| desired.contains(key));
+        for contest in self.contested.values_mut() {
+            if contest.held_until.is_some_and(|until| now >= until) {
+                contest.held_until = None;
+            }
+        }
+    }
+}
+
 /// What a route currently in the system table represents, from the
 /// route-ownership coordinator's perspective.
 ///
@@ -410,8 +478,8 @@ impl RouteReconcileDelta {
 pub struct SecondaryRouteReconciler {
     api: Arc<dyn RouteTablePort>,
     /// Routes this reconciler currently owns (last successfully applied
-    /// desired set).
-    owned: Mutex<Vec<RouteEntry>>,
+    /// desired set, plus what went in ahead of the next pass).
+    owned: Mutex<OwnedRoutes>,
     /// Bumped after every write of ours to the table: a reading taken before
     /// it may miss a route we own, and is read again.
     writes: AtomicU64,
@@ -419,6 +487,7 @@ pub struct SecondaryRouteReconciler {
     /// table with no service left to reap it. Injected rather than read from
     /// the static directly so a test can flip it for itself alone.
     teardown_gate: Arc<dyn Fn() -> bool + Send + Sync>,
+    clock: Arc<dyn Fn() -> std::time::Instant + Send + Sync>,
 }
 
 // `owned` is a `Mutex`; `lock().unwrap_or_else(into_inner)` recovers from a
@@ -427,10 +496,17 @@ impl SecondaryRouteReconciler {
     pub fn new(api: Arc<dyn RouteTablePort>) -> Self {
         Self {
             api,
-            owned: Mutex::new(Vec::new()),
+            owned: Mutex::new(OwnedRoutes::default()),
             writes: AtomicU64::new(0),
             teardown_gate: Arc::new(crate::teardown_in_progress),
+            clock: Arc::new(std::time::Instant::now),
         }
+    }
+
+    #[cfg(test)]
+    pub fn with_clock(mut self, clock: Arc<dyn Fn() -> std::time::Instant + Send + Sync>) -> Self {
+        self.clock = clock;
+        self
     }
 
     /// Answer "is the service stopping?" from something other than the
@@ -447,7 +523,10 @@ impl SecondaryRouteReconciler {
     /// can delete the ones the new desired set no longer wants.
     pub fn adopt_owned(&self, routes: Vec<RouteEntry>) {
         let mut owned = self.owned.lock().unwrap_or_else(|p| p.into_inner());
-        *owned = routes;
+        *owned = OwnedRoutes {
+            routes,
+            ..OwnedRoutes::default()
+        };
     }
 
     /// Add to the owned set every row of the live table that carries our
@@ -467,8 +546,12 @@ impl SecondaryRouteReconciler {
         let count = found.len();
         let mut owned = self.owned.lock().unwrap_or_else(|p| p.into_inner());
         for route in found {
-            if !owned.iter().any(|o| route_key(o) == route_key(&route)) {
-                owned.push(route);
+            if !owned
+                .routes
+                .iter()
+                .any(|o| route_key(o) == route_key(&route))
+            {
+                owned.routes.push(route);
             }
         }
         Ok(count)
@@ -485,6 +568,7 @@ impl SecondaryRouteReconciler {
         self.owned
             .lock()
             .unwrap_or_else(|p| p.into_inner())
+            .routes
             .iter()
             .any(|our| {
                 our.destination == route.destination
@@ -495,11 +579,17 @@ impl SecondaryRouteReconciler {
 
     /// Number of routes currently owned.
     pub fn owned_count(&self) -> usize {
-        self.owned.lock().unwrap_or_else(|p| p.into_inner()).len()
+        self.owned
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .routes
+            .len()
     }
 
     /// How many writes of ours the table has seen; pairs with
-    /// [`Self::reconcile_seen`].
+    /// [`Self::reconcile_seen`] and [`Self::reconcile_planned`]. A pass reads
+    /// it BEFORE the inputs it plans from, so a route installed ahead of it
+    /// after that reading is recognised as newer than its plan.
     pub fn write_count(&self) -> u64 {
         self.writes.load(Ordering::SeqCst)
     }
@@ -508,20 +598,39 @@ impl SecondaryRouteReconciler {
     /// success the owned set becomes exactly `desired`. On any platform
     /// error the partial changes are rolled back and the owned set follows
     /// what the rollback actually restored.
+    ///
+    /// `desired` is taken as the whole truth: a route installed ahead of a pass
+    /// goes too. A pass that planned from inputs read earlier passes the write
+    /// count it read first to [`Self::reconcile_planned`] instead.
     pub fn reconcile(&self, desired: &[RouteEntry]) -> Result<RouteReconcileDelta, PlatformError> {
-        self.reconcile_seen(desired, None)
+        let owned = self.owned.lock().unwrap_or_else(|p| p.into_inner());
+        self.reconcile_owned(desired, owned, None, None)
     }
 
-    /// [`Self::reconcile`] checking the kept routes against `seen`, the table
-    /// the caller read for this pass, instead of reading it again. Stale once
-    /// a write of ours followed it, and then read afresh.
+    /// [`Self::reconcile`] for a pass that read [`Self::write_count`] as
+    /// `planned_at` before the inputs `desired` was planned from: a route
+    /// installed ahead of the pass after that reading is kept, since the plan
+    /// never saw the address it serves. Only a pass planned later drops it.
+    pub fn reconcile_planned(
+        &self,
+        desired: &[RouteEntry],
+        planned_at: u64,
+    ) -> Result<RouteReconcileDelta, PlatformError> {
+        let owned = self.owned.lock().unwrap_or_else(|p| p.into_inner());
+        self.reconcile_owned(desired, owned, Some(planned_at), None)
+    }
+
+    /// [`Self::reconcile_planned`] also checking the kept routes against
+    /// `seen`, the table the caller read for this pass, instead of reading it
+    /// again. Stale once a write of ours followed it, and then read afresh.
     pub fn reconcile_seen(
         &self,
         desired: &[RouteEntry],
+        planned_at: u64,
         seen: Option<TableReading<'_>>,
     ) -> Result<RouteReconcileDelta, PlatformError> {
         let owned = self.owned.lock().unwrap_or_else(|p| p.into_inner());
-        self.reconcile_owned(desired, owned, seen)
+        self.reconcile_owned(desired, owned, Some(planned_at), seen)
     }
 
     /// Forget the kept routes the live table no longer holds, so the diff puts
@@ -531,11 +640,11 @@ impl SecondaryRouteReconciler {
     /// between it and the diff.
     fn forget_vanished(
         &self,
-        owned: &mut Vec<RouteEntry>,
+        owned: &mut OwnedRoutes,
         desired: &HashSet<RouteKey>,
         seen: Option<TableReading<'_>>,
     ) {
-        if !owned.iter().any(|o| desired.contains(&route_key(o))) {
+        if !owned.routes.iter().any(|o| desired.contains(&route_key(o))) {
             return;
         }
         let fresh: Vec<RouteEntry>;
@@ -557,15 +666,34 @@ impl SecondaryRouteReconciler {
             },
         };
         let present: HashSet<PresenceKey> = rows.iter().map(presence_key).collect();
-        let before = owned.len();
-        owned.retain(|o| !desired.contains(&route_key(o)) || present.contains(&presence_key(o)));
-        let vanished = before - owned.len();
-        if vanished > 0 {
-            tracing::info!(
-                target: "nrr::route-reconciler",
-                vanished = vanished as u64,
-                "routes of ours were removed from outside; putting them back",
-            );
+        let mut vanished: Vec<RouteEntry> = Vec::new();
+        owned.routes.retain(|o| {
+            let kept = !desired.contains(&route_key(o)) || present.contains(&presence_key(o));
+            if !kept {
+                vanished.push(o.clone());
+            }
+            kept
+        });
+        if vanished.is_empty() {
+            return;
+        }
+        tracing::info!(
+            target: "nrr::route-reconciler",
+            vanished = vanished.len() as u64,
+            "routes of ours were removed from outside; putting them back",
+        );
+        let now = (self.clock)();
+        for route in vanished {
+            if owned.note_vanished(route_key(&route), now) {
+                tracing::warn!(
+                    target: "nrr::route-reconciler",
+                    msg_key = "routerecon-route-contested",
+                    destination = %route.destination,
+                    prefix_len = route.prefix_length,
+                    interface = route.interface_index,
+                    "another program keeps removing a route of ours; it is left to it for five minutes",
+                );
+            }
         }
     }
 
@@ -577,22 +705,39 @@ impl SecondaryRouteReconciler {
     fn reconcile_owned(
         &self,
         desired: &[RouteEntry],
-        mut owned: std::sync::MutexGuard<'_, Vec<RouteEntry>>,
+        mut owned: std::sync::MutexGuard<'_, OwnedRoutes>,
+        planned_at: Option<u64>,
         seen: Option<TableReading<'_>>,
     ) -> Result<RouteReconcileDelta, PlatformError> {
         let desired_keys: HashSet<RouteKey> = desired.iter().map(route_key).collect();
+        let now = (self.clock)();
+        owned.settle_contests(&desired_keys, now);
         self.forget_vanished(&mut owned, &desired_keys, seen);
-        let owned_keys: HashSet<RouteKey> = owned.iter().map(route_key).collect();
+        // A route the plan wants is the plan's from here on.
+        owned.ahead.retain(|(k, _)| !desired_keys.contains(k));
+        let owned_keys: HashSet<RouteKey> = owned.routes.iter().map(route_key).collect();
 
         let mut actions: Vec<RoutingAction> = Vec::new();
-        // Delete owned routes the new desired set drops.
+        // Delete owned routes the new desired set drops — except one that went
+        // in ahead of this pass after its plan was read: the plan never saw
+        // the address, so its absence from `desired` says nothing.
         let mut removed = 0usize;
-        for r in owned.iter() {
-            if !desired_keys.contains(&route_key(r)) {
-                actions.push(RoutingAction::DeleteRoute(r.clone()));
-                removed += 1;
+        let mut kept_ahead: Vec<RouteEntry> = Vec::new();
+        for r in owned.routes.iter() {
+            let key = route_key(r);
+            if desired_keys.contains(&key) {
+                continue;
             }
+            if planned_at.is_some_and(|at| owned.installed_after(&key, at)) {
+                kept_ahead.push(r.clone());
+                continue;
+            }
+            actions.push(RoutingAction::DeleteRoute(r.clone()));
+            removed += 1;
         }
+        owned
+            .ahead
+            .retain(|(k, _)| kept_ahead.iter().any(|r| route_key(r) == *k));
         // Add newly-desired routes (AddRoute is idempotent on conflict, so
         // a route already in the table is harmless). Never once the stop
         // teardown has begun: a pass that entered before the latch is still
@@ -601,7 +746,11 @@ impl SecondaryRouteReconciler {
         let mut added = 0usize;
         let mut refused = 0usize;
         for r in desired.iter() {
-            if !owned_keys.contains(&route_key(r)) {
+            let key = route_key(r);
+            if !owned_keys.contains(&key) {
+                if owned.held_out(&key, now) {
+                    continue;
+                }
                 if (self.teardown_gate)() {
                     refused += 1;
                     continue;
@@ -636,13 +785,14 @@ impl SecondaryRouteReconciler {
                 // exactly what destabilises the VPN client.
                 let landed: HashSet<RouteKey> = tx.added_routes().iter().map(route_key).collect();
                 tx.finalize();
-                *owned = desired
+                owned.routes = desired
                     .iter()
                     .filter(|d| {
                         let key = route_key(d);
                         landed.contains(&key) || owned_keys.contains(&key)
                     })
                     .cloned()
+                    .chain(kept_ahead)
                     .collect();
                 Ok(RouteReconcileDelta { added, removed })
             }
@@ -652,15 +802,15 @@ impl SecondaryRouteReconciler {
                 // until restart; keeping it whole claimed routes the undo failed
                 // to put back, so the next diff never re-added them.
                 let residue = tx.rollback_with_residue();
-                owned.retain(|o| {
+                owned.routes.retain(|o| {
                     !residue
                         .still_removed
                         .iter()
                         .any(|r| route_key(r) == route_key(o))
                 });
                 for r in residue.still_added {
-                    if !owned.iter().any(|o| route_key(o) == route_key(&r)) {
-                        owned.push(r);
+                    if !owned.routes.iter().any(|o| route_key(o) == route_key(&r)) {
+                        owned.routes.push(r);
                     }
                 }
                 Err(e)
@@ -677,8 +827,9 @@ impl SecondaryRouteReconciler {
     /// Installs `extra` beside the owned set without touching the rest of it,
     /// and claims what actually landed — a conflicting add stays whoever's it
     /// is. For a first contact with a new address: the full reconcile that
-    /// wants the same routes runs seconds later and finds them in place.
-    /// Returns how many were added.
+    /// wants the same routes runs seconds later and finds them in place, and
+    /// a pass already planned when they went in leaves them alone (see
+    /// [`Self::reconcile_planned`]). Returns how many were added.
     pub fn install_additional(&self, extra: &[RouteEntry]) -> Result<usize, PlatformError> {
         if (self.teardown_gate)() {
             return Ok(0);
@@ -686,7 +837,7 @@ impl SecondaryRouteReconciler {
         let mut owned = self.owned.lock().unwrap_or_else(|p| p.into_inner());
         let actions: Vec<RoutingAction> = extra
             .iter()
-            .filter(|r| !owned.iter().any(|o| route_key(o) == route_key(r)))
+            .filter(|r| !owned.routes.iter().any(|o| route_key(o) == route_key(r)))
             .map(|r| RoutingAction::AddRoute(r.clone()))
             .collect();
         if actions.is_empty() {
@@ -694,15 +845,18 @@ impl SecondaryRouteReconciler {
         }
         let mut tx = RoutingTransaction::new(Arc::clone(&self.api));
         let executed = tx.execute(&actions);
-        self.writes.fetch_add(1, Ordering::SeqCst);
+        let installed_at = self.writes.fetch_add(1, Ordering::SeqCst) + 1;
         if let Err(e) = executed {
-            owned.extend(tx.rollback_with_residue().still_added);
+            owned.routes.extend(tx.rollback_with_residue().still_added);
             return Err(e);
         }
         let landed = tx.added_routes();
         tx.finalize();
         let added = landed.len();
-        owned.extend(landed);
+        owned
+            .ahead
+            .extend(landed.iter().map(|r| (route_key(r), installed_at)));
+        owned.routes.extend(landed);
         Ok(added)
     }
 
@@ -718,11 +872,12 @@ impl SecondaryRouteReconciler {
         // deleted by a `desired` that predates them.
         let owned = self.owned.lock().unwrap_or_else(|p| p.into_inner());
         let keep: Vec<RouteEntry> = owned
+            .routes
             .iter()
             .filter(|r| !crate::route_codegen::is_overlay_route(r))
             .cloned()
             .collect();
-        self.reconcile_owned(&keep, owned, None)
+        self.reconcile_owned(&keep, owned, None, None)
     }
 }
 
@@ -1186,6 +1341,41 @@ mod tests {
         assert!(rec.reconcile(&desired).unwrap().is_noop());
     }
 
+    /// A client that enforces its own table deletes our route again and again;
+    /// past three put-backs a minute the route is left to it for five minutes,
+    /// then tried again, instead of trading deletes on every pass.
+    #[test]
+    fn a_route_removed_again_and_again_is_left_alone_for_a_while() {
+        let api = Arc::new(MockWindowsApi::new());
+        let now = Arc::new(Mutex::new(std::time::Instant::now()));
+        let clock = {
+            let now = Arc::clone(&now);
+            Arc::new(move || *now.lock().expect("clock"))
+        };
+        let rec = SecondaryRouteReconciler::new(Arc::clone(&api) as Arc<dyn RouteTablePort>)
+            .with_clock(clock);
+        let a = route([198, 51, 100, 1], [10, 0, 0, 1], 7);
+        let desired = [a.clone()];
+        rec.reconcile(&desired).unwrap();
+
+        let mut put_back = 0;
+        for _ in 0..3 {
+            api.delete_ip_forward_entry(&a).unwrap();
+            *now.lock().expect("clock") += std::time::Duration::from_secs(5);
+            put_back += rec.reconcile(&desired).unwrap().added;
+        }
+        assert_eq!(put_back, 2, "the third removal is not answered");
+        assert!(api.get_ip_forward_table().unwrap().is_empty());
+        assert!(
+            rec.reconcile(&desired).unwrap().is_noop(),
+            "held while it lasts"
+        );
+
+        *now.lock().expect("clock") += CONTEST_BACKOFF;
+        assert_eq!(rec.reconcile(&desired).unwrap().added, 1, "tried again");
+        assert_eq!(api.get_ip_forward_table().unwrap().len(), 1);
+    }
+
     /// The OS may report a route of ours with another next-hop spelling or
     /// metric. It is still in place: re-adding it would conflict and lose the
     /// claim on it.
@@ -1238,15 +1428,70 @@ mod tests {
             writes,
             rows: &rows,
         };
-        let delta = rec.reconcile_seen(&both, Some(stale)).unwrap();
+        let delta = rec.reconcile_seen(&both, writes, Some(stale)).unwrap();
         assert!(delta.is_noop(), "read again, and both are there: {delta:?}");
 
         // A current reading is taken at its word.
-        let current = TableReading {
-            writes: rec.write_count(),
-            rows: &[],
-        };
-        assert_eq!(rec.reconcile_seen(&both, Some(current)).unwrap().added, 2);
+        let writes = rec.write_count();
+        let current = TableReading { writes, rows: &[] };
+        assert_eq!(
+            rec.reconcile_seen(&both, writes, Some(current))
+                .unwrap()
+                .added,
+            2
+        );
+    }
+
+    /// The DNS answer that installs a first-contact route lands while a pass
+    /// is already planned from an older cache: that pass must not take the
+    /// route out, or the host's next connection leaves by the main link until
+    /// the forced pass puts it back. A pass planned after the install, whose
+    /// plan still does not want the route, drops it as any route of ours.
+    #[test]
+    fn a_route_installed_ahead_survives_the_pass_planned_before_it() {
+        let api = Arc::new(MockWindowsApi::new());
+        let rec = SecondaryRouteReconciler::new(Arc::clone(&api) as Arc<dyn RouteTablePort>);
+        let a = route([198, 51, 100, 1], [10, 0, 0, 1], 7);
+        let x = route([198, 51, 100, 9], [10, 0, 0, 1], 7);
+        rec.reconcile(std::slice::from_ref(&a)).unwrap();
+
+        // The pass reads the write count, then its inputs (without X)...
+        let planned_at = rec.write_count();
+        // ...and the DNS answer installs X in between.
+        assert_eq!(rec.install_additional(std::slice::from_ref(&x)).unwrap(), 1);
+
+        let delta = rec
+            .reconcile_planned(std::slice::from_ref(&a), planned_at)
+            .unwrap();
+        assert!(delta.is_noop(), "{delta:?}");
+        assert!(table_dests(&api).contains(&Ipv4Addr::new(198, 51, 100, 9)));
+        assert_eq!(rec.owned_count(), 2, "X stays ours");
+
+        // The pass planned after the install, with X in its plan, redoes nothing.
+        let planned_at = rec.write_count();
+        let both = [a.clone(), x.clone()];
+        assert!(rec.reconcile_planned(&both, planned_at).unwrap().is_noop());
+
+        // One planned after the install without X takes it out.
+        let planned_at = rec.write_count();
+        let delta = rec
+            .reconcile_planned(std::slice::from_ref(&a), planned_at)
+            .unwrap();
+        assert_eq!(delta.removed, 1);
+        assert!(!table_dests(&api).contains(&Ipv4Addr::new(198, 51, 100, 9)));
+    }
+
+    /// A pass with no plan origin — the teardown's `clear`, a persist-pause
+    /// `retain_rule_routes` — still owns everything, ahead routes included.
+    #[test]
+    fn a_pass_without_a_plan_origin_takes_ahead_routes_out_too() {
+        let api = Arc::new(MockWindowsApi::new());
+        let rec = SecondaryRouteReconciler::new(Arc::clone(&api) as Arc<dyn RouteTablePort>);
+        let x = route([198, 51, 100, 9], [10, 0, 0, 1], 7);
+        assert_eq!(rec.install_additional(std::slice::from_ref(&x)).unwrap(), 1);
+        assert_eq!(rec.clear().unwrap().removed, 1);
+        assert!(table_dests(&api).is_empty());
+        assert_eq!(rec.owned_count(), 0);
     }
 
     // ── route ownership classification ──

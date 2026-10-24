@@ -168,6 +168,25 @@ impl SecondaryRouteCoordinator {
         )
     }
 
+    /// Record whether `sid`'s pass read the machine (its kept-direct segments
+    /// were published) or could not.
+    pub(super) fn note_machine_read(&self, sid: &str, read: bool) {
+        let mut known = self.machine_read.lock().unwrap_or_else(|p| p.into_inner());
+        if read {
+            known.insert(sid.to_owned());
+        } else {
+            known.remove(sid);
+        }
+    }
+
+    /// Keep the machine reading only for `served`; with an empty slice, nobody's.
+    pub(super) fn keep_machine_reads(&self, served: &[String]) {
+        self.machine_read
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .retain(|sid| served.contains(sid));
+    }
+
     pub(super) fn remember_resolution(&self, sid: &str, resolution: &RouteResolution) {
         let mut last = self
             .last_resolution
@@ -210,6 +229,17 @@ impl SecondaryRouteCoordinator {
         let Some(secondary) = resolution.secondary else {
             return 0;
         };
+        // Unread machine: nothing says which addresses are a LAN's or a foreign
+        // tunnel's, and a `/32` planned blind would pull one into the tunnel.
+        // The pass that reads it routes the rest.
+        if !self
+            .machine_read
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .contains(sid)
+        {
+            return 0;
+        }
         let Some(snapshot) = self.rules_provider.active_rules_for(sid) else {
             return 0;
         };

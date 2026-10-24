@@ -55,6 +55,18 @@ impl FakeIpStack {
                 return;
             }
         };
+        // One site past its share is refused alone: the others keep theirs.
+        let site = site_of(&hostname);
+        let held = self
+            .flows
+            .values()
+            .filter(|f| f.policy.site == site)
+            .count();
+        if held >= site_flow_share(self.max_flows) {
+            self.health.record_tcp_flow_refused_at_capacity();
+            self.warn_at_flow_capacity();
+            return;
+        }
         // Notify the observer (VPN self-heal) with the client's own endpoint and
         // the fake destination it dialed. Must be prompt — the production
         // observer only enqueues.
@@ -83,6 +95,7 @@ impl FakeIpStack {
         let handle = self.sockets.add(socket);
 
         self.health.record_tcp_relay_flow_opened();
+        let policy = FlowPolicy::of(&hostname, &target);
         let shared =
             FlowShared::for_flow(Arc::clone(&self.waker), Arc::clone(&self.ready), packet.key);
         let submitted = submit_tcp_dial(
@@ -107,11 +120,45 @@ impl FakeIpStack {
             FlowConn {
                 handle,
                 shared,
+                policy,
                 client_close_sent: false,
                 abort_sent: false,
             },
         );
         let _ = now_ms;
+    }
+
+    /// Reset every flow the books no longer give the route it was opened
+    /// with — moved to the other link, blocked, or its rule gone. The client
+    /// reconnects and the new book decides; the old flow carried on the old
+    /// route for its whole life otherwise, minutes for a stream.
+    // `pub(super)`: this split inherent impl is called from a sibling module.
+    pub(super) fn recheck_tcp_policy(&mut self) {
+        let mut books = BookRoutes::new(&self.relay);
+        let mut aborted = Vec::new();
+        for (key, flow) in &mut self.flows {
+            if flow.abort_sent || flow.policy.still_holds(&mut books) {
+                continue;
+            }
+            self.sockets.get_mut::<tcp::Socket>(flow.handle).abort();
+            flow.abort_sent = true;
+            aborted.push(*key);
+        }
+        if aborted.is_empty() {
+            return;
+        }
+        tracing::info!(
+            target: "nrr::fake-ip",
+            msg_key = "fakeip-flows-reset-after-rule-change",
+            flows = aborted.len(),
+            "reset relayed connections whose rule changed — the application reconnects under the new rule",
+        );
+        // The RST queued by the abort is dispatched by the next step, which
+        // nothing else would ask for.
+        for key in aborted {
+            self.ready.mark(key);
+        }
+        self.waker.wake();
     }
 
     /// Move bytes between the sockets with work and their upstreams, then reap
@@ -215,6 +262,18 @@ impl FakeIpStack {
             {
                 socket.close();
                 flow.client_close_sent = true;
+            }
+
+            // Workers gone with no verdict: whatever ended them, the client
+            // is reset rather than left on a connection nobody serves.
+            if flow.shared.is_dead()
+                && !flow.abort_sent
+                && !matches!(socket.state(), tcp::State::Closed | tcp::State::TimeWait)
+            {
+                socket.abort();
+                flow.abort_sent = true;
+                revisit.push(key);
+                continue;
             }
 
             if socket.state() == tcp::State::Closed {

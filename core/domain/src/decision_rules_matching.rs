@@ -1,7 +1,8 @@
 //! Rule matching implementation.
 //!
-//! Five-tier matching algorithm, after one veto: an `ExactIp` Block on the
-//! observed address wins outright.
+//! Five-tier matching algorithm, after two vetoes: an `ExactIp` Block on the
+//! observed address, then an address-less Block of the application, win
+//! outright.
 //! 1. ExactFqdn — exact hostname (always before SuffixDomain for the same hostname)
 //! 2. SuffixDomain — longest suffix domain (`*.label`); covers the apex `label`
 //!    itself and every subdomain of it — see [`match_suffix_domain`]
@@ -76,6 +77,20 @@ pub fn match_rules(
             .collect();
         if let Some(winner) = select_winner(vetoes) {
             return RequestedRouteDecision::MatchedRoute { candidate: winner };
+        }
+    }
+
+    // A denied application is dropped wherever it connects: enforcement blocks
+    // its image above every route, so no address rule outranks the deny.
+    if avail.application.is_none() {
+        if let Some(app_identity) = &input.app_identity {
+            let vetoes: Vec<_> = collect_application(rule_book, app_identity)
+                .into_iter()
+                .filter(|c| c.action == RuleAction::Block)
+                .collect();
+            if let Some(winner) = select_winner(vetoes) {
+                return RequestedRouteDecision::MatchedRoute { candidate: winner };
+            }
         }
     }
 

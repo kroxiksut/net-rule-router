@@ -49,6 +49,7 @@ impl PerSidApplyOrchestrator {
                     // policy gone ⇒ any block-all is disarming.
                     let flushed = self.note_block_all_state(sid, false);
                     self.note_fail_closed_state(sid, false, flushed);
+                    self.note_machine_wide_cut(sid, false);
                     // No policy ⇒ no kill-switch filters either; drop any stale
                     // entry so the registry never role-verifies a drop for a SID
                     // whose leak-guard is no longer armed.
@@ -100,6 +101,7 @@ impl PerSidApplyOrchestrator {
                     // rules gone ⇒ any block-all is disarming.
                     let flushed = self.note_block_all_state(sid, false);
                     self.note_fail_closed_state(sid, false, flushed);
+                    self.note_machine_wide_cut(sid, false);
                     self.update_killswitch_registry(sid, KillswitchBlockIds::default());
                 }
                 return Ok(ComputedFilterSet::NoActiveRules);
@@ -221,7 +223,9 @@ impl PerSidApplyOrchestrator {
             app_observations: self.app_observations.as_ref(),
             app_resolver: self.app_resolver.as_ref(),
             secondary_ip_denylist: &secondary_ip_denylist,
-            zone_priority_over_ip: false,
+            // The routes and the address arbiter read the stored flag; the
+            // filters must answer the same question.
+            zone_priority_over_ip: policy.zone_priority_over_ip,
             app_rules_take_all_addresses: policy.app_rules_take_all_addresses,
             families: ipv6.families(),
             packet_blocks: self.rules_provider.rules_are_baseline_for(sid),
@@ -243,6 +247,7 @@ impl PerSidApplyOrchestrator {
             &rules.rule_book,
             fqdn_cache,
             &secondary_ip_denylist,
+            policy.zone_priority_over_ip,
             policy.app_rules_take_all_addresses,
             ipv6,
             &codegen_out.filters,
@@ -275,6 +280,9 @@ impl PerSidApplyOrchestrator {
         // hear which one won, or the app will look mis-routed for no visible
         // reason.
         let mut claimed_by_main: Vec<(String, std::net::Ipv4Addr)> = Vec::new();
+        // Destinations an app rule left alone because other programs use them
+        // too: they go direct, or nowhere for the app while its guard is on.
+        let mut shared_with_others: Vec<(String, std::net::Ipv4Addr)> = Vec::new();
         let mut unsupported_shapes: Vec<String> = Vec::new();
         let mut networks_over_cap: Vec<crate::rule_conflicts::RuleConflict> = Vec::new();
         for diag in &codegen_out.diagnostics {
@@ -310,6 +318,13 @@ impl PerSidApplyOrchestrator {
                     ..
                 } => {
                     claimed_by_main.push((app.clone(), *ip));
+                }
+                crate::wfp_codegen::CodegenDiagnostic::AppDestinationUsedByOtherProcess {
+                    app,
+                    ip,
+                    ..
+                } => {
+                    shared_with_others.push((app.clone(), *ip));
                 }
                 crate::wfp_codegen::CodegenDiagnostic::SuffixTruncated {
                     rule_id,
@@ -385,6 +400,13 @@ impl PerSidApplyOrchestrator {
                     "an application rule is talking to addresses your main-link rules name: those stay on the main link. The app keeps the additional link for everything else",
                 );
             }
+            if !shared_with_others.is_empty() {
+                log_app_destinations_shared(
+                    sid,
+                    &mut shared_with_others,
+                    policy.leak_protection.is_on(),
+                );
+            }
             if !over_capped.is_empty() {
                 tracing::warn!(
                     target: "nrr::app-resolver",
@@ -456,6 +478,8 @@ impl PerSidApplyOrchestrator {
         // OS resolver-cache flush at the end of the function; per-destination
         // pins never flush).
         let mut block_all_armed = false;
+        // whether that blanket stands because the additional link is gone
+        let mut outage_hold = false;
         // whether THIS compute left the guard blocking with the additional link
         // unresolved (either posture) — see `note_fail_closed_state`.
         let mut fail_closed_armed = false;
@@ -579,6 +603,23 @@ impl PerSidApplyOrchestrator {
                     (floor.local_subnets.clone(), floor.local_subnets_v6.clone())
                 }
             };
+            let infrastructure = {
+                let (v4, v6) = match kill_switch().as_ref() {
+                    Some(r) => (&r.bootstrap_server_ips, &r.bootstrap_server_ips_v6),
+                    None => {
+                        let floor = fail_closed_base();
+                        (&floor.bootstrap_server_ips, &floor.bootstrap_server_ips_v6)
+                    }
+                };
+                crate::enforcement_planner::LinkInfrastructure {
+                    tunnel_servers: v4
+                        .iter()
+                        .map(|ip| std::net::IpAddr::V4(*ip))
+                        .chain(v6.iter().map(|ip| std::net::IpAddr::V6(*ip)))
+                        .collect(),
+                    link_resolvers: self.primary_dns(),
+                }
+            };
             // An address only an APPLICATION rule brought in is not pinned
             // per-destination: the app's own egress-conditional pair (or its
             // unconditional fail-closed block) already governs every flow of
@@ -616,6 +657,15 @@ impl PerSidApplyOrchestrator {
                         *ip,
                         &local_subnets,
                         &local_subnets_v6,
+                    )
+                })
+                .filter(|ip| {
+                    !infrastructure.spares(
+                        *ip,
+                        crate::enforcement_planner::names_address_literally(
+                            &rules.rule_book.secondary,
+                            *ip,
+                        ),
                     )
                 })
                 .filter(|ip| match ip {
@@ -1026,6 +1076,7 @@ impl PerSidApplyOrchestrator {
                             .collect();
                     }
                     block_all_armed = effective_block_all;
+                    outage_hold = effective_block_all;
                     // The networks the tunnel's rules name are pinned whatever
                     // the posture: the blanket sits below the main-link rule
                     // band, the holds above it, and only the holds keep a
@@ -1246,7 +1297,10 @@ impl PerSidApplyOrchestrator {
             policy.doh_lockdown_enabled,
             policy.doh_lockdown_scope,
             protection.is_on(),
-            crate::rule_book_facts::has_secondary_rules(&rules.rule_book),
+            crate::rule_book_facts::needs_names_seen(
+                &rules.rule_book,
+                policy.mode == super::PerSidBehaviorMode::PreferSecondaryWhenAvailable,
+            ),
         ) {
             let doh = crate::killswitch_codegen::doh_dot_block_filters(
                 sid,
@@ -1372,11 +1426,21 @@ impl PerSidApplyOrchestrator {
                     "standing WFP filter volume back under the alarm line",
                 );
             }
+            drop(alarmed);
+            note_machine_volume(
+                crate::standing_volume::global_standing_volume().record(
+                    sid,
+                    filters.len(),
+                    nrr_platform_api::enforcement::EnforcementCapabilities::current()
+                        .standing_filter_alarm,
+                ),
+            );
         }
         // edge-triggered OS resolver-cache flush; a no-op
         // unless the block-all state changed since the previous compute.
         if intent.publishes() {
             let flushed = self.note_block_all_state(sid, block_all_armed);
+            self.note_outage_hold(sid, outage_hold);
             self.note_fail_closed_state(sid, fail_closed_armed, flushed);
             // Both postures cut at the packet layer, which has no user
             // condition — see `note_machine_wide_cut`.
@@ -1459,5 +1523,66 @@ impl PerSidApplyOrchestrator {
             .into_iter()
             .filter(|f| !present.contains(&f.id))
             .collect()
+    }
+}
+
+/// One line per apply naming the app-rule destinations other programs share:
+/// pinning one would move those programs too, so it stays off the tunnel, and
+/// with the guard on the app's own traffic to it is dropped, not sent direct.
+fn log_app_destinations_shared(
+    sid: &str,
+    shared: &mut Vec<(String, std::net::Ipv4Addr)>,
+    guarded: bool,
+) {
+    shared.sort();
+    shared.dedup();
+    let shown: Vec<String> = shared
+        .iter()
+        .take(8)
+        .map(|(app, ip)| format!("{app} → {ip}"))
+        .collect();
+    if guarded {
+        tracing::warn!(
+            target: "nrr::wfp-codegen",
+            msg_key = "persid-plan-app-dest-shared-guarded",
+            sid = %sid,
+            count = shared.len(),
+            conflicts = %shown.join(", "),
+            "application rule addresses are used by other programs too, so they stay off the additional link; with leak protection on the application cannot reach them while that link is up",
+        );
+    } else {
+        tracing::info!(
+            target: "nrr::wfp-codegen",
+            msg_key = "persid-plan-app-dest-shared",
+            sid = %sid,
+            count = shared.len(),
+            conflicts = %shown.join(", "),
+            "application rule addresses are used by other programs too, so they stay off the additional link and the application reaches them over the main link",
+        );
+    }
+}
+
+/// The machine total's log line: every signed-in user's set counts towards the
+/// filtering service's limit, which no single user's count shows.
+pub(super) fn note_machine_volume(edge: crate::standing_volume::MachineEdge) {
+    use crate::standing_volume::MachineEdge;
+    match edge {
+        MachineEdge::Rising {
+            total,
+            previous_peak,
+        } => tracing::warn!(
+            target: "nrr::per_sid_orchestrator",
+            msg_key = "persid-plan-machine-filter-alarm",
+            filters = total,
+            previous_peak,
+            "standing WFP filters on the machine, all users together, above the alarm line and still rising",
+        ),
+        MachineEdge::Recovered { total } => tracing::info!(
+            target: "nrr::per_sid_orchestrator",
+            msg_key = "persid-plan-machine-filter-recovered",
+            filters = total,
+            "standing WFP filters on the machine back under the alarm line",
+        ),
+        MachineEdge::Steady => {}
     }
 }

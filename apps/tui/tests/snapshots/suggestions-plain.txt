@@ -22,8 +22,8 @@ Notifications:
   No notifications.
 Commands on this screen:
   r: restore your settings to a service that lost them
-  t: confirm the listed programs as your VPN, so leak protection keeps them working
-  a: allow the listed VPNs to reach their servers, so leak protection lets them connect
+  t: confirm the first listed program as your VPN (T: with the programs it ships with), so leak protection keeps it working
+  a: allow the first listed VPN to reach its server, so leak protection lets it connect
   p: confirm the suggested main connection; another one is chosen under Interfaces and routes
   v: send the blocked site named under the state over the additional route; you are asked first
 Type a screen number, h for help or q to quit, then press Enter.
@@ -48,6 +48,9 @@ Commands on this screen:
   k and an item number: check that site, whether the network or the site is at fault
   s: show or hide answered addresses; v: show or hide addresses the main connection handles
   o: change the order of the list
+  f and an item number: forget that item with its answer; x: forget them all (asks first)
+  / and text: show only what matches; / on its own shows everything
+  p and a site name: show only what that site needs; p on its own shows everything; * and an item number: mark or unmark it, then a, n, r or f and any marked number acts on every marked one
 Type a screen number, h for help or q to quit, then press Enter.
 
 Screen: Suggested addresses
@@ -82,6 +85,9 @@ Commands on this screen:
   k and an item number: check that site, whether the network or the site is at fault
   s: show or hide answered addresses; v: show or hide addresses the main connection handles
   o: change the order of the list
+  f and an item number: forget that item with its answer; x: forget them all (asks first)
+  / and text: show only what matches; / on its own shows everything
+  p and a site name: show only what that site needs; p on its own shows everything; * and an item number: mark or unmark it, then a, n, r or f and any marked number acts on every marked one
 Type a screen number, h for help or q to quit, then press Enter.
 
 Screen: Suggested addresses
@@ -116,6 +122,9 @@ Commands on this screen:
   k and an item number: check that site, whether the network or the site is at fault
   s: show or hide answered addresses; v: show or hide addresses the main connection handles
   o: change the order of the list
+  f and an item number: forget that item with its answer; x: forget them all (asks first)
+  / and text: show only what matches; / on its own shows everything
+  p and a site name: show only what that site needs; p on its own shows everything; * and an item number: mark or unmark it, then a, n, r or f and any marked number acts on every marked one
 Type a screen number, h for help or q to quit, then press Enter.
 Addresses your sites need: Will not be suggested again: 2.
 
@@ -152,6 +161,9 @@ Commands on this screen:
   k and an item number: check that site, whether the network or the site is at fault
   s: show or hide answered addresses; v: show or hide addresses the main connection handles
   o: change the order of the list
+  f and an item number: forget that item with its answer; x: forget them all (asks first)
+  / and text: show only what matches; / on its own shows everything
+  p and a site name: show only what that site needs; p on its own shows everything; * and an item number: mark or unmark it, then a, n, r or f and any marked number acts on every marked one
 Type a screen number, h for help or q to quit, then press Enter.
 
 Screen: Suggested addresses
@@ -189,6 +201,9 @@ Commands on this screen:
   k and an item number: check that site, whether the network or the site is at fault
   s: show or hide answered addresses; v: show or hide addresses the main connection handles
   o: change the order of the list
+  f and an item number: forget that item with its answer; x: forget them all (asks first)
+  / and text: show only what matches; / on its own shows everything
+  p and a site name: show only what that site needs; p on its own shows everything; * and an item number: mark or unmark it, then a, n, r or f and any marked number acts on every marked one
 Type y to turn it on or n to cancel, then press Enter.
 
 Screen: Suggested addresses
@@ -224,6 +239,9 @@ Commands on this screen:
   k and an item number: check that site, whether the network or the site is at fault
   s: show or hide answered addresses; v: show or hide addresses the main connection handles
   o: change the order of the list
+  f and an item number: forget that item with its answer; x: forget them all (asks first)
+  / and text: show only what matches; / on its own shows everything
+  p and a site name: show only what that site needs; p on its own shows everything; * and an item number: mark or unmark it, then a, n, r or f and any marked number acts on every marked one
 Type a screen number, h for help or q to quit, then press Enter.
 
 Screen: Suggested addresses
@@ -260,5 +278,8 @@ Commands on this screen:
   k and an item number: check that site, whether the network or the site is at fault
   s: show or hide answered addresses; v: show or hide addresses the main connection handles
   o: change the order of the list
+  f and an item number: forget that item with its answer; x: forget them all (asks first)
+  / and text: show only what matches; / on its own shows everything
+  p and a site name: show only what that site needs; p on its own shows everything; * and an item number: mark or unmark it, then a, n, r or f and any marked number acts on every marked one
 Type a screen number, h for help or q to quit, then press Enter.
 Addresses your sites need: Checking 3 addresses over the main connection...

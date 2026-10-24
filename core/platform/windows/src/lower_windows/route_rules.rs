@@ -15,8 +15,9 @@ use super::*;
 /// `wfp_codegen::push_packet_block_mirror`. Ids are deterministic (re-apply = no
 /// churn) but need NOT match the old FNV scheme — the oracle ignores ids.
 pub fn lower_route_rules(plan: &EnforcementPlan) -> Vec<WfpFilterSpec> {
-    // Host flows are COLLECTED per rule and packed; everything else (app
-    // filters, the default catch-all) lowers one flow at a time.
+    // Host flows are COLLECTED and packed: a route band's permits as one set,
+    // a Block rule's per rule. Everything else (app filters, the default
+    // catch-all) lowers one flow at a time.
     //
     // The neutral plan stays per-address — which addresses a rule covers is
     // policy. Folding them into chunk filters is Windows mechanism (WFP ORs
@@ -35,11 +36,10 @@ pub fn lower_route_rules(plan: &EnforcementPlan) -> Vec<WfpFilterSpec> {
         }
     }
     for (key, ips) in rules {
+        let slots = nrr_platform_api::enforcement::SLOTS_PER_RULE;
         for (idx, chunk) in pack_both(ips).into_iter().enumerate() {
-            let weight = key.base
-                + key.rule_position * nrr_platform_api::enforcement::SLOTS_PER_RULE
-                + key.slot_base
-                + idx as u64;
+            let weight =
+                key.base + key.rule_position * slots + (key.slot_base + idx as u64).min(slots - 1);
             let (ale, packet) = match chunk {
                 FamilyChunk::V4(_) => (
                     WfpLayerKey::AleAuthConnectV4,
@@ -73,13 +73,14 @@ pub fn lower_route_rules(plan: &EnforcementPlan) -> Vec<WfpFilterSpec> {
     out
 }
 
-/// What makes two host flows part of the SAME packed rule.
+/// What makes two host flows part of the SAME packed set.
 ///
-/// The ordinal the planner assigns is `rule_position * SLOTS_PER_RULE +
-/// fanout_index`, so dividing it recovers the rule and every address of one
-/// rule lands in one group. Everything else in the key is what a filter would
-/// carry anyway — mixing two of them into one chunk would change what the
-/// filter means.
+/// A permit belongs to its route band as a whole: a band holds only permits,
+/// so which rule's matched decides nothing (`wfp_codegen::flush_route_band`).
+/// A Block keeps its rule: the ordinal is `rule_position * SLOTS_PER_RULE +
+/// fanout_index`, so dividing it recovers the rule. Everything else in the key
+/// is what a filter would carry anyway — mixing two of them into one chunk
+/// would change what the filter means.
 #[derive(Clone, PartialEq, Eq)]
 pub(super) struct RuleChunkKey {
     base: u64,
@@ -112,11 +113,16 @@ pub(super) fn rule_chunk_key(flow: &FlowRule) -> Option<(RuleChunkKey, IpAddr)> 
     };
     let ordinal = u64::from(flow.precedence.ordinal);
     let observed_app_range = nrr_platform_api::enforcement::APP_PATH_FANOUT_CAP + 1;
+    let per_rule = action == WfpAction::Block;
     Some((
         RuleChunkKey {
             base,
-            rule_position: ordinal / nrr_platform_api::enforcement::SLOTS_PER_RULE,
-            slot_base: if flow.observed_by_program {
+            rule_position: if per_rule {
+                ordinal / nrr_platform_api::enforcement::SLOTS_PER_RULE
+            } else {
+                0
+            },
+            slot_base: if per_rule && flow.observed_by_program {
                 observed_app_range
             } else {
                 0

@@ -50,12 +50,14 @@ pub(super) fn spawn_fcrdns_learner_worker(
     if let Some(deps) = companion {
         let engine = Arc::clone(deps.engine);
         let active_sid = Arc::clone(deps.active_sid);
+        let several_served = deps.several_served;
         let job_owner = Arc::clone(&job_owner);
         sink = sink.with_companion_sink(Arc::new(move |hostname: &str| {
             let owner = job_owner.lock().unwrap_or_else(|p| p.into_inner()).clone();
             let Some(sid) = nrr_service_runtime::conn_observation_consumer::suggestion_owner(
                 owner.as_deref(),
                 &active_sid,
+                &several_served,
             ) else {
                 return;
             };
@@ -176,6 +178,7 @@ pub(super) type VpnClientAppPersistFn = Arc<dyn Fn(&str) + Send + Sync>;
 pub(super) struct CompanionFromReverseDeps<'a> {
     pub(super) engine: &'a Arc<nrr_service_runtime::auto_rules::AutoRulesEngine>,
     pub(super) active_sid: &'a nrr_service_runtime::supervised_runtime::ActiveRoutingSidFn,
+    pub(super) several_served: nrr_service_runtime::conn_observation_consumer::SeveralServedFn,
 }
 
 /// Map an OBSERVED process path to the Win32 drive-letter form the WFP
@@ -219,6 +222,9 @@ pub(super) struct ObservationSinks {
     /// The shared-address census a pin-drop teardown spares by.
     pub(super) flow_reset_census:
         Option<Arc<dyn nrr_service_runtime::fqdn_cache_lookup::FqdnCacheLookup>>,
+    /// Whether more than one person is served: an ownerless connection then
+    /// feeds nobody's suggestions.
+    pub(super) several_served: nrr_service_runtime::conn_observation_consumer::SeveralServedFn,
 }
 
 /// What the connection-trace wiring hands back: the merged observation source,
@@ -249,6 +255,7 @@ pub(super) fn build_conn_trace_pair(
         app_destination_forget,
         routed_apps,
         flow_reset_census,
+        several_served,
     } = sinks;
     // The observer runs whenever the route path is available (it is a
     // passive kernel event subscription that also feeds app-routing's observed
@@ -422,10 +429,11 @@ pub(super) fn build_conn_trace_pair(
         let sid_for_companion = Arc::clone(active_sid);
         // Every sink below files under the connection's own user.
         use nrr_service_runtime::conn_observation_consumer::suggestion_owner;
+        let served = Arc::clone(&several_served);
         consumer_builder = consumer_builder.with_companion_in_use(
             Arc::new(move |ip| recent.lookup(ip)),
             Arc::new(move |owner: Option<&str>, hostname: &str| {
-                let Some(sid) = suggestion_owner(owner, &sid_for_companion) else {
+                let Some(sid) = suggestion_owner(owner, &sid_for_companion, &served) else {
                     return;
                 };
                 engine.note_candidate_in_use(&sid, hostname, std::time::SystemTime::now());
@@ -436,9 +444,10 @@ pub(super) fn build_conn_trace_pair(
         {
             let engine = Arc::clone(&engine_app);
             let routing = Arc::clone(active_sid);
+            let served = Arc::clone(&several_served);
             consumer_builder =
                 consumer_builder.with_primary_egress_learning(Arc::new(move |owner: &str| {
-                    suggestion_owner(Some(owner), &routing)
+                    suggestion_owner(Some(owner), &routing, &served)
                         .is_some_and(|sid| engine.learns_for(&sid))
                 }));
         }
@@ -452,6 +461,7 @@ pub(super) fn build_conn_trace_pair(
         // destination, which is the only record of "this host does not open"
         // for a host nobody has a theory about yet.
         let stalls = nrr_service_runtime::primary_stall_registry::global_primary_stalls();
+        let served = Arc::clone(&several_served);
         consumer_builder = consumer_builder.with_companion_primary_health(Arc::new(
             move |owner, hostname, stalled| {
                 let event = if stalled {
@@ -459,13 +469,13 @@ pub(super) fn build_conn_trace_pair(
                 } else {
                     nrr_domain::companion_affinity::PrimaryHealthEvent::Completed
                 };
-                let report = stalls.note(hostname, event);
+                let Some(sid) = suggestion_owner(owner, &sid_for_health, &served) else {
+                    return;
+                };
+                let report = stalls.note(&sid, hostname, event);
                 if let Some(report) = report.as_ref() {
                     nrr_service_runtime::primary_stall_registry::log_report(report);
                 }
-                let Some(sid) = suggestion_owner(owner, &sid_for_health) else {
-                    return;
-                };
                 engine_health.note_primary_health(&sid, hostname, event);
                 // A verdict that just turned to "stalls" is the product
                 // finding out, by measurement, that the main link will
@@ -497,17 +507,19 @@ pub(super) fn build_conn_trace_pair(
             let sid_for_app = Arc::clone(active_sid);
             let engine_split = Arc::clone(&engine_app);
             let reach = nrr_service_runtime::app_main_link_reach::global_app_main_link_reach();
+            let served = Arc::clone(&several_served);
             consumer_builder = consumer_builder.with_app_main_link(Arc::new(
                 move |owner: Option<&str>,
                       program: &str,
                       remote: std::net::IpAddr,
                       stalled: bool,
                       named: bool| {
-                    let at_ms = nrr_service_runtime::conn_observation_consumer::now_unix_ms();
-                    let Some(verdict) = reach.note(program, remote, stalled, named, at_ms) else {
+                    let Some(sid) = suggestion_owner(owner, &sid_for_app, &served) else {
                         return;
                     };
-                    let Some(sid) = suggestion_owner(owner, &sid_for_app) else {
+                    let at_ms = nrr_service_runtime::conn_observation_consumer::now_unix_ms();
+                    let Some(verdict) = reach.note(&sid, program, remote, stalled, named, at_ms)
+                    else {
                         return;
                     };
                     let now = std::time::SystemTime::now();
@@ -525,19 +537,17 @@ pub(super) fn build_conn_trace_pair(
             ));
             let sid_for_split = Arc::clone(active_sid);
             let reach = nrr_service_runtime::app_main_link_reach::global_app_main_link_reach();
+            let served = Arc::clone(&several_served);
             consumer_builder = consumer_builder.with_app_additional_link(Arc::new(
                 move |owner: Option<&str>, program: &str| {
+                    let Some(sid) = suggestion_owner(owner, &sid_for_split, &served) else {
+                        return;
+                    };
                     let at_ms = nrr_service_runtime::conn_observation_consumer::now_unix_ms();
-                    if reach.note_additional_link(program, at_ms).is_none() {
+                    if reach.note_additional_link(&sid, program, at_ms).is_none() {
                         return;
                     }
-                    if let Some(sid) = suggestion_owner(owner, &sid_for_split) {
-                        engine_split.withdraw_app_offer(
-                            &sid,
-                            program,
-                            std::time::SystemTime::now(),
-                        );
-                    }
+                    engine_split.withdraw_app_offer(&sid, program, std::time::SystemTime::now());
                 },
             ));
         }
@@ -546,9 +556,10 @@ pub(super) fn build_conn_trace_pair(
         // exchange and opened site alike; the connection says who went.
         {
             let sid_for_placeholder = Arc::clone(active_sid);
+            let served = Arc::clone(&several_served);
             consumer_builder = consumer_builder.with_placeholder_confirmed(Arc::new(
                 move |owner: Option<&str>, hostname: &str| {
-                    let Some(sid) = suggestion_owner(owner, &sid_for_placeholder) else {
+                    let Some(sid) = suggestion_owner(owner, &sid_for_placeholder, &served) else {
                         return;
                     };
                     engine_placeholder.note_placeholder_answer_host(

@@ -28,15 +28,26 @@ fn unbound() -> Fixture {
     }
 }
 
-/// The healthy machine's adapters with no binding in the policy.
+/// A first start as the service reports it: the machine's adapters, and no
+/// policy until the user's first save.
 fn first_start() -> Value {
+    let mut snapshot = snapshot_json(&Fixture::healthy());
+    snapshot
+        .as_object_mut()
+        .expect("fixture snapshot")
+        .remove("route-policy");
+    snapshot
+}
+
+/// The policy the first save stores: the healthy one with no binding.
+fn first_saved_policy() -> Value {
     let mut snapshot = snapshot_json(&Fixture::healthy());
     let policy = snapshot["route-policy"]
         .as_object_mut()
         .expect("fixture policy");
     policy.remove("primary");
     policy.remove("secondary");
-    snapshot
+    snapshot["route-policy"].take()
 }
 
 fn app_on_wizard() -> AppState {
@@ -56,12 +67,8 @@ fn app_on_wizard() -> AppState {
 
 fn service() -> FakeService {
     let fake = FakeService::new(ConnectionStatus::Connected);
-    let snapshot = first_start();
-    fake.answer(
-        IpcOperationName::RoutePolicyUpdate,
-        snapshot["route-policy"].clone(),
-    );
-    fake.answer(IpcOperationName::SnapshotInitialGet, snapshot);
+    fake.answer(IpcOperationName::RoutePolicyUpdate, first_saved_policy());
+    fake.answer(IpcOperationName::SnapshotInitialGet, first_start());
     fake
 }
 
@@ -333,13 +340,16 @@ fn the_offer_raised_by_the_additional_route_is_noted_too() {
     if let Some(bound) = fixture.secondary.as_mut() {
         bound.availability = Some("unavailable");
     }
+    // A new user: no policy yet, the install-time default route.
     let mut snapshot = snapshot_json(&fixture);
-    let policy = snapshot["route-policy"]
+    snapshot
         .as_object_mut()
-        .expect("fixture policy");
-    policy.insert("mode".into(), json!("prefer-secondary-when-available"));
-    policy.remove("primary");
-    policy.remove("secondary");
+        .expect("snapshot")
+        .remove("route-policy");
+    snapshot["first-policy"] = json!({
+        "mode": "prefer-secondary-when-available",
+        "leak-protection-at-least": "off"
+    });
     let mut app = AppState::new(ScreenId::Status, false);
     app.apply(BackendEvent::Link(Link::Connected), &texts, Instant::now());
     let parsed = serde_json::from_value(snapshot).expect("snapshot parses");
@@ -396,6 +406,39 @@ fn leaving_the_setup_keeps_the_protection_of_a_user_already_set_up() {
     assert_eq!(sent.len(), 1);
     assert_eq!(sent[0]["leak-protection"], json!("sites"));
     assert_eq!(sent[0]["doh-lockdown-enabled"], json!(false));
+}
+
+/// A user who chose "Everything" in the window and closed its setup before
+/// binding a connection: the terminal's setup opens by itself, and closing it
+/// must not write "only sites" and lockdown on over that choice.
+#[test]
+fn closing_the_setup_keeps_a_saved_policy_with_no_connection_bound() {
+    let fake = service();
+    let texts = texts_en();
+    let mut app = AppState::new(ScreenId::Status, false);
+    app.apply(BackendEvent::Link(Link::Connected), &texts, Instant::now());
+    let mut snapshot = snapshot_json(&Fixture::healthy());
+    let policy = snapshot["route-policy"].as_object_mut().expect("policy");
+    policy.remove("primary");
+    policy.remove("secondary");
+    policy.insert("leak-protection".into(), json!("everything"));
+    policy.insert("doh-lockdown-enabled".into(), json!(false));
+    policy.insert("doh-lockdown-auto".into(), json!(false));
+    let parsed = serde_json::from_value(snapshot).expect("snapshot parses");
+    app.apply(
+        BackendEvent::Snapshot(Box::new(parsed)),
+        &texts,
+        Instant::now(),
+    );
+    app.outbox.take();
+    app.open(ScreenId::Wizard);
+    take(&mut app, &Action::Close);
+    run_jobs(&mut app, &fake);
+    assert!(
+        fake.sent(IpcOperationName::RoutePolicyUpdate).is_empty(),
+        "closing the setup wrote over the saved policy: {:?}",
+        fake.sent(IpcOperationName::RoutePolicyUpdate)
+    );
 }
 
 #[test]

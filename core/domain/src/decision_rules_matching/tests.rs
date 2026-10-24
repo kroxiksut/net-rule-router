@@ -1601,6 +1601,52 @@ fn a_disabled_literal_ip_block_does_not_veto() {
     assert_eq!(matched_rule_id(&d), Some("r-exact"));
 }
 
+/// Enforcement drops a denied application wherever it connects, so a route
+/// naming the destination must not outrank the deny; another program keeps
+/// the route, and a ROUTE of the application still waits for its tier.
+#[test]
+fn an_application_deny_vetoes_every_address_rule() {
+    let mut deny = rule("b-app", None, Some(app_exact("telemetry.exe")));
+    deny.action = crate::canonical::RuleAction::Block;
+    let rb = book(
+        vec![rule("r-suffix", Some(suffix_domain("example.com")), None)],
+        vec![deny],
+    );
+    let probe = |process: &str| {
+        match_rules(
+            &input_full("www.example.com", Ipv4Addr::new(192, 0, 2, 10), process),
+            &empty_lookup(),
+            &rb,
+            default_zone_policy(),
+            prefer_primary(),
+        )
+    };
+    let d = probe("telemetry.exe");
+    assert_eq!(matched_rule_id(&d), Some("b-app"));
+    assert_eq!(
+        matched_action(&d),
+        Some(crate::canonical::RuleAction::Block)
+    );
+    assert_eq!(matched_rule_id(&probe("curl.exe")), Some("r-suffix"));
+
+    let routed = book(
+        vec![rule("r-suffix", Some(suffix_domain("example.com")), None)],
+        vec![rule("r-app", None, Some(app_exact("telemetry.exe")))],
+    );
+    let d = match_rules(
+        &input_full(
+            "www.example.com",
+            Ipv4Addr::new(192, 0, 2, 10),
+            "telemetry.exe",
+        ),
+        &empty_lookup(),
+        &routed,
+        default_zone_policy(),
+        prefer_primary(),
+    );
+    assert_eq!(matched_rule_id(&d), Some("r-suffix"));
+}
+
 /// A Block and a route of identical specificity: the Block wins on whichever
 /// set either sits, as enforcement does.
 #[test]

@@ -442,6 +442,44 @@ fn clearing_the_cache_asks_first() {
     );
 }
 
+/// The window's cache filters narrow the loaded rows one press at a time, and
+/// `b` asks the service to seed the cache from browser history.
+#[test]
+fn the_cache_filters_narrow_the_rows_and_b_seeds_from_history() {
+    let fake = service();
+    fake.answer(
+        IpcOperationName::SeedFromBrowserHistory,
+        json!({ "started": true, "already-running": false }),
+    );
+    let mut app = connected();
+    open(&mut app, &fake, ScreenId::Cache);
+    let text = view_text(&app, ScreenId::Cache);
+    assert!(
+        text.contains("Shown: All sources · Any freshness · All routes"),
+        "{text}"
+    );
+
+    // Route: all → primary (none in the fixture) → secondary (three rows).
+    key(&mut app, KeyCode::Char('w'));
+    let text = view_text(&app, ScreenId::Cache);
+    assert!(text.contains("No entries match your search"), "{text}");
+    key(&mut app, KeyCode::Char('w'));
+    let text = view_text(&app, ScreenId::Cache);
+    assert!(text.contains("host2.example.com"), "{text}");
+    assert!(!text.contains("host5.example.com"), "{text}");
+    // Freshness: every fixture row is fresh, so "stale" keeps none.
+    key(&mut app, KeyCode::Char('f'));
+    key(&mut app, KeyCode::Char('f'));
+    assert!(!view_text(&app, ScreenId::Cache).contains("host2.example.com"));
+
+    key(&mut app, KeyCode::Char('b'));
+    settle(&mut app, &fake);
+    assert!(fake
+        .operations()
+        .contains(&IpcOperationName::SeedFromBrowserHistory));
+    assert!(view_text(&app, ScreenId::Cache).contains("Import started"));
+}
+
 /// Another surface acknowledging an alert reaches this screen as a push; the
 /// list is re-read on the spot, and only while it is the screen on show.
 #[test]
@@ -503,6 +541,66 @@ fn an_alert_that_trusts_rule_sets_shows_them_before_acknowledging() {
         .operations()
         .contains(&IpcOperationName::OperationStatusGet));
     assert!(render(&app, 100, 40).contains("Security alert acknowledged."));
+}
+
+/// A broken audit chain offers the restart; the breaks it covers are shown
+/// before anything is confirmed, and the confirm reports its outcome.
+#[test]
+fn a_broken_audit_chain_is_restarted_after_its_breaks_are_shown() {
+    let fake = service();
+    let mut status = diagnostics_status();
+    status["security_status"]["audit_chain_ok"] = json!(false);
+    fake.answer(
+        IpcOperationName::SnapshotDiagnosticsGet,
+        json!({ "status": status }),
+    );
+    fake.answer(
+        IpcOperationName::MutationSubmit,
+        json!({
+            "review-summary": { "diff-summary": "", "provenance": "", "risk-level": "high",
+                                "requires-review": true, "changed-fields": [] },
+            "confirmation-token": "tok-2",
+            "review-risk-level": "high",
+            "audit-chain": {
+                "break-count": 2,
+                "breaks": [{ "kind": "hash-mismatch", "file": "audit-1.ndjson", "line": 7 }],
+                "breaks-digest": "d1"
+            },
+            "operation-id": "op-2"
+        }),
+    );
+    let mut app = connected();
+    open(&mut app, &fake, ScreenId::Diagnostics);
+    let picture = render(&app, 120, 40);
+    assert!(picture.contains("k: Restart audit chain"), "{picture}");
+
+    key(&mut app, KeyCode::Char('k'));
+    settle(&mut app, &fake);
+    let text = view_text(&app, ScreenId::Diagnostics);
+    assert!(text.contains("fails verification in 2 places"), "{text}");
+    assert!(
+        text.contains("audit-1.ndjson, line 7: record changed after it was written"),
+        "{text}"
+    );
+    assert!(text.contains("Only the first 1 are listed."), "{text}");
+    assert!(
+        !fake
+            .operations()
+            .contains(&IpcOperationName::OperationStatusGet),
+        "nothing is confirmed before the answer"
+    );
+
+    key(&mut app, KeyCode::Char('y'));
+    settle(&mut app, &fake);
+    let submits = fake.sent(IpcOperationName::MutationSubmit);
+    assert!(
+        submits
+            .iter()
+            .any(|s| s["payload"]["breaks-digest"] == json!("d1") && s["dry-run"] == json!(false)),
+        "{submits:?}"
+    );
+    let text = view_text(&app, ScreenId::Diagnostics);
+    assert!(text.contains("Audit chain restarted."), "{text}");
 }
 
 #[test]

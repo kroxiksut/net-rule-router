@@ -90,6 +90,11 @@ public:
     /// `path` is a local filesystem path (the launcher's `lastSavedPath*`).
     Q_INVOKABLE void openContainingFolder(const QString &path);
 
+    /// Open the file manager at `path` when it is an existing directory and
+    /// do nothing otherwise: a file path handed to Explorer or the desktop
+    /// opener starts the program.
+    Q_INVOKABLE void openFolder(const QString &path);
+
     /// Programmatic grayscale of a tray icon. SystemTrayIcon on
     /// Qt.labs.platform only accepts a URL; runtime QImage transforms
     /// must be done off-band and saved to a file. We grayscale once on
@@ -146,9 +151,9 @@ public:
     // consume race with the tray's own Exit path.
     Q_INVOKABLE bool requestTrayShutdown();
 
-    /// Whether the tray process this host spawned still exists. False once it
-    /// is gone, and when this host never tracked one. An undecidable probe
-    /// counts as alive: the caller waits a bounded time and then goes on.
+    /// Whether a tray still holds its single-instance lock, spawned here or
+    /// not; the spawned PID decides only when the lock cannot be read. An
+    /// undecidable probe counts as alive: the caller waits a bounded time.
     Q_INVOKABLE bool isTrayProcessAlive();
 
     // Tray polls this (Tray.qml) and quits when it returns true. Consumed
@@ -607,6 +612,10 @@ public:
     /// `{"hand-edited": [...]}`, the files changed by hand since).
     Q_INVOKABLE QString rpcUserSettingsRulesFileWritten(const QVariantMap &payload);
     Q_INVOKABLE QString rpcUserSettingsRulesFilesHandEdited(const QVariantMap &payload);
+    /// `local.user-settings.rules-file-write` (`{path, text, overwrite?}`):
+    /// the one write of a rules file. It refuses a file edited by hand
+    /// (`rules-file-hand-edited`) unless `overwrite` is set.
+    Q_INVOKABLE QString rpcUserSettingsRulesFileWrite(const QVariantMap &payload);
 
     /// Async wrapper over the launcher-local `local.update-check.run` RPC: the
     /// Help menu's "Check for updates". Answers `{status: "update-available",

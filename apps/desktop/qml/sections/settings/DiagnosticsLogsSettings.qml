@@ -765,6 +765,7 @@ GroupBox {
                 }
                 ThemedSpinBox {
                     id: logsMaxAge
+                    accessibleLabel: root.uiRevision >= 0 ? root.tr("diag.retention.logs-max-age-label", "Keep logs for") : ""
                     theme: root.uiTheme
                     Layout.preferredWidth: 140
                     Layout.minimumWidth: 140
@@ -788,6 +789,7 @@ GroupBox {
                 }
                 ThemedSpinBox {
                     id: logsMaxSize
+                    accessibleLabel: root.uiRevision >= 0 ? root.tr("diag.retention.logs-max-size-label", "Maximum log storage") : ""
                     theme: root.uiTheme
                     Layout.preferredWidth: 140
                     Layout.minimumWidth: 140
@@ -804,6 +806,7 @@ GroupBox {
                 }
                 ThemedComboBox {
                     id: logsSizeUnitCombo
+                    accessibleLabel: root.uiRevision >= 0 ? root.tr("diag.retention.logs-max-size-label", "Maximum log storage") : ""
                     theme: root.uiTheme
                     Layout.preferredWidth: 100
                     Layout.minimumWidth: 100
@@ -823,6 +826,7 @@ GroupBox {
                 }
                 ThemedSpinBox {
                     id: auditMaxAge
+                    accessibleLabel: root.uiRevision >= 0 ? root.tr("diag.retention.audit-max-age-label", "Keep audit trail for") : ""
                     theme: root.uiTheme
                     Layout.preferredWidth: 140
                     Layout.minimumWidth: 140
@@ -848,6 +852,7 @@ GroupBox {
                 }
                 ThemedSpinBox {
                     id: auditMaxSize
+                    accessibleLabel: root.uiRevision >= 0 ? root.tr("diag.retention.audit-max-size-label", "Maximum audit storage") : ""
                     theme: root.uiTheme
                     Layout.preferredWidth: 140
                     Layout.minimumWidth: 140
@@ -865,6 +870,7 @@ GroupBox {
                 }
                 ThemedComboBox {
                     id: auditSizeUnitCombo
+                    accessibleLabel: root.uiRevision >= 0 ? root.tr("diag.retention.audit-max-size-label", "Maximum audit storage") : ""
                     theme: root.uiTheme
                     Layout.preferredWidth: 100
                     Layout.minimumWidth: 100
@@ -999,6 +1005,7 @@ GroupBox {
                 }
                 ThemedTextField {
                     id: archiveFolderField
+                    accessibleLabel: root.uiRevision >= 0 ? root.tr("diag.archive.folder-label", "Save folder") : ""
                     theme: root.uiTheme
                     Layout.fillWidth: true
                     readOnly: true
@@ -1024,8 +1031,7 @@ GroupBox {
                         icon.source: root.uiIconSource("open-file")
                         onClicked: {
                             if (exportState.lastArchiveDir === "") return
-                            Pure.openExternalUrl(
-                                "file:///" + exportState.lastArchiveDir.replace(/\\/g, "/"))
+                            root.openOwnFolder(Pure.localFolderUrl(exportState.lastArchiveDir))
                         }
                     }
                     Label {
@@ -1269,6 +1275,7 @@ GroupBox {
                     }
                     ThemedComboBox {
                         id: stabilityPolicyCombo
+                        accessibleLabel: root.uiRevision >= 0 ? root.tr("settings.diagnostics.service-stability.ipc.policy.label", "Control-channel failure policy") : ""
                         theme: root.uiTheme
                         Layout.preferredWidth: 340
                         // The model carries the wire-stable `kind` slug so the
@@ -1332,6 +1339,7 @@ GroupBox {
                         Layout.alignment: Qt.AlignVCenter
                     }
                     ThemedSpinBox {
+                        accessibleLabel: root.uiRevision >= 0 ? root.tr("settings.diagnostics.service-stability.ipc.max-restarts.label", "Max restart attempts") : ""
                         theme: root.uiTheme
                         Layout.preferredWidth: 140
                         editable: true
@@ -1357,6 +1365,7 @@ GroupBox {
                     }
                     ThemedSpinBox {
                         id: stabilityBackoffBaseField
+                        accessibleLabel: root.uiRevision >= 0 ? root.tr("settings.diagnostics.service-stability.ipc.backoff-base.label", "Initial backoff (ms)") : ""
                         theme: root.uiTheme
                         Layout.preferredWidth: 140
                         editable: true
@@ -1383,6 +1392,7 @@ GroupBox {
                     }
                     ThemedSpinBox {
                         id: stabilityBackoffCapField
+                        accessibleLabel: root.uiRevision >= 0 ? root.tr("settings.diagnostics.service-stability.ipc.backoff-cap.label", "Max backoff (s)") : ""
                         theme: root.uiTheme
                         Layout.preferredWidth: 140
                         editable: true
@@ -1452,6 +1462,7 @@ GroupBox {
                         }
                         ThemedSpinBox {
                             id: cacheRefreshSpin
+                            accessibleLabel: root.uiRevision >= 0 ? root.tr("settings.diagnostics.cache-refresh.label", "Re-resolve routed sites every") : ""
                             theme: root.uiTheme
                             editable: true
                             from: group._cacheRefreshMinMinutes

@@ -5,10 +5,11 @@
 use nrr_shared::ipc::{ipc_operation_spec, IpcInteractionClass, IpcOperationName};
 use nrr_shared::ipc_payloads::{
     ConnHistoryClearRequest, ConnHistoryEntryDto, ConnHistoryListRequest, ConnHistoryListResponse,
-    ConnHistorySettingsSetRequest, ConnHistorySettingsSetResponse,
+    ConnHistoryPageKey, ConnHistorySettingsSetRequest, ConnHistorySettingsSetResponse,
+    CONN_HISTORY_MAX_CURSOR_BYTES,
 };
 use nrr_shared::ipc_transport::{canonical_operation_class, IpcOperationClass};
-use nrr_shared::pagination::PageResult;
+use nrr_shared::pagination::{PageCursor, PageResult};
 use serde_json::json;
 
 #[test]
@@ -141,4 +142,31 @@ fn the_write_requests_name_only_what_changes() {
     })
     .unwrap_or_else(|e| panic!("{e}"));
     assert_eq!(reply, json!({ "enabled": false, "retention-days": 7 }));
+}
+
+#[test]
+fn a_page_key_survives_the_round_trip_and_a_forged_one_is_refused() {
+    let key = ConnHistoryPageKey {
+        to_ms: 1_700_000_000_000,
+        last_ms: 1_699_999_999_000,
+        program: "C:\\Apps\\a|b \"quoted\".exe".to_owned(),
+        host: "site.example".to_owned(),
+        remote_ip: "2001:db8::1".to_owned(),
+        route: "primary".to_owned(),
+        verdict: "permit".to_owned(),
+        blocked_by: String::new(),
+    };
+    assert_eq!(ConnHistoryPageKey::decode(&key.encode()), Some(key));
+    for forged in [
+        String::new(),
+        "12".to_owned(),
+        "-1|[0,\"\",\"\",\"\",\"\",\"\",\"\"]".to_owned(),
+        "12|[0,\"\"]".to_owned(),
+        "12|{\"a\":1}".to_owned(),
+        format!("12|{}", "[".repeat(CONN_HISTORY_MAX_CURSOR_BYTES)),
+    ] {
+        let cursor: PageCursor =
+            serde_json::from_value(json!(forged)).unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(ConnHistoryPageKey::decode(&cursor), None, "{forged:.40}");
+    }
 }

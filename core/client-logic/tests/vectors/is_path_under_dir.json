@@ -1,0 +1,16 @@
+{
+  "description": "pure.js isPathUnderDir / rule_sets::is_path_under_dir: case-insensitive, separator-blind containment",
+  "cases": [
+    { "name": "a file inside the folder", "input": { "path": "C:/Users/u/rules/rules_primary.txt", "dir": "C:/Users/u/rules" }, "expected": true },
+    { "name": "the folder itself", "input": { "path": "C:/Users/u/rules", "dir": "C:/Users/u/rules" }, "expected": true },
+    { "name": "a sibling with the folder name as prefix", "input": { "path": "C:/Users/u/rules-x/a.txt", "dir": "C:/Users/u/rules" }, "expected": false },
+    { "name": "backslashes on one side", "input": { "path": "C:\\Users\\u\\rules\\a.txt", "dir": "C:/Users/u/rules" }, "expected": true },
+    { "name": "case differs", "input": { "path": "c:/users/U/RULES/a.txt", "dir": "C:/Users/u/rules" }, "expected": true },
+    { "name": "trailing separators on the folder", "input": { "path": "C:/Users/u/rules/a.txt", "dir": "C:/Users/u/rules//" }, "expected": true },
+    { "name": "an empty folder contains nothing", "input": { "path": "C:/Users/u/rules/a.txt", "dir": "" }, "expected": false },
+    { "name": "an empty path is nowhere", "input": { "path": "", "dir": "C:/Users/u/rules" }, "expected": false },
+    { "name": "a parent is not inside its child", "input": { "path": "C:/Users/u", "dir": "C:/Users/u/rules" }, "expected": false },
+    { "name": "a nested subfolder", "input": { "path": "/home/u/rules/sets/work/rules_secondary.txt", "dir": "/home/u/rules" }, "expected": true },
+    { "name": "a folder of only separators is empty", "input": { "path": "/a.txt", "dir": "/" }, "expected": false }
+  ]
+}

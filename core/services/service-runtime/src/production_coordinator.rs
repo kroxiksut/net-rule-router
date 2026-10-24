@@ -64,6 +64,21 @@ fn millis_since_epoch() -> i64 {
         .unwrap_or(0)
 }
 
+/// The audit payload of an event about `principal`'s rules. A user's event
+/// names them under `sid`, the one field the audit reader scopes by; the
+/// baseline is everyone's and names nobody.
+fn payload_about(principal: &str, mut payload: serde_json::Value) -> String {
+    if principal != nrr_storage::BASELINE_PRINCIPAL {
+        if let Some(map) = payload.as_object_mut() {
+            map.insert(
+                "sid".into(),
+                serde_json::Value::String(principal.to_owned()),
+            );
+        }
+    }
+    payload.to_string()
+}
+
 // ── ProductionIdGenerator ────────────────────────────────────────────────────
 
 /// Generates revision/token/attempt ids without depending on the `uuid`
@@ -238,18 +253,21 @@ impl ActivationAuditEmitter for ProductionActivationAuditEmitter {
     fn emit(&self, event: ActivationAuditEvent) {
         match event {
             ActivationAuditEvent::RevisionSubmitted {
+                principal,
                 revision_id,
                 content_hash,
                 source,
                 correlation_id: _,
                 was_dedup,
             } => {
-                let payload = json!({
-                    "event": "submitted",
-                    "content_hash": content_hash,
-                    "dedup": was_dedup,
-                })
-                .to_string();
+                let payload = payload_about(
+                    &principal,
+                    json!({
+                        "event": "submitted",
+                        "content_hash": content_hash,
+                        "dedup": was_dedup,
+                    }),
+                );
                 let (kind, reason) = match source {
                     RulesRevisionSource::PresetImport => {
                         (AuditEventKind::ImportCreated, import::CANDIDATE_CREATED)
@@ -269,6 +287,7 @@ impl ActivationAuditEmitter for ProductionActivationAuditEmitter {
                 );
             }
             ActivationAuditEvent::DryRunRequested {
+                principal,
                 revision_id,
                 correlation_id: _,
             } => {
@@ -277,15 +296,22 @@ impl ActivationAuditEmitter for ProductionActivationAuditEmitter {
                     AuditEventResult::Success,
                     REVIEW_APPROVED,
                     Some(revision_id),
-                    Some(json!({ "event": "dry_run_requested" }).to_string()),
+                    Some(payload_about(
+                        &principal,
+                        json!({ "event": "dry_run_requested" }),
+                    )),
                 );
             }
             ActivationAuditEvent::TokenIssued {
+                principal,
                 revision_id,
                 token: _,
                 ttl_secs,
             } => {
-                let payload = json!({ "event": "token_issued", "ttl_secs": ttl_secs }).to_string();
+                let payload = payload_about(
+                    &principal,
+                    json!({ "event": "token_issued", "ttl_secs": ttl_secs }),
+                );
                 self.append(
                     AuditEventKind::ReviewApproved,
                     AuditEventResult::Success,
@@ -295,6 +321,7 @@ impl ActivationAuditEmitter for ProductionActivationAuditEmitter {
                 );
             }
             ActivationAuditEvent::TokenConsumed {
+                principal,
                 revision_id,
                 token: _,
             } => {
@@ -303,16 +330,22 @@ impl ActivationAuditEmitter for ProductionActivationAuditEmitter {
                     AuditEventResult::Success,
                     REVIEW_APPROVED,
                     Some(revision_id),
-                    Some(json!({ "event": "token_consumed" }).to_string()),
+                    Some(payload_about(
+                        &principal,
+                        json!({ "event": "token_consumed" }),
+                    )),
                 );
             }
             ActivationAuditEvent::ActivationStarted {
+                principal,
                 revision_id,
                 attempt_id,
                 ..
             } => {
-                let payload =
-                    json!({ "event": "activation_started", "attempt_id": attempt_id }).to_string();
+                let payload = payload_about(
+                    &principal,
+                    json!({ "event": "activation_started", "attempt_id": attempt_id }),
+                );
                 self.append(
                     AuditEventKind::RevisionActivated,
                     AuditEventResult::Success,
@@ -322,6 +355,7 @@ impl ActivationAuditEmitter for ProductionActivationAuditEmitter {
                 );
             }
             ActivationAuditEvent::PreFlightPassed {
+                principal,
                 revision_id,
                 sids: _,
             } => {
@@ -330,18 +364,24 @@ impl ActivationAuditEmitter for ProductionActivationAuditEmitter {
                     AuditEventResult::Success,
                     apply_reason::STARTED,
                     Some(revision_id),
-                    Some(json!({ "event": "pre_flight_passed" }).to_string()),
+                    Some(payload_about(
+                        &principal,
+                        json!({ "event": "pre_flight_passed" }),
+                    )),
                 );
             }
             ActivationAuditEvent::PreFlightFailed {
+                principal,
                 revision_id,
                 sid_failures,
             } => {
-                let payload = json!({
-                    "event": "pre_flight_failed",
-                    "failure_count": sid_failures.len(),
-                })
-                .to_string();
+                let payload = payload_about(
+                    &principal,
+                    json!({
+                        "event": "pre_flight_failed",
+                        "failure_count": sid_failures.len(),
+                    }),
+                );
                 self.append(
                     AuditEventKind::RevisionActivated,
                     AuditEventResult::Failure,
@@ -351,14 +391,17 @@ impl ActivationAuditEmitter for ProductionActivationAuditEmitter {
                 );
             }
             ActivationAuditEvent::PreFlightPassedButApplyFailed {
+                principal,
                 revision_id,
                 sid_failures,
             } => {
-                let payload = json!({
-                    "event": "pre_flight_passed_but_apply_failed",
-                    "failure_count": sid_failures.len(),
-                })
-                .to_string();
+                let payload = payload_about(
+                    &principal,
+                    json!({
+                        "event": "pre_flight_passed_but_apply_failed",
+                        "failure_count": sid_failures.len(),
+                    }),
+                );
                 self.append(
                     AuditEventKind::RevisionActivated,
                     AuditEventResult::Failure,
@@ -374,13 +417,15 @@ impl ActivationAuditEmitter for ProductionActivationAuditEmitter {
                 succeeded_sids,
                 drift_sids,
             } => {
-                let payload = json!({
-                    "event": "revision_activated",
-                    "previous": previous_revision_id,
-                    "succeeded": succeeded_sids.len(),
-                    "drift": drift_sids.len(),
-                })
-                .to_string();
+                let payload = payload_about(
+                    &principal,
+                    json!({
+                        "event": "revision_activated",
+                        "previous": previous_revision_id,
+                        "succeeded": succeeded_sids.len(),
+                        "drift": drift_sids.len(),
+                    }),
+                );
                 self.append(
                     AuditEventKind::RevisionActivated,
                     AuditEventResult::Success,
@@ -396,7 +441,10 @@ impl ActivationAuditEmitter for ProductionActivationAuditEmitter {
                 reason,
                 sid_failures: _,
             } => {
-                let payload = json!({ "event": "revision_rejected", "reason": reason }).to_string();
+                let payload = payload_about(
+                    &principal,
+                    json!({ "event": "revision_rejected", "reason": reason }),
+                );
                 self.append(
                     AuditEventKind::ReviewRejected,
                     AuditEventResult::Failure,
@@ -407,11 +455,14 @@ impl ActivationAuditEmitter for ProductionActivationAuditEmitter {
                 self.publish_status_change(&principal, &revision_id, "rejected");
             }
             ActivationAuditEvent::RollbackRequested {
+                principal,
                 target,
                 correlation_id: _,
             } => {
-                let payload =
-                    json!({ "event": "rollback_requested", "target": target }).to_string();
+                let payload = payload_about(
+                    &principal,
+                    json!({ "event": "rollback_requested", "target": target }),
+                );
                 self.append(
                     AuditEventKind::RollbackStarted,
                     AuditEventResult::Success,
@@ -425,12 +476,14 @@ impl ActivationAuditEmitter for ProductionActivationAuditEmitter {
                 from_revision_id,
                 to_revision_id,
             } => {
-                let payload = json!({
-                    "event": "rolled_back",
-                    "from": from_revision_id,
-                    "to": to_revision_id,
-                })
-                .to_string();
+                let payload = payload_about(
+                    &principal,
+                    json!({
+                        "event": "rolled_back",
+                        "from": from_revision_id,
+                        "to": to_revision_id,
+                    }),
+                );
                 self.append(
                     AuditEventKind::RollbackCompleted,
                     AuditEventResult::Success,
@@ -462,12 +515,13 @@ impl ActivationAuditEmitter for ProductionActivationAuditEmitter {
                         nrr_shared::ipc_payloads::REVISION_STATUS_RESET_TO_BASELINE,
                     );
                 }
-                let payload = json!({
-                    "event": "reset_to_baseline",
-                    "principal": principal,
-                    "deleted": deleted_revisions,
-                })
-                .to_string();
+                let payload = payload_about(
+                    &principal,
+                    json!({
+                        "event": "reset_to_baseline",
+                        "deleted": deleted_revisions,
+                    }),
+                );
                 self.append(
                     AuditEventKind::RollbackCompleted,
                     AuditEventResult::Success,
@@ -495,16 +549,17 @@ impl ActivationAuditEmitter for ProductionActivationAuditEmitter {
                         format!("rule-cap-exceeded({user_rule_count}>{cap})")
                     }
                 };
-                let payload = json!({
-                    "event": "active_integrity_rejected",
-                    "principal": principal,
-                    "reason": reason_slug,
-                    "rejected_user_rule_count": rejected_user_rule_count,
-                    "trusted_source_revision_id": trusted_source_revision_id,
-                    "trusted_user_rule_count": trusted_user_rule_count,
-                    "new_active_revision_id": new_active_revision_id,
-                })
-                .to_string();
+                let payload = payload_about(
+                    &principal,
+                    json!({
+                        "event": "active_integrity_rejected",
+                        "reason": reason_slug,
+                        "rejected_user_rule_count": rejected_user_rule_count,
+                        "trusted_source_revision_id": trusted_source_revision_id,
+                        "trusted_user_rule_count": trusted_user_rule_count,
+                        "new_active_revision_id": new_active_revision_id,
+                    }),
+                );
                 self.append(
                     AuditEventKind::UntrustedRevisionRejected,
                     AuditEventResult::Failure,
@@ -1230,6 +1285,7 @@ mod tests {
         assert!(first.as_str() < second.as_str(), "{first:?} !< {second:?}");
     }
     use super::*;
+    use crate::activation_coordinator::ApplyFailurePolicy;
     use std::collections::HashSet;
 
     // ── ProductionIdGenerator ────────────────────────────────────────────────
@@ -1539,6 +1595,7 @@ mod tests {
         );
         let n = nasty();
         emitter.emit(ActivationAuditEvent::RevisionSubmitted {
+            principal: n.clone(),
             revision_id: n.clone(),
             content_hash: n.clone(),
             source: nrr_domain::rules_revision::RulesRevisionSource::GuiRulesEdit,
@@ -1552,6 +1609,7 @@ mod tests {
             sid_failures: vec![],
         });
         emitter.emit(ActivationAuditEvent::RollbackRequested {
+            principal: n.clone(),
             target: n.clone(),
             correlation_id: n.clone(),
         });
@@ -1591,6 +1649,149 @@ mod tests {
         assert!(writer.verify_chain(None).chain_ok);
     }
 
+    /// Every step of one user's activation, rollback, reset or integrity
+    /// refusal is that user's to read; another user sees none of it, and a
+    /// baseline change is everyone's.
+    #[test]
+    fn a_users_activation_trail_is_read_by_that_user_only() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let writer = Arc::new(AuditWriter::open(
+            nrr_diagnostics::audit::writer::AuditWriterConfig::new(dir.path()),
+        ));
+        let emitter = ProductionActivationAuditEmitter::new(
+            Arc::clone(&writer),
+            Arc::new(ProductionIdGenerator::new()),
+        );
+        let trail_of = |who: &str| {
+            let p = || who.to_string();
+            let rev = || format!("rev-{who}");
+            vec![
+                ActivationAuditEvent::RevisionSubmitted {
+                    principal: p(),
+                    revision_id: rev(),
+                    content_hash: "hash".into(),
+                    source: RulesRevisionSource::GuiRulesEdit,
+                    correlation_id: "corr".into(),
+                    was_dedup: false,
+                },
+                ActivationAuditEvent::DryRunRequested {
+                    principal: p(),
+                    revision_id: String::new(),
+                    correlation_id: "corr".into(),
+                },
+                ActivationAuditEvent::TokenIssued {
+                    principal: p(),
+                    revision_id: rev(),
+                    token: "tok".into(),
+                    ttl_secs: 60,
+                },
+                ActivationAuditEvent::TokenConsumed {
+                    principal: p(),
+                    revision_id: rev(),
+                    token: "tok".into(),
+                },
+                ActivationAuditEvent::ActivationStarted {
+                    principal: p(),
+                    revision_id: rev(),
+                    attempt_id: "att".into(),
+                    previous_revision_id: None,
+                    sid_snapshot: vec![p()],
+                    policy: ApplyFailurePolicy::AllOrNothing,
+                },
+                ActivationAuditEvent::PreFlightPassed {
+                    principal: p(),
+                    revision_id: rev(),
+                    sids: vec![p()],
+                },
+                ActivationAuditEvent::PreFlightFailed {
+                    principal: p(),
+                    revision_id: rev(),
+                    sid_failures: vec![(p(), "no".into())],
+                },
+                ActivationAuditEvent::PreFlightPassedButApplyFailed {
+                    principal: p(),
+                    revision_id: rev(),
+                    sid_failures: vec![(p(), "no".into())],
+                },
+                ActivationAuditEvent::RevisionActivated {
+                    principal: p(),
+                    revision_id: rev(),
+                    previous_revision_id: None,
+                    succeeded_sids: vec![p()],
+                    drift_sids: vec![],
+                },
+                ActivationAuditEvent::RevisionRejected {
+                    principal: p(),
+                    revision_id: rev(),
+                    reason: "apply failed".into(),
+                    sid_failures: vec![],
+                },
+                ActivationAuditEvent::RollbackRequested {
+                    principal: p(),
+                    target: "previous".into(),
+                    correlation_id: "corr".into(),
+                },
+                ActivationAuditEvent::RolledBack {
+                    principal: p(),
+                    from_revision_id: rev(),
+                    to_revision_id: "rev-0".into(),
+                },
+                ActivationAuditEvent::ResetToBaseline {
+                    principal: p(),
+                    deleted_revisions: 1,
+                    correlation_id: "corr".into(),
+                },
+                ActivationAuditEvent::ActiveIntegrityRejected {
+                    principal: p(),
+                    rejected_revision_id: rev(),
+                    reason: RevisionRejectReason::Unsigned,
+                    rejected_user_rule_count: 1,
+                    trusted_source_revision_id: None,
+                    trusted_user_rule_count: None,
+                    new_active_revision_id: None,
+                },
+            ]
+        };
+        let a_trail = trail_of("S-1-A");
+        let per_user = a_trail.len();
+        for event in a_trail.into_iter().chain(trail_of("S-1-B")) {
+            emitter.emit(event);
+        }
+        emitter.emit(ActivationAuditEvent::RevisionActivated {
+            principal: nrr_storage::BASELINE_PRINCIPAL.into(),
+            revision_id: "rev-base".into(),
+            previous_revision_id: None,
+            succeeded_sids: vec![],
+            drift_sids: vec![],
+        });
+
+        let reader = nrr_diagnostics::audit::AuditReader::new(dir.path());
+        let seen_by = |audience: nrr_shared::diagnostics_dto::DiagnosticsAudience| {
+            reader
+                .scan(&nrr_diagnostics::audit::AuditQueryFilter::new(), &audience)
+                .into_iter()
+                .map(|e| e.payload_summary_json.expect("a payload"))
+                .collect::<Vec<String>>()
+        };
+        let a_sees = seen_by(nrr_shared::diagnostics_dto::DiagnosticsAudience::Principal(
+            "S-1-A".into(),
+        ));
+        assert_eq!(a_sees.len(), per_user + 1, "own trail plus the baseline");
+        assert!(
+            a_sees
+                .iter()
+                .all(|p| !p.contains("S-1-B") && !p.contains("rev-S-1-B")),
+            "another user's steps leaked: {a_sees:?}"
+        );
+        assert!(
+            a_sees.last().is_some_and(|p| !p.contains("sid")),
+            "the baseline names nobody"
+        );
+        let machine = seen_by(nrr_shared::diagnostics_dto::DiagnosticsAudience::Machine);
+        assert_eq!(machine.len(), per_user * 2 + 1);
+        assert!(writer.verify_chain(None).chain_ok);
+    }
+
     /// An import and a refusal each land under their own kind, not under the
     /// approval or activation they used to be filed as.
     #[test]
@@ -1604,6 +1805,7 @@ mod tests {
             Arc::new(ProductionIdGenerator::new()),
         );
         let submitted = |source| ActivationAuditEvent::RevisionSubmitted {
+            principal: "S-1-A".into(),
             revision_id: "rev-1".into(),
             content_hash: "hash".into(),
             source,

@@ -57,6 +57,7 @@ GroupBox {
         }
         ThemedComboBox {
             id: compatModeCombo
+            accessibleLabel: root.uiRevision >= 0 ? root.tr("settings.updates.compat-banner-mode.label", "Compatibility banner") : ""
             theme: root.uiTheme
             Layout.fillWidth: true
             model: [ "auto", "always", "never" ]

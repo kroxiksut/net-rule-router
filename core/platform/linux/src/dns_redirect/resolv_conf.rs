@@ -146,7 +146,28 @@ pub(crate) fn write_atomically(path: &Path, text: &str) -> Result<(), PlatformEr
         let _ = std::fs::remove_file(&temp);
         failed(e)
     })?;
-    sync_dir(dir).map_err(failed)
+    sync_dir(dir).map_err(failed)?;
+    relabel(path);
+    Ok(())
+}
+
+/// Give a file under `/etc` the SELinux label its own name carries. Written
+/// under a temporary name and renamed, it kept that name's label, and the
+/// network tools allowed to rewrite `resolv.conf` were then refused it. A
+/// system without SELinux has no `restorecon`; that, like any failure here,
+/// changes nothing.
+fn relabel(path: &Path) {
+    if !path.starts_with("/etc") {
+        return;
+    }
+    let Some(text) = path.to_str() else {
+        return;
+    };
+    let _ = crate::command::output_with_timeout(
+        "restorecon",
+        &["-F", "--", text],
+        std::time::Duration::from_secs(2),
+    );
 }
 
 /// Make a rename in `dir` durable.
@@ -326,7 +347,9 @@ fn relink(path: &Path, target: &Path) -> Result<(), PlatformError> {
     let _ = std::fs::remove_file(&temp);
     std::os::unix::fs::symlink(target, &temp).map_err(failed)?;
     std::fs::rename(&temp, path).map_err(failed)?;
-    sync_dir(path.parent().unwrap_or_else(|| Path::new("/"))).map_err(failed)
+    sync_dir(path.parent().unwrap_or_else(|| Path::new("/"))).map_err(failed)?;
+    relabel(path);
+    Ok(())
 }
 
 #[cfg(not(unix))]

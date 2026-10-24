@@ -7,14 +7,16 @@ use nrr_client_logic::adapters::{
     unroutable_reason,
 };
 use nrr_client_logic::route_policy::{
-    build_full_update_request, name_changes, settle_leak_protection,
+    build_full_update_request, coerce_leak_protection, name_changes, secondary_change_holds_now,
+    settle_leak_protection, DEFAULT_ROUTES,
 };
 use nrr_client_logic::Route;
 use nrr_ipc_client::{ipc_error_to_wire, ipc_operation_timeout, IpcClient, IpcClientError};
 use nrr_shared::display_text::display_text;
 use nrr_shared::ipc::IpcOperationName;
 use nrr_shared::ipc_payloads::{
-    InterfaceRowDto, LeakProtectionDto, RouteBindingDto, RoutePolicyDto, SnapshotInterfacesResponse,
+    BehaviorModeDto, InterfaceRowDto, LeakProtectionDto, RouteBindingDto, RoutePolicyDto,
+    SnapshotInterfacesResponse,
 };
 use serde_json::{json, Map, Value};
 
@@ -370,6 +372,44 @@ pub fn kill_switch_on(app: &AppState) -> bool {
         .as_ref()
         .and_then(|s| s.route_policy.as_ref())
         .is_some_and(|p| p.leak_protection != LeakProtectionDto::Off)
+}
+
+/// The leak protection in force, settled against the default route.
+pub fn leak_level(app: &AppState) -> &'static str {
+    app.snapshot
+        .as_ref()
+        .and_then(|s| s.route_policy.as_ref())
+        .map_or(LeakProtectionDto::Off.as_slug(), |p| {
+            let route = match p.mode {
+                BehaviorModeDto::PreferPrimary => DEFAULT_ROUTES[0],
+                BehaviorModeDto::PreferSecondaryWhenAvailable => DEFAULT_ROUTES[1],
+            };
+            coerce_leak_protection(route, p.leak_protection.as_slug())
+        })
+}
+
+/// Whether `change` to `key`'s adapter leaves no available adapter holding the
+/// additional role under "Everything": the GUI asks before the internet stops.
+pub fn change_holds_now(app: &AppState, key: &str, change: &RoleChange) -> bool {
+    let rows = adapters(app, true);
+    let before = rows.iter().find(|row| holds(row, Route::Secondary));
+    let after = match change {
+        RoleChange::Unassign {
+            route: Route::Primary,
+        } => return false,
+        RoleChange::Unassign {
+            route: Route::Secondary,
+        } => None,
+        RoleChange::Assign {
+            route: Route::Secondary,
+            ..
+        } => find(&rows, key),
+        RoleChange::Assign {
+            route: Route::Primary,
+            ..
+        } => before.filter(|row| row_key(row) != key),
+    };
+    secondary_change_holds_now(leak_level(app), before, after)
 }
 
 /// The GUI's warning before an adapter with no way out takes a role.

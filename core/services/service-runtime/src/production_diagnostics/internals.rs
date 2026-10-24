@@ -84,6 +84,11 @@ impl ProductionDiagnosticsFacade {
         if self.reads_include_subdomains(caller_sid) {
             rule_book = rule_book.with_subdomain_coverage();
         }
+        // A rule enforcement keeps out (a protected program, a path rule this
+        // platform cannot apply) must not win here either.
+        let requested_book = rule_book.clone();
+        let (kept, withheld) = crate::protected_rules::withhold_for(caller_sid, rule_book);
+        rule_book = kept;
 
         // Match through the REAL engine matcher so the probe cannot diverge
         // from production routing semantics — `match_sample` honours the
@@ -241,6 +246,29 @@ impl ProductionDiagnosticsFacade {
                 )
             }
         };
+        // Default route only because the rule that would win is withheld: say
+        // the rule exists, so "no rule matched" does not read as a missing rule.
+        let withheld_rule_won = !withheld.is_empty()
+            && matches!(
+                decision,
+                nrr_domain::decision_matching::RequestedRouteDecision::DefaultRoute { .. }
+            )
+            && match nrr_domain::decision_engine_input::match_sample(
+                &requested_book,
+                match_host,
+                observed_ipaddr,
+                sample.process_name.as_deref(),
+                zone_policy,
+                behavior_mode,
+            ) {
+                nrr_domain::decision_matching::RequestedRouteDecision::MatchedRoute {
+                    candidate,
+                } => withheld.iter().any(|w| w.rule_id == candidate.rule_id),
+                nrr_domain::decision_matching::RequestedRouteDecision::DefaultRoute { .. } => false,
+            };
+        if withheld_rule_won {
+            reason_key = "diag.explain.reason.rule-withheld".to_string();
+        }
         if shape_not_enforced {
             reason_key = "diag.explain.reason.rule-shape-not-enforced".to_string();
         }

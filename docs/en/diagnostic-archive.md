@@ -75,11 +75,11 @@ The following are structurally excluded and can never appear in an archive:
 
 ## Privacy note: domain names and IP addresses
 
-The default privacy mode used for every archive reduces a hostname to its registrable domain (for example, `updates.example.com` becomes `example.com`) and replaces an IP address with a category marker (`<private-ipv4>` or `<public-ipv4>`) instead of the address itself. `logs.ndjson` and `audit_summary.json` are structured event records (message keys and correlation ids), so under normal export they do not carry raw hostnames or IP addresses at all.
+In the default privacy mode the archive names neither the sites you visit nor the addresses they resolved to. In the service's log lines such a value is replaced whole with `<redacted>`, and the line itself (what happened and when) stays readable. In the network adapter snapshot an address becomes a category marker (`<private-ipv4>` or `<public-ipv4>`). `logs.ndjson` and `audit_summary.json` are structured event records (message keys and correlation ids), so under normal export they do not carry raw hostnames or IP addresses at all.
 
 The one exception is the optional `explain_samples.json` section described above: because its whole purpose is to show why a routing decision was made, it can include a destination hostname. This section is off by default and only appears in a **Full diagnostics** export.
 
-If you export without administrator rights, file and folder paths inside error texts are replaced with `<masked-path>`, in the archive and in the Logs view alike: the line still says what failed, without naming files on the computer. An administrator sees those texts as written.
+If you export without administrator rights, file and folder paths inside error texts are replaced with `<masked-path>`, in the archive and in the Logs view alike: the line still says what failed, without naming files on the computer. An administrator sees those texts as written. The app's own window-side logs added to your copy (see below) have their paths masked in every case.
 
 Because the archive is a plain, human-readable `.zip`, you can always open any file inside it and inspect — or remove — a line before sharing it.
 

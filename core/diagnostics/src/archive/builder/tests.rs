@@ -876,7 +876,7 @@ fn broker_logs_ship_at_the_root_without_the_users_name() {
 }
 
 #[test]
-fn a_default_export_does_not_ship_mac_addresses_or_dns_servers() {
+fn a_default_export_does_not_ship_addresses_or_adapter_names() {
     use nrr_shared::ipc_payloads::{AdapterEntry, InterfaceRowDto, SnapshotInterfacesResponse};
 
     let dir = tempfile::tempdir().expect("temp");
@@ -885,8 +885,8 @@ fn a_default_export_does_not_ship_mac_addresses_or_dns_servers() {
     let row = InterfaceRowDto {
         persistent_id: "00-11-22-33-44-55".into(),
         adapter_name: "Ethernet".into(),
-        name: "Ethernet".into(),
-        interface_description: "Ethernet adapter".into(),
+        name: "Example Corp office tunnel".into(),
+        interface_description: "Example Provider TUN driver".into(),
         interface_type: "ethernet".into(),
         kind: "ethernet".into(),
         device_technology: None,
@@ -902,9 +902,9 @@ fn a_default_export_does_not_ship_mac_addresses_or_dns_servers() {
         route_state: "not-selected".into(),
         observed_facts: nrr_shared::ipc_payloads::InterfaceObservedFactsDto {
             connectivity_state: "online".into(),
-            external_ip_status: "not-checked".into(),
-            external_ip: None,
-            external_probe_attempted: false,
+            external_ip_status: "checked".into(),
+            external_ip: Some("203.0.113.99".into()),
+            external_probe_attempted: true,
             external_probe_note: String::new(),
         },
         derived_assessment: nrr_shared::ipc_payloads::InterfaceDerivedAssessmentDto {
@@ -931,8 +931,8 @@ fn a_default_export_does_not_ship_mac_addresses_or_dns_servers() {
             adapter_name: "Ethernet".into(),
             ipv6_if_index: 12,
             physical_address: Some("00-11-22-33-44-55".into()),
-            name: "Ethernet".into(),
-            interface_description: "Ethernet adapter".into(),
+            name: "Example Corp office tunnel".into(),
+            interface_description: "Example Provider TUN driver".into(),
             interface_type: "ethernet".into(),
             oper_status: "up".into(),
         }],
@@ -949,6 +949,14 @@ fn a_default_export_does_not_ship_mac_addresses_or_dns_servers() {
     );
     assert!(!health.contains("192.0.2.42"), "local address leaked");
     assert!(!health.contains("198.51.100.53"), "DNS server leaked");
+    assert!(
+        !health.contains("203.0.113.99"),
+        "external address leaked: {health}"
+    );
+    assert!(
+        !health.contains("Example Corp") && !health.contains("Example Provider"),
+        "an adapter's own name says whose it is: {health}"
+    );
 }
 
 fn read_zip_entry(archive: &Path, name: &str) -> String {

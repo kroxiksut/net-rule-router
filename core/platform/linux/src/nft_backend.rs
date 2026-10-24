@@ -13,7 +13,7 @@
 //! that no longer exists — silently, because the rule would still look applied.
 
 use nrr_platform_api::enforcement::{
-    ApplyReport, EnforcementBackend, EnforcementCapabilities, EnforcementPlan,
+    ApplyNote, ApplyReport, EnforcementBackend, EnforcementCapabilities, EnforcementPlan,
 };
 
 use crate::lower_linux::{lower_plans, EgressNames, UnsupportedReason, UnsupportedRule};
@@ -70,8 +70,13 @@ impl EnforcementBackend for NftablesEnforcement {
         // indistinguishable from one that enforces all of it. Two sources feed
         // this: rules the lowering could not express at all, and rules the
         // kernel then refused.
-        let mut notes: Vec<String> = lowered.unsupported.iter().map(note_for).collect();
-        notes.extend(outcome.skipped.iter().map(note_for_skipped));
+        let mut notes: Vec<ApplyNote> = lowered.unsupported.iter().map(note_for).collect();
+        notes.extend(
+            outcome
+                .skipped
+                .iter()
+                .map(|rule| ApplyNote::machine(note_for_skipped(rule))),
+        );
 
         Ok(ApplyReport {
             applied: outcome.applied,
@@ -86,8 +91,6 @@ impl EnforcementBackend for NftablesEnforcement {
     }
 }
 
-/// Say whose rule went unenforced and what the user loses by it — this note is
-/// the only thing about it that reaches an operator.
 /// What to say about a rule the KERNEL refused, as opposed to one the lowering
 /// could not express. The comment is the only human-readable thing an nft rule
 /// carries, and it names the user rule behind it.
@@ -98,7 +101,13 @@ pub(crate) fn note_for_skipped(rule: &SkippedNftRule) -> String {
     )
 }
 
-pub(crate) fn note_for(rule: &UnsupportedRule) -> String {
+/// Say whose rule went unenforced and what the user loses by it. The note is
+/// the owner's: it names their program or adapter.
+pub(crate) fn note_for(rule: &UnsupportedRule) -> ApplyNote {
+    ApplyNote::of(&rule.principal, note_text(rule))
+}
+
+fn note_text(rule: &UnsupportedRule) -> String {
     let (index, who) = (rule.index, &rule.principal);
     match &rule.reason {
         UnsupportedReason::AppScoped { key } => format!(
@@ -180,5 +189,18 @@ mod tests {
         let lowered = lower_plans(&[plan_with(vec![app_rule()])], &backend.egress);
         assert_eq!(lowered.unsupported.len(), 1);
         assert!(lowered.ruleset.rules.is_empty());
+    }
+
+    /// The note names the owner's program, so it is filed as theirs.
+    #[test]
+    fn an_unenforced_rule_note_belongs_to_the_rules_owner() {
+        let egress = EgressNames {
+            primary: Some("eth0".into()),
+            secondary: Some("tun0".into()),
+        };
+        let lowered = lower_plans(&[plan_with(vec![app_rule()])], &egress);
+        let note = note_for(&lowered.unsupported[0]);
+        assert_eq!(note.principal.as_deref(), Some("unix:uid:1000"));
+        assert!(note.text.contains("unix:uid:1000"), "{}", note.text);
     }
 }

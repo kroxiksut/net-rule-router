@@ -31,7 +31,8 @@ pub const IPC_PROTOCOL_VERSION: u32 = 1;
 /// without a bump.
 ///
 /// 2: route policy carries `leak-protection`; the kill-switch fields are gone.
-pub const IPC_CONTRACT_REVISION: u32 = 2;
+/// 3: `doh.resolvers.set` carries `drop-seeded`; a rules pause carries its term.
+pub const IPC_CONTRACT_REVISION: u32 = 3;
 
 /// What a peer that states no revision speaks: it predates the field.
 pub const IPC_CONTRACT_REVISION_UNSTATED: u32 = 1;

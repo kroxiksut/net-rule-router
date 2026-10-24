@@ -49,7 +49,7 @@ QtObject {
         && typeof nrrNativeBridge.rpcRulesList === "function"
         && typeof nrrNativeBridge.rpcSidecarPassthroughRead === "function"
         && typeof nrrNativeBridge.readFileBytes === "function"
-        && typeof nrrNativeBridge.writeTextFile === "function"
+        && typeof nrrNativeBridge.rpcUserSettingsRulesFileWrite === "function"
 
     /// Pull what the service enforces and mirror it into every linked file.
     /// Silent and best-effort: a failure leaves the file as it was, and the

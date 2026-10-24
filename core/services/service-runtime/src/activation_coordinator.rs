@@ -388,6 +388,7 @@ impl ActivationCoordinator {
         {
             let id = parse_revision_id(&existing.revision_id)?;
             self.audit.emit(ActivationAuditEvent::RevisionSubmitted {
+                principal: principal.to_string(),
                 revision_id: existing.revision_id.clone(),
                 content_hash: existing.content_hash.clone(),
                 source: submission.source,
@@ -421,6 +422,7 @@ impl ActivationCoordinator {
             })?;
 
         self.audit.emit(ActivationAuditEvent::RevisionSubmitted {
+            principal: principal.to_string(),
             revision_id: revision_id.as_str().to_string(),
             content_hash: submission.content_hash,
             source: submission.source,
@@ -446,6 +448,7 @@ impl ActivationCoordinator {
     ) -> DryRunSummary {
         let summary = self.plan_rules(principal, rules_json);
         self.audit.emit(ActivationAuditEvent::DryRunRequested {
+            principal: principal.to_string(),
             revision_id: String::new(),
             correlation_id: correlation_id.to_string(),
         });
@@ -522,6 +525,7 @@ impl ActivationCoordinator {
             })?;
 
         self.audit.emit(ActivationAuditEvent::TokenIssued {
+            principal,
             revision_id: revision_id.as_str().to_string(),
             token: token.clone(),
             ttl_secs,
@@ -583,6 +587,7 @@ impl ActivationCoordinator {
 
         let policy = self.failure_policy();
         self.audit.emit(ActivationAuditEvent::ActivationStarted {
+            principal: principal.clone(),
             revision_id: revision_id.as_str().to_string(),
             attempt_id: phase1.attempt_id.clone(),
             previous_revision_id: phase1
@@ -610,6 +615,7 @@ impl ActivationCoordinator {
             drop(preview);
             if !pre.failures.is_empty() {
                 self.audit.emit(ActivationAuditEvent::PreFlightFailed {
+                    principal: principal.clone(),
                     revision_id: revision_id.as_str().to_string(),
                     sid_failures: pre.failures.clone(),
                 });
@@ -622,6 +628,7 @@ impl ActivationCoordinator {
                 );
             }
             self.audit.emit(ActivationAuditEvent::PreFlightPassed {
+                principal: principal.clone(),
                 revision_id: revision_id.as_str().to_string(),
                 sids: phase1.sids.clone(),
             });
@@ -728,6 +735,7 @@ impl ActivationCoordinator {
         }
 
         self.audit.emit(ActivationAuditEvent::RollbackRequested {
+            principal: principal.to_string(),
             target: rollback_target_str(&target),
             correlation_id: correlation_id.to_string(),
         });
@@ -898,6 +906,16 @@ impl ActivationCoordinator {
             }
             found => found.ok().flatten(),
         }
+    }
+
+    /// The book `principal` is under right now, resolved as the rules provider
+    /// resolves it; `Ok(None)` when there is none, `Err` on a storage error.
+    pub(crate) fn book_in_force_for(
+        &self,
+        principal: &str,
+    ) -> Result<Option<crate::production_rules_provider::BookInForce>, String> {
+        let conn = self.conn.lock().expect("connection mutex poisoned");
+        crate::production_rules_provider::book_in_force_for(&conn, principal)
     }
 
     /// The base a write by `principal` must name to be applied.

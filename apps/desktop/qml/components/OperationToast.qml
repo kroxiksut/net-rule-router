@@ -13,8 +13,8 @@
 //     (default 4 s). The timer pauses while the user hovers — so a
 //     toast they're reading doesn't vanish under their pointer.
 //   * Failed entries never auto-dismiss. The X button is always
-//     visible on failed. On running/completed it appears only on
-//     hover so the badge stays uncluttered.
+//     visible on failed. On running/completed it appears on hover or
+//     keyboard focus, which also pauses the timer.
 //
 // Signals:
 //   - `dismissRequested(id)` — bubbles up to the stack container
@@ -134,9 +134,10 @@ Rectangle {
 
         ToolButton {
             id: dismissButton
-            // Failed → always visible (user must dismiss). Otherwise
-            // show only on hover so the row stays uncluttered.
-            visible: root.phase === "failed" || hoverArea.containsMouse
+            // Shown on failure, hover or keyboard focus. Hidden by opacity, not
+            // `visible`, so Tab still reaches it.
+            opacity: root.phase === "failed" || hoverArea.containsMouse
+                || dismissButton.activeFocus ? 1 : 0
             text: "✕"
             implicitWidth: 24
             implicitHeight: 24
@@ -150,6 +151,8 @@ Rectangle {
             background: Rectangle {
                 color: dismissButton.hovered ? theme.stateHoverFill : "transparent"
                 radius: theme.radiusSm
+                border.width: dismissButton.visualFocus ? 2 : 0
+                border.color: theme.colorFocusRing
             }
             contentItem: Label {
                 text: dismissButton.text
@@ -180,6 +183,7 @@ Rectangle {
         interval: root.autoDismissCompletedMs
         repeat: false
         running: root.phase === "completed" && !hoverArea.containsMouse
+            && !dismissButton.activeFocus
         onTriggered: root.dismissRequested(root.rowId)
     }
 

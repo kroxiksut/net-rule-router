@@ -24,6 +24,10 @@ pub enum StopReason {
     /// The machine is going down while system services still run. Filters do
     /// not survive it anyway, so removing them only opens a window.
     MachineShutdown,
+    /// The installer replaces the service's files and starts it again. Nobody
+    /// asked for protection to go: the new instance takes over what this one
+    /// leaves, as after a crash.
+    Upgrade,
 }
 
 /// An edge of the service lifecycle.
@@ -290,6 +294,13 @@ pub fn stop_plan(reason: StopReason, inputs: LifecycleInputs) -> StopPlan {
             routes: RouteTeardown::Keep,
             filters: FilterTeardown::Keep,
         },
+        // The window between the old instance's exit and the new one's first
+        // pass is the whole risk; DNS still comes back, the new resolver
+        // takes it again.
+        StopReason::Upgrade => StopPlan {
+            routes: RouteTeardown::Keep,
+            filters: FilterTeardown::Keep,
+        },
         StopReason::ServiceStop => StopPlan {
             routes: if inputs.keep_rule_routes_on_stop {
                 RouteTeardown::KeepRuleRoutes
@@ -376,6 +387,29 @@ where
     }
 }
 
+/// Take `lock` if it frees up within `wait`, `None` otherwise. For the stop:
+/// a holder that has wedged must not take the teardown down with it. A
+/// poisoned lock is taken as is: the stop only reads through it.
+pub fn lock_within<T: ?Sized>(
+    lock: &std::sync::Mutex<T>,
+    wait: Duration,
+) -> Option<std::sync::MutexGuard<'_, T>> {
+    const POLL: Duration = Duration::from_millis(20);
+    let began = std::time::Instant::now();
+    loop {
+        match lock.try_lock() {
+            Ok(guard) => return Some(guard),
+            Err(std::sync::TryLockError::Poisoned(p)) => return Some(p.into_inner()),
+            Err(std::sync::TryLockError::WouldBlock) => {}
+        }
+        let elapsed = began.elapsed();
+        if elapsed >= wait {
+            return None;
+        }
+        std::thread::sleep(POLL.min(wait - elapsed));
+    }
+}
+
 /// Cells that only a machine can show. Each names what to do and what to
 /// look at; the tests below hold the rest of the table.
 pub const LIVE_CHECKS: &[(LifecycleEdge, &str)] = &[
@@ -389,6 +423,12 @@ pub const LIVE_CHECKS: &[(LifecycleEdge, &str)] = &[
         LifecycleEdge::StartAfterCrash,
         "kill the service hard with leak protection on and the additional link down; the rule \
          host stays blocked through the restart and after its first pass",
+    ),
+    (
+        LifecycleEdge::Stop(StopReason::Upgrade),
+        "install a newer build over a running one with leak protection on (`nrr-cli install`, \
+         the EXE, the MSI, a .deb/.rpm upgrade); a rule host stays blocked from the old \
+         instance's exit through the new one's first pass",
     ),
     (
         LifecycleEdge::BlockedStart,
@@ -490,6 +530,22 @@ mod tests {
         }
     }
 
+    /// An upgrade used to run as a service stop: every block and route came
+    /// off for the copy and the first pass of the new build, a leak the user
+    /// never asked for, on every update.
+    #[test]
+    fn an_upgrade_keeps_every_block_and_route_and_gives_dns_back() {
+        for inputs in [ARMED, UNARMED] {
+            let plan = stop_plan(StopReason::Upgrade, inputs);
+            assert_eq!(plan.filters, FilterTeardown::Keep);
+            assert_eq!(plan.routes, RouteTeardown::Keep);
+            let state = expected_after(LifecycleEdge::Stop(StopReason::Upgrade), inputs);
+            assert_eq!(state.fail_closed_blocks, Keep);
+            assert_eq!(state.routes, Keep);
+            assert_eq!(state.dns_redirect, Remove);
+        }
+    }
+
     #[test]
     fn a_service_stop_removes_filters_and_follows_the_route_setting() {
         let plan = stop_plan(StopReason::ServiceStop, UNARMED);
@@ -585,6 +641,33 @@ mod tests {
         );
     }
 
+    /// A lock wedged by another thread costs the stop its wait and no more; a
+    /// free one, or one freed in time, is taken.
+    #[test]
+    fn a_wedged_lock_costs_the_stop_its_wait_and_no_more() {
+        let lock = std::sync::Arc::new(std::sync::Mutex::new(5u8));
+        let (held_tx, held_rx) = std::sync::mpsc::channel::<()>();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let holder = {
+            let lock = std::sync::Arc::clone(&lock);
+            std::thread::spawn(move || {
+                let _guard = lock.lock();
+                let _ = held_tx.send(());
+                let _ = release_rx.recv();
+            })
+        };
+        let _ = held_rx.recv();
+        let began = std::time::Instant::now();
+        assert!(lock_within(&lock, Duration::from_millis(100)).is_none());
+        assert!(began.elapsed() < Duration::from_secs(5));
+        let _ = release_tx.send(());
+        let _ = holder.join();
+        assert_eq!(
+            lock_within(&lock, Duration::from_secs(5)).map(|g| *g),
+            Some(5)
+        );
+    }
+
     #[test]
     fn a_missing_state_db_means_nobody_is_protected() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -628,6 +711,7 @@ mod tests {
             LifecycleEdge::BlockedStart,
             LifecycleEdge::Stop(StopReason::ServiceStop),
             LifecycleEdge::Stop(StopReason::MachineShutdown),
+            LifecycleEdge::Stop(StopReason::Upgrade),
             LifecycleEdge::RestartsExhausted,
             LifecycleEdge::LastUserSignedOut,
             LifecycleEdge::UserSignedIn,
@@ -643,6 +727,7 @@ mod tests {
             LifecycleEdge::BlockedStart,
             LifecycleEdge::Stop(StopReason::ServiceStop),
             LifecycleEdge::Stop(StopReason::MachineShutdown),
+            LifecycleEdge::Stop(StopReason::Upgrade),
             LifecycleEdge::RestartsExhausted,
             LifecycleEdge::LastUserSignedOut,
             LifecycleEdge::UserSignedIn,

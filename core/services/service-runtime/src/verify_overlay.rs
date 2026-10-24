@@ -6,17 +6,18 @@
 //! principal, so no wiring can hand one reader a different set than another;
 //! a service restart forgets it, which is what makes the check repeat.
 //!
-//! A rule is named by its set and address ([`VerifyKey`]), never by its
-//! number: numbers restart in each set and shift under an inserted line.
+//! A rule is named by its set and address (`VerifyKey`), never by its
+//! number: numbers restart in each set and shift under an inserted line;
+//! each verdict carries the host that proved it ([`VerifyMove`]).
 
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock, PoisonError, RwLock};
 
-use nrr_domain::canonical::{CanonicalRuleBook, VerifyKey};
+use nrr_domain::canonical::{CanonicalRuleBook, VerifyMove};
 
 struct Entry {
-    moved: Arc<HashSet<VerifyKey>>,
+    moved: Arc<HashSet<VerifyMove>>,
     generation: u64,
 }
 
@@ -28,8 +29,8 @@ fn registry() -> &'static RwLock<HashMap<String, Entry>> {
     REGISTRY.get_or_init(Default::default)
 }
 
-fn empty() -> Arc<HashSet<VerifyKey>> {
-    static EMPTY: OnceLock<Arc<HashSet<VerifyKey>>> = OnceLock::new();
+fn empty() -> Arc<HashSet<VerifyMove>> {
+    static EMPTY: OnceLock<Arc<HashSet<VerifyMove>>> = OnceLock::new();
     Arc::clone(EMPTY.get_or_init(Default::default))
 }
 
@@ -40,7 +41,7 @@ pub(crate) fn changes() -> u64 {
 }
 
 /// `principal`'s moved rules and the generation they carry (0 when none).
-pub(crate) fn moved_for(principal: &str) -> (u64, Arc<HashSet<VerifyKey>>) {
+pub(crate) fn moved_for(principal: &str) -> (u64, Arc<HashSet<VerifyMove>>) {
     let map = registry().read().unwrap_or_else(PoisonError::into_inner);
     match map.get(principal) {
         Some(e) => (e.generation, Arc::clone(&e.moved)),
@@ -49,7 +50,7 @@ pub(crate) fn moved_for(principal: &str) -> (u64, Arc<HashSet<VerifyKey>>) {
 }
 
 /// Replace `principal`'s set; `false` when it was already this one.
-pub(crate) fn set(principal: &str, moved: HashSet<VerifyKey>) -> bool {
+pub(crate) fn set(principal: &str, moved: HashSet<VerifyMove>) -> bool {
     let mut map = registry().write().unwrap_or_else(PoisonError::into_inner);
     let current = map.get(principal).map(|e| e.moved.as_ref());
     if current.map_or(moved.is_empty(), |c| *c == moved) {
@@ -82,12 +83,15 @@ mod tests {
     use nrr_domain::canonical::CanonicalAddressMatch;
     use nrr_shared::RouteRole;
 
-    fn keys(hosts: &[&str]) -> HashSet<VerifyKey> {
+    fn keys(hosts: &[&str]) -> HashSet<VerifyMove> {
         hosts
             .iter()
-            .map(|h| VerifyKey {
-                written: RouteRole::Primary,
-                address: CanonicalAddressMatch::ExactFqdn((*h).to_string()),
+            .map(|h| VerifyMove {
+                key: nrr_domain::canonical::VerifyKey {
+                    written: RouteRole::Primary,
+                    address: CanonicalAddressMatch::ExactFqdn((*h).to_string()),
+                },
+                host: (*h).to_string(),
             })
             .collect()
     }

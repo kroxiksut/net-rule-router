@@ -16,7 +16,8 @@
 ;     /SECONDARY_UNSET=direct|block
 ; The files are checked before anything is installed: a refused one ends Setup
 ; with exit code 7, the service binary's own code (10-14) in the setup log. A
-; file that fails when it is copied after the install ends with that code itself.
+; file that fails when it is copied after the install ends with that code itself,
+; and a service that could not be registered or started with 15.
 
 ; The architecture identifiers used below arrived in 6.3.
 #if VER < EncodeVer(6,3,0) || VER >= EncodeVer(7,0,0)
@@ -102,6 +103,8 @@ english.ServiceRegisterFailed=NetRuleRouter is installed, but its background ser
 russian.ServiceRegisterFailed=NetRuleRouter установлена, но её фоновую службу не удалось зарегистрировать или запустить. Откройте NetRuleRouter, чтобы увидеть причину, или выполните "nrr-cli diag doctor" в папке установки. Подробности: %1
 english.ProvisionRefused=A file given to Setup was refused (code %1), so nothing was installed. The reason is in the setup log.
 russian.ProvisionRefused=Файл, переданный установке, отклонён (код %1), поэтому ничего не установлено. Причина указана в журнале установки.
+english.ProvisionNotChecked=The files given to Setup could not be checked: the check did not start (code %1), so nothing was installed. Run Setup again; if it repeats, report the code.
+russian.ProvisionNotChecked=Не удалось проверить файлы, переданные установке: проверка не запустилась (код %1), поэтому ничего не установлено. Запустите установку снова; если ошибка повторится, сообщите этот код.
 english.ProvisionNotStaged=NetRuleRouter is installed, but the files given to Setup could not be prepared for the service (code %1). Details: %2
 russian.ProvisionNotStaged=NetRuleRouter установлена, но переданные установке файлы не удалось подготовить для службы (код %1). Подробности: %2
 english.UninstallModeTitle=How should NetRuleRouter be removed?
@@ -131,8 +134,14 @@ Source: "setup-actions.ps1"; DestDir: "{app}\scripts"; Flags: ignoreversion
 ; Extracted to {tmp} to stop the service before any file is replaced.
 Source: "setup-actions.ps1"; Flags: dontcopy
 Source: "{#PackageDir}\scripts\lib\service-paths.ps1"; Flags: dontcopy
-; Checks prepared files before anything is installed.
+; Checks prepared files before anything is installed. It links the Visual C++
+; runtime dynamically, and a clean Windows has none: the DLLs go beside it.
 Source: "{#PackageDir}\nrr-service.exe"; Flags: dontcopy
+Source: "{#PackageDir}\vcruntime140.dll"; Flags: dontcopy
+#if FileExists(AddBackslash(PackageDir) + "vcruntime140_1.dll")
+  #define HasVcRuntime1
+Source: "{#PackageDir}\vcruntime140_1.dll"; Flags: dontcopy
+#endif
 
 #if Variant == "full"
 [Icons]
@@ -147,11 +156,14 @@ var
   RemoveData, RemoveAudit: Boolean;
   { The service binary's code when staging the prepared files failed; 0 otherwise. }
   ProvisionExitCode: Integer;
+  RegisterFailed: Boolean;
 
 const
   { The MSI's UpgradeCode (NetRuleRouter.wxs), and this Setup's uninstall key:
     its AppId plus "_is1". }
   MsiUpgradeCode = '{32814437-D697-4AC1-B07C-BD46DE72F89C}';
+  { Exit code of a Setup that installed the files but left no running service. }
+  RegisterFailedExitCode = 15;
   OwnUninstallKey = 'Software\Microsoft\Windows\CurrentVersion\Uninstall\{A7629E15-413C-4ACE-BD45-FE227D6CDEA1}_is1';
 
 { This Setup's numeric version a.b.c.d, split as a file version block holds it. }
@@ -251,9 +263,17 @@ begin
   if not HasProvisioning() then
     Exit;
   ExtractTemporaryFile('nrr-service.exe');
+  ExtractTemporaryFile('vcruntime140.dll');
+#ifdef HasVcRuntime1
+  ExtractTemporaryFile('vcruntime140_1.dll');
+#endif
   if not Exec(ExpandConstant('{tmp}\nrr-service.exe'), 'provision-check' + ProvisionOptions(),
       '', SW_HIDE, ewWaitUntilTerminated, Code) then
-    Code := 14;
+  begin
+    { Code is a Windows error here and may fall inside 10-14. }
+    Log('nrr-service provision-check did not start: ' + SysErrorMessage(Code));
+    Code := -1;
+  end;
   Log(Format('nrr-service provision-check: exit %d', [Code]));
   Result := Code;
 end;
@@ -283,9 +303,16 @@ var
 begin
   Result := '';
   Refused := CheckProvisioning();
-  if Refused <> 0 then
+  { Outside 10-14 the binary did not run (a loader status such as 0xC0000135 is
+    negative here), which says nothing about the files. }
+  if (Refused >= 10) and (Refused <= 14) then
   begin
     Result := FmtMessage(CustomMessage('ProvisionRefused'), [IntToStr(Refused)]);
+    Exit;
+  end;
+  if Refused <> 0 then
+  begin
+    Result := FmtMessage(CustomMessage('ProvisionNotChecked'), [Format('0x%.8x', [Refused])]);
     Exit;
   end;
   ExtractTemporaryFile('setup-actions.ps1');
@@ -308,16 +335,19 @@ begin
       SuppressibleMsgBox(FmtMessage(CustomMessage('ProvisionNotStaged'), [
         IntToStr(ProvisionExitCode), ActionLog()]), mbError, MB_OK, IDOK);
   end;
-  if RunAction(ExpandConstant('{app}\scripts\setup-actions.ps1'), '-Action Register') <> 0 then
+  RegisterFailed := RunAction(ExpandConstant('{app}\scripts\setup-actions.ps1'), '-Action Register') <> 0;
+  if RegisterFailed then
     SuppressibleMsgBox(FmtMessage(CustomMessage('ServiceRegisterFailed'), [ActionLog()]),
       mbError, MB_OK, IDOK);
 end;
 
-{ A batch that installed the program but not its prepared files must not read
-  that as success. }
+{ A batch that installed the program but not its prepared files, or without a
+  service, must not read that as success; the MSI rolls back in both cases. }
 function GetCustomSetupExitCode(): Integer;
 begin
   Result := ProvisionExitCode;
+  if (Result = 0) and RegisterFailed then
+    Result := RegisterFailedExitCode;
 end;
 
 { /NAME or /NAME=1 on the uninstaller's command line. }

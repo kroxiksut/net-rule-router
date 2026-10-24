@@ -463,7 +463,35 @@ pub struct ApplyReport {
     pub applied: usize,
     pub skipped: usize,
     pub failed: usize,
-    pub notes: Vec<String>,
+    pub notes: Vec<ApplyNote>,
+}
+
+/// One thing a reconcile did not do as asked. A note about one user's rule
+/// names that user's stored principal: it goes to their log, not everyone's.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ApplyNote {
+    pub principal: Option<String>,
+    pub text: String,
+}
+
+impl ApplyNote {
+    /// A note about the machine's ruleset, owned by nobody.
+    #[must_use]
+    pub fn machine(text: String) -> Self {
+        Self {
+            principal: None,
+            text,
+        }
+    }
+
+    /// A note about a rule of `principal` (stored form).
+    #[must_use]
+    pub fn of(principal: &str, text: String) -> Self {
+        Self {
+            principal: Some(principal.to_owned()),
+            text,
+        }
+    }
 }
 
 /// How a platform matches per-application rules. Surfaced as a capability so the
@@ -516,6 +544,10 @@ pub struct EnforcementCapabilities {
     /// observation pass: its destinations are learnt from its first
     /// connection, and a deny does not hold it.
     pub app_path_scripts: bool,
+    /// Standing filters on the machine above which the user is warned. WFP's
+    /// filtering service has crashed the machine under a few thousand; nft set
+    /// elements are cheap, so Linux has no such line.
+    pub standing_filter_alarm: Option<usize>,
 }
 
 impl EnforcementCapabilities {
@@ -532,6 +564,7 @@ impl EnforcementCapabilities {
             app_match: AppMatchMechanism::WfpAppId,
             app_path_rules: true,
             app_path_scripts: true,
+            standing_filter_alarm: Some(3200),
         }
     }
 
@@ -547,6 +580,7 @@ impl EnforcementCapabilities {
             app_match: AppMatchMechanism::ObservedDestOnly,
             app_path_rules: true,
             app_path_scripts: true,
+            standing_filter_alarm: None,
         }
     }
 
@@ -574,6 +608,7 @@ impl EnforcementCapabilities {
             app_match: AppMatchMechanism::ObservedDestOnly,
             app_path_rules: false,
             app_path_scripts: false,
+            standing_filter_alarm: None,
         }
     }
 

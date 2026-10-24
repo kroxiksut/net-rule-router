@@ -211,6 +211,7 @@ GroupBox {
                 text: root.tr("settings.console.folder-label", "Console folder")
             }
             ThemedTextField {
+                accessibleLabel: root.tr("settings.console.folder-label", "Console folder")
                 theme: root.uiTheme
                 Layout.fillWidth: true
                 readOnly: true
@@ -289,6 +290,7 @@ GroupBox {
                     "Terminals that are already open keep the PATH they started with. Open a new one, or run this line in the current one:")
             }
             ThemedTextField {
+                accessibleLabel: root.tr("settings.console.session-command-label", "Command for an open terminal")
                 theme: root.uiTheme
                 Layout.fillWidth: true
                 readOnly: true

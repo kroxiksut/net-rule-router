@@ -12,6 +12,10 @@
     { "name": "the main route takes no confirmation", "input": { "ruleType": "application", "value": "/var/www/*", "route": "primary", "os": "linux" }, "expected": "" },
     { "name": "an address rule takes no confirmation", "input": { "ruleType": "domain", "value": "example.com", "route": "block", "os": "linux" }, "expected": "" },
     { "name": "flags only", "input": { "ruleType": "application", "value": "  ", "route": "block", "os": "windows" }, "expected": "" },
+    { "name": "windows folder with cyrillic capitals", "input": { "ruleType": "application", "value": "C:\\Program Files\\Мой Софт\\* +override", "route": "secondary", "os": "windows" }, "expected": "secondary|c:\\program files\\мой софт\\*" },
+    { "name": "windows name with cyrillic capitals", "input": { "ruleType": "application", "value": "Программа.EXE +override", "route": "block", "os": "windows" }, "expected": "block|программа" },
+    { "name": "macos path with cyrillic capitals", "input": { "ruleType": "application", "value": "/Users/Иван/Приложения/*", "route": "block", "os": "macos" }, "expected": "block|/users/иван/приложения/*" },
+    { "name": "linux path keeps cyrillic capitals", "input": { "ruleType": "application", "value": "/home/Иван/*", "route": "block", "os": "linux" }, "expected": "block|/home/Иван/*" },
     { "name": "absent os reads as windows", "input": { "ruleType": "application", "value": "C:\\X\\*", "route": "block" }, "expected": "block|c:\\x\\*" }
   ]
 }

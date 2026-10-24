@@ -146,6 +146,9 @@ pub enum CycleOutcome {
         guarded: usize,
         /// What the route pass did, when a route mechanism is wired.
         routes: Option<crate::route_apply::RouteApplyReport>,
+        /// Principals whose book or policy did not read this pass: their last
+        /// plan was carried, or nothing was, while everyone else was applied.
+        held_back: Vec<String>,
     },
     /// Nothing the pass reads has changed since the policy in force was
     /// applied, so neither planning nor the platform was asked.
@@ -628,6 +631,9 @@ impl PrincipalEnforcementCycle {
                 }
             }
         }
+        // Read before any plan's inputs: a first-contact route installed from
+        // here on is newer than this pass's plans, and the route apply keeps it.
+        let planned_at = self.routes.as_ref().map(|applier| applier.plan_origin());
         self.plans.begin_pass();
         self.plans.set_route_table_owner(owner.as_ref());
         let mut plans: Vec<EnforcementPlan> = Vec::new();
@@ -661,23 +667,16 @@ impl PrincipalEnforcementCycle {
                     }
                     match previous {
                         Some(plan) => plans.push(plan),
-                        None => {
-                            if let Some(inputs) = self.inputs.as_ref() {
-                                inputs.unsettle();
-                            }
-                            // Health is read by every client: who and why go to
-                            // the audience-scoped log only.
-                            tracing::warn!(
-                                target: "nrr::enforcement",
-                                sid = principal.as_stored(),
-                                reason = %reason,
-                                "rule book unreadable and nothing applied yet to keep"
-                            );
-                            return CycleOutcome::EnforcementFailed {
-                                persistent: false,
-                                reason: "rule book unreadable for a present user and nothing applied yet to keep".to_owned(),
-                            };
-                        }
+                        // Nothing to carry: this user alone is skipped. Holding
+                        // the whole pass for them would leave another user's
+                        // tunnel loss unanswered. Health is read by every
+                        // client: who and why go to the audience-scoped log.
+                        None => tracing::warn!(
+                            target: "nrr::enforcement",
+                            sid = principal.as_stored(),
+                            reason = %reason,
+                            "rule book unreadable and nothing applied yet to keep"
+                        ),
                     }
                     continue;
                 }
@@ -700,6 +699,18 @@ impl PrincipalEnforcementCycle {
         }
 
         self.plans.end_pass();
+        // Everyone present unreadable and nothing to carry: an empty set would
+        // strip what a previous instance left, so the pass changes nothing.
+        if plans.is_empty() && !held_back.is_empty() {
+            if let Some(inputs) = self.inputs.as_ref() {
+                inputs.unsettle();
+            }
+            return CycleOutcome::EnforcementFailed {
+                persistent: false,
+                reason: "rule book unreadable for a present user and nothing applied yet to keep"
+                    .to_owned(),
+            };
+        }
         let changed = last.as_deref().map(Vec::as_slice) != Some(plans.as_slice());
         timings.mark("plan");
 
@@ -777,6 +788,7 @@ impl PrincipalEnforcementCycle {
                         plans: &route_plans,
                         present: &route_present,
                         owner: route_owner.as_ref(),
+                        planned_at: planned_at.unwrap_or_else(|| applier.plan_origin()),
                     };
                     applier.apply_pass(pass).unwrap_or_else(|reason| {
                         crate::route_apply::RouteApplyReport {
@@ -836,6 +848,7 @@ impl PrincipalEnforcementCycle {
                     unprotected,
                     guarded,
                     routes,
+                    held_back,
                 }
             }
             // Deliberately NOT recorded as applied: the kernel does not hold
@@ -1069,7 +1082,19 @@ pub fn log_outcome(outcome: &CycleOutcome, trigger: &'static str, authority: &'s
             unprotected,
             guarded,
             routes,
+            held_back,
         } => {
+            // Every pass: a user whose book stopped reading keeps yesterday's
+            // policy, and a single line about it must not scroll away.
+            if !held_back.is_empty() {
+                tracing::warn!(
+                    target: "nrr::enforcement",
+                    msg_key = "principal-plan-held-back-unreadable",
+                    trigger,
+                    principals = ?held_back,
+                    "rule book or policy unreadable: last applied plan kept, or nothing, for these users",
+                );
+            }
             // Routes are the half that STEERS traffic. Their failure is
             // reported at error level even though the filters landed: with the
             // filters in force and no route, a rule meant to send a host over
@@ -1119,11 +1144,21 @@ pub fn log_outcome(outcome: &CycleOutcome, trigger: &'static str, authority: &'s
             // Loud when the set of plans changed, quiet on the identical
             // re-apply that follows every ten seconds: a warning repeated
             // forever is one an operator learns to scroll past.
+            // A note about one user's rule names their program: `sid` files it
+            // as theirs, not every reader's.
             for note in &report.notes {
+                let sid = note.principal.as_deref();
                 if *changed {
-                    tracing::warn!(target: "nrr::enforcement", msg_key = "principal-rule-not-enforced-as-written", trigger, note = %note, "rule not enforced as written");
+                    tracing::warn!(
+                        target: "nrr::enforcement",
+                        msg_key = "principal-rule-not-enforced-as-written",
+                        trigger,
+                        sid,
+                        note = %note.text,
+                        "rule not enforced as written",
+                    );
                 } else {
-                    tracing::debug!(target: "nrr::enforcement", trigger, note = %note, "rule not enforced as written");
+                    tracing::debug!(target: "nrr::enforcement", trigger, sid, note = %note.text, "rule not enforced as written");
                 }
             }
             // Only a CHANGE is worth a line at info: re-applying the same policy
@@ -1223,6 +1258,7 @@ mod tests {
                 failure: failure.map(str::to_owned),
                 ..Default::default()
             }),
+            held_back: Vec::new(),
         };
         assert_eq!(outcome(None).landed(), Ok(()));
         let err = outcome(Some("no gateway"))
@@ -2309,6 +2345,76 @@ mod tests {
             enforcer.calls().len(),
             settled_calls + 1,
             "the pass re-applies the plan it kept"
+        );
+    }
+
+    /// A second user whose book does not read, with nothing applied yet, is
+    /// skipped alone: the first user's new plan still lands (their tunnel loss
+    /// must still arm fail-closed), the pass names who was held back, and it
+    /// stays unsettled so the next tick asks again.
+    #[test]
+    fn one_unreadable_newcomer_does_not_freeze_the_pass_for_the_others() {
+        struct UnreadableFor {
+            inner: PlanEveryone,
+            principal: String,
+        }
+        impl PrincipalPlanSource for UnreadableFor {
+            fn plan_for(
+                &self,
+                principal: &UserPrincipal,
+                availability: ChannelAvailability,
+            ) -> Option<PlannedPolicy> {
+                self.inner.plan_for(principal, availability)
+            }
+            fn plan_read_for(
+                &self,
+                principal: &UserPrincipal,
+                availability: ChannelAvailability,
+            ) -> PlanRead {
+                if principal.as_stored() == self.principal {
+                    return PlanRead::Unreadable("damaged row".to_owned());
+                }
+                self.inner.plan_read_for(principal, availability)
+            }
+        }
+        let enforcer = Arc::new(RecordingEnforcer::new(false));
+        let cycle = PrincipalEnforcementCycle::new(
+            Arc::new(ScriptedPrincipals {
+                answer: Some(vec![uid(1000), uid(1001)]),
+            }),
+            Arc::new(UnreadableFor {
+                inner: PlanEveryone {
+                    without_policy: Vec::new(),
+                },
+                principal: uid(1001).as_stored().to_owned(),
+            }),
+            Arc::clone(&enforcer) as Arc<dyn PolicyEnforcer>,
+        )
+        .with_pass_inputs(
+            crate::pass_inputs::PassInputs::new().with_source("test", Arc::new(|| Some(1))),
+        );
+
+        let outcome = cycle.tick();
+        let CycleOutcome::Applied {
+            principals,
+            held_back,
+            ..
+        } = outcome
+        else {
+            panic!("the readable user is applied: {outcome:?}");
+        };
+        assert_eq!(principals, vec![uid(1000).as_stored().to_owned()]);
+        assert_eq!(held_back, vec![uid(1001).as_stored().to_owned()]);
+        assert_eq!(
+            enforcer.calls(),
+            vec![vec![uid(1000).as_stored().to_owned()]]
+        );
+        assert!(
+            !matches!(
+                cycle.tick_if_changed_logged("timer"),
+                CycleOutcome::Unchanged
+            ),
+            "a held-back book is asked again"
         );
     }
 

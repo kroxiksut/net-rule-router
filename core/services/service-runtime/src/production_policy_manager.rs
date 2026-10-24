@@ -10,13 +10,14 @@
 //! coordinator's `current_active` is consulted directly to keep this
 //! production impl independent of the loader's state machine.
 
-use std::sync::{Arc, Mutex};
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex, PoisonError};
 
 use rusqlite::Connection;
 
 use crate::activation_coordinator::ActivationCoordinator;
 use crate::managers::{PolicyManager, RevisionSummary};
-use crate::state::{ActiveRevisionState, ServicePolicyState};
+use crate::state::{ActiveRevisionState, ActiveRuleCounts, ServicePolicyState};
 use nrr_storage::policy_settings::ApplyFailurePolicySettingsRepository;
 use nrr_storage::revisions::RevisionsRepository;
 
@@ -28,7 +29,13 @@ pub struct CoordinatorPolicyManager {
     /// Limit for `pending_revisions` query. Recent candidates +
     /// recent terminal entries; the GUI lists are short.
     pending_limit: usize,
+    /// Counts per committed revision id: a revision's rules never change, and
+    /// the status is polled every few seconds by every client.
+    counts_by_revision: Mutex<HashMap<String, ActiveRuleCounts>>,
 }
+
+/// Revisions whose counts are kept; past it the cache starts over.
+const RULE_COUNTS_CACHED: usize = 32;
 
 impl CoordinatorPolicyManager {
     pub fn new(coordinator: Arc<ActivationCoordinator>, conn: Arc<Mutex<Connection>>) -> Self {
@@ -36,6 +43,7 @@ impl CoordinatorPolicyManager {
             coordinator,
             conn,
             pending_limit: 10,
+            counts_by_revision: Mutex::new(HashMap::new()),
         }
     }
 
@@ -43,6 +51,30 @@ impl CoordinatorPolicyManager {
         self.pending_limit = limit;
         self
     }
+
+    /// A principal with no revision of its own still runs the baseline
+    /// (provider read-through), so falling back is what it actually has.
+    fn active_record_for(&self, principal: &str) -> Option<nrr_storage::revisions::RevisionRecord> {
+        let own = if principal.is_empty() {
+            None
+        } else {
+            self.coordinator
+                .current_active_for(principal)
+                .ok()
+                .flatten()
+        };
+        own.or_else(|| self.coordinator.current_active().ok().flatten())
+    }
+}
+
+/// A book that does not decode counts as empty: the apply layer refuses it too.
+fn rule_counts(rules_json: &str) -> ActiveRuleCounts {
+    nrr_shared::rules_json::from_canonical_string(rules_json)
+        .map(|book| ActiveRuleCounts {
+            total: book.primary.len() + book.secondary.len(),
+            enabled_secondary: book.secondary.iter().filter(|rule| rule.enabled).count(),
+        })
+        .unwrap_or_default()
 }
 
 /// The pending / superseded list for ONE principal, newest first.
@@ -150,18 +182,32 @@ impl PolicyManager for CoordinatorPolicyManager {
     }
 
     fn current_revision_for(&self, principal: &str) -> Option<ActiveRevisionState> {
-        if principal.is_empty() {
-            return self.current_revision();
+        self.active_record_for(principal)
+            .map(record_to_active_state)
+    }
+
+    /// Read as every rules reader reads, so a revision mid-activation counts;
+    /// a storage error is "unknown", never "empty".
+    fn active_rule_counts_for(&self, principal: &str) -> Option<ActiveRuleCounts> {
+        let Some(book) = self.coordinator.book_in_force_for(principal).ok()? else {
+            return Some(ActiveRuleCounts::default());
+        };
+        let Some(revision_id) = book.revision_id else {
+            return Some(rule_counts(&book.rules_json));
+        };
+        let mut cache = self
+            .counts_by_revision
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        if let Some(counts) = cache.get(&revision_id) {
+            return Some(*counts);
         }
-        // A principal with no revision of its own still runs the baseline
-        // (provider read-through), so falling back is what it actually has.
-        let record = self
-            .coordinator
-            .current_active_for(principal)
-            .ok()
-            .flatten()
-            .or_else(|| self.coordinator.current_active().ok().flatten())?;
-        Some(record_to_active_state(record))
+        let counts = rule_counts(&book.rules_json);
+        if cache.len() >= RULE_COUNTS_CACHED {
+            cache.clear();
+        }
+        cache.insert(revision_id, counts);
+        Some(counts)
     }
 
     fn pending_revisions(&self, principal: &str) -> Vec<RevisionSummary> {
@@ -351,6 +397,71 @@ mod tests {
             .map(|r| r.revision_id)
             .collect();
         assert_eq!(ids, vec!["rev-a".to_string()]);
+    }
+
+    #[test]
+    fn rule_counts_take_every_rule_and_only_enabled_additional_ones() {
+        let book = r#"{"primary":[{"address-match":{"kind":"exact-fqdn","value":"a.test"},"enabled":true,"id":"r-1"}],"schema-version":1,"secondary":[{"address-match":{"kind":"exact-fqdn","value":"b.test"},"enabled":true,"id":"r-2"},{"address-match":{"kind":"exact-fqdn","value":"c.test"},"enabled":false,"id":"r-3"}]}"#;
+        assert_eq!(
+            rule_counts(book),
+            ActiveRuleCounts {
+                total: 3,
+                enabled_secondary: 1
+            }
+        );
+        assert_eq!(rule_counts("not json"), ActiveRuleCounts::default());
+    }
+
+    /// The status counts what the user is under: a revision mid-activation
+    /// already, nothing in force as zero, and a storage failure as unknown
+    /// rather than "the set is empty".
+    #[test]
+    fn rule_counts_follow_the_rules_in_force_and_a_failure_is_not_empty() {
+        use crate::activation_coordinator::{ApplyFailurePolicy, IdGenerator, NoopActivationAudit};
+        use crate::active_sid_registry::ActiveSidRegistry;
+        use crate::production_coordinator::{
+            NoopRulesApplyDispatcher, ProductionApplyMarkerStore, ProductionIdGenerator,
+        };
+        use nrr_storage::migration::{open_connection, SqliteMigrationRunner};
+        use nrr_storage::repository::MigrationRunner;
+
+        let dir = tempfile::tempdir().expect("temp dir");
+        let conn = open_connection(&dir.path().join("state.db")).expect("open");
+        let runner = SqliteMigrationRunner::for_state_db(conn);
+        runner.run_pending_migrations().expect("migrate");
+        let conn = Arc::new(Mutex::new(runner.into_connection()));
+        let coordinator = ActivationCoordinator::new(
+            Arc::clone(&conn),
+            Arc::new(ActiveSidRegistry::new()),
+            Arc::new(NoopRulesApplyDispatcher),
+            Arc::new(ProductionApplyMarkerStore::new(dir.path())),
+            Arc::new(NoopActivationAudit),
+            Arc::new(crate::production_settings::SystemClock),
+            Arc::new(ProductionIdGenerator::new()) as Arc<dyn IdGenerator>,
+            ApplyFailurePolicy::AllOrNothing,
+        );
+        let manager = CoordinatorPolicyManager::new(Arc::new(coordinator), Arc::clone(&conn));
+        let none = Some(ActiveRuleCounts::default());
+        assert_eq!(manager.active_rule_counts_for("S-1-A"), none);
+
+        let book = r#"{"primary":[],"schema-version":1,"secondary":[{"address-match":{"kind":"exact-fqdn","value":"b.test"},"enabled":true,"id":"r-2"}]}"#;
+        let overlay = {
+            let guard = conn.lock().expect("lock");
+            crate::applying_revision_overlay::publish(&guard, "S-1-A", book)
+        };
+        let applying = Some(ActiveRuleCounts {
+            total: 1,
+            enabled_secondary: 1,
+        });
+        assert_eq!(manager.active_rule_counts_for("S-1-A"), applying);
+        drop(overlay);
+        assert_eq!(manager.active_rule_counts_for("S-1-A"), none);
+
+        conn.lock()
+            .expect("lock")
+            .execute_batch("DROP TABLE revisions")
+            .expect("drop");
+        assert_eq!(manager.active_rule_counts_for("S-1-A"), None);
     }
 
     #[test]

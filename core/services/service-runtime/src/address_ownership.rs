@@ -150,7 +150,8 @@ impl AddressOwnership {
     /// ZONE and nothing more — matching the rule model's default (exact IP
     /// overrides zone) and the switch in Settings -> Routing; anything the main
     /// link named more closely than that still keeps it, so the collateral
-    /// argument above is untouched.
+    /// argument above is untouched. The mirror holds too: a main-link literal
+    /// yields to an additional-link name the engine evaluates first.
     #[must_use]
     pub fn resolve_with_order(
         rule_book: &CanonicalRuleBook,
@@ -266,6 +267,21 @@ impl AddressOwnership {
                 if !main_named_it_closer {
                     main.remove(ip);
                 }
+            }
+        }
+        // The mirror contest: a main literal yields to an additional NAME the
+        // engine evaluates ahead of it (a host or suffix always, a zone only
+        // with zones first). A main host on the address keeps it, as above.
+        for ip in &main_literal {
+            let additional_named_it_closer = !additional_literal.contains(ip)
+                && !main_claim.contains_key(ip)
+                && match additional_claim.get(ip) {
+                    Some(NameClaim::Zone(_)) => order == ZoneVsIpOrder::ZoneFirst,
+                    Some(_) => true,
+                    None => false,
+                };
+            if additional_named_it_closer {
+                main.remove(ip);
             }
         }
 
@@ -475,14 +491,22 @@ impl AddressOwnership {
     /// steering went to the additional link because the user named it there
     /// literally is still an address a main-link rule points at, and blocking
     /// it is the outcome neither of their rules asked for. A main-link network
-    /// names every address inside it in the same sense.
+    /// names every address inside it in the same sense — except one an
+    /// additional-link rule names more closely (a host, or a literal address):
+    /// the narrower rule carries it, so the pin is its only guard while the
+    /// tunnel is gone. A narrower additional NETWORK inside it is held as a
+    /// network, not pinned per address.
     #[must_use]
     pub fn may_block(&self, ip: IpAddr) -> bool {
-        !self.main_claimed.contains(&ip) && !self.networks.names(ip, Link::Main)
+        if self.main_claimed.contains(&ip) {
+            return false;
+        }
+        !self.networks.names(ip, Link::Main)
+            || (self.additional.contains(&ip) && self.address_owner(ip) == Some(Link::Additional))
     }
 
     /// Whether `link`'s address rules name `ip` — literally, through a host or
-    /// through a network. For the main link this is `!may_block(ip)`.
+    /// through a network.
     #[must_use]
     pub fn named_by(&self, ip: IpAddr, link: Link) -> bool {
         let explicit = match link {
@@ -1935,6 +1959,102 @@ mod tests {
             assert_eq!(ownership.owner_of(ip("10.0.0.1")), Some(Link::Main));
         }
 
+        /// The engine's answer for `host` at `at` under `order`.
+        fn engine_owner_for(
+            book: &CanonicalRuleBook,
+            host: &str,
+            at: IpAddr,
+            order: ZoneVsIpOrder,
+        ) -> Option<Link> {
+            match match_sample(
+                book,
+                Some(host),
+                Some(at),
+                None,
+                ZonePriorityPolicy {
+                    prefer_ip: order == ZoneVsIpOrder::ExactIpFirst,
+                },
+                RouteBehaviorMode::PreferPrimary,
+            ) {
+                RequestedRouteDecision::MatchedRoute { candidate } => {
+                    Some(link_of(candidate.route_role))
+                }
+                _ => None,
+            }
+        }
+
+        /// A main literal against an additional name for the same address:
+        /// the arbiter gives it to whichever rule the engine picks for the
+        /// host, in both orders.
+        #[test]
+        fn a_main_literal_yields_to_an_additional_name_the_engine_picks() {
+            let at = ip("203.0.113.5");
+            let cache = MockFqdnCacheLookup::new();
+            cache.set_ips("api.corp.example", vec![Ipv4Addr::new(203, 0, 113, 5)]);
+            let named = |m: CanonicalAddressMatch| {
+                book(
+                    vec![route("p1", literal("203.0.113.5"))],
+                    vec![route("s1", m)],
+                )
+            };
+            let cases = [
+                (
+                    CanonicalAddressMatch::ExactFqdn("api.corp.example".into()),
+                    ZoneVsIpOrder::ExactIpFirst,
+                    Link::Additional,
+                ),
+                (
+                    CanonicalAddressMatch::SuffixDomain("corp.example".into()),
+                    ZoneVsIpOrder::ExactIpFirst,
+                    Link::Additional,
+                ),
+                (
+                    CanonicalAddressMatch::Zone("example".into()),
+                    ZoneVsIpOrder::ExactIpFirst,
+                    Link::Main,
+                ),
+                (
+                    CanonicalAddressMatch::Zone("example".into()),
+                    ZoneVsIpOrder::ZoneFirst,
+                    Link::Additional,
+                ),
+            ];
+            for (m, order, want) in cases {
+                let book = named(m.clone());
+                let ownership = resolve_in(&book, &cache, order);
+                assert_eq!(ownership.owner_of(at), Some(want), "{m:?} {order:?}");
+                assert_eq!(
+                    engine_owner_for(&book, "api.corp.example", at, order),
+                    Some(want),
+                    "engine {m:?} {order:?}"
+                );
+                assert_eq!(
+                    ownership.address_rule_may_steer(at, Link::Additional),
+                    want == Link::Additional
+                );
+                // The main literal still names it: never blocked.
+                assert!(!ownership.may_block(at));
+            }
+
+            // A main host on the same address keeps it, whatever the literal.
+            cache.set_ips("www.other", vec![Ipv4Addr::new(203, 0, 113, 5)]);
+            let shared = book(
+                vec![
+                    route("p1", literal("203.0.113.5")),
+                    route("p2", CanonicalAddressMatch::ExactFqdn("www.other".into())),
+                ],
+                vec![route(
+                    "s1",
+                    CanonicalAddressMatch::ExactFqdn("api.corp.example".into()),
+                )],
+            );
+            assert_eq!(
+                resolve(&shared, &cache).owner_of(at),
+                Some(Link::Main),
+                "a shared address stays with the main link"
+            );
+        }
+
         #[test]
         fn a_name_on_the_main_link_keeps_its_address_inside_an_additional_subnet() {
             let cache = MockFqdnCacheLookup::new();
@@ -1957,6 +2077,41 @@ mod tests {
             assert_eq!(ownership.owner_of(ip("10.0.0.7")), Some(Link::Additional));
             assert!(ownership.address_rule_may_steer(ip("10.0.0.7"), Link::Additional));
             assert_eq!(ownership.owner_of(ip("10.0.0.8")), Some(Link::Main));
+        }
+
+        /// Narrow beats wide in protection too: a host the additional link
+        /// names inside a main-link network is the tunnel's, and the pin is
+        /// all that holds it when the tunnel is gone. The rest of the network
+        /// stays unblockable, and a zone the network outranks does not pin.
+        #[test]
+        fn a_host_of_the_additional_link_inside_a_main_network_is_pinned() {
+            let cache = MockFqdnCacheLookup::new();
+            cache.set_ips("secret.example", vec![Ipv4Addr::new(203, 0, 113, 5)]);
+            let rules = book(
+                vec![route("p-net", subnet("203.0.113.0/24"))],
+                vec![
+                    route(
+                        "s-host",
+                        CanonicalAddressMatch::ExactFqdn("secret.example".into()),
+                    ),
+                    route("s-ip", literal("203.0.113.6")),
+                ],
+            );
+            let ownership = resolve(&rules, &cache);
+            assert!(ownership.may_block(ip("203.0.113.5")), "a name");
+            assert!(ownership.may_block(ip("203.0.113.6")), "a literal");
+            assert!(!ownership.may_block(ip("203.0.113.9")), "the network's own");
+            assert!(ownership.named_by(ip("203.0.113.5"), Link::Main));
+
+            cache.set_ips("files.corp.intra", vec![Ipv4Addr::new(203, 0, 113, 7)]);
+            let zoned = book(
+                vec![route("p-net", subnet("203.0.113.0/24"))],
+                vec![route("s-zone", CanonicalAddressMatch::Zone("intra".into()))],
+            );
+            assert!(!resolve(&zoned, &cache).may_block(ip("203.0.113.7")));
+            assert!(
+                resolve_in(&zoned, &cache, ZoneVsIpOrder::ZoneFirst).may_block(ip("203.0.113.7"))
+            );
         }
 
         /// A network beats a zone in the default order and loses to one with

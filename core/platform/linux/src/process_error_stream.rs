@@ -37,10 +37,13 @@ impl ProcessErrorStreamPort for UnixProcessErrorStream {
     fn redirect_to_file(&self, path: &Path) -> Result<(), PlatformError> {
         use std::fs::OpenOptions;
         use std::os::fd::AsRawFd;
+        use std::os::unix::fs::OpenOptionsExt;
 
+        // Everything the process writes to its error stream; nobody else reads it.
         let file = OpenOptions::new()
             .create(true)
             .append(true)
+            .mode(0o600)
             .open(path)
             .map_err(|e| PlatformError::Transient {
                 operation: "open error-stream file",

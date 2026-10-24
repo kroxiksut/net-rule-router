@@ -55,6 +55,8 @@ pub struct DohResolversSetHandler {
     /// Same hook as `RoutePolicyUpdateHandler` — the resolver set changes the
     /// DoH-lockdown blocks, so a routing-active caller recompiles immediately.
     apply_trigger: Option<Arc<dyn RoutePolicyApplyTrigger>>,
+    /// `(kind, target)` of every built-in entry, lower-cased.
+    seeded: Vec<(String, String)>,
 }
 
 impl DohResolversSetHandler {
@@ -62,19 +64,93 @@ impl DohResolversSetHandler {
         store: Arc<dyn DohResolverListStore>,
         apply_trigger: Option<Arc<dyn RoutePolicyApplyTrigger>>,
     ) -> Self {
+        let seeded = crate::doh_seed::builtin_seed()
+            .entries
+            .iter()
+            .map(|s| entry_key(s.entry.target.kind_str(), &s.entry.target.value_str()))
+            .collect();
+        Self::with_seeded(store, apply_trigger, seeded)
+    }
+
+    /// The handler over an explicit built-in set (tests).
+    pub fn with_seeded(
+        store: Arc<dyn DohResolverListStore>,
+        apply_trigger: Option<Arc<dyn RoutePolicyApplyTrigger>>,
+        seeded: Vec<(String, String)>,
+    ) -> Self {
         Self {
             store,
             apply_trigger,
+            seeded,
         }
     }
 }
 
+/// The stored spelling, so `2001:DB8::1` and a v4-mapped form match their row.
+fn entry_key(kind: &str, target: &str) -> (String, String) {
+    match nrr_storage::doh_lockdown::DohTarget::parse(kind, target) {
+        Some(t) => (t.kind_str().to_string(), t.value_str()),
+        None => (
+            kind.to_ascii_lowercase(),
+            target.trim().to_ascii_lowercase(),
+        ),
+    }
+}
+
+/// Built-in entries `current` holds that `wanted` leaves out. The seed is never
+/// re-applied, so a list written from a copy that was never read would erase
+/// them for every user of the machine; only a caller that says it removed
+/// them on purpose may.
+fn seeded_entries_dropped(
+    seeded: &[(String, String)],
+    current: &[DohResolverEntryDto],
+    wanted: &[DohResolverEntryDto],
+) -> Vec<String> {
+    let kept: std::collections::HashSet<(String, String)> = wanted
+        .iter()
+        .map(|e| entry_key(&e.target_kind, &e.target))
+        .collect();
+    current
+        .iter()
+        .filter(|e| {
+            let key = entry_key(&e.target_kind, &e.target);
+            seeded.contains(&key) && !kept.contains(&key)
+        })
+        .map(|e| e.target.clone())
+        .collect()
+}
+
 impl DohResolversSetHandler {
+    fn seed_guard(
+        &self,
+        req: &DohResolversSetRequest,
+        current: &[DohResolverEntryDto],
+    ) -> Result<(), IpcError> {
+        if req.drop_seeded {
+            return Ok(());
+        }
+        let dropped = seeded_entries_dropped(&self.seeded, current, &req.resolvers);
+        if dropped.is_empty() {
+            return Ok(());
+        }
+        Err(IpcError {
+            code: IpcErrorCode::PreconditionFailed,
+            message: format!(
+                "the list leaves out {} built-in resolver entries ({}); re-read the list, \
+                 or set drop-seeded to remove them on purpose",
+                dropped.len(),
+                dropped.join(", ")
+            ),
+            diagnostics_id: None,
+        })
+    }
+
     /// The list is shared by every user of this machine. A non-elevated caller
     /// may still SAVE it - clients read-modify-write the whole settings page -
     /// as long as the list comes back unchanged.
     fn gate(&self, req: &DohResolversSetRequest, ctx: &IpcRequestContext) -> Result<(), IpcError> {
         let current = self.store.get_all().map_err(map_write_error)?;
+        self.seed_guard(req, &current)?;
         if crate::machine_scoped::machine_scoped_write_allowed(
             &req.resolvers,
             &current,
@@ -253,6 +329,7 @@ mod tests {
                 entry("ip", "198.51.100.1"),
                 entry("host", "resolver.example"),
             ],
+            drop_seeded: false,
         })
         .unwrap();
         let v = h
@@ -279,6 +356,7 @@ mod tests {
             DohResolversSetHandler::new(Arc::clone(&store) as Arc<dyn DohResolverListStore>, None);
         let payload = serde_json::to_value(DohResolversSetRequest {
             resolvers: vec![entry("ip", "not-an-ip")],
+            drop_seeded: false,
         })
         .unwrap();
         let err = h
@@ -289,5 +367,64 @@ mod tests {
             store.get_all().unwrap().is_empty(),
             "no write on invalid input"
         );
+    }
+
+    fn seeded_handler(store: Arc<MemStore>) -> DohResolversSetHandler {
+        DohResolversSetHandler::with_seeded(
+            store as Arc<dyn DohResolverListStore>,
+            None,
+            vec![("ip".into(), "198.51.100.8".into())],
+        )
+    }
+
+    #[test]
+    fn a_list_without_a_stored_builtin_entry_is_refused_and_nothing_written() {
+        let store = Arc::new(MemStore {
+            entries: Mutex::new(vec![
+                entry("ip", "198.51.100.8"),
+                entry("host", "mine.example"),
+            ]),
+        });
+        let h = seeded_handler(Arc::clone(&store));
+        let payload = serde_json::to_value(DohResolversSetRequest {
+            resolvers: vec![entry("host", "added.example")],
+            drop_seeded: false,
+        })
+        .unwrap();
+        let err = h
+            .handle(&req(IpcOperationName::DohResolversSet, payload), &ctx("S"))
+            .unwrap_err();
+        assert_eq!(err.code, IpcErrorCode::PreconditionFailed);
+        assert!(err.message.contains("198.51.100.8"));
+        assert_eq!(store.get_all().unwrap().len(), 2, "no write");
+    }
+
+    #[test]
+    fn a_builtin_entry_removed_on_purpose_goes_and_a_user_entry_may_go_silently() {
+        let store = Arc::new(MemStore {
+            entries: Mutex::new(vec![
+                entry("ip", "198.51.100.8"),
+                entry("host", "mine.example"),
+            ]),
+        });
+        let h = seeded_handler(Arc::clone(&store));
+        // A user's own entry is not guarded.
+        let payload = serde_json::to_value(DohResolversSetRequest {
+            resolvers: vec![entry("ip", "198.51.100.8")],
+            drop_seeded: false,
+        })
+        .unwrap();
+        h.handle(&req(IpcOperationName::DohResolversSet, payload), &ctx("S"))
+            .unwrap();
+        assert_eq!(store.get_all().unwrap().len(), 1);
+        // The built-in one goes only with the flag.
+        let payload = serde_json::to_value(DohResolversSetRequest {
+            resolvers: Vec::new(),
+            drop_seeded: true,
+        })
+        .unwrap();
+        h.handle(&req(IpcOperationName::DohResolversSet, payload), &ctx("S"))
+            .unwrap();
+        assert!(store.get_all().unwrap().is_empty());
     }
 }

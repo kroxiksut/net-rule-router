@@ -931,43 +931,6 @@ fn glob_app_rule_fans_out_one_app_id_filter_per_resolved_path() {
     assert_ne!(app_id_filters[0].id.raw, app_id_filters[1].id.raw);
 }
 
-#[test]
-fn resolved_app_id_weight_sits_below_shifted_observation_mirrors() {
-    let cache = MockFqdnCacheLookup::new();
-    let resolver =
-        MockAppPathResolver::new().with("chrome.exe", vec![PathBuf::from(r"C:\Apps\chrome.exe")]);
-    let app_obs = MockAppObservationLookup::new();
-    app_obs.set_ips("chrome.exe", vec![Ipv4Addr::new(203, 0, 113, 7)]);
-    let rule_book = book(vec![app_rule("r-app", "chrome.exe", false)], vec![]);
-    let out = generate_filters(CodegenInput {
-        sid: "S",
-        rule_book: &rule_book,
-        fqdn_cache: &cache,
-        app_observations: &app_obs,
-        app_resolver: &resolver,
-        secondary_ip_denylist: &std::collections::HashSet::new(),
-        zone_priority_over_ip: false,
-        app_rules_take_all_addresses: false,
-        families: crate::enforcement_planner::FamilyScope::V4Only,
-        packet_blocks: true,
-    });
-    let app_id = out
-        .filters
-        .iter()
-        .find(|f| f.app_pattern.is_some())
-        .expect("app-id filter");
-    let mirror = out
-        .filters
-        .iter()
-        .find(|f| f.remote_ip.is_some() || !f.remote_ip_set.is_empty())
-        .expect("observation /32 mirror");
-    // The app-id band (slots 0..APP_PATH_FANOUT_CAP) sits strictly below the
-    // observation-mirror band (slots APP_PATH_FANOUT_CAP + 1 + i) — no
-    // weight collision between the two fan-outs of the same rule.
-    assert!(app_id.weight < mirror.weight);
-    assert_eq!(mirror.weight - app_id.weight, APP_PATH_FANOUT_CAP + 1);
-}
-
 // ── Default route ───────────────────────────────────────────────────────
 
 /// No rules, no filters: unmatched traffic follows the OS route table, and
@@ -1817,6 +1780,7 @@ fn no_capability_set_unlocks_an_unimplemented_shape() {
         app_match: AppMatchMechanism::WfpAppId,
         app_path_rules: true,
         app_path_scripts: true,
+        standing_filter_alarm: None,
     };
     for caps in [
         everything,
@@ -2185,6 +2149,70 @@ fn a_program_deny_closes_both_families_and_leaves_loopback_open() {
     );
 }
 
+/// A program deny stays a program deny when programs take all their
+/// addresses: the CDN front the denied program was seen using is shared with
+/// the user's browser, and a block on it without the program would cut the
+/// browser too. Both emitters.
+#[test]
+fn a_program_deny_under_the_takeover_blocks_no_address_for_other_programs() {
+    let cdn = Ipv4Addr::new(203, 0, 113, 16);
+    let resolver = MockAppPathResolver::from_seed([(
+        "evil.exe".to_string(),
+        vec![PathBuf::from(r"C:\Apps\evil.exe")],
+    )]);
+    let observations = MockAppObservationLookup::new();
+    observations.set_ips("evil.exe", vec![cdn]);
+    let mut denied = app_rule("r-deny", "evil.exe", false);
+    denied.action = nrr_domain::RuleAction::Block;
+    let rule_book = book(vec![], vec![denied]);
+    let cache = MockFqdnCacheLookup::new();
+    let out = generate_filters(CodegenInput {
+        sid: "S",
+        rule_book: &rule_book,
+        fqdn_cache: &cache,
+        app_observations: &observations,
+        app_resolver: &resolver,
+        secondary_ip_denylist: &std::collections::HashSet::new(),
+        zone_priority_over_ip: false,
+        app_rules_take_all_addresses: true,
+        families: crate::enforcement_planner::FamilyScope::V4Only,
+        packet_blocks: true,
+    });
+    assert!(
+        out.filters.iter().any(|f| f.action == WfpAction::Block
+            && f.app_pattern.as_deref() == Some(r"C:\Apps\evil.exe")),
+        "the deny carries the program"
+    );
+    assert!(
+        !out.filters.iter().any(|f| f.covers_v4(cdn)),
+        "an address the denied program used is nobody else's to lose"
+    );
+    assert!(out.filters.iter().all(|f| f.app_pattern.is_some()));
+
+    let flows = crate::enforcement_planner::plan_route_rules(
+        &rule_book,
+        "S",
+        &crate::enforcement_planner::PlannerInput {
+            ipv6: crate::enforcement_planner::Ipv6Guard::Off,
+            fqdn_cache: &cache,
+            app_resolver: &resolver,
+            app_observations: &observations,
+            zone_priority_over_ip: false,
+            app_rules_take_all_addresses: true,
+            secondary_ip_denylist: &std::collections::HashSet::new(),
+            packet_blocks: true,
+        },
+    )
+    .0;
+    assert!(
+        flows.iter().all(|f| matches!(
+            f.app,
+            nrr_platform_api::enforcement::AppScope::Program { .. }
+        )),
+        "the plan holds nothing wider than the program: {flows:?}"
+    );
+}
+
 #[test]
 fn a_program_route_rule_gets_no_loopback_companions() {
     let resolver = MockAppPathResolver::from_seed([(
@@ -2207,4 +2235,51 @@ fn a_program_route_rule_gets_no_loopback_companions() {
     assert!(out.filters.iter().all(|f| f.remote_subnet.is_none()
         && f.remote_subnet_v6.is_none()
         && f.layer == WfpLayerKey::AleAuthConnectV4));
+}
+
+/// A book naming many hosts over a warm cache keeps every address's permit and
+/// stays at a few dozen filters in its route band. Packed rule by rule the band
+/// stood at ~2000 filters per user, and the BFE host crashed (0xEF) under ~3700
+/// standing filters on the machine.
+#[test]
+fn a_large_book_packs_its_route_permits_per_band_not_per_rule() {
+    let cache = MockFqdnCacheLookup::new();
+    let mut secondary = Vec::new();
+    for i in 0..300u32 {
+        let name = format!("host{i}.example");
+        let ips = (0..6u32)
+            .map(|k| Ipv4Addr::new(198, 18, (i % 250) as u8, (k * 40 + i / 250) as u8))
+            .collect();
+        cache.set_ips(&name, ips);
+        secondary.push(exact_fqdn_rule(&format!("r-{i}"), &name));
+    }
+    let rule_book = book(vec![], secondary);
+    let app_obs = MockAppObservationLookup::new();
+    let out = generate_filters(CodegenInput {
+        sid: "S-1-5-21-A",
+        rule_book: &rule_book,
+        fqdn_cache: &cache,
+        app_observations: &app_obs,
+        app_resolver: &NoopAppPathResolver,
+        secondary_ip_denylist: &std::collections::HashSet::new(),
+        zone_priority_over_ip: false,
+        app_rules_take_all_addresses: false,
+        families: crate::enforcement_planner::FamilyScope::V4Only,
+        packet_blocks: false,
+    });
+    let band: Vec<&WfpFilterSpec> = out
+        .filters
+        .iter()
+        .filter(|f| (BASE_SECONDARY..BASE_SECONDARY + BAND_WIDTH).contains(&f.weight))
+        .collect();
+    assert!(band.iter().all(|f| f.action == WfpAction::Permit));
+    let mut permitted: Vec<Ipv4Addr> = band.iter().flat_map(|f| f.remote_ip_set.clone()).collect();
+    permitted.sort_unstable();
+    permitted.dedup();
+    assert_eq!(permitted.len(), 1800, "every address keeps its permit");
+    assert!(
+        band.len() <= 48,
+        "{} filters for 1800 addresses: the band is packed rule by rule again",
+        band.len()
+    );
 }

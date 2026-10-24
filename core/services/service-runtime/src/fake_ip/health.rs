@@ -77,6 +77,8 @@ pub struct FakeIpHealth {
     /// this is the per-packet cost of the pump — the number that says whether
     /// the stack is servicing the flows with work or walking all of them.
     tcp_flow_visits: AtomicU64,
+    /// The same for UDP binds.
+    udp_bind_visits: AtomicU64,
     /// Upstream UDP datagrams dropped because a flow's reply queue was full —
     /// a peer answering faster than the poll loop drains, or a flood.
     udp_replies_dropped: AtomicU64,
@@ -152,6 +154,16 @@ impl FakeIpHealth {
     #[must_use]
     pub fn tcp_flow_visits(&self) -> u64 {
         self.tcp_flow_visits.load(Ordering::Relaxed)
+    }
+
+    /// One UDP bind was visited by the datagram pump.
+    pub fn record_udp_bind_serviced(&self) {
+        self.udp_bind_visits.fetch_add(1, Ordering::Relaxed);
+    }
+
+    #[must_use]
+    pub fn udp_bind_visits(&self) -> u64 {
+        self.udp_bind_visits.load(Ordering::Relaxed)
     }
 
     /// A TCP dial completed successfully.

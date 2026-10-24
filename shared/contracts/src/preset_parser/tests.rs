@@ -180,8 +180,18 @@ fn a_quoted_program_is_a_rule_on_or_off() {
 /// off; a value that read back bare keeps its bytes.
 #[test]
 fn a_program_value_on_its_line_reads_back_whole() {
-    let cases: [(&str, bool, &str); 11] = [
+    let cases: [(&str, bool, &str); 17] = [
         ("Web Content", false, "\"Web Content\""),
+        (r"C:\Projects\C#\tool.exe", true, r"C:\Projects\C#\tool.exe"),
+        ("c#tool.exe", false, "c#tool.exe"),
+        (r"C:\My #1\tool.exe", true, r#""C:\My #1\tool.exe""#),
+        (
+            r"C:\My #1\tool.exe +children",
+            false,
+            r#""C:\My #1\tool.exe" +children"#,
+        ),
+        ("#tool.exe", true, "\"#tool.exe\""),
+        (r"C:\My  Tools\app.exe", true, r"C:\My  Tools\app.exe"),
         ("/opt/My Apps/tool", false, "\"/opt/My Apps/tool\""),
         ("Web Content +children", false, "\"Web Content\" +children"),
         ("Web Content", true, "Web Content"),
@@ -283,6 +293,61 @@ fn single_known_section_with_one_rule() {
     assert_eq!(r.rule_type, ParsedRuleType::Zone);
     assert_eq!(r.match_value, "ru");
     assert!(r.enabled);
+}
+
+#[test]
+fn an_inline_comment_starts_at_a_hash_after_whitespace() {
+    let cases: [(&str, &str, Option<&str>); 9] = [
+        ("example.com  # note", "example.com  ", Some(" note")),
+        ("example.com\t#note", "example.com\t", Some("note")),
+        ("# note", "", Some(" note")),
+        (r"C:\Projects\C#\tool.exe", r"C:\Projects\C#\tool.exe", None),
+        ("c#tool.exe # x # y", "c#tool.exe ", Some(" x # y")),
+        (
+            r#""C:\My #1\app.exe" +children # note"#,
+            r#""C:\My #1\app.exe" +children "#,
+            Some(" note"),
+        ),
+        ("!\"a #b.exe\"", "!\"a #b.exe\"", None),
+        ("\"#tool.exe\"", "\"#tool.exe\"", None),
+        // No closing quote: read as unquoted text.
+        ("\"half #x", "\"half ", Some("x")),
+    ];
+    for (body, value, comment) in cases {
+        assert_eq!(split_inline_comment(body), (value, comment), "{body}");
+    }
+}
+
+#[test]
+fn a_one_word_note_is_no_disabled_address() {
+    let text = "--- IP\n# Office\n# 192.0.2.7\n--- CIDR\n# Office\n--- Ranges\n# Office\n\
+                --- Zones\n# TODO:\n# corp\n";
+    let rules: Vec<(String, bool)> = parse_canonical_rules(text)
+        .rules
+        .iter()
+        .map(|r| (r.match_value.clone(), r.enabled))
+        .collect();
+    assert_eq!(
+        rules,
+        vec![("192.0.2.7".to_owned(), false), ("corp".to_owned(), false)]
+    );
+}
+
+#[test]
+fn split_rule_flags_keeps_the_spacing_inside_a_value() {
+    let children = RuleFlags {
+        children: true,
+        override_requested: false,
+    };
+    assert_eq!(
+        split_rule_flags("  C:\\My  Tools\\app.exe\t +children "),
+        (r"C:\My  Tools\app.exe".to_owned(), children)
+    );
+    assert_eq!(
+        split_rule_flags("a  +children  b"),
+        ("a b".to_owned(), children),
+        "one space closes the gap a flag leaves"
+    );
 }
 
 #[test]
@@ -1406,5 +1471,46 @@ fn a_comment_without_the_hint_prefix_is_read_as_before() {
             ("example.com", false, ""),
             ("example.net", true, ": a note"),
         ]
+    );
+}
+
+/// Unticking a rule that carries a mark must not turn it into prose: the line
+/// would vanish from the table and the next write would drop it. Every network
+/// section, each mark and the mark pair the validator later refuses.
+#[test]
+fn a_disabled_line_keeps_its_marks_and_stays_a_rule() {
+    let text = "--- Domains\n# !blocked.example\n# ?checked.example\n# !?both.example\n\
+                --- Zones\n# !corp\n\
+                --- IP\n# !192.0.2.7\n# ?192.0.2.8\n# !2001:db8::1\n\
+                --- CIDR\n# !10.0.0.0/8\n\
+                --- Ranges\n# !10.0.0.5-10.0.0.9\n";
+    let rules: Vec<(String, bool)> = parse_canonical_rules(text)
+        .rules
+        .iter()
+        .map(|r| {
+            let marks = format!(
+                "{}{}",
+                if r.blocked { "!" } else { "" },
+                if r.verify_primary { "?" } else { "" }
+            );
+            (format!("{marks}{}", r.match_value), r.enabled)
+        })
+        .collect();
+    let want = [
+        "!blocked.example",
+        "?checked.example",
+        "!?both.example",
+        "!corp",
+        "!192.0.2.7",
+        "?192.0.2.8",
+        "!2001:db8::1",
+        "!10.0.0.0/8",
+        "!10.0.0.5-10.0.0.9",
+    ];
+    assert_eq!(
+        rules,
+        want.iter()
+            .map(|v| ((*v).to_owned(), false))
+            .collect::<Vec<_>>()
     );
 }

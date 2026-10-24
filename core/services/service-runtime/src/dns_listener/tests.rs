@@ -2097,6 +2097,57 @@ fn a_forwarded_reply_with_a_compressed_or_unlearnable_question_is_still_checked(
     );
 }
 
+/// A query we cannot read a question from (none at all, or a name over the
+/// wire limit) is forwarded raw. The server cannot echo a question it could
+/// not read either, so only an error or a question-less reply is its answer;
+/// a late answer to an EARLIER query of the same id, question and all, must
+/// keep waiting rather than reach this client.
+#[test]
+fn a_query_without_a_readable_question_accepts_only_an_error_reply() {
+    use crate::dns_wire::{build_address_query, DNS_HEADER_LEN};
+    // QDCOUNT=0: the header alone.
+    let bare = vec![0x5A, 0x5A, 0x01, 0x00, 0, 0, 0, 0, 0, 0, 0, 0];
+    // A name over 255 bytes: five 63-byte labels.
+    let mut overlong = vec![0x5A, 0x5A, 0x01, 0x00, 0, 1, 0, 0, 0, 0, 0, 0];
+    for _ in 0..5 {
+        overlong.push(63);
+        overlong.extend(std::iter::repeat_n(b'a', 63));
+    }
+    overlong.extend_from_slice(&[0, 0, 1, 0, 1]);
+    assert!(crate::dns_wire::question_key(&overlong).is_none());
+
+    let mut stale = build_address_query(0x5A5A, "earlier.example", QTYPE_A).expect("query");
+    stale[2] |= 0x80;
+    let mut stale_nxdomain = stale.clone();
+    stale_nxdomain[3] = (stale_nxdomain[3] & 0xF0) | 0x03;
+    let mut formerr = bare.clone();
+    formerr[2] |= 0x80;
+    formerr[3] = 0x01;
+    let mut empty_ok = bare.clone();
+    empty_ok[2] |= 0x80;
+
+    for query in [&bare, &overlong] {
+        assert!(
+            !reply_answers_query(query, &stale),
+            "a complete answer to another question is not ours"
+        );
+        assert!(
+            !reply_answers_query(query, &stale_nxdomain),
+            "nor is an error answer to another question"
+        );
+        assert!(reply_answers_query(query, &formerr));
+        assert!(reply_answers_query(query, &empty_ok));
+        // The echoed query itself is still no answer.
+        assert!(!reply_answers_query(query, query));
+    }
+    // A FORMERR that echoes the raw question is accepted as well.
+    let mut echoed = overlong.clone();
+    echoed[2] |= 0x80;
+    echoed[3] = 0x01;
+    assert!(echoed.len() > DNS_HEADER_LEN);
+    assert!(reply_answers_query(&overlong, &echoed));
+}
+
 /// A UDP socket and a TCP listener on one loopback port, as the resolver binds
 /// them. Hyper-V reserves 100-port windows per protocol, and the OS hands out
 /// ephemeral ports in sequence, so asking it again lands in the same window.

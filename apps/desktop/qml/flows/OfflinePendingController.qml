@@ -67,7 +67,7 @@ QtObject {
                 return root.tr("settings.routing.kill-switch.protocols.label", "Protocols leak protection cuts")
             case "allow-dns-over-primary":
                 return root.tr("settings.routing.kill-switch.allow-dns-label",
-                    "Allow name resolution over the main connection while blocked")
+                    "While everything is held, look up site names over the main connection")
             case "include-subdomains":
                 return root.tr("settings.routing-behavior.include-subdomains.label",
                     "Also cover subdomains for domain rules")

@@ -127,10 +127,17 @@ impl IpcHandler for SnapshotInitialHandler {
             self.fake_ip_datapath.as_ref(),
             ctx.caller_stored(),
         );
-        let adapters = self.adapters.adapters_snapshot(false);
+        let adapters = self
+            .adapters
+            .adapters_snapshot_for(false, ctx.caller_stored());
         let diag_status = self.diagnostics.get_status(&ctx.diagnostics_audience());
         let active_alerts_count = diag_status.active_alerts.len() as u32;
         let active_revision_id = health.active_revision_id.clone();
+        // Unreadable stays absent: a client reads zero as "the set is empty".
+        let rule_counts = self.policy.active_rule_counts_for(ctx.caller_stored());
+        let as_wire = |n: usize| u32::try_from(n).unwrap_or(u32::MAX);
+        let active_rule_count = rule_counts.map(|c| as_wire(c.total));
+        let active_secondary_rule_count = rule_counts.map(|c| as_wire(c.enabled_secondary));
 
         // Read route policy for caller's SID. Empty SID
         // (e.g. cross-platform tests) returns `None`, which is the
@@ -166,11 +173,13 @@ impl IpcHandler for SnapshotInitialHandler {
             .collect();
         let last_known_good = self.policy.last_known_good_id();
         let apply_failure_policy = Some(self.apply_failure_policy.get());
-        let (routing_paused, pause_term) = if ctx.caller_stored().is_empty() {
-            (false, Default::default())
+        let (routing_paused, routing_paused_at, pause_term) = if ctx.caller_stored().is_empty() {
+            (false, None, Default::default())
         } else {
+            let pause = self.routing_pause.get(ctx.caller_stored());
             (
-                self.routing_pause.get(ctx.caller_stored()).paused,
+                pause.paused,
+                pause.paused_at.filter(|_| pause.paused),
                 self.routing_pause.term(ctx.caller_stored()),
             )
         };
@@ -187,6 +196,16 @@ impl IpcHandler for SnapshotInitialHandler {
         // Block-all posture for the "leak protection is blocking
         // unknown traffic" banner.
         let kill_switch_block_all_armed = self.block_all_posture.armed();
+        let (protection_filters_on_machine, protection_filters_high) = {
+            let volume = crate::standing_volume::global_standing_volume();
+            let line = nrr_platform_api::enforcement::EnforcementCapabilities::current()
+                .standing_filter_alarm;
+            (
+                u32::try_from(volume.total()).unwrap_or(u32::MAX),
+                volume.is_high(line),
+            )
+        };
+        let kill_switch_holding_for_outage = self.block_all_posture.holding_for_outage();
         // The caller's own conflicts only: they name its rules and addresses.
         let rule_conflicts = self.app_enforcement.rule_conflicts(ctx.caller_stored());
         // The caller's own reports only: candidates name that user's adapters.
@@ -246,6 +265,7 @@ impl IpcHandler for SnapshotInitialHandler {
             last_known_good,
             apply_failure_policy,
             routing_paused,
+            routing_paused_at,
             routing_pause_resumes_at_ms: pause_term.resumes_at_ms,
             routing_pause_until_restart: pause_term.until_restart,
             autostart,
@@ -255,11 +275,16 @@ impl IpcHandler for SnapshotInitialHandler {
             kill_switch_shared_ip_exemptions,
             kill_switch_shared_ip_exemption_addresses,
             kill_switch_block_all_armed,
+            kill_switch_holding_for_outage,
+            protection_filters_on_machine,
+            protection_filters_high,
             rule_conflicts,
             enforcement_status,
             routes_held_by_another_user,
             traffic_carried_by_another_user,
             rules_book_unreadable,
+            active_rule_count,
+            active_secondary_rule_count,
             pending_vpn_clients,
             pending_vpn_gateways,
             confirmed_vpn_gateways,
@@ -353,6 +378,11 @@ mod tests {
         assert!(parsed.diagnostics.overall_healthy);
         assert_eq!(parsed.active_alerts_count, 0);
         assert_eq!(parsed.active_revision_id.as_deref(), Some("rev-init"));
+        assert_eq!(
+            parsed.active_rule_count,
+            Some(3),
+            "the revision's count rides along"
+        );
         assert!(parsed.unenforced_app_rules.is_empty());
         assert_eq!(parsed.kill_switch_shared_ip_exemptions, 0);
         assert!(!parsed.kill_switch_block_all_armed, "disarmed by default");
@@ -408,6 +438,12 @@ mod tests {
         };
         let resp = h.handle(&req(), &caller).unwrap();
         let parsed: SnapshotInitialResponse = serde_json::from_value(resp).unwrap();
+        assert_eq!(
+            parsed.active_rule_count,
+            Some(0),
+            "no revision in force is no rules"
+        );
+        assert_eq!(parsed.active_secondary_rule_count, Some(0));
         // The caller's own, sorted + deduped by the status; another user's stay out.
         assert_eq!(parsed.unenforced_app_rules, vec!["ab.exe", "disko*.exe"]);
         // The smart-kill-switch exclusion count rides the same snapshot.

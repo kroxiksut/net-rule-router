@@ -14,6 +14,15 @@ pub(crate) const EVENT_HEADER_LEN: usize = 16;
 pub(crate) const IN_Q_OVERFLOW: u32 = 0x4000;
 /// The event's subject is a directory.
 pub(crate) const IN_ISDIR: u32 = 0x4000_0000;
+/// Entry created in, moved out of, moved into a watched directory.
+pub(crate) const IN_CREATE: u32 = 0x100;
+pub(crate) const IN_MOVED_FROM: u32 = 0x40;
+pub(crate) const IN_MOVED_TO: u32 = 0x80;
+/// The watched directory itself was deleted or moved.
+pub(crate) const IN_DELETE_SELF: u32 = 0x400;
+pub(crate) const IN_MOVE_SELF: u32 = 0x800;
+/// The kernel dropped the watch; its descriptor names nothing any more.
+pub(crate) const IN_IGNORED: u32 = 0x8000;
 /// Events read from one buffer; the rest is ignored.
 pub(crate) const MAX_EVENTS: usize = 4096;
 

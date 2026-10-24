@@ -237,3 +237,64 @@ fn recompute_active_keeps_slash32_when_paused_persist() {
         "the matched host still egresses the secondary under Persist pause"
     );
 }
+
+/// A pass wedged at the stop does not hold the routes hostage: past the wait
+/// our signed rows go straight from the table, a foreign row stays, and the
+/// keep-rule-routes stop takes only the overlays.
+#[test]
+fn a_wedged_pass_does_not_keep_the_stop_from_removing_our_routes() {
+    use nrr_platform_api::route_signature::{NETWORK_ROUTE_METRIC, SECONDARY_ROUTE_METRIC};
+    let row = |d: [u8; 4], prefix: u8, metric: u32| RouteEntry {
+        destination: IpAddr::V4(Ipv4Addr::from(d)),
+        prefix_length: prefix,
+        next_hop: IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)),
+        interface_index: 7,
+        metric,
+        is_ours: false,
+        table: nrr_platform_api::RouteTableRef::Main,
+    };
+    let host = row([198, 51, 100, 1], 32, SECONDARY_ROUTE_METRIC);
+    let network = row([10, 20, 0, 0], 16, NETWORK_ROUTE_METRIC);
+    let overlay = row([0, 0, 0, 0], 2, SECONDARY_ROUTE_METRIC);
+    let foreign = row([0, 0, 0, 0], 1, 1);
+    let wait = std::time::Duration::from_millis(50);
+
+    let api = Arc::new(MockWindowsApi::new());
+    let coord = coordinator(Arc::clone(&api), Arc::new(FakeRules::new()));
+    api.set_route_table(vec![
+        host.clone(),
+        network.clone(),
+        overlay.clone(),
+        foreign.clone(),
+    ]);
+    {
+        let _wedged = coord.pass_lock.lock().unwrap();
+        let delta = coord.teardown_keep_rule_routes_within(wait).unwrap();
+        assert_eq!(delta.removed, 1);
+    }
+    let left: Vec<(IpAddr, u8)> = api
+        .get_ip_forward_table()
+        .unwrap()
+        .iter()
+        .map(|r| (r.destination, r.prefix_length))
+        .collect();
+    assert!(!left.contains(&(overlay.destination, 2)), "{left:?}");
+    assert!(left.contains(&(host.destination, 32)), "{left:?}");
+    assert!(left.contains(&(network.destination, 16)), "{left:?}");
+
+    api.set_route_table(vec![host, network, overlay, foreign.clone()]);
+    let began = std::time::Instant::now();
+    {
+        let _wedged = coord.pass_lock.lock().unwrap();
+        let delta = coord.teardown_within(wait).unwrap();
+        assert_eq!(delta.removed, 3);
+    }
+    assert!(began.elapsed() < std::time::Duration::from_secs(5));
+    let left: Vec<(IpAddr, u8)> = api
+        .get_ip_forward_table()
+        .unwrap()
+        .iter()
+        .map(|r| (r.destination, r.prefix_length))
+        .collect();
+    assert_eq!(left, vec![(foreign.destination, 1)]);
+}

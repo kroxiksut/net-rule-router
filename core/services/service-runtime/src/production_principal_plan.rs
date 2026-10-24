@@ -48,7 +48,7 @@ use crate::enforcement_planner::{
 };
 use crate::killswitch_codegen::KillSwitchProtocols;
 use crate::machine_reading::MachineReading;
-use crate::per_sid_orchestrator::PerSidPolicySnapshot;
+use crate::per_sid_orchestrator::{ActiveRulesSnapshot, PerSidPolicySnapshot};
 
 use crate::app_observation_lookup::AppObservationLookup;
 use crate::enforcement_planner::{plan_route_rules, plan_routes_with, PlannerInput};
@@ -121,6 +121,9 @@ pub struct ProductionPrincipalPlanSource {
     pass_owner: Mutex<Option<Option<UserPrincipal>>>,
     /// Each planned user's links this pass, published as one view at its end.
     pass_links: Mutex<std::collections::BTreeMap<String, PassLinks>>,
+    /// Users a pass has published a machine reading for. Until then a first
+    /// contact cannot tell a LAN or another tunnel's address from a remote one.
+    machine_read: Mutex<std::collections::HashSet<String>>,
 }
 
 /// One user's foreign tunnels and additional-route links, from the pass's
@@ -193,6 +196,7 @@ impl ProductionPrincipalPlanSource {
             local_networks: None,
             pass_owner: Mutex::new(None),
             pass_links: Mutex::new(Default::default()),
+            machine_read: Mutex::new(Default::default()),
         }
     }
 
@@ -348,19 +352,38 @@ impl ProductionPrincipalPlanSource {
         principal: &UserPrincipal,
         availability: ChannelAvailability,
     ) -> Option<(EnforcementPlan, PlanCoverage)> {
+        self.plan_over(principal, availability, || {
+            self.rules.active_rules_for(principal.as_stored())
+        })
+    }
+
+    /// [`Self::plan_with_coverage`] over the book `read_rules` yields, so a
+    /// caller that already read it to tell "unreadable" from "none" plans that
+    /// same read rather than a second one that may fail.
+    fn plan_over(
+        &self,
+        principal: &UserPrincipal,
+        availability: ChannelAvailability,
+        read_rules: impl FnOnce() -> Option<ActiveRulesSnapshot>,
+    ) -> Option<(EnforcementPlan, PlanCoverage)> {
         let stored = principal.as_stored();
         let mut timings = crate::phase_timings::PhaseTimings::start();
         // No stored routing policy means the user never bound their adapters,
         // and a plan built without that would pin nothing.
         // Without a policy or rules nothing is planned, so nothing conflicts.
         let Some(policy) = self.policy.load_for_sid(stored) else {
+            // A store that did not answer is not "no policy": the plan in force
+            // is carried, so its IPv6 board and conflicts must stay published.
+            if self.policy.read_failure_for(stored).is_some() {
+                return None;
+            }
             publish_ipv6_disposition(stored, None);
             // Routing needs connections; a deny does not.
-            return self.plan_denies_without_policy(principal);
+            return self.plan_denies_without_policy(principal, read_rules);
         };
         timings.mark("policy");
         self.note_pass_links(stored, &policy);
-        let Some(rules) = self.rules.active_rules_for(stored) else {
+        let Some(rules) = read_rules() else {
             publish_ipv6_disposition(stored, None);
             self.publish_conflicts(stored, None);
             return None;
@@ -470,13 +493,39 @@ impl ProductionPrincipalPlanSource {
         // The addresses the leak-guard may act on, under the same shared-address
         // rule as the Windows guard: smart spares what a direct host shares.
         // The main link's own segments too, read once: nothing to read when off.
+        let floor = if matches!(posture, ProtectionPosture::Open) {
+            CatchAllExemptions::default()
+        } else {
+            self.exemptions_for(stored, &policy)
+        };
         let spared = Spared {
             shared: self.shared_ips_spared(&policy, cache),
-            floor: if matches!(posture, ProtectionPosture::Open) {
-                CatchAllExemptions::default()
-            } else {
-                self.exemptions_for(stored, &policy)
+            infrastructure: crate::enforcement_planner::LinkInfrastructure {
+                tunnel_servers: floor
+                    .server_ips
+                    .iter()
+                    .map(|ip| std::net::IpAddr::V4(*ip))
+                    .chain(
+                        floor
+                            .server_ips_v6
+                            .iter()
+                            .map(|ip| std::net::IpAddr::V6(*ip)),
+                    )
+                    .collect(),
+                link_resolvers: self.primary_dns(),
             },
+            secondary_literals: rules
+                .rule_book
+                .secondary
+                .rules()
+                .iter()
+                .filter(|rule| rule.enabled)
+                .filter_map(|rule| match rule.address_match {
+                    Some(nrr_domain::canonical::CanonicalAddressMatch::ExactIp(ip)) => Some(ip),
+                    _ => None,
+                })
+                .collect(),
+            floor,
         };
 
         // A rule the tunnel cannot carry over IPv6 is BLOCKED, not leaked.
@@ -624,12 +673,11 @@ impl ProductionPrincipalPlanSource {
     fn plan_denies_without_policy(
         &self,
         principal: &UserPrincipal,
+        read_rules: impl FnOnce() -> Option<ActiveRulesSnapshot>,
     ) -> Option<(EnforcementPlan, PlanCoverage)> {
         let stored = principal.as_stored();
-        let Some(rules) = self
-            .rules
-            .active_rules_for(stored)
-            .filter(|r| crate::rule_book_facts::has_deny_rules(&r.rule_book))
+        let Some(rules) =
+            read_rules().filter(|r| crate::rule_book_facts::has_deny_rules(&r.rule_book))
         else {
             self.publish_conflicts(stored, None);
             return None;
@@ -646,6 +694,7 @@ impl ProductionPrincipalPlanSource {
             Some(reading) => crate::enforcement_planner::Ipv6Guard::from_links(
                 reading.adapters().unwrap_or_default(),
                 None,
+                &[],
             ),
             None => crate::enforcement_planner::Ipv6Guard::Off,
         };
@@ -689,8 +738,8 @@ impl ProductionPrincipalPlanSource {
     }
 }
 
-/// One line naming the network rules carved past the cap: their narrower rules
-/// quietly lose, so it is worth a look. Both planners call it.
+/// One line naming the network rules carved past the cap, which were skipped.
+/// Both planners call it.
 pub(crate) fn log_networks_over_cap(principal: &str, rules: &[String]) {
     if rules.is_empty() {
         return;
@@ -701,7 +750,7 @@ pub(crate) fn log_networks_over_cap(principal: &str, rules: &[String]) {
         sid = %principal,
         count = rules.len(),
         rules = %rules.join(", "),
-        "network rules hold more narrower rules than can be carved out, so each covers its whole network and the narrower rules inside lose (rule: pieces/cap)",
+        "network rules hold more narrower rules than can be carved out, so their filters are skipped and the narrower rules inside keep working (rule: pieces/cap)",
     );
 }
 
@@ -935,26 +984,27 @@ impl ProductionPrincipalPlanSource {
             adapters,
             policy.secondary.as_ref().map(|b| b.display_name.as_str()),
         );
-        Ipv6Guard::from_links(adapters, secondary)
+        Ipv6Guard::from_links(adapters, secondary, reading.routes().unwrap_or_default())
     }
 
     /// The prefixes the bound tunnel steers the internet with, which mode A's
-    /// counter-overlay has to out-specific. Empty when the machine cannot be
-    /// read, which falls back to the classic `/2` set.
+    /// counter-overlay has to out-specific. A machine that cannot be read is
+    /// taken to hold the classic redirect pair; a tunnel not up takes nothing.
     fn tunnel_catch_alls(&self, policy: &PerSidPolicySnapshot) -> Vec<(std::net::Ipv4Addr, u8)> {
+        let assumed = || crate::route_codegen::ASSUMED_CATCH_ALLS.to_vec();
         let Some(reading) = self.machine_reading() else {
-            return Vec::new();
+            return assumed();
+        };
+        let (Some(adapters), Some(routes)) = (reading.adapters(), reading.routes()) else {
+            return assumed();
         };
         let Some(tunnel) = crate::catch_all_exemptions::bound_adapter(
-            reading.adapters().unwrap_or_default(),
+            adapters,
             policy.secondary.as_ref().map(|b| b.display_name.as_str()),
         ) else {
             return Vec::new();
         };
-        crate::route_codegen::tunnel_catch_all_prefixes(
-            reading.routes().unwrap_or_default(),
-            tunnel.index,
-        )
+        crate::route_codegen::tunnel_catch_all_prefixes(routes, tunnel.index)
     }
 
     /// The route intents for `book`, network routes planned around this
@@ -998,8 +1048,9 @@ impl ProductionPrincipalPlanSource {
     /// can be early for, so a rule host's first connect leaves through the
     /// link its rule names. On the answer path: no machine reading of its own,
     /// network rules planned around nothing, since a first contact is a host,
-    /// and the cache cut down to `addresses`. A v6 address is routed only when the last pass found the link
-    /// carrying the family; before any pass it waits for one.
+    /// and the cache cut down to `addresses`. Nothing before a pass has read the
+    /// machine; a v6 address only when the last pass found the link carrying
+    /// the family.
     pub fn first_contact_routes(
         &self,
         principal: &PlanPrincipal,
@@ -1011,6 +1062,16 @@ impl ProductionPrincipalPlanSource {
             return Vec::new();
         }
         let stored = principal.as_stored();
+        // Before a pass has read the machine, a LAN or another tunnel's
+        // address would plan into our tunnel: wait for the pass.
+        if !self
+            .machine_read
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .contains(stored)
+        {
+            return Vec::new();
+        }
         let Some(policy) = self.policy.load_for_sid(stored) else {
             return Vec::new();
         };
@@ -1128,6 +1189,10 @@ impl ProductionPrincipalPlanSource {
         let facts = NetworkRouteFacts::read(routes, adapters, tunnel, servers)
             .with_foreign_tunnels(routes, &foreign);
         crate::kept_direct::publish(stored, &facts);
+        self.machine_read
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .insert(stored.to_owned());
         facts
     }
 
@@ -1607,6 +1672,10 @@ struct Spared {
     shared: SharedIps,
     /// The floor the blanket would keep open; empty while protection is off.
     floor: CatchAllExemptions,
+    /// The tunnel's servers and the main link's resolvers.
+    infrastructure: crate::enforcement_planner::LinkInfrastructure,
+    /// Addresses the additional route's rules name literally.
+    secondary_literals: Vec<std::net::IpAddr>,
 }
 
 impl Spared {
@@ -1622,6 +1691,9 @@ impl Spared {
 /// Whether the leak-guard leaves `ip` alone.
 fn is_spared(ip: std::net::IpAddr, spared: &Spared) -> bool {
     spared.on_local_segment(ip)
+        || spared
+            .infrastructure
+            .spares(ip, spared.secondary_literals.contains(&ip))
         || match ip {
             std::net::IpAddr::V4(v4) => spared.shared.contains(&v4),
             std::net::IpAddr::V6(_) => false,
@@ -1760,12 +1832,7 @@ impl PrincipalPlanSource for ProductionPrincipalPlanSource {
         availability: ChannelAvailability,
     ) -> Option<PlannedPolicy> {
         self.plan_with_coverage(principal, availability)
-            .map(|(plan, coverage)| PlannedPolicy {
-                plan,
-                protection_complete: coverage.kill_switch_complete,
-                fail_closed_blocks: coverage.fail_closed_blocks,
-                guard_holding: coverage.guard_holding,
-            })
+            .map(planned_policy)
     }
 
     /// A book that cannot be read is said so before any plan is drawn: the
@@ -1777,10 +1844,16 @@ impl PrincipalPlanSource for ProductionPrincipalPlanSource {
     ) -> crate::principal_enforcement::PlanRead {
         use crate::per_sid_orchestrator::RulesRead;
         use crate::principal_enforcement::PlanRead;
-        if let RulesRead::Unreadable(reason) = self.rules.rules_read_for(principal.as_stored()) {
-            return PlanRead::Unreadable(reason);
-        }
-        let planned = self.plan_for(principal, availability);
+        // One read decides both: a book that fails between a readability check
+        // and the plan's own read would plan as "no rules".
+        let rules = match self.rules.rules_read_for(principal.as_stored()) {
+            RulesRead::Unreadable(reason) => return PlanRead::Unreadable(reason),
+            RulesRead::Rules(snapshot) => Some(snapshot),
+            RulesRead::NoPolicy => None,
+        };
+        let planned = self
+            .plan_over(principal, availability, || rules)
+            .map(planned_policy);
         // A policy that could not be read answered like an absent one, and the
         // denies-only plan it produced would withdraw the rest.
         if let Some(reason) = self.policy.read_failure_for(principal.as_stored()) {
@@ -1793,6 +1866,15 @@ impl PrincipalPlanSource for ProductionPrincipalPlanSource {
     }
 }
 
+fn planned_policy((plan, coverage): (EnforcementPlan, PlanCoverage)) -> PlannedPolicy {
+    PlannedPolicy {
+        plan,
+        protection_complete: coverage.kill_switch_complete,
+        fail_closed_blocks: coverage.fail_closed_blocks,
+        guard_holding: coverage.guard_holding,
+    }
+}
+
 fn doh_lockdown_active(
     policy: &PerSidPolicySnapshot,
     rule_book: &nrr_domain::canonical::CanonicalRuleBook,
@@ -1802,7 +1884,11 @@ fn doh_lockdown_active(
         policy.doh_lockdown_enabled,
         policy.doh_lockdown_scope,
         policy.leak_protection.is_on(),
-        crate::rule_book_facts::has_secondary_rules(rule_book),
+        crate::rule_book_facts::needs_names_seen(
+            rule_book,
+            policy.mode
+                == crate::per_sid_orchestrator::PerSidBehaviorMode::PreferSecondaryWhenAvailable,
+        ),
     )
 }
 
@@ -2592,6 +2678,58 @@ mod tests {
         );
     }
 
+    /// A tunnel host inside a main-link network: the narrower rule carries
+    /// it, so the guard holds it when the tunnel is gone, and leaves the
+    /// network's other addresses to the main link.
+    struct HostInsideMainNetwork;
+    impl RulesProvider for HostInsideMainNetwork {
+        fn active_rules(&self) -> Option<ActiveRulesSnapshot> {
+            let rule = |id: &str, m: CanonicalAddressMatch| CanonicalRule {
+                id: RuleId(id.into()),
+                enabled: true,
+                address_match: Some(m),
+                app_match: None,
+                comment: String::new(),
+                action: RuleAction::Route,
+                origin: None,
+            };
+            let network = nrr_shared::ip_block::IpBlock::parse("203.0.113.0/24").expect("net");
+            Some(ActiveRulesSnapshot {
+                rule_book: CanonicalRuleBook {
+                    primary: CanonicalRuleSet::from_rules(vec![rule(
+                        "p-net",
+                        CanonicalAddressMatch::Subnet(network),
+                    )]),
+                    secondary: CanonicalRuleSet::from_rules(vec![rule(
+                        "s-host",
+                        CanonicalAddressMatch::ExactFqdn("secret.example".into()),
+                    )]),
+                },
+            })
+        }
+    }
+
+    #[test]
+    fn a_lost_secondary_holds_a_tunnel_host_inside_a_main_link_network() {
+        let host = Ipv4Addr::new(203, 0, 113, 5);
+        let cache = Arc::new(crate::fqdn_cache_lookup::MockFqdnCacheLookup::new());
+        cache.set_ips("secret.example", vec![host]);
+        let (plan, coverage) = source_with_cache(
+            Arc::new(HostInsideMainNetwork),
+            Arc::new(Policy::armed()),
+            cache,
+        )
+        .plan_with_coverage(&user(), availability(false))
+        .expect("the rules must plan");
+
+        assert!(coverage.fail_closed_blocks > 0);
+        assert!(
+            blocks_on(&plan, host) > 0,
+            "the tunnel host leaks over the main link"
+        );
+        assert_eq!(blocks_on(&plan, Ipv4Addr::new(203, 0, 113, 9)), 0);
+    }
+
     /// The guard is opt-in. Blocking traffic the user never asked to have
     /// blocked is the one failure a routing product must not have.
     #[test]
@@ -2905,13 +3043,26 @@ mod tests {
     const SHARED_HOST: Ipv4Addr = Ipv4Addr::new(198, 51, 100, 5);
 
     /// A first contact gets only its own `/32`s to the additional link,
-    /// planned as the pass would plan them, and nothing while that link is
-    /// down.
+    /// planned as the pass would plan them, nothing while that link is down,
+    /// and nothing before a pass has read the machine: until then a LAN or
+    /// another tunnel's address cannot be told from a remote one.
     #[test]
     fn a_first_contact_is_routed_only_for_its_own_addresses_on_a_live_link() {
-        let source = source(Arc::new(OneSecondaryRule), Arc::new(Policy::armed()));
+        let (api, links) = machine(false);
+        let source = source(Arc::new(OneSecondaryRule), Arc::new(Policy::armed()))
+            .with_machine_facts(
+                api as Arc<dyn nrr_platform_api::route_table::RouteTablePort>,
+                links as Arc<dyn nrr_platform_api::adapters::AdapterEventSource>,
+            );
         let host = IpAddr::V4(SECONDARY_HOST);
         let stranger = IpAddr::V4(Ipv4Addr::new(192, 0, 2, 99));
+        assert!(
+            source
+                .first_contact_routes(&user(), availability(true), &[host])
+                .is_empty(),
+            "before a pass has read the machine, a first contact waits for it",
+        );
+        let _ = source.plan_with_coverage(&user(), availability(true));
         let routes = source.first_contact_routes(&user(), availability(true), &[host, stranger]);
         assert_eq!(routes.len(), 1);
         assert_eq!(routes[0].dst, DstMatch::HostV4(SECONDARY_HOST));
@@ -2922,6 +3073,35 @@ mod tests {
         assert!(source
             .first_contact_routes(&user(), availability(false), &[host])
             .is_empty());
+    }
+
+    /// A book that answers its readability check and then fails, as a store
+    /// going away between two reads would.
+    struct ReadsOnce(std::sync::atomic::AtomicBool);
+    impl RulesProvider for ReadsOnce {
+        fn active_rules(&self) -> Option<ActiveRulesSnapshot> {
+            if self.0.swap(true, std::sync::atomic::Ordering::SeqCst) {
+                None
+            } else {
+                OneSecondaryRule.active_rules()
+            }
+        }
+    }
+
+    /// The plan is drawn from the read that found the book readable: a second
+    /// read failing in between must not plan as "no rules", which would
+    /// withdraw what is installed.
+    #[test]
+    fn a_book_read_once_is_planned_from_that_read() {
+        use crate::principal_enforcement::PlanRead;
+        let source = source(
+            Arc::new(ReadsOnce(Default::default())),
+            Arc::new(Policy::armed()),
+        );
+        match source.plan_read_for(&user(), availability(true)) {
+            PlanRead::Planned(planned) => assert!(!planned.plan.flows.is_empty()),
+            _ => panic!("a book that read must be planned, not taken for none"),
+        }
     }
 
     /// The v6 twin: a `/128` only for the host's own addresses, only while the
@@ -2939,6 +3119,21 @@ mod tests {
                     adapters[1].ipv6_addresses =
                         vec![Ipv6Addr::new(0x2001, 0xdb8, 0, 5, 0, 0, 0, 1)];
                 }
+            }
+            if tunnel_v6 {
+                // A live v6 link has a way out: the client's on-link `::/0`.
+                use nrr_platform_api::route_table::RouteTablePort;
+                let mut routes = api.get_ip_forward_table().expect("routes");
+                routes.push(nrr_platform_api::types::RouteEntry {
+                    destination: IpAddr::V6(Ipv6Addr::UNSPECIFIED),
+                    prefix_length: 0,
+                    next_hop: IpAddr::V6(Ipv6Addr::UNSPECIFIED),
+                    interface_index: 5,
+                    metric: 0,
+                    is_ours: false,
+                    table: nrr_platform_api::RouteTableRef::Main,
+                });
+                api.set_route_table(routes);
             }
             let cache = Arc::new(crate::fqdn_cache_lookup::MockFqdnCacheLookup::default());
             cache.set_addresses(HOST, vec![IpAddr::V6(HOST_V6)]);
@@ -3351,6 +3546,30 @@ mod tests {
             read(Some("disk I/O error")),
             PlanRead::Unreadable(reason) if reason == "disk I/O error"
         ));
+    }
+
+    /// The plan carried over a failed policy read still pins what it pinned:
+    /// the failed read must not tell the DNS path that nothing does.
+    #[test]
+    fn a_policy_that_did_not_read_leaves_the_ipv6_board_as_the_carried_plan_set_it() {
+        use crate::enforcement_planner::Ipv6Guard;
+        use crate::principal_enforcement::PlanRead;
+        // Its own principal: the board is process-wide.
+        let principal = UserPrincipal::from_linux_uid(4243);
+        let board = crate::ipv6_disposition::global_ipv6_dispositions();
+        board.set(principal.as_stored(), Ipv6Guard::FiltersOnly);
+
+        let read = source(
+            Arc::new(OneSecondaryRule),
+            Arc::new(NothingBecause(Some("database is locked"))),
+        )
+        .plan_read_for(&principal, availability(true));
+
+        assert!(matches!(read, PlanRead::Unreadable(_)));
+        assert_eq!(
+            board.of(principal.as_stored()),
+            Some(Ipv6Guard::FiltersOnly)
+        );
     }
 
     fn bob() -> UserPrincipal {
@@ -4451,6 +4670,53 @@ mod tests {
                     "tunnel up: {up}: the NAS is routed into the tunnel"
                 );
             }
+        }
+
+        /// A name of the tunnel's rules resolving to the tunnel's own server is
+        /// neither pinned nor routed into the tunnel: either one seals the
+        /// tunnel's reconnect.
+        #[test]
+        fn a_rule_host_on_the_tunnels_server_is_neither_pinned_nor_routed_into_it() {
+            let book = CanonicalRuleBook {
+                primary: CanonicalRuleSet::from_rules(Vec::new()),
+                secondary: CanonicalRuleSet::from_rules(vec![
+                    route(
+                        "s-zone-host",
+                        CanonicalAddressMatch::ExactFqdn("vpn.attacker.example".into()),
+                    ),
+                    route(
+                        "s-host",
+                        CanonicalAddressMatch::ExactIp(IpAddr::V4(SECONDARY_HOST)),
+                    ),
+                ]),
+            };
+            let cache = Arc::new(crate::fqdn_cache_lookup::MockFqdnCacheLookup::default());
+            cache.set_ips("vpn.attacker.example", vec![SERVER]);
+            let (api, links) = machine(true);
+            let (plan, _) = source_with_cache(
+                Arc::new(Book(book)),
+                Arc::new(Policy::armed()),
+                Arc::clone(&cache) as Arc<dyn crate::fqdn_cache_lookup::FqdnCacheLookup>,
+            )
+            .with_machine_facts(
+                api as Arc<dyn nrr_platform_api::route_table::RouteTablePort>,
+                links as Arc<dyn nrr_platform_api::adapters::AdapterEventSource>,
+            )
+            .plan_with_coverage(&user(), availability(true))
+            .expect("the rules must plan");
+            let pinned = |ip: Ipv4Addr| {
+                plan.flows.iter().any(|f| {
+                    f.flow.dst == DstMatch::HostV4(ip)
+                        && f.egress == EgressConstraint::OnlyVia(EgressRef::Secondary)
+                })
+            };
+            assert!(pinned(SECONDARY_HOST), "fixture guard: the guard pins");
+            assert!(!pinned(SERVER), "the tunnel's server is held to the tunnel");
+            assert!(
+                !plan.routes.iter().any(|r| r.dst == DstMatch::HostV4(SERVER)
+                    && r.egress == nrr_platform_api::enforcement::EgressRef::Secondary),
+                "the tunnel's server is routed into the tunnel"
+            );
         }
     }
 

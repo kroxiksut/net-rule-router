@@ -10,7 +10,9 @@
 //! second copy of that policy to drift out of sync.
 
 use std::collections::HashMap;
+use std::hash::{Hash, Hasher};
 use std::net::{IpAddr, SocketAddr};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime};
 
@@ -311,6 +313,8 @@ impl super::stack::FlowObserver for CompositeFlowObserver {
 pub struct RuleBookRouteSelector {
     rules_provider: Arc<dyn RulesProvider>,
     active_sid: Arc<dyn Fn() -> Option<String> + Send + Sync>,
+    routing_user: RoutingUserStamp,
+    paused: Option<Arc<crate::routing_pause::PausedPrincipals>>,
 }
 
 impl RuleBookRouteSelector {
@@ -322,7 +326,66 @@ impl RuleBookRouteSelector {
         Self {
             rules_provider,
             active_sid,
+            routing_user: RoutingUserStamp::new(ROUTING_USER_REREAD),
+            paused: None,
         }
+    }
+
+    /// A paused user's flows take the primary with no rule of theirs applied,
+    /// as their filters and routes do while paused.
+    #[must_use]
+    pub fn with_paused(mut self, paused: Arc<crate::routing_pause::PausedPrincipals>) -> Self {
+        self.paused = Some(paused);
+        self
+    }
+
+    fn active_book_for(
+        &self,
+        principal: &str,
+    ) -> Option<crate::per_sid_orchestrator::ActiveRulesSnapshot> {
+        if self.paused.as_ref().is_some_and(|p| p.contains(principal)) {
+            return None;
+        }
+        self.rules_provider.active_rules_for(principal)
+    }
+}
+
+/// How often the stamp re-reads who the routing user is. The read takes the
+/// session registry's lock, and the stamp is asked on every poll step.
+const ROUTING_USER_REREAD: Duration = Duration::from_millis(500);
+
+/// A hash of the routing user, re-read at most once per `every`: a change of
+/// routing user swaps the book `RoutingUser` flows are carried by.
+struct RoutingUserStamp {
+    origin: Instant,
+    every_ms: u64,
+    next_read_ms: AtomicU64,
+    hash: AtomicU64,
+}
+
+impl RoutingUserStamp {
+    fn new(every: Duration) -> Self {
+        Self {
+            origin: Instant::now(),
+            every_ms: u64::try_from(every.as_millis()).unwrap_or(u64::MAX),
+            next_read_ms: AtomicU64::new(0),
+            hash: AtomicU64::new(0),
+        }
+    }
+
+    fn current(&self, read: impl FnOnce() -> Option<String>) -> u64 {
+        let now_ms = u64::try_from(self.origin.elapsed().as_millis()).unwrap_or(u64::MAX);
+        if now_ms >= self.next_read_ms.load(Ordering::Relaxed) {
+            self.next_read_ms
+                .store(now_ms.saturating_add(self.every_ms), Ordering::Relaxed);
+            let hash = read().map_or(0, |sid| {
+                let mut hasher = std::collections::hash_map::DefaultHasher::new();
+                sid.hash(&mut hasher);
+                hasher.finish() | 1
+            });
+            self.hash.store(hash, Ordering::Relaxed);
+        }
+        self.hash.load(Ordering::Relaxed)
     }
 }
 
@@ -336,7 +399,22 @@ fn secondary_covers(book: &nrr_domain::canonical::CanonicalRuleBook, hostname: &
     book.secondary
         .rules()
         .iter()
-        .any(|r| steers(r) && rule_covers(r, hostname))
+        .any(|r| steers(r) && covers_in_book(book, r, hostname))
+}
+
+/// `base.*` yields to a rule naming its zone outright, as in the engine.
+fn covers_in_book(
+    book: &nrr_domain::canonical::CanonicalRuleBook,
+    rule: &nrr_domain::canonical::CanonicalRule,
+    hostname: &str,
+) -> bool {
+    match &rule.address_match {
+        Some(nrr_domain::canonical::CanonicalAddressMatch::AnyZoneDomain(base)) => {
+            nrr_domain::decision_matching::match_any_zone_domain(hostname, base)
+                .is_some_and(|named| !book.names_suffix_outright(named))
+        }
+        _ => rule_covers(rule, hostname),
+    }
 }
 
 /// Whether the narrowest name rule claiming `hostname` in `book` is a block.
@@ -352,7 +430,7 @@ fn book_blocks(book: &nrr_domain::canonical::CanonicalRuleBook, hostname: &str) 
         .chain(book.secondary.rules())
         .filter(|r| steers(r) && r.app_match.is_none())
     {
-        let claim = rule_match_specificity(hostname, rule);
+        let claim = rule_match_specificity(hostname, rule, book);
         match rule.action {
             nrr_domain::RuleAction::Block => block = block.max(claim),
             nrr_domain::RuleAction::Route | nrr_domain::RuleAction::Verify => {
@@ -363,33 +441,63 @@ fn book_blocks(book: &nrr_domain::canonical::CanonicalRuleBook, hostname: &str) 
     block.is_some() && block >= route
 }
 
+/// The route `book` gives `hostname`, `None` when it blocks it. One function
+/// for the routing user and every other served user: the relay's dial is the
+/// service's own and passes the filters of the user it carries for, so that
+/// user's block is honoured here or nowhere.
+fn route_in_book(
+    book: Option<&nrr_domain::canonical::CanonicalRuleBook>,
+    hostname: &str,
+) -> Option<RouteRole> {
+    let Some(book) = book else {
+        return Some(RouteRole::Primary);
+    };
+    if book_blocks(book, hostname) {
+        return None;
+    }
+    Some(if secondary_covers(book, hostname) {
+        RouteRole::Secondary
+    } else {
+        RouteRole::Primary
+    })
+}
+
 impl RouteSelector for RuleBookRouteSelector {
-    fn route_for(&self, hostname: &str) -> RouteRole {
-        let is_secondary = (self.active_sid)()
-            .and_then(|sid| self.rules_provider.active_rules_for(&sid))
-            .is_some_and(|snapshot| secondary_covers(&snapshot.rule_book, hostname));
-        if is_secondary {
-            RouteRole::Secondary
-        } else {
-            RouteRole::Primary
-        }
+    fn route_for(&self, hostname: &str) -> Option<RouteRole> {
+        let snapshot = (self.active_sid)().and_then(|sid| self.active_book_for(&sid));
+        route_in_book(snapshot.as_ref().map(|s| &s.rule_book), hostname)
     }
 
-    /// The shared DNS answer was given by the routing user's book, so a host
-    /// this user blocks can arrive here: their own filters never see the
-    /// relay's dial, and the block is honoured here instead.
     fn route_for_principal(&self, principal: &str, hostname: &str) -> Option<RouteRole> {
-        let Some(snapshot) = self.rules_provider.active_rules_for(principal) else {
-            return Some(RouteRole::Primary);
-        };
-        if book_blocks(&snapshot.rule_book, hostname) {
-            return None;
-        }
-        Some(if secondary_covers(&snapshot.rule_book, hostname) {
-            RouteRole::Secondary
-        } else {
-            RouteRole::Primary
+        let snapshot = self.active_book_for(principal);
+        route_in_book(snapshot.as_ref().map(|s| &s.rule_book), hostname)
+    }
+
+    /// Every input the enforcement book is read with: an activation publishes
+    /// and withdraws the applying overlay, check verdicts, confirmations and
+    /// `site.*` zone twins change the book with no activation at all, a new
+    /// routing user brings their own book, and a pause sets one aside. Atomic
+    /// loads, plus the routing user re-read twice a second: this is read on
+    /// every poll step.
+    fn policy_stamp(&self) -> u64 {
+        [
+            crate::applying_revision_overlay::changes(),
+            crate::verify_overlay::changes(),
+            crate::override_grants::generation(),
+            crate::any_zone_sites::generation(),
+            self.routing_user.current(|| (self.active_sid)()),
+            self.paused.as_ref().map_or(0, |p| p.generation()),
+        ]
+        .into_iter()
+        .fold(0u64, |stamp, part| {
+            stamp.wrapping_mul(0x0000_0100_0000_01B3).wrapping_add(part)
         })
+    }
+
+    fn book_for(&self, owner: Option<&str>) -> Box<dyn Fn(&str) -> Option<RouteRole> + '_> {
+        let principal = owner.map(str::to_owned).or_else(|| (self.active_sid)());
+        let snapshot = principal.and_then(|p| self.active_book_for(&p));
+        Box::new(move |hostname| route_in_book(snapshot.as_ref().map(|s| &s.rule_book), hostname))
     }
 }
 
@@ -598,17 +706,139 @@ mod tests {
         let selector = selector_for("assistant.example", Some("S-1-5-21-1"));
         assert_eq!(
             selector.route_for("assistant.example"),
-            RouteRole::Secondary
+            Some(RouteRole::Secondary)
         );
         // A primary-only rule host, and an unmatched host, both take the primary.
-        assert_eq!(selector.route_for("primary.example"), RouteRole::Primary);
-        assert_eq!(selector.route_for("random.example.net"), RouteRole::Primary);
+        assert_eq!(
+            selector.route_for("primary.example"),
+            Some(RouteRole::Primary)
+        );
+        assert_eq!(
+            selector.route_for("random.example.net"),
+            Some(RouteRole::Primary)
+        );
     }
 
     #[test]
     fn route_selector_defaults_to_primary_with_no_active_principal() {
         let selector = selector_for("assistant.example", None);
-        assert_eq!(selector.route_for("assistant.example"), RouteRole::Primary);
+        assert_eq!(
+            selector.route_for("assistant.example"),
+            Some(RouteRole::Primary)
+        );
+    }
+
+    /// The routing user's own block holds on the relay path too: a host moved
+    /// to Block keeps its virtual address for a while, and without this the
+    /// relay dialled it over the primary where no filter of theirs looks.
+    #[test]
+    fn the_routing_users_block_refuses_the_host_like_any_other_users() {
+        let mut blocked = exact_rule("r-b", "bank.example");
+        blocked.action = nrr_domain::RuleAction::Block;
+        let rules = Arc::new(FakeRules {
+            primary: CanonicalRuleSet::from_rules(vec![
+                blocked,
+                suffix_rule("r-w", "wide.example", nrr_domain::RuleAction::Block),
+                exact_rule("r-n", "open.wide.example"),
+            ]),
+            secondary: CanonicalRuleSet::from_rules(vec![exact_rule("r-s", "tunnel.example")]),
+        });
+        let selector =
+            RuleBookRouteSelector::new(rules, Arc::new(|| Some("S-1-5-21-1".to_owned())));
+
+        assert_eq!(selector.route_for("bank.example"), None);
+        assert_eq!(selector.route_for("deep.wide.example"), None);
+        assert_eq!(
+            selector.route_for("open.wide.example"),
+            Some(RouteRole::Primary)
+        );
+        assert_eq!(
+            selector.route_for("tunnel.example"),
+            Some(RouteRole::Secondary)
+        );
+        assert_eq!(
+            selector.route_for_principal("S-1-5-21-1", "bank.example"),
+            None,
+            "the same answer whichever path asks"
+        );
+        let routing = selector.book_for(None);
+        assert_eq!(routing("bank.example"), None);
+        assert_eq!(routing("tunnel.example"), Some(RouteRole::Secondary));
+        assert_eq!(
+            selector.book_for(Some("S-1-5-21-1"))("deep.wide.example"),
+            None
+        );
+    }
+
+    /// A paused user's rule host is dialled over the primary, block or route:
+    /// pause takes every filter and route of theirs down, and the relay is the
+    /// one path that kept carrying it over the tunnel.
+    #[test]
+    fn a_paused_users_hosts_take_the_primary_until_they_resume() {
+        let mut blocked = exact_rule("r-b", "bank.example");
+        blocked.action = nrr_domain::RuleAction::Block;
+        let rules = Arc::new(FakeRules {
+            primary: CanonicalRuleSet::from_rules(vec![blocked]),
+            secondary: CanonicalRuleSet::from_rules(vec![exact_rule("r-s", "tunnel.example")]),
+        });
+        let paused = Arc::new(crate::routing_pause::PausedPrincipals::default());
+        let selector =
+            RuleBookRouteSelector::new(rules, Arc::new(|| Some("S-1-5-21-1".to_owned())))
+                .with_paused(Arc::clone(&paused));
+        let unpaused_stamp = selector.policy_stamp();
+
+        crate::routing_pause::PausedPrincipals::set_for_test(&paused, "S-1-5-21-1", true);
+        assert_ne!(
+            selector.policy_stamp(),
+            unpaused_stamp,
+            "held flows are re-decided"
+        );
+        assert_eq!(
+            selector.route_for("tunnel.example"),
+            Some(RouteRole::Primary)
+        );
+        assert_eq!(selector.route_for("bank.example"), Some(RouteRole::Primary));
+        assert_eq!(
+            selector.route_for_principal("S-1-5-21-1", "tunnel.example"),
+            Some(RouteRole::Primary)
+        );
+        assert_eq!(
+            selector.book_for(None)("tunnel.example"),
+            Some(RouteRole::Primary)
+        );
+
+        crate::routing_pause::PausedPrincipals::set_for_test(&paused, "S-1-5-21-1", false);
+        assert_eq!(
+            selector.route_for("tunnel.example"),
+            Some(RouteRole::Secondary)
+        );
+    }
+
+    /// `example.*` on the secondary yields where the primary names
+    /// `*.example.by` outright, exactly as the engine decides.
+    #[test]
+    fn a_site_any_zone_rule_yields_to_a_rule_naming_its_zone() {
+        let site = CanonicalRule {
+            address_match: Some(CanonicalAddressMatch::AnyZoneDomain("example".into())),
+            ..exact_rule("r-site", "unused.example")
+        };
+        let book = CanonicalRuleBook {
+            primary: CanonicalRuleSet::from_rules(vec![suffix_rule(
+                "r-by",
+                "example.by",
+                nrr_domain::RuleAction::Route,
+            )]),
+            secondary: CanonicalRuleSet::from_rules(vec![site]),
+        };
+
+        assert_eq!(
+            route_in_book(Some(&book), "www.example.by"),
+            Some(RouteRole::Primary)
+        );
+        assert_eq!(
+            route_in_book(Some(&book), "www.example.de"),
+            Some(RouteRole::Secondary)
+        );
     }
 
     fn suffix_rule(id: &str, suffix: &str, action: nrr_domain::RuleAction) -> CanonicalRule {
@@ -704,5 +934,51 @@ mod tests {
         let any: SocketAddr = "10.0.0.2:50001".parse().expect("addr");
         assert_eq!(owners.owner_of(any, any, None), FlowOwner::RoutingUser);
         assert_eq!(lookup.call_count(), 0);
+    }
+
+    /// A new routing user brings another book for every `RoutingUser` flow,
+    /// so the stamp the stack rechecks live flows on must move with them.
+    #[test]
+    fn the_stamp_moves_when_the_routing_user_changes() {
+        let stamp = RoutingUserStamp::new(Duration::ZERO);
+        let alice = stamp.current(|| Some("S-1-5-21-1".to_owned()));
+        assert_eq!(alice, stamp.current(|| Some("S-1-5-21-1".to_owned())));
+        let bob = stamp.current(|| Some("S-1-5-21-2".to_owned()));
+        assert_ne!(alice, bob);
+        let nobody = stamp.current(|| None);
+        assert_ne!(nobody, alice);
+        assert_ne!(nobody, bob);
+
+        let current = Arc::new(Mutex::new(Some("S-1-5-21-1".to_owned())));
+        let read = Arc::clone(&current);
+        let mut selector = RuleBookRouteSelector::new(
+            Arc::new(FakeRules {
+                primary: CanonicalRuleSet::from_rules(Vec::new()),
+                secondary: CanonicalRuleSet::from_rules(Vec::new()),
+            }),
+            Arc::new(move || read.lock().unwrap_or_else(|p| p.into_inner()).clone()),
+        );
+        selector.routing_user = RoutingUserStamp::new(Duration::ZERO);
+        let before = selector.policy_stamp();
+        *current.lock().unwrap_or_else(|p| p.into_inner()) = Some("S-1-5-21-2".to_owned());
+        assert_ne!(selector.policy_stamp(), before);
+    }
+
+    /// The routing user is read under the session registry's lock: on the poll
+    /// thread that is paid once per interval, not once per step.
+    #[test]
+    fn the_routing_user_is_not_reread_within_the_interval() {
+        let stamp = RoutingUserStamp::new(Duration::from_secs(3600));
+        let reads = std::cell::Cell::new(0u32);
+        let first = stamp.current(|| {
+            reads.set(reads.get() + 1);
+            Some("S-1-5-21-1".to_owned())
+        });
+        let second = stamp.current(|| {
+            reads.set(reads.get() + 1);
+            Some("S-1-5-21-2".to_owned())
+        });
+        assert_eq!(reads.get(), 1);
+        assert_eq!(first, second);
     }
 }

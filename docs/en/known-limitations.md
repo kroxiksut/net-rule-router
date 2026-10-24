@@ -89,6 +89,26 @@ leads nowhere. NetRuleRouter asks another resolver for those names and routes
 them correctly anyway. The Diagnostics screen tells you when this is
 happening on your connection and for how many sites.
 
+## What "Everything" holds for system programs
+
+Leak protection "Everything" holds the programs you run. The computer's own
+services — updates, time synchronisation, the name lookups the system makes
+for everyone — and, on Linux, every program running as root are held only
+for the addresses your rules name: their other traffic still goes over the
+main connection while the additional connection is down.
+
+## Site names while everything is held
+
+With leak protection "Everything" and the additional connection down, the
+computer still looks up site names over the main connection, so that sites
+work again the moment the connection returns. The DNS servers of the main
+connection, usually your provider's, then see which sites you open, including
+the ones your rules send through the additional connection; the traffic
+itself stays held. To prevent it, turn off "While everything is held, look up
+site names over the main connection" in the routing settings: name lookups
+are then blocked too, and nothing works until the additional connection
+returns.
+
 ## Name lookups are shared by the computer
 
 Name resolution belongs to the computer as a whole, not to one person. When

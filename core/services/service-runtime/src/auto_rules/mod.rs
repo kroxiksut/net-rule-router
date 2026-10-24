@@ -197,7 +197,8 @@ pub type SecondaryReadyFn = Arc<dyn Fn(&str) -> bool + Send + Sync>;
 /// the composition root answers it for any name. `None` behaves as
 /// [`PrimaryBehavior::Unknown`], which is what a self-signed offer carried
 /// before this existed.
-pub type PrimaryBehaviorFn = Arc<dyn Fn(&str) -> PrimaryBehavior + Send + Sync>;
+/// Asked as `(principal, hostname)`: the evidence is the principal's own.
+pub type PrimaryBehaviorFn = Arc<dyn Fn(&str, &str) -> PrimaryBehavior + Send + Sync>;
 
 /// What one principal configured for companion discovery, read together and
 /// memoised together because they are one row and are consulted on the same

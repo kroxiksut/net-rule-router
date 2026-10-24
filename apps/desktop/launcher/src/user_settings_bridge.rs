@@ -9,13 +9,16 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use nrr_shared::client_error_codes::{
-    MALFORMED_INPUT, USER_SETTINGS_READ_ONLY, USER_SETTINGS_UNAVAILABLE,
+    MALFORMED_INPUT, RULES_FILE_HAND_EDITED, RULES_FILE_WRITE_FAILED, USER_SETTINGS_READ_ONLY,
+    USER_SETTINGS_UNAVAILABLE,
 };
 use nrr_shared::user_settings::{
     portable_path, read_rules_file_bytes, UserSettings, UserSettingsError, UserSettingsStore,
-    INTENT_NOTICE_MUTES, INTENT_ROUTE_POLICY,
+    INTENT_NOTICE_MUTES, INTENT_ROUTE_POLICY, MAX_RULES_FILE_BYTES,
 };
-use nrr_ui_support::ui_preferences::{is_storable_json_blob, UiPreferences};
+use nrr_ui_support::ui_preferences::{
+    is_storable_json_blob, UiPreferences, MERGE_CONFLICT_POLICIES, MERGE_CONFLICT_POLICY_DEFAULT,
+};
 use serde_json::{Map, Value};
 
 /// The shared fields as the preferences hold them, paths in the file's
@@ -25,6 +28,7 @@ pub(crate) fn settings_from_preferences(preferences: &UiPreferences) -> UserSett
         selected_set: preferences.selected_preset_set.clone(),
         service_intent: intent_object(&preferences.service_intent_json),
         accepted_eula: preferences.accepted_eula_version,
+        merge_policy: preferences.merge_conflict_policy.clone(),
         ..UserSettings::default()
     };
     let bound = |path: &Option<String>| path.as_deref().unwrap_or_default().to_owned();
@@ -57,6 +61,9 @@ pub(crate) fn overlay(preferences: &mut UiPreferences, settings: &UserSettings) 
     }
     if one_line(&settings.selected_set) {
         preferences.selected_preset_set = settings.selected_set.clone();
+    }
+    if MERGE_CONFLICT_POLICIES.contains(&settings.merge_policy.as_str()) {
+        preferences.merge_conflict_policy = settings.merge_policy.clone();
     }
     let bound = [
         (
@@ -174,6 +181,11 @@ pub(crate) enum IntentError {
     ReadOnly,
     /// The request named no namespace this operation records, or no value.
     BadRequest(&'static str),
+    /// The rules file changed by hand since the program wrote it; the caller
+    /// asks the user before writing it with `overwrite`.
+    HandEdited,
+    /// The rules file itself could not be written.
+    FileWrite(std::io::Error),
     Settings(UserSettingsError),
 }
 
@@ -182,6 +194,8 @@ impl IntentError {
         match self {
             Self::ReadOnly => USER_SETTINGS_READ_ONLY,
             Self::BadRequest(_) => MALFORMED_INPUT,
+            Self::HandEdited => RULES_FILE_HAND_EDITED,
+            Self::FileWrite(_) => RULES_FILE_WRITE_FAILED,
             Self::Settings(_) => USER_SETTINGS_UNAVAILABLE,
         }
     }
@@ -192,6 +206,10 @@ impl std::fmt::Display for IntentError {
         match self {
             Self::ReadOnly => f.write_str("this session does not write the user settings"),
             Self::BadRequest(what) => f.write_str(what),
+            Self::HandEdited => {
+                f.write_str("the rules file was edited by hand since it was written")
+            }
+            Self::FileWrite(error) => write!(f, "rules file not written: {error}"),
             Self::Settings(error) => write!(f, "{error}"),
         }
     }
@@ -257,16 +275,20 @@ const MAX_CHECKED_PATHS: usize = 8;
 
 /// SHA-256 of a rules file's bytes; `Ok(None)` when it is absent.
 fn rules_file_sha256(path: &str) -> std::io::Result<Option<String>> {
-    use sha2::{Digest, Sha256};
-    use std::fmt::Write as _;
     let Some(bytes) = read_rules_file_bytes(std::path::Path::new(path))? else {
         return Ok(None);
     };
+    Ok(Some(sha256_hex(&bytes)))
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    use std::fmt::Write as _;
     let mut hex = String::with_capacity(64);
-    for byte in Sha256::digest(&bytes) {
+    for byte in Sha256::digest(bytes) {
         let _ = write!(hex, "{byte:02x}");
     }
-    Ok(Some(hex))
+    hex
 }
 
 fn path_field(value: Option<&Value>) -> Result<&str, IntentError> {
@@ -298,6 +320,91 @@ pub(crate) fn rules_file_written_in(
     };
     store.update(|settings| settings.record_rules_file_written(path, &sha256))?;
     Ok(serde_json::json!({ "recorded": true }))
+}
+
+/// `local.user-settings.rules-file-write`: writes `text` to the rules file at
+/// `path` and records it as the program's version. A file edited by hand
+/// since the program last wrote it is refused (`rules-file-hand-edited`)
+/// unless `overwrite` is true: the check sits in the write itself, so no
+/// client can skip it. The write lands whether or not this session may
+/// record it; an unrecorded write is asked about next time, never lost.
+pub(crate) fn rules_file_write(payload: &Value) -> Result<Value, IntentError> {
+    let may_write = SESSION_MAY_WRITE.load(Ordering::Relaxed);
+    rules_file_write_in(&UserSettingsStore::open()?, payload, may_write)
+}
+
+pub(crate) fn rules_file_write_in(
+    store: &UserSettingsStore,
+    payload: &Value,
+    may_write: bool,
+) -> Result<Value, IntentError> {
+    let path = path_field(payload.get("path"))?;
+    let text = payload
+        .get("text")
+        .and_then(Value::as_str)
+        .filter(|text| text.len() as u64 <= MAX_RULES_FILE_BYTES)
+        .ok_or(IntentError::BadRequest("`text` is not a rules file"))?;
+    let overwrite = payload.get("overwrite").and_then(Value::as_bool) == Some(true);
+    if !overwrite {
+        let settings = store.load()?.unwrap_or_default();
+        let on_disk = rules_file_sha256(path).unwrap_or_else(|_| Some(String::new()));
+        let unchanged = on_disk.as_deref() == Some(sha256_hex(text.as_bytes()).as_str());
+        if !unchanged && settings.rules_file_hand_edited(path, on_disk.as_deref()) {
+            return Err(IntentError::HandEdited);
+        }
+    }
+    write_file_atomically(std::path::Path::new(path), text.as_bytes())
+        .map_err(IntentError::FileWrite)?;
+    if !may_write {
+        return Ok(serde_json::json!({ "written": true, "recorded": false }));
+    }
+    let Ok(Some(sha256)) = rules_file_sha256(path) else {
+        return Ok(serde_json::json!({ "written": true, "recorded": false }));
+    };
+    store.update(|settings| settings.record_rules_file_written(path, &sha256))?;
+    Ok(serde_json::json!({ "written": true, "recorded": true }))
+}
+
+/// Staged beside the file and renamed into place: a reader sees the old
+/// text or the new one, never a torn file. A link is written through to its
+/// target (a file the user linked on purpose, which a rename would replace
+/// with a copy), and a folder that takes no new files is written in place.
+fn write_file_atomically(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
+    use std::io::Write as _;
+    let target = match std::fs::symlink_metadata(path) {
+        Ok(meta) if meta.file_type().is_symlink() => match std::fs::canonicalize(path) {
+            Ok(target) => target,
+            Err(_) => return write_in_place(path, bytes),
+        },
+        _ => path.to_path_buf(),
+    };
+    let mut name = target
+        .file_name()
+        .map(std::ffi::OsString::from)
+        .unwrap_or_default();
+    name.push(format!(".{}.tmp", std::process::id()));
+    let staged = target.with_file_name(name);
+    let mut file = match std::fs::File::create(&staged) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => {
+            return write_in_place(&target, bytes);
+        }
+        Err(error) => return Err(error),
+    };
+    let written = file.write_all(bytes).and_then(|()| file.sync_all());
+    drop(file);
+    let result = written.and_then(|()| std::fs::rename(&staged, &target));
+    if result.is_err() {
+        let _ = std::fs::remove_file(&staged);
+    }
+    result
+}
+
+fn write_in_place(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
+    use std::io::Write as _;
+    let mut file = std::fs::File::create(path)?;
+    file.write_all(bytes)?;
+    file.sync_all()
 }
 
 /// `local.user-settings.rules-files-hand-edited`: which of `paths` changed
@@ -362,6 +469,18 @@ pub(crate) fn open_session_in(
                         settings.accepted_eula = settings.accepted_eula.max(accepted);
                     });
                 }
+                // Likewise a merge policy chosen before the file carried it;
+                // none there already means the default.
+                let policy = preferences.merge_conflict_policy.clone();
+                if outcome.settings.merge_policy.is_empty()
+                    && policy != MERGE_CONFLICT_POLICY_DEFAULT
+                {
+                    let _ = store.update(|settings| {
+                        if settings.merge_policy.is_empty() {
+                            settings.merge_policy = policy;
+                        }
+                    });
+                }
             }
             Some(UserSettingsMirror::new(store, preferences))
         }
@@ -416,6 +535,21 @@ mod tests {
     }
 
     #[test]
+    fn a_merge_policy_chosen_before_the_file_carried_it_is_written_there() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        store_in(&dir)
+            .update(|s| s.selected_set = "user:a".to_string())
+            .expect("seed");
+        let mut prefs = preferences();
+        prefs.merge_conflict_policy = "file-wins".to_string();
+        open_session_in(store_in(&dir), &mut prefs, true).expect("mirror");
+
+        assert_eq!(prefs.merge_conflict_policy, "file-wins");
+        let on_disk = store_in(&dir).load().expect("load").expect("file");
+        assert_eq!(on_disk.merge_policy, "file-wins");
+    }
+
+    #[test]
     fn the_file_overrides_the_preferences() {
         let dir = tempfile::tempdir().expect("temp dir");
         store_in(&dir)
@@ -423,6 +557,7 @@ mod tests {
                 s.rules_folder = "/terminal/sets".to_string();
                 s.rules_files.secondary = "/terminal/sets/b/rules_secondary.txt".to_string();
                 s.selected_set = "bundled:ru_basic".to_string();
+                s.merge_policy = "service-wins".to_string();
             })
             .expect("seed");
         let mut prefs = preferences();
@@ -434,6 +569,7 @@ mod tests {
         assert_eq!(prefs.last_saved_path_secondary, secondary);
         assert_eq!(prefs.last_loaded_path_secondary, secondary);
         assert_eq!(prefs.selected_preset_set, "bundled:ru_basic");
+        assert_eq!(prefs.merge_conflict_policy, "service-wins");
         assert_eq!(prefs.service_intent_json, "", "an empty intent is none");
     }
 
@@ -556,6 +692,151 @@ mod tests {
         ));
         let bad = serde_json::json!({ "paths": "x" });
         assert!(rules_files_hand_edited_in(&store, &bad).is_err());
+    }
+
+    #[test]
+    fn a_rules_file_edited_by_hand_is_not_overwritten_unasked() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let store = store_in(&dir);
+        let file = dir.path().join("rules_primary.txt");
+        let path = file.to_string_lossy().into_owned();
+        let write = |text: &str, overwrite: bool| {
+            rules_file_write_in(
+                &store,
+                &serde_json::json!({ "path": path, "text": text, "overwrite": overwrite }),
+                true,
+            )
+        };
+        write("example.com\n", false).expect("first write");
+        assert_eq!(
+            std::fs::read_to_string(&file).expect("read"),
+            "example.com\n"
+        );
+
+        std::fs::write(&file, "example.com\nexample.org\n").expect("hand edit");
+        assert!(matches!(
+            write("example.net\n", false),
+            Err(IntentError::HandEdited)
+        ));
+        assert_eq!(
+            std::fs::read_to_string(&file).expect("read"),
+            "example.com\nexample.org\n",
+            "the hand edit stays"
+        );
+
+        let answer = write("example.net\n", true).expect("confirmed overwrite");
+        assert_eq!(answer["written"], Value::Bool(true));
+        assert_eq!(
+            std::fs::read_to_string(&file).expect("read"),
+            "example.net\n"
+        );
+        let ask = serde_json::json!({ "paths": [path] });
+        let answer = rules_files_hand_edited_in(&store, &ask).expect("checked");
+        assert_eq!(
+            answer["hand-edited"],
+            serde_json::json!([]),
+            "recorded as ours"
+        );
+
+        // No session right to record: the file is still written, not lost.
+        let answer = rules_file_write_in(
+            &store,
+            &serde_json::json!({ "path": path, "text": "example.com\n" }),
+            false,
+        )
+        .expect("written");
+        assert_eq!(answer["recorded"], Value::Bool(false));
+        assert_eq!(
+            std::fs::read_to_string(&file).expect("read"),
+            "example.com\n"
+        );
+        assert!(std::fs::read_dir(dir.path())
+            .expect("list")
+            .flatten()
+            .all(|e| !e.file_name().to_string_lossy().ends_with(".tmp")));
+
+        let oversized = "x".repeat(MAX_RULES_FILE_BYTES as usize + 1);
+        assert!(matches!(
+            write(&oversized, true),
+            Err(IntentError::BadRequest(_))
+        ));
+    }
+
+    /// No record of what the program last wrote, and the file on disk is not
+    /// what it is about to write: the user's text is asked about, not replaced.
+    /// Both ways to get there: a write this session could not record, and a
+    /// file bound with the user's own rules the program never wrote.
+    #[test]
+    fn a_file_with_no_record_of_our_write_is_not_overwritten_unasked() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let store = store_in(&dir);
+        let file = dir.path().join("rules_primary.txt");
+        let path = file.to_string_lossy().into_owned();
+        let write = |text: &str, recorded: bool| {
+            rules_file_write_in(
+                &store,
+                &serde_json::json!({ "path": path, "text": text }),
+                recorded,
+            )
+        };
+
+        write("example.com\n", false).expect("first write, not recorded");
+        std::fs::write(&file, "example.com\nmine.example\n").expect("hand edit");
+        assert!(matches!(
+            write("example.net\n", true),
+            Err(IntentError::HandEdited)
+        ));
+        assert_eq!(
+            std::fs::read_to_string(&file).expect("read"),
+            "example.com\nmine.example\n",
+            "the edit made after an unrecorded write stays"
+        );
+
+        let own = dir.path().join("rules_secondary.txt");
+        std::fs::write(&own, "my.example\n").expect("the user's own file");
+        let own_path = own.to_string_lossy().into_owned();
+        assert!(matches!(
+            rules_file_write_in(
+                &store,
+                &serde_json::json!({ "path": own_path, "text": "other.example\n" }),
+                true,
+            ),
+            Err(IntentError::HandEdited)
+        ));
+        assert_eq!(std::fs::read_to_string(&own).expect("read"), "my.example\n");
+
+        // Writing what is already there, or into an empty or missing file,
+        // loses nothing and asks nothing.
+        rules_file_write_in(
+            &store,
+            &serde_json::json!({ "path": own_path, "text": "my.example\n" }),
+            true,
+        )
+        .expect("the same text");
+        let fresh = dir.path().join("fresh.txt").to_string_lossy().into_owned();
+        rules_file_write_in(
+            &store,
+            &serde_json::json!({ "path": fresh, "text": "a.example\n" }),
+            true,
+        )
+        .expect("a missing file");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_linked_rules_file_is_written_through_to_its_target() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let target = dir.path().join("real_rules.txt");
+        let link = dir.path().join("rules_primary.txt");
+        std::fs::write(&target, "old\n").expect("seed");
+        std::os::unix::fs::symlink(&target, &link).expect("link");
+
+        write_file_atomically(&link, b"new\n").expect("written");
+        assert!(std::fs::symlink_metadata(&link)
+            .expect("meta")
+            .file_type()
+            .is_symlink());
+        assert_eq!(std::fs::read_to_string(&target).expect("read"), "new\n");
     }
 
     #[test]

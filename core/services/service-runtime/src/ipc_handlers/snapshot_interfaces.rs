@@ -49,7 +49,9 @@ impl IpcHandler for SnapshotInterfacesHandler {
             })?
         };
 
-        let mut resp = self.adapters.adapters_snapshot(req.force_refresh);
+        let mut resp = self
+            .adapters
+            .adapters_snapshot_for(req.force_refresh, ctx.caller_stored());
         if let Some(probe) = &self.fail_closed_probe {
             resp.secondary = probe.probe(ctx.caller_stored(), &resp.adapters);
         }

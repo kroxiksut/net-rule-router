@@ -19,9 +19,9 @@ QtObject {
     readonly property color colorTextMuted: isHighContrast ? "#d7d7d7" : isDark ? "#c9d1d9" : "#52606d"
     readonly property color colorBorder: isHighContrast ? "#ffffff" : isDark ? "#47515f" : "#cbd2d9"
     readonly property color colorAccent: isHighContrast ? "#ffd24d" : isDark ? "#6c9bff" : "#2f6feb"
-    readonly property color colorWarning: isHighContrast ? "#ffb020" : isDark ? "#f0a030" : "#d97706"
+    readonly property color colorWarning: isHighContrast ? "#ffb020" : isDark ? "#f0a030" : "#b05207"
     readonly property color colorDanger: isHighContrast ? "#ff6b6b" : isDark ? "#ff6b6b" : "#c92a2a"
-    readonly property color colorSuccess: isHighContrast ? "#9be58f" : isDark ? "#4cc38a" : "#2e8b57"
+    readonly property color colorSuccess: isHighContrast ? "#9be58f" : isDark ? "#4cc38a" : "#23744a"
     readonly property color colorOnAccent: isHighContrast ? "#000000" : isDark ? "#0b1020" : "#ffffff"
     readonly property color colorFocusRing: isHighContrast ? "#ffd24d" : colorAccent
     readonly property color colorSelection: isHighContrast ? "#ffd24d" : Qt.tint(colorBase, Qt.rgba(colorAccent.r, colorAccent.g, colorAccent.b, 0.35))
@@ -57,6 +57,9 @@ QtObject {
     readonly property int radiusMd: 6
     readonly property int radiusLg: 8
     readonly property int borderWidth: 1
+    // A one-pixel accent ring vanished on accent-filled controls and was easy
+    // to miss on the rest.
+    readonly property int focusBorderWidth: 2
 
     // Component-state tokens
     readonly property color stateDefaultFill: colorPanel
@@ -67,8 +70,23 @@ QtObject {
     readonly property color stateSelectedFill: colorAccent
     readonly property color stateDefaultBorder: colorBorder
     readonly property color stateFocusedBorder: colorFocusRing
+    // On a control filled with the accent (or the danger colour) the accent
+    // ring has nothing to stand out against; the text colour does.
+    readonly property color stateFocusedBorderOnFill: colorText
     readonly property color stateDisabledBorder: Qt.rgba(colorBorder.r, colorBorder.g, colorBorder.b, 0.55)
     readonly property color stateSelectedBorder: colorAccent
+
+    // Top-of-window banners: white text at no less than 4.5:1 on every fill.
+    // The contrast theme draws them black with a white frame, the same as its
+    // panels, so the frame, not a hue, sets them apart from the window.
+    readonly property color bannerText: "#ffffff"
+    readonly property color bannerNeutralFill: isHighContrast ? "#000000" : "#475569"
+    readonly property color bannerInfoFill: isHighContrast ? "#000000" : "#2c6fbb"
+    readonly property color bannerSuccessFill: isHighContrast ? "#000000" : "#2d6a4f"
+    readonly property color bannerWarningFill: isHighContrast ? "#000000" : "#8a5a00"
+    readonly property color bannerDangerFill: isHighContrast ? "#000000" : "#c0392b"
+    readonly property int bannerBorderWidth: isHighContrast ? 2 : 0
+    readonly property color bannerBorder: colorText
 
     readonly property bool useHighContrastIcons: isHighContrast
     readonly property string resolvedFontFamily:

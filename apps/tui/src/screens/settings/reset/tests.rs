@@ -131,6 +131,42 @@ fn a_refused_purge_stops_before_the_rules_and_the_service_are_touched() {
 }
 
 #[test]
+fn a_refused_purge_of_everyones_data_erases_nothing_first() {
+    let client = Script::new(&[Op::PrincipalDataPurge]);
+    drive(&client, true, &|| panic!("the service must not be stopped"));
+    assert_eq!(client.ops(), [Op::PrincipalDataPurge], "no log was cleared");
+}
+
+#[test]
+fn everyones_data_is_purged_once() {
+    let client = Script::new(&[]);
+    let end = drive(&client, true, &stopped);
+    assert_eq!(end, Next::Finish { cleared: true });
+    let purges = client
+        .ops()
+        .into_iter()
+        .filter(|op| *op == Op::PrincipalDataPurge)
+        .count();
+    assert_eq!(purges, 1);
+}
+
+#[test]
+fn a_reset_stopped_for_rights_keeps_the_shared_settings_file() {
+    let dir = crate::testing::Scratch::new("reset-stopped-keeps");
+    let store =
+        nrr_shared::user_settings::UserSettingsStore::at(dir.path().join("user-settings.json"));
+    store
+        .update(|s| s.set_primary_file("/home/me/p.txt"))
+        .expect("written");
+    let script = Script::new(&[Op::PrincipalDataPurge]);
+    let reply = full_reset(true, no_manager, Some(store.path().to_path_buf()))(&script);
+    let mut app = app_at(Link::Connected, Some(&Fixture::healthy()));
+    (reply.0)(&mut app);
+    let after = store.load().expect("read").unwrap_or_default();
+    assert!(!after.rules_files.primary.is_empty(), "the binding stays");
+}
+
+#[test]
 fn a_refused_log_clear_does_not_stop_the_reset() {
     let client = Script::new(&[Op::LogsClear]);
     let end = drive(&client, false, &stopped);

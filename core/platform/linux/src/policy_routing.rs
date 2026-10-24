@@ -652,7 +652,8 @@ mod tests {
     }
 
     /// A present root is a person: uid 0 leaves the service-account ranges and
-    /// gets its own table, looked up first.
+    /// gets its own table, looked up first. The ranges are the system accounts,
+    /// systemd's `DynamicUser` block and `nobody`.
     #[test]
     fn a_present_root_leaves_the_system_range() {
         let rules = selector_rules(
@@ -666,7 +667,11 @@ mod tests {
             .collect();
         assert_eq!(
             system.iter().map(|r| r.uid_range).collect::<Vec<_>>(),
-            vec![Some((1, 999)), Some((65_534, 65_534))]
+            vec![
+                Some((1, 999)),
+                Some((61_184, 65_519)),
+                Some((65_534, 65_534))
+            ]
         );
         assert!(system.iter().all(|r| r.priority == SYSTEM_PRIORITY));
         let root = for_uid(&rules, 0);
@@ -998,14 +1003,15 @@ mod tests {
         record(KernelCapability::UserRoutes, true);
     }
 
-    /// The reset script and the AUR removal fallback remove our rules by hand;
-    /// their copies of the band and of the first table must match.
+    /// The reset script and the package removal fallbacks remove our rules by
+    /// hand; their copies of the band and of the first table must match.
     #[test]
     fn the_reset_script_mirrors_the_band_and_the_tables() {
         let reset = include_str!("../../../../scripts/reset-network.sh");
         let aur =
             include_str!("../../../../packaging/linux/aur/netrulerouter-bin/netrulerouter.install");
-        for (script, prefix) in [(reset, ""), (aur, "_nrr_")] {
+        let packages = include_str!("../../../../packaging/linux/maintainer/functions.sh");
+        for (script, prefix) in [(reset, ""), (aur, "_nrr_"), (packages, "nrr_pkg_")] {
             for line in [
                 format!("{prefix}rule_priority_first={}", PRIORITY_BAND.start()),
                 format!("{prefix}rule_priority_last={}", PRIORITY_BAND.end()),

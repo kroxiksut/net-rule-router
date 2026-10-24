@@ -50,8 +50,8 @@
 .PARAMETER Full
     Deploy the complete Qt runtime. The default trims the pieces this app never
     loads (Qt's own translations, the software OpenGL rasterizer, the legacy
-    D3D shader compiler) and the Qt Quick styles the app never selects, saving
-    roughly 37 MB in total.
+    D3D shader compiler), the Qt Quick styles the app never selects with their
+    libraries, and the network and touch plugins nothing loads.
 
 .PARAMETER Zip
     Also produce NetRuleRouter-windows-<arch>-<version>+<commit>.zip next to
@@ -589,6 +589,30 @@ if (-not $Headless) {
                 Remove-Item -Path $styleDir -Recurse -Force
             }
         }
+        # Their libraries stay behind in the package root, linked by nothing once
+        # the style trees are gone; Quick3DUtils comes with them. NativeStyle is
+        # the base of the Windows and macOS styles only. The TLS and network
+        # information backends serve Qt networking, which the QML never does, and
+        # the generic plugin is TUIO touch over the network.
+        $deadLibraries = @('Qt6Quick3DUtils.dll')
+        foreach ($style in $unusedStyles) {
+            $deadLibraries += "Qt6QuickControls2$style.dll", "Qt6QuickControls2${style}StyleImpl.dll"
+        }
+        foreach ($name in $deadLibraries) {
+            $path = Join-Path $binDir $name
+            if (Test-Path $path) {
+                $freedBytes += (Get-Item $path).Length
+                Remove-Item -Path $path -Force
+            }
+        }
+        $deadTrees = @('qml\QtQuick\NativeStyle', 'tls', 'networkinformation', 'generic')
+        foreach ($tree in $deadTrees) {
+            $path = Join-Path $binDir $tree
+            if (Test-Path $path) {
+                $freedBytes += (Get-ChildItem $path -Recurse -File | Measure-Object -Property Length -Sum).Sum
+                Remove-Item -Path $path -Recurse -Force
+            }
+        }
         # Image formats we never decode. The app's own art is SVG (icons), PNG
         # (logo lock-ups) and ICO (window/tray icon): PNG is built into Qt6Gui, ICO
         # and SVG are the two plugins below. Nothing in the QML tree references a
@@ -611,7 +635,7 @@ if (-not $Headless) {
             $freedBytes += (Get-ChildItem $qmlTooling -Recurse -File | Measure-Object -Property Length -Sum).Sum
             Remove-Item -Path $qmlTooling -Recurse -Force
         }
-        Write-Step ("trimmed unused Qt styles, image formats and QML tooling: {0:N1} MB" -f ($freedBytes / 1MB))
+        Write-Step ("trimmed unused Qt styles, libraries, plugins and QML tooling: {0:N1} MB" -f ($freedBytes / 1MB))
     }
 }
 
@@ -649,7 +673,7 @@ Copy-Item -LiteralPath (Join-Path $repoRoot 'LICENSE') -Destination (Join-Path $
 Copy-Item -LiteralPath (Join-Path $repoRoot 'THIRD_PARTY_LICENSES.md') -Destination $licensesDir -Force
 Copy-Item -LiteralPath (Join-Path $repoRoot 'third_party\wintun\LICENSE.txt') -Destination (Join-Path $licensesDir 'Wintun-LICENSE.txt') -Force
 if (-not $Headless) {
-    if ($windeployqt -notmatch '^(?<root>.*\Qt)\(?<version>\d+\.\d+\.\d+)\') {
+    if ($windeployqt -notmatch '^(?<root>.*\\Qt)\\(?<version>\d+\.\d+\.\d+)\\') {
         throw "Cannot find the Qt installation root from '$windeployqt' to take the licence texts from."
     }
     $qtDocs = Join-Path $Matches['root'] "Docs\Qt-$($Matches['version'])\qtdoc"
@@ -921,11 +945,18 @@ if ($Zip) {
 if ($buildExe -or $buildMsi) {
     $installerSources = Join-Path $repoRoot 'packaging\windows'
     # Windows Installer and the EXE's version block take numbers only; the
-    # full stamp still names the files and shows in Apps & Features.
+    # full stamp still names the files and shows in Apps & Features. The
+    # numbers come from the service binary, whose fourth field is the
+    # pre-release (packaging/windows/version_rank.rs): read back, not derived
+    # a second time. Windows Installer compares three fields, so there the
+    # pre-release joins the third.
     $numericVersion = ($productVersion -split '[-+]')[0]
-    if ($numericVersion -notmatch '^\d+\.\d+\.\d+$') {
-        throw "Cannot derive a numeric a.b.c version from '$productVersion'."
+    $fileVersion = (Get-Item -LiteralPath (Join-Path $binDir 'nrr-service.exe')).VersionInfo.FileVersionRaw
+    if ($null -eq $fileVersion -or "$($fileVersion.Major).$($fileVersion.Minor).$($fileVersion.Build)" -ne $numericVersion) {
+        throw "nrr-service.exe carries version '$fileVersion', not the $numericVersion of '$productVersion'."
     }
+    $exeVersion = "$numericVersion.$($fileVersion.Revision)"
+    $msiVersion = "$($fileVersion.Major).$($fileVersion.Minor).$($fileVersion.Build * 100 + $fileVersion.Revision)"
 }
 
 if ($buildExe) {
@@ -935,7 +966,7 @@ if ($buildExe) {
         Remove-Item -LiteralPath $setupPath -Force
     }
     Write-Step "building the EXE installer with '$iscc'"
-    & $iscc '/Q' "/DPackageDir=$packageRoot" "/DAppVersion=$buildStamp" "/DVersionNumeric=$numericVersion.0" "/DArch=$Arch" `
+    & $iscc '/Q' "/DPackageDir=$packageRoot" "/DAppVersion=$buildStamp" "/DVersionNumeric=$exeVersion" "/DArch=$Arch" `
         "/DVariant=$(if ($Headless) { 'headless' } else { 'full' })" `
         "/DOutputDir=$OutputRoot" "/DOutputBaseFilename=$setupName" (Join-Path $installerSources 'NetRuleRouter.iss')
     if ($LASTEXITCODE -ne 0 -or -not (Test-Path -LiteralPath $setupPath)) {
@@ -956,7 +987,7 @@ if ($buildMsi) {
         $licenseRtf = Join-Path $workDir 'LICENSE.rtf'
         ConvertTo-RtfFile -Source (Join-Path $repoRoot 'LICENSE') -Destination $licenseRtf
         $wixArguments = @('build', '-arch', $Arch,'-bindpath', "pkg=$packageRoot",
-            '-d', "Version=$numericVersion", '-d', "DisplayVersion=$buildStamp", '-d', "LicenseRtf=$licenseRtf",
+            '-d', "Version=$msiVersion", '-d', "DisplayVersion=$buildStamp", '-d', "LicenseRtf=$licenseRtf",
             '-d', "Variant=$(if ($Headless) { 'headless' } else { 'full' })",
             '-intermediatefolder', $workDir, '-pdb', (Join-Path $workDir 'NetRuleRouter.wixpdb'),
             '-o', $msiPath)

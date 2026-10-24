@@ -61,7 +61,7 @@ fn fixture_with_main_link_verdicts(
         // Merged over the subtree, exactly as the production source does: an
         // offer is written as a suffix, so its verdict is about everything
         // the rule would carry, not about the bare name.
-        .with_primary_behavior_source(Arc::new(move |name: &str| {
+        .with_primary_behavior_source(Arc::new(move |_sid: &str, name: &str| {
             let suffix = format!(".{name}");
             verdicts
                 .lock()
@@ -639,15 +639,15 @@ fn a_self_signed_offer_does_not_come_back_after_a_restart_but_a_companion_does()
             None,
         );
         let v = Arc::clone(&verdicts);
-        f.engine = f
-            .engine
-            .with_primary_behavior_source(Arc::new(move |host: &str| {
-                v.lock()
-                    .unwrap_or_else(|p| p.into_inner())
-                    .get(host)
-                    .copied()
-                    .unwrap_or(PrimaryBehavior::Unknown)
-            }));
+        f.engine =
+            f.engine
+                .with_primary_behavior_source(Arc::new(move |_sid: &str, host: &str| {
+                    v.lock()
+                        .unwrap_or_else(|p| p.into_inner())
+                        .get(host)
+                        .copied()
+                        .unwrap_or(PrimaryBehavior::Unknown)
+                }));
         set_verdict(&verdicts, "forum.talk.example", PrimaryBehavior::Stalls);
         assert!(f.engine.note_main_link_blocked_host(
             SID,

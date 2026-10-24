@@ -76,6 +76,10 @@ jobs:
 
       # No build cache: what ships is built from the tagged sources alone.
 
+      # Qt is downloaded afresh too: the cache the quality job writes was
+      # populated on a runner that had already run every dependency's build
+      # script, and the DLLs windeployqt ships must not come from there. The
+      # documentation component carries the LGPL/GPL texts the package copies.
       - name: Install Qt
         if: matrix.variant == 'full'
         uses: jurplel/install-qt-action@a9c63c7c123f3069cff414e7e482d95dfa9d8125 # v4.4.1
@@ -83,7 +87,9 @@ jobs:
           version: "6.8.3"
           host: ${{ matrix.qt_host }}
           arch: ${{ matrix.qt_arch }}
-          cache: true
+          documentation: true
+          doc-archives: qtdoc
+          cache: false
 
       - name: Point the Qt host at Qt
         if: matrix.variant == 'full'
@@ -95,11 +101,13 @@ jobs:
         shell: bash
         run: echo "NRR_SKIP_QT_HOST=1" >> "$GITHUB_ENV"
 
-      # WiX 6 carries a maintenance-fee licence; 5.0.2 does not.
+      # WiX 6 carries a maintenance-fee licence; 5.0.2 does not. Inno Setup is
+      # pinned like every other tool: a new major would refuse the script, and
+      # a new minor would change the installer without a trace in the repository.
       - name: Install installer tools
         shell: pwsh
         run: |
-          choco install innosetup --no-progress -y
+          choco install innosetup --version 6.7.3 --no-progress -y
           dotnet tool install --global wix --version 5.0.2
           wix extension add -g WixToolset.Util.wixext/5.0.2
           wix extension add -g WixToolset.UI.wixext/5.0.2
@@ -245,6 +253,13 @@ jobs:
     permissions:
       contents: write
     steps:
+      # Only for the public signing key; nothing from the checkout is run.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        if: ${{ vars.NRR_SIGN_CHECKSUMS == 'true' }}
+        with:
+          persist-credentials: false
+          path: source
+
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           path: artifacts
@@ -257,8 +272,10 @@ jobs:
         run: sha256sum -- * > SHA256SUMS
 
       # Off until the repository variable NRR_SIGN_CHECKSUMS is "true" and the
-      # secret MINISIGN_KEY (an unencrypted minisign secret key) exists; the
-      # public key is then published next to the release notes.
+      # secret MINISIGN_KEY (an unencrypted minisign secret key) exists. The
+      # signature is checked against the public key users get, the one in the
+      # repository, so a secret that stopped matching it (a rotation, a typo)
+      # cannot produce a release nobody can verify.
       - name: Sign the checksums
         if: ${{ vars.NRR_SIGN_CHECKSUMS == 'true' }}
         working-directory: artifacts
@@ -266,12 +283,17 @@ jobs:
           MINISIGN_KEY: ${{ secrets.MINISIGN_KEY }}
         run: |
           test -n "$MINISIGN_KEY" || { echo "MINISIGN_KEY is not set"; exit 1; }
+          pub="$GITHUB_WORKSPACE/source/packaging/minisign.pub"
+          test -s "$pub" || { echo "packaging/minisign.pub is missing: the public key users verify with"; exit 1; }
+          sudo apt-get update
           sudo apt-get install -y --no-install-recommends minisign
           umask 077
           key="$RUNNER_TEMP/minisign.key"
+          trap 'rm -f "$key"' EXIT
           printf '%s\n' "$MINISIGN_KEY" > "$key"
           minisign -S -s "$key" -m SHA256SUMS
-          rm -f "$key"
+          minisign -V -p "$pub" -m SHA256SUMS
+          cp "$pub" minisign.pub
 
       - name: Draft the release
         if: startsWith(github.ref, 'refs/tags/')

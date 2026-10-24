@@ -44,6 +44,25 @@ pub trait AdaptersSnapshotProvider: Send + Sync {
     fn adapters_snapshot_probing_external_ip(&self) -> SnapshotInterfacesResponse {
         self.adapters_snapshot(true)
     }
+
+    /// [`Self::adapters_snapshot`] as `caller` may see it: a remembered
+    /// external address only where their own check obtained it.
+    fn adapters_snapshot_for(
+        &self,
+        force_refresh: bool,
+        _caller: &str,
+    ) -> SnapshotInterfacesResponse {
+        self.adapters_snapshot(force_refresh)
+    }
+
+    /// [`Self::adapters_snapshot_probing_external_ip`] through `caller`'s own
+    /// connections only: another user's tunnel is not theirs to send through.
+    fn adapters_snapshot_probing_external_ip_for(
+        &self,
+        _caller: &str,
+    ) -> SnapshotInterfacesResponse {
+        self.adapters_snapshot_probing_external_ip()
+    }
 }
 
 /// Per-SID Fail-Closed state probe.

@@ -35,7 +35,9 @@ use crate::timed_window::{now_ms, TimedSwitch, WindowKind, WindowSink};
 pub const MAX_GRANTS_PER_PRINCIPAL: usize = 64;
 /// How long a preview's token stays good.
 pub const TOKEN_TTL_MS: i64 = 10 * 60 * 1000;
-/// Previews waiting for their confirmation, across users; the oldest goes.
+/// Previews one user may keep waiting; their own oldest goes.
+const MAX_TOKENS_PER_PRINCIPAL: usize = 8;
+/// Previews waiting across users; the oldest of whoever holds most goes.
 const MAX_TOKENS: usize = 64;
 /// Characters of a rule value an audit record keeps.
 const AUDIT_VALUE_CHARS: usize = 96;
@@ -316,6 +318,15 @@ fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
+/// `owner`'s oldest waiting preview.
+fn oldest_of(tokens: &HashMap<String, Waiting>, owner: &str) -> Option<String> {
+    tokens
+        .iter()
+        .filter(|(_, waiting)| waiting.preview.owner == owner)
+        .min_by_key(|(_, waiting)| waiting.seq)
+        .map(|(token, _)| token.clone())
+}
+
 impl OverrideGrants {
     /// Reads the stored confirmations and the revocations a reset left. A
     /// row that does not verify is dropped and audited; one past its term is
@@ -501,12 +512,32 @@ impl OverrideGrants {
                 && waiting.preview.value == preview.value
                 && waiting.preview.effect == preview.effect)
         });
+        // One user previewing in a loop must not push out another's token
+        // between their preview and confirmation.
+        while tokens
+            .values()
+            .filter(|waiting| waiting.preview.owner == preview.owner)
+            .count()
+            >= MAX_TOKENS_PER_PRINCIPAL
+        {
+            let Some(oldest) = oldest_of(&tokens, &preview.owner) else {
+                break;
+            };
+            tokens.remove(&oldest);
+        }
         while tokens.len() >= MAX_TOKENS {
-            let Some(oldest) = tokens
-                .iter()
-                .min_by_key(|(_, waiting)| waiting.seq)
-                .map(|(token, _)| token.clone())
+            let mut held: HashMap<&str, usize> = HashMap::new();
+            for waiting in tokens.values() {
+                *held.entry(waiting.preview.owner.as_str()).or_default() += 1;
+            }
+            let Some(busiest) = held
+                .into_iter()
+                .max_by_key(|(_, count)| *count)
+                .map(|(owner, _)| owner.to_owned())
             else {
+                break;
+            };
+            let Some(oldest) = oldest_of(&tokens, &busiest) else {
                 break;
             };
             tokens.remove(&oldest);

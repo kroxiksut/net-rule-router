@@ -22,7 +22,9 @@ use smoltcp::time::Instant as SmolInstant;
 pub struct TunPhyDevice {
     device: Box<dyn TunDevice>,
     mtu: u16,
-    pending_rx: Option<Vec<u8>>,
+    rx: Vec<u8>,
+    pending_len: Option<usize>,
+    tx_scratch: Vec<u8>,
 }
 
 impl TunPhyDevice {
@@ -32,7 +34,9 @@ impl TunPhyDevice {
         Self {
             device,
             mtu,
-            pending_rx: None,
+            rx: Vec::new(),
+            pending_len: None,
+            tx_scratch: Vec::new(),
         }
     }
 
@@ -42,9 +46,12 @@ impl TunPhyDevice {
         self.device.read_packet(buf)
     }
 
-    /// Hand `smoltcp` the packet the poll loop just read and classified.
-    pub fn ingest(&mut self, packet: Vec<u8>) {
-        self.pending_rx = Some(packet);
+    /// Hand `smoltcp` the first `len` bytes of `packet`, the one the poll loop
+    /// just read and classified. Buffers are swapped, not copied: `packet` comes
+    /// back holding the previous receive buffer, so no packet allocates.
+    pub fn ingest(&mut self, packet: &mut Vec<u8>, len: usize) {
+        std::mem::swap(&mut self.rx, packet);
+        self.pending_len = Some(len.min(self.rx.len()));
     }
 
     /// Write one client-bound IP packet the poll loop built itself, bypassing
@@ -69,21 +76,23 @@ impl TunPhyDevice {
     }
 }
 
-/// Received-packet token: owns the bytes, so it needs no borrow of the device.
-pub struct TunRxToken(Vec<u8>);
+/// Received-packet token: borrows the device's receive buffer.
+pub struct TunRxToken<'a>(&'a [u8]);
 
-impl RxToken for TunRxToken {
+impl RxToken for TunRxToken<'_> {
     fn consume<R, F>(self, f: F) -> R
     where
         F: FnOnce(&[u8]) -> R,
     {
-        f(&self.0)
+        f(self.0)
     }
 }
 
-/// Transmit token: borrows the device just long enough to write one reply.
+/// Transmit token: borrows the device and its reusable scratch buffer just
+/// long enough to write one reply.
 pub struct TunTxToken<'a> {
     device: &'a mut dyn TunDevice,
+    scratch: &'a mut Vec<u8>,
 }
 
 impl TxToken for TunTxToken<'_> {
@@ -91,28 +100,32 @@ impl TxToken for TunTxToken<'_> {
     where
         F: FnOnce(&mut [u8]) -> R,
     {
-        let mut buf = vec![0u8; len];
-        let result = f(&mut buf);
+        // Zeroed, so a short write never sends the previous packet's bytes.
+        self.scratch.clear();
+        self.scratch.resize(len, 0);
+        let result = f(self.scratch.as_mut_slice());
         // Best-effort: a full TUN ring drops the reply, which TCP treats as a
         // lost segment and retransmits — never a reason to unwind the loop.
-        let _ = self.device.write_packet(&buf);
+        let _ = self.device.write_packet(self.scratch.as_slice());
         result
     }
 }
 
 impl Device for TunPhyDevice {
-    type RxToken<'a> = TunRxToken;
+    type RxToken<'a> = TunRxToken<'a>;
     type TxToken<'a> = TunTxToken<'a>;
 
     fn receive(
         &mut self,
         _timestamp: SmolInstant,
     ) -> Option<(Self::RxToken<'_>, Self::TxToken<'_>)> {
-        let packet = self.pending_rx.take()?;
+        let len = self.pending_len.take()?;
+        let packet = self.rx.get(..len)?;
         Some((
             TunRxToken(packet),
             TunTxToken {
                 device: &mut *self.device,
+                scratch: &mut self.tx_scratch,
             },
         ))
     }
@@ -120,6 +133,7 @@ impl Device for TunPhyDevice {
     fn transmit(&mut self, _timestamp: SmolInstant) -> Option<Self::TxToken<'_>> {
         Some(TunTxToken {
             device: &mut *self.device,
+            scratch: &mut self.tx_scratch,
         })
     }
 

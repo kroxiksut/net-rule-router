@@ -1,4 +1,5 @@
 use super::*;
+use std::net::{Ipv4Addr, Ipv6Addr};
 
 fn utf16z(s: &str) -> Vec<u8> {
     s.encode_utf16()
@@ -21,6 +22,7 @@ fn payload(name: &str, results: &str) -> Vec<u8> {
 /// must agree with.
 mod reference {
     use super::super::*;
+    use std::net::{Ipv4Addr, Ipv6Addr};
 
     fn read_utf16z(bytes: &[u8], off: usize) -> Option<(String, usize)> {
         let mut units: Vec<u16> = Vec::new();
@@ -65,23 +67,42 @@ mod reference {
         }
     }
 
+    /// One `;`-separated record's address. A record is taken whole, never
+    /// mined for digit runs: a CNAME name is the remote server's choice.
+    fn record_address(raw: &str) -> Option<IpAddr> {
+        if !raw.is_ascii() || raw.len() > MAX_RECORD {
+            return None;
+        }
+        let record = raw.trim_ascii();
+        let value = match record.strip_prefix("type:") {
+            None => record,
+            Some(rest) => {
+                let rest = rest.trim_ascii_start();
+                let type_end = rest
+                    .char_indices()
+                    .find(|(_, c)| !c.is_ascii_digit())
+                    .map_or(rest.len(), |(i, _)| i);
+                if !["1", "28"].contains(&&rest[..type_end]) {
+                    return None;
+                }
+                rest[type_end..].trim_ascii_start()
+            }
+        };
+        let address = value.split('%').next().unwrap_or_default();
+        match address.parse::<IpAddr>().ok()? {
+            IpAddr::V6(ip) => Some(ip.to_ipv4_mapped().map_or(IpAddr::V6(ip), IpAddr::V4)),
+            v4 => Some(v4),
+        }
+    }
+
     fn addresses(results: &str) -> (Vec<Ipv4Addr>, Vec<Ipv6Addr>) {
         let mut v4 = Vec::new();
-        for token in results.split(|c: char| !(c.is_ascii_digit() || c == '.')) {
-            if let Ok(ip) = token.parse::<Ipv4Addr>() {
-                push(&mut v4, ip);
-            }
-        }
         let mut v6 = Vec::new();
-        for token in results.split(|c: char| !(c.is_ascii_hexdigit() || c == ':' || c == '.')) {
-            if !token.contains(':') {
-                continue;
-            }
-            if let Ok(ip) = token.parse::<Ipv6Addr>() {
-                match ip.to_ipv4_mapped() {
-                    Some(mapped) => push(&mut v4, mapped),
-                    None => push(&mut v6, ip),
-                }
+        for record in results.split(';') {
+            match record_address(record) {
+                Some(IpAddr::V4(ip)) => push(&mut v4, ip),
+                Some(IpAddr::V6(ip)) => push(&mut v6, ip),
+                None => {}
             }
         }
         (v4, v6)
@@ -137,10 +158,11 @@ fn golden_payloads() -> Vec<Vec<u8>> {
     shadowed.extend(utf16z("x"));
     out.push(shadowed);
     let mut surrogate = utf16z("s.example");
-    let answer = "192.0.2.7"
+    // The surrogate costs only the record it sits in.
+    let answer = "192.0.2.7;1"
         .encode_utf16()
         .chain([0xD800])
-        .chain("192.0.2.8;".encode_utf16());
+        .chain("92.0.2.9;192.0.2.8;".encode_utf16());
     for u in answer {
         surrogate.extend_from_slice(&u.to_le_bytes());
     }
@@ -149,6 +171,19 @@ fn golden_payloads() -> Vec<Vec<u8>> {
     out.push(payload(
         "dual.example",
         "type:  28 ::ffff:192.0.2.9;2001:db8::9;fe80::1%12;12345:db8::1;",
+    ));
+    // Digit runs inside alias names and records of other types are no
+    // answer: the server that owns the name chose them.
+    out.push(payload(
+        "img.example",
+        concat!(
+            "type:  5 203.0.113.7-x.evil.example;type:  5 cafe::1-x.example;",
+            "type:  12 198.51.100.9;type: 1 192.0.2.12;192.0.2.13;",
+        ),
+    ));
+    out.push(payload(
+        "alias-only.example",
+        "type:  5 203.0.113.7.evil.example;type:  5 203.0.113.8-x;",
     ));
     out
 }
@@ -178,7 +213,7 @@ fn golden_payloads_parse_as_expected() {
         got[1],
         obs(
             "a.example",
-            vec![Ipv4Addr::new(198, 51, 100, 7), ip(44)],
+            vec![ip(44), Ipv4Addr::new(198, 51, 100, 7)],
             vec![]
         )
     );
@@ -224,6 +259,12 @@ fn golden_payloads_parse_as_expected() {
             vec![v6("2001:db8::9"), v6("fe80::1")]
         )
     );
+    assert_eq!(
+        got[16],
+        obs("img.example", vec![ip(12), ip(13)], vec![]),
+        "an alias name never lends its digits as an address"
+    );
+    assert_eq!(got[17], None, "an answer of aliases alone has no address");
 }
 
 #[test]

@@ -33,6 +33,7 @@ priority.
 | Connections chosen at installation | A silent installation names the main and the additional connection, so identical computers route by your rules right after setup, with nothing to click | medium |
 | Leak protection chosen at installation | A silent installation sets the level of leak protection, so every user of every computer is protected from their first sign-in | low |
 | Package repositories for Linux | Installs and updates the way your distribution does it: `apt` on Ubuntu and Debian, `dnf` on Fedora, RHEL, AlmaLinux and Rocky Linux, `zypper` on openSUSE, the AUR on Arch Linux, then the Astra Linux and RED OS app stores | medium |
+| Installers for ARM computers | The EXE and MSI installers for Windows on ARM and the `.deb` and `.rpm` packages for 64-bit ARM Linux, once they are tested on real ARM machines. Until then, ARM computers use the portable builds | medium |
 | NetRuleRouter on your VPN server | Installed on a server running WireGuard or AmneziaWG, it routes the traffic of that server's clients by your rules — a phone, a laptop, or a home router connected to the server — with nothing to install on them. We will verify the setup and describe it step by step | medium |
 | Up-to-date libraries | The libraries for checksums, signatures and data encoding move to their current versions, while rules and the audit trail saved by earlier versions keep working unchanged | medium |
 | Installing a program without network access | Start an installer from the window or the terminal interface, and neither it nor anything it starts can reach beyond your computer until the installation ends. The network comes back on its own, and the app offers rules for the program it installed. An Explorer context-menu item will follow if users ask for it | medium |
@@ -41,6 +42,8 @@ priority.
 | Protection back on its own after a Windows firewall restart | If the Windows firewall service restarts while NetRuleRouter runs, the protection is put back at once and the window tells you, so the computer is never left unprotected | medium |
 | Strict network checks on RHEL-family systems | On RHEL, RED OS, AlmaLinux and similar systems with strict network checks turned on, the sites your rules send over the additional connection keep working for every user of the computer | medium |
 | Pages come back after the VPN returns | A page that could not open while the additional connection was down opens again on its own once the connection is back, with no manual reload | medium |
+| Rules for the whole computer | One set of rules for every program on the computer, including services and programs that run with nobody signed in. An administrator turns it on | medium |
+| Name lookups wait too when the VPN drops | With leak protection set to Everything, while the additional connection is down even the look-ups of site names wait for it instead of going out over the main connection | medium |
 | Gateway for home network devices | A computer running NetRuleRouter routes the traffic of a phone, a TV and other devices by the same rules | low |
 | Warning about tampered name answers | A notice when a public Wi-Fi network or the provider tampers with the answers about site names | low |
 | Own route for containers and virtual machines | Docker, Podman and local virtual machines get a route the way a program does, with the same protection if the connection drops | low |
@@ -48,11 +51,15 @@ priority.
 | Traffic per user of the machine | How much traffic each user of the computer used, not only each connection | low |
 | Containers held as tightly as the computer | With leak protection set to Everything and the additional connection as the default route, WSL, containers and virtual machines are kept to it just as the computer itself is | low |
 | More privacy between users of one computer | What the app tells one user never reveals how busy the other users of the computer are | low |
+| Window run as administrator keeps to its own files | When you start the window as administrator, it works only from files it creates itself, never from files another program in your session could have changed | low |
 | Stronger focus and simpler labels | An optional thicker outline around the focused control and shorter labels in the window, for easier reading | low |
 | Data plan limit warning | A notice when the additional connection's usage nears the limit of a VPN subscription or a mobile plan | low |
 | Suggestions for programs | A program whose connections do not get through on the main connection is offered a move to the additional one, as sites are today | low |
 | Connection check | One button shows whether the VPN connection loses large packets and what to change in the VPN client's settings | low |
 | History of rule changes | Every rule added, removed or changed, with when and from where, and any one change undone on its own | low |
+| Notice when another program removes your routes | When another program, such as a corporate VPN that enforces its own routes, keeps removing the routes your rules need, the window and the terminal interface tell you once which sites are affected and which program is in the way | low |
+| Warning about another program's wide route | When another program, such as a virtual machine manager, takes over a whole range of addresses, the app shows which addresses it swallows and offers to remove that route, so a server or site that would not open works again | low |
+| Console for every user of the computer | `nrr-cli` can be added to the command path of every user of the computer, not only your own account, with one button in the window | low |
 | Administrator rights from the terminal interface on Windows | When a change made in the terminal interface needs administrator rights, Windows asks for them with its usual prompt, with no need to restart the terminal as administrator | low |
 | Traffic charts by connection | The traffic statistics you can already export, as a chart in the window and the terminal interface | low |
 | Name lookups repeated over the same connection | When a lookup of a site name has to be repeated, the repeat goes over the same connection as the first attempt — the one your rules chose for the site | low |

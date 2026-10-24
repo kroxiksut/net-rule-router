@@ -29,6 +29,7 @@ impl ProgramFolders for Machine {
             "/tmp/tools",
             "/opt/tool",
             "/usr/bin",
+            "/srv/bob",
         ];
         if known.iter().any(|folder| path == Path::new(folder)) {
             PlaceOnDisk::Folder
@@ -68,6 +69,10 @@ impl ProgramFolders for Machine {
 
     fn writable_by_anyone(&self, place: &Path) -> bool {
         place.starts_with("/tmp")
+    }
+
+    fn owner_may_list(&self, place: &Path, owner: &str) -> bool {
+        !place.starts_with("/srv/bob") || owner == BOB
     }
 }
 
@@ -112,6 +117,23 @@ fn a_folder_in_another_users_home_is_refused_unread() {
     assert_eq!(machine.looked.load(Ordering::SeqCst), 0);
     assert_eq!(
         ask(&machine, "/home/b/apps/*", "primary", BOB).outcome,
+        APP_PATH_COVERAGE_FOUND
+    );
+}
+
+/// A folder outside every home that only its owner may open is refused to
+/// anyone else before the service lists it.
+#[test]
+fn a_folder_closed_to_the_asker_is_refused_unlisted() {
+    let machine = Arc::new(Machine::default());
+    let answer = ask(&machine, "/srv/bob/*", "primary", ALICE);
+    assert_eq!(answer.outcome, APP_PATH_COVERAGE_REFUSED);
+    assert_eq!(answer.refusal_key, OTHER_USERS_FOLDER_KEY);
+    assert_eq!(answer.programs, 0);
+    assert!(answer.place.is_empty(), "the real place is not told either");
+    assert_eq!(machine.looked.load(Ordering::SeqCst), 0);
+    assert_eq!(
+        ask(&machine, "/srv/bob/*", "primary", BOB).outcome,
         APP_PATH_COVERAGE_FOUND
     );
 }

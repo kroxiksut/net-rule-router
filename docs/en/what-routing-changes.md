@@ -58,7 +58,7 @@ protection has less to work with.
 
 This is a real trade-off, not a detail: encrypted DNS in the browser and
 name-based routing want the same information. So NetRuleRouter blocks browser
-DoH/DoT on its own as soon as you have rules for the additional route, and
+DoH/DoT on its own as soon as your rules route or block sites by name, and
 tells you so in Settings → Routing; there you can switch the blocking off or
 set it by hand. It closes the known encrypted-DNS services over both IPv4 and
 IPv6. The built-in list of those services grows

@@ -119,6 +119,23 @@ impl ProgramFolders for WindowsProgramFolders {
             .map(|(_, profile)| PathBuf::from(profile.join(r"\")))
     }
 
+    fn owner_may_list(&self, place: &Path, owner: &str) -> bool {
+        if !is_user_sid(owner) {
+            return true;
+        }
+        let folder = if place.is_file() {
+            place.parent().unwrap_or(place)
+        } else {
+            place
+        };
+        if !folder.is_dir() {
+            return true;
+        }
+        // An account the system cannot resolve right now (a domain user off
+        // the network) keeps the answer it always had.
+        crate::trusted_location::sid_may_list(folder, owner).unwrap_or(true)
+    }
+
     fn writable_by_anyone(&self, place: &Path) -> bool {
         // A file is put there by whoever may write into its folder; a missing
         // folder by whoever may create it in the nearest one that exists.
@@ -168,7 +185,7 @@ fn read_profile_list() -> Vec<(String, Vec<String>)> {
 
 /// A local, domain or cloud user account, not a service identity.
 fn is_user_sid(sid: &str) -> bool {
-    sid.starts_with("S-1-5-21-") || sid.starts_with("S-1-12-1-")
+    nrr_platform_api::types::is_user_account_sid(sid)
 }
 
 /// A raw handle crossing into the watch thread. The thread is its only user

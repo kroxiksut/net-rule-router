@@ -320,6 +320,33 @@ pub const CACHE_HELP_CLEAR: Key = key(
     "tui.cache.help-clear",
     "c: clear the app cache   o: flush the operating system's DNS cache (each asks first)",
 );
+pub const CACHE_HELP_FILTERS: Key = key(
+    "tui.cache.help-filters",
+    "f: freshness, t: source, w: route; each press shows the next choice of that filter",
+);
+pub const CACHE_HELP_SEED: Key = key(
+    "tui.cache.help-seed",
+    "b: seed the cache from browser history (only names that match your rules)",
+);
+pub const CACHE_FILTERS: Key = key(
+    "tui.cache.filters",
+    "Shown: {source} · {freshness} · {route}",
+);
+pub const CACHE_SOURCE_ALL: Key = key("diag.cache.source-filter.all", "All sources");
+pub const CACHE_FRESH_ALL: Key = key("diag.cache.freshness-filter.all", "Any freshness");
+pub const CACHE_FRESH_FRESH: Key = key("diag.cache.freshness-filter.fresh", "Fresh");
+pub const CACHE_FRESH_STALE: Key = key("diag.cache.freshness-filter.stale", "Stale");
+pub const CACHE_ROUTE_ALL: Key = key("diag.cache.route-filter.all", "All routes");
+pub const CACHE_ROUTE_NONE: Key = key("diag.cache.route-filter.none", "No rule");
+pub const CACHE_SEED_STARTED: Key = key(
+    "diag.cache.seed-browser-history.started",
+    "Import started — hosts matching your rules will appear in the cache.",
+);
+pub const CACHE_SEED_RUNNING: Key = key("diag.cache.seed-browser-history.already-running", "Your previous import is still running — hosts matching your rules will appear in the cache when it finishes.");
+pub const CACHE_SEED_UNAVAILABLE: Key = key(
+    "diag.cache.seed-browser-history.unavailable",
+    "This feature is unavailable.",
+);
 pub const CACHE_PLAIN_DETAILS: Key = key(
     "tui.cache.plain-details",
     "d and a row number: show that entry, for example d 3",
@@ -564,6 +591,35 @@ pub const DIAG_PLAIN_EXPORT: Key = key(
     "tui.diagnostics.plain-export",
     "x: export a diagnostic archive",
 );
+pub const AUDIT_RESTART_OPEN: Key = key("diag.audit.restart.open", "Restart audit chain…");
+pub const AUDIT_RESTART_TITLE: Key = key("diag.audit.restart.title", "Restart audit chain");
+pub const AUDIT_RESTART_LOADING: Key =
+    key("diag.audit.restart.loading", "Checking the audit trail…");
+pub const AUDIT_RESTART_ROW_LINE: Key =
+    key("diag.audit.restart.row-line", "{file}, line {line}: {kind}");
+pub const AUDIT_RESTART_ROW_FILE: Key = key("diag.audit.restart.row-file", "{file}: {kind}");
+pub const AUDIT_RESTART_TRUNCATED: Key = key(
+    "diag.audit.restart.list-truncated",
+    "Only the first {shown} are listed.",
+);
+pub const AUDIT_RESTART_EXPLAIN: Key = key("diag.audit.restart.explain", "Confirming does not erase these breaks: they stay recorded in the audit trail, and checking continues from this point. A new break will be reported again.");
+pub const AUDIT_RESTART_CHANGED: Key = key(
+    "diag.audit.restart.changed",
+    "The audit trail changed while this list was open. Review the updated list and confirm again.",
+);
+pub const AUDIT_RESTART_COMPLETED: Key = key(
+    "diag.audit.restart.completed",
+    "Audit chain restarted. Checking continues from this point.",
+);
+pub const AUDIT_RESTART_FAILED: Key = key(
+    "diag.audit.restart.failed",
+    "Could not restart the audit chain: ",
+);
+pub const AUDIT_RESTART_SUMMARY: Plural = Plural {
+    stem: "diag.audit.restart.summary.",
+    one: "The audit trail fails verification in {count} place:",
+    other: "The audit trail fails verification in {count} places:",
+};
 pub const DIAG_PLAIN_LOG_FILTERS: Key = key(
     "tui.diagnostics.plain-log-filters",
     "In the log: v next level, / and text filter by event type (/ on its own clears), s this session or all history",
@@ -580,6 +636,16 @@ pub const ALL: &[Key] = &[
     HELP_REFRESH,
     TYPING_HINT,
     YES_NO,
+    AUDIT_RESTART_OPEN,
+    AUDIT_RESTART_TITLE,
+    AUDIT_RESTART_LOADING,
+    AUDIT_RESTART_ROW_LINE,
+    AUDIT_RESTART_ROW_FILE,
+    AUDIT_RESTART_TRUNCATED,
+    AUDIT_RESTART_EXPLAIN,
+    AUDIT_RESTART_CHANGED,
+    AUDIT_RESTART_COMPLETED,
+    AUDIT_RESTART_FAILED,
     YES,
     NO,
     PRIMARY,
@@ -690,6 +756,18 @@ pub const ALL: &[Key] = &[
     CACHE_NO_RULE,
     CACHE_HELP_SEARCH,
     CACHE_HELP_CLEAR,
+    CACHE_HELP_FILTERS,
+    CACHE_HELP_SEED,
+    CACHE_FILTERS,
+    CACHE_SOURCE_ALL,
+    CACHE_FRESH_ALL,
+    CACHE_FRESH_FRESH,
+    CACHE_FRESH_STALE,
+    CACHE_ROUTE_ALL,
+    CACHE_ROUTE_NONE,
+    CACHE_SEED_STARTED,
+    CACHE_SEED_RUNNING,
+    CACHE_SEED_UNAVAILABLE,
     CACHE_PLAIN_DETAILS,
     CACHE_PLAIN_SEARCH,
     SERVICE,
@@ -818,7 +896,11 @@ mod tests {
     fn plural_families_are_in_both_locale_files() {
         for language in ["en", "ru"] {
             let root = locale(language);
-            for plural in [super::TRACE_GROUP_CONNECTIONS, super::TRACE_GROUP_PROGRAMS] {
+            for plural in [
+                super::TRACE_GROUP_CONNECTIONS,
+                super::TRACE_GROUP_PROGRAMS,
+                super::AUDIT_RESTART_SUMMARY,
+            ] {
                 for id in plural.required_ids() {
                     let found = id
                         .split('.')

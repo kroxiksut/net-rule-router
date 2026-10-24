@@ -43,9 +43,9 @@
 //! partial commit (a route with no matching filter, or a block with no rule
 //! behind it).
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::net::{IpAddr, Ipv4Addr};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, SystemTime};
 
 use nrr_domain::decision_lookup::FreshnessThresholds;
@@ -577,9 +577,55 @@ pub struct FqdnCacheSnapshot {
     /// what suffix fan-out walks, and the order that decides which hosts of a
     /// capped zone earn a permit.
     hostnames_by_recency: Vec<String>,
+    /// Built on the first suffix question.
+    suffix_index: OnceLock<SuffixIndex>,
     direct_host_counts: HashMap<Ipv4Addr, u32>,
     shared_direct: std::collections::HashSet<Ipv4Addr>,
     shared_direct_primary_ruled: std::collections::HashSet<Ipv4Addr>,
+}
+
+/// Cached hostnames keyed by their labels reversed, lowered once.
+///
+/// The hosts under a suffix are then one range of the map. A pass asked every
+/// suffix and zone rule for its hosts by lowering and testing every cached
+/// name, several times per pass and per user: with hundreds of such rules and
+/// tens of thousands of names, the seconds a pass took.
+#[derive(Default)]
+struct SuffixIndex {
+    /// `com.example.www` → positions in `hostnames_by_recency`.
+    by_reversed: BTreeMap<String, Vec<usize>>,
+}
+
+impl SuffixIndex {
+    fn build(hosts: &[String]) -> Self {
+        let mut by_reversed: BTreeMap<String, Vec<usize>> = BTreeMap::new();
+        for (at, host) in hosts.iter().enumerate() {
+            by_reversed
+                .entry(reversed_labels(&host.to_ascii_lowercase()))
+                .or_default()
+                .push(at);
+        }
+        Self { by_reversed }
+    }
+
+    /// Positions of the hosts strictly under `suffix` (lowercase, no trailing
+    /// dot), in recency order: what `LIKE '%.suffix'` matches, the apex out.
+    fn under(&self, suffix: &str) -> Vec<usize> {
+        let prefix = format!("{}.", reversed_labels(suffix));
+        let mut at: Vec<usize> = self
+            .by_reversed
+            .range(prefix.clone()..)
+            .take_while(|(key, _)| key.starts_with(&prefix))
+            .flat_map(|(_, positions)| positions.iter().copied())
+            .collect();
+        at.sort_unstable();
+        at
+    }
+}
+
+/// `www.example.com` → `com.example.www`.
+fn reversed_labels(host: &str) -> String {
+    host.rsplit('.').collect::<Vec<_>>().join(".")
 }
 
 impl FqdnCacheSnapshot {
@@ -636,6 +682,7 @@ impl FqdnCacheSnapshot {
         Self {
             by_hostname,
             hostnames_by_recency,
+            suffix_index: OnceLock::new(),
             direct_host_counts,
             shared_direct,
             shared_direct_primary_ruled,
@@ -646,6 +693,7 @@ impl FqdnCacheSnapshot {
         Self {
             by_hostname: HashMap::new(),
             hostnames_by_recency: Vec::new(),
+            suffix_index: OnceLock::new(),
             direct_host_counts: HashMap::new(),
             shared_direct: std::collections::HashSet::new(),
             shared_direct_primary_ruled: std::collections::HashSet::new(),
@@ -688,6 +736,7 @@ impl FqdnCacheSnapshot {
         Self {
             by_hostname,
             hostnames_by_recency,
+            suffix_index: OnceLock::new(),
             direct_host_counts: self
                 .direct_host_counts
                 .iter()
@@ -731,18 +780,19 @@ impl FqdnCacheLookup for FqdnCacheSnapshot {
         if normalised.is_empty() {
             return Vec::new();
         }
-        // `LIKE '%.{suffix}'` in SQLite is ASCII-case-INSENSITIVE, and the
-        // stored names are not all lowercase, so a case-sensitive `ends_with`
-        // here would quietly drop hosts the query returns. The leading dot is
-        // what keeps the apex out of its own suffix.
-        let needle = format!(".{normalised}");
-        let mut hosts: Vec<String> = self
-            .hostnames_by_recency
-            .iter()
-            .filter(|h| h.to_ascii_lowercase().ends_with(&needle))
-            .take(limit)
-            .cloned()
-            .collect();
+        // `LIKE '%.{suffix}'` in SQLite is ASCII-case-INSENSITIVE and the
+        // stored names are not all lowercase; the index lowers them once.
+        let positions = self
+            .suffix_index
+            .get_or_init(|| SuffixIndex::build(&self.hostnames_by_recency))
+            .under(&normalised);
+        let mut hosts = nrr_storage::suffix_window::fair_suffix_window(
+            positions
+                .into_iter()
+                .filter_map(|at| self.hostnames_by_recency.get(at).cloned()),
+            &normalised,
+            limit,
+        );
         hosts.sort_unstable();
         hosts
     }
@@ -769,6 +819,50 @@ impl FqdnCacheLookup for FqdnCacheSnapshot {
 }
 
 // ── Tests ───────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod suffix_index_tests {
+    use super::SuffixIndex;
+
+    /// The index answers what the scan it replaces answered: case folded, the
+    /// apex out, a label boundary, recency order kept.
+    #[test]
+    fn the_index_finds_what_a_scan_of_every_name_finds() {
+        let hosts: Vec<String> = [
+            "www.Example.com",
+            "example.com",
+            "xexample.com",
+            "a.b.example.com",
+            "example.com.evil.test",
+            "cdn.example.co.uk",
+            "co.uk",
+            "x..example.com",
+            "API.EXAMPLE.COM",
+            "trailing.example.com.",
+        ]
+        .iter()
+        .map(|s| (*s).to_string())
+        .collect();
+        let index = SuffixIndex::build(&hosts);
+        for suffix in [
+            "example.com",
+            "com",
+            "co.uk",
+            "uk",
+            "b.example.com",
+            "nothing.test",
+        ] {
+            let needle = format!(".{suffix}");
+            let scanned: Vec<usize> = hosts
+                .iter()
+                .enumerate()
+                .filter(|(_, h)| h.to_ascii_lowercase().ends_with(&needle))
+                .map(|(at, _)| at)
+                .collect();
+            assert_eq!(index.under(suffix), scanned, "{suffix}");
+        }
+    }
+}
 
 #[cfg(test)]
 mod tests {
@@ -982,10 +1076,11 @@ mod tests {
         let thresholds = FreshnessThresholds::default_production();
         let store = SqliteCacheStore::new(runner.into_connection(), thresholds.clone());
         let now = std::time::SystemTime::now();
-        // `www` is the most recently seen of the two.
+        // `www` is the most recently seen of the two, by more than the hour
+        // recency is compared to.
         for (h, ip, ago) in [
             ("www.example.com", Ipv4Addr::new(203, 0, 113, 2), 10),
-            ("api.example.com", Ipv4Addr::new(203, 0, 113, 1), 60),
+            ("api.example.com", Ipv4Addr::new(203, 0, 113, 1), 7200),
         ] {
             store
                 .upsert_resolution(ResolutionEntry {

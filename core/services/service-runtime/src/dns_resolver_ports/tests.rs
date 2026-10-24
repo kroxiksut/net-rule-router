@@ -863,6 +863,41 @@ fn a_host_is_a_rule_host_for_whichever_served_user_names_it() {
     assert!(oracle.owners_of("nobody.example").is_empty());
 }
 
+/// A paused user's rule host gets its real address: a substituted one would
+/// carry it over the tunnel through the relay, and their guard would withhold
+/// it while their own filters are down.
+#[test]
+fn a_paused_users_rule_hosts_resolve_like_any_other_name() {
+    use crate::dns_resolver::LeakGuardPosture;
+    let (rules, served) = two_users();
+    let paused = Arc::new(crate::routing_pause::PausedPrincipals::default());
+    let oracle = Arc::new(
+        ActiveRuleHostOracle::new(rules, Arc::new(|| Some(ALICE.to_owned())))
+            .with_served(Arc::clone(&served))
+            .with_paused(Arc::clone(&paused)),
+    );
+    crate::routing_pause::PausedPrincipals::set_for_test(&paused, BOB, true);
+
+    assert!(!oracle.is_rule_host("bob-site.example"));
+    assert!(oracle.owners_of("bob-site.example").is_empty());
+    assert!(
+        oracle.is_rule_host("alice-site.example"),
+        "Alice is not paused"
+    );
+    let guard = HostOwnersLeakGuard::new(
+        Arc::clone(&oracle),
+        served,
+        Arc::new(|sid: &str| sid == BOB),
+    );
+    assert!(!guard.blocking_for_host("bob-site.example"));
+
+    crate::routing_pause::PausedPrincipals::set_for_test(&paused, BOB, false);
+    assert!(
+        oracle.is_rule_host("bob-site.example"),
+        "back with the resume"
+    );
+}
+
 #[test]
 fn one_users_guard_withholds_only_the_hosts_that_users_rules_name() {
     use crate::dns_resolver::LeakGuardPosture;
@@ -1509,6 +1544,22 @@ fn direct_udp_resolves_ptr_names_from_fake_server() {
     let r = DirectUdpUpstreamResolver::new(addr, Duration::from_secs(2), 1);
     let names = r.resolve_ptr(ip(203, 0, 113, 100)).expect("ptr names");
     assert_eq!(names, vec!["feed.example".to_string()]);
+}
+
+/// A PTR answer past 2 KiB is read whole: on Windows a smaller buffer fails
+/// the receive, and the answer would count as a transport failure.
+#[test]
+fn direct_udp_reads_an_oversized_ptr_answer_whole() {
+    let addr = spawn_fake_dns(|query| {
+        let mut reply = build_error_response(query, RCODE_NXDOMAIN).expect("nx");
+        reply.resize(9000, 0);
+        vec![reply]
+    });
+    let r = DirectUdpUpstreamResolver::new(addr, Duration::from_secs(2), 1);
+    assert_eq!(
+        r.resolve_ptr(ip(203, 0, 113, 100)),
+        Err(ResolveError::NoRecords)
+    );
 }
 
 #[test]

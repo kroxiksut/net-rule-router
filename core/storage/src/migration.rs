@@ -36,6 +36,7 @@ use crate::schema::STATE_DB_V80_DDL;
 use crate::schema::STATE_DB_V81_DDL;
 use crate::schema::STATE_DB_V82_DDL;
 use crate::schema::STATE_DB_V83_DDL;
+use crate::schema::STATE_DB_V84_DDL;
 use crate::schema::{
     CACHE_DB_V1_DDL, CACHE_DB_V2_DDL, CACHE_DB_V3_DDL, CACHE_DB_V4_DDL, STATE_DB_V10_DDL,
     STATE_DB_V11_DDL, STATE_DB_V12_DDL, STATE_DB_V13_DDL, STATE_DB_V14_DDL, STATE_DB_V15_DDL,
@@ -697,6 +698,11 @@ pub(crate) const STATE_MIGRATIONS: &[MigrationDef] = &[
         name: "add_routing_pause_term",
         stmts: STATE_DB_V83_DDL,
     },
+    MigrationDef {
+        version: 84,
+        name: "kill_switch_strict_shared_ips_by_default",
+        stmts: STATE_DB_V84_DDL,
+    },
 ];
 
 // nrr_conn_history.db. Rebuildable and versioned on its own, like the traffic
@@ -865,6 +871,18 @@ pub fn open_connection(path: &Path) -> StorageResult<Connection> {
     let _ = checkpoint_wal_truncate(&conn);
     crate::write_ledger::watch(&conn, path);
 
+    Ok(conn)
+}
+
+/// [`open_connection`] for `nrr_fqdn_ip_cache.db`: every rule-host answer
+/// writes to it, and at full durability each of those commits waited for an
+/// fsync under the cache lock, tens of milliseconds on a spinning disk. Under
+/// WAL, `NORMAL` loses at most the last commits on a power cut, which the
+/// cache relearns from the next answers; it holds no policy and no secret.
+pub fn open_cache_connection(path: &Path) -> StorageResult<Connection> {
+    let conn = open_connection(path)?;
+    conn.execute_batch("PRAGMA synchronous = NORMAL;")
+        .map_err(|e| StorageError::Internal(format!("cache durability pragma: {e}")))?;
     Ok(conn)
 }
 

@@ -44,7 +44,7 @@ pub enum RuleConflict {
         reason: UnsupportedShapeReason,
     },
     /// Carving the narrower rules out of this network needed more than `cap`
-    /// pieces: it covers its whole network and the narrower rules inside lose.
+    /// pieces, so it was skipped rather than widened over the rules inside.
     NetworkCarvingOverCap {
         rule_id: String,
         pieces: usize,

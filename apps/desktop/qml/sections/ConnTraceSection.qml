@@ -80,6 +80,9 @@ ScrollView {
     // next page via the offset cursor echoed back by the previous response.
     property var _connTraceEntries: []
     property string _connTraceCursor: ""
+    // Bumped by every reset: a page answered for an earlier list is dropped,
+    // or it would be appended to the new one and start a second drain.
+    property int _connLoadGeneration: 0
     property bool _connTraceLoading: false
     property bool _connTraceShown: false
     // Auto-refresh state. The observer is NOT on the data path: the panel pulls
@@ -150,7 +153,9 @@ ScrollView {
         if (reset) {
             section._connTraceEntries = []
             section._connTraceCursor = ""
+            section._connLoadGeneration++
         }
+        var generation = section._connLoadGeneration
         var pagination = { "page_size": 200 }
         if (!reset && section._connTraceCursor !== "")
             pagination["cursor"] = section._connTraceCursor
@@ -169,8 +174,9 @@ ScrollView {
         var mode = section._connMode
         var period = section._connHistoryPeriod
         root.rpc.registerRpcCallback(corr, function(ok, payload, errorCode, errorMessage) {
-            // A switch made while this page travelled owns the list now.
-            if (mode !== section._connMode || period !== section._connHistoryPeriod)
+            // A switch or reload made while this page travelled owns the list now.
+            if (generation !== section._connLoadGeneration
+                    || mode !== section._connMode || period !== section._connHistoryPeriod)
                 return
             section._connTraceLoading = false
             if (!ok) {
@@ -581,7 +587,9 @@ ScrollView {
         if (reset) {
             section._connTraceEntries = []
             section._connTraceCursor = ""
+            section._connLoadGeneration++
         }
+        var generation = section._connLoadGeneration
         section._connTraceShown = true
         section._connTraceLoading = true
         section._connTraceError = ""
@@ -591,7 +599,7 @@ ScrollView {
         // that rebuilt the render model on every append and froze the view.
         var corr = nrrNativeBridge.rpcConnTraceEntriesList(cursor, 200)
         root.rpc.registerRpcCallback(corr, function(ok, payload, errorCode, errorMessage) {
-            if (section._connIsHistory)
+            if (section._connIsHistory || generation !== section._connLoadGeneration)
                 return
             section._connTraceLoading = false
             if (!ok) {
@@ -867,6 +875,7 @@ ScrollView {
                     }
                     ThemedTextField {
                         id: connTraceSearchField
+                        accessibleLabel: root.uiRevision >= 0 ? root.tr("action.search", "Search") : ""
                         theme: root.uiTheme
                         Layout.fillWidth: true
                         visible: section._connTraceShown

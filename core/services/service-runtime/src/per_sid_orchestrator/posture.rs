@@ -156,6 +156,25 @@ impl PerSidApplyOrchestrator {
     /// few seconds and a per-tick flush would defeat the OS cache entirely.
     /// `true` when it flushed, so the fail-closed edge of the same compute
     /// need not flush again; a failed flush leaves that edge its own try.
+    /// Publish whether anyone's traffic waits for their additional link.
+    pub(super) fn note_outage_hold(&self, sid: &str, holding: bool) {
+        let any = {
+            let mut g = self
+                .outage_hold_state
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            if holding {
+                g.insert(sid.to_owned());
+            } else {
+                g.remove(sid);
+            }
+            !g.is_empty()
+        };
+        if let Some(status) = self.block_all_posture_status.as_ref() {
+            status.set_outage(any);
+        }
+    }
+
     pub(super) fn note_block_all_state(&self, sid: &str, armed: bool) -> bool {
         let transitioned = {
             let mut g = self
@@ -262,10 +281,20 @@ impl PerSidApplyOrchestrator {
             .remove(sid);
         crate::enforced_addresses::global_enforced_addresses().forget(sid);
         crate::ipv6_disposition::global_ipv6_dispositions().forget(sid);
+        super::plan::note_machine_volume(crate::standing_volume::global_standing_volume().forget(
+            sid,
+            nrr_platform_api::enforcement::EnforcementCapabilities::current().standing_filter_alarm,
+        ));
         let flushed = self.note_block_all_state(sid, false);
+        self.note_outage_hold(sid, false);
         self.note_fail_closed_state(sid, false, flushed);
         self.update_killswitch_registry(sid, KillswitchBlockIds::default());
         self.clear_pending_vpn_clients(sid);
+        // A cut asked for by someone gone must not be blamed on them later.
+        self.machine_wide_cut_state
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .remove(sid);
         self.posture_log_state
             .lock()
             .unwrap_or_else(|p| p.into_inner())

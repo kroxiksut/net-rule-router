@@ -125,16 +125,36 @@ impl AutostartRegistryPort for XdgAutostartRegistry {
 /// (the helper already quoted the path), escaped per the Desktop Entry spec.
 fn render_desktop_entry(exec_value: &str) -> String {
     let exec_line = format!("Exec={}", escape_exec(exec_value));
-    let mut out = String::with_capacity(DESKTOP_ENTRY_TEMPLATE.len() + exec_line.len());
+    let mut out = String::with_capacity(DESKTOP_ENTRY_TEMPLATE.len() + 2 * exec_line.len());
     for line in DESKTOP_ENTRY_TEMPLATE.lines() {
-        out.push_str(if line.starts_with("Exec=") {
-            &exec_line
-        } else {
-            line
-        });
+        if line.starts_with("Exec=") {
+            out.push_str(&exec_line);
+            out.push('\n');
+            // The session skips an entry whose program is gone: after the
+            // package is removed the entry stays in every profile that turned
+            // autostart on, and without this it ran a missing binary at each
+            // sign-in.
+            if let Some(program) = exec_program(exec_value) {
+                out.push_str("TryExec=");
+                out.push_str(&program.replace('\\', "\\\\"));
+                out.push('\n');
+            }
+            continue;
+        }
+        out.push_str(line);
         out.push('\n');
     }
     out
+}
+
+/// The program an `Exec=` value starts: its first word, quotes off.
+fn exec_program(exec_value: &str) -> Option<&str> {
+    let value = exec_value.trim_start();
+    let program = match value.strip_prefix('"') {
+        Some(rest) => &rest[..rest.find('"')?],
+        None => value.split_whitespace().next()?,
+    };
+    (!program.is_empty()).then_some(program)
 }
 
 /// Two layers: inside a quoted argument `"`, `` ` ``, `$` and `\` take a
@@ -268,6 +288,26 @@ mod tests {
         let value = r#""/opt/net rule/NetRuleRouterTray""#;
         let parsed = parse_exec_from_desktop(&render_desktop_entry(value));
         assert_eq!(parsed.as_deref(), Some(value));
+    }
+
+    /// Once the package is removed the entry stays in each profile that turned
+    /// autostart on; `TryExec` makes the session skip it instead of running a
+    /// missing program at every sign-in.
+    #[test]
+    fn the_entry_names_its_program_for_the_session_to_check() {
+        let out = render_desktop_entry(r#""/opt/net rule/NetRuleRouterTray" --autostart"#);
+        assert!(
+            out.lines()
+                .any(|l| l == "TryExec=/opt/net rule/NetRuleRouterTray"),
+            "{out}"
+        );
+        let bare = render_desktop_entry("/usr/bin/netrulerouter-tray");
+        assert!(
+            bare.lines()
+                .any(|l| l == "TryExec=/usr/bin/netrulerouter-tray"),
+            "{bare}"
+        );
+        assert_eq!(out.matches("TryExec=").count(), 1);
     }
 
     #[test]

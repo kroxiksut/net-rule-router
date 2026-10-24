@@ -54,6 +54,224 @@ fn a_first_contact_routes_only_what_the_planner_would() {
     );
 }
 
+/// A rule book whose next read hands out the book as it stood and then, before
+/// returning, moves to `newer` and runs `hook` — a first contact landing after
+/// the pass has read its plan's inputs.
+struct BookMovesMidRead {
+    book: Mutex<CanonicalRuleSet>,
+    next: Mutex<Option<(CanonicalRuleSet, MidReadHook)>>,
+}
+
+type MidReadHook = Box<dyn FnOnce() + Send>;
+
+impl BookMovesMidRead {
+    fn set(&self, book: CanonicalRuleSet) {
+        *self.book.lock().unwrap_or_else(|p| p.into_inner()) = book;
+    }
+}
+
+impl RulesProvider for BookMovesMidRead {
+    fn active_rules(&self) -> Option<ActiveRulesSnapshot> {
+        None
+    }
+    fn active_rules_for(&self, _principal: &str) -> Option<ActiveRulesSnapshot> {
+        let secondary = self.book.lock().unwrap_or_else(|p| p.into_inner()).clone();
+        let armed = self.next.lock().unwrap_or_else(|p| p.into_inner()).take();
+        if let Some((newer, hook)) = armed {
+            self.set(newer);
+            hook();
+        }
+        Some(ActiveRulesSnapshot {
+            rule_book: CanonicalRuleBook {
+                primary: CanonicalRuleSet::from_rules(vec![]),
+                secondary,
+            },
+        })
+    }
+}
+
+/// A first contact installed while a pass is already planning from the book
+/// without its address must outlive that pass: the plan never saw the address.
+/// The pin installed right after it (route before pin) would otherwise be left
+/// with no route until the next pass. A pass planned later without the address
+/// takes the route out as any of ours.
+#[test]
+fn a_first_contact_outlives_the_pass_planned_before_it() {
+    let api = Arc::new(MockWindowsApi::new());
+    let only_a = || CanonicalRuleSet::from_rules(vec![ip_rule("a", 203, 0, 113, 1)]);
+    let rules = Arc::new(BookMovesMidRead {
+        book: Mutex::new(only_a()),
+        next: Mutex::new(None),
+    });
+    let coord = Arc::new(SecondaryRouteCoordinator::new(
+        Arc::clone(&api) as Arc<dyn RouteTablePort>,
+        Arc::clone(&rules) as Arc<dyn RulesProvider>,
+        Arc::new(FakePolicy::new()) as Arc<dyn RoutePolicySource>,
+        Arc::new(MockFqdnCacheLookup::new()) as Arc<dyn FqdnCacheLookup>,
+        Arc::new(|| false) as RuleScopeProvider,
+    ));
+    coord
+        .recompute_for("S-IVANOV", &res(Some(target())))
+        .expect("recompute");
+
+    let fresh = Ipv4Addr::new(203, 0, 113, 2);
+    let routed = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let hook = {
+        let coord = Arc::downgrade(&coord);
+        let routed = Arc::clone(&routed);
+        Box::new(move || {
+            if let Some(coord) = coord.upgrade() {
+                let n = coord.route_first_contact("S-IVANOV", &[IpAddr::V4(fresh)]);
+                routed.store(n, std::sync::atomic::Ordering::SeqCst);
+            }
+        }) as Box<dyn FnOnce() + Send>
+    };
+    let with_b = CanonicalRuleSet::from_rules(vec![
+        ip_rule("a", 203, 0, 113, 1),
+        ip_rule("b", 203, 0, 113, 2),
+    ]);
+    *rules.next.lock().unwrap_or_else(|p| p.into_inner()) = Some((with_b, hook));
+
+    let delta = coord
+        .recompute_for("S-IVANOV", &res(Some(target())))
+        .expect("recompute");
+    assert_eq!(routed.load(std::sync::atomic::Ordering::SeqCst), 1);
+    assert_eq!(delta.removed, 0, "{delta:?}");
+    assert!(table_dests(&api).contains(&fresh));
+
+    let delta = coord
+        .recompute_for("S-IVANOV", &res(Some(target())))
+        .expect("recompute");
+    assert!(
+        delta.is_noop(),
+        "the pass that plans it finds it: {delta:?}"
+    );
+
+    rules.set(only_a());
+    let delta = coord
+        .recompute_for("S-IVANOV", &res(Some(target())))
+        .expect("recompute");
+    assert_eq!(delta.removed, 1, "{delta:?}");
+    assert!(!table_dests(&api).contains(&fresh));
+}
+
+/// An empty cache whose next snapshot request runs `hook` first: something
+/// landing while a pass is between its resolve and its plan.
+#[derive(Default)]
+struct HookOnSnapshot {
+    live: MockFqdnCacheLookup,
+    hook: Mutex<Option<Box<dyn FnOnce() + Send>>>,
+}
+
+impl FqdnCacheLookup for HookOnSnapshot {
+    fn ips_for_hostname(&self, hostname: &str) -> Vec<IpAddr> {
+        self.live.ips_for_hostname(hostname)
+    }
+    fn hostnames_under_suffix(&self, suffix: &str, limit: usize) -> Vec<String> {
+        self.live.hostnames_under_suffix(suffix, limit)
+    }
+    fn hostnames_for_any_zone(&self, base: &str, limit: usize) -> Vec<String> {
+        self.live.hostnames_for_any_zone(base, limit)
+    }
+    fn snapshot_for_compute(&self) -> Option<crate::fqdn_cache_lookup::FqdnCacheSnapshot> {
+        let hook = self.hook.lock().unwrap_or_else(|p| p.into_inner()).take();
+        if let Some(hook) = hook {
+            hook();
+        }
+        None
+    }
+}
+
+/// The tunnel is recreated under a new interface and the pass that follows
+/// has resolved it, but not yet planned: a first contact landing then goes
+/// through the new interface, not the one the previous pass saw.
+#[test]
+fn a_first_contact_during_a_pass_takes_the_link_that_pass_resolved() {
+    let api = Arc::new(MockWindowsApi::new());
+    let vpn = adapter("vpn", 78, true, true, Some([10, 0, 0, 1]));
+    let vpn_id = vpn.stable_id();
+    api.set_adapter_infos(vec![vpn]);
+    let rules = Arc::new(FakeRules::new());
+    rules.set_secondary(
+        "S-IVANOV",
+        CanonicalRuleSet::from_rules(vec![ip_rule("a", 203, 0, 113, 1)]),
+    );
+    let policy = Arc::new(FakePolicy::new());
+    policy.bind_secondary("S-IVANOV", &vpn_id);
+    let cache = Arc::new(HookOnSnapshot::default());
+    let coord = Arc::new(SecondaryRouteCoordinator::new(
+        Arc::clone(&api) as Arc<dyn RouteTablePort>,
+        Arc::clone(&rules) as Arc<dyn RulesProvider>,
+        policy as Arc<dyn RoutePolicySource>,
+        Arc::clone(&cache) as Arc<dyn FqdnCacheLookup>,
+        Arc::new(|| false) as RuleScopeProvider,
+    ));
+    let sids = ["S-IVANOV".to_string()];
+    coord.recompute_active(&sids).expect("first pass");
+
+    // Same adapter, recreated under a new index.
+    let mut again = adapter("vpn", 79, true, true, Some([10, 0, 0, 1]));
+    again.mac = Some([0, 1, 2, 3, 4, 78]);
+    assert_eq!(again.stable_id(), vpn_id);
+    api.set_adapter_infos(vec![again]);
+    let fresh = Ipv4Addr::new(203, 0, 113, 2);
+    *cache.hook.lock().unwrap_or_else(|p| p.into_inner()) = Some({
+        let coord = Arc::downgrade(&coord);
+        let rules = Arc::clone(&rules);
+        Box::new(move || {
+            rules.set_secondary(
+                "S-IVANOV",
+                CanonicalRuleSet::from_rules(vec![
+                    ip_rule("a", 203, 0, 113, 1),
+                    ip_rule("b", 203, 0, 113, 2),
+                ]),
+            );
+            if let Some(coord) = coord.upgrade() {
+                coord.route_first_contact("S-IVANOV", &[IpAddr::V4(fresh)]);
+            }
+        }) as Box<dyn FnOnce() + Send>
+    });
+    coord.recompute_active(&sids).expect("second pass");
+
+    let links: Vec<u32> = api
+        .get_ip_forward_table()
+        .expect("table")
+        .iter()
+        .filter(|r| r.destination == IpAddr::V4(fresh))
+        .map(|r| r.interface_index)
+        .collect();
+    assert_eq!(links, vec![79], "never through the interface that is gone");
+}
+
+/// A pass that could not read the table names no LAN and no foreign tunnel, so
+/// a first contact after it would plan blind and could pull such an address
+/// into the tunnel: it waits for a pass that read the machine.
+#[test]
+fn a_first_contact_waits_out_a_pass_that_could_not_read_the_machine() {
+    let api = Arc::new(MockWindowsApi::new());
+    let rules = Arc::new(FakeRules::new());
+    rules.set_secondary(
+        "S-IVANOV",
+        CanonicalRuleSet::from_rules(vec![
+            ip_rule("a", 203, 0, 113, 1),
+            ip_rule("b", 203, 0, 113, 2),
+        ]),
+    );
+    let coord = coordinator(Arc::clone(&api), Arc::clone(&rules));
+    let fresh = [IpAddr::V4(Ipv4Addr::new(203, 0, 113, 2))];
+
+    api.set_route_table_read_error(Some("busy"));
+    // Its outcome does not matter here: only what it read.
+    let _ = coord.recompute_for("S-IVANOV", &res(Some(target())));
+    assert_eq!(coord.route_first_contact("S-IVANOV", &fresh), 0);
+
+    api.set_route_table_read_error(None);
+    coord
+        .recompute_for("S-IVANOV", &res(Some(target())))
+        .expect("recompute");
+    assert_eq!(coord.route_first_contact("S-IVANOV", &fresh), 1);
+}
+
 /// A rule host's IPv6 front is first contact like its IPv4 one: its `/128`
 /// goes in ahead of the full run through the link's v6 next hop — and only
 /// when the link has one, or the route would attract traffic into a black

@@ -4,6 +4,7 @@
 //! here, their IPC runs as backend jobs, and their long lists go a page at a
 //! time in both renderers.
 
+pub mod audit_restart;
 pub mod cache;
 pub mod diagnostics;
 pub(crate) mod keys;
@@ -228,13 +229,13 @@ fn page_lines(
 }
 
 /// One key for a line being typed.
-enum Edit {
+pub(crate) enum Edit {
     Typing,
     Done(String),
     Cancelled,
 }
 
-fn edit(buffer: &mut String, key: KeyEvent) -> Edit {
+pub(crate) fn edit(buffer: &mut String, key: KeyEvent) -> Edit {
     match key.code {
         KeyCode::Enter => Edit::Done(std::mem::take(buffer)),
         KeyCode::Esc => Edit::Cancelled,
@@ -251,7 +252,7 @@ fn edit(buffer: &mut String, key: KeyEvent) -> Edit {
 }
 
 /// The line being typed, with its label and how to finish it.
-fn typing_lines(texts: &Texts, label: &str, buffer: &str) -> Vec<ViewLine> {
+pub(crate) fn typing_lines(texts: &Texts, label: &str, buffer: &str) -> Vec<ViewLine> {
     vec![
         ViewLine::new(vec![Segment::strong(format!("{label}: {buffer}_"))]),
         ViewLine::text(texts.get(keys::TYPING_HINT)),

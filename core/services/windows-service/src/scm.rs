@@ -36,7 +36,9 @@ use nrr_platform_api::service_control::{ServiceControlError, ServiceControlPort}
 use nrr_platform_windows::event_log::WindowsEventLog;
 use nrr_platform_windows::service_control::WindowsServiceControl;
 use nrr_service_runtime::lifecycle_journal::LifecycleJournal;
-use nrr_service_runtime::lifecycle_matrix::StopReason;
+use nrr_service_runtime::lifecycle_matrix::{
+    stop_plan, FilterTeardown, LifecycleInputs, StopPlan, StopReason,
+};
 use nrr_service_runtime::{
     run_bootstrap, run_supervised_runtime, BootstrapConfig, InstallConfig, InstallOutcome,
     ServiceController, ServiceRuntimeState, StopToken, UninstallConfig, UninstallOutcome,
@@ -168,6 +170,10 @@ fn capture_stderr() {
 /// Non-zero, so SCM's recovery actions start the service again.
 const STOPPED_UNASKED: u32 = 2;
 
+/// The service-specific exit code of a stop that outran its hard limit:
+/// non-zero for the same reason, so the next start clears what it left.
+const STOP_OVERRAN: u32 = 3;
+
 /// Controls advertised while Running. Each entry is load-bearing, and an
 /// omission is silent: SCM simply never delivers that control. `SESSION_CHANGE`
 /// carries the sign-in the DNS resolver arms on; `PRESHUTDOWN` buys teardown
@@ -180,12 +186,54 @@ fn running_controls() -> ServiceControlAccept {
         | ServiceControlAccept::SESSION_CHANGE
 }
 
+/// How long a skipped restart may spend sweeping before SCM reads it as hung:
+/// the filter sweep's own budget, with room for the DNS and route passes.
+const SKIPPED_RESTART_SWEEP_HINT: Duration = Duration::from_secs(90);
+
+/// What a restart skipped at `stop`'s request takes down: the stop verb's own
+/// plan, not the after-crash one. The user stopped the service, so its blocks
+/// come off whatever the leak-guard setting — a block with no service to lift
+/// it is a lockout — and the dead instance's routes go with them.
+fn skipped_restart_plan(leak_guard_armed: bool) -> StopPlan {
+    stop_plan(
+        StopReason::ServiceStop,
+        LifecycleInputs {
+            leak_guard_armed,
+            keep_rule_routes_on_stop: false,
+        },
+    )
+}
+
+/// Carry out [`skipped_restart_plan`] on a machine with no service running.
+/// `true` when everything reachable went.
+fn sweep_after_skipped_restart() -> bool {
+    // Unknown counts as armed; the plan removes all either way, so the read
+    // only documents the input.
+    let plan = skipped_restart_plan(true);
+    if plan.filters == FilterTeardown::RemoveAll {
+        return matches!(
+            crate::runtime_deps::sweep_orphaned_machine_state(),
+            crate::runtime_deps::SweepOutcome::Done
+        );
+    }
+    nrr_platform_windows::dns_redirect::sweep_orphan_dns_state(
+        &nrr_platform_windows::dns_redirect::TransactedNrptStore,
+        &nrr_platform_windows::dns_redirect::WindowsSearchList,
+    )
+    .is_clean()
+}
+
 fn run_scm_inner(refused: Option<String>, lockdown: Duration) -> Result<(), ScmError> {
-    // Left by a stop that never arrived; it must not speak for a later one.
+    // Left by a stop that never arrived; they must not speak for a later one.
     let _ = nrr_platform_windows::service_control::take_deliberate_stop_marker();
+    let _ = nrr_platform_windows::service_control::take_upgrade_stop_marker();
+    // Read before the recovery actions come back: a restart skipped here
+    // leaves them off, as the stop did, for the next real start to restore.
+    let stay_stopped = nrr_platform_windows::service_control::take_stay_stopped_marker();
     // A deliberate stop takes the recovery actions off; a start puts them back.
-    let recovery_restored = std::env::current_exe()
-        .ok()
+    let recovery_restored = (!stay_stopped)
+        .then(std::env::current_exe)
+        .and_then(Result::ok)
         .map(|binary| nrr_platform_windows::service_control::restore_recovery_if_missing(&binary));
     let stop = StopToken::new();
     let stop_for_handler = stop.clone();
@@ -202,7 +250,9 @@ fn run_scm_inner(refused: Option<String>, lockdown: Duration) -> Result<(), ScmE
             // is indistinguishable from a process that died on its own.
             ServiceControl::Stop => {
                 tracing::info!(target: "nrr::lifecycle", msg_key = "svc-scm-control-received", control = "stop", "SCM control received");
-                if !nrr_platform_windows::service_control::take_deliberate_stop_marker() {
+                let deliberate =
+                    nrr_platform_windows::service_control::take_deliberate_stop_marker();
+                if !deliberate {
                     unasked_stop_for_handler.store(true, std::sync::atomic::Ordering::SeqCst);
                     let engine_down =
                         nrr_platform_windows::service_control::filtering_engine_running()
@@ -226,7 +276,14 @@ fn run_scm_inner(refused: Option<String>, lockdown: Duration) -> Result<(), ScmE
                         );
                     }
                 }
-                stop_for_handler.request_stop();
+                // An installer's stop leaves protection to the new instance.
+                let upgrade =
+                    deliberate && nrr_platform_windows::service_control::take_upgrade_stop_marker();
+                stop_for_handler.request_stop_for(if upgrade {
+                    StopReason::Upgrade
+                } else {
+                    StopReason::ServiceStop
+                });
                 ServiceControlHandlerResult::NoError
             }
             // The machine is going down: the teardown hands DNS back and keeps
@@ -280,6 +337,42 @@ fn run_scm_inner(refused: Option<String>, lockdown: Duration) -> Result<(), ScmE
         });
         return Err(ScmError::Handler(reason));
     }
+    // Ends cleanly: an error code would schedule the next restart. First the
+    // dead instance's leftovers go, as the stop would have taken them: nothing
+    // else is coming to lift its blocks or hand the system DNS back.
+    if stay_stopped {
+        eprintln!(
+            "nrr-service: a restart scheduled before `nrr-cli stop` was skipped; the service stays stopped as asked"
+        );
+        // The sweep is RPC into the filtering engine under its own budget; a
+        // pending state with that much wait hint keeps SCM from calling it a hang.
+        let _ = status_handle.set_service_status(ServiceStatus {
+            service_type: ServiceType::OWN_PROCESS,
+            current_state: ServiceState::StartPending,
+            controls_accepted: ServiceControlAccept::empty(),
+            exit_code: ServiceExitCode::Win32(0),
+            checkpoint: 1,
+            wait_hint: SKIPPED_RESTART_SWEEP_HINT,
+            process_id: None,
+        });
+        if sweep_after_skipped_restart() {
+            eprintln!("nrr-service: what the stopped instance left on the machine was removed");
+        } else {
+            eprintln!(
+                "nrr-service: what the stopped instance left could not all be removed; run `nrr-cli reset-network --confirm` or reboot"
+            );
+        }
+        let _ = status_handle.set_service_status(ServiceStatus {
+            service_type: ServiceType::OWN_PROCESS,
+            current_state: ServiceState::Stopped,
+            controls_accepted: ServiceControlAccept::empty(),
+            exit_code: ServiceExitCode::Win32(0),
+            checkpoint: 0,
+            wait_hint: Duration::from_secs(0),
+            process_id: None,
+        });
+        return Ok(());
+    }
 
     // Build a controller that reports state to SCM. The runtime body
     // calls `report` synchronously; SCM accepts repeated `Running`
@@ -330,9 +423,11 @@ fn run_scm_inner(refused: Option<String>, lockdown: Duration) -> Result<(), ScmE
                 service_type: ServiceType::OWN_PROCESS,
                 current_state: scm_state,
                 controls_accepted,
-                exit_code: if scm_state == ServiceState::Stopped
-                    && self.unasked_stop.load(std::sync::atomic::Ordering::SeqCst)
-                {
+                exit_code: if scm_state != ServiceState::Stopped {
+                    ServiceExitCode::Win32(0)
+                } else if nrr_service_runtime::supervised_runtime::stop_overran() {
+                    ServiceExitCode::ServiceSpecific(STOP_OVERRAN)
+                } else if self.unasked_stop.load(std::sync::atomic::Ordering::SeqCst) {
                     ServiceExitCode::ServiceSpecific(STOPPED_UNASKED)
                 } else {
                     ServiceExitCode::Win32(0)
@@ -553,6 +648,26 @@ mod tests {
         assert_ne!(
             other.exit_code(),
             nrr_platform_api::service_control::RELOCATION_FAILED_EXIT_CODE
+        );
+    }
+
+    /// A restart skipped for `stop` leaves nothing of the dead instance behind:
+    /// its blocks and routes go whatever the leak-guard setting, unlike the
+    /// after-crash sweep, which keeps a block someone asked for.
+    #[test]
+    fn a_skipped_restart_sweeps_everything_the_dead_instance_left() {
+        use nrr_service_runtime::lifecycle_matrix::RouteTeardown;
+        for armed in [false, true] {
+            let plan = skipped_restart_plan(armed);
+            assert_eq!(plan.filters, FilterTeardown::RemoveAll, "armed={armed}");
+            assert_eq!(plan.routes, RouteTeardown::RemoveAll, "armed={armed}");
+        }
+        assert_ne!(
+            skipped_restart_plan(true),
+            nrr_service_runtime::lifecycle_matrix::after_crash_plan(LifecycleInputs {
+                leak_guard_armed: true,
+                keep_rule_routes_on_stop: false,
+            })
         );
     }
 

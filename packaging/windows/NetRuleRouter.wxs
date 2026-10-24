@@ -40,7 +40,8 @@
   <Package Name="NetRuleRouter" Manufacturer="NetRuleRouter" Version="$(var.Version)"
            UpgradeCode="32814437-D697-4AC1-B07C-BD46DE72F89C" Scope="perMachine"
            Language="1033">
-    <!-- Pre-release builds share one numeric version; each must still replace the last. -->
+    <!-- The pre-release is in the third field, so an older one is a downgrade;
+         builds of one pre-release share a version and each replaces the last. -->
     <MajorUpgrade AllowSameVersionUpgrades="yes"
                   DowngradeErrorMessage="A newer version of NetRuleRouter is already installed." />
     <MediaTemplate EmbedCab="yes" CompressionLevel="high" />
@@ -119,6 +120,10 @@
     <SetProperty Id="NrrMarkStop" Sequence="execute" Before="NrrMarkStop"
                  Condition="Installed"
                  Value="&quot;$(var.SysDir)WindowsPowerShell\v1.0\powershell.exe&quot; -NoProfile -NonInteractive -ExecutionPolicy Bypass -File &quot;[INSTALLFOLDER]scripts\setup-actions.ps1&quot; -Action MarkStop" />
+    <!-- A newer MSI replacing this one: the stop leaves protection in place. -->
+    <SetProperty Action="SetNrrMarkStopUpgrade" Id="NrrMarkStop" Sequence="execute"
+                 After="SetNrrMarkStop" Condition="Installed AND UPGRADINGPRODUCTCODE"
+                 Value="&quot;$(var.SysDir)WindowsPowerShell\v1.0\powershell.exe&quot; -NoProfile -NonInteractive -ExecutionPolicy Bypass -File &quot;[INSTALLFOLDER]scripts\setup-actions.ps1&quot; -Action MarkStop -Upgrade" />
 
     <!-- The installing user's own data, as that user: the elevated half runs as
          SYSTEM, whose profile never held any. -->

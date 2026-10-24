@@ -93,11 +93,12 @@ function Test-ServiceDeletePending {
     catch { return $false }
 }
 
-# The deliberate-stop marker, or $null unless the data root is a real directory
-# owned by SYSTEM or Administrators: anyone may create folders in ProgramData,
-# and a planted root or a link in it would steer this elevated write onto
-# another file. ProgramData comes from Windows, not from the environment.
-function Get-NrrDeliberateStopMarker {
+# The service's data root, or $null unless it is a real directory owned by
+# SYSTEM or Administrators: anyone may create folders in ProgramData, and a
+# planted root or a link in it would steer an elevated write onto another file
+# or feed this script notes nobody of ours wrote. ProgramData comes from
+# Windows, not from the environment.
+function Get-NrrProtectedDataRoot {
     $programData = [Environment]::GetFolderPath('CommonApplicationData')
     if (-not $programData) { return $null }
     $root = Join-Path $programData $NrrProductName
@@ -107,7 +108,38 @@ function Get-NrrDeliberateStopMarker {
     try { $owner = (Get-Acl -LiteralPath $root).GetOwner([Security.Principal.SecurityIdentifier]).Value }
     catch { return $null }
     if ($owner -notin @('S-1-5-18', 'S-1-5-32-544')) { return $null }
+    return $root
+}
+
+# The deliberate-stop marker, or $null without a protected data root.
+function Get-NrrDeliberateStopMarker {
+    $root = Get-NrrProtectedDataRoot
+    if (-not $root) { return $null }
     return Join-Path $root 'deliberate-stop'
+}
+
+# The lines of a note the service keeps in its data root, or $null when there
+# is none to trust: no protected root, no plain file, or one larger than any
+# note the service writes.
+function Read-NrrStateNote {
+    param([string] $Name, [int] $MaxBytes = 65536)
+    $root = Get-NrrProtectedDataRoot
+    if (-not $root) { return $null }
+    $path = Join-Path $root $Name
+    $item = Get-Item -LiteralPath $path -Force -ErrorAction SilentlyContinue
+    if (-not $item -or $item.PSIsContainer) { return $null }
+    if ($item.Attributes -band [IO.FileAttributes]::ReparsePoint) { return $null }
+    if ($item.Length -gt $MaxBytes) { return $null }
+    try { $text = [IO.File]::ReadAllText($path) }
+    catch { return $null }
+    return @($text -split "`r?`n" | ForEach-Object { $_.Trim() } | Where-Object { $_ })
+}
+
+function Remove-NrrStateNote {
+    param([string] $Name)
+    $root = Get-NrrProtectedDataRoot
+    if (-not $root) { return }
+    Remove-Item -LiteralPath (Join-Path $root $Name) -Force -ErrorAction SilentlyContinue
 }
 
 # Marks the next stop as wanted: the service restarts itself after any stop
@@ -122,6 +154,20 @@ function Set-NrrDeliberateStop {
         [System.IO.File]::Open($mark, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write).Dispose()
     }
     catch { Write-Host "    could not mark the stop as wanted: $($_.Exception.Message)" }
+}
+
+# Marks the next stop as an installer's (UPGRADE_STOP_MARKER in platform/windows
+# service_control.rs): the service keeps its protection in place for the new
+# files' instance. Same care as Set-NrrDeliberateStop.
+function Set-NrrUpgradeStop {
+    $root = Get-NrrProtectedDataRoot
+    if (-not $root) { return }
+    $mark = Join-Path $root 'upgrade-stop'
+    try {
+        Remove-Item -LiteralPath $mark -Force -ErrorAction SilentlyContinue
+        [System.IO.File]::Open($mark, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write).Dispose()
+    }
+    catch { Write-Host "    could not mark the stop as an upgrade's: $($_.Exception.Message)" }
 }
 
 # Stops the service as a wanted stop; returns sc's exit code. A refused stop (a
@@ -395,4 +441,130 @@ function Remove-NrrWfpFilters {
         return $false
     }
     return ($result[1] -eq $result[0])
+}
+
+# The global DNS suffix list the service wrote outlives a reboot, and while it
+# stands Windows completes single-label names with it alone. Taken back only
+# while every entry is one the note lists (search_list.rs release_search_list):
+# a list someone else set since stays. $true when nothing failed.
+$NrrSearchListNote = 'dns-search-list.owned'
+
+function Restore-NrrDnsSearchList {
+    $noted = @(Read-NrrStateNote -Name $NrrSearchListNote |
+            ForEach-Object { $_.Trim('.').ToLowerInvariant() } | Where-Object { $_ })
+    if ($noted.Count -eq 0) { return $true }
+    Write-Host "--> taking back the DNS suffix search list we wrote"
+    try {
+        $raw = (Get-ItemProperty -LiteralPath 'HKLM:\SYSTEM\CurrentControlSet\Services\Tcpip\Parameters' `
+                -Name SearchList -ErrorAction SilentlyContinue).SearchList
+        $global = @("$raw" -split ',' | ForEach-Object { $_.Trim().Trim('.').ToLowerInvariant() } |
+                Where-Object { $_ })
+        $ours = $global.Count -gt 0 -and -not ($global | Where-Object { $noted -notcontains $_ })
+        if ($ours) {
+            # Through the DNS client: a registry write alone stays unseen until a reboot.
+            Set-DnsClientGlobalSetting -SuffixSearchList @('') -ErrorAction Stop
+            Write-Host "    cleared: $($global -join ', ')"
+        }
+        else {
+            Write-Host "    the list in force is not ours; left as it is"
+        }
+    }
+    catch {
+        Write-Warning "DNS suffix search list could not be taken back: $($_.Exception.Message)"
+        return $false
+    }
+    Remove-NrrStateNote -Name $NrrSearchListNote
+    return $true
+}
+
+# Machine-wide Base Filtering Engine options the connection observer switches
+# on (wfp_events.rs): an instance killed rather than stopped leaves BFE writing
+# a net event for every classify on the host. The note holds what they were.
+$NrrWfpOptionsNote = 'wfp-engine-options.prior'
+$NrrWfpCollectWritten = 1
+$NrrWfpKeywordsWritten = 16
+
+$NrrWfpOptionsSource = @'
+using System;
+using System.Runtime.InteropServices;
+public static class NrrWfpEngineOptions {
+    [StructLayout(LayoutKind.Sequential)]
+    struct FwpValue { public uint Type; public IntPtr Value; }
+    [DllImport("fwpuclnt.dll")] static extern uint FwpmEngineOpen0([MarshalAs(UnmanagedType.LPWStr)] string server, uint authn, IntPtr identity, IntPtr session, out IntPtr engine);
+    [DllImport("fwpuclnt.dll")] static extern uint FwpmEngineClose0(IntPtr engine);
+    [DllImport("fwpuclnt.dll")] static extern uint FwpmEngineGetOption0(IntPtr engine, uint option, out IntPtr value);
+    [DllImport("fwpuclnt.dll")] static extern uint FwpmEngineSetOption0(IntPtr engine, uint option, ref FwpValue value);
+    [DllImport("fwpuclnt.dll")] static extern void FwpmFreeMemory0(ref IntPtr memory);
+    const uint RpcAuthnWinNt = 10;
+    const uint Uint32Type = 3;
+    const uint CollectNetEvents = 0;
+    const uint MatchAnyKeywords = 1;
+
+    // Puts an option back only while it still holds what we wrote: something
+    // else may have taken it over since. 0, or the error of the write.
+    static uint PutBack(IntPtr engine, uint option, long prior, uint written) {
+        if (prior < 0) return 0;
+        IntPtr current;
+        if (FwpmEngineGetOption0(engine, option, out current) != 0 || current == IntPtr.Zero) return 0;
+        bool ours;
+        try {
+            FwpValue found = (FwpValue)Marshal.PtrToStructure(current, typeof(FwpValue));
+            ours = found.Type == Uint32Type && (uint)(found.Value.ToInt64() & 0xFFFFFFFF) == written;
+        }
+        finally { FwpmFreeMemory0(ref current); }
+        if (!ours) return 0;
+        FwpValue value = new FwpValue();
+        value.Type = Uint32Type;
+        value.Value = new IntPtr((long)(uint)prior);
+        return FwpmEngineSetOption0(engine, option, ref value);
+    }
+
+    // A prior of -1 is an option the note does not name. { open, collect, keywords } errors.
+    public static uint[] Restore(long collect, long keywords, uint collectWritten, uint keywordsWritten) {
+        IntPtr engine;
+        uint code = FwpmEngineOpen0(null, RpcAuthnWinNt, IntPtr.Zero, IntPtr.Zero, out engine);
+        if (code != 0) return new uint[] { code, 0, 0 };
+        try {
+            return new uint[] {
+                0,
+                PutBack(engine, CollectNetEvents, collect, collectWritten),
+                PutBack(engine, MatchAnyKeywords, keywords, keywordsWritten)
+            };
+        }
+        finally { FwpmEngineClose0(engine); }
+    }
+}
+'@
+
+# $true when nothing failed; without a note nothing of ours was changed.
+function Restore-NrrWfpEngineOptions {
+    $collect = -1
+    $keywords = -1
+    foreach ($line in @(Read-NrrStateNote -Name $NrrWfpOptionsNote -MaxBytes 4096)) {
+        $pair = $line -split '=', 2
+        $value = [uint32]0
+        if ($pair.Count -ne 2 -or -not [uint32]::TryParse($pair[1].Trim(), [ref]$value)) { continue }
+        switch ($pair[0].Trim()) {
+            'collect' { $collect = [long]$value }
+            'keywords' { $keywords = [long]$value }
+        }
+    }
+    if ($collect -lt 0 -and $keywords -lt 0) { return $true }
+    Write-Host "--> handing the Base Filtering Engine options back"
+    try {
+        if (-not ('NrrWfpEngineOptions' -as [type])) { Add-Type -TypeDefinition $NrrWfpOptionsSource -ErrorAction Stop }
+        $result = [NrrWfpEngineOptions]::Restore($collect, $keywords, $NrrWfpCollectWritten, $NrrWfpKeywordsWritten)
+    }
+    catch {
+        Write-Warning "BFE options could not be handed back: $($_.Exception.Message)"
+        return $false
+    }
+    $failed = @($result | Where-Object { $_ -ne 0 })
+    if ($failed.Count -gt 0) {
+        Write-Warning ("BFE options could not be handed back: Win32 error 0x{0:X8}" -f $failed[0])
+        return $false
+    }
+    Remove-NrrStateNote -Name $NrrWfpOptionsNote
+    Write-Host "    done"
+    return $true
 }

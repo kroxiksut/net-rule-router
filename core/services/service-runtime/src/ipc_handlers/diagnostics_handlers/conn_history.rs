@@ -10,13 +10,13 @@ use super::*;
 
 use nrr_shared::ipc_payloads::{
     ConnHistoryClearRequest, ConnHistoryClearResponse, ConnHistoryEntryDto, ConnHistoryListRequest,
-    ConnHistoryListResponse, ConnHistorySettingsSetRequest, ConnHistorySettingsSetResponse,
-    CONN_HISTORY_MAX_PROGRAM_FILTER, CONN_HISTORY_VERDICTS,
+    ConnHistoryListResponse, ConnHistoryPageKey, ConnHistorySettingsSetRequest,
+    ConnHistorySettingsSetResponse, CONN_HISTORY_MAX_PROGRAM_FILTER, CONN_HISTORY_VERDICTS,
 };
 use nrr_storage::conn_history::MAX_RETENTION_DAYS;
 
 use super::conn_trace::exe_name;
-use crate::conn_history::{ConnHistory, HistoryError, HistoryRead};
+use crate::conn_history::{ConnHistory, ConnHistoryCursor, HistoryError, HistoryRead};
 use crate::conn_observation_consumer::now_unix_ms;
 
 const OP_LIST: &str = "conn-history.list";
@@ -93,11 +93,25 @@ impl IpcHandler for ConnHistoryListHandler {
         if verdict.is_some_and(|v| !CONN_HISTORY_VERDICTS.contains(&v)) {
             return Err(malformed_msg(OP_LIST, "unknown verdict"));
         }
+        let page_key = req
+            .pagination
+            .cursor
+            .as_ref()
+            .map(|c| {
+                ConnHistoryPageKey::decode(c)
+                    .ok_or_else(|| malformed_msg(OP_LIST, "cursor was not issued by this list"))
+            })
+            .transpose()?;
         let now_ms = now_unix_ms();
         let from_ms = u64::try_from(req.from_unix_ms).unwrap_or(0);
-        let to_ms = req
-            .to_unix_ms
-            .map_or(now_ms, |t| u64::try_from(t).unwrap_or(0));
+        // A continuing page keeps the end its first page was read to, so the
+        // order the cursor points into cannot move under it.
+        let to_ms = match &page_key {
+            Some(k) => u64::try_from(k.to_ms).unwrap_or(0),
+            None => req
+                .to_unix_ms
+                .map_or(now_ms, |t| u64::try_from(t).unwrap_or(0)),
+        };
         if to_ms < from_ms {
             return Err(malformed_msg(OP_LIST, "the period ends before it starts"));
         }
@@ -124,20 +138,22 @@ impl IpcHandler for ConnHistoryListHandler {
         }
 
         let limit = req.pagination.effective_page_size();
-        let offset = req
-            .pagination
-            .cursor
-            .as_ref()
-            .and_then(|c| c.parse())
-            .map(|(o, _)| u32::try_from(o.max(0)).unwrap_or(u32::MAX))
-            .unwrap_or(0);
+        let after = page_key.as_ref().map(|k| ConnHistoryCursor {
+            last_ms: k.last_ms,
+            program: k.program.clone(),
+            host: k.host.clone(),
+            remote_ip: k.remote_ip.clone(),
+            route: k.route.clone(),
+            verdict: k.verdict.clone(),
+            blocked_by: k.blocked_by.clone(),
+        });
         let read = HistoryRead {
             principal: Some(caller_sid.as_str()),
             from_ms,
             to_ms,
             program,
             verdict,
-            offset,
+            after: after.as_ref(),
             limit: limit.saturating_add(1),
         };
         let (rows, removed, skipped) = match history.read(&read, now_ms) {
@@ -148,6 +164,23 @@ impl IpcHandler for ConnHistoryListHandler {
             Err(e) => return Err(history_error(OP_LIST, e)),
         };
         let has_more = rows.len() as u32 > limit;
+        let next_cursor = rows
+            .get(limit as usize - 1)
+            .filter(|_| has_more)
+            .map(|last| {
+                let key = ConnHistoryCursor::after(last);
+                ConnHistoryPageKey {
+                    to_ms: i64::try_from(to_ms).unwrap_or(i64::MAX),
+                    last_ms: key.last_ms,
+                    program: key.program,
+                    host: key.host,
+                    remote_ip: key.remote_ip,
+                    route: key.route,
+                    verdict: key.verdict,
+                    blocked_by: key.blocked_by,
+                }
+                .encode()
+            });
         let items = rows
             .into_iter()
             .take(limit as usize)
@@ -169,9 +202,6 @@ impl IpcHandler for ConnHistoryListHandler {
                 attempts: e.attempts,
             })
             .collect();
-        let next_cursor = has_more.then(|| {
-            PageCursor::from_position(i64::from(offset) + i64::from(limit), "conn-history")
-        });
         serialise(
             OP_LIST,
             ConnHistoryListResponse {
@@ -405,6 +435,69 @@ mod tests {
             list(&ring, &ctx(None, false)).page.items.is_empty(),
             "an unattributed caller owns nothing"
         );
+    }
+
+    fn page(
+        handler: &ConnHistoryListHandler,
+        cursor: Option<nrr_shared::pagination::PageCursor>,
+    ) -> ConnHistoryListResponse {
+        let payload = serde_json::to_value(ConnHistoryListRequest {
+            pagination: nrr_shared::pagination::PaginationParams {
+                cursor,
+                page_size: 1,
+            },
+            ..ConnHistoryListRequest::default()
+        })
+        .expect("encode");
+        let value = handler
+            .handle(
+                &req(IpcOperationName::ConnHistoryList, payload),
+                &ctx(Some(ALICE), false),
+            )
+            .expect("page");
+        serde_json::from_value(value).expect("decode")
+    }
+
+    #[test]
+    fn a_walk_over_pages_sees_each_destination_once_while_rows_arrive() {
+        let (_dir, ring) = wired();
+        ring.push(row(ALICE, r"C:\Apps\alice.exe", 3));
+        ring.push(row(ALICE, r"C:\Apps\alice.exe", 4));
+        let handler = ConnHistoryListHandler::new(Arc::clone(&ring));
+        let mut seen = Vec::new();
+        let mut cursor = None;
+        loop {
+            let answer = page(&handler, cursor);
+            seen.extend(answer.page.items.into_iter().map(|e| e.remote_ip));
+            // A destination that turns newest mid-walk must not jump back
+            // to the start nor repeat the last row of the page before.
+            ring.push(row(ALICE, r"C:\Apps\alice.exe", 1));
+            cursor = answer.page.next_cursor;
+            if cursor.is_none() {
+                break;
+            }
+        }
+        let mut unique = seen.clone();
+        unique.sort();
+        unique.dedup();
+        assert_eq!(seen.len(), 3, "{seen:?}");
+        assert_eq!(unique.len(), 3, "{seen:?}");
+    }
+
+    #[test]
+    fn a_cursor_the_list_did_not_issue_is_refused() {
+        let (_dir, ring) = wired();
+        let handler = ConnHistoryListHandler::new(ring);
+        let err = handler
+            .handle(
+                &req(
+                    IpcOperationName::ConnHistoryList,
+                    serde_json::json!({ "pagination": { "cursor": "200|conn-history", "page_size": 1 } }),
+                ),
+                &ctx(Some(ALICE), false),
+            )
+            .expect_err("refused");
+        assert_eq!(err.code, IpcErrorCode::MalformedRequest);
     }
 
     #[test]

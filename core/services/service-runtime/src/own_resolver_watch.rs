@@ -12,7 +12,7 @@ use std::net::IpAddr;
 use std::sync::{Arc, Mutex};
 
 use nrr_domain::own_resolver::{
-    is_encrypted_dns_contact, is_nameable_destination, resolves_names_itself, OwnResolverEvidence,
+    is_nameable_destination, is_resolver_contact, resolves_names_itself, OwnResolverEvidence,
     OWN_RESOLVER_UNNAMED_CONFIRMATIONS,
 };
 use nrr_storage::doh_lockdown::DohTarget;
@@ -203,7 +203,7 @@ impl OwnResolverWatch {
         }
         let program = nrr_domain::app_offer::program_name(path);
         let ip = rec.remote.ip();
-        let contact = is_encrypted_dns_contact(rec.remote, self.known.lists(rec));
+        let contact = is_resolver_contact(rec.remote, self.known.lists(rec));
         if program.is_empty() || (!contact && !is_nameable_destination(ip)) {
             return None;
         }
@@ -364,6 +364,20 @@ mod tests {
         assert!(run(&watch(), by_name, 3).is_some());
         let dot = row(Ipv4Addr::new(198, 51, 100, 2), 853, &[], 0);
         assert!(run(&watch(), dot, 3).is_some());
+    }
+
+    /// `nslookup` against a server of its own, a c-ares program with its own
+    /// servers, a hypervisor relaying its guests' lookups: plain DNS past ours.
+    #[test]
+    fn plain_dns_to_a_server_of_its_own_counts() {
+        let router = row(Ipv4Addr::new(192, 168, 1, 1), 53, &[], 0);
+        assert!(run(&watch(), router, 3).is_some());
+        let ours = row(Ipv4Addr::LOCALHOST, 53, &[], 0);
+        assert_eq!(
+            run(&watch(), ours, 3),
+            None,
+            "asking ours is the system's way"
+        );
     }
 
     #[test]

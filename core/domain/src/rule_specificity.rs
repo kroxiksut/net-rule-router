@@ -9,7 +9,7 @@
 //!
 //! Pure and total: no I/O, no clock, ordering fully determined by the inputs.
 
-use crate::canonical::{CanonicalAddressMatch, CanonicalRule, CanonicalRuleSet};
+use crate::canonical::{CanonicalAddressMatch, CanonicalRule, CanonicalRuleBook, CanonicalRuleSet};
 use crate::decision_matching::{match_any_zone_domain, match_suffix_domain, match_zone};
 
 /// Strength of a rule set's claim on one hostname. Ordered least to most
@@ -32,23 +32,32 @@ pub enum MatchSpecificity {
     ExactFqdn,
 }
 
-/// The strongest claim `set` has on `hostname`, or `None` when nothing in it
-/// matches by address.
+/// The strongest claim `set`, one of `book`'s two sets, has on `hostname`, or
+/// `None` when nothing in it matches by address.
 ///
 /// Address matches only: an app-scoped rule says nothing about who owns an
 /// address, and an exact-IP rule claims an address rather than a name — the
 /// caller comparing two hostnames' claims must not read either as coverage.
-pub fn match_specificity(hostname: &str, set: &CanonicalRuleSet) -> Option<MatchSpecificity> {
+pub fn match_specificity(
+    hostname: &str,
+    set: &CanonicalRuleSet,
+    book: &CanonicalRuleBook,
+) -> Option<MatchSpecificity> {
     set.rules()
         .iter()
         .filter(|rule| rule.enabled)
-        .filter_map(|rule| rule_match_specificity(hostname, rule))
+        .filter_map(|rule| rule_match_specificity(hostname, rule, book))
         .max()
 }
 
-/// One rule's claim on `hostname`, enabled or not; `None` when it does not
-/// match by name.
-pub fn rule_match_specificity(hostname: &str, rule: &CanonicalRule) -> Option<MatchSpecificity> {
+/// One rule of `book`'s claim on `hostname`, enabled or not; `None` when it
+/// does not match by name. A `base.*` rule claims nothing where a rule of
+/// either set names that zone outright, as in the decision engine.
+pub fn rule_match_specificity(
+    hostname: &str,
+    rule: &CanonicalRule,
+    book: &CanonicalRuleBook,
+) -> Option<MatchSpecificity> {
     match &rule.address_match {
         Some(CanonicalAddressMatch::ExactFqdn(name)) if name == hostname => {
             Some(MatchSpecificity::ExactFqdn)
@@ -61,6 +70,7 @@ pub fn rule_match_specificity(hostname: &str, rule: &CanonicalRule) -> Option<Ma
             })
         }
         Some(CanonicalAddressMatch::AnyZoneDomain(base)) => match_any_zone_domain(hostname, base)
+            .filter(|named| !book.names_suffix_outright(named))
             .map(|named| MatchSpecificity::SuffixDomain {
                 label_len: named.len(),
             }),
@@ -95,6 +105,23 @@ mod tests {
         CanonicalRuleSet::from_rules(rules)
     }
 
+    fn suffix(id: &str, label: &str) -> CanonicalRule {
+        rule(id, CanonicalAddressMatch::SuffixDomain(label.into()))
+    }
+
+    fn any_zone(id: &str, base: &str) -> CanonicalRule {
+        rule(id, CanonicalAddressMatch::AnyZoneDomain(base.into()))
+    }
+
+    /// `set`'s claim in a book whose other set is empty.
+    fn claim_in_own_book(hostname: &str, set: &CanonicalRuleSet) -> Option<MatchSpecificity> {
+        let book = CanonicalRuleBook {
+            primary: set.clone(),
+            secondary: CanonicalRuleSet::default(),
+        };
+        match_specificity(hostname, &book.primary, &book)
+    }
+
     #[test]
     fn a_name_beats_a_suffix_beats_a_zone() {
         assert!(MatchSpecificity::ExactFqdn > MatchSpecificity::SuffixDomain { label_len: 99 });
@@ -115,7 +142,7 @@ mod tests {
             CanonicalAddressMatch::SuffixDomain("ai.search.example".into()),
         )]);
         let host = "studio.ai.search.example";
-        assert!(match_specificity(host, &narrow) > match_specificity(host, &wide));
+        assert!(claim_in_own_book(host, &narrow) > claim_in_own_book(host, &wide));
     }
 
     #[test]
@@ -132,7 +159,7 @@ mod tests {
             ),
         ]);
         assert_eq!(
-            match_specificity("aistudio.search.example", &mixed),
+            claim_in_own_book("aistudio.search.example", &mixed),
             Some(MatchSpecificity::ExactFqdn)
         );
     }
@@ -150,8 +177,8 @@ mod tests {
             CanonicalAddressMatch::SuffixDomain("search.example".into()),
         )]);
         assert!(
-            match_specificity("aistudio.search.example", &secondary)
-                > match_specificity("workspace.search.example", &primary)
+            claim_in_own_book("aistudio.search.example", &secondary)
+                > claim_in_own_book("workspace.search.example", &primary)
         );
     }
 
@@ -162,14 +189,14 @@ mod tests {
             CanonicalAddressMatch::ExactFqdn("other.example".into()),
         )]);
         assert_eq!(
-            match_specificity("report.telemetry.example", &unrelated),
+            claim_in_own_book("report.telemetry.example", &unrelated),
             None
         );
         // A disabled rule claims nothing either.
         let mut disabled = rule("d", CanonicalAddressMatch::ExactFqdn("host.example".into()));
         disabled.enabled = false;
         assert_eq!(
-            match_specificity("host.example", &set(vec![disabled])),
+            claim_in_own_book("host.example", &set(vec![disabled])),
             None
         );
     }
@@ -180,8 +207,36 @@ mod tests {
             "r",
             CanonicalAddressMatch::SuffixDomain("example.com".into()),
         )]);
-        assert!(match_specificity("example.com", &s).is_some());
-        assert!(match_specificity("cdn.example.com", &s).is_some());
-        assert_eq!(match_specificity("notexample.com", &s), None);
+        assert!(claim_in_own_book("example.com", &s).is_some());
+        assert!(claim_in_own_book("cdn.example.com", &s).is_some());
+        assert_eq!(claim_in_own_book("notexample.com", &s), None);
+    }
+
+    #[test]
+    fn an_any_zone_rule_claims_nothing_where_a_rule_names_its_zone() {
+        let book = CanonicalRuleBook {
+            primary: set(vec![suffix("p", "example.by")]),
+            secondary: set(vec![any_zone("s", "example")]),
+        };
+        let host = "www.example.by";
+        assert_eq!(match_specificity(host, &book.secondary, &book), None);
+        assert_eq!(
+            match_specificity(host, &book.primary, &book),
+            Some(MatchSpecificity::SuffixDomain { label_len: 10 })
+        );
+        // Elsewhere the any-zone rule still claims its site.
+        assert_eq!(
+            match_specificity("www.example.com", &book.secondary, &book),
+            Some(MatchSpecificity::SuffixDomain { label_len: 11 })
+        );
+    }
+
+    #[test]
+    fn an_any_zone_rule_claims_a_site_under_a_country_second_level() {
+        let s = set(vec![any_zone("s", "google")]);
+        assert_eq!(
+            claim_in_own_book("www.google.com.vn", &s),
+            Some(MatchSpecificity::SuffixDomain { label_len: 13 })
+        );
     }
 }

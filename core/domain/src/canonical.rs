@@ -500,6 +500,14 @@ impl VerifyKey {
     }
 }
 
+/// A verdict a check reached: the `?` rule `key` names does not reach `host`
+/// over the route it is written for, and the other route does.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct VerifyMove {
+    pub key: VerifyKey,
+    pub host: String,
+}
+
 /// The handle clients echo back: `primary:*.mail.example.net`.
 impl fmt::Display for VerifyKey {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -619,15 +627,56 @@ impl CanonicalRuleBook {
     }
 
     /// The book as enforcement must see it: every [`RuleAction::Verify`]
-    /// rule is a `Route` of its own set, except one `moved` names (a verdict
-    /// the user has not accepted yet), which is a `Route` of the other set.
-    /// Enforcement-only, like [`Self::with_subdomain_coverage`] and applied
-    /// before it; never stored, hashed or written back.
-    pub fn with_verify_effective(&self, moved: &HashSet<VerifyKey>) -> CanonicalRuleBook {
+    /// rule is a `Route` of its own set. A verdict in `moved` the user has not
+    /// accepted yet moves what it proved: a rule for one destination goes to
+    /// the other set whole, and a wider rule stays where it is written while
+    /// each proven host gets an exact rule of the other set, which outranks
+    /// it. A page can make the check prove any host under `*.github.io`; that
+    /// host is all it moves. Enforcement-only, like
+    /// [`Self::with_subdomain_coverage`] and applied before it; never stored,
+    /// hashed or written back.
+    pub fn with_verify_effective(&self, moved: &HashSet<VerifyMove>) -> CanonicalRuleBook {
         let is_verify = |r: &CanonicalRule| r.action == RuleAction::Verify;
-        // `moved` holds a handful of keys at most: a scan beats building one.
+        let one_destination = |r: &CanonicalRule| {
+            matches!(
+                r.address_match,
+                Some(CanonicalAddressMatch::ExactFqdn(_) | CanonicalAddressMatch::ExactIp(_))
+            )
+        };
+        // `moved` holds a handful of verdicts at most: a scan beats an index.
+        let moves = |written: RouteRole, r: &CanonicalRule| -> Vec<&VerifyMove> {
+            if !is_verify(r) {
+                return Vec::new();
+            }
+            moved.iter().filter(|m| m.key.names(written, r)).collect()
+        };
         let is_moved = |written: RouteRole, r: &CanonicalRule| {
-            is_verify(r) && moved.iter().any(|k| k.names(written, r))
+            one_destination(r) && !moves(written, r).is_empty()
+        };
+        // An exact rule of the other set for each host a wider rule proved.
+        let proven_hosts = |written: RouteRole, r: &CanonicalRule| -> Vec<CanonicalRule> {
+            if one_destination(r) {
+                return Vec::new();
+            }
+            moves(written, r)
+                .into_iter()
+                .map(|m| {
+                    let host = m.host.trim().trim_end_matches('.').to_ascii_lowercase();
+                    let address = host.parse::<IpAddr>().map_or_else(
+                        |_| CanonicalAddressMatch::ExactFqdn(host.clone()),
+                        CanonicalAddressMatch::ExactIp,
+                    );
+                    CanonicalRule {
+                        id: crate::RuleId(format!("{}~{host}", r.id.0)),
+                        enabled: true,
+                        address_match: Some(address),
+                        app_match: None,
+                        comment: String::new(),
+                        action: RuleAction::Route,
+                        origin: None,
+                    }
+                })
+                .collect()
         };
         if !self
             .primary
@@ -649,7 +698,7 @@ impl CanonicalRuleBook {
             }
         };
         let settle = |own: RouteRole, other: RouteRole| {
-            let rules = self
+            let mut rules: Vec<CanonicalRule> = self
                 .set_for(own)
                 .rules
                 .iter()
@@ -662,6 +711,9 @@ impl CanonicalRuleBook {
                 )
                 .map(as_route)
                 .collect();
+            for r in &self.set_for(other).rules {
+                rules.extend(proven_hosts(other, r));
+            }
             CanonicalRuleSet::from_rules(rules)
         };
         CanonicalRuleBook {
@@ -1043,29 +1095,90 @@ mod tests {
         );
 
         let key = |written, rule: &CanonicalRule| VerifyKey::of(written, rule).expect("address");
-        let moved: HashSet<VerifyKey> = [
-            key(RouteRole::Secondary, &verify_s),
-            key(RouteRole::Primary, &verify_p),
-            key(
+        let verdict = |written, rule: &CanonicalRule, host: &str| VerifyMove {
+            key: key(written, rule),
+            host: host.into(),
+        };
+        let moved: HashSet<VerifyMove> = [
+            verdict(RouteRole::Secondary, &verify_s, "mail.proton.example"),
+            verdict(RouteRole::Primary, &verify_p, "192.0.2.7"),
+            verdict(
                 RouteRole::Secondary,
                 &exact_fqdn_rule("s-route", "chat.example"),
+                "chat.example",
             ),
         ]
         .into_iter()
         .collect();
         let effective = book.with_verify_effective(&moved);
+        // The address rule moves whole; the suffix rule stays, its proven host moves.
+        let proven = CanonicalRule {
+            id: crate::RuleId("s-verify~mail.proton.example".into()),
+            ..exact_fqdn_rule("s-verify", "mail.proton.example")
+        };
         assert_eq!(
             effective.primary,
-            CanonicalRuleSet::from_rules(vec![block, as_route(&verify_s)])
+            CanonicalRuleSet::from_rules(vec![block, proven])
         );
         assert_eq!(
             effective.secondary,
             CanonicalRuleSet::from_rules(vec![
                 exact_fqdn_rule("s-route", "chat.example"),
+                as_route(&verify_s),
                 as_route(&verify_p),
             ]),
             "only a `?` rule follows a verdict"
         );
+        assert_eq!(
+            effective.with_verify_effective(&moved),
+            effective,
+            "nothing left to move"
+        );
+    }
+
+    /// A page can name any subdomain of `*.github.io?`, and its server can
+    /// answer only from the provider's address: the check then proves that
+    /// one host, and only that host moves. The rule keeps every other host of
+    /// it on the route the user wrote.
+    #[test]
+    fn a_verdict_on_one_host_of_a_wide_rule_moves_that_host_only() {
+        let pages = CanonicalRule {
+            id: crate::RuleId("p-pages".into()),
+            enabled: true,
+            address_match: Some(CanonicalAddressMatch::SuffixDomain("github.io".into())),
+            app_match: None,
+            comment: String::new(),
+            action: RuleAction::Verify,
+            origin: None,
+        };
+        let book = CanonicalRuleBook {
+            primary: CanonicalRuleSet::from_rules(vec![pages.clone()]),
+            secondary: CanonicalRuleSet::default(),
+        };
+        let key = VerifyKey::of(RouteRole::Primary, &pages).expect("address");
+        let moved: HashSet<VerifyMove> = [VerifyMove {
+            key,
+            host: "attacker.github.io".into(),
+        }]
+        .into_iter()
+        .collect();
+        let effective = book.with_verify_effective(&moved);
+        assert!(
+            effective
+                .primary
+                .rules
+                .iter()
+                .any(|r| r.address_match == pages.address_match && r.action == RuleAction::Route),
+            "the whole rule left the route it is written for"
+        );
+        assert!(
+            effective.secondary.rules.iter().any(|r| r.address_match
+                == Some(CanonicalAddressMatch::ExactFqdn(
+                    "attacker.github.io".into()
+                ))),
+            "the proven host did not move"
+        );
+        assert_eq!(effective.secondary.rules.len(), 1, "nothing else moved");
         assert_eq!(
             effective.with_verify_effective(&moved),
             effective,
@@ -1094,7 +1207,12 @@ mod tests {
             ..r.clone()
         };
         let key = VerifyKey::of(RouteRole::Primary, &site_a).expect("address");
-        let moved: HashSet<VerifyKey> = [key.clone()].into_iter().collect();
+        let moved: HashSet<VerifyMove> = [VerifyMove {
+            key: key.clone(),
+            host: "site-a.example".into(),
+        }]
+        .into_iter()
+        .collect();
         let effective = book.with_verify_effective(&moved);
         assert!(effective.primary.is_empty());
         assert_eq!(

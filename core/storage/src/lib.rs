@@ -74,6 +74,7 @@ pub mod route_bindings;
 pub mod schema;
 pub mod service_stability_config;
 pub mod store;
+pub mod suffix_window;
 // Per-adapter traffic-statistics store over the rebuildable
 // nrr_traffic_stats.db. Consumes nrr-domain TrafficDelta.
 pub mod traffic_stats;
@@ -109,8 +110,9 @@ pub use error::{IntegrityFailureKind, StorageError, StorageResult};
 pub use explain::DiagnosticRedactionLevel;
 pub use log_retention_config::{LogRetentionConfig, LogRetentionConfigRepository};
 pub use migration::{
-    open_conn_history_connection_or_rebuild, open_connection, open_traffic_connection_or_rebuild,
-    read_schema_version, rebuild_conn_history_db, SqliteMigrationRunner, TrafficDbOpen,
+    open_cache_connection, open_conn_history_connection_or_rebuild, open_connection,
+    open_traffic_connection_or_rebuild, read_schema_version, rebuild_conn_history_db,
+    SqliteMigrationRunner, TrafficDbOpen,
 };
 pub use mutation_tokens::{ConsumeOutcome, MutationTokenStoreSqlite, StoredMutationToken};
 pub use pause_state::{PauseEnd, RoutingPauseRecord, RoutingPauseStateRepository};

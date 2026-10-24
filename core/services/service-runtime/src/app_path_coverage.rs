@@ -90,6 +90,9 @@ impl AppPathCoverage {
             ProtectionVerdict::Warn(reason) => out.warning_key = protection_message_key(reason),
             ProtectionVerdict::Allowed => {}
         }
+        if path.profile_folder().is_none() && !self.owner_may_see(&path, owner) {
+            return refused(out, OTHER_USERS_FOLDER_KEY.into());
+        }
         let found = path_programs_once(self.folders.as_ref(), &path, owner);
         match found.outcome {
             PathOutcome::OtherUsersFolder => return refused(out, OTHER_USERS_FOLDER_KEY.into()),
@@ -118,6 +121,16 @@ impl AppPathCoverage {
             out.anyone_can_write = self.folders.writable_by_anyone(Path::new(own.place()));
         }
         fill_found(out, found)
+    }
+
+    /// Whether `owner` may list the place `path` names. Checked before the
+    /// listing: what the service counts there, `owner` could not have seen.
+    fn owner_may_see(&self, path: &AppPath, owner: &str) -> bool {
+        let Some(real) = self.folders.real_path(Path::new(path.place())) else {
+            return true;
+        };
+        // Another user's profile has its own refusal, reached unread.
+        self.folders.foreign_profile(&real, owner) || self.folders.owner_may_list(&real, owner)
     }
 
     /// `path` as `owner` has it: a profile folder resolved to theirs.

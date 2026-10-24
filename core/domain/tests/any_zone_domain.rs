@@ -109,6 +109,27 @@ fn the_zone_is_the_public_suffix_of_the_host() {
 }
 
 #[test]
+fn a_country_second_level_outside_any_table_is_part_of_the_zone() {
+    let m = |host| match_any_zone_domain(host, "google");
+    assert_eq!(m("www.google.com.vn"), Some("google.com.vn"));
+    assert_eq!(m("google.co.nz"), Some("google.co.nz"));
+    assert_eq!(m("maps.google.com.pk"), Some("google.com.pk"));
+    assert_eq!(m("google.org.pl"), Some("google.org.pl"));
+    assert_eq!(m("google.spb.ru"), Some("google.spb.ru"));
+    assert_eq!(m("google.ru"), Some("google.ru"));
+    assert_eq!(m("com.vn"), None);
+    assert_eq!(m("google.com.attacker.net"), None);
+    assert_eq!(m("google.attacker.vn"), None);
+
+    let rules = book(vec![], vec![any_zone("s", "google")]);
+    assert_eq!(
+        route_of(&rules, "www.google.com.vn"),
+        Some(RouteRole::Secondary)
+    );
+    assert_eq!(route_of(&rules, "google.co.nz"), Some(RouteRole::Secondary));
+}
+
+#[test]
 fn a_rule_naming_the_zone_beats_the_any_zone_rule() {
     let rules = book(
         vec![suffix("p", "autodesk.by")],

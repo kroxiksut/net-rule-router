@@ -25,6 +25,7 @@ fn scratch(test: &str) -> (tempfile::TempDir, DnsFiles) {
         nm_conf_dir: root.join("run-nm").join("conf.d"),
         resolvconf_record_dirs: vec![root.join("records")],
         resolved_stub: root.join("run-resolved").join("stub-resolv.conf"),
+        nsswitch_conf: root.join("etc").join("nsswitch.conf"),
     };
     (dir, files)
 }

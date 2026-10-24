@@ -5,20 +5,27 @@ use std::env;
 use std::fs;
 use std::path::Path;
 
+include!("version_rank.rs");
+
 /// Fills the template for the binary `bin` and links the result into it alone.
 pub fn embed(repo_root: &Path, bin: &str, description: &str) {
     let template_path = repo_root.join("packaging/windows/app.rc.in");
     let icon_path = repo_root.join("assets/icons/app/app.ico");
     let helper_path = repo_root.join("packaging/windows/app_resource.rs");
-    for path in [&template_path, &icon_path, &helper_path] {
+    let rank_path = repo_root.join("packaging/windows/version_rank.rs");
+    for path in [&template_path, &icon_path, &helper_path, &rank_path] {
         println!("cargo:rerun-if-changed={}", path.display());
     }
 
     let var = |key: &str| env::var(key).unwrap_or_else(|error| panic!("{key}: {error}"));
     let template = fs::read_to_string(&template_path)
         .unwrap_or_else(|error| panic!("read {}: {error}", template_path.display()));
+    // The installers order builds by this block; the fourth field is the
+    // pre-release.
+    let rank =
+        prerelease_rank(&var("CARGO_PKG_VERSION_PRE")).unwrap_or_else(|error| panic!("{error}"));
     let version_commas = format!(
-        "{},{},{},0",
+        "{},{},{},{rank}",
         var("CARGO_PKG_VERSION_MAJOR"),
         var("CARGO_PKG_VERSION_MINOR"),
         var("CARGO_PKG_VERSION_PATCH")

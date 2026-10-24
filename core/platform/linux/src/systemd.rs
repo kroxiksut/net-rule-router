@@ -139,11 +139,16 @@ pub fn after_crash_unit_name() -> String {
 
 /// Render the failure unit. One command, no sandboxing of its own: it runs the
 /// same binary as the service with the verb that undoes what the service left.
+///
+/// Ordered before the service, so a start asked for while it runs waits for it:
+/// run side by side, its cleanup took down the policy the new daemon had just
+/// put in place. Bounded like a stop, as a oneshot is not by default.
 pub fn render_after_crash_unit(cfg: &SystemdServiceConfig) -> String {
     let executable = exec_word(&cfg.binary_path);
     format!(
-        "[Unit]\nDescription={} — after the service stopped for good\n\n\
-         [Service]\nType=oneshot\nExecStart={executable} {DAEMON_AFTER_CRASH_VERB}\n",
+        "[Unit]\nDescription={} — after the service stopped for good\nBefore={SYSTEMD_UNIT_NAME}\n\n\
+         [Service]\nType=oneshot\nTimeoutStartSec={STOP_TIMEOUT_SEC}\n\
+         ExecStart={executable} {DAEMON_AFTER_CRASH_VERB}\n",
         cfg.description
     )
 }
@@ -212,9 +217,11 @@ pub fn render_service_unit(cfg: &SystemdServiceConfig) -> String {
     let executable = exec_word(&cfg.binary_path);
     s.push_str(&format!("ExecStart={executable} {DAEMON_RUN_VERB}\n"));
     // Runs after every exit, a crash included, so a dead daemon never leaves
-    // the machine's DNS pointed at its listener.
+    // the machine's DNS pointed at its listener. `-`: a resolver that did not
+    // answer must not fail an ordinary stop, which would start the after-crash
+    // unit beside the restart an upgrade asked for.
     s.push_str(&format!(
-        "ExecStopPost={executable} {DAEMON_RESTORE_DNS_VERB}\n"
+        "ExecStopPost=-{executable} {DAEMON_RESTORE_DNS_VERB}\n"
     ));
     s.push_str("Restart=on-failure\n");
     s.push_str(&format!("RestartSec={}\n", cfg.restart_sec));
@@ -266,7 +273,9 @@ pub fn render_service_unit(cfg: &SystemdServiceConfig) -> String {
 /// helpers the daemon runs).
 const HARDENING: &[&str] = &[
     "NoNewPrivileges=yes",
-    "ProtectHome=yes",
+    // Read-only, not hidden: rules name programs and folders in users' homes,
+    // and the browser-history seed reads from there.
+    "ProtectHome=read-only",
     // Read-only everywhere but the unit's own directories and these two: the
     // bare-file DNS redirect writes `resolv.conf` by temp file + rename in
     // /etc, as openresolv run from here does; the NetworkManager drop-in and
@@ -293,20 +302,17 @@ const HARDENING: &[&str] = &[
     "LockPersonality=yes",
 ];
 
-/// Directory trees the unit written above cannot execute from.
-///
-/// `ProtectHome=yes` replaces them with empty mounts for the service, so an
-/// `ExecStart` that points there fails at exec with 203 — after `enable`
-/// reported success. The two halves are written a screen apart, which is how a
-/// build installed from a checkout under `/home` came to register a service
-/// that could never start.
-const HIDDEN_BY_PROTECT_HOME: [&str; 3] = ["/home/", "/root/", "/run/user/"];
+/// Directory trees a root daemon is never run from: their owner can replace
+/// the binary under it. A build installed from a checkout under `/home` is the
+/// usual way to get there.
+const USER_OWNED_TREES: [&str; 3] = ["/home/", "/root/", "/run/user/"];
 
 /// Why the unit this module renders could not execute a binary.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum UnitExecRefusal {
-    /// The path lies in a tree `ProtectHome=yes` hides from the service.
-    HiddenByProtectHome,
+    /// The path lies in a tree its user can write, so the binary is theirs to
+    /// replace.
+    UserOwnedTree,
     /// Not UTF-8, or holds a control character or `$`: no quoting in a unit
     /// line carries it through to `execve` unchanged.
     Unrepresentable,
@@ -325,11 +331,8 @@ pub fn unit_can_execute(binary_path: &Path) -> Result<(), UnitExecRefusal> {
     if path.chars().any(|c| c.is_control() || c == '$') {
         return Err(UnitExecRefusal::Unrepresentable);
     }
-    if HIDDEN_BY_PROTECT_HOME
-        .iter()
-        .any(|hidden| path.starts_with(hidden))
-    {
-        return Err(UnitExecRefusal::HiddenByProtectHome);
+    if USER_OWNED_TREES.iter().any(|tree| path.starts_with(tree)) {
+        return Err(UnitExecRefusal::UserOwnedTree);
     }
     Ok(())
 }
@@ -539,8 +542,7 @@ pub fn runtime_dir() -> PathBuf {
 }
 
 /// Where the daemon is installed (`/usr/libexec/netrulerouter/nrr-serviced`):
-/// the unit sets `ProtectHome=yes`, so a copy under `/home` can never be the
-/// one it runs. `libexec`, because SELinux labels a file there a program: under
+/// a root daemon is never run from a user's home, which that user can write. `libexec`, because SELinux labels a file there a program: under
 /// `/usr/lib` it is a library, the unit runs in systemd's own domain, and with
 /// `NoNewPrivileges` that domain may not run `nft` or `ip`. The install scripts
 /// stage the binary here.
@@ -800,15 +802,21 @@ mod tests {
 
     const SAMPLE_BINARY: &str = "/usr/libexec/netrulerouter/nrr-serviced";
 
-    /// The unit hides these trees from the service, so a binary living in one
-    /// can be registered but never started. Both facts are declared in this
-    /// module; the test is what keeps them agreeing.
+    /// Rules name programs and folders under users' homes: a service that
+    /// sees `/home` empty enforces none of them, and the history seed finds no
+    /// browser. The homes are visible, read-only.
     #[test]
-    fn a_binary_under_a_home_tree_cannot_be_executed_by_the_unit() {
+    fn the_service_sees_the_homes_read_only() {
         let cfg = SystemdServiceConfig::for_binary(PathBuf::from(SAMPLE_BINARY));
-        assert!(render_service_unit(&cfg).contains("ProtectHome=yes"));
+        let unit = render_service_unit(&cfg);
+        assert!(unit.contains("ProtectHome=read-only"), "{unit}");
+        assert!(!unit.contains("ProtectHome=yes"), "{unit}");
+    }
 
-        let hidden = Err(UnitExecRefusal::HiddenByProtectHome);
+    /// A root daemon is never registered from a tree its user can write.
+    #[test]
+    fn a_binary_under_a_home_tree_is_not_run_as_the_daemon() {
+        let hidden = Err(UnitExecRefusal::UserOwnedTree);
         assert_eq!(
             unit_can_execute(Path::new("/home/user/nrr/target/debug/nrr-serviced")),
             hidden
@@ -834,7 +842,7 @@ mod tests {
         let word = r#""/opt/Net Rule %%h\\x\"q/nrr-serviced""#;
         assert!(unit.contains(&format!("ExecStart={word} run\n")), "{unit}");
         assert!(
-            unit.contains(&format!("ExecStopPost={word} restore-dns\n")),
+            unit.contains(&format!("ExecStopPost=-{word} restore-dns\n")),
             "{unit}"
         );
     }
@@ -889,7 +897,7 @@ mod tests {
         });
         assert!(unit.contains("Restart=on-failure"), "{unit}");
         assert!(
-            unit.contains(r#"ExecStopPost="/usr/libexec/netrulerouter/nrr-serviced" restore-dns"#),
+            unit.contains(r#"ExecStopPost=-"/usr/libexec/netrulerouter/nrr-serviced" restore-dns"#),
             "{unit}"
         );
         assert!(unit.contains("RestartSec=7"), "{unit}");
@@ -909,6 +917,10 @@ mod tests {
     fn the_failure_unit_runs_the_after_crash_verb_once() {
         let unit = render_after_crash_unit(&sample_config());
         assert!(unit.contains("Type=oneshot\n"), "{unit}");
+        // A start asked for while the cleanup runs waits for it, and a hung
+        // cleanup does not hold the unit for ever.
+        assert!(unit.contains("Before=netrulerouter.service\n"), "{unit}");
+        assert!(unit.contains("TimeoutStartSec=120\n"), "{unit}");
         assert!(
             unit.contains(r#"ExecStart="/usr/libexec/netrulerouter/nrr-serviced" after-crash"#),
             "{unit}"

@@ -379,22 +379,67 @@ pub(crate) enum SweepOutcome {
 /// happened.
 pub(crate) fn sweep_orphaned_machine_state() -> SweepOutcome {
     let api: Arc<dyn WindowsApiPort> = Arc::new(ProductionWindowsApi);
+    let wfp_api = Arc::clone(&api);
+    sweep_in_order(&SweepSteps {
+        dns: &|| {
+            nrr_platform_windows::dns_redirect::sweep_orphan_dns_state(
+                &nrr_platform_windows::dns_redirect::TransactedNrptStore,
+                &nrr_platform_windows::dns_redirect::WindowsSearchList,
+            )
+        },
+        // Opening the engine and sweeping it are one budgeted unit: both are
+        // RPC into the Base Filtering Engine, and a wedged engine answers
+        // neither. `cleanup_all` deletes every filter under our provider in one
+        // transaction, as the orchestrator's `cleanup_wfp` does.
+        wfp: &|| {
+            let api = Arc::clone(&wfp_api);
+            with_budget("WFP filter sweep", WFP_SWEEP_BUDGET, move || {
+                WfpSession::open(api).and_then(|session| session.cleanup_all())
+            })
+        },
+        // An instance that was killed never restored the engine options it
+        // changed; it wrote down what they held, which makes this possible.
+        engine_options: &nrr_platform_windows::conn_observe::wfp_events::restore_engine_options,
+        // Signature-based, so it needs no per-SID state; non-fatal, our routes
+        // do not survive a reboot.
+        routes: &|| {
+            nrr_service_runtime::route_reconciler::sweep_owned_routes(
+                Arc::clone(&api) as Arc<dyn nrr_platform_api::route_table::RouteTablePort>
+            )
+            .map_err(|e| e.to_string())
+        },
+    })
+}
 
-    // ── WFP filter sweep (the lockout risk) ────────────────────────────
-    // Opening the engine and sweeping it are one budgeted unit: both are RPC
-    // into the Base Filtering Engine, and a wedged engine answers neither. This
-    // command exists to rescue a machine that is already in trouble, so it must
-    // come back and say so rather than sit there.
-    //
-    // `cleanup_all` enumerates every filter under the NRR provider GUID and
-    // deletes it in one transaction (block AND permit) — the same sweep the
-    // orchestrator's `cleanup_wfp` runs, minus the in-memory tracked-id pass
-    // (there is no live orchestrator state to consult offline).
-    let swept = with_budget("WFP filter sweep", WFP_SWEEP_BUDGET, {
-        let api = Arc::clone(&api);
-        move || WfpSession::open(api).and_then(|session| session.cleanup_all())
-    });
-    let filters_removed = match swept {
+/// The steps of an offline sweep, apart so their order can be tested.
+pub(crate) struct SweepSteps<'a> {
+    pub(crate) dns: &'a dyn Fn() -> nrr_platform_windows::dns_redirect::OrphanDnsSweep,
+    pub(crate) wfp: &'a dyn Fn() -> Result<usize, PlatformError>,
+    pub(crate) engine_options: &'a dyn Fn(),
+    pub(crate) routes: &'a dyn Fn() -> Result<usize, String>,
+}
+
+/// DNS first and whatever else fails: a crashed Mode-B session leaves an NRPT
+/// catch-all pointing all name resolution at our dead loopback, and a wedged
+/// filter engine that ends the sweep must not leave the machine without names.
+/// The suffix list we wrote outlives even a reboot.
+pub(crate) fn sweep_in_order(steps: &SweepSteps<'_>) -> SweepOutcome {
+    let dns_sweep = (steps.dns)();
+    if let Err(e) = &dns_sweep.nrpt_rules {
+        eprintln!(
+            "cleanup: NRPT/DNS-redirect sweep failed ({e}); if DNS is broken, remove the \
+             rule manually (`Get-DnsClientNrptRule | Where Comment -eq \
+             'NetRuleRouter-ModeB-DnsRedirect' | Remove-DnsClientNrptRule -Force`) or reboot."
+        );
+    }
+    if let Err(e) = &dns_sweep.search_list {
+        eprintln!(
+            "cleanup: DNS suffix search list sweep failed ({e}); check the list with \
+             `Get-DnsClientGlobalSetting` and remove suffixes NetRuleRouter added."
+        );
+    }
+
+    let filters_removed = match (steps.wfp)() {
         Ok(n) => n,
         Err(e) if e.classify() == ErrorClass::PrivilegeRequired => {
             eprintln!(
@@ -402,6 +447,7 @@ pub(crate) fn sweep_orphaned_machine_state() -> SweepOutcome {
                  (Administrator) console (the `scripts/reset-network.ps1` wrapper \
                  self-elevates via UAC)."
             );
+            report_dns(&dns_sweep);
             return SweepOutcome::PrivilegeRequired;
         }
         Err(nrr_platform_windows::PlatformError::Transient {
@@ -417,59 +463,27 @@ pub(crate) fn sweep_orphaned_machine_state() -> SweepOutcome {
                 "  Our filters are not persistent: a REBOOT clears them and restores \
                  the network. Restarting the `BFE` service first is worth a try."
             );
+            report_dns(&dns_sweep);
             return SweepOutcome::Failed;
         }
         Err(e) => {
             eprintln!("cleanup: WFP filter sweep failed: {e:?}");
+            report_dns(&dns_sweep);
             return SweepOutcome::Failed;
         }
     };
 
-    // Machine-wide Base Filtering Engine options. An instance that was killed
-    // rather than stopped never ran its own restore and left them changed; it
-    // wrote down what they held, which is what makes this possible from here.
-    nrr_platform_windows::conn_observe::wfp_events::restore_engine_options();
-
-    // ── Route sweep (best-effort) ──────────────────────────────────────
-    // Signature-based, so it needs no per-SID state; the same sweep the Linux
-    // daemon's `cleanup` runs. Non-fatal: our routes do not survive a reboot.
-    let routes_removed: Option<usize> =
-        match nrr_service_runtime::route_reconciler::sweep_owned_routes(
-            Arc::clone(&api) as Arc<dyn nrr_platform_api::route_table::RouteTablePort>
-        ) {
-            Ok(n) => Some(n),
-            Err(e) => {
-                eprintln!(
-                    "cleanup: route sweep failed ({e}); a reboot fully clears any remaining \
-                     NetRuleRouter routes."
-                );
-                None
-            }
-        };
-
-    // ── DNS sweep: NRPT redirect + suffix search list ─────────────────
-    // A crashed Mode-B (Resolver) session leaves an NRPT catch-all pointing ALL
-    // name resolution at our dead loopback :53 — no name resolves until it
-    // goes or the machine reboots. A suffix list we wrote outlives even a
-    // reboot. Both removals are scoped to what we wrote; the same sweep the
-    // service runs at boot and the uninstall runs.
-    let dns_sweep = nrr_platform_windows::dns_redirect::sweep_orphan_dns_state(
-        &nrr_platform_windows::dns_redirect::TransactedNrptStore,
-        &nrr_platform_windows::dns_redirect::WindowsSearchList,
-    );
-    if let Err(e) = &dns_sweep.nrpt_rules {
-        eprintln!(
-            "cleanup: NRPT/DNS-redirect sweep failed ({e}); if DNS is broken, remove the \
-             rule manually (`Get-DnsClientNrptRule | Where Comment -eq \
-             'NetRuleRouter-ModeB-DnsRedirect' | Remove-DnsClientNrptRule -Force`) or reboot."
-        );
-    }
-    if let Err(e) = &dns_sweep.search_list {
-        eprintln!(
-            "cleanup: DNS suffix search list sweep failed ({e}); check the list with \
-             `Get-DnsClientGlobalSetting` and remove suffixes NetRuleRouter added."
-        );
-    }
+    (steps.engine_options)();
+    let routes_removed: Option<usize> = match (steps.routes)() {
+        Ok(n) => Some(n),
+        Err(e) => {
+            eprintln!(
+                "cleanup: route sweep failed ({e}); a reboot fully clears any remaining \
+                 NetRuleRouter routes."
+            );
+            None
+        }
+    };
 
     // ── Summary ────────────────────────────────────────────────────────
     println!("NetRuleRouter offline reset complete.");
@@ -492,6 +506,14 @@ pub(crate) fn sweep_orphaned_machine_state() -> SweepOutcome {
         SweepOutcome::Done
     } else {
         SweepOutcome::Failed
+    }
+}
+
+/// What the DNS half did, for a sweep that stopped before its summary.
+fn report_dns(dns_sweep: &nrr_platform_windows::dns_redirect::OrphanDnsSweep) {
+    match &dns_sweep.nrpt_rules {
+        Ok(n) => println!("  DNS redirect (NRPT) rules removed: {n}"),
+        Err(_) => println!("  DNS redirect (NRPT) rules: <sweep failed — see above>"),
     }
 }
 
@@ -634,5 +656,50 @@ mod tests {
 
         assert_eq!(outcome, OrphanStrip::Stripped(orphans.len()));
         assert!(installed_ids(&api).is_empty());
+    }
+
+    /// A wedged or refusing filter engine ends the sweep early. The NRPT
+    /// redirect to our dead resolver must already be gone by then, or the
+    /// machine is left without names until somebody finds the rule by hand.
+    #[test]
+    fn the_dns_redirect_goes_first_whatever_the_filter_engine_does() {
+        use std::cell::RefCell;
+        let failures = [
+            PlatformError::AccessDenied {
+                operation: "FwpmEngineOpen0",
+            },
+            PlatformError::Transient {
+                operation: "budgeted start",
+                detail: "wedged".to_owned(),
+            },
+            PlatformError::StateCorrupted {
+                detail: "broken".to_owned(),
+            },
+        ];
+        for failure in failures {
+            let order = RefCell::new(Vec::new());
+            let wfp_error = RefCell::new(Some(failure));
+            let outcome = sweep_in_order(&SweepSteps {
+                dns: &|| {
+                    order.borrow_mut().push("dns");
+                    nrr_platform_windows::dns_redirect::OrphanDnsSweep {
+                        nrpt_rules: Ok(1),
+                        search_list: Ok(false),
+                    }
+                },
+                wfp: &|| {
+                    order.borrow_mut().push("wfp");
+                    Err(wfp_error.borrow_mut().take().expect("one call"))
+                },
+                engine_options: &|| order.borrow_mut().push("engine"),
+                routes: &|| {
+                    order.borrow_mut().push("routes");
+                    Ok(0)
+                },
+            });
+            assert!(!matches!(outcome, SweepOutcome::Done));
+            assert_eq!(order.borrow().first(), Some(&"dns"), "{:?}", order.borrow());
+            assert!(order.borrow().contains(&"dns"));
+        }
     }
 }

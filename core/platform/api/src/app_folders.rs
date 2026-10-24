@@ -184,6 +184,15 @@ pub trait ProgramFolders: Send + Sync {
         None
     }
 
+    /// Whether `owner` may list the folder at `place` (for a file, the folder
+    /// holding it) under the file system's own permissions. The service reads
+    /// every folder; an answer about one closed to `owner` tells them what
+    /// they could not see. Best-effort: a place or an owner the OS cannot
+    /// judge reads as `true`, as it did before anyone asked.
+    fn owner_may_list(&self, _place: &Path, _owner: &str) -> bool {
+        true
+    }
+
     /// Whether any account may put a program at `place`, or create it first
     /// where it is missing (`/tmp`, `C:\Users\Public`). What runs from such
     /// a place vouches for nothing. Best-effort: unreadable reads as `false`.

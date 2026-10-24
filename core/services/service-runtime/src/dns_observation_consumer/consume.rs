@@ -345,8 +345,9 @@ impl DnsObservationConsumer {
                     // pinning its address to the additional route cannot divert
                     // it there, because the user's own rule sends it the other
                     // way — the two orders cancel and the host dies instead.
+                    let book = &snapshot.rule_book;
                     let primary_ruled =
-                        match_specificity(&obs.hostname, &snapshot.rule_book.primary).is_some();
+                        match_specificity(&obs.hostname, &book.primary, book).is_some();
                     self.record_direct_tenant(&obs.hostname, *ip, now, primary_ruled);
                     if self.note_collateral_once(&obs.hostname, *ip) {
                         summary.collateral = summary.collateral.saturating_add(1);

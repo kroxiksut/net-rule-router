@@ -44,8 +44,31 @@ GroupBox {
         draftPinLkg = values.pinLkg !== false
     }
 
+    function _draftValues() {
+        return {
+            supersededDays: draftSupersededDays,
+            supersededCountCap: draftSupersededCountCap,
+            rejectedDays: draftRejectedDays,
+            rolledbackDays: draftRolledbackDays,
+            rolledbackCountCap: draftRolledbackCountCap,
+            pinLkg: draftPinLkg
+        }
+    }
+    // What the draft opened with: Save sends only the fields the user changed,
+    // and the rest come from the service's own read.
+    property var _draftBase: ({})
+    function _changedFields() {
+        var now = _draftValues()
+        var out = {}
+        for (var k in now) {
+            if (now[k] !== _draftBase[k]) out[k] = now[k]
+        }
+        return out
+    }
+
     function reloadFromCurrent() {
         loadDraft(current)
+        _draftBase = _draftValues()
         draftDirty = false
     }
 
@@ -293,14 +316,8 @@ GroupBox {
                 text: root.tr("settings.revisions.retention.save", "Save")
                 icon.source: root.uiIconSource("save")
                 onClicked: {
-                    root.setRetentionSettings({
-                        supersededDays: group.draftSupersededDays,
-                        supersededCountCap: group.draftSupersededCountCap,
-                        rejectedDays: group.draftRejectedDays,
-                        rolledbackDays: group.draftRolledbackDays,
-                        rolledbackCountCap: group.draftRolledbackCountCap,
-                        pinLkg: group.draftPinLkg
-                    })
+                    root.setRetentionSettings(group._changedFields())
+                    group._draftBase = group._draftValues()
                     group.draftDirty = false
                     group.justSaved = true
                 }

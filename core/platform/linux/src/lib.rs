@@ -299,6 +299,8 @@ pub mod app_path_resolver;
 /// homes, and inotify watches on the rule's folders. Parsing is pure and
 /// tested on every host.
 pub mod app_folders;
+/// Whether a user may list a folder, from its mode bits.
+pub mod folder_access;
 /// The `struct inotify_event` walk both inotify watches share, fuzzed.
 pub mod inotify_events;
 

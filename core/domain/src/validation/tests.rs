@@ -214,6 +214,23 @@ fn domain_label_idn_unicode_normalized_to_punycode() {
 }
 
 #[test]
+fn an_idn_takes_its_case_from_uts46_not_from_lowercasing() {
+    let id = RuleId("r-1".to_string());
+    let ace = |v: &str| normalize_domain_label(v, &id, &mut Vec::new()).expect("idn");
+    // UTS-46 maps a capital sigma to `σ`; lowercasing first wrote `ς` at a word end.
+    assert_eq!(ace("ΣΑΣ.gr"), ace("σασ.gr"));
+    assert_ne!(ace("ΣΑΣ.gr"), ace("σας.gr"));
+    // A rule and the name a request carries take one spelling.
+    for v in ["ΣΑΣ.gr", "STRAẞE.de", "Тест.РФ"] {
+        assert_eq!(
+            Some(ace(v)),
+            crate::decision_engine_input::hostname_ace(v),
+            "{v}"
+        );
+    }
+}
+
+#[test]
 fn domain_label_ascii_no_idn_warning() {
     let mut warnings = Vec::new();
     let result = normalize_domain_label("example.com", &RuleId("r-1".to_string()), &mut warnings);

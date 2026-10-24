@@ -150,7 +150,13 @@ Pane {
                                     theme: root.uiTheme
                                     cornerRadius: root.uiTheme.radiusSm
                                     color: navButton.highlighted ? root.accentColor : root.panelColor
-                                    border.color: navButton.highlighted ? root.uiTheme.stateSelectedBorder : root.uiTheme.stateDefaultBorder
+                                    border.width: navButton.activeFocus
+                                        ? root.uiTheme.focusBorderWidth : root.uiTheme.borderWidth
+                                    border.color: navButton.activeFocus
+                                        ? (navButton.highlighted
+                                               ? root.uiTheme.stateFocusedBorderOnFill
+                                               : root.uiTheme.stateFocusedBorder)
+                                        : navButton.highlighted ? root.uiTheme.stateSelectedBorder : root.uiTheme.stateDefaultBorder
                                 }
                                 contentItem: RowLayout {
                                     id: navContent

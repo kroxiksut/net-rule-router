@@ -730,6 +730,24 @@ pub fn include_subdomains_for(guard: &Connection, principal: &str) -> bool {
         .unwrap_or(false)
 }
 
+/// Whether `record`'s leak protection keeps everything off the main
+/// connection ("everything", or "routed sites" under the additional default
+/// route): the service's own checks then never name a held site there.
+pub fn keeps_names_off_main(record: &nrr_storage::route_bindings::RoutePolicyRecord) -> bool {
+    use std::str::FromStr;
+    let mode = nrr_domain::RouteBehaviorMode::from_str(record.mode.slug())
+        .unwrap_or(nrr_domain::RouteBehaviorMode::PreferSecondaryWhenAvailable);
+    record.leak_protection.effective(mode) == nrr_domain::LeakProtection::Everything
+}
+
+/// [`keeps_names_off_main`] for `principal`; a policy that cannot be read
+/// keeps them off.
+pub fn keeps_names_off_main_for(guard: &Connection, principal: &str) -> bool {
+    nrr_storage::route_bindings::RouteBindingsRepository::new(guard)
+        .load_for_sid(principal)
+        .map_or(true, |record| keeps_names_off_main(&record))
+}
+
 // ── Tests ───────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -1530,15 +1548,28 @@ mod tests {
             .iter()
             .all(|r| r.action == RuleAction::Route));
 
-        // A verdict moves it; the cached decode does not hide the change.
+        // A verdict moves its proven host; the cached decode does not hide the
+        // change, and the suffix rule stays in the set it is written in.
         let key = VerifyKey {
             written: RouteRole::Secondary,
             address: CanonicalAddressMatch::SuffixDomain("proton.example".into()),
         };
-        crate::verify_overlay::set(sid, [key].into_iter().collect());
+        let verdict = nrr_domain::canonical::VerifyMove {
+            key,
+            host: "mail.proton.example".into(),
+        };
+        crate::verify_overlay::set(sid, [verdict].into_iter().collect());
         let moved = provider.active_rules_for(sid).expect("rules present");
-        assert!(moved.rule_book.secondary.is_empty());
-        assert!(!moved.rule_book.primary.is_empty());
+        assert_eq!(moved.rule_book.secondary.len(), 1);
+        assert!(moved
+            .rule_book
+            .primary
+            .rules()
+            .iter()
+            .any(|r| r.address_match
+                == Some(CanonicalAddressMatch::ExactFqdn(
+                    "mail.proton.example".into()
+                ))));
 
         let stored = provider.stored_rules_for(sid).expect("rules present");
         assert!(stored.rule_book.primary.is_empty());

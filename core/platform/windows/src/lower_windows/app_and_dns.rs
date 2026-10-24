@@ -159,16 +159,22 @@ pub(super) fn ale_app_egress_permit(
     luid: u64,
     weight: u64,
     user_sid: Option<String>,
+    v6: bool,
 ) -> WfpFilterSpec {
     WfpFilterSpec {
-        layer: WfpLayerKey::AleAuthConnectV4,
+        layer: ale_app_layer(v6),
         action: WfpAction::Permit,
         remote_ip: None,
         remote_ip_set: Vec::new(),
         remote_ip_set_v6: Vec::new(),
         remote_port: None,
         weight,
-        id: derive_app_id(user_sid.as_deref(), WfpAction::Permit, pattern, weight),
+        id: derive_app_id(
+            user_sid.as_deref(),
+            WfpAction::Permit,
+            &family_key(pattern, v6),
+            weight,
+        ),
         user_sid,
         app_pattern: Some(pattern.to_string()),
         local_interface_luid: Some(luid),
@@ -179,18 +185,46 @@ pub(super) fn ale_app_egress_permit(
     }
 }
 
+/// The pattern as an id key: the v6 twin is a filter of its own.
+fn family_key(pattern: &str, v6: bool) -> String {
+    if v6 {
+        format!("{pattern}|v6")
+    } else {
+        pattern.to_string()
+    }
+}
+
+/// The ALE connect layer of the app pair's family.
+fn ale_app_layer(v6: bool) -> WfpLayerKey {
+    if v6 {
+        WfpLayerKey::AleAuthConnectV6
+    } else {
+        WfpLayerKey::AleAuthConnectV4
+    }
+}
+
 /// ALE-connect per-app unconditional `Block` (proto-agnostic). Mirrors
 /// `killswitch_codegen::block_app_off_secondary` / `ale_block_app`.
-pub(super) fn ale_app_block(pattern: &str, weight: u64, user_sid: Option<String>) -> WfpFilterSpec {
+pub(super) fn ale_app_block(
+    pattern: &str,
+    weight: u64,
+    user_sid: Option<String>,
+    v6: bool,
+) -> WfpFilterSpec {
     WfpFilterSpec {
-        layer: WfpLayerKey::AleAuthConnectV4,
+        layer: ale_app_layer(v6),
         action: WfpAction::Block,
         remote_ip: None,
         remote_ip_set: Vec::new(),
         remote_ip_set_v6: Vec::new(),
         remote_port: None,
         weight,
-        id: derive_app_id(user_sid.as_deref(), WfpAction::Block, pattern, weight),
+        id: derive_app_id(
+            user_sid.as_deref(),
+            WfpAction::Block,
+            &family_key(pattern, v6),
+            weight,
+        ),
         user_sid,
         app_pattern: Some(pattern.to_string()),
         local_interface_luid: None,

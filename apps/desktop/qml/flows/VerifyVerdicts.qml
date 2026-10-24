@@ -37,21 +37,25 @@ QtObject {
     }
 
     /// Move every waiting rule to the route where it works.
-    /// `done(ok, errorCode)`.
-    function accept(done) { _answer("rpcVerifyVerdictsAccept", done) }
+    /// `done(ok, errorCode)`. `ids`: only these, the set the user was shown;
+    /// a verdict that arrived after it must not ride along unseen.
+    function accept(done, ids) { _answer("rpcVerifyVerdictsAccept", done, ids) }
 
     /// Leave every waiting rule as written: the move lasts until the next
-    /// restart and the check repeats after it. `done(ok, errorCode)`.
-    function dismiss(done) { _answer("rpcVerifyVerdictsDismiss", done) }
+    /// restart and the check repeats after it. `done(ok, errorCode)`, `ids` as
+    /// for `accept`.
+    function dismiss(done, ids) { _answer("rpcVerifyVerdictsDismiss", done, ids) }
 
-    function _answer(method, done) {
+    function _answer(method, done, ids) {
         var reply = typeof done === "function" ? done : function() {}
         var waiting = notice
-        if (!waiting || !rpc || typeof rpc[method] !== "function") {
+        var asked = (ids !== undefined && ids !== null)
+            ? Array.prototype.slice.call(ids) : (waiting ? waiting.ids : [])
+        if (!waiting || asked.length === 0 || !rpc || typeof rpc[method] !== "function") {
             reply(false, "")
             return
         }
-        var corr = rpc[method]({ "rule-ids": waiting.ids })
+        var corr = rpc[method]({ "rule-ids": asked })
         if (!corr) {
             reply(false, "transport-disconnected")
             return

@@ -96,8 +96,8 @@ The service normally runs as a systemd unit rather than from a terminal:
 ```
 
 The unit is staged into `/usr/libexec/netrulerouter` before it is registered:
-it runs with `ProtectHome=yes`, and a daemon left under `/home` could only ever
-fail at exec. `libexec` is where systems with SELinux enforcing (RED OS,
+a service running as root is never started from `/home`, where the user who
+owns the folder could replace it. `libexec` is where systems with SELinux enforcing (RED OS,
 Fedora and their relatives) expect a service's programs, so the service can
 manage the firewall and routes there without a policy change. Only the staging
 copy and the registration step use `sudo` — the build stays unprivileged, so

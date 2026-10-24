@@ -69,6 +69,18 @@ if [ "${#provision[@]}" -gt 0 ]; then
   fi
 fi
 
+# What the administrator left: an update keeps a unit they took out of start-up
+# (or the start-on-demand mode, disabled but running) as it was, as the
+# packages do.
+was_installed=0
+was_enabled=1
+was_active=1
+if nrr_pkg_have_systemd && [ -e "$NRR_UNIT_FILE" ]; then
+  was_installed=1
+  systemctl is-enabled --quiet "$NRR_UNIT_NAME" || was_enabled=0
+  systemctl is-active --quiet "$NRR_UNIT_NAME" || was_active=0
+fi
+
 # A running daemon would keep serving the files about to be replaced.
 if nrr_pkg_have_systemd && systemctl is-active --quiet "$NRR_UNIT_NAME"; then
   nrr_cyan "==> stop $NRR_UNIT_NAME"
@@ -122,5 +134,12 @@ fi
 
 nrr_cyan "==> register and start the service"
 "$NRR_STAGED_SERVICE_BINARY" install
+if [ "$was_installed" -eq 1 ] && [ "$was_enabled" -eq 0 ]; then
+  nrr_cyan "==> $NRR_UNIT_NAME stays out of start-up, as it was"
+  systemctl disable "$NRR_UNIT_NAME" >/dev/null 2>&1 || true
+  if [ "$was_active" -eq 0 ]; then
+    systemctl stop "$NRR_UNIT_NAME" >/dev/null 2>&1 || true
+  fi
+fi
 
 nrr_green "Installed. Remove with: sudo $NRR_SERVICE_INSTALL_DIR/scripts/uninstall.sh [--purge]"

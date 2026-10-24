@@ -20,6 +20,7 @@ GroupBox {
         }
         ThemedComboBox {
             id: themeCombo
+            accessibleLabel: root.uiRevision >= 0 ? root.tr("settings.field.theme", "Theme") : ""
             theme: root.uiTheme
             Layout.fillWidth: true
             model: [ "light", "dark", "system", "high-contrast" ]

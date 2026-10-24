@@ -362,7 +362,7 @@ mod tests {
             doh_lockdown_scope: nrr_storage::doh_lockdown::DohLockdownScope::default(),
             doh_lockdown_auto: true,
             browser_history_auto_seed: false,
-            kill_switch_strict_shared_ips: false,
+            kill_switch_strict_shared_ips: true,
             auto_rules_mode: nrr_storage::auto_rules::AutoRulesMode::default(),
             auto_rules_eager_delivery_names: false,
             primary_probe_auto: false,

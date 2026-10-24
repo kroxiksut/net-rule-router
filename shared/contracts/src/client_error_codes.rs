@@ -34,6 +34,10 @@ pub const UNKNOWN_PRESET_OPERATION: &str = "unknown-preset-operation";
 pub const MALFORMED_PRESET_PAYLOAD: &str = "malformed-preset-payload";
 pub const USER_SETTINGS_READ_ONLY: &str = "user-settings-read-only";
 pub const USER_SETTINGS_UNAVAILABLE: &str = "user-settings-unavailable";
+/// A linked rules file changed by hand since the program wrote it; the
+/// write is refused until the user says what to keep.
+pub const RULES_FILE_HAND_EDITED: &str = "rules-file-hand-edited";
+pub const RULES_FILE_WRITE_FAILED: &str = "rules-file-write-failed";
 
 // Service control, run by the launcher on Unix and by the elevation broker on
 // Windows.
@@ -135,6 +139,8 @@ pub const CLIENT_ERROR_CODES: &[&str] = &[
     MALFORMED_PRESET_PAYLOAD,
     USER_SETTINGS_READ_ONLY,
     USER_SETTINGS_UNAVAILABLE,
+    RULES_FILE_HAND_EDITED,
+    RULES_FILE_WRITE_FAILED,
     // Elevation and service control.
     ELEVATION_DECLINED_CLIENT_SLUG,
     ELEVATION_AGENT_MISSING_CLIENT_SLUG,

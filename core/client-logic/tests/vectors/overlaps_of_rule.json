@@ -1,0 +1,82 @@
+{
+  "description": "rules.js overlapsOfRule / rules_overlaps::overlaps_of_rule: the pairs one rule takes part in, compared by key; `overlaps` is shared by every case unless a case brings its own",
+  "overlaps": [
+    {
+      "key": "primary:exact-ip:192.0.2.7>secondary:subnet:192.0.2.0/24",
+      "kind": "nested",
+      "winner": { "rule-id": "R-0002", "route": "primary", "rule-type": "exact-ip", "value": "192.0.2.7" },
+      "loser": { "rule-id": "R-0001", "route": "secondary", "rule-type": "subnet", "value": "192.0.2.0/24" },
+      "block-wins-tie": false,
+      "main-stays-when-additional-down": false
+    },
+    {
+      "key": "secondary:exact-fqdn:mail.example>primary:zone:example",
+      "kind": "nested",
+      "winner": { "rule-id": "R-0004", "route": "secondary", "rule-type": "exact-fqdn", "value": "mail.example" },
+      "loser": { "rule-id": "R-0003", "route": "primary", "rule-type": "zone", "value": "example" },
+      "block-wins-tie": false,
+      "main-stays-when-additional-down": false
+    },
+    {
+      "key": "primary:suffix-domain:example.org>secondary:suffix-domain:example.org",
+      "kind": "duplicate",
+      "winner": { "rule-id": "R-0005", "route": "primary", "rule-type": "suffix-domain", "value": "example.org" },
+      "loser": { "rule-id": "R-0006", "route": "secondary", "rule-type": "suffix-domain", "value": "example.org" },
+      "block-wins-tie": true,
+      "main-stays-when-additional-down": false
+    },
+    {
+      "key": "secondary:subnet:192.0.2.0/24>primary:subnet:192.0.2.0/23",
+      "kind": "nested",
+      "winner": { "rule-id": "R-0001", "route": "secondary", "rule-type": "subnet", "value": "192.0.2.0/24" },
+      "loser": { "rule-id": "R-0007", "route": "primary", "rule-type": "subnet", "value": "192.0.2.0/23" },
+      "block-wins-tie": false,
+      "main-stays-when-additional-down": true
+    }
+  ],
+  "cases": [
+    {
+      "name": "a rule on both sides of different pairs, in list order",
+      "input": { "id": "R-0001" },
+      "expected": [
+        "primary:exact-ip:192.0.2.7>secondary:subnet:192.0.2.0/24",
+        "secondary:subnet:192.0.2.0/24>primary:subnet:192.0.2.0/23"
+      ]
+    },
+    {
+      "name": "a winner only",
+      "input": { "id": "R-0002" },
+      "expected": ["primary:exact-ip:192.0.2.7>secondary:subnet:192.0.2.0/24"]
+    },
+    {
+      "name": "a loser only",
+      "input": { "id": "R-0003" },
+      "expected": ["secondary:exact-fqdn:mail.example>primary:zone:example"]
+    },
+    {
+      "name": "a duplicate's second rule",
+      "input": { "id": "R-0006" },
+      "expected": ["primary:suffix-domain:example.org>secondary:suffix-domain:example.org"]
+    },
+    {
+      "name": "a rule in no pair",
+      "input": { "id": "R-0099" },
+      "expected": []
+    },
+    {
+      "name": "an empty id matches nothing",
+      "input": { "id": "" },
+      "expected": []
+    },
+    {
+      "name": "ids compare exactly, not by case",
+      "input": { "id": "r-0001" },
+      "expected": []
+    },
+    {
+      "name": "no pairs at all",
+      "input": { "id": "R-0001", "overlaps": [] },
+      "expected": []
+    }
+  ]
+}

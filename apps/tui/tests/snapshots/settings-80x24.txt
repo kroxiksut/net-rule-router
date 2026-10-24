@@ -7,7 +7,7 @@ Service: OK
 │  5 Overlaps               ││  c5. Presets and settings                       │
 │  6 Suggested addresses    ││  c6. Logs and diagnostics                       │
 │  7 Connection trace       ││  c7. Traffic statistics                         │
-│  8 Cache                  ││  c8. Check for updates                          │
+│  8 Cache                  ││  c8. About and updates                          │
 │  9 Diagnostics and logs   ││  c9. Terminal                                   │
 │> 0 Settings               ││                                                 │
 │      Notifications        ││                                                 │
@@ -17,7 +17,7 @@ Service: OK
 │      Presets and settings ││                                                 │
 │      Logs and diagnostics ││                                                 │
 │      Traffic statistics   ││                                                 │
-│      Check for updates    ││                                                 │
+│      About and updates    ││                                                 │
 │      Terminal             ││                                                 │
 │                           ││                                                 │
 ╰───────────────────────────╯╰─────────────────────────────────────────────────╯

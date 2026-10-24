@@ -8,10 +8,12 @@ TextArea {
     id: root
     property var theme
 
-    // Accessible baseline — see the note in `ThemedComboBox.qml`. The name
-    // falls back to the placeholder; a caller with a visible label overrides it.
+    // See `ThemedTextField.qml`.
+    property string accessibleLabel: ""
+
     Accessible.role: Accessible.EditableText
-    Accessible.name: root.placeholderText
+    Accessible.name: root.accessibleLabel !== ""
+        ? root.accessibleLabel.replace(/:\s*$/, "") : root.placeholderText
     Accessible.description: root.ToolTip.text
 
     color: theme.colorText

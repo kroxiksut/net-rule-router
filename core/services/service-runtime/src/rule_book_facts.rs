@@ -24,6 +24,41 @@ pub fn has_deny_rules(book: &CanonicalRuleBook) -> bool {
         .any(|rule| rule.enabled && rule.action == RuleAction::Block)
 }
 
+/// Does applying the book depend on seeing the site names a program resolves?
+/// A rule sending sites off the default route by name does, and so does a
+/// block by name; a resolver answering past ours (browser DoH) defeats both.
+/// `secondary_by_default` is the "prefer the additional route" mode, where the
+/// main-route rules are the exceptions. Any additional-route rule counts, as it
+/// always has.
+#[must_use]
+pub fn needs_names_seen(book: &CanonicalRuleBook, secondary_by_default: bool) -> bool {
+    let names_a_site = |rule: &nrr_domain::canonical::CanonicalRule| {
+        rule.enabled
+            && matches!(
+                rule.address_match,
+                Some(
+                    CanonicalAddressMatch::ExactFqdn(_)
+                        | CanonicalAddressMatch::SuffixDomain(_)
+                        | CanonicalAddressMatch::AnyZoneDomain(_)
+                        | CanonicalAddressMatch::Zone(_)
+                )
+            )
+    };
+    let blocks_a_name = book
+        .primary
+        .rules()
+        .iter()
+        .chain(book.secondary.rules())
+        .any(|rule| rule.action == RuleAction::Block && names_a_site(rule));
+    let named_exception = secondary_by_default
+        && book
+            .primary
+            .rules()
+            .iter()
+            .any(|rule| rule.action != RuleAction::Block && names_a_site(rule));
+    has_secondary_rules(book) || named_exception || blocks_a_name
+}
+
 /// Every host or domain name an enabled rule of either route names, as the
 /// rule stores it. Zones and addresses are not names.
 #[must_use]
@@ -106,6 +141,40 @@ mod tests {
             vec![],
             vec![blocking(rule("s", fqdn("a.example"), true))]
         )));
+    }
+
+    /// Browser DoH hides the name from us. Under "prefer the additional route"
+    /// the main-route exceptions then take the tunnel, and a block by name
+    /// lets the site through; an address block needs no name.
+    #[test]
+    fn exceptions_off_the_default_and_blocks_by_name_need_the_names() {
+        let exception = book(vec![rule("p", fqdn("bank.example"), true)], vec![]);
+        assert!(
+            !needs_names_seen(&exception, false),
+            "the main route is the default"
+        );
+        assert!(needs_names_seen(&exception, true));
+        let by_address = CanonicalAddressMatch::ExactIp(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 4)));
+        let address_exception = book(vec![rule("p", by_address, true)], vec![]);
+        assert!(
+            !needs_names_seen(&address_exception, true),
+            "an address needs no name"
+        );
+
+        let named_block = book(vec![blocking(rule("b", fqdn("ads.example"), true))], vec![]);
+        assert!(needs_names_seen(&named_block, false));
+        let address = CanonicalAddressMatch::ExactIp(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 9)));
+        let address_block = book(vec![blocking(rule("b", address, true))], vec![]);
+        assert!(!needs_names_seen(&address_block, false));
+        let off = book(
+            vec![blocking(rule("b", fqdn("ads.example"), false))],
+            vec![],
+        );
+        assert!(!needs_names_seen(&off, true));
+
+        let routed = book(vec![], vec![rule("s", fqdn("video.example"), true)]);
+        assert!(needs_names_seen(&routed, false));
+        assert!(needs_names_seen(&routed, true), "as before");
     }
 
     #[test]

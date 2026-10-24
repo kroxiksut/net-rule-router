@@ -12,7 +12,7 @@ use std::collections::BTreeMap;
 
 use windows::core::HSTRING;
 use windows::Win32::System::Registry::{
-    RegGetValueW, HKEY_LOCAL_MACHINE, RRF_RT_REG_EXPAND_SZ, RRF_RT_REG_SZ,
+    RegGetValueW, HKEY_LOCAL_MACHINE, RRF_NOEXPAND, RRF_RT_REG_EXPAND_SZ, RRF_RT_REG_SZ,
 };
 use windows::Win32::System::SystemInformation::GetSystemWindowsDirectoryW;
 
@@ -37,8 +37,9 @@ const MACHINE_ENVIRONMENT_KEY: &str =
 /// The [`FORWARDED`] variables as the machine sets them.
 pub fn machine_environment() -> BTreeMap<String, String> {
     let mut out = BTreeMap::new();
+    let roots = MachineRoots::from_api();
     for name in FORWARDED {
-        if let Some(text) = machine_value(name) {
+        if let Some(text) = machine_value(name).and_then(|raw| roots.expand(name, &raw)) {
             out.insert((*name).to_string(), text);
         }
     }
@@ -72,8 +73,78 @@ pub fn apply_machine_environment(cmd: &mut std::process::Command) {
     }
 }
 
-/// One value of the machine environment key. Two calls: the first sizes the
-/// buffer, the second fills it.
+/// The roots a `REG_EXPAND_SZ` machine value may refer to, each taken from
+/// the API: the registry's own expansion would use THIS process's
+/// environment, which under UAC is the user's, so `%SystemRoot%` in the
+/// machine `Path` would point wherever the user said.
+struct MachineRoots {
+    system_root: String,
+    system_drive: Option<String>,
+    program_data: Option<String>,
+}
+
+impl MachineRoots {
+    fn from_api() -> Self {
+        let system_root = system_directory_root();
+        let system_drive = system_root.get(..2).map(str::to_owned);
+        let program_data = crate::system_shell::program_data_directory()
+            .map(|dir| dir.to_string_lossy().into_owned());
+        Self {
+            system_root,
+            system_drive,
+            program_data,
+        }
+    }
+
+    fn root(&self, reference: &str) -> Option<&str> {
+        if reference.eq_ignore_ascii_case("SystemRoot") || reference.eq_ignore_ascii_case("windir")
+        {
+            Some(&self.system_root)
+        } else if reference.eq_ignore_ascii_case("SystemDrive") {
+            self.system_drive.as_deref()
+        } else if reference.eq_ignore_ascii_case("ProgramData") {
+            self.program_data.as_deref()
+        } else {
+            None
+        }
+    }
+
+    /// `value` with every `%root%` replaced. A reference to anything else
+    /// cannot be resolved from the machine alone: a `Path` segment holding
+    /// one is dropped, any other value is withheld whole.
+    fn expand(&self, name: &str, value: &str) -> Option<String> {
+        if name.eq_ignore_ascii_case("Path") {
+            let kept: Vec<String> = value
+                .split(';')
+                .filter(|segment| !segment.is_empty())
+                .filter_map(|segment| self.expand_one(segment))
+                .collect();
+            return (!kept.is_empty()).then(|| kept.join(";"));
+        }
+        self.expand_one(value)
+    }
+
+    fn expand_one(&self, value: &str) -> Option<String> {
+        let mut out = String::with_capacity(value.len());
+        let mut rest = value;
+        while let Some(start) = rest.find('%') {
+            out.push_str(&rest[..start]);
+            let after = &rest[start + 1..];
+            let Some(end) = after.find('%') else {
+                // A lone `%` is literal text.
+                out.push_str(&rest[start..]);
+                return Some(out);
+            };
+            out.push_str(self.root(&after[..end])?);
+            rest = &after[end + 1..];
+        }
+        out.push_str(rest);
+        Some(out)
+    }
+}
+
+/// One value of the machine environment key, unexpanded. Two calls: the first
+/// sizes the buffer, the second fills it.
 fn machine_value(name: &str) -> Option<String> {
     let subkey = HSTRING::from(MACHINE_ENVIRONMENT_KEY);
     let value = HSTRING::from(name);
@@ -85,7 +156,7 @@ fn machine_value(name: &str) -> Option<String> {
             HKEY_LOCAL_MACHINE,
             &subkey,
             &value,
-            RRF_RT_REG_SZ | RRF_RT_REG_EXPAND_SZ,
+            RRF_RT_REG_SZ | RRF_RT_REG_EXPAND_SZ | RRF_NOEXPAND,
             None,
             None,
             Some(&mut size),
@@ -102,7 +173,7 @@ fn machine_value(name: &str) -> Option<String> {
             HKEY_LOCAL_MACHINE,
             &subkey,
             &value,
-            RRF_RT_REG_SZ | RRF_RT_REG_EXPAND_SZ,
+            RRF_RT_REG_SZ | RRF_RT_REG_EXPAND_SZ | RRF_NOEXPAND,
             None,
             Some(buffer.as_mut_ptr().cast()),
             Some(&mut size),
@@ -153,5 +224,60 @@ mod tests {
         assert!(std::path::Path::new(program_data).is_absolute());
         let drive = env.get("SystemDrive").expect("SystemDrive");
         assert!(drive.len() == 2 && drive.ends_with(':'), "{drive}");
+    }
+
+    fn roots() -> MachineRoots {
+        MachineRoots {
+            system_root: r"C:\WINDOWS".into(),
+            system_drive: Some("C:".into()),
+            program_data: Some(r"C:\ProgramData".into()),
+        }
+    }
+
+    /// The registry's own expansion reads this process's environment, which
+    /// a user controls; the roots come from the API instead.
+    #[test]
+    fn machine_references_expand_from_the_api_not_the_environment() {
+        let roots = roots();
+        assert_eq!(
+            roots
+                .expand("ComSpec", r"%SystemRoot%\system32\cmd.exe")
+                .as_deref(),
+            Some(r"C:\WINDOWS\system32\cmd.exe")
+        );
+        assert_eq!(
+            roots
+                .expand(
+                    "Path",
+                    r"%SYSTEMROOT%\system32;%windir%;%ProgramData%\x;C:\Tools"
+                )
+                .as_deref(),
+            Some(r"C:\WINDOWS\system32;C:\WINDOWS;C:\ProgramData\x;C:\Tools")
+        );
+        assert_eq!(
+            roots.expand("OS", "Windows_NT").as_deref(),
+            Some("Windows_NT")
+        );
+        assert_eq!(roots.expand("X", "50%").as_deref(), Some("50%"));
+    }
+
+    #[test]
+    fn a_reference_the_machine_cannot_resolve_is_dropped_never_taken_from_the_user() {
+        let roots = roots();
+        assert_eq!(roots.expand("ComSpec", r"%USERPROFILE%\cmd.exe"), None);
+        assert_eq!(
+            roots
+                .expand("Path", r"%SystemRoot%\system32;%JAVA_HOME%\bin;;C:\Tools")
+                .as_deref(),
+            Some(r"C:\WINDOWS\system32;C:\Tools")
+        );
+        assert_eq!(roots.expand("Path", r"%JAVA_HOME%\bin"), None);
+    }
+
+    #[test]
+    fn the_forwarded_machine_values_carry_no_unexpanded_reference() {
+        for (name, value) in machine_environment() {
+            assert!(!value.contains('%'), "{name}={value}");
+        }
     }
 }

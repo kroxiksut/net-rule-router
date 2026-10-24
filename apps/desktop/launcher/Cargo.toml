@@ -23,6 +23,9 @@ path = "src/lib.rs"
 nrr-application = { path = "../../../core/application" }
 nrr-ui-support = { path = "../../../core/ui-support" }
 nrr-mock-backend = { path = "../../../core/mock-backend" }
+# Path masking for the window logs added to the diagnostic archive; already
+# linked through `nrr-mock-backend`.
+nrr-diagnostics = { path = "../../../core/diagnostics" }
 nrr-shared = { path = "../../../shared/contracts" }
 nrr-desktop-gui = { path = "../gui" }
 nrr-desktop-tray = { path = "../tray" }

@@ -287,6 +287,7 @@ fn every_status_update_event() -> Vec<StatusUpdateEvent> {
         StatusUpdateEvent::RoutingPauseStateChanged {
             sid: "S-1-5-21".into(),
             paused: false,
+            paused_at: None,
             resumes_at_ms: Some(1_700_000_000_000),
             until_restart: false,
         },

@@ -20,9 +20,13 @@ QtObject {
             ? function(key, fallback) { return source.tr(key, fallback) } : null)
     }
 
+    /// The write goes through the launcher, which refuses a file edited by
+    /// hand: no bridge-side `writeTextFile` fallback, that is the unchecked
+    /// write this exists to replace.
     readonly property bool canWrite: typeof nrrNativeBridge !== "undefined"
         && nrrNativeBridge !== null
-        && typeof nrrNativeBridge.writeTextFile === "function"
+        && typeof nrrNativeBridge.rpcUserSettingsRulesFileWrite === "function"
+        && rpc !== null && typeof rpc.registerRpcCallback === "function"
 
     /// The foreign-OS / unsupported sections captured at the last import for
     /// `route`, handed to `onSections`. The sidecar is owned by the launcher,
@@ -65,9 +69,12 @@ QtObject {
     /// the file already held these rules and was left alone. `keep`: the file
     /// was edited by hand since the program wrote it, so it is never
     /// overwritten here, only recognised when it already holds these rules.
-    function writeRoute(route, path, rows, includeComments, os, done, keep) {
-        var finish = function(ok, changed) {
-            if (typeof done === "function") done(!!ok, !!changed)
+    /// The launcher makes the same refusal on its own (`done(false, false,
+    /// "rules-file-hand-edited")`), whoever calls; `overwrite` is the user's
+    /// answer that the file may go.
+    function writeRoute(route, path, rows, includeComments, os, done, keep, overwrite) {
+        var finish = function(ok, changed, code) {
+            if (typeof done === "function") done(!!ok, !!changed, String(code || ""))
         }
         if (!canWrite) {
             finish(false, false)
@@ -86,27 +93,38 @@ QtObject {
                 finish(true, false)
                 return
             }
-            if (!nrrNativeBridge.writeTextFile(path, text)) {
-                console.log("[bound-file] writeTextFile failed:", route, path)
+            var corr = nrrNativeBridge.rpcUserSettingsRulesFileWrite({
+                "path": String(path), "text": text, "overwrite": overwrite === true })
+            if (!corr || String(corr) === "") {
+                console.log("[bound-file] write request not sent:", route, path)
                 finish(false, false)
                 return
             }
-            writer.noteWritten(path)
-            finish(true, true)
+            rpc.registerRpcCallback(corr, function(ok, payload, code, msg) {
+                if (!ok) {
+                    console.log("[bound-file] write refused:", route, path, code, msg)
+                    finish(false, false, code)
+                    return
+                }
+                finish(true, true)
+            })
         })
     }
 
     /// `path` now holds the program's version of its rules: a later change
     /// there is the user's hand, which a write from elsewhere must not erase
-    /// unasked (`handEdited`).
-    function noteWritten(path) {
+    /// unasked (`handEdited`). `done()`, when given, runs once the record is
+    /// in or could not be made.
+    function noteWritten(path, done) {
+        var finish = function() { if (typeof done === "function") done() }
         if (typeof nrrNativeBridge === "undefined" || !nrrNativeBridge
                 || typeof nrrNativeBridge.rpcUserSettingsRulesFileWritten !== "function"
-                || !rpc || typeof rpc.registerRpcCallback !== "function") return
+                || !rpc || typeof rpc.registerRpcCallback !== "function") { finish(); return }
         var corr = nrrNativeBridge.rpcUserSettingsRulesFileWritten({ "path": String(path) })
-        if (!corr || String(corr) === "") return
+        if (!corr || String(corr) === "") { finish(); return }
         rpc.registerRpcCallback(corr, function(ok, payload, code, msg) {
             if (!ok) console.log("[bound-file] written version not recorded:", code, msg)
+            finish()
         })
     }
 

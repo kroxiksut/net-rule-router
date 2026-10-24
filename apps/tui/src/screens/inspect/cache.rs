@@ -4,12 +4,16 @@
 //! keystroke is easier to make by accident than a click.
 
 use crossterm::event::{KeyCode, KeyEvent};
+use nrr_client_logic::cache_view::{
+    cache_entry_passes, CacheFilters, CACHE_FRESHNESS_FILTERS, CACHE_ROUTE_FILTERS,
+    CACHE_SOURCE_FILTERS,
+};
 use nrr_ipc_client::IpcClient;
 use nrr_shared::display_text::display_text;
 use nrr_shared::ipc::IpcOperationName;
 use nrr_shared::ipc_payloads::{
     CacheClearRequest, CacheClearResponse, CacheEntriesListRequest, CacheEntriesListResponse,
-    CacheEntryDto,
+    CacheEntryDto, SeedFromBrowserHistoryResponse,
 };
 use nrr_shared::pagination::{PageCursor, PaginationParams};
 
@@ -57,6 +61,48 @@ pub struct CacheState {
     question: Option<Clear>,
     clearing: bool,
     cleared: Option<Cleared>,
+    /// The window's three filters over the loaded rows, by slug; `all` is off.
+    source: &'static str,
+    freshness: &'static str,
+    route: &'static str,
+    /// What the last browser-history seed came to.
+    seeded: Option<Result<Key, String>>,
+}
+
+fn next_of(values: &[&'static str], now: &str) -> &'static str {
+    let at = values.iter().position(|v| *v == now).unwrap_or(0);
+    values[(at + 1) % values.len()]
+}
+
+impl CacheState {
+    /// The loaded rows the filters keep, by index.
+    fn visible(&self) -> Vec<usize> {
+        let filters = CacheFilters {
+            source: self.source,
+            freshness: self.freshness,
+            route: self.route,
+        };
+        self.entries
+            .iter()
+            .enumerate()
+            .filter(|(_, e)| {
+                cache_entry_passes(&e.source, &e.freshness, &e.expected_route, &filters)
+            })
+            .map(|(i, _)| i)
+            .collect()
+    }
+
+    fn accept(&mut self, page: Page) {
+        self.entries.extend(page.entries);
+        self.cursor = page.cursor;
+        self.total = page.total.or(self.total);
+        self.redacted = page.redacted;
+        // The pager walks the rows the filters keep, not every loaded one.
+        if std::mem::take(&mut self.advance) {
+            let shown = self.visible().len();
+            self.pager.next_page(shown);
+        }
+    }
 }
 
 struct Page {
@@ -115,15 +161,7 @@ fn load(app: &mut AppState, reset: bool) {
             }
             state.loading = false;
             match result {
-                Ok(page) => {
-                    state.entries.extend(page.entries);
-                    state.cursor = page.cursor;
-                    state.total = page.total.or(state.total);
-                    state.redacted = page.redacted;
-                    if std::mem::take(&mut state.advance) {
-                        state.pager.next_page(state.entries.len());
-                    }
-                }
+                Ok(page) => state.accept(page),
                 Err(slug) => {
                     state.advance = false;
                     state.error = Some(slug);
@@ -136,7 +174,7 @@ fn load(app: &mut AppState, reset: bool) {
 /// The next page: from what is loaded, else asked of the service.
 fn more(app: &mut AppState) {
     let state = &mut app.inspect.cache;
-    let len = state.entries.len();
+    let len = state.visible().len();
     if state.pager.next_page(len) || state.cursor.is_none() || state.loading {
         return;
     }
@@ -181,6 +219,43 @@ fn clear(app: &mut AppState, what: Clear) {
     });
 }
 
+/// One press: the filter moves on to its next choice.
+fn cycle(app: &mut AppState, filter: char) {
+    let state = &mut app.inspect.cache;
+    match filter {
+        'f' => state.freshness = next_of(&CACHE_FRESHNESS_FILTERS, state.freshness),
+        't' => state.source = next_of(&CACHE_SOURCE_FILTERS, state.source),
+        _ => state.route = next_of(&CACHE_ROUTE_FILTERS, state.route),
+    }
+    state.pager = Pager::default();
+}
+
+/// `b`: the service resolves the names from browser history that match the
+/// user's rules; the rows arrive in the cache as it goes.
+fn seed(app: &mut AppState) {
+    app.inspect.cache.seeded = None;
+    queue(app, |client| {
+        let result = call(
+            client,
+            IpcOperationName::SeedFromBrowserHistory,
+            serde_json::json!({}),
+        )
+        .and_then(|answer| {
+            serde_json::from_value::<SeedFromBrowserHistoryResponse>(answer).map_err(bad_response)
+        })
+        .map(|answer| {
+            if answer.started {
+                keys::CACHE_SEED_STARTED
+            } else if answer.already_running {
+                keys::CACHE_SEED_RUNNING
+            } else {
+                keys::CACHE_SEED_UNAVAILABLE
+            }
+        });
+        Reply::new(move |app| app.inspect.cache.seeded = Some(result))
+    });
+}
+
 fn search(app: &mut AppState, query: String) {
     app.inspect.cache.query = query;
     load(app, true);
@@ -209,17 +284,15 @@ pub struct CacheScreen;
 impl Screen for CacheScreen {
     fn view(&self, app: &AppState, texts: &Texts) -> ScreenView {
         let state = &app.inspect.cache;
+        let visible = state.visible();
         let mut pager = state.pager;
-        pager.clamp(state.entries.len());
-        let mut list = page_lines(
-            texts,
-            pager,
-            state.entries.len(),
-            state.cursor.is_some(),
-            |i| row_text(texts, &state.entries[i]),
-        );
-        if state.asked && !state.loading && state.error.is_none() && state.entries.is_empty() {
-            let empty = if state.query.is_empty() {
+        pager.clamp(visible.len());
+        let mut list = page_lines(texts, pager, visible.len(), state.cursor.is_some(), |i| {
+            row_text(texts, &state.entries[visible[i]])
+        });
+        if state.asked && !state.loading && state.error.is_none() && visible.is_empty() {
+            let filtered = !state.entries.is_empty();
+            let empty = if state.query.is_empty() && !filtered {
                 keys::CACHE_EMPTY
             } else {
                 keys::CACHE_NO_MATCH
@@ -242,9 +315,9 @@ impl Screen for CacheScreen {
                 },
                 Panel {
                     title: texts.get(keys::CACHE_DETAIL),
-                    lines: state
-                        .entries
+                    lines: visible
                         .get(pager.selected)
+                        .and_then(|&i| state.entries.get(i))
                         .map(|e| detail_lines(texts, e))
                         .unwrap_or_default(),
                     feed: false,
@@ -257,6 +330,8 @@ impl Screen for CacheScreen {
         &[
             keys::CACHE_HELP_SEARCH,
             keys::CACHE_HELP_CLEAR,
+            keys::CACHE_HELP_FILTERS,
+            keys::CACHE_HELP_SEED,
             keys::HELP_PAGES,
             keys::HELP_REFRESH,
         ]
@@ -268,6 +343,8 @@ impl Screen for CacheScreen {
             keys::CACHE_PLAIN_DETAILS,
             keys::CACHE_PLAIN_SEARCH,
             keys::CACHE_HELP_CLEAR,
+            keys::CACHE_HELP_FILTERS,
+            keys::CACHE_HELP_SEED,
             keys::HELP_REFRESH,
         ]
     }
@@ -315,8 +392,10 @@ impl Screen for CacheScreen {
             return true;
         }
         let state = &mut app.inspect.cache;
-        let len = state.entries.len();
+        let len = state.visible().len();
         match key.code {
+            KeyCode::Char(filter @ ('f' | 't' | 'w')) => cycle(app, filter),
+            KeyCode::Char('b') => seed(app),
             KeyCode::Char('/') => state.typing = Some(state.query.clone()),
             KeyCode::Char('r') => load(app, true),
             KeyCode::Char('c') => ask(app, Clear::App),
@@ -339,8 +418,12 @@ impl Screen for CacheScreen {
             };
         }
         let state = &mut app.inspect.cache;
-        let len = state.entries.len();
+        let len = state.visible().len();
         match command(line) {
+            ("f", "") => cycle(app, 'f'),
+            ("t", "") => cycle(app, 't'),
+            ("w", "") => cycle(app, 'w'),
+            ("b", "") => seed(app),
             ("n", "") => more(app),
             ("p", "") => state.pager.previous_page(),
             ("r", "") => load(app, true),
@@ -383,6 +466,12 @@ fn summary_lines(app: &AppState, texts: &Texts) -> Vec<ViewLine> {
     if state.redacted {
         lines.push(ViewLine::text(texts.get(keys::CACHE_REDACTED)));
     }
+    lines.push(ViewLine::text(filters_text(state, texts)));
+    match &state.seeded {
+        Some(Ok(key)) => lines.push(ViewLine::text(texts.get(*key))),
+        Some(Err(slug)) => lines.push(ViewLine::text(error_text(texts, slug))),
+        None => {}
+    }
     match &state.typing {
         Some(buffer) => lines.extend(typing_lines(
             texts,
@@ -418,6 +507,32 @@ fn summary_lines(app: &AppState, texts: &Texts) -> Vec<ViewLine> {
         }
     }
     lines
+}
+
+/// The three filters in the window's words, `all` read as such.
+fn filters_text(state: &CacheState, texts: &Texts) -> String {
+    let source = match state.source {
+        "" | "all" => texts.get(keys::CACHE_SOURCE_ALL),
+        slug => slug_label(texts, "source", slug),
+    };
+    let freshness = texts.get(match state.freshness {
+        "fresh" => keys::CACHE_FRESH_FRESH,
+        "stale" => keys::CACHE_FRESH_STALE,
+        _ => keys::CACHE_FRESH_ALL,
+    });
+    let route = match state.route {
+        "" | "all" => texts.get(keys::CACHE_ROUTE_ALL),
+        "none" => texts.get(keys::CACHE_ROUTE_NONE),
+        other => route_label(texts, other),
+    };
+    texts.fill(
+        keys::CACHE_FILTERS,
+        &[
+            ("source", source),
+            ("freshness", freshness),
+            ("route", route),
+        ],
+    )
 }
 
 fn cleared_text(texts: &Texts, cleared: &Cleared) -> String {
@@ -496,6 +611,44 @@ fn detail_lines(texts: &Texts, e: &CacheEntryDto) -> Vec<ViewLine> {
         wall_clock(e.expires_at_ms)
     )));
     lines
+}
+
+#[cfg(test)]
+mod pager_tests {
+    use super::*;
+
+    fn row(route: &str) -> CacheEntryDto {
+        serde_json::from_value(serde_json::json!({
+            "hostname": "a.example", "ip": "192.0.2.1", "freshness": "fresh",
+            "source": "dns", "resolved_at_ms": 0, "expires_at_ms": 0,
+            "expected_route": route,
+        }))
+        .expect("a cache row")
+    }
+
+    /// A page of rows the filter hides must not move the pager past the
+    /// rows it shows.
+    #[test]
+    fn more_rows_hidden_by_the_filter_keep_the_page() {
+        let mut state = CacheState {
+            route: "primary",
+            entries: std::iter::repeat_with(|| row("primary"))
+                .take(super::super::PAGE_ROWS)
+                .collect(),
+            advance: true,
+            ..CacheState::default()
+        };
+        state.accept(Page {
+            entries: std::iter::repeat_with(|| row("secondary"))
+                .take(super::super::PAGE_ROWS)
+                .collect(),
+            cursor: None,
+            total: None,
+            redacted: false,
+        });
+        assert_eq!(state.pager.selected, 0);
+        assert!(!state.advance);
+    }
 }
 
 #[cfg(test)]

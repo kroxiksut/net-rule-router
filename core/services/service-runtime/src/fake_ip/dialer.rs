@@ -63,6 +63,9 @@ pub const TCP_READ_POLL_INTERVAL: Duration = Duration::from_secs(1);
 /// tears the flow down instead of leaving the writer thread unjoinable.
 pub const UPSTREAM_WRITE_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// Idle time before the upstream connection is probed.
+const UPSTREAM_KEEPALIVE: Duration = Duration::from_secs(30);
+
 /// Where a flow really goes, and over which route it must leave.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct UpstreamTarget {
@@ -81,6 +84,10 @@ pub struct UpstreamTarget {
     pub port: u16,
     /// Route the policy picked for this hostname.
     pub route: RouteRole,
+    /// The route the routing user's or the owner's book gave, before a
+    /// confirmed VPN client's flow was moved to the primary; `None` when that
+    /// book blocks the host. What a later book is compared with.
+    pub book_route: Option<RouteRole>,
     /// The served user whose links carry the flow, when it is not the
     /// routing user's.
     pub owner: Option<String>,
@@ -96,6 +103,7 @@ impl UpstreamTarget {
             address: Some(address),
             fallbacks: Vec::new(),
             route,
+            book_route: Some(route),
             owner: None,
         }
     }
@@ -670,6 +678,10 @@ impl RelayDialer for SystemRelayDialer {
             );
         }
         stream.set_nodelay(true).ok();
+        // A tunnel or NAT that died quietly is found without a write to fail.
+        socket2::SockRef::from(&stream)
+            .set_tcp_keepalive(&socket2::TcpKeepalive::new().with_time(UPSTREAM_KEEPALIVE))
+            .ok();
         // Both timeouts exist so worker threads stay joinable: the reader turns
         // a silent-forever upstream into periodic teardown checks, the writer
         // cannot sit in `write` past the bound. Failure to set them must fail
@@ -1109,6 +1121,7 @@ mod tests {
             fallbacks: Vec::new(),
             port,
             route: RouteRole::Primary,
+            book_route: Some(RouteRole::Primary),
             owner: None,
         }
     }

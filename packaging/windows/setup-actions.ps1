@@ -4,9 +4,11 @@
 # the installers add no second way to register the service, restore the
 # network or remove data.
 #
-#   Stop        before files are replaced: stop the service so its binary is free
+#   Stop        before files are replaced: stop the service so its binary is free;
+#               the stop is an upgrade's, so protection stays for the new files
 #   MarkStop    before the MSI's own stop: mark it as wanted, or the service
-#               restarts itself mid-removal
+#               restarts itself mid-removal; -Upgrade when a newer MSI replaces
+#               this one, so protection stays
 #   Register    files in place: register the service from this folder and start it
 #   Unregister  removal: stop and unregister the service, restore the network,
 #               and remove the service copy a portable install left under
@@ -285,6 +287,7 @@ $exitCode = 0
 $leftForOthers = $false
 switch ($Action) {
     'Stop' {
+        Set-NrrUpgradeStop
         if (-not (Stop-NrrService)) {
             Write-Host "    $NrrServiceName did not stop"
             $exitCode = 1
@@ -292,6 +295,7 @@ switch ($Action) {
     }
     'MarkStop' {
         Set-NrrDeliberateStop
+        if ($Upgrade) { Set-NrrUpgradeStop }
     }
     'Register' {
         if (-not (Test-Path -LiteralPath $console)) {

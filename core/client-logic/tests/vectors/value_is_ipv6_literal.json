@@ -1,0 +1,15 @@
+{
+  "description": "rules.js valueIsIpv6Literal / rules_table::value_is_ipv6_literal",
+  "cases": [
+    { "name": "exact-ipv6 is always a literal", "input": { "ruleType": "exact-ipv6", "value": "2001:db8::1" }, "expected": true },
+    { "name": "exact-ipv6 by type alone", "input": { "ruleType": "exact-ipv6", "value": "" }, "expected": true },
+    { "name": "exact-ip with a colon", "input": { "ruleType": "exact-ip", "value": "2001:db8::7" }, "expected": true },
+    { "name": "exact-ip IPv4", "input": { "ruleType": "exact-ip", "value": "192.0.2.7" }, "expected": false },
+    { "name": "exact-ipv4 never", "input": { "ruleType": "exact-ipv4", "value": "192.0.2.7" }, "expected": false },
+    { "name": "subnet IPv6 is not an exact literal", "input": { "ruleType": "subnet", "value": "2001:db8::/32" }, "expected": false },
+    { "name": "domain never", "input": { "ruleType": "domain", "value": "example.com" }, "expected": false },
+    { "name": "type spelling is case-sensitive", "input": { "ruleType": "EXACT-IPV6", "value": "2001:db8::1" }, "expected": false },
+    { "name": "empty type", "input": { "ruleType": "", "value": "2001:db8::1" }, "expected": false },
+    { "name": "ip-range IPv6 is not an exact literal", "input": { "ruleType": "ip-range", "value": "2001:db8::1-2001:db8::9" }, "expected": false }
+  ]
+}

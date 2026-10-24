@@ -81,11 +81,13 @@ struct StopSignal {
 const REASON_NONE: u8 = 0;
 const REASON_SERVICE_STOP: u8 = 1;
 const REASON_MACHINE_SHUTDOWN: u8 = 2;
+const REASON_UPGRADE: u8 = 3;
 
 fn encode_reason(reason: StopReason) -> u8 {
     match reason {
         StopReason::ServiceStop => REASON_SERVICE_STOP,
         StopReason::MachineShutdown => REASON_MACHINE_SHUTDOWN,
+        StopReason::Upgrade => REASON_UPGRADE,
     }
 }
 
@@ -93,6 +95,7 @@ fn decode_reason(code: u8) -> Option<StopReason> {
     match code {
         REASON_SERVICE_STOP => Some(StopReason::ServiceStop),
         REASON_MACHINE_SHUTDOWN => Some(StopReason::MachineShutdown),
+        REASON_UPGRADE => Some(StopReason::Upgrade),
         _ => None,
     }
 }
@@ -202,6 +205,29 @@ pub fn teardown_reason() -> StopReason {
     decode_reason(TEARDOWN_REASON.load(Ordering::SeqCst)).unwrap_or(StopReason::ServiceStop)
 }
 
+/// The file a package upgrade leaves in the service's data directory before it
+/// restarts the daemon: the stop is the upgrade's (`StopReason::Upgrade`).
+/// The directory is the root-only state root, so nobody else can plant it.
+pub const UPGRADE_STOP_MARKER: &str = "upgrade-stop";
+
+/// How long the marker speaks for a stop: an upgrade that never stopped the
+/// daemon must not make a later stop keep its blocks.
+const UPGRADE_STOP_FRESHNESS: std::time::Duration = std::time::Duration::from_secs(120);
+
+/// Whether the stop under way is a package upgrade's. Consumes the marker; a
+/// stale one, or anything but a plain file, counts for nothing.
+pub fn take_upgrade_stop_marker(data_dir: &std::path::Path) -> bool {
+    let path = data_dir.join(UPGRADE_STOP_MARKER);
+    let fresh = std::fs::symlink_metadata(&path)
+        .ok()
+        .filter(std::fs::Metadata::is_file)
+        .and_then(|meta| meta.modified().ok())
+        .and_then(|at| at.elapsed().ok())
+        .is_some_and(|age| age <= UPGRADE_STOP_FRESHNESS);
+    let _ = std::fs::remove_file(&path);
+    fresh
+}
+
 /// Clear the latch at runtime start so a second runtime in the same process
 /// (tests, console-mode restart) is not born already tearing down.
 pub fn clear_teardown() {
@@ -248,6 +274,25 @@ pub trait ServiceController: Send + Sync {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A package upgrade marks its stop; the marker is read once, and a link
+    /// planted under the name never counts.
+    #[test]
+    fn an_upgrade_marker_speaks_for_one_stop_only() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        assert!(!take_upgrade_stop_marker(dir.path()));
+        std::fs::write(dir.path().join(UPGRADE_STOP_MARKER), b"").expect("mark");
+        assert!(take_upgrade_stop_marker(dir.path()));
+        assert!(!take_upgrade_stop_marker(dir.path()), "consumed");
+        #[cfg(unix)]
+        {
+            let target = dir.path().join("elsewhere");
+            std::fs::write(&target, b"").expect("target");
+            std::os::unix::fs::symlink(&target, dir.path().join(UPGRADE_STOP_MARKER))
+                .expect("link");
+            assert!(!take_upgrade_stop_marker(dir.path()));
+        }
+    }
 
     /// A sleeper wakes on the stop itself, not on its next poll — and without
     /// one, sleeps out its time instead of spinning.

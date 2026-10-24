@@ -192,6 +192,19 @@ bool NrrNativeBridge::isElevated() {
     return nrrProcessIsElevated();
 }
 
+void NrrNativeBridge::openFolder(const QString &path) {
+    const QFileInfo info(path);
+    if (path.isEmpty() || !info.isDir()) {
+        return;
+    }
+#ifdef Q_OS_WIN
+    QProcess::startDetached(systemExplorerPath(),
+                            {QDir::toNativeSeparators(info.absoluteFilePath())});
+#else
+    QDesktopServices::openUrl(QUrl::fromLocalFile(info.absoluteFilePath()));
+#endif
+}
+
 void NrrNativeBridge::openContainingFolder(const QString &path) {
     if (path.isEmpty()) {
         return;
@@ -212,9 +225,12 @@ void NrrNativeBridge::openContainingFolder(const QString &path) {
         }
     }
 #else
-    QFileInfo info(path);
-    QDesktopServices::openUrl(QUrl::fromLocalFile(
-        info.exists() ? info.absolutePath() : path));
+    // The containing folder whether or not the file is still there, as on
+    // Windows; a missing path itself would open nothing.
+    const QString dir = QFileInfo(path).absolutePath();
+    if (!dir.isEmpty()) {
+        QDesktopServices::openUrl(QUrl::fromLocalFile(dir));
+    }
 #endif
 }
 
@@ -383,7 +399,48 @@ bool NrrNativeBridge::requestTrayShutdown() {
     return true;
 }
 
+namespace {
+
+// The tray launcher's single-instance lock file (`tray-shell-v1`, the key in
+// `nrr-launcher`), which it removes as it gives up the claim. -1 when absent,
+// 0 when present without a readable pid. Private runtime dir, still bounded.
+qint64 trayLockHolderPid() {
+    const QString path =
+        QDir(appRuntimeDirectoryPath()).filePath(QStringLiteral("tray-shell-v1.lock"));
+    const QFileInfo info(path);
+    if (appRuntimeDirectoryPath().isEmpty() || info.isSymLink() || !info.isFile()) {
+        return -1;
+    }
+    QFile file(path);
+    if (!file.open(QIODevice::ReadOnly)) {
+        return 0;
+    }
+    const QList<QByteArray> lines = file.read(4096).split('\n');
+    for (const QByteArray &line : lines) {
+        const QByteArray trimmed = line.trimmed();
+        if (!trimmed.startsWith("pid=")) {
+            continue;
+        }
+        bool ok = false;
+        const qint64 pid = trimmed.mid(4).trimmed().toLongLong(&ok);
+        return ok && pid > 0 && pid <= 0xFFFFFFFFLL ? pid : 0;
+    }
+    return 0;
+}
+
+}  // namespace
+
 bool NrrNativeBridge::isTrayProcessAlive() {
+    // The lock, not the PID this host spawned: a tray that outlived an earlier
+    // window was never spawned here, and a duplicate that exited at once left
+    // a PID that says nothing about the tray holding the icon.
+    const qint64 lockPid = trayLockHolderPid();
+    if (lockPid < 0) {
+        return false;
+    }
+    if (lockPid > 0) {
+        return probeProcessLiveness(lockPid) != ProcessLiveness::Gone;
+    }
     if (trayProcessId_ <= 0) {
         return false;
     }

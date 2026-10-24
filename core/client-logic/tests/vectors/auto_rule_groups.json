@@ -1,5 +1,5 @@
 {
-  "description": "pure.js suggestion pipeline as the suggestions screen runs it: groupAutoRuleRows, filterAutoRuleGroupsByStatus, filterAutoRuleGroupsServedByMainLink, searchAutoRuleGroups, sortAutoRuleGroups, the two counts and autoRuleRowsShownByDefault. Each candidate is `base-candidate` with its patch laid over it.",
+  "description": "pure.js suggestion pipeline as the suggestions screen runs it: groupAutoRuleRows, filterAutoRuleGroupsByStatus, filterAutoRuleGroupsServedByMainLink, filterAutoRuleGroups, searchAutoRuleGroups, sortAutoRuleGroups, the two counts and autoRuleRowsShownByDefault. Each candidate is `base-candidate` with its patch laid over it.",
   "base-candidate": {
     "id": "c1",
     "anchor": "site.example",
@@ -159,6 +159,18 @@
           { "id": "c2", "proposed-match": "self.example.org", "anchor": "", "observations": null, "signal": "main-link-blocked", "anchor-refuses-main-link": true }
         ],
         "dismissed": [], "show-dismissed": false, "show-served": false, "query": "", "sort": "main-route"
+      }
+    },
+    {
+      "name": "a consumer filter keeps only the groups that site relies on, by its exact name",
+      "input": {
+        "candidates": [
+          { "consumers": [ { "hostname": "news.example", "route": "secondary" } ] },
+          { "id": "c3", "proposed-match": "other.test", "consumers": [ { "hostname": "shop.example", "route": "primary" } ] },
+          { "id": "c4", "proposed-match": "third.test", "consumers": [ { "hostname": "news.example.org", "route": "secondary" } ] }
+        ],
+        "dismissed": [], "show-dismissed": false, "show-served": false,
+        "consumer": "news.example", "query": "", "sort": "main-route"
       }
     }
   ]

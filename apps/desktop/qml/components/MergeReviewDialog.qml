@@ -539,6 +539,7 @@ Dialog {
                             // Per-conflict pick — only under Union.
                             ThemedComboBox {
                                 id: pickCombo
+                                accessibleLabel: String(modelData.value || "")
                                 theme: dialog.ownerRoot ? dialog.ownerRoot.uiTheme : null
                                 visible: dialog.policy === "union"
                                 Layout.preferredWidth: 140
@@ -584,7 +585,7 @@ Dialog {
             text: dialog.tr("dialog.merge.unresolved-hint",
                 "Pick a side for every conflict before merging.")
             wrapMode: Text.Wrap
-            color: dialog.ownerRoot ? dialog.ownerRoot.uiTheme.colorWarning : "#d97706"
+            color: dialog.ownerRoot ? dialog.ownerRoot.uiTheme.colorWarning : "#b05207"
         }
 
         // ── Buttons ──────────────────────────────────────────────

@@ -48,7 +48,7 @@ ColumnLayout {
     readonly property var offered: Pure.offeredRoutingSettings(
         root.platformProfile ? root.platformProfile.supports : null,
         panel.enforcementMode, panel.leakEffective, panel.secondaryBound, panel.fakeIpEnabled)
-    // "Allow name resolution over the main connection while blocked". Acts
+    // "While everything is held, look up site names over the main connection". Acts
     // only when everything is blocked. Default true: with DNS cut too, the
     // outage is a total blackout. Read from the per-SID policy.
     property bool allowDnsOverPrimary: true
@@ -1314,6 +1314,10 @@ ColumnLayout {
         _loadKillSwitchPosture(); _loadEnforcementMode()
         _loadLivenessWindow(); _loadStopScope()
         _loadFakeIpDriverStatus(); loadLocalNetworks()
+        localSuffixesGroup._load()
+        // Unsaved resolver edits are kept; only a list that never arrived is asked again.
+        if (dohLockdownGroup._dohLoadFailed && root.routingDohEditorExpanded)
+            dohLockdownGroup._dohLoad()
     }
 
     Component.onCompleted: {
@@ -1635,6 +1639,7 @@ ColumnLayout {
             }
             ThemedComboBox {
                 id: defaultRouteCombo
+                accessibleLabel: root.uiRevision >= 0 ? root.tr("settings.routing.default-route.title", "Default route") : ""
                 theme: root.uiTheme
                 Layout.fillWidth: true
                 Layout.maximumWidth: 380
@@ -2100,7 +2105,7 @@ ColumnLayout {
                     font.pixelSize: root.uiTheme.baseFontSizePx - 1
                     text: root.uiRevision >= 0
                         ? root.tr("settings.routing.leak-protection.note-sites",
-                            "What your rules send through the additional connection never goes out the main one. Everything else keeps working.")
+                            "What your rules send through the additional connection never goes out the main one while strict blocking of shared addresses is on, as it is by default. Everything else keeps working, except sites that share an address with a routed one.")
                         : ""
                 }
                 ThemedRadioButton {
@@ -2186,7 +2191,7 @@ ColumnLayout {
                 visible: panel.offered.indexOf("allow-dns-over-primary") >= 0
                 checked: panel.allowDnsOverPrimary
                 text: root.tr("settings.routing.kill-switch.allow-dns-label",
-                    "Allow name resolution over the main connection while blocked")
+                    "While everything is held, look up site names over the main connection")
                 contentItem: Label {
                     text: allowDnsOverPrimaryCheck.text
                     leftPadding: allowDnsOverPrimaryCheck.indicator.width + allowDnsOverPrimaryCheck.spacing
@@ -2209,7 +2214,7 @@ ColumnLayout {
                 wrapMode: Text.WordWrap
                 font.pixelSize: root.uiTheme.baseFontSizePx - 1
                 text: root.tr("settings.routing.kill-switch.allow-dns-note",
-                    "On by default: a narrow exception keeps name resolution working while blocked — only to the DNS servers your main connection is configured with, and only on the DNS port. Turn this off only for strict blocking: with DNS cut too, you have no working internet at all until the additional connection returns.")
+                    "On by default, so site names keep resolving while the additional connection is down — only through the DNS servers of your main connection and only on the DNS port. The cost: those servers, usually your provider's, see the names of the sites you open, including the ones your rules send through the additional connection; the traffic itself stays held. Turn it off for strict blocking: with name lookups cut too, nothing works until the additional connection returns.")
             }
 
             // What the user sees, not what is enforced: the banner Main.qml
@@ -2386,6 +2391,7 @@ ColumnLayout {
             }
             ThemedComboBox {
                 id: enforcementModeCombo
+                accessibleLabel: root.uiRevision >= 0 ? root.tr("settings.routing.enforcement-mode.label", "How routed traffic is enforced") : ""
                 theme: root.uiTheme
                 visible: panel.offered.indexOf("enforcement-mode") >= 0
                 Layout.fillWidth: true
@@ -2776,6 +2782,7 @@ ColumnLayout {
                     }
                     ThemedComboBox {
                         id: sharedIpCombo
+                        accessibleLabel: root.uiRevision >= 0 ? root.tr("settings.routing-behavior.shared-ip.label", "When a routed domain shares an IP address with other sites") : ""
                         theme: root.uiTheme
                         visible: panel.offered.indexOf("shared-ip-policy") >= 0
                         Layout.fillWidth: true
@@ -2902,7 +2909,7 @@ ColumnLayout {
                         wrapMode: Text.WordWrap
                         font.pixelSize: root.uiTheme.baseFontSizePx - 1
                         text: root.tr("settings.routing.kill-switch.shared-strict-note",
-                            "Off (recommended): more convenient. Ordinary sites keep opening while the additional adapter is down, but some traffic of routed sites may go out through the main connection. On (strict): safer. No traffic of routed sites goes out through the main connection, but some ordinary sites may stop opening until the additional adapter is back.")
+                            "On (the default): safer. No traffic of routed sites goes out through the main connection, but some ordinary sites that share an address with them may stop opening until the additional adapter is back. Off: more convenient. Ordinary sites keep opening while the additional adapter is down, but some traffic of routed sites may go out through the main connection.")
                     }
                     Label {
                         Layout.fillWidth: true
@@ -3031,6 +3038,7 @@ ColumnLayout {
             }
             ThemedComboBox {
                 id: livenessWindowCombo
+                accessibleLabel: root.uiRevision >= 0 ? root.tr("settings.routing.liveness-window.label", "Additional tunnel liveness window") : ""
                 theme: root.uiTheme
                 visible: panel.offered.indexOf("secondary-liveness-window-secs") >= 0
                 Layout.fillWidth: true
@@ -3117,6 +3125,7 @@ ColumnLayout {
             }
             ThemedSpinBox {
                 id: livenessCustomSpin
+                accessibleLabel: root.uiRevision >= 0 ? root.tr("settings.routing.liveness-window.label", "Additional tunnel liveness window") : ""
                 theme: root.uiTheme
                 Layout.leftMargin: root.uiTheme.spacingSm
                 from: 5
@@ -3436,6 +3445,8 @@ ColumnLayout {
         property var _offered: []
         property bool _loading: false
         property bool _loaded: false
+        property bool _loadFailed: false
+        property bool _saving: false
 
         function _load() {
             if (localSuffixesGroup._loading) return
@@ -3446,6 +3457,7 @@ ColumnLayout {
             root.rpc.registerRpcCallback(corr, function(ok, p, code, msg) {
                 localSuffixesGroup._loading = false
                 if (!ok) {
+                    localSuffixesGroup._loadFailed = !localSuffixesGroup._loaded
                     root.statusLine = root.tr("settings.routing.local-suffixes.load-failed",
                         "Could not load the network name list: ")
                         + ((typeof root.ipcErrorLabel === "function") ? root.ipcErrorLabel(String(code || "")) : String(code || ""))
@@ -3458,6 +3470,7 @@ ColumnLayout {
             localSuffixesGroup._suffixes = (p && p.suffixes) || []
             localSuffixesGroup._offered = (p && p.offered) || []
             localSuffixesGroup._loaded = true
+            localSuffixesGroup._loadFailed = false
         }
         function _names() {
             var out = []
@@ -3465,13 +3478,42 @@ ColumnLayout {
                 out.push(String(localSuffixesGroup._suffixes[i].suffix || ""))
             return out
         }
+        function _same(a, b) {
+            return String(a || "").trim().toLowerCase() === String(b || "").trim().toLowerCase()
+        }
+        // The list is the machine's and the write replaces it whole: `change`
+        // runs on a fresh read, never on the copy shown since the page opened.
+        function _mutate(change) {
+            if (!localSuffixesGroup._loaded || localSuffixesGroup._saving) return
+            if (typeof root.rpc.rpcLocalDnsSuffixesGet !== "function") return
+            localSuffixesGroup._saving = true
+            var corr = root.rpc.rpcLocalDnsSuffixesGet()
+            if (!corr) { localSuffixesGroup._saving = false; return }
+            root.rpc.registerRpcCallback(corr, function(ok, p, code, msg) {
+                if (!ok) {
+                    localSuffixesGroup._saving = false
+                    root.statusLine = root.tr("settings.routing.local-suffixes.save-failed",
+                        "Could not save the network name list: ")
+                        + ((typeof root.ipcErrorLabel === "function") ? root.ipcErrorLabel(String(code || "")) : String(code || ""))
+                    return
+                }
+                localSuffixesGroup._take(p)
+                var next = change(localSuffixesGroup._names())
+                if (next === null) { localSuffixesGroup._saving = false; return }
+                localSuffixesGroup._save(next)
+            })
+        }
         /// The whole list is sent; the service replaces it and answers with
         /// what it stored.
         function _save(names) {
-            if (typeof root.rpc.rpcLocalDnsSuffixesSet !== "function") return
+            if (typeof root.rpc.rpcLocalDnsSuffixesSet !== "function") {
+                localSuffixesGroup._saving = false
+                return
+            }
             var corr = root.rpc.rpcLocalDnsSuffixesSet({ "suffixes": names })
-            if (!corr) return
+            if (!corr) { localSuffixesGroup._saving = false; return }
             root.rpc.registerRpcCallback(corr, function(ok, p, code, msg) {
+                localSuffixesGroup._saving = false
                 if (ok) {
                     localSuffixesGroup._take(p)
                     root.statusLine = root.tr("settings.routing.local-suffixes.saved",
@@ -3488,15 +3530,20 @@ ColumnLayout {
             })
         }
         function _add(name) {
-            var names = localSuffixesGroup._names()
-            names.push(String(name || "").trim())
-            localSuffixesGroup._save(names)
+            var added = String(name || "").trim()
+            if (added === "") return
+            localSuffixesGroup._mutate(function(names) {
+                for (var i = 0; i < names.length; i += 1)
+                    if (localSuffixesGroup._same(names[i], added)) return null
+                names.push(added)
+                return names
+            })
         }
-        function _remove(index) {
-            var names = localSuffixesGroup._names()
-            if (index < 0 || index >= names.length) return
-            names.splice(index, 1)
-            localSuffixesGroup._save(names)
+        function _remove(name) {
+            localSuffixesGroup._mutate(function(names) {
+                var kept = names.filter(function(n) { return !localSuffixesGroup._same(n, name) })
+                return kept.length === names.length ? null : kept
+            })
         }
         Component.onCompleted: localSuffixesGroup._load()
 
@@ -3520,6 +3567,25 @@ ColumnLayout {
                 color: root.mutedTextColor
                 wrapMode: Text.WordWrap
                 text: root.tr("settings.routing.local-suffixes.empty", "The list is empty.")
+            }
+            RowLayout {
+                Layout.fillWidth: true
+                visible: localSuffixesGroup._loadFailed
+                spacing: root.uiTheme.spacingSm
+                Label {
+                    Layout.fillWidth: true
+                    Layout.preferredWidth: 0
+                    color: root.mutedTextColor
+                    wrapMode: Text.WordWrap
+                    text: root.tr("settings.routing.local-suffixes.not-read",
+                        "The network name list could not be read, so it cannot be changed now.")
+                }
+                ThemedButton {
+                    theme: root.uiTheme
+                    enabled: !localSuffixesGroup._loading
+                    text: root.tr("action.retry", "Try again")
+                    onClicked: localSuffixesGroup._load()
+                }
             }
             Repeater {
                 model: localSuffixesGroup._suffixes
@@ -3554,9 +3620,10 @@ ColumnLayout {
                     ThemedButton {
                         theme: root.uiTheme
                         flat: true
+                        enabled: !localSuffixesGroup._saving
                         text: root.tr("action.delete", "Delete")
                         Accessible.name: text + " " + String(suffixRow.modelData.suffix || "")
-                        onClicked: localSuffixesGroup._remove(suffixRow.index)
+                        onClicked: localSuffixesGroup._remove(String(suffixRow.modelData.suffix || ""))
                     }
                 }
             }
@@ -3581,6 +3648,7 @@ ColumnLayout {
                     }
                     ThemedButton {
                         theme: root.uiTheme
+                        enabled: localSuffixesGroup._loaded && !localSuffixesGroup._saving
                         text: root.tr("action.add", "Add")
                         icon.source: root.uiIconSource("add")
                         onClicked: localSuffixesGroup._add(offerRow.modelData.suffix)
@@ -3592,13 +3660,15 @@ ColumnLayout {
                 spacing: root.uiTheme.spacingSm
                 ThemedTextField {
                     id: suffixAddField
+                    accessibleLabel: root.uiRevision >= 0 ? root.tr("settings.routing.local-suffixes.add-field", "New suffix") : ""
                     theme: root.uiTheme
                     Layout.fillWidth: true
                     placeholderText: root.tr("settings.routing.local-suffixes.add-field", "New suffix")
                 }
                 ThemedButton {
                     theme: root.uiTheme
-                    enabled: suffixAddField.text.trim() !== ""
+                    enabled: localSuffixesGroup._loaded && !localSuffixesGroup._saving
+                        && suffixAddField.text.trim() !== ""
                     text: root.tr("action.add", "Add")
                     icon.source: root.uiIconSource("add")
                     onClicked: {
@@ -3834,6 +3904,7 @@ ColumnLayout {
             }
             ThemedComboBox {
                 id: autoRulesModeCombo
+                accessibleLabel: root.uiRevision >= 0 ? root.tr("settings.routing.auto-rules.label", "Missing companion domains") : ""
                 theme: root.uiTheme
                 Layout.fillWidth: true
                 Layout.maximumWidth: 460
@@ -3995,9 +4066,14 @@ ColumnLayout {
         // a stable `uid` so per-row edits map back to the master array regardless
         // of the active filter.
         property var _dohMaster: []
+        // The wire rows the editor opened with: a save lays the edits made
+        // since over a fresh read instead of sending this copy back.
+        property var _dohBase: []
         property int _dohNextUid: 1
         property bool _dohLoaded: false
         property bool _dohLoading: false
+        property bool _dohLoadFailed: false
+        property bool _dohSaving: false
         property string _dohFilter: ""
 
         // A hostname never holds ':', an IPv6 literal always does. The service
@@ -4055,41 +4131,72 @@ ColumnLayout {
             root.rpc.registerRpcCallback(corr, function(ok, p, code, msg) {
                 dohLockdownGroup._dohLoading = false
                 if (!ok) {
+                    dohLockdownGroup._dohLoadFailed = true
                     root.statusLine = root.tr("settings.routing.doh-lockdown.resolvers.load-failed",
                         "Could not load the resolver list: ")
                         + ((typeof root.ipcErrorLabel === "function")
                             ? root.ipcErrorLabel(String(code || "")) : String(code || ""))
                     return
                 }
-                dohLockdownGroup._dohMaster =
-                    dohLockdownGroup._dohNormalizeList((p && p.resolvers) || [])
+                dohLockdownGroup._dohTake((p && p.resolvers) || [])
+                dohLockdownGroup._dohLoadFailed = false
                 dohLockdownGroup._dohLoaded = true
-                dohLockdownGroup._dohRebuildVisible()
             })
         }
-        function _dohSave() {
-            var bridge = (typeof nrrNativeBridge !== "undefined") ? nrrNativeBridge : null
-            if (bridge === null || typeof bridge.rpcDohResolversSet !== "function") return
-            var arr = dohLockdownGroup._dohMaster
-            var payload = { "resolvers": [] }
+        function _dohTake(list) {
+            dohLockdownGroup._dohBase = list
+            dohLockdownGroup._dohMaster = dohLockdownGroup._dohNormalizeList(list)
+            dohLockdownGroup._dohRebuildVisible()
+        }
+        function _dohWire(arr) {
+            var out = []
             for (var i = 0; i < arr.length; i += 1) {
-                payload.resolvers.push({
+                out.push({
                     "target-kind": String(arr[i].kind || "host"),
                     "target": String(arr[i].target || ""),
                     "comment": String(arr[i].comment || ""),
                     "enabled": arr[i].enabled !== false
                 })
             }
+            return out
+        }
+        // The list is the machine's and the write replaces it whole, so it is
+        // built from a fresh read; nothing is sent from a list never read.
+        function _dohSave() {
+            if (!dohLockdownGroup._dohLoaded || dohLockdownGroup._dohSaving) return
+            var bridge = (typeof nrrNativeBridge !== "undefined") ? nrrNativeBridge : null
+            if (bridge === null || typeof bridge.rpcDohResolversSet !== "function"
+                    || typeof bridge.rpcDohResolversGet !== "function") return
+            dohLockdownGroup._dohSaving = true
+            var readCorr = bridge.rpcDohResolversGet()
+            if (!readCorr) { dohLockdownGroup._dohSaving = false; return }
+            root.rpc.registerRpcCallback(readCorr, function(readOk, fresh, readCode, readMsg) {
+                if (!readOk) {
+                    dohLockdownGroup._dohSaving = false
+                    root.statusLine = root.tr("settings.routing.doh-lockdown.resolvers.save-failed",
+                        "Could not save the resolver list: ")
+                        + ((typeof root.ipcErrorLabel === "function")
+                            ? root.ipcErrorLabel(String(readCode || "")) : String(readCode || ""))
+                    return
+                }
+                var next = Pure.dohResolversRebase(dohLockdownGroup._dohBase,
+                    dohLockdownGroup._dohWire(dohLockdownGroup._dohMaster),
+                    (fresh && fresh.resolvers) || [])
+                var payload = { "resolvers": next.resolvers }
+                if (next.removed) payload["drop-seeded"] = true
+                dohLockdownGroup._dohSend(bridge, payload)
+            })
+        }
+        function _dohSend(bridge, payload) {
             var corr = bridge.rpcDohResolversSet(JSON.stringify(payload))
-            if (!corr) return
+            if (!corr) { dohLockdownGroup._dohSaving = false; return }
             root.rpc.registerRpcCallback(corr, function(ok, p, code, msg) {
+                dohLockdownGroup._dohSaving = false
                 if (ok) {
                     root.statusLine = root.tr("settings.routing.doh-lockdown.resolvers.saved",
                         "Resolver list saved.")
                     // Reflect the stored (validated / normalised) list.
-                    dohLockdownGroup._dohMaster =
-                        dohLockdownGroup._dohNormalizeList((p && p.resolvers) || [])
-                    dohLockdownGroup._dohRebuildVisible()
+                    dohLockdownGroup._dohTake((p && p.resolvers) || [])
                     return
                 }
                 var c = String(code || "")
@@ -4160,7 +4267,7 @@ ColumnLayout {
                 wrapMode: Text.WordWrap
                 font.pixelSize: root.uiTheme.baseFontSizePx - 1
                 text: root.tr("settings.routing.doh-lockdown.auto-note",
-                    "Blocks encrypted DNS in browsers while you have rules for the additional route, so the sites you route are seen and routed. Turn this off to set the blocking by hand.")
+                    "Blocks encrypted DNS in browsers while your rules need to see site names, so the sites you route or block are seen and handled. Turn this off to set the blocking by hand.")
             }
             Label {
                 Layout.fillWidth: true
@@ -4171,9 +4278,9 @@ ColumnLayout {
                 wrapMode: Text.WordWrap
                 text: (root.uiRevision >= 0 && panel.dohLockdownEffective)
                     ? root.tr("settings.routing.doh-lockdown.auto-on",
-                        "On: you have rules for the additional route.")
+                        "On: your rules route or block sites by name.")
                     : root.tr("settings.routing.doh-lockdown.auto-off",
-                        "Off: no rules for the additional route yet.")
+                        "Off: none of your rules needs site names.")
             }
 
             // ── Part A: per-SID master toggle (hand-set) ──
@@ -4225,6 +4332,7 @@ ColumnLayout {
             }
             ThemedComboBox {
                 id: dohScopeCombo
+                accessibleLabel: root.uiRevision >= 0 ? root.tr("settings.routing.doh-lockdown.scope-label", "When to apply") : ""
                 theme: root.uiTheme
                 visible: panel.dohLockdownManual
                 Layout.fillWidth: true
@@ -4353,6 +4461,7 @@ ColumnLayout {
 
                 ThemedTextField {
                     id: dohFilterField
+                    accessibleLabel: root.uiRevision >= 0 ? root.tr("settings.routing.doh-lockdown.resolvers.filter", "Filter by address or note…") : ""
                     theme: root.uiTheme
                     Layout.fillWidth: true
                     placeholderText: root.tr("settings.routing.doh-lockdown.resolvers.filter",
@@ -4437,9 +4546,18 @@ ColumnLayout {
                         wrapMode: Text.WordWrap
                         text: dohLockdownGroup._dohLoading
                             ? root.tr("settings.routing.doh-lockdown.resolvers.loading", "Loading…")
-                            : root.tr("settings.routing.doh-lockdown.resolvers.empty",
-                                "No resolvers in the list.")
+                            : dohLockdownGroup._dohLoadFailed
+                                ? root.tr("settings.routing.doh-lockdown.resolvers.not-read",
+                                    "The resolver list could not be read, so it cannot be changed now.")
+                                : root.tr("settings.routing.doh-lockdown.resolvers.empty",
+                                    "No resolvers in the list.")
                     }
+                }
+                ThemedButton {
+                    theme: root.uiTheme
+                    visible: dohLockdownGroup._dohLoadFailed && !dohLockdownGroup._dohLoading
+                    text: root.tr("action.retry", "Try again")
+                    onClicked: dohLockdownGroup._dohLoad()
                 }
 
                 // ── Part B: add-a-row form ──
@@ -4448,6 +4566,7 @@ ColumnLayout {
                     spacing: root.uiTheme.spacingSm
                     ThemedTextField {
                         id: dohAddTarget
+                        accessibleLabel: root.uiRevision >= 0 ? root.tr("settings.routing.doh-lockdown.resolvers.add-target", "IP address or hostname") : ""
                         theme: root.uiTheme
                         Layout.fillWidth: true
                         placeholderText: root.tr("settings.routing.doh-lockdown.resolvers.add-target",
@@ -4455,6 +4574,7 @@ ColumnLayout {
                     }
                     ThemedTextField {
                         id: dohAddComment
+                        accessibleLabel: root.uiRevision >= 0 ? root.tr("settings.routing.doh-lockdown.resolvers.add-comment", "Note (provider / country)") : ""
                         theme: root.uiTheme
                         Layout.fillWidth: true
                         placeholderText: root.tr("settings.routing.doh-lockdown.resolvers.add-comment",
@@ -4462,7 +4582,8 @@ ColumnLayout {
                     }
                     ThemedButton {
                         theme: root.uiTheme
-                        enabled: dohAddTarget.text.trim() !== ""
+                        enabled: dohLockdownGroup._dohLoaded && !dohLockdownGroup._dohSaving
+                            && dohAddTarget.text.trim() !== ""
                         text: root.tr("settings.routing.doh-lockdown.resolvers.add", "Add")
                         icon.source: root.uiIconSource("add")
                         onClicked: {
@@ -4489,6 +4610,7 @@ ColumnLayout {
                     Item { Layout.fillWidth: true }
                     ThemedButton {
                         theme: root.uiTheme
+                        enabled: dohLockdownGroup._dohLoaded && !dohLockdownGroup._dohSaving
                         text: root.tr("settings.routing.doh-lockdown.resolvers.save",
                             "Save resolver list")
                         icon.source: root.uiIconSource("save")
@@ -4577,7 +4699,7 @@ ColumnLayout {
                     ToolTip.visible: hovered
                     ToolTip.delay: 400
                     ToolTip.text: root.tr("settings.routing.rule-lock.allow.tooltip",
-                        "On (default): anyone signed in to this computer can add, edit and apply their own routing rules. Turn it off on company laptops, or for parental control, so only an administrator decides where traffic goes.")
+                        "On (default): anyone signed in to this computer can add, edit and apply their own routing rules. Turn it off on company laptops so only an administrator changes the rules. Pausing routing and the route settings (connections, default route, leak protection) stay with each user.")
                 }
                 Label {
                     Layout.fillWidth: true
@@ -4769,6 +4891,7 @@ ColumnLayout {
                     spacing: root.uiTheme.spacingSm
                     ThemedTextField {
                         id: hostsFilePathField
+                        accessibleLabel: root.uiRevision >= 0 ? root.tr("settings.routing.hosts-file.label", "OS hosts file") : ""
                         theme: root.uiTheme
                         Layout.fillWidth: true
                         readOnly: true
@@ -4785,7 +4908,7 @@ ColumnLayout {
                         enabled: hostsFilePathField.text.length > 0
                         onClicked: {
                             var url = panel._hostsFolderUrl(hostsFilePathField.text)
-                            if (url) Pure.openExternalUrl(url)
+                            if (url) root.openOwnFolder(url)
                         }
                     }
                 }

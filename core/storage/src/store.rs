@@ -535,12 +535,12 @@ impl CacheRepository for SqliteCacheStore {
         let mut stmt = conn
             .prepare(
                 "SELECT canonical_host, MIN(last_seen_at, ?1) AS seen FROM hostnames
-                 ORDER BY seen DESC, canonical_host ASC",
+                 ORDER BY seen / ?2 DESC, canonical_host ASC",
             )
             .map_err(db_err)?;
         let now_ms = system_time_to_ms(SystemTime::now());
         let rows = stmt
-            .query_map([now_ms], |r| {
+            .query_map([now_ms, crate::suffix_window::RECENCY_BUCKET_MS], |r| {
                 Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?))
             })
             .map_err(db_err)?;
@@ -554,34 +554,36 @@ impl CacheRepository for SqliteCacheStore {
     fn shared_ip_direct_host_counts(&self) -> StorageResult<Vec<(Ipv4Addr, u32)>> {
         let conn = self.conn.borrow();
         let mut stmt = conn
-            .prepare(
-                "SELECT ipv4_packed, COUNT(DISTINCT hostname) \
-                 FROM shared_ip_direct_hosts GROUP BY ipv4_packed",
-            )
+            .prepare("SELECT ipv4_packed, hostname FROM shared_ip_direct_hosts")
             .map_err(db_err)?;
         let rows = stmt
-            .query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?)))
+            .query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)))
             .map_err(db_err)?;
-        let mut out = Vec::new();
+        let mut sites: std::collections::BTreeMap<i64, std::collections::HashSet<String>> =
+            std::collections::BTreeMap::new();
         for row in rows {
-            let (packed, count) = row.map_err(db_err)?;
-            out.push((Ipv4Addr::from(packed as u32), count.max(0) as u32));
+            let (packed, host) = row.map_err(db_err)?;
+            sites.entry(packed).or_default().insert(census_site(&host));
         }
-        Ok(out)
+        Ok(sites
+            .into_iter()
+            .map(|(packed, hosts)| (Ipv4Addr::from(packed as u32), hosts.len() as u32))
+            .collect())
     }
 
     fn direct_host_count_for_ip(&self, ip: Ipv4Addr) -> StorageResult<u32> {
         let conn = self.conn.borrow();
-        let packed = ipv4_packed(ip);
-        let n: i64 = conn
-            .query_row(
-                "SELECT COUNT(DISTINCT hostname) FROM shared_ip_direct_hosts \
-                 WHERE ipv4_packed = ?1",
-                params![packed],
-                |r| r.get(0),
-            )
+        let mut stmt = conn
+            .prepare_cached("SELECT hostname FROM shared_ip_direct_hosts WHERE ipv4_packed = ?1")
             .map_err(db_err)?;
-        Ok(n.max(0) as u32)
+        let mut sites = std::collections::HashSet::new();
+        for host in stmt
+            .query_map(params![ipv4_packed(ip)], |r| r.get::<_, String>(0))
+            .map_err(db_err)?
+        {
+            sites.insert(census_site(&host.map_err(db_err)?));
+        }
+        Ok(sites.len() as u32)
     }
 
     fn names_for_address(
@@ -879,22 +881,30 @@ impl CacheRepository for SqliteCacheStore {
         // was blocked by the catch-all. `last_seen_at DESC` keeps the hosts the
         // user is actually using inside the window; `canonical_host ASC` breaks
         // ties deterministically so identical-timestamp rows stay stable.
+        // The hour, not the millisecond, so a repeat visit keeps the window
+        // (`suffix_window`), which also caps what one site of the zone holds.
         let mut stmt = conn
             .prepare(
                 "SELECT canonical_host FROM hostnames
                  WHERE canonical_host LIKE ?1 ESCAPE '\\'
-                 ORDER BY last_seen_at DESC, canonical_host ASC
-                 LIMIT ?2",
+                 ORDER BY last_seen_at / ?2 DESC, canonical_host ASC",
             )
             .map_err(db_err)?;
         let rows = stmt
-            .query_map(params![pattern, limit as i64], |r| r.get::<_, String>(0))
+            .query_map(
+                params![pattern, crate::suffix_window::RECENCY_BUCKET_MS],
+                |r| r.get::<_, String>(0),
+            )
             .map_err(db_err)?;
-        let mut out = Vec::new();
+        let mut names = Vec::new();
         for row in rows {
-            out.push(row.map_err(db_err)?);
+            names.push(row.map_err(db_err)?);
         }
-        Ok(out)
+        Ok(crate::suffix_window::fair_suffix_window(
+            names,
+            &normalised,
+            limit,
+        ))
     }
 
     fn list_hostnames_with_site(&self, site: &str, limit: usize) -> StorageResult<Vec<String>> {
@@ -1511,6 +1521,15 @@ fn clamp_stamps_to_now(resolved_at_ms: i64, expires_at_ms: i64, now_ms: i64) -> 
 
 fn ms_to_system_time(ms: i64) -> SystemTime {
     SystemTime::UNIX_EPOCH + std::time::Duration::from_millis(ms.max(0) as u64)
+}
+
+/// The site a census name belongs to: its registrable domain, the name itself
+/// when it has none. A page can point any number of names of its own domain at
+/// an address; they are one tenant there, not a majority.
+fn census_site(hostname: &str) -> String {
+    nrr_domain::companion_affinity::registrable_domain(hostname)
+        .unwrap_or(hostname)
+        .to_ascii_lowercase()
 }
 
 fn ipv4_packed(ip: Ipv4Addr) -> i64 {

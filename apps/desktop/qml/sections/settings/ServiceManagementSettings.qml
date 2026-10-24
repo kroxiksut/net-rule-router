@@ -2,6 +2,7 @@ import QtQuick 2.15
 import QtQuick.Controls 2.15
 import QtQuick.Layouts 1.15
 import "../../components"
+import "../../lib/pure.js" as Pure
 
 // Settings → Service management panel.
 //
@@ -666,7 +667,7 @@ GroupBox {
                         "Service logs folder path unavailable.")
                     return
                 }
-                Qt.openUrlExternally(url)
+                root.openOwnFolder(url)
             }
         }
 

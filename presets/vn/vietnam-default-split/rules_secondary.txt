@@ -14,6 +14,7 @@
 *.redd.it  # Reddit: blocked on part of the networks of a major ISP
 *.redditstatic.com  # Reddit: blocked on part of the networks of a major ISP
 *.redditmedia.com  # Reddit: blocked on part of the networks of a major ISP
+*.redditmail.com  # Reddit: blocked on part of the networks of a major ISP
 
 telegram.*  # Telegram: blocked nationwide in 2025, the block order was never withdrawn
 *.t.me  # Telegram: blocked nationwide in 2025, the block order was never withdrawn

@@ -1,9 +1,9 @@
 //! One live test against the real mechanism: a name the machine's own resolver
 //! knows must come back with addresses AND a TTL.
 //!
-//! Needs no root, but does need working DNS. Without it — no nameserver in
-//! `/etc/resolv.conf`, or nothing answering — the test skips loudly rather than
-//! failing: an offline build machine is not a broken resolver.
+//! Needs no root, but does need working DNS, so it is `#[ignore]`d out of the
+//! default gate (an offline build machine is not a broken resolver) and runs
+//! with `--ignored`, where a missing nameserver fails rather than passes.
 
 #![cfg(target_os = "linux")]
 #![allow(clippy::expect_used)]
@@ -17,26 +17,24 @@ use nrr_platform_linux::dns_resolver::{parse_nameservers, LinuxDnsResolver, RESO
 /// anyone would notice one query to.
 const KNOWN_NAME: &str = "example.com";
 
-fn has_a_nameserver() -> bool {
-    std::fs::read_to_string(RESOLV_CONF)
+fn assert_a_nameserver() {
+    let configured = std::fs::read_to_string(RESOLV_CONF)
         .map(|text| !parse_nameservers(&text).is_empty())
-        .unwrap_or(false)
+        .unwrap_or(false);
+    assert!(
+        configured,
+        "no IPv4 nameserver in {RESOLV_CONF}: this test needs working DNS"
+    );
 }
 
 #[test]
+#[ignore = "needs working DNS (a reachable IPv4 nameserver in /etc/resolv.conf)"]
 fn a_known_name_resolves_with_a_ttl() {
-    if !has_a_nameserver() {
-        eprintln!("SKIPPED dns_resolver_live: no IPv4 nameserver in {RESOLV_CONF}");
-        return;
-    }
+    assert_a_nameserver();
     let resolver = LinuxDnsResolver::new().with_timeout(Duration::from_secs(3));
 
     let record = match resolver.resolve(KNOWN_NAME, AddressFamily::Ipv4) {
         Ok(record) => record,
-        Err(DnsResolverError::Timeout { .. }) | Err(DnsResolverError::Network { .. }) => {
-            eprintln!("SKIPPED dns_resolver_live: the configured nameserver did not answer");
-            return;
-        }
         Err(other) => panic!("the resolver failed on a name that exists: {other:?}"),
     };
 
@@ -59,19 +57,14 @@ fn a_known_name_resolves_with_a_ttl() {
 /// The distinction the cache depends on: a name that does not exist is an
 /// authoritative answer worth remembering, not a failure worth retrying.
 #[test]
+#[ignore = "needs working DNS (a reachable IPv4 nameserver in /etc/resolv.conf)"]
 fn a_name_that_does_not_exist_comes_back_as_nxdomain() {
-    if !has_a_nameserver() {
-        eprintln!("SKIPPED dns_resolver_live: no IPv4 nameserver in {RESOLV_CONF}");
-        return;
-    }
+    assert_a_nameserver();
     let resolver = LinuxDnsResolver::new().with_timeout(Duration::from_secs(3));
 
     // `.invalid` is reserved by RFC 2606 precisely so it can never resolve.
     match resolver.resolve("nrr-does-not-exist.invalid", AddressFamily::Ipv4) {
         Err(DnsResolverError::NxDomain { .. }) => {}
-        Err(DnsResolverError::Timeout { .. }) | Err(DnsResolverError::Network { .. }) => {
-            eprintln!("SKIPPED dns_resolver_live: the configured nameserver did not answer");
-        }
         other => panic!("a reserved non-existent name must be NxDomain, got {other:?}"),
     }
 }

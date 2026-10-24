@@ -390,6 +390,34 @@ fn a_preview_token_is_its_owners_and_runs_out() {
     assert!(grants.preview(&second, now).is_ok());
 }
 
+/// One user previewing in a loop pushes out only their own tokens.
+#[test]
+fn previews_in_a_loop_do_not_push_out_another_users_token() {
+    let conn = state_conn();
+    let (grants, _) = opened(&conn, Some(KEY.to_vec()));
+    let now = now_ms();
+    let bobs = grants.issue(preview_for("S-1-5-21-b", false), now);
+    let mut alices = Vec::new();
+    for i in 0..(MAX_TOKENS * 2) {
+        let mut preview = preview_for("S-1-5-21-a", false);
+        preview.value = format!("{}-{i}", preview.value);
+        alices.push(grants.issue(preview, now));
+    }
+    assert!(
+        grants.preview(&bobs, now).is_ok(),
+        "the other user's token stays"
+    );
+    let alive = alices
+        .iter()
+        .filter(|t| grants.preview(t, now).is_ok())
+        .count();
+    assert_eq!(alive, MAX_TOKENS_PER_PRINCIPAL);
+    assert!(
+        grants.preview(alices.last().expect("issued"), now).is_ok(),
+        "the newest of the looping user's stays"
+    );
+}
+
 /// A full reset of a user's data takes their confirmations with it.
 #[test]
 fn a_full_reset_forgets_the_users_confirmations() {

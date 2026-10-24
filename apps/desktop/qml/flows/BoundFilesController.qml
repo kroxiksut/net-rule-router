@@ -41,28 +41,31 @@ QtObject {
     }
 
     /// Generate `route`'s rules from the local table and write them to `path`.
-    /// `onDone(ok, changed)` — `changed` is false when the file already held
-    /// these rules and was left alone (no needless mtime churn, no misleading
-    /// "saved" report for a route nobody touched).
-    function writeRouteToPath(route, path, includeComments, onDone) {
-        var done = function(ok, changed) {
-            if (typeof onDone === "function") onDone(!!ok, !!changed)
+    /// `onDone(ok, changed, held)` — `changed` is false when the file already
+    /// held these rules and was left alone (no needless mtime churn, no
+    /// misleading "saved" report for a route nobody touched); `held` when the
+    /// launcher refused because the file was edited by hand and `overwrite`
+    /// did not say the user agrees to lose that.
+    function writeRouteToPath(route, path, includeComments, onDone, overwrite) {
+        var done = function(ok, changed, held) {
+            if (typeof onDone === "function") onDone(!!ok, !!changed, !!held)
         }
         if (!writer.canWrite) {
             root.statusLine = root.tr("status.bridge-unavailable", "Native bridge unavailable")
-            done(false, false)
+            done(false, false, false)
             return
         }
         writer.writeRoute(route, path, root.rulesModel,
             (includeComments === undefined) ? _emitComments() : !!includeComments,
             root.platformProfile.os,
-            function(ok, changed) {
-                if (!ok) {
+            function(ok, changed, code) {
+                var held = !ok && code === "rules-file-hand-edited"
+                if (!ok && !held) {
                     root.statusLine = root.tr("status.export-write-failed",
                         "Cannot write preset file to the chosen path.") + " " + path
                 }
-                done(ok, changed)
-            })
+                done(ok, changed, held)
+            }, undefined, overwrite === true)
     }
 
     // ── the "this is one of the app's own rule sets" gate ────────────────
@@ -187,18 +190,23 @@ QtObject {
     /// the warning above rebases a target, or the Save-As picker names one,
     /// that file is where the route lives from now on.
     /// `onDone(ok, writtenPaths)`; `writtenPaths` lists only the files that
-    /// actually changed.
-    function _writeTargets(targets, allowFactory, onDone) {
+    /// actually changed. A file edited by hand is refused by the launcher and
+    /// asked about here (`rulesFileEditedDialog`), whichever gesture wrote;
+    /// `overwrite` is that dialog's "replace the file".
+    function _writeTargets(targets, allowFactory, onDone, overwrite) {
         var done = function(ok, paths) {
             if (typeof onDone === "function") onDone(!!ok, paths || [])
         }
         if (!targets || targets.length === 0) { done(true, []); return }
         if (!allowFactory && _guardFactoryTargets(targets,
-                function(resolved, sameLocation) { _writeTargets(resolved, sameLocation, onDone) },
+                function(resolved, sameLocation) {
+                    _writeTargets(resolved, sameLocation, onDone, overwrite)
+                },
                 function() { done(false, []) })) return
         var pending = targets.length
         var okAll = true
         var written = []
+        var held = []
         var patch = {}
         var settle = function() {
             pending -= 1
@@ -215,10 +223,18 @@ QtObject {
                     && typeof root.driftController._driftRecheckNow === "function") {
                 Qt.callLater(root.driftController._driftRecheckNow)
             }
+            if (held.length > 0) _askAboutHandEdited(held)
             done(okAll, written)
         }
         var writeOne = function(t) {
-            writeRouteToPath(t.route, t.path, t.includeComments, function(ok, changed) {
+            writeRouteToPath(t.route, t.path, t.includeComments, function(ok, changed, kept) {
+                if (kept) {
+                    // The table still differs from the file; the chip and the
+                    // close prompt keep saying so until the user answers.
+                    if (t.route === "primary") root._filesSyncDirtyPrimary = true
+                    else root._filesSyncDirtySecondary = true
+                    held.push({ route: t.route, path: t.path })
+                }
                 if (!ok) { okAll = false; settle(); return }
                 if (changed) written.push(t.path)
                 if (t.route === "primary") {
@@ -236,7 +252,7 @@ QtObject {
                 }
                 root.suggestRulesFolder(t.path)
                 settle()
-            })
+            }, overwrite === true)
         }
         for (var i = 0; i < targets.length; i += 1) writeOne(targets[i])
     }
@@ -629,14 +645,15 @@ QtObject {
         if (root.driftController) root.driftController._openMergeDialog()
     }
 
-    /// "Replace the file": the rules in force overwrite the hand edit.
+    /// "Replace the file": the rules in force overwrite the hand edit — the
+    /// one write that tells the launcher the user agreed to lose it.
     function overwriteHandEditedFiles(targets) {
         _writeTargets(targets || [], false, function(ok, written) {
             if (ok && written.length > 0) {
                 root.statusLine = root.tr("status.bound-file-saved", "Bound rules file saved.")
                     + " → " + written.join("\n")
             }
-        })
+        }, true)
     }
 
     function handleAutoRulesAuthored(correlationId) {
@@ -796,6 +813,32 @@ QtObject {
         _writeBoundFiles(false, null, true)
     }
 
+    /// A merge built from `taken` (`{ primary, secondary }` file texts, or
+    /// null) is in force: a bound file still holding the text it was merged
+    /// from is the program's version, so following the merged rules writes it
+    /// unasked. One edited since stays the user's and is asked about.
+    function noteMergedFrom(taken, done) {
+        var paths = {
+            primary: String(root.prefs.lastSavedPathPrimary || ""),
+            secondary: String(root.prefs.lastSavedPathSecondary || "")
+        }
+        var current = { primary: _fileText(paths.primary), secondary: _fileText(paths.secondary) }
+        var pending = Pure.mergeTakenPaths(paths, taken, current)
+        var next = function() {
+            if (pending.length === 0) { done(); return }
+            writer.noteWritten(pending.shift(), next)
+        }
+        next()
+    }
+
+    /// `path`'s text as the merge read it, null when there is none to read.
+    function _fileText(path) {
+        if (path === "" || typeof nrrNativeBridge.readFileBytes !== "function"
+                || typeof nrrNativeBridge.decodeBase64Utf8 !== "function") return null
+        var b64 = String(nrrNativeBridge.readFileBytes(path) || "")
+        return b64 ? String(nrrNativeBridge.decodeBase64Utf8(b64) || "") : null
+    }
+
     /// The footer "Save to file" chip.
     function _saveBoundFilesNow() {
         saveRulesToFiles(true, null)
@@ -877,6 +920,19 @@ QtObject {
         })
     }
 
+    /// The table came from the bound files this session (an offline load or
+    /// the cold-start hydration).
+    property bool tableFromFiles: false
+
+    /// A file is bound, yet the table holds neither the service's rules nor
+    /// that file's: only what was typed since. Writing it as the set, to the
+    /// file or as work to apply later, would drop every rule it never loaded.
+    function tableMissesBoundRules() {
+        if (_boundTargets().length === 0) return false
+        return !(root._serviceRuleCount >= 0 || root.rulesBaseRevision !== null
+            || tableFromFiles)
+    }
+
     /// The folder a bound route file lives in, "" when the route has no file.
     function _routeFolder(path) {
         var norm = String(path || "").replace(/\\/g, "/")
@@ -899,6 +955,12 @@ QtObject {
         var pathSecondary = String(root.prefs.lastSavedPathSecondary || "")
         if (pathPrimary === "" && pathSecondary === "") {
             exportCurrentRulesInteractive(onDone)
+            return
+        }
+        if (tableMissesBoundRules()) {
+            root.statusLine = root.tr("status.rules-not-loaded-not-saved",
+                "Your rules file was not loaded, so nothing was saved over it. Load your rules first, then save.")
+            if (typeof onDone === "function") onDone(false)
             return
         }
         var folder = _routeFolder(pathPrimary !== "" ? pathPrimary : pathSecondary)

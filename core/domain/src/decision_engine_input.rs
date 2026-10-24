@@ -100,8 +100,8 @@ fn normalize_hostname_value(raw: Option<&str>) -> (NormalizedHostname, Vec<Norma
     } else {
         trimmed
     };
-    let lowercased = without_dot.to_lowercase();
-    if lowercased.is_ascii() {
+    if without_dot.is_ascii() {
+        let lowercased = without_dot.to_ascii_lowercase();
         // `_` too: the rule validator accepts it (internal corp zones use it),
         // and rejecting it here made a valid rule's host `Invalid`, which
         // silently disables three match classes for that request.
@@ -129,11 +129,12 @@ fn normalize_hostname_value(raw: Option<&str>) -> (NormalizedHostname, Vec<Norma
             )
         }
     } else {
-        match idna::domain_to_ascii(&lowercased) {
+        // UTS-46 maps the case itself, as the rule validator does.
+        match idna::domain_to_ascii(without_dot) {
             Ok(ascii) => {
-                if ascii != lowercased {
+                if ascii != without_dot {
                     warnings.push(NormalizationWarning::DomainPunycodeEncoded {
-                        original: lowercased,
+                        original: without_dot.to_owned(),
                         punycode: ascii.clone(),
                     });
                 }
@@ -936,5 +937,13 @@ mod tests {
             Some("xn--e1aybc.xn--p1ai")
         );
         assert_eq!(hostname_ace("not a host"), None);
+    }
+
+    /// The case is UTS-46's, as a browser maps it: a capital sigma is `σ`,
+    /// never the final `ς` lowercasing writes at a word end.
+    #[test]
+    fn a_capital_sigma_maps_as_uts46_maps_it() {
+        assert_eq!(hostname_ace("ΣΑΣ.gr"), hostname_ace("σασ.gr"));
+        assert_ne!(hostname_ace("ΣΑΣ.gr"), hostname_ace("σας.gr"));
     }
 }

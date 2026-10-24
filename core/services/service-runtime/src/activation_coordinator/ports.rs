@@ -84,9 +84,14 @@ pub trait RulesApplyDispatcher: Send + Sync {
 
 /// Audit events emitted by the coordinator. Real impl writes to the
 /// audit NDJSON via `nrr-diagnostics`; tests use [`NoopActivationAudit`].
+///
+/// `principal` is whose revision the event is about: the audit record is
+/// filed under it, so another user never reads it, and the status push is
+/// addressed to them (to everyone for the baseline).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ActivationAuditEvent {
     RevisionSubmitted {
+        principal: String,
         revision_id: String,
         content_hash: String,
         source: RulesRevisionSource,
@@ -94,19 +99,23 @@ pub enum ActivationAuditEvent {
         was_dedup: bool,
     },
     DryRunRequested {
+        principal: String,
         revision_id: String,
         correlation_id: String,
     },
     TokenIssued {
+        principal: String,
         revision_id: String,
         token: String,
         ttl_secs: i64,
     },
     TokenConsumed {
+        principal: String,
         revision_id: String,
         token: String,
     },
     ActivationStarted {
+        principal: String,
         revision_id: String,
         attempt_id: String,
         previous_revision_id: Option<String>,
@@ -114,19 +123,20 @@ pub enum ActivationAuditEvent {
         policy: ApplyFailurePolicy,
     },
     PreFlightPassed {
+        principal: String,
         revision_id: String,
         sids: Vec<String>,
     },
     PreFlightFailed {
+        principal: String,
         revision_id: String,
         sid_failures: Vec<(String, String)>,
     },
     PreFlightPassedButApplyFailed {
+        principal: String,
         revision_id: String,
         sid_failures: Vec<(String, String)>,
     },
-    // `principal` on the terminal transitions is whose revision it is — the
-    // status push is addressed to them, or to everyone for the baseline.
     RevisionActivated {
         principal: String,
         revision_id: String,
@@ -141,6 +151,7 @@ pub enum ActivationAuditEvent {
         sid_failures: Vec<(String, String)>,
     },
     RollbackRequested {
+        principal: String,
         target: String,
         correlation_id: String,
     },

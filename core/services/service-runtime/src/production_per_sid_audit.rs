@@ -141,7 +141,7 @@ mod tests {
 
     #[test]
     fn applied_record_maps_to_completed_success() {
-        let (writer, _dir) = make_writer();
+        let (writer, dir) = make_writer();
         let ids = Arc::new(ProductionIdGenerator::new());
         let sink = ProductionPerSidApplyAudit::new(writer, ids);
         sink.emit(PerSidApplyAuditRecord {
@@ -150,9 +150,26 @@ mod tests {
             filter_count: 7,
             message: "applied for test".into(),
         });
-        // Append succeeded if the closure didn't panic / log error.
-        // We verified the mapping arithmetic via map_record directly
-        // below.
+        let files: Vec<_> = std::fs::read_dir(dir.path())
+            .expect("read audit dir")
+            .flatten()
+            .filter(|e| e.path().extension().and_then(|s| s.to_str()) == Some("ndjson"))
+            .collect();
+        assert_eq!(files.len(), 1, "the emit reached the trail");
+        let body = std::fs::read_to_string(files[0].path()).expect("read trail");
+        let lines: Vec<&str> = body.lines().collect();
+        assert_eq!(lines.len(), 1, "one record per emit");
+        let event: serde_json::Value = serde_json::from_str(lines[0]).expect("ndjson line");
+        assert_eq!(event["reason_code"], apply_reason::COMPLETED.0);
+        assert_eq!(event["result"], "success");
+        let summary: serde_json::Value = serde_json::from_str(
+            event["payload_summary_json"]
+                .as_str()
+                .expect("summary is kept"),
+        )
+        .expect("summary is JSON");
+        assert_eq!(summary["filter_count"], 7);
+        assert_eq!(summary["kind"], "per-sid-policy-applied");
     }
 
     #[test]

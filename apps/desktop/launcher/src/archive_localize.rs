@@ -250,9 +250,10 @@ fn append_attachments(zip_path: &Path, log_dir: &Path, logs_from_ms: Option<i64>
             let Ok(content) = fs::read(&source_path) else {
                 continue;
             };
+            let content = with_paths_masked(&content);
             let options = zip_options_for_copied_file(&source_path);
             let started = writer.start_file(entry_name, options).is_ok();
-            if started && writer.write_all(&content).is_ok() {
+            if started && writer.write_all(content.as_bytes()).is_ok() {
                 any = true;
             }
         }
@@ -261,6 +262,16 @@ fn append_attachments(zip_path: &Path, log_dir: &Path, logs_from_ms: Option<i64>
         return false;
     }
     any
+}
+
+/// A window log as it goes into the archive: every absolute path masked, as
+/// in the service's own lines, so a shared archive does not name the user's
+/// folders and files. Line by line, since the masker reads a bounded line.
+fn with_paths_masked(content: &[u8]) -> String {
+    String::from_utf8_lossy(content)
+        .split_inclusive('\n')
+        .map(nrr_diagnostics::privacy::path_scrub::mask_absolute_paths)
+        .collect()
 }
 
 #[cfg(test)]
@@ -534,6 +545,38 @@ mod tests {
         let resp = serde_json::json!({ "unrelated": 1 });
         let out = localize_export_response_into(resp.clone(), &dest_dir, &dest_dir, None);
         assert_eq!(out, resp);
+        let _ = fs::remove_dir_all(dest_dir);
+    }
+
+    /// An archive is made to be sent to someone: the window log's paths name
+    /// the user and their files, and are masked as the service's own are.
+    #[test]
+    fn a_shared_archive_does_not_name_the_users_folders() {
+        let src_dir = unique_test_dir("mask-src");
+        let dest_dir = unique_test_dir("mask-dest");
+        let src = src_dir.join("nrr-diagnostics-test.zip");
+        write_source_zip(&src);
+        fs::write(
+            src_dir.join("launcher-main.log"),
+            "[bound-file] read C:\\Users\\alice\\Documents\\rules_primary.txt\n\
+             [bound-file] read /home/alice/rules/rules_secondary.txt: denied\n\
+             IPC timeout after 5 s\n",
+        )
+        .expect("log");
+        let resp = serde_json::json!({ "archive-path": src.to_string_lossy() });
+        let out = localize_export_response_into(resp, &dest_dir, &src_dir, None);
+        let copied = fs::File::open(out["archive-path"].as_str().expect("path")).expect("copy");
+        let mut archive = zip::ZipArchive::new(copied).expect("valid zip");
+        let mut log = String::new();
+        archive
+            .by_name("launcher-main.log")
+            .expect("log entry")
+            .read_to_string(&mut log)
+            .expect("read log");
+        assert!(!log.contains("alice"), "{log}");
+        assert_eq!(log.matches("<masked-path>").count(), 2, "{log}");
+        assert!(log.ends_with("IPC timeout after 5 s\n"), "{log}");
+        let _ = fs::remove_dir_all(src_dir);
         let _ = fs::remove_dir_all(dest_dir);
     }
 }

@@ -228,13 +228,12 @@ function settingsCategories(updateCheckAvailable) {
         ? all : all.filter(function(c) { return c.id !== "updates" })
 }
 
-// Schemes the app is willing to hand to the OS. A URL string reaches this
-// helper from an about-payload, a third-party manifest and a user-editable
-// preference, and `Qt.openUrlExternally` will launch whatever the platform has
-// registered for a scheme — `file:` browsers a folder, and other schemes can
-// start programs. Nothing here needs more than the web and the local folders we
-// open ourselves.
-var EXTERNAL_URL_SCHEMES = ["http://", "https://", "file:///"]
+// Schemes the app hands to the OS for a URL it did not build: an about-payload,
+// a third-party manifest, a preference, a link inside a translation.
+// `Qt.openUrlExternally` launches whatever the platform registered, and a
+// `file:` URL to a program runs it, so only the web passes here; a folder goes
+// goes through `ownFolderPath` and the bridge's `openFolder`.
+var EXTERNAL_URL_SCHEMES = ["http://", "https://"]
 
 function isOpenableExternalUrl(url) {
     var s = String(url || "")
@@ -246,6 +245,91 @@ function isOpenableExternalUrl(url) {
 
 function openExternalUrl(url) {
     if (isOpenableExternalUrl(url)) Qt.openUrlExternally(String(url))
+}
+
+// A local folder URL the window computed itself, never one from a payload or
+// a translation: absolute, on this machine (no `file:////host` share), with no
+// query or fragment. Only the shape: the bridge's `openFolder` opens nothing
+// but an existing directory.
+function isOwnFolderUrl(url) {
+    var s = String(url || "")
+    if (s.toLowerCase().indexOf("file:///") !== 0) return false
+    var path = s.substring(8)
+    return path !== "" && path.charAt(0) !== "/" && path.charAt(0) !== "\\"
+        && path.indexOf("?") < 0 && path.indexOf("#") < 0
+}
+
+// The tray's notice queue after `entry` ({ kind, show, user }) arrives: one
+// notice per kind, the newest kept; the user's own picks go ahead of background
+// notices in their order and are never the ones `cap` drops.
+function noticeQueueWith(queue, entry, cap) {
+    var queued = []
+    var old = queue || []
+    for (var i = 0; i < old.length; i += 1) {
+        if (old[i].kind !== entry.kind) queued.push(old[i])
+    }
+    if (entry.user === true) {
+        var at = 0
+        while (at < queued.length && queued[at].user === true) at += 1
+        queued.splice(at, 0, entry)
+    } else {
+        queued.push(entry)
+    }
+    while (queued.length > cap) {
+        var drop = -1
+        for (var j = 0; j < queued.length && drop < 0; j += 1) {
+            if (queued[j].user !== true) drop = j
+        }
+        if (drop < 0) break
+        queued.splice(drop, 1)
+    }
+    return queued
+}
+
+// The notice settings the window publishes in the presence file, which any
+// process of the user can rewrite: anything but an object gives null, and each
+// field falls back to its default instead of breaking the tray.
+function trayNoticePrefsOf(raw) {
+    if (!raw || typeof raw !== "object" || raw instanceof Array) return null
+    var opacity = parseInt(raw.trayNoticeOpacityPercent)
+    return {
+        showNotifications: raw.showNotifications !== false,
+        notifySuggestionChanges: raw.notifySuggestionChanges !== false,
+        notifyBlockNotices: raw.notifyBlockNotices !== false,
+        notifyRuleDuplicates: raw.notifyRuleDuplicates !== false,
+        hideBlockNoticeAddresses: raw.hideBlockNoticeAddresses === true,
+        trayNoticeOpacityPercent: isNaN(opacity) ? 100 : Math.max(40, Math.min(100, opacity))
+    }
+}
+
+// The bound files a merge now in force took: `paths` and `current` are each
+// route's bound file and its text now (`{ primary, secondary }`), `taken` the
+// texts the merge was built from (null for no merge). A file is taken only
+// while it still holds that text; an edit since, or an empty file, is not.
+function mergeTakenPaths(paths, taken, current) {
+    var out = []
+    if (!taken) return out
+    var routes = ["primary", "secondary"]
+    for (var i = 0; i < routes.length; i += 1) {
+        var r = routes[i]
+        var path = String((paths || {})[r] || "")
+        var was = taken[r]
+        var now = (current || {})[r]
+        if (path !== "" && typeof was === "string" && was !== "" && now === was) out.push(path)
+    }
+    return out
+}
+
+// The local path behind an own folder URL, "" for anything else.
+function ownFolderPath(url) {
+    return isOwnFolderUrl(url) ? localPathFromFileUrl(url) : ""
+}
+
+// `file:` URL of a local directory path in either spelling.
+function localFolderUrl(path) {
+    var fwd = String(path || "").replace(/\\/g, "/")
+    if (fwd === "") return ""
+    return fwd.charAt(0) === "/" ? "file://" + fwd : "file:///" + fwd
 }
 
 // The page the compatibility banner offers. A user/administrator override wins
@@ -792,6 +876,34 @@ var CONN_TRACE_GROUPINGS = ["none", "program", "folder"]
 function connTraceGroupingOrDefault(slug) {
     var s = String(slug || "")
     return CONN_TRACE_GROUPINGS.indexOf(s) >= 0 ? s : "program"
+}
+
+// ---- the cache list's filters (nrr-client-logic `cache_view`) ----
+
+// The filter boxes' choices, in the order the window offers them; "all" is off.
+var CACHE_SOURCE_FILTERS = ["all", "dns", "observed-from-traffic", "manual-refresh",
+    "imported-seed", "cache-rebuild", "os-cache-seed", "reverse-confirmed", "browser-history-seed"]
+var CACHE_FRESHNESS_FILTERS = ["all", "fresh", "stale"]
+var CACHE_ROUTE_FILTERS = ["all", "primary", "secondary", "none"]
+
+// Whether a cache row (wire fields `source`, `freshness`, `expected_route`)
+// passes the three filters; an empty slug reads as "all". Backend slugs are
+// snake_case and the filter slugs kebab-case, so the row's are folded.
+function cacheEntryPassesFilters(entry, sourceSlug, freshnessBucket, routeSlug) {
+    var e = entry || {}
+    var src = String(sourceSlug || "all")
+    if (src !== "all" && String(e.source || "").replace(/_/g, "-") !== src) return false
+    var fresh = String(freshnessBucket || "all")
+    // "fresh" = the `fresh` slug only; "stale" = every other slug.
+    var isFresh = String(e.freshness || "").replace(/_/g, "-") === "fresh"
+    if (fresh === "fresh" && !isFresh) return false
+    if (fresh === "stale" && isFresh) return false
+    var route = String(routeSlug || "all")
+    if (route === "all") return true
+    var r = String(e.expected_route || "")
+    // No rule can cover an IPv6 row: it sits with the rows no rule names.
+    if (route === "none") return r === "" || r === "ipv6"
+    return r === route
 }
 
 // Whether `s` holds more than `limit` bytes as UTF-8.
@@ -1716,6 +1828,15 @@ function enforcementRestoreIsNews(previous) {
     return String(previous || "") !== "no-policy"
 }
 
+// What the additional connection being down means, by leak protection. Twin
+// of `nrr_client_logic::enforcement_notice::secondary_down_body_key`.
+function enforcementSecondaryDownBodyKey(leakProtection) {
+    var level = String(leakProtection || "")
+    if (level === "off") return "notifications.enforcement.secondary-down.body-off"
+    if (level === "everything") return "notifications.enforcement.secondary-down.body-everything"
+    return "notifications.enforcement.secondary-down.body"
+}
+
 // One reading of the service manager's state for a client that watched the
 // service run: a stop nobody asked for raises the notice once and offers the
 // recoveries; a stop the user made stays silent. Twin of
@@ -2177,7 +2298,7 @@ var ROUTE_POLICY_FIELD_DEFAULTS = {
     "doh-lockdown-scope": "leak-protection-only",
     "doh-lockdown-auto": true,
     "browser-history-auto-seed": false,
-    "kill-switch-strict-shared-ips": false,
+    "kill-switch-strict-shared-ips": true,
     "auto-rules-mode": "suggest",
     "auto-rules-eager-delivery-names": false,
     "primary-probe-auto": false,
@@ -2312,6 +2433,26 @@ function raiseLeakProtection(defaultRoute, level, floor) {
         ? least : held
 }
 
+// The protection a user already set up holds, as the first-run setup starts
+// from it: `{level, doh}`, null while the service holds no policy for them (a
+// new user starts from the offer). Twin of
+// `route_policy::first_run_held_protection`.
+function firstRunHeldProtection(policySaved, defaultRoute, leakProtection, dohAuto, dohEnabled) {
+    if (policySaved !== true) return null
+    return {
+        level: coerceLeakProtection(defaultRoute, leakProtection),
+        doh: dohAuto === true || dohEnabled === true
+    }
+}
+
+// What the first-run setup writes when it ends: `{protection, stability}`.
+// A user already set up keeps what the service holds unless a choice changed.
+// Twin of `route_policy::first_run_writes`.
+function firstRunWrites(held, level, doh, stabilityTouched) {
+    var same = !!held && held.level === level && held.doh === (doh === true)
+    return { protection: !same, stability: !held || stabilityTouched === true }
+}
+
 // What moving leak protection from `current` to `next` (both settled against
 // the default route) must be confirmed for: "holds-now" (Everything while the
 // additional connection is not available), "unroutable" (switched on over an
@@ -2339,6 +2480,13 @@ function defaultRouteChangeConfirmSlug(level, nextRoute, secondaryRow) {
 // `route_policy::leak_protection_holds_now`.
 function leakProtectionHoldsNow(level, secondaryRow) {
     return leakProtectionConfirmSlug("off", level, secondaryRow) === "holds-now"
+}
+
+// Whether moving the additional role from `beforeRow` to `afterRow` (null:
+// unbound) is what makes `level` hold the internet. Twin of
+// `route_policy::secondary_change_holds_now`.
+function secondaryChangeHoldsNow(level, beforeRow, afterRow) {
+    return leakProtectionHoldsNow(level, afterRow) && !leakProtectionHoldsNow(level, beforeRow)
 }
 
 // Brings `req`'s leak protection in line with its own default route, so a
@@ -2956,7 +3104,7 @@ function autoRuleRowsShownByDefault(rows) {
 }
 
 /// The wire contract this window's code speaks; `IPC_CONTRACT_REVISION` in Rust.
-var WIRE_CONTRACT_REVISION = 2
+var WIRE_CONTRACT_REVISION = 3
 
 /// The contract-skew slug from `local.service-info`, `""` when there is none.
 /// Twin of `nrr_client_logic::contract::skew`.
@@ -3535,6 +3683,24 @@ function vpnGatewayOffers(pending) {
     return offers
 }
 
+// One reading of a standing question (from its push or the snapshot): raise
+// the notice when something not announced yet is waiting, and remember what is
+// waiting now, so a re-read repeats nothing and an answered item asked again
+// later is news again. `keys` compare case-insensitively.
+function standingOfferStep(shown, keys) {
+    var before = {}
+    for (var i = 0; i < (shown || []).length; i += 1) before[String(shown[i])] = true
+    var now = []
+    var raise = false
+    for (var j = 0; j < (keys || []).length; j += 1) {
+        var key = String(keys[j] || "").trim().toLowerCase()
+        if (key === "" || now.indexOf(key) >= 0) continue
+        now.push(key)
+        if (before[key] !== true) raise = true
+    }
+    return { raise: raise, shown: now }
+}
+
 function vpnGatewaysConfirmed(existing, offer) {
     var out = []
     var push = function (address, program) {
@@ -3561,6 +3727,66 @@ function vpnGatewaysRemoved(existing, address) {
         if (!_vpnGatewaySame(g["address"], address)) out.push(g)
     }
     return out
+}
+
+// `nrr_client_logic::doh_resolvers::rebase`. `doh.resolvers.set` replaces the
+// machine's whole list: the editor's rows (opened as `base`) go over a fresh
+// read by address. `removed` says the user dropped a row the editor opened
+// with, which the write must declare (`drop-seeded`).
+function _dohRow(r) {
+    var o = r || {}
+    return {
+        "target-kind": String(o["target-kind"] || "host"),
+        "target": String(o["target"] || ""),
+        "comment": String(o["comment"] || ""),
+        "enabled": o["enabled"] !== false
+    }
+}
+function _dohKey(r) {
+    return String(r["target"] || "").trim().toLowerCase()
+}
+function _dohByKey(rows) {
+    var map = {}
+    for (var i = 0; i < rows.length; i += 1) {
+        var k = _dohKey(rows[i])
+        if (k !== "" && !Object.prototype.hasOwnProperty.call(map, k)) map[k] = rows[i]
+    }
+    return map
+}
+function dohResolversRebase(base, edited, fresh) {
+    var b = (base || []).map(_dohRow)
+    var e = (edited || []).map(_dohRow)
+    var f = (fresh || []).map(_dohRow)
+    var has = function (map, k) { return Object.prototype.hasOwnProperty.call(map, k) }
+    var baseRows = _dohByKey(b)
+    var editedRows = _dohByKey(e)
+    var removed = false
+    for (var bk in baseRows) {
+        if (has(baseRows, bk) && !has(editedRows, bk)) removed = true
+    }
+    var out = []
+    var seen = {}
+    for (var i = 0; i < f.length; i += 1) {
+        var k = _dohKey(f[i])
+        if (k === "" || has(seen, k)) continue
+        var next = f[i]
+        if (has(baseRows, k)) {
+            if (!has(editedRows, k)) continue
+            var was = baseRows[k]
+            var now = editedRows[k]
+            if (now["comment"] !== was["comment"]) next["comment"] = now["comment"]
+            if (now["enabled"] !== was["enabled"]) next["enabled"] = now["enabled"]
+        }
+        out.push(next)
+        seen[k] = true
+    }
+    for (var j = 0; j < e.length; j += 1) {
+        var ek = _dohKey(e[j])
+        if (ek === "" || has(seen, ek) || has(baseRows, ek)) continue
+        out.push(e[j])
+        seen[ek] = true
+    }
+    return { "resolvers": out, "removed": removed }
 }
 
 // `nrr_shared::glob::glob_match`: `*` is the only wildcard, `?` is literal.
@@ -3618,10 +3844,28 @@ function _globFoldStr(text) {
     return out
 }
 
+// `without_rule_flags`: a table's program value as the service matches it,
+// `+children` / `+override` after the first word taken off.
+function _appRuleBareValue(value) {
+    var v = String(value || ""), words = [], start = -1
+    for (var i = 0; i <= v.length; i += 1) {
+        var space = i === v.length || _rustIsSpaceUnit(v.charCodeAt(i))
+        if (space && start >= 0) { words.push(v.substring(start, i)); start = -1 }
+        else if (!space && start < 0) start = i
+    }
+    var kept = [], dropped = false
+    for (var k = 0; k < words.length; k += 1) {
+        if (k > 0 && (words[k] === "+children" || words[k] === "+override")) dropped = true
+        else kept.push(words[k])
+    }
+    return dropped ? kept.join(" ") : v
+}
+
 // `nrr_client_logic::app_routes::plan_app_route_assignments`: which application
 // rules an app-group / virtual-machine route assignment removes, retargets
 // (to secondary, enabled) or adds. Indexes point into `rules`
-// ({value, route, enabled}); `assignments` are {value, route}.
+// ({value, route, enabled}, compared without their flags); `assignments`
+// are {value, route}.
 function planAppRouteAssignments(rules, assignments) {
     var list = rules || [], todo = assignments || []
     var removed = []
@@ -3632,7 +3876,7 @@ function planAppRouteAssignments(rules, assignments) {
         var pv = String(todo[k].value || "")
         if (String(todo[k].route || "") !== "primary" || pv === "") continue
         for (i = 0; i < list.length; i += 1) {
-            if (!removed[i] && globMatch(String(list[i].value || ""), pv)) removed[i] = true
+            if (!removed[i] && globMatch(_appRuleBareValue(list[i].value), pv)) removed[i] = true
         }
     }
     var entries = []
@@ -3640,7 +3884,7 @@ function planAppRouteAssignments(rules, assignments) {
         if (removed[i]) { plan.remove.push(i); continue }
         entries.push({
             index: i,
-            value: String(list[i].value || ""),
+            value: _appRuleBareValue(list[i].value),
             ready: String(list[i].route || "") === "secondary" && list[i].enabled !== false
         })
     }
@@ -3671,7 +3915,7 @@ function planAppRouteAssignments(rules, assignments) {
 function appRouteOf(rules, program) {
     var list = rules || []
     for (var i = 0; i < list.length; i += 1) {
-        if (list[i].enabled !== false && globMatch(String(list[i].value || ""), String(program || ""))) {
+        if (list[i].enabled !== false && globMatch(_appRuleBareValue(list[i].value), String(program || ""))) {
             return String(list[i].route || "primary")
         }
     }

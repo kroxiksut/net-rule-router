@@ -156,13 +156,12 @@ pub struct RoutePolicyDto {
     /// explicit opt-in). `#[serde(default)]` keeps it additive.
     #[serde(default)]
     pub browser_history_auto_seed: bool,
-    /// Shared-IP strictness while leak protection is on. `false` (default,
-    /// "smart"): IPs the shared-IP census has seen on direct (non-rule) hosts
-    /// are excluded from the per-IP pin/block set (an innocent
-    /// co-tenant site is never cut). `true` ("strict"): pin/block every
-    /// secondary-destined IP regardless of sharing. `#[serde(default)]`
-    /// keeps it additive.
-    #[serde(default)]
+    /// Shared-IP strictness while leak protection is on. `true` (default,
+    /// "strict"): pin/block every secondary-destined IP regardless of sharing.
+    /// `false` ("smart"), the user's choice: IPs the shared-IP census has seen
+    /// on direct (non-rule) hosts are excluded from the pin/block set, which a
+    /// page naming the rule host's address under its own domain can steer.
+    #[serde(default = "default_true")]
     pub kill_switch_strict_shared_ips: bool,
     /// What the service may do with the companion domains it
     /// discovers for a routed site (the CDN/media hosts its rules do not
@@ -332,6 +331,11 @@ pub struct DohResolversGetResponse {
 pub struct DohResolversSetRequest {
     #[serde(default)]
     pub resolvers: Vec<DohResolverEntryDto>,
+    /// The caller removed built-in entries on purpose. Without it a list that
+    /// lacks a stored built-in entry is refused: the seed is never re-applied,
+    /// so a list written from an unread copy would erase it for good.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub drop_seeded: bool,
 }
 
 /// `doh.resolvers.set` response — the stored list after the write.

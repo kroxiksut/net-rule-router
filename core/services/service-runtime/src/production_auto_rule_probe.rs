@@ -287,13 +287,23 @@ impl ProductionAutoRuleProbe {
     /// A suggestion neither knows is skipped rather than resolved here:
     /// resolving would send a query the user did not ask for, and the answer
     /// would arrive too late for this pass anyway.
-    fn targets(&self, sid: &str, ids: &[String]) -> Vec<ProbeTarget> {
-        self.engine
+    /// With the hosts the tunnel may be asked about ([`tunnel_may_ask`]).
+    fn targets(
+        &self,
+        sid: &str,
+        ids: &[String],
+    ) -> (Vec<ProbeTarget>, std::collections::HashSet<String>) {
+        let mut tunnel_askable = std::collections::HashSet::new();
+        let targets = self
+            .engine
             .candidates(sid)
             .into_iter()
             .filter(|c| ids.is_empty() || ids.contains(&c.id))
             .filter_map(|c| {
                 let hostname = c.proposed_match.trim_start_matches("*.").to_string();
+                if tunnel_may_ask(&c.anchor, &hostname) {
+                    tunnel_askable.insert(hostname.clone());
+                }
                 let mut addresses =
                     crate::dns_wire::only_v4(&self.cache.ips_for_hostname(&hostname));
                 if addresses.is_empty() {
@@ -306,8 +316,21 @@ impl ProductionAutoRuleProbe {
                     addresses,
                 })
             })
-            .collect()
+            .collect();
+        (targets, tunnel_askable)
     }
+}
+
+/// Whether the tunnel may be asked about `hostname`, offered beside `anchor`:
+/// only a host of the anchor's own site. Asked from both links, a host another
+/// page named saw the user's provider address and the tunnel's exit for one
+/// name, a moment apart.
+fn tunnel_may_ask(anchor: &str, hostname: &str) -> bool {
+    let site = |host: &str| {
+        nrr_domain::companion_affinity::registrable_domain(host.trim_start_matches("*."))
+            .map(str::to_ascii_lowercase)
+    };
+    site(anchor).is_some_and(|own| site(hostname) == Some(own))
 }
 
 impl AutoRuleProbeRunner for ProductionAutoRuleProbe {
@@ -321,7 +344,7 @@ impl AutoRuleProbeRunner for ProductionAutoRuleProbe {
             return self.probe_rule_hosts(sid, rule_hostnames);
         }
         let limits = (self.limits_for)(sid);
-        let targets = self.targets(sid, ids);
+        let (targets, tunnel_askable) = self.targets(sid, ids);
         if targets.is_empty() {
             return AutoRuleCandidatesProbeResponse::default();
         }
@@ -402,6 +425,7 @@ impl AutoRuleProbeRunner for ProductionAutoRuleProbe {
                 let second_targets: Vec<ProbeTarget> = targets_for_second
                     .into_iter()
                     .filter(|t| silent.contains(&t.hostname))
+                    .filter(|t| tunnel_askable.contains(&t.hostname))
                     .collect();
                 let record = move |hostname: &str, answered: bool| {
                     engine_for_second.note_secondary_reach(
@@ -507,6 +531,28 @@ pub fn egress_sources_from(
     };
     let address = |link: Option<&AdapterInfo>| link.and_then(|l| l.ipv4_addresses.first().copied());
     (address(primary_link), address(secondary_link))
+}
+
+#[cfg(test)]
+mod tunnel_leg_tests {
+    use super::tunnel_may_ask;
+
+    /// A host a foreign page named is never asked from the tunnel too: from
+    /// both links one server sees the provider address and the tunnel's exit.
+    #[test]
+    fn only_a_host_of_the_anchors_own_site_is_asked_from_the_tunnel() {
+        assert!(tunnel_may_ask("www.example.com", "cdn.example.com"));
+        assert!(tunnel_may_ask("Example.com", "*.img.EXAMPLE.com"));
+        assert!(!tunnel_may_ask("www.example.com", "t1.attacker.test"));
+        assert!(!tunnel_may_ask(
+            "www.example.com",
+            "example.com.attacker.test"
+        ));
+        assert!(
+            !tunnel_may_ask("localhost", "localhost"),
+            "no site, no tunnel"
+        );
+    }
 }
 
 #[cfg(test)]

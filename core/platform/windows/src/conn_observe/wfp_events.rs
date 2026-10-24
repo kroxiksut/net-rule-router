@@ -953,4 +953,27 @@ mod tests {
     fn what_we_actually_changed_is_what_goes_back() {
         assert_eq!(restore_target(None, Some(0), Some(7)), (Some(0), Some(7)));
     }
+
+    /// The reset script hands the options back without the binary; its note
+    /// name, option ids and written values must be these.
+    #[test]
+    fn the_reset_script_restores_the_same_options() {
+        let lib = include_str!("../../../../../scripts/lib/service-paths.ps1");
+        for line in [
+            format!("$NrrWfpOptionsNote = '{PRIOR_OPTIONS_FILE}'"),
+            "$NrrWfpCollectWritten = 1".to_string(),
+            format!("$NrrWfpKeywordsWritten = {FWPM_NET_EVENT_KEYWORD_CLASSIFY_ALLOW}"),
+            format!(
+                "    const uint CollectNetEvents = {};",
+                FWPM_ENGINE_COLLECT_NET_EVENTS.0
+            ),
+            format!(
+                "    const uint MatchAnyKeywords = {};",
+                FWPM_ENGINE_NET_EVENT_MATCH_ANY_KEYWORDS.0
+            ),
+            format!("    const uint Uint32Type = {};", FWP_UINT32.0),
+        ] {
+            assert!(lib.lines().any(|l| l == line), "{line}");
+        }
+    }
 }

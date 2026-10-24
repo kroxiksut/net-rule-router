@@ -24,7 +24,7 @@ pub(super) fn open_cache_store(
     use nrr_storage::repository::MigrationRunner;
     use nrr_storage::store::SqliteCacheStore;
 
-    let conn = match nrr_storage::migration::open_connection(path) {
+    let conn = match nrr_storage::open_cache_connection(path) {
         Ok(c) => c,
         Err(e) => {
             tracing::warn!(
@@ -37,13 +37,6 @@ pub(super) fn open_cache_store(
             return None;
         }
     };
-    // Rebuildable cache DB — WAL for reader/writer concurrency (the leak-guard
-    // reads while the DNS-refresh task writes), `synchronous = NORMAL` because a
-    // corrupt cache is deleted + rebuilt anyway, so full fsync durability is
-    // wasted overhead. Best-effort; on failure the connection keeps its defaults.
-    let _: rusqlite::Result<()> = conn.execute_batch(
-        "PRAGMA journal_mode = WAL; PRAGMA synchronous = NORMAL; PRAGMA busy_timeout = 5000;",
-    );
     let runner = SqliteMigrationRunner::for_cache_db(conn);
     if let Err(e) = runner.run_pending_migrations() {
         tracing::warn!(
@@ -276,16 +269,46 @@ pub(super) fn read_fake_ip_instant_rst(conn: &Arc<Mutex<Connection>>) -> bool {
 /// (teardown). Called from the graceful-stop hook at stop time (not a boot
 /// snapshot) so a mid-session Save takes effect. Failing to `false` is the safe
 /// posture: teardown always cleans up, so a corrupted row can never strand
-/// routes or an orphaned block.
-pub(super) fn read_routing_stop_persist(conn: &Arc<Mutex<Connection>>) -> bool {
+/// routes or an orphaned block. A connection still held after `wait` reads as
+/// `false` too: the stop must end, and taking everything off is its safe side.
+pub(super) fn read_routing_stop_persist(
+    conn: &Arc<Mutex<Connection>>,
+    wait: std::time::Duration,
+) -> bool {
     use nrr_storage::service_stability_config::{
         RoutingStopPolicy, ServiceStabilityConfigRepository,
     };
-    let Ok(guard) = conn.lock() else {
+    let Some(guard) = nrr_service_runtime::lifecycle_matrix::lock_within(conn, wait) else {
+        tracing::warn!(
+            target: "nrr::lifecycle",
+            msg_key = "svc-stop-plan-read-timed-out",
+            wait_ms = wait.as_millis() as u64,
+            "the state database stayed busy at the stop; everything of ours comes off",
+        );
         return false;
     };
     match ServiceStabilityConfigRepository::new(&guard).get_or_default() {
         Ok(r) => matches!(r.routing_stop_policy, RoutingStopPolicy::Persist),
         Err(_) => false,
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod tests {
+    use super::*;
+
+    /// A state database wedged by another holder does not hold the stop: the
+    /// plan reads "take everything off" once the wait runs out.
+    #[test]
+    fn a_wedged_state_database_reads_as_teardown_at_the_stop() {
+        let conn = Arc::new(Mutex::new(Connection::open_in_memory().unwrap()));
+        let _wedged = conn.lock().unwrap();
+        let began = std::time::Instant::now();
+        assert!(!read_routing_stop_persist(
+            &conn,
+            std::time::Duration::from_millis(50)
+        ));
+        assert!(began.elapsed() < std::time::Duration::from_secs(5));
     }
 }

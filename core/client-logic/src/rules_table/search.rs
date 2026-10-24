@@ -1,6 +1,6 @@
 //! The rules table's search box: a pasted URL cleaned to its host
-//! (`normalizeHostInput`), and the row filter (`passesFilter` of the rules
-//! section, which has no JS twin to run against).
+//! (`normalizeHostInput`), and the search part of the row filter
+//! (`rulePassesFilters`).
 
 use super::{RuleRow, RuleType};
 use crate::js;
@@ -87,7 +87,8 @@ pub fn search_box_text(text: &str) -> String {
     }
 }
 
-/// Whether `row` passes the search `query` (`passesFilter`). `ace_lower` is the
+/// Whether `row` passes the search `query` (the search part of
+/// `rulePassesFilters`). `ace_lower` is the
 /// row's lower-case ACE value, so `xn--p1ai` finds `рф` and back. The needle is
 /// both the host-cleaned query and the query as typed.
 pub fn row_matches_search(row: &RuleRow, ace_lower: &str, query: &str) -> bool {

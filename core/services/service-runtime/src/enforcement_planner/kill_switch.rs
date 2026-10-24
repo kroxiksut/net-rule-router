@@ -499,12 +499,13 @@ pub(crate) fn holds_posture_block(principal: &PrincipalScope, flows: &[FlowRule]
     })
 }
 
-/// The DoH/DoT lockdown restated for each foreign link `flows` holds a permit
-/// for, and for IPsec-protected traffic when they spare it: a copy of every
-/// lockdown block that drops only what leaves that way, above the permits. The
-/// lockdown is the user's own protection, so a resolver the corporate network
-/// routes is not exempt from it. The lockdown keeps its own place for every
-/// other egress.
+/// The DoH/DoT lockdown restated for each link `flows` holds a permit for, our
+/// own tunnel's block-all egress included, and for IPsec-protected traffic when
+/// they spare it: a copy of every lockdown block that drops only what leaves
+/// that way, above the permits. The lockdown is the user's own protection, so
+/// neither a resolver the corporate network routes nor one reached through our
+/// tunnel is exempt from it. The lockdown keeps its own place for every other
+/// egress.
 #[must_use]
 pub fn plan_doh_foreign_vetoes(sid: &str, doh: &[FlowRule], flows: &[FlowRule]) -> Vec<FlowRule> {
     use nrr_platform_api::enforcement::DOH_FOREIGN_VETO_ORDINAL_BASE;
@@ -513,7 +514,9 @@ pub fn plan_doh_foreign_vetoes(sid: &str, doh: &[FlowRule], flows: &[FlowRule]) 
         f.principal == principal
             && f.verdict == Verdict::Permit
             && f.precedence.class == PrecedenceClass::CatchAllExempt
-            && f.precedence.ordinal >= FOREIGN_TUNNEL_ORDINAL_BASE
+            && (f.precedence.ordinal >= FOREIGN_TUNNEL_ORDINAL_BASE
+                || (f.flow.dst == DstMatch::Any
+                    && matches!(f.egress, EgressConstraint::OnlyVia(_))))
     });
     let mut links: Vec<&nrr_platform_api::enforcement::AdapterId> = spared
         .clone()
@@ -524,9 +527,17 @@ pub fn plan_doh_foreign_vetoes(sid: &str, doh: &[FlowRule], flows: &[FlowRule]) 
         .collect();
     links.sort_by(|a, b| a.0.cmp(&b.0));
     links.dedup();
-    let mut egresses: Vec<EgressConstraint> = links
+    let own = EgressConstraint::OnlyVia(EgressRef::Secondary);
+    let mut egresses: Vec<EgressConstraint> = spared
+        .clone()
+        .any(|f| f.egress == own && f.flow.dst == DstMatch::Any)
+        .then(|| own.clone())
         .into_iter()
-        .map(|link| EgressConstraint::OnlyVia(EgressRef::Adapter(link.clone())))
+        .chain(
+            links
+                .into_iter()
+                .map(|link| EgressConstraint::OnlyVia(EgressRef::Adapter(link.clone()))),
+        )
         .collect();
     if spared.any(|f| f.egress == EgressConstraint::UnderIpsecPolicy) {
         egresses.push(EgressConstraint::UnderIpsecPolicy);

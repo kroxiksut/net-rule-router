@@ -1465,6 +1465,7 @@ dependencies = [
  "nrr-client-logic",
  "nrr-desktop-gui",
  "nrr-desktop-tray",
+ "nrr-diagnostics",
  "nrr-ipc-client",
  "nrr-mock-backend",
  "nrr-platform-api",

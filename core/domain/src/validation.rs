@@ -894,12 +894,7 @@ fn normalize_rule(
         }
         Some(AddressMatch::SuffixDomain(value)) => {
             match canonical_host_name(HostNameKind::Domain, value, &rule.id, warnings) {
-                // A whole top-level domain is a zone however it was written,
-                // so a literal address inside it beats it, as with `.ru`.
-                Ok(normalized) if !normalized.contains('.') => {
-                    Some(CanonicalAddressMatch::Zone(normalized))
-                }
-                Ok(normalized) => Some(CanonicalAddressMatch::SuffixDomain(normalized)),
+                Ok(normalized) => Some(suffix_or_zone(normalized)),
                 Err(e) => {
                     errors.push(e);
                     return None;
@@ -1042,8 +1037,8 @@ pub(crate) fn canonical_host_name(
         HostNameKind::Zone => {
             // `.ru` is how a user naturally writes a TLD. Kept, `match_zone`
             // would look for `..ru` and the rule would be accepted and inert.
-            let trimmed = value.trim().to_lowercase();
-            let stripped = trimmed.strip_prefix("*.").unwrap_or(&trimmed);
+            let trimmed = value.trim();
+            let stripped = trimmed.strip_prefix("*.").unwrap_or(trimmed);
             let body = stripped.strip_prefix('.').unwrap_or(stripped);
             if body.is_empty() {
                 return Err(ValidationError::ZoneEmptyName {
@@ -1061,8 +1056,8 @@ pub(crate) fn canonical_host_name(
 /// `SuffixDomain`, and the label part of `Zone`):
 /// - Removes trailing dot.
 /// - Rejects empty values.
-/// - Lowercases the result.
-/// - Applies IDNA2008 normalization for non-ASCII labels (Unicode → punycode).
+/// - Lowercases an ASCII value.
+/// - Applies UTS-46 to a non-ASCII value (case mapping and Unicode → punycode).
 ///
 /// The caller is responsible for passing the right content: for `SuffixDomain`,
 /// the `*.` prefix is already stripped by the file converter before reaching here.
@@ -1091,26 +1086,25 @@ fn normalize_domain_label(
         });
     }
 
-    // Lowercase first (IDNA processing expects lowercase input for best results).
-    let lowercased = without_dot.to_lowercase();
-
     // If purely ASCII, no further IDNA processing is needed — but it still has
     // to BE a hostname. Nothing checked that in the production pipeline, so
     // `hello world`, a path, a control byte or `192.168.1.0/24` from the IP
     // section became a live `ExactFqdn` and travelled into storage and codegen,
     // where it could never match anything.
-    if lowercased.is_ascii() {
+    if without_dot.is_ascii() {
+        let lowercased = without_dot.to_ascii_lowercase();
         reject_if_not_a_hostname(&lowercased, rule_id)?;
         return Ok(lowercased);
     }
 
-    // Non-ASCII: apply IDNA2008 normalization (Unicode → punycode per UTS#46).
-    match idna::domain_to_ascii(&lowercased) {
+    // Non-ASCII: UTS-46 maps the case itself, as browsers do. Lowercasing first
+    // made `ẞ` a kept `ß` and a final `Σ` a `ς`: another ACE than the browser asks.
+    match idna::domain_to_ascii(without_dot) {
         Ok(ascii) => {
-            if ascii != lowercased {
+            if ascii != without_dot {
                 warnings.push(ValidationWarning::DomainNormalizedToAscii {
                     rule_id: rule_id.clone(),
-                    original: lowercased,
+                    original: without_dot.to_string(),
                     normalized: ascii.clone(),
                 });
             }
@@ -1202,6 +1196,18 @@ pub(crate) fn canonical_ip_address(
         });
     }
     Ok(canonical)
+}
+
+/// A suffix rule's canonical form: a whole top-level domain is a zone however
+/// it was written, so a literal address inside it beats it, as with `.ru`.
+/// The rules file and the wire decoder both read it, so `*.ru` is one rule
+/// with one hash whichever way it came in.
+pub(crate) fn suffix_or_zone(normalized: String) -> CanonicalAddressMatch {
+    if normalized.is_empty() || normalized.contains('.') {
+        CanonicalAddressMatch::SuffixDomain(normalized)
+    } else {
+        CanonicalAddressMatch::Zone(normalized)
+    }
 }
 
 /// Names what an unparseable address value is, when its shape says so.

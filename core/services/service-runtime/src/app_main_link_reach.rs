@@ -99,25 +99,28 @@ pub enum AppVerdict {
     Carried,
 }
 
+/// Keyed by `(owner, program)`: one user's failures must not become another
+/// user's offer, nor list the addresses another user's program reached.
 #[derive(Default)]
 pub struct AppMainLinkReachRegistry {
-    programs: Mutex<HashMap<String, Tally>>,
+    programs: Mutex<HashMap<(String, String), Tally>>,
 }
 
 impl AppMainLinkReachRegistry {
-    /// Records one main-link connection of `program` that stalled or closed in
-    /// order. Only an unnamed stall counts toward the threshold — a named one
-    /// has its own host offer — while every address counts toward "most of
-    /// them fail". Answers only when the verdict turns.
+    /// Records one main-link connection of `owner`'s `program` that stalled or
+    /// closed in order. Only an unnamed stall counts toward the threshold — a
+    /// named one has its own host offer — while every address counts toward
+    /// "most of them fail". Answers only when the verdict turns.
     pub fn note(
         &self,
+        owner: &str,
         program: &str,
         remote: IpAddr,
         stalled: bool,
         named: bool,
         at_ms: u64,
     ) -> Option<AppVerdict> {
-        self.with_tally(program, at_ms, |tally| {
+        self.with_tally(owner, program, at_ms, |tally| {
             tally.record(
                 remote,
                 Outcome {
@@ -139,8 +142,13 @@ impl AppMainLinkReachRegistry {
 
     /// A connection of `program` left over the additional link: it is already
     /// split between the links, so it is not to be moved whole.
-    pub fn note_additional_link(&self, program: &str, at_ms: u64) -> Option<AppVerdict> {
-        self.with_tally(program, at_ms, |tally| {
+    pub fn note_additional_link(
+        &self,
+        owner: &str,
+        program: &str,
+        at_ms: u64,
+    ) -> Option<AppVerdict> {
+        self.with_tally(owner, program, at_ms, |tally| {
             tally.rides_additional_link = true;
             tally.withdrawn()
         })
@@ -148,21 +156,23 @@ impl AppMainLinkReachRegistry {
 
     fn with_tally(
         &self,
+        owner: &str,
         program: &str,
         at_ms: u64,
         f: impl FnOnce(&mut Tally) -> Option<AppVerdict>,
     ) -> Option<AppVerdict> {
-        if program.is_empty() {
+        if owner.is_empty() || program.is_empty() {
             return None;
         }
+        let key = (owner.to_string(), program.to_string());
         let mut programs = self.programs.lock().unwrap_or_else(|p| p.into_inner());
-        if !programs.contains_key(program) && programs.len() >= MAX_PROGRAMS {
+        if !programs.contains_key(&key) && programs.len() >= MAX_PROGRAMS {
             programs.retain(|_, t| at_ms.saturating_sub(t.last_ms) < WINDOW_MS);
             if programs.len() >= MAX_PROGRAMS {
                 return None;
             }
         }
-        let tally = programs.entry(program.to_string()).or_default();
+        let tally = programs.entry(key).or_default();
         if tally.last_ms != 0 && at_ms.saturating_sub(tally.last_ms) >= WINDOW_MS {
             *tally = Tally::default();
         }
@@ -183,34 +193,75 @@ mod tests {
     use super::*;
     use std::net::Ipv4Addr;
 
+    const A: &str = "S-1-5-21-1-2-3-1001";
+    const B: &str = "S-1-5-21-1-2-3-1002";
+
     fn addr(last: u8) -> IpAddr {
         IpAddr::V4(Ipv4Addr::new(203, 0, 113, last))
+    }
+
+    /// Two users run the same program. B's three stalls are B's evidence: A's
+    /// single connection neither tips A's verdict nor lists B's addresses,
+    /// and B's later success does not withdraw anything of A's.
+    #[test]
+    fn one_users_stalls_are_not_another_users_offer() {
+        let r = AppMainLinkReachRegistry::default();
+        for last in 1..=2 {
+            assert_eq!(
+                r.note(B, "chrome.exe", addr(last), true, false, 1_000),
+                None
+            );
+        }
+        assert_eq!(r.note(A, "chrome.exe", addr(9), true, false, 1_500), None);
+        assert_eq!(
+            r.note(B, "chrome.exe", addr(3), true, false, 2_000),
+            Some(AppVerdict::NotCarried(vec![addr(1), addr(2), addr(3)]))
+        );
+        for last in 10..=13 {
+            assert_eq!(
+                r.note(B, "chrome.exe", addr(last), false, false, 2_500),
+                None
+            );
+        }
+        assert_eq!(
+            r.note(B, "chrome.exe", addr(14), false, false, 2_500),
+            Some(AppVerdict::Carried)
+        );
+        assert_eq!(r.note(A, "chrome.exe", addr(8), true, false, 3_000), None);
+        assert!(matches!(
+            r.note(A, "chrome.exe", addr(7), true, false, 3_000),
+            Some(AppVerdict::NotCarried(ref addresses)) if addresses == &vec![addr(7), addr(8), addr(9)]
+        ));
+        assert_eq!(r.note("", "chrome.exe", addr(1), true, false, 3_000), None);
     }
 
     #[test]
     fn three_unnamed_stalls_turn_the_verdict_once() {
         let r = AppMainLinkReachRegistry::default();
-        assert_eq!(r.note("app.exe", addr(1), true, false, 1_000), None);
-        assert_eq!(r.note("app.exe", addr(2), true, false, 2_000), None);
+        assert_eq!(r.note(A, "app.exe", addr(1), true, false, 1_000), None);
+        assert_eq!(r.note(A, "app.exe", addr(2), true, false, 2_000), None);
         assert_eq!(
-            r.note("app.exe", addr(3), true, false, 3_000),
+            r.note(A, "app.exe", addr(3), true, false, 3_000),
             Some(AppVerdict::NotCarried(vec![addr(1), addr(2), addr(3)]))
         );
-        assert_eq!(r.note("app.exe", addr(4), true, false, 4_000), None);
+        assert_eq!(r.note(A, "app.exe", addr(4), true, false, 4_000), None);
     }
 
     #[test]
     fn a_program_that_works_on_most_addresses_is_not_offered() {
         let r = AppMainLinkReachRegistry::default();
         for last in 10..=15 {
-            assert_eq!(r.note("browser.exe", addr(last), false, true, 500), None);
+            assert_eq!(r.note(A, "browser.exe", addr(last), false, true, 500), None);
         }
         for last in 1..=6 {
-            assert_eq!(r.note("browser.exe", addr(last), true, false, 1_000), None);
+            assert_eq!(
+                r.note(A, "browser.exe", addr(last), true, false, 1_000),
+                None
+            );
         }
         // Positive control: one more failing address tips the majority.
         assert!(matches!(
-            r.note("browser.exe", addr(7), true, false, 1_000),
+            r.note(A, "browser.exe", addr(7), true, false, 1_000),
             Some(AppVerdict::NotCarried(_))
         ));
     }
@@ -219,14 +270,17 @@ mod tests {
     fn a_program_on_the_additional_link_is_never_offered_and_its_offer_goes() {
         let r = AppMainLinkReachRegistry::default();
         for last in 1..=3 {
-            r.note("browser.exe", addr(last), true, false, 1_000);
+            r.note(A, "browser.exe", addr(last), true, false, 1_000);
         }
         assert_eq!(
-            r.note_additional_link("browser.exe", 1_500),
+            r.note_additional_link(A, "browser.exe", 1_500),
             Some(AppVerdict::Carried)
         );
         for last in 4..=8 {
-            assert_eq!(r.note("browser.exe", addr(last), true, false, 2_000), None);
+            assert_eq!(
+                r.note(A, "browser.exe", addr(last), true, false, 2_000),
+                None
+            );
         }
     }
 
@@ -234,7 +288,10 @@ mod tests {
     fn named_stalls_do_not_count() {
         let r = AppMainLinkReachRegistry::default();
         for last in 1..=5 {
-            assert_eq!(r.note("browser.exe", addr(last), true, true, 1_000), None);
+            assert_eq!(
+                r.note(A, "browser.exe", addr(last), true, true, 1_000),
+                None
+            );
         }
     }
 
@@ -242,13 +299,13 @@ mod tests {
     fn the_offer_goes_once_most_addresses_work_by_the_margin() {
         let r = AppMainLinkReachRegistry::default();
         for last in 1..=3 {
-            r.note("app.exe", addr(last), true, false, 1_000);
+            r.note(A, "app.exe", addr(last), true, false, 1_000);
         }
         for last in 7..=10 {
-            assert_eq!(r.note("app.exe", addr(last), false, false, 2_000), None);
+            assert_eq!(r.note(A, "app.exe", addr(last), false, false, 2_000), None);
         }
         assert_eq!(
-            r.note("app.exe", addr(11), false, false, 2_000),
+            r.note(A, "app.exe", addr(11), false, false, 2_000),
             Some(AppVerdict::Carried)
         );
     }
@@ -259,10 +316,19 @@ mod tests {
     fn failures_can_still_win_after_many_working_addresses() {
         let r = AppMainLinkReachRegistry::default();
         for last in 1..=40 {
-            r.note("app.exe", addr(last), false, false, u64::from(last));
+            r.note(A, "app.exe", addr(last), false, false, u64::from(last));
         }
         let turned = (100..=140)
-            .filter_map(|last| r.note("app.exe", addr(last), true, false, 1_000 + u64::from(last)))
+            .filter_map(|last| {
+                r.note(
+                    A,
+                    "app.exe",
+                    addr(last),
+                    true,
+                    false,
+                    1_000 + u64::from(last),
+                )
+            })
             .collect::<Vec<_>>();
         assert!(
             matches!(turned.as_slice(), [AppVerdict::NotCarried(_)]),
@@ -276,10 +342,10 @@ mod tests {
     fn an_address_counts_by_its_last_outcome() {
         let r = AppMainLinkReachRegistry::default();
         for last in 1..=5 {
-            assert_eq!(r.note("app.exe", addr(last), true, false, 1_000), None);
-            assert_eq!(r.note("app.exe", addr(last), false, false, 1_500), None);
+            assert_eq!(r.note(A, "app.exe", addr(last), true, false, 1_000), None);
+            assert_eq!(r.note(A, "app.exe", addr(last), false, false, 1_500), None);
         }
-        assert_eq!(r.note("app.exe", addr(6), true, false, 2_000), None);
+        assert_eq!(r.note(A, "app.exe", addr(6), true, false, 2_000), None);
     }
 
     /// One address flipping between a stall and a reply cannot flap the
@@ -288,27 +354,30 @@ mod tests {
     fn one_flipping_address_does_not_flap_the_verdict() {
         let r = AppMainLinkReachRegistry::default();
         for last in 10..=12 {
-            r.note("app.exe", addr(last), false, false, 500);
+            r.note(A, "app.exe", addr(last), false, false, 500);
         }
         for last in 1..=3 {
-            r.note("app.exe", addr(last), true, false, 1_000);
+            r.note(A, "app.exe", addr(last), true, false, 1_000);
         }
         assert!(matches!(
-            r.note("app.exe", addr(4), true, false, 1_000),
+            r.note(A, "app.exe", addr(4), true, false, 1_000),
             Some(AppVerdict::NotCarried(_))
         ));
         for at in 0..5 {
-            assert_eq!(r.note("app.exe", addr(4), false, false, 2_000 + at), None);
-            assert_eq!(r.note("app.exe", addr(4), true, false, 2_500 + at), None);
+            assert_eq!(
+                r.note(A, "app.exe", addr(4), false, false, 2_000 + at),
+                None
+            );
+            assert_eq!(r.note(A, "app.exe", addr(4), true, false, 2_500 + at), None);
         }
     }
 
     #[test]
     fn a_quiet_window_starts_the_tally_over() {
         let r = AppMainLinkReachRegistry::default();
-        r.note("app.exe", addr(1), true, false, 1_000);
-        r.note("app.exe", addr(2), true, false, 2_000);
+        r.note(A, "app.exe", addr(1), true, false, 1_000);
+        r.note(A, "app.exe", addr(2), true, false, 2_000);
         let later = 2_000 + WINDOW_MS;
-        assert_eq!(r.note("app.exe", addr(3), true, false, later), None);
+        assert_eq!(r.note(A, "app.exe", addr(3), true, false, later), None);
     }
 }

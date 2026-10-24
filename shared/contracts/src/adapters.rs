@@ -4,6 +4,25 @@
 //! with `ifindex + mac` as the fallback, because the friendly name is the one
 //! thing a user can change.
 
+/// The bridges Linux container and VM managers create: Docker (`docker0`,
+/// `br-<id>`), libvirt, LXC, LXD, Incus and Podman. Exact case: Linux names.
+pub const LINUX_BRIDGE_PREFIXES: [&str; 8] = [
+    "docker",
+    "br-",
+    "virbr",
+    "lxcbr",
+    "lxdbr",
+    "incusbr",
+    "cni-podman",
+    "podman",
+];
+
+/// Whether a link `name` is such a bridge: the network of this computer's own
+/// virtual machines and containers.
+pub fn is_linux_bridge_name(name: &str) -> bool {
+    LINUX_BRIDGE_PREFIXES.iter().any(|p| name.starts_with(p))
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum ConnectivityState {
     Available,

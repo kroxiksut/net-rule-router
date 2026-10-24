@@ -1,0 +1,23 @@
+{
+  "description": "pure.js cacheEntryPassesFilters: the cache list's three filters over one loaded row; an empty slug reads as all",
+  "cases": [
+    { "name": "no filters", "input": { "entry": { "source": "dns", "freshness": "stale_usable", "expected_route": "" }, "source": "all", "freshness": "all", "route": "all" }, "expected": true },
+    { "name": "empty slugs read as all", "input": { "entry": { "source": "dns", "freshness": "stale_usable", "expected_route": "" }, "source": "", "freshness": "", "route": "" }, "expected": true },
+    { "name": "absent slugs read as all", "input": { "entry": { "source": "dns", "freshness": "fresh", "expected_route": "primary" } }, "expected": true },
+    { "name": "source folds underscores", "input": { "entry": { "source": "observed_from_traffic", "freshness": "fresh", "expected_route": "" }, "source": "observed-from-traffic", "freshness": "all", "route": "all" }, "expected": true },
+    { "name": "other source", "input": { "entry": { "source": "manual_refresh", "freshness": "fresh", "expected_route": "" }, "source": "dns", "freshness": "all", "route": "all" }, "expected": false },
+    { "name": "fresh keeps fresh", "input": { "entry": { "source": "dns", "freshness": "fresh", "expected_route": "" }, "source": "all", "freshness": "fresh", "route": "all" }, "expected": true },
+    { "name": "fresh drops stale", "input": { "entry": { "source": "dns", "freshness": "stale_not_usable", "expected_route": "" }, "source": "all", "freshness": "fresh", "route": "all" }, "expected": false },
+    { "name": "stale is every other slug", "input": { "entry": { "source": "dns", "freshness": "negative_cached", "expected_route": "" }, "source": "all", "freshness": "stale", "route": "all" }, "expected": true },
+    { "name": "stale drops fresh", "input": { "entry": { "source": "dns", "freshness": "fresh", "expected_route": "" }, "source": "all", "freshness": "stale", "route": "all" }, "expected": false },
+    { "name": "route primary", "input": { "entry": { "source": "dns", "freshness": "fresh", "expected_route": "primary" }, "source": "all", "freshness": "all", "route": "primary" }, "expected": true },
+    { "name": "route secondary wanted, primary row", "input": { "entry": { "source": "dns", "freshness": "fresh", "expected_route": "primary" }, "source": "all", "freshness": "all", "route": "secondary" }, "expected": false },
+    { "name": "none keeps the row no rule names", "input": { "entry": { "source": "dns", "freshness": "fresh", "expected_route": "" }, "source": "all", "freshness": "all", "route": "none" }, "expected": true },
+    { "name": "none keeps an ipv6 row", "input": { "entry": { "source": "dns", "freshness": "fresh", "expected_route": "ipv6" }, "source": "all", "freshness": "all", "route": "none" }, "expected": true },
+    { "name": "none drops a routed row", "input": { "entry": { "source": "dns", "freshness": "fresh", "expected_route": "secondary" }, "source": "all", "freshness": "all", "route": "none" }, "expected": false },
+    { "name": "all three at once", "input": { "entry": { "source": "browser_history_seed", "freshness": "fresh", "expected_route": "secondary" }, "source": "browser-history-seed", "freshness": "fresh", "route": "secondary" }, "expected": true },
+    { "name": "one of three fails", "input": { "entry": { "source": "browser_history_seed", "freshness": "stale_usable", "expected_route": "secondary" }, "source": "browser-history-seed", "freshness": "fresh", "route": "secondary" }, "expected": false },
+    { "name": "missing fields", "input": { "entry": {}, "source": "all", "freshness": "stale", "route": "none" }, "expected": true },
+    { "name": "missing fields against fresh", "input": { "entry": {}, "source": "all", "freshness": "fresh", "route": "all" }, "expected": false }
+  ]
+}

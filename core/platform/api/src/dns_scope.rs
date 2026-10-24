@@ -107,11 +107,13 @@ pub fn is_actionable_scope(scope: &InterfaceDnsScope) -> bool {
     usable
 }
 
-/// Normalise a raw suffix as the OS reports it. `None` when nothing is claimed.
+/// Normalise a raw suffix as the OS reports it. `None` when nothing is claimed
+/// or the lease carries something the suffix list could not hold: one
+/// definition of a suffix, so a claim is published only in the form the plan
+/// would act on.
 #[must_use]
 pub fn normalize_suffix(raw: &str) -> Option<String> {
-    let s = raw.trim().trim_matches('.').to_ascii_lowercase();
-    (!s.is_empty()).then_some(s)
+    suffix_policy::normalize_suffix(raw).ok()
 }
 
 /// Which kind of connection made a claim. Only a tunnel somebody else runs
@@ -390,6 +392,25 @@ mod tests {
         );
         assert_eq!(normalize_suffix("   "), None);
         assert_eq!(normalize_suffix(""), None);
+    }
+
+    #[test]
+    fn a_lease_suffix_the_list_could_not_hold_is_no_claim() {
+        assert_eq!(normalize_suffix("bad_label.example"), None);
+        assert_eq!(normalize_suffix("corp..example"), None);
+        assert_eq!(normalize_suffix(&"a".repeat(300)), None);
+        for raw in [
+            "Branch.Corp.Example.",
+            "bad_label.example",
+            "",
+            "-x.example",
+        ] {
+            assert_eq!(
+                normalize_suffix(raw),
+                suffix_policy::normalize_suffix(raw).ok(),
+                "{raw:?}"
+            );
+        }
     }
 
     #[test]

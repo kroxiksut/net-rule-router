@@ -64,15 +64,27 @@ impl FakeIpStack {
         );
     }
 
-    /// Pump every UDP bind: client datagrams out to their upstreams, upstream
-    /// replies back to their clients, then reap idle flows.
+    /// Pump the UDP binds with work: client datagrams out to their upstreams,
+    /// upstream replies back to their clients, then reap idle flows.
+    ///
+    /// A datagram, a reply, a landed dial or a dead reader marks its bind, as
+    /// for TCP; every `FLOW_SWEEP_INTERVAL_MS` all binds are visited anyway,
+    /// which is what the idle reap rides on.
     // `pub(super)`: this split inherent impl is called from a sibling module.
     pub(super) fn service_udp(&mut self, now_ms: u64) {
-        let keys: Vec<(std::net::IpAddr, u16)> = self.udp_binds.keys().copied().collect();
+        let sweep_due = now_ms.saturating_sub(self.last_udp_sweep_ms) >= FLOW_SWEEP_INTERVAL_MS;
+        let keys: Vec<UdpBindKey> = if sweep_due {
+            self.last_udp_sweep_ms = now_ms;
+            self.ready_udp.clear();
+            self.udp_binds.keys().copied().collect()
+        } else {
+            self.ready_udp.take()
+        };
         for key in keys {
             let Some(&UdpBind { handle, local, .. }) = self.udp_binds.get(&key) else {
                 continue;
             };
+            self.health.record_udp_bind_serviced();
             self.collect_udp_dials(&key, now_ms);
 
             // Client -> upstream. Copy each datagram out (releasing the socket
@@ -117,7 +129,7 @@ impl FakeIpStack {
         }
         // Re-armed only well under the cap, so a table hovering at it stays one
         // line in the log.
-        if self.udp_capacity_warned {
+        if sweep_due && self.udp_capacity_warned {
             let (pending, live) = self.udp_flow_counts();
             if pending + live < self.max_udp_flows / 2 {
                 self.udp_capacity_warned = false;
@@ -191,6 +203,7 @@ impl FakeIpStack {
             }
         };
         self.health.record_udp_relay_flow_opened();
+        let (book_route, owner) = (target.book_route, target.owner.clone());
         let outcome = Arc::new(Mutex::new(None));
         let submitted = submit_udp_dial(
             &self.dial_pool,
@@ -198,6 +211,7 @@ impl FakeIpStack {
             target,
             Arc::clone(&outcome),
             Arc::clone(&self.waker),
+            (Arc::clone(&self.ready_udp), *key),
         );
         if let Err(refusal) = submitted {
             self.warn_dial_refused(&refusal);
@@ -210,6 +224,8 @@ impl FakeIpStack {
                 client,
                 PendingUdpDial {
                     outcome,
+                    book_route,
+                    owner,
                     first_payload_len: payload.len(),
                     queued: VecDeque::from([payload]),
                     started_at: std::time::Instant::now(),
@@ -262,7 +278,12 @@ impl FakeIpStack {
                 }
             };
             let upstream: Arc<dyn RelayDatagram> = Arc::from(datagram);
-            let replies = UdpReplies::new(Arc::clone(&self.waker), Arc::clone(&self.health));
+            let replies = UdpReplies::for_bind(
+                Arc::clone(&self.waker),
+                Arc::clone(&self.ready_udp),
+                *key,
+                Arc::clone(&self.health),
+            );
             // No reader, no replies: the flow fails here, like a dial that
             // never landed. The upstream socket closes with `upstream`.
             let worker = match spawn_udp_reader(Arc::clone(&upstream), Arc::clone(&replies)) {
@@ -283,6 +304,8 @@ impl FakeIpStack {
                     replies,
                     worker,
                     last_seen_at: now_ms,
+                    book_route: pending.book_route,
+                    owner: pending.owner.clone(),
                 },
             );
             for datagram in pending.queued {
@@ -382,6 +405,60 @@ impl FakeIpStack {
                 self.send_port_unreachable(*key, client, payload.len());
                 false
             }
+        }
+    }
+
+    /// Retire every UDP flow whose route the books no longer give, live or
+    /// still dialling. A bind the routing user's book moved goes whole: its
+    /// target was decided by that book, and the next datagram binds afresh
+    /// under the new one, where a block is answered port-unreachable.
+    // `pub(super)`: this split inherent impl is called from a sibling module.
+    pub(super) fn recheck_udp_policy(&mut self) {
+        let mut stale_binds = Vec::new();
+        let mut stale_clients = Vec::new();
+        {
+            let mut books = BookRoutes::new(&self.relay);
+            for (key, bind) in &mut self.udp_binds {
+                let hostname = bind.target.hostname.as_str();
+                // The in-tunnel rescue carries a literal address no book names.
+                if hostname.parse::<std::net::IpAddr>().is_ok() {
+                    continue;
+                }
+                if books.route(None, hostname) != bind.target.book_route {
+                    stale_binds.push(*key);
+                    continue;
+                }
+                let mut holds = |route: Option<RouteRole>, owner: Option<&str>| {
+                    owner.is_none() || books.route(owner, hostname) == route
+                };
+                stale_clients.extend(
+                    bind.clients
+                        .iter()
+                        .filter(|(_, flow)| !holds(flow.book_route, flow.owner.as_deref()))
+                        .map(|(client, _)| (*key, *client)),
+                );
+                bind.pending
+                    .retain(|_, pending| holds(pending.book_route, pending.owner.as_deref()));
+            }
+        }
+        for (key, client) in stale_clients {
+            self.retire_udp_client(&key, client);
+        }
+        for key in stale_binds {
+            self.drop_udp_bind(&key);
+        }
+    }
+
+    /// Remove a bind with every client and dial on it.
+    fn drop_udp_bind(&mut self, key: &(std::net::IpAddr, u16)) {
+        let Some(bind) = self.udp_binds.remove(key) else {
+            return;
+        };
+        self.sockets.remove(bind.handle);
+        for (_, flow) in bind.clients {
+            flow.replies.mark_dead();
+            // Graveyard, not join — same poll-thread rule as the reap.
+            self.worker_graveyard.push(flow.worker);
         }
     }
 

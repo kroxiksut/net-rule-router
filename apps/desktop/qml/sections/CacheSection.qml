@@ -222,11 +222,7 @@ ScrollView {
     property string _cacheSourceFilter: "all"
     // Known cache source slugs (kebab-case) — drives the source-filter combo and
     // reuses the existing `diag.cache.source.<slug>` labels via _cacheSourceLabel.
-    readonly property var _cacheSourceSlugs: [
-        "all", "dns", "observed-from-traffic", "manual-refresh",
-        "imported-seed", "cache-rebuild", "os-cache-seed", "reverse-confirmed",
-        "browser-history-seed"
-    ]
+    readonly property var _cacheSourceSlugs: Pure.CACHE_SOURCE_FILTERS
     // Client-side freshness bucket filter over the loaded rows.
     // "all" disables it; "fresh" = the `fresh` slug only; "stale" = every other
     // slug (stale_usable + stale_not_usable + conflicting + negative_cached).
@@ -590,42 +586,20 @@ ScrollView {
         return b
     }
 
-    // All-field client-side filter: hostname, IP, the localized freshness and
-    // source labels, and both formatted timestamps. Case-insensitive substring
-    // match. A second, AND-combined predicate matches the entry `source` slug
-    // exactly (kebab-normalised) when `sourceSlug` is not "all". Passing
-    // `entries`/`query`/`sourceSlug` as arguments keeps the binding reactive
-    // (all reads happen in the binding scope).
+    // The search box matches every shown field, localized labels and
+    // formatted timestamps included; the three filter boxes are the shared
+    // `Pure.cacheEntryPassesFilters`. Arguments, not reads of `section`, keep
+    // the binding reactive.
     function _filterCacheEntries(entries, query, sourceSlug, freshnessBucket, routeSlug) {
         var q = String(query || "").trim().toLowerCase()
-        var src = String(sourceSlug || "all")
-        var fresh = String(freshnessBucket || "all")
-        var route = String(routeSlug || "all")
-        if (q === "" && src === "all" && fresh === "all" && route === "all")
+        if (q === "" && String(sourceSlug || "all") === "all"
+                && String(freshnessBucket || "all") === "all"
+                && String(routeSlug || "all") === "all")
             return entries
         var out = []
         for (var i = 0; i < entries.length; i++) {
             var e = entries[i] || {}
-            if (src !== "all") {
-                var es = String((e && e.source) || "").replace(/_/g, "-")
-                if (es !== src) continue
-            }
-            if (fresh !== "all") {
-                // "fresh" = the `fresh` slug only; "stale" = every other slug
-                // (stale_usable + stale_not_usable + conflicting + negative_cached).
-                var fs = String((e && e.freshness) || "").replace(/_/g, "-")
-                var isFresh = fs === "fresh"
-                if (fresh === "fresh" && !isFresh) continue
-                if (fresh === "stale" && isFresh) continue
-            }
-            if (route !== "all") {
-                var r = String((e && e.expected_route) || "")
-                // "ipv6" is not a route the user can pick — it means no rule
-                // CAN cover the row, so it belongs with the no-rule bucket
-                // rather than vanishing from every filter.
-                if (route === "none") { if (r !== "" && r !== "ipv6") continue }
-                else if (r !== route) continue
-            }
+            if (!Pure.cacheEntryPassesFilters(e, sourceSlug, freshnessBucket, routeSlug)) continue
             if (q !== "" && section._cacheRowBlob(e).indexOf(q) === -1) continue
             out.push(e)
         }
@@ -919,6 +893,7 @@ ScrollView {
                     spacing: root.uiTheme.spacingSm
                     ThemedTextField {
                         id: cacheSearchField
+                        accessibleLabel: root.uiRevision >= 0 ? root.tr("action.search", "Search") : ""
                         theme: root.uiTheme
                         Layout.fillWidth: true
                         visible: section._cacheEntries.length > 0
@@ -949,9 +924,10 @@ ScrollView {
                         || section._cacheRouteFilter !== "all"
                     ThemedComboBox {
                         id: cacheFreshnessFilterCombo
+                        accessibleLabel: root.uiRevision >= 0 ? root.tr("diag.cache.col-freshness", "Freshness") : ""
                         theme: root.uiTheme
                         implicitWidth: 180
-                        model: ["all", "fresh", "stale"]
+                        model: Pure.CACHE_FRESHNESS_FILTERS
                         function freshnessFilterLabel(slug) {
                             if (slug === "fresh")
                                 return root.tr("diag.cache.freshness-filter.fresh", "Fresh")
@@ -984,9 +960,10 @@ ScrollView {
                     }
                     ThemedComboBox {
                         id: cacheRouteFilterCombo
+                        accessibleLabel: root.uiRevision >= 0 ? root.tr("diag.cache.col-route", "Route") : ""
                         theme: root.uiTheme
                         implicitWidth: 180
-                        model: ["all", "primary", "secondary", "none"]
+                        model: Pure.CACHE_ROUTE_FILTERS
                         function routeFilterLabel(slug) {
                             if (slug === "primary")
                                 return root.connEgressLabel("primary")
@@ -1021,6 +998,7 @@ ScrollView {
                     }
                     ThemedComboBox {
                         id: cacheSourceFilterCombo
+                        accessibleLabel: root.uiRevision >= 0 ? root.tr("diag.cache.col-source", "Source") : ""
                         theme: root.uiTheme
                         implicitWidth: 200
                         model: section._cacheSourceSlugs

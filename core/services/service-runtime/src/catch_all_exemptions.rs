@@ -317,6 +317,42 @@ mod tests {
 
     /// The failure that matters: with no server address the guard would seal the
     /// tunnel's own reconnect, so it must refuse to arm rather than arm blind.
+    /// libvirt, Podman, LXD and Docker Compose bridges carry no driver name on
+    /// Linux, only the link name. Under "everything" the user's own virtual
+    /// machines and containers stay reachable, as on Windows.
+    #[test]
+    fn a_linux_bridge_for_local_machines_is_a_local_network() {
+        let (mut routes, mut adapters) = machine();
+        for (index, name, net) in [
+            (7, "virbr0", Ipv4Addr::new(192, 168, 122, 0)),
+            (8, "br-3f2a9c1d", Ipv4Addr::new(172, 18, 0, 0)),
+        ] {
+            let mut bridge = adapter(index, name, Vec::new());
+            let octets = net.octets();
+            bridge.ipv4_addresses = vec![Ipv4Addr::new(octets[0], octets[1], octets[2], 1)];
+            adapters.push(bridge);
+            routes.push(route(
+                net,
+                if index == 7 { 24 } else { 16 },
+                Ipv4Addr::UNSPECIFIED,
+                index,
+            ));
+        }
+        let ex = collect_exemptions(&routes, &adapters, Some("eth0"), Some("tun0"));
+        assert!(
+            ex.local_subnets
+                .contains(&(Ipv4Addr::new(192, 168, 122, 0), 24)),
+            "{:?}",
+            ex.local_subnets
+        );
+        assert!(
+            ex.local_subnets
+                .contains(&(Ipv4Addr::new(172, 18, 0, 0), 16)),
+            "{:?}",
+            ex.local_subnets
+        );
+    }
+
     #[test]
     fn without_a_server_route_the_block_must_not_arm() {
         let (mut routes, adapters) = machine();

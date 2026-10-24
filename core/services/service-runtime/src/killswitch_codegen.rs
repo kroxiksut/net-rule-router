@@ -576,13 +576,24 @@ pub fn app_kill_switch_filters_for(
         .enumerate()
     {
         let idx = idx as u64;
-        filters.push(permit_app_via_secondary(sid, pattern, secondary_luid, idx));
-        // An address a MAIN-LINK rule names is not this app's to cut: the block
-        // sits BELOW the primary rule band, so the primary rules' own permits
-        // outrank it for every address they name — uncapped, unlike the old
-        // per-(app, address) rescue permits this ordering replaced. Unless the
-        // app takes all its addresses: then those are its own.
-        filters.push(block_app_off_secondary(sid, pattern, idx, app_takeover));
+        // Both families: the pair is keyed on the program, not on an address,
+        // so its v6 twin holds the app's IPv6 off the tunnel without learning
+        // a single v6 destination. Without it a dual-stack site took the
+        // program's v6 out of the main link.
+        for v6 in [false, true] {
+            filters.push(permit_app_via_secondary(
+                sid,
+                pattern,
+                secondary_luid,
+                idx,
+                v6,
+            ));
+            // An address a MAIN-LINK rule names is not this app's to cut: the
+            // block sits BELOW the primary rule band, so the primary rules' own
+            // permits outrank it for every address they name. Unless the app
+            // takes all its addresses: then those are its own.
+            filters.push(block_app_off_secondary(sid, pattern, idx, app_takeover, v6));
+        }
     }
     filters
 }
@@ -596,9 +607,10 @@ fn permit_app_via_secondary(
     pattern: &str,
     secondary_luid: u64,
     idx: u64,
+    v6: bool,
 ) -> WfpFilterSpec {
     WfpFilterSpec {
-        layer: WfpLayerKey::AleAuthConnectV4,
+        layer: ale_layer_for(v6),
         action: WfpAction::Permit,
         remote_ip: None,
         remote_ip_set: Vec::new(),
@@ -609,7 +621,11 @@ fn permit_app_via_secondary(
             sid,
             KILLSWITCH_ROLE,
             &permit_luid_seg(secondary_luid),
-            "ks-app-permit",
+            if v6 {
+                "ks-app-permit-v6"
+            } else {
+                "ks-app-permit"
+            },
             pattern,
         ),
         user_sid: Some(sid.to_string()),
@@ -637,17 +653,28 @@ fn block_app_off_secondary(
     pattern: &str,
     idx: u64,
     app_takeover: bool,
+    v6: bool,
 ) -> WfpFilterSpec {
     let (weight, band) = app_block_band(idx, app_takeover);
     WfpFilterSpec {
-        layer: WfpLayerKey::AleAuthConnectV4,
+        layer: ale_layer_for(v6),
         action: WfpAction::Block,
         remote_ip: None,
         remote_ip_set: Vec::new(),
         remote_ip_set_v6: Vec::new(),
         remote_port: None,
         weight,
-        id: filter_id_for(sid, KILLSWITCH_ROLE, band, "ks-app-block", pattern),
+        id: filter_id_for(
+            sid,
+            KILLSWITCH_ROLE,
+            band,
+            if v6 {
+                "ks-app-block-v6"
+            } else {
+                "ks-app-block"
+            },
+            pattern,
+        ),
         user_sid: Some(sid.to_string()),
         app_pattern: Some(pattern.to_string()),
         local_interface_luid: None,
@@ -655,6 +682,15 @@ fn block_app_off_secondary(
         remote_subnet_v6: None,
         ip_protocol: None,
         remote_subnet_set: Vec::new(),
+    }
+}
+
+/// The ALE connect layer of one family.
+pub(crate) fn ale_layer_for(v6: bool) -> WfpLayerKey {
+    if v6 {
+        WfpLayerKey::AleAuthConnectV6
+    } else {
+        WfpLayerKey::AleAuthConnectV4
     }
 }
 
@@ -750,24 +786,36 @@ pub const DEFAULT_VPN_EXEMPT_PATTERNS: &[&str] = &[
 /// sits below the kill-switch block band, which is what keeps a rule host on
 /// the tunnel even for that application.
 pub fn primary_app_exempt_filters(sid: &str, app_patterns: &[String]) -> Vec<WfpFilterSpec> {
+    // Both families: a tunnel client whose server has an IPv6 address met the
+    // v6 block-all with no permit of its own and sealed its own reconnect.
     app_patterns
         .iter()
         .take(KILLSWITCH_MAX_DESTINATIONS)
         .enumerate()
-        .map(|(idx, pattern)| exempt_primary_app(sid, pattern, idx as u64))
+        .flat_map(|(idx, pattern)| {
+            [
+                exempt_primary_app(sid, pattern, idx as u64, false),
+                exempt_primary_app(sid, pattern, idx as u64, true),
+            ]
+        })
         .collect()
 }
 
-fn exempt_primary_app(sid: &str, pattern: &str, idx: u64) -> WfpFilterSpec {
+fn exempt_primary_app(sid: &str, pattern: &str, idx: u64, v6: bool) -> WfpFilterSpec {
+    let (layer, kind) = if v6 {
+        (WfpLayerKey::AleAuthConnectV6, "ks-app-exempt-v6")
+    } else {
+        (WfpLayerKey::AleAuthConnectV4, "ks-app-exempt")
+    };
     WfpFilterSpec {
-        layer: WfpLayerKey::AleAuthConnectV4,
+        layer,
         action: WfpAction::Permit,
         remote_ip: None,
         remote_ip_set: Vec::new(),
         remote_ip_set_v6: Vec::new(),
         remote_port: None,
         weight: APP_EXEMPT_BASE + idx,
-        id: filter_id_for(sid, KILLSWITCH_ROLE, "", "ks-app-exempt", pattern),
+        id: filter_id_for(sid, KILLSWITCH_ROLE, "", kind, pattern),
         user_sid: Some(sid.to_string()),
         app_pattern: Some(pattern.to_string()),
         local_interface_luid: None,

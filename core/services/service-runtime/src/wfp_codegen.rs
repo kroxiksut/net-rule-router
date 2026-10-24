@@ -321,6 +321,9 @@ pub struct CodegenOutput {
     pub secondary_dest_networks: Vec<IpBlock>,
     /// The network pieces the primary route rules' filters carry.
     pub primary_dest_networks: Vec<IpBlock>,
+    /// Addresses the current role's route rules permit, packed together once the
+    /// role is done ([`flush_route_band`]).
+    route_band_ips: Vec<IpAddr>,
 }
 
 impl CodegenOutput {
@@ -464,8 +467,8 @@ pub enum CodegenDiagnostic {
         reason: UnsupportedShapeReason,
     },
     /// Carving the narrower rules out of a network rule needed more than
-    /// `cap` pieces, so its filters cover its own blocks uncarved and the
-    /// narrower rules inside lose to it. `pieces` is where carving stopped.
+    /// `cap` pieces, so the rule emitted nothing rather than cover its blocks
+    /// over the narrower rules inside. `pieces` is where carving stopped.
     NetworkCarvingOverCap {
         rule_id: String,
         pieces: usize,
@@ -727,6 +730,7 @@ pub fn generate_filters_with_shapes(
                 &mut out,
             );
         }
+        flush_route_band(input.sid, role, base, &mut out);
     }
 
     // Collect the secondary-rule destination IPs (deduped, in order) for
@@ -1247,9 +1251,9 @@ fn emit_for_app_match(
     // The per-process filter (app-id condition). For a route rule this is a
     // Permit (the app is explicitly allowed and the kill-switch's
     // block-when-unavailable posture still governs it). For a Block rule this
-    // drops all connect-layer traffic from the process. (ICMP from a specific
-    // process is not matchable at the packet layer, which has no app context —
-    // the /32 mirrors below cover the app's observed destinations.)
+    // drops all connect-layer traffic from the process, and is the whole of the
+    // deny: ICMP from a specific process is not matchable at the packet layer,
+    // which has no app context.
     //
     // The WFP `ALE_APP_ID` condition keys on a real, on-disk file PATH
     // (`FwpmGetAppIdFromFileName0`), NOT the rule's name/glob — so we resolve
@@ -1330,6 +1334,14 @@ fn emit_for_app_match(
     // `/32` fan-out starts AFTER the resolved-path band (slots
     // `APP_PATH_FANOUT_CAP + 1 + i`) so it never collides with the per-path
     // app-id filters above.
+    // A program deny is the app-id block above and nothing wider: a block on
+    // its observed addresses carries no app condition, so it would drop a CDN
+    // front for every program of the user (the takeover setting admits such
+    // addresses without the census). ICMP from one process is not matchable
+    // at the packet layer either way.
+    if ctx.is_block() {
+        return;
+    }
     // Ownership and the outside-use census, asked through the gate the route
     // codegen reads — the two mechanisms must not disagree about who owns an
     // address, because a pin one way and a block the other leave the
@@ -1480,6 +1492,23 @@ fn deny_app_companions(
     ]
 }
 
+/// A program deny's loopback permit from [`deny_app_companions`]: a hole in the
+/// rule's own block, not a route, so it travels with the block.
+pub(crate) fn is_deny_loopback_permit(f: &WfpFilterSpec) -> bool {
+    f.action == WfpAction::Permit
+        && f.app_pattern.is_some()
+        && f.remote_ip.is_none()
+        && f.remote_ip_set.is_empty()
+        && f.remote_ip_set_v6.is_empty()
+        && f.remote_subnet_set.is_empty()
+        && f.remote_port.is_none()
+        && match (f.remote_subnet, f.remote_subnet_v6) {
+            (Some(v4), None) => v4 == (std::net::Ipv4Addr::new(127, 0, 0, 0), 8),
+            (None, Some(v6)) => v6 == (std::net::Ipv6Addr::LOCALHOST, 128),
+            _ => false,
+        }
+}
+
 /// An app rule's own route permit. A deny's loopback companion also names the
 /// app but routes nothing, so it must not mark the app as routed.
 fn is_whole_app_permit(f: &WfpFilterSpec) -> bool {
@@ -1586,15 +1615,13 @@ fn network_spec(
 /// producer left after the kill switch was packed — about 2000 of 2260 on the
 /// first measured run.
 ///
-/// Safe here for the reason the fan-out comment already states: within one rule
-/// every target carries the SAME verdict, so their relative order is
-/// irrelevant. Ordering still matters BETWEEN rules, and that is untouched —
-/// each chunk sits at `rule_weight(base, pos, chunk_index)`, inside the same
-/// per-rule slot range a per-address filter used.
+/// A route rule's permits go to the band's common set ([`flush_route_band`]). A
+/// Block rule's chunks keep their rule's slot range: the Block band also holds
+/// the app-scoped loopback permits, where order between rules decides.
 ///
-/// Filter identity becomes content-addressed (the chunk's digest), like the
-/// kill switch's: the same address set always yields the same id, so a
-/// recompute that changes nothing installs nothing.
+/// Filter identity is content-addressed (the chunk's digest), like the kill
+/// switch's: the same address set always yields the same id, so a recompute
+/// that changes nothing installs nothing.
 #[allow(clippy::too_many_arguments)]
 fn emit_packed_ip_filters(
     sid: &str,
@@ -1607,6 +1634,10 @@ fn emit_packed_ip_filters(
     ips: Vec<IpAddr>,
     out: &mut CodegenOutput,
 ) {
+    if ctx.action == WfpAction::Permit {
+        out.route_band_ips.extend(ips);
+        return;
+    }
     let kind = format!("{}{}", ctx.kind_prefix, rule_kind);
     for (idx, chunk) in nrr_platform_api::wfp_slotting::pack_both(ips)
         .into_iter()
@@ -1623,6 +1654,29 @@ fn emit_packed_ip_filters(
                 sid, role_slug, rule, &kind, &target, &chunk, weight, out,
             );
         }
+    }
+}
+
+/// One role's route-rule permits, packed as ONE set rather than rule by rule.
+///
+/// A route band holds nothing but permits, so which rule's permit matched
+/// decides nothing: the order between rules lives in the band's position
+/// against the others. Packed per rule, a book over a warm cache stood at about
+/// 2000 filters per user in this band alone, and the BFE host has crashed
+/// (0xEF) under ~3700 standing filters on the machine. The weights match
+/// `lower_windows::route_rules` for the shadow comparison.
+fn flush_route_band(sid: &str, role: RouteRole, base: u64, out: &mut CodegenOutput) {
+    let ips = std::mem::take(&mut out.route_band_ips);
+    let role_slug = role_slug(role);
+    for (idx, chunk) in nrr_platform_api::wfp_slotting::pack_both(ips)
+        .into_iter()
+        .enumerate()
+    {
+        let weight = rule_weight(base, 0, idx as u64);
+        let id = filter_id_for(sid, role_slug, "", "route-band", &chunk.id_seg());
+        let mut spec = chunk_spec(&chunk, ale_layer(&chunk), WfpAction::Permit, weight, id);
+        spec.user_sid = Some(sid.to_string());
+        out.filters.push(spec);
     }
 }
 

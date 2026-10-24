@@ -112,6 +112,7 @@ impl PerSidApplyOrchestrator {
         rule_book: &nrr_domain::canonical::CanonicalRuleBook,
         fqdn_cache: &dyn crate::fqdn_cache_lookup::FqdnCacheLookup,
         secondary_ip_denylist: &std::collections::HashSet<std::net::Ipv4Addr>,
+        zone_priority_over_ip: bool,
         app_takeover: bool,
         ipv6: crate::enforcement_planner::Ipv6Guard,
         live: &[nrr_platform_api::types::WfpFilterSpec],
@@ -139,6 +140,7 @@ impl PerSidApplyOrchestrator {
             rule_book,
             fqdn_cache,
             secondary_ip_denylist,
+            zone_priority_over_ip,
             app_takeover,
             ipv6,
             live,
@@ -187,6 +189,7 @@ impl PerSidApplyOrchestrator {
         rule_book: &nrr_domain::canonical::CanonicalRuleBook,
         fqdn_cache: &dyn crate::fqdn_cache_lookup::FqdnCacheLookup,
         secondary_ip_denylist: &std::collections::HashSet<std::net::Ipv4Addr>,
+        zone_priority_over_ip: bool,
         app_takeover: bool,
         ipv6: crate::enforcement_planner::Ipv6Guard,
         live: &[nrr_platform_api::types::WfpFilterSpec],
@@ -207,7 +210,8 @@ impl PerSidApplyOrchestrator {
             fqdn_cache,
             app_resolver: self.app_resolver.as_ref(),
             app_observations: self.app_observations.as_ref(),
-            zone_priority_over_ip: false,
+            // The live codegen read the stored order; another one compares two policies.
+            zone_priority_over_ip,
             app_rules_take_all_addresses: app_takeover,
             // The set the live pass hid from the tunnel. Comparing against a
             // plan that never saw it was comparing a pipeline WITH the

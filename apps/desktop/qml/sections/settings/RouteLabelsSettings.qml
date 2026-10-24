@@ -25,6 +25,7 @@ GroupBox {
             color: root.textColor
         }
         ThemedTextField {
+            accessibleLabel: root.tr("settings.field.route-primary-label", "Primary route name")
             theme: root.uiTheme
             Layout.fillWidth: true
             text: root.prefs.routePrimaryLabel
@@ -40,6 +41,7 @@ GroupBox {
             color: root.textColor
         }
         ThemedTextField {
+            accessibleLabel: root.tr("settings.field.route-secondary-label", "Additional route name")
             theme: root.uiTheme
             Layout.fillWidth: true
             text: root.prefs.routeSecondaryLabel

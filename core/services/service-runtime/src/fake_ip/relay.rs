@@ -19,6 +19,9 @@ use std::sync::{Arc, Mutex};
 use nrr_platform_api::fake_ip::{FakeIpAllocator, FakeIpScope, FakeIpVerdict, FlowTransport};
 use nrr_shared::RouteRole;
 
+/// One owner's book, read once and asked per hostname; `None` when blocked.
+pub type BookRoute<'a> = Box<dyn Fn(&str) -> Option<RouteRole> + 'a>;
+
 use super::dialer::UpstreamTarget;
 use super::flow::ParsedPacket;
 
@@ -34,12 +37,32 @@ pub trait UpstreamAddressResolver: Send + Sync {
 /// Which route a hostname's traffic must leave over — the existing rule engine
 /// verdict, injected so the relay never re-implements policy.
 pub trait RouteSelector: Send + Sync {
-    fn route_for(&self, hostname: &str) -> RouteRole;
+    /// The route the routing user's book gives `hostname`; `None` when that
+    /// book blocks it. The relay's dial is the service's own traffic and
+    /// passes the user's filters, so the block is honoured here or nowhere.
+    fn route_for(&self, hostname: &str) -> Option<RouteRole>;
 
     /// The route `principal`'s own rule book gives `hostname`; `None` when
     /// that book blocks it.
     fn route_for_principal(&self, _principal: &str, hostname: &str) -> Option<RouteRole> {
-        Some(self.route_for(hostname))
+        self.route_for(hostname)
+    }
+
+    /// A number that moves whenever a rule book may have changed. The stack
+    /// re-decides every live flow when it moves, so a flow opened under the
+    /// old book does not outlive it. Read once per poll step: cheap or never.
+    fn policy_stamp(&self) -> u64 {
+        0
+    }
+
+    /// [`Self::route_for`] (`owner` `None`) or [`Self::route_for_principal`]
+    /// over a book read once, for asking about every live flow at a time.
+    fn book_for(&self, owner: Option<&str>) -> BookRoute<'_> {
+        let owner = owner.map(str::to_owned);
+        Box::new(move |hostname| match owner.as_deref() {
+            None => self.route_for(hostname),
+            Some(principal) => self.route_for_principal(principal, hostname),
+        })
     }
 }
 
@@ -334,7 +357,12 @@ impl RelayCore {
             return RelayDecision::NoUpstreamAddress { hostname };
         }
 
-        let route = self.unless_vpn_client(self.routes.route_for(&hostname), source, destination);
+        // A host the routing user's book blocks is still decided: the flow may
+        // be another served user's, whose own book `for_owner` asks.
+        let book_route = self.routes.route_for(&hostname);
+        let route = book_route.map_or(RouteRole::Primary, |route| {
+            self.unless_vpn_client(route, source, destination)
+        });
         RelayDecision::Relay {
             target: UpstreamTarget {
                 hostname: hostname.clone(),
@@ -342,6 +370,7 @@ impl RelayCore {
                 fallbacks,
                 port: destination.port(),
                 route,
+                book_route,
                 owner: None,
             },
             hostname,
@@ -383,6 +412,14 @@ impl RelayCore {
         transport: Option<FlowTransport>,
     ) -> Result<UpstreamTarget, OwnerRefusal> {
         let principal = match self.owners.owner_of(client, destination, transport) {
+            // The relay's dial is the service's own traffic and passes the
+            // routing user's filters: their block is honoured here or nowhere.
+            FlowOwner::RoutingUser if target.book_route.is_none() => {
+                return Err(OwnerRefusal {
+                    hostname: target.hostname,
+                    reason: "blocked-host",
+                })
+            }
             FlowOwner::RoutingUser => return Ok(target),
             FlowOwner::Principal(principal) => principal,
             FlowOwner::Refused(reason) => {
@@ -405,9 +442,26 @@ impl RelayCore {
                 });
             };
             target.route = self.unless_vpn_client(route, client, destination);
+            target.book_route = Some(route);
         }
         target.owner = Some(principal);
         Ok(target)
+    }
+
+    /// See [`RouteSelector::policy_stamp`].
+    #[must_use]
+    pub fn policy_stamp(&self) -> u64 {
+        self.routes.policy_stamp()
+    }
+
+    /// The route the books give hostnames now — the routing user's (`owner`
+    /// `None`) or that owner's, `None` when blocked — over one read of the
+    /// book. Compared with a live flow's [`UpstreamTarget::book_route`]:
+    /// before the VPN-client bypass, whose lookup is rate-limited and must
+    /// not decide whether a flow is torn down.
+    #[must_use]
+    pub fn book_routes(&self, owner: Option<&str>) -> BookRoute<'_> {
+        self.routes.book_for(owner)
     }
 }
 
@@ -465,8 +519,8 @@ impl UpstreamAddressResolver for StaticUpstreamResolver {
 pub struct FixedRouteSelector(pub RouteRole);
 
 impl RouteSelector for FixedRouteSelector {
-    fn route_for(&self, _hostname: &str) -> RouteRole {
-        self.0
+    fn route_for(&self, _hostname: &str) -> Option<RouteRole> {
+        Some(self.0)
     }
 }
 
@@ -799,13 +853,73 @@ mod tests {
         }
     }
 
+    /// Blocks every hostname in the routing user's book; "S-1-5-21-2" routes
+    /// them over the secondary.
+    struct RoutingUserBlocks;
+
+    impl RouteSelector for RoutingUserBlocks {
+        fn route_for(&self, _hostname: &str) -> Option<RouteRole> {
+            None
+        }
+
+        fn route_for_principal(&self, principal: &str, _hostname: &str) -> Option<RouteRole> {
+            (principal == "S-1-5-21-2").then_some(RouteRole::Secondary)
+        }
+    }
+
+    /// A host the routing user's book blocks is refused even though its
+    /// binding is still live: the relay's own dial passes their filters, so
+    /// carrying it would reach the host the rule forbids. Another served
+    /// user's flow is still carried by that user's own book.
+    #[test]
+    fn a_host_the_routing_users_book_blocks_is_refused_not_carried() {
+        let (allocator, fake) = allocator_with("bank.example");
+        let resolver = StaticUpstreamResolver::new().with("bank.example", &[ip("203.0.113.5")]);
+        let mut relay = RelayCore::new(
+            allocator,
+            FakeIpScope::enabled(Vec::<String>::new()),
+            Arc::new(resolver),
+            Arc::new(RoutingUserBlocks),
+        );
+        let destination = SocketAddr::new(fake, 443);
+        let decide = |relay: &RelayCore| match relay.decide(&packet(destination, true)) {
+            RelayDecision::Relay { target, .. } => target,
+            other => panic!("decided for the owner to judge, got {other:?}"),
+        };
+        let routing_user: SocketAddr = "10.0.0.2:51000".parse().expect("addr");
+
+        let refusal = relay
+            .for_owner(
+                decide(&relay),
+                routing_user,
+                destination,
+                Some(FlowTransport::Tcp),
+            )
+            .expect_err("the routing user's block holds");
+        assert_eq!(refusal.reason, "blocked-host");
+        assert_eq!(relay.book_routes(None)("bank.example"), None);
+
+        relay.set_flow_owners(Arc::new(OwnersByPort));
+        let other_user: SocketAddr = "10.0.0.2:50002".parse().expect("addr");
+        let carried = relay
+            .for_owner(
+                decide(&relay),
+                other_user,
+                destination,
+                Some(FlowTransport::Tcp),
+            )
+            .expect("another user's own book routes the host");
+        assert_eq!(carried.route, RouteRole::Secondary);
+        assert_eq!(carried.book_route, Some(RouteRole::Secondary));
+    }
+
     /// Routes by whose book is asked: "S-1-5-21-2" sends the host over the
     /// secondary, "S-1-5-21-3" blocks it, the routing user takes the primary.
     struct PerUserRoutes;
 
     impl RouteSelector for PerUserRoutes {
-        fn route_for(&self, _hostname: &str) -> RouteRole {
-            RouteRole::Primary
+        fn route_for(&self, _hostname: &str) -> Option<RouteRole> {
+            Some(RouteRole::Primary)
         }
 
         fn route_for_principal(&self, principal: &str, _hostname: &str) -> Option<RouteRole> {

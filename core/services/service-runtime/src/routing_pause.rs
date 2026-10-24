@@ -38,7 +38,8 @@
 //! platform did not carry out would report "paused" over live routing, the
 //! one state a pause exists to rule out.
 
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, RwLock};
 
 use rusqlite::Connection;
 
@@ -132,6 +133,56 @@ pub trait PauseDispatcher: Send + Sync {
     fn remove_for_sid(&self, sid: &str) -> Result<(), String>;
 }
 
+// ── In-memory view ────────────────────────────────────────────────────────────
+
+/// Who is paused, for readers on the traffic path that cannot take the
+/// settings lock per lookup: the DNS answer and the relay's dial. It follows
+/// every stored change the coordinator makes.
+#[derive(Debug, Default)]
+pub struct PausedPrincipals {
+    sids: RwLock<Vec<String>>,
+    generation: AtomicU64,
+}
+
+impl PausedPrincipals {
+    /// Whether `principal`'s routing is paused.
+    pub fn contains(&self, principal: &str) -> bool {
+        self.sids
+            .read()
+            .unwrap_or_else(|p| p.into_inner())
+            .iter()
+            .any(|sid| sid == principal)
+    }
+
+    /// Moves on every change, so a cached decision knows to be re-made.
+    pub fn generation(&self) -> u64 {
+        self.generation.load(Ordering::Acquire)
+    }
+
+    fn set(&self, principal: &str, paused: bool) {
+        let mut sids = self.sids.write().unwrap_or_else(|p| p.into_inner());
+        let at = sids.iter().position(|sid| sid == principal);
+        match (paused, at) {
+            (true, None) => sids.push(principal.to_owned()),
+            (false, Some(at)) => {
+                sids.swap_remove(at);
+            }
+            _ => return,
+        }
+        self.generation.fetch_add(1, Ordering::AcqRel);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_for_test(&self, principal: &str, paused: bool) {
+        self.set(principal, paused);
+    }
+
+    fn replace(&self, paused: Vec<String>) {
+        *self.sids.write().unwrap_or_else(|p| p.into_inner()) = paused;
+        self.generation.fetch_add(1, Ordering::AcqRel);
+    }
+}
+
 // ── Coordinator ───────────────────────────────────────────────────────────────
 
 pub struct RoutingPauseCoordinator {
@@ -151,6 +202,7 @@ pub struct RoutingPauseCoordinator {
     /// the registry: logind on Linux. `None` leaves presence to the registry
     /// and the route coordinator.
     presence: Option<Arc<dyn ActivePrincipalSource>>,
+    paused: Arc<PausedPrincipals>,
 }
 
 /// When a pause asked for with `term` at `now_ms` ends.
@@ -185,6 +237,12 @@ impl RoutingPauseTerms {
         }
     }
 
+    /// The paused set as the traffic path reads it.
+    #[must_use]
+    pub fn paused_view(&self) -> Arc<PausedPrincipals> {
+        self.coordinator.paused_view()
+    }
+
     pub fn tick(&self, now_ms: i64) {
         let at_start = !self.started.swap(true, std::sync::atomic::Ordering::SeqCst);
         for sid in self.coordinator.lift_ended(now_ms, at_start) {
@@ -194,6 +252,7 @@ impl RoutingPauseTerms {
                     nrr_shared::ipc_payloads::StatusUpdateEvent::RoutingPauseStateChanged {
                         sid: sid.clone(),
                         paused: false,
+                        paused_at: None,
                         resumes_at_ms: None,
                         until_restart: false,
                     },
@@ -214,6 +273,14 @@ impl RoutingPauseCoordinator {
         audit: Arc<dyn RoutingPauseAudit>,
         clock: Arc<dyn Clock>,
     ) -> Self {
+        let paused = Arc::new(PausedPrincipals::default());
+        // A pause outlives a restart. An unreadable table leaves nobody paused
+        // here, as every other reader of it does.
+        if let Ok(guard) = conn.lock() {
+            if let Ok(stored) = RoutingPauseStateRepository::new(&guard).list_paused() {
+                paused.replace(stored);
+            }
+        }
         Self {
             conn,
             registry,
@@ -222,7 +289,14 @@ impl RoutingPauseCoordinator {
             clock,
             route_coord: None,
             presence: None,
+            paused,
         }
+    }
+
+    /// The paused set as the traffic path reads it.
+    #[must_use]
+    pub fn paused_view(&self) -> Arc<PausedPrincipals> {
+        Arc::clone(&self.paused)
     }
 
     /// Count a principal the platform authority names as live, so a pause
@@ -270,6 +344,7 @@ impl RoutingPauseCoordinator {
             }
             None => repo.forget(sid),
         };
+        self.paused.set(sid, previous.is_some_and(|rec| rec.paused));
         if let Err(e) = result {
             tracing::warn!(
                 target: "nrr::routing-pause",
@@ -418,6 +493,7 @@ impl RoutingPauseCoordinator {
                     message: e.to_string(),
                 })?;
         }
+        self.paused.set(sid, true);
         // Platform mutation outside the connection lock. Widened from
         // `is_active` alone to ALSO cover the effective routing SID: a no-tray
         // console user is not in the active registry, yet its filters and routes
@@ -467,6 +543,7 @@ impl RoutingPauseCoordinator {
                     message: e.to_string(),
                 })?;
         }
+        self.paused.set(sid, false);
         let effective = self.is_effective(sid);
         if self.registry.is_active(sid) || effective {
             // Routing that did not come back is still paused, and the flag
@@ -1011,6 +1088,48 @@ mod tests {
         let mut paused = fx.coord.paused_sids().expect("list");
         paused.sort();
         assert_eq!(paused, vec!["S-A".to_string(), "S-C".to_string()]);
+    }
+
+    /// The DNS answer and the relay read who is paused from memory; a view
+    /// that lags the stored flag keeps a paused user's rule hosts routed.
+    #[test]
+    fn the_paused_view_follows_every_stored_change() {
+        let fx = build_fx();
+        let view = fx.coord.paused_view();
+        fx.registry
+            .on_connect("S-A", IpcClientProfile::TrayLightweight);
+
+        let before = view.generation();
+        fx.coord.pause("S-A", None).expect("pause");
+        assert!(view.contains("S-A"));
+        assert_ne!(view.generation(), before, "a cached route is re-made");
+
+        fx.coord.resume("S-A").expect("resume");
+        assert!(!view.contains("S-A"));
+
+        fx.dispatcher.queue_remove("S-A", Err("refused".to_owned()));
+        assert!(fx.coord.pause("S-A", None).is_err());
+        assert!(!view.contains("S-A"), "a refused pause pauses nothing");
+
+        fx.coord
+            .pause_until("S-B", None, PauseEnd::At(5_000))
+            .expect("timed pause");
+        fx.coord.lift_ended(5_000, false);
+        assert!(!view.contains("S-B"), "an ended term lifts it here too");
+    }
+
+    #[test]
+    fn a_pause_from_the_last_run_is_in_the_view_at_start() {
+        let fx = build_fx();
+        fx.coord.pause("S-A", None).expect("pause");
+        let next_run = RoutingPauseCoordinator::new(
+            Arc::clone(&fx.coord.conn),
+            Arc::new(ActiveSidRegistry::new()),
+            fx.dispatcher.clone() as Arc<dyn PauseDispatcher>,
+            fx.audit.clone() as Arc<dyn RoutingPauseAudit>,
+            FixedClock::new(1_700_000_000) as Arc<dyn Clock>,
+        );
+        assert!(next_run.paused_view().contains("S-A"));
     }
 
     #[test]

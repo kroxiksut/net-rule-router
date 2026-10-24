@@ -15,7 +15,9 @@ What counts as signed in:
   service.
 - **Linux:** the user at the seat and every SSH session. To keep your rules
   in force while you are not connected, enable lingering for your account
-  (see [the terminal interface](tui.md#linux-servers)).
+  (see [the terminal interface](tui.md#linux-servers)). Programs you leave
+  running when you sign out, such as a `tmux` session or a download started
+  with `nohup`, stay under your rules and protection until they exit.
 
 Rules belong to the person who wrote them. A site in one user's rules is
 routed and protected for that user, and suggestions are offered to the person

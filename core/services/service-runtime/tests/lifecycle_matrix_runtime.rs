@@ -293,6 +293,7 @@ fn deps(
         sign_in_gate: None,
         fake_ip_shutdown: None,
         conn_observer_shutdown: None,
+        dns_redirect_release: None,
         event_bus: None,
         network_change_observer: None,
         secondary_liveness_hook: None,

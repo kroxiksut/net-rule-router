@@ -107,7 +107,12 @@ impl SecondaryRouteCoordinator {
             "recompute_active for routing user",
         );
         crate::kept_direct::retain_only(std::slice::from_ref(&sid));
+        self.keep_machine_reads(std::slice::from_ref(&sid));
         let resolution = self.resolve_inner(&sid, None, adapters.as_deref().ok());
+        // First contacts plan from this link from now on, not from the one the
+        // last pass saw: the cache snapshot ahead takes long enough for a
+        // tunnel recreated just now to be answered on its old interface.
+        self.remember_resolution(&sid, &resolution);
         self.recompute_for_with(&sid, &resolution, adapters.ok())
     }
 
@@ -119,6 +124,7 @@ impl SecondaryRouteCoordinator {
         let own = self.links_kept_as_ours(cell.own_links(), sids);
         cell.publish_served(None, &[], &[], &own);
         crate::kept_direct::forget_all();
+        self.keep_machine_reads(&[]);
     }
 
     /// `previous` plus the additional links of `sids`, from what the last
@@ -186,5 +192,67 @@ impl SecondaryRouteCoordinator {
         let _pass = self.pass_lock.lock().unwrap_or_else(|p| p.into_inner());
         self.drop_machine_memo();
         self.reconciler.retain_rule_routes()
+    }
+
+    /// [`Self::teardown`] for the stop, which must end: a pass still running
+    /// after `wait` has wedged, and the routes then go by their signature,
+    /// past the pass and the owned set it may be holding.
+    pub fn teardown_within(&self, wait: Duration) -> Result<RouteReconcileDelta, PlatformError> {
+        match crate::lifecycle_matrix::lock_within(&self.pass_lock, wait) {
+            Some(_pass) => {
+                self.drop_machine_memo();
+                self.reconciler.clear()
+            }
+            None => self.sweep_signed_past_the_pass(false),
+        }
+    }
+
+    /// [`Self::teardown_keep_rule_routes`] under the same bound as
+    /// [`Self::teardown_within`]; past it only the overlays go.
+    pub fn teardown_keep_rule_routes_within(
+        &self,
+        wait: Duration,
+    ) -> Result<RouteReconcileDelta, PlatformError> {
+        match crate::lifecycle_matrix::lock_within(&self.pass_lock, wait) {
+            Some(_pass) => {
+                self.drop_machine_memo();
+                self.reconciler.retain_rule_routes()
+            }
+            None => self.sweep_signed_past_the_pass(true),
+        }
+    }
+
+    /// Remove our signed rows straight from the table, each on its own: no
+    /// pass is left to want one back. `overlays_only` keeps the rule routes.
+    fn sweep_signed_past_the_pass(
+        &self,
+        overlays_only: bool,
+    ) -> Result<RouteReconcileDelta, PlatformError> {
+        use nrr_platform_api::route_signature::{is_overlay_route, signed_routes};
+        tracing::warn!(
+            target: "nrr::route-coordinator",
+            msg_key = "route-teardown-pass-wedged",
+            overlays_only,
+            "a route pass is still running at the stop; removing our routes by their signature instead",
+        );
+        let rows = signed_routes(self.api.as_ref(), &|_: &RouteEntry| false)?;
+        let mut removed = 0usize;
+        let mut refused = None;
+        for route in rows
+            .iter()
+            .filter(|r| !overlays_only || is_overlay_route(r))
+        {
+            match self.api.delete_ip_forward_entry(route) {
+                Ok(()) => removed += 1,
+                Err(e) if e.classify() == nrr_platform_api::ErrorClass::Idempotent => {}
+                Err(e) => {
+                    refused.get_or_insert(e);
+                }
+            }
+        }
+        match refused {
+            None => Ok(RouteReconcileDelta { added: 0, removed }),
+            Some(e) => Err(e),
+        }
     }
 }

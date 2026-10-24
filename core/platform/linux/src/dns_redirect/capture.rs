@@ -73,7 +73,7 @@ pub fn detect_capture_method(
     commands: &dyn DnsCommands,
     files: &DnsFiles,
 ) -> Option<DnsCaptureMethod> {
-    let resolved = match resolved_carries_programs(commands) {
+    let resolved = match resolved_carries_programs(commands, files) {
         Some(carries) => carries,
         None => resolv_conf_names_resolved_stub(files),
     };

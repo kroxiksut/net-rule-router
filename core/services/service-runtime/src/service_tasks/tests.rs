@@ -859,3 +859,50 @@ fn a_withdrawal_or_a_learnt_vpn_client_always_re_drives_policy() {
     assert!(other.redrives_policy(false));
     assert!(!Fold::default().redrives_policy(true));
 }
+
+/// Under protection that keeps everything off the main connection, the
+/// automatic pass would name the suggested sites there: the opt-in alone does
+/// not start it.
+#[test]
+fn the_automatic_pass_stays_off_while_protection_holds_everything_off_the_main_connection() {
+    use nrr_domain::LeakProtection;
+    use nrr_storage::repository::MigrationRunner;
+    use nrr_storage::route_bindings::{BehaviorMode, RouteBindingsRepository};
+    let runner = nrr_storage::migration::SqliteMigrationRunner::for_state_db(
+        rusqlite::Connection::open_in_memory().expect("open"),
+    );
+    runner.run_pending_migrations().expect("migrate");
+    let conn = Arc::new(std::sync::Mutex::new(runner.into_connection()));
+    let cadence = super::auto_rules::stored_auto_probe_cadence(Arc::clone(&conn));
+    let cases = [
+        (
+            LeakProtection::Off,
+            BehaviorMode::PreferSecondaryWhenAvailable,
+            true,
+        ),
+        (LeakProtection::Sites, BehaviorMode::PreferPrimary, true),
+        (
+            LeakProtection::Sites,
+            BehaviorMode::PreferSecondaryWhenAvailable,
+            false,
+        ),
+        (
+            LeakProtection::Everything,
+            BehaviorMode::PreferPrimary,
+            false,
+        ),
+    ];
+    for (i, (protection, mode, runs)) in cases.into_iter().enumerate() {
+        let sid = format!("S-1-5-21-probe-{i}");
+        {
+            let guard = conn.lock().expect("lock");
+            let repo = RouteBindingsRepository::new(&guard);
+            let mut policy = repo.load_for_sid(&sid).expect("load");
+            policy.primary_probe_auto = true;
+            policy.leak_protection = protection;
+            policy.mode = mode;
+            repo.update_for_sid(&sid, &policy, 0).expect("store");
+        }
+        assert_eq!(cadence(&sid).enabled, runs, "{protection:?} under {mode:?}");
+    }
+}

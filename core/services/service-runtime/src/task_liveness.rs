@@ -5,13 +5,15 @@
 //! them, whose death while it intercepts leaves the machine's DNS pointed at
 //! nothing with health still green.
 //!
-//! Two kinds of evidence, both a pair of atomics the loop already passes:
+//! Three kinds of evidence, each a pair of atomics the loop already passes:
 //!
 //! - a **pulse** of a supervised task: the supervisor marks each tick's start
 //!   and end, so a tick that runs past its deadline is a hang;
 //! - a **lease** an own-thread task holds: dropped without `finish`, the
 //!   thread ended by a panic; finished with [`ThreadExit::Stopped`], nothing
-//!   is said; its [`Watch`] says what counts as a hang.
+//!   is said; its [`Watch`] says what counts as a hang;
+//! - a [`TickWatch`] on a loop that waits inside its tick (the IPC acceptor):
+//!   the hang watchdog pokes it, so a tick that still does not end is a hang.
 //!
 //! The health-aggregator tick calls [`TaskLiveness::audit`]; everything else
 //! is recorded at the moment it happens. Verdicts go through one named voice
@@ -68,6 +70,10 @@ fn broken_news(kind: ServiceTaskKind) -> Option<nrr_shared::ipc_payloads::Status
         .then_some(nrr_shared::ipc_payloads::StatusUpdateEvent::SystemDnsNotRestored)
 }
 
+/// How long one accept tick may stay open while the hang watchdog pokes the
+/// listener every 15 s: four pokes that all went unanswered.
+pub const ACCEPT_TICK_DEADLINE: Duration = Duration::from_secs(60);
+
 /// One task's sign of life. Shared between the thread that touches it and the
 /// audit that reads it; two atomics, no lock.
 pub struct Pulse {
@@ -107,6 +113,23 @@ pub struct WorkGuard<'a> {
 impl Drop for WorkGuard<'_> {
     fn drop(&mut self) {
         self.pulse.touch(self.board, false);
+    }
+}
+
+/// The ticks of a loop that waits inside its tick by design (the IPC acceptor
+/// waits there for a client), so the supervisor gives it no deadline. The hang
+/// watchdog pokes such a loop from outside; a tick still open past the
+/// deadline is then a hang. Idle between ticks (a retry backoff) is not.
+#[derive(Clone)]
+pub struct TickWatch {
+    board: Arc<TaskLiveness>,
+    pulse: Arc<Pulse>,
+}
+
+impl TickWatch {
+    /// A tick starts; it ends when the guard drops.
+    pub fn tick(&self) -> WorkGuard<'_> {
+        self.board.tick_begins(&self.pulse)
     }
 }
 
@@ -228,6 +251,29 @@ impl TaskLiveness {
         });
         self.lock().pulses.insert(id.to_owned(), Arc::clone(&pulse));
         Some(pulse)
+    }
+
+    /// Watch the ticks of a loop the supervisor gives no deadline. Named
+    /// `<kind>:<label>`, so it never displaces a pulse of the supervisor's.
+    pub fn tick_watch(
+        self: &Arc<Self>,
+        kind: ServiceTaskKind,
+        label: &str,
+        deadline: Duration,
+    ) -> TickWatch {
+        let pulse = Arc::new(Pulse {
+            kind,
+            last_seen: AtomicU64::new(self.now_ms()),
+            busy: AtomicBool::new(false),
+            watch: Watch::Work(deadline),
+        });
+        self.lock()
+            .pulses
+            .insert(format!("{}:{label}", kind.id()), Arc::clone(&pulse));
+        TickWatch {
+            board: Arc::clone(self),
+            pulse,
+        }
     }
 
     /// A supervised tick starts; the guard ends it.
@@ -385,6 +431,36 @@ impl TaskLiveness {
             .collect()
     }
 
+    /// The first task of `kinds` hung for at least `threshold`, and for how
+    /// long. Read by the hang watchdog, which shares no lock with the work.
+    pub fn hung_past(
+        &self,
+        kinds: &[ServiceTaskKind],
+        threshold: Duration,
+    ) -> Option<(String, Duration)> {
+        self.hung_past_at(kinds, threshold, self.now_ms())
+    }
+
+    /// [`Self::hung_past`] at `now_ms` on the board's clock.
+    fn hung_past_at(
+        &self,
+        kinds: &[ServiceTaskKind],
+        threshold: Duration,
+        now_ms: u64,
+    ) -> Option<(String, Duration)> {
+        let inner = self.lock();
+        inner
+            .pulses
+            .iter()
+            .filter(|(_, pulse)| kinds.contains(&pulse.kind))
+            .find_map(|(name, pulse)| {
+                pulse
+                    .hang(now_ms)
+                    .filter(|(for_how_long, _)| *for_how_long >= threshold)
+                    .map(|(for_how_long, _)| (name.clone(), for_how_long))
+            })
+    }
+
     /// Record, per component, the worst thing known; clear the rest.
     fn publish(&self, inner: &Inner) {
         let mut worst: BTreeMap<HealthComponent, (ServiceHealthSeverity, String)> = BTreeMap::new();
@@ -419,6 +495,13 @@ impl TaskLiveness {
             } = kind.health()
             else {
                 continue;
+            };
+            // A Blocking verdict would refuse the first client that does get
+            // through a slow acceptor; the watchdog acts on a real hang.
+            let severity = if kind == ServiceTaskKind::IpcAcceptLoop {
+                severity.min(ServiceHealthSeverity::Degraded)
+            } else {
+                severity
             };
             note(
                 &mut worst,
@@ -455,6 +538,119 @@ fn note(
             worst.insert(component, (severity, message));
         }
     }
+}
+
+/// Tasks whose hang leaves the machine without working DNS or with the pass
+/// that enforces policy stuck: the resolver and its reconcile worker, and the
+/// periodic passes, which wait on the same locks any pass does. And the
+/// acceptor, seen through its [`TickWatch`]: hung, no client can reach the
+/// service to repair anything.
+pub const RESTART_ON_HANG: &[ServiceTaskKind] = &[
+    ServiceTaskKind::DnsResolver,
+    ServiceTaskKind::DnsReconcileWorker,
+    ServiceTaskKind::RouteReconcileSafety,
+    ServiceTaskKind::PrincipalEnforcement,
+    ServiceTaskKind::IpcAcceptLoop,
+];
+
+/// How long the watchdog must itself see one of [`RESTART_ON_HANG`] past its
+/// own deadline before the service gives up on it: past every honest pass,
+/// short of a user giving up on the network.
+pub const HANG_RESTART_AFTER: Duration = Duration::from_secs(180);
+
+/// How often the hang watchdog looks.
+const HANG_WATCH_EVERY: Duration = Duration::from_secs(15);
+
+/// A gap between two looks longer than this is a sleep or a stall of the
+/// watchdog's own: the ages it then reads say nothing, so watching restarts.
+const HANG_WATCH_GAP: Duration = Duration::from_secs(60);
+
+/// What the watchdog does about a hang: the name of the task and how long it
+/// was seen hung. Expected not to return (it ends the process).
+pub type OnHang = Arc<dyn Fn(&str, Duration) + Send + Sync>;
+
+/// Makes a waiting acceptor finish its tick (a connection to its own listener).
+/// Must not block.
+pub type Poke = Arc<dyn Fn() + Send + Sync>;
+
+/// The watchdog's memory between looks. A hang counts only for the time the
+/// watchdog itself saw it, look after look: a pulse's age alone also grows
+/// through a suspend, and a tick caught mid-flight by one would read as hung.
+#[derive(Default)]
+struct HangWatch {
+    last_look_ms: Option<u64>,
+    /// The task seen hung at the last look and for how long so far.
+    suspect: Option<(String, Duration)>,
+}
+
+impl HangWatch {
+    /// One look at `now_ms` on the board's clock; the task to give up on, if
+    /// any. Nothing while the stop runs: the stop has its own limit.
+    fn look(
+        &mut self,
+        board: &TaskLiveness,
+        now_ms: u64,
+        stopping: bool,
+    ) -> Option<(String, Duration)> {
+        let gap = self
+            .last_look_ms
+            .map(|last| Duration::from_millis(now_ms.saturating_sub(last)));
+        self.last_look_ms = Some(now_ms);
+        if stopping || gap.is_none_or(|gap| gap > HANG_WATCH_GAP) {
+            self.suspect = None;
+            return None;
+        }
+        let gap = gap.unwrap_or_default();
+        let Some((name, _)) = board.hung_past_at(RESTART_ON_HANG, Duration::ZERO, now_ms) else {
+            self.suspect = None;
+            return None;
+        };
+        let seen = match self.suspect.take() {
+            Some((suspect, seen)) if suspect == name => seen + gap,
+            _ => Duration::ZERO,
+        };
+        if seen >= HANG_RESTART_AFTER {
+            return Some((name, seen));
+        }
+        self.suspect = Some((name, seen));
+        None
+    }
+}
+
+/// Start the hang watchdog on a thread of its own, outside every pass and
+/// lock it watches: a hang inside the service is noticed by health alone
+/// otherwise, which nobody reads while every request waits on the same lock.
+///
+/// `poke` runs before every wait: an idle acceptor sits in its tick until a
+/// client comes, so a live one must be made to turn once per look.
+pub fn spawn_hang_watchdog(
+    board: Arc<TaskLiveness>,
+    poke: Option<Poke>,
+    on_hang: OnHang,
+) -> std::io::Result<()> {
+    std::thread::Builder::new()
+        .name("nrr-hang-watchdog".to_owned())
+        .spawn(move || {
+            let mut watch = HangWatch::default();
+            loop {
+                if let Some(poke) = poke.as_ref() {
+                    poke();
+                }
+                std::thread::sleep(HANG_WATCH_EVERY);
+                let stopping = crate::lifecycle::teardown_in_progress();
+                if let Some((name, seen)) = watch.look(&board, board.now_ms(), stopping) {
+                    tracing::error!(
+                        target: "nrr::supervisor",
+                        msg_key = "supervised-hang-watchdog-fired",
+                        task = name.as_str(),
+                        seconds = seen.as_secs(),
+                        "a task the network depends on is hung; handing DNS back and restarting the service",
+                    );
+                    on_hang(&name, seen);
+                }
+            }
+        })
+        .map(|_| ())
 }
 
 /// Every component a registry entry can name.
@@ -662,5 +858,161 @@ mod tests {
             board.troubled(),
             vec!["net-change-debounce:power".to_owned()]
         );
+    }
+
+    /// On a fake clock: a pass wedged in a tick, or a silent resolver, is
+    /// given up on once the watchdog has seen it hung for the limit, look
+    /// after look; not for a task the network does not depend on, not across
+    /// a sleep, and not while the stop runs.
+    #[test]
+    fn the_hang_watchdog_gives_up_on_a_hung_pass_or_resolver_it_saw_for_the_limit() {
+        let (board, _health) = board();
+        let start = board.now_ms();
+        let at = |s: u64| start + s * 1_000;
+        let every = HANG_WATCH_EVERY.as_secs();
+        let looks_to_fire = HANG_RESTART_AFTER.as_secs() / every;
+
+        // A non-critical worker hung for ten minutes is health's business.
+        let learner = board.lease(
+            ServiceTaskKind::FcrdnsLearner,
+            None,
+            Watch::Work(Duration::from_secs(1)),
+        );
+        let learner_work = learner.work();
+        let mut watch = HangWatch::default();
+        for n in 0..=40 {
+            assert_eq!(watch.look(&board, at(n * every), false), None);
+        }
+        drop(learner_work);
+
+        // The periodic pass, wedged inside a tick from the start.
+        let pulse = board
+            .supervised(
+                ServiceTaskKind::RouteReconcileSafety.id(),
+                Some(DEFAULT_TICK_DEADLINE),
+            )
+            .expect("pulse");
+        let tick = board.tick_begins(&pulse);
+        let first_hung = DEFAULT_TICK_DEADLINE.as_secs() + every;
+        let mut watch = HangWatch::default();
+        assert_eq!(watch.look(&board, at(first_hung - every), false), None);
+        for n in 0..looks_to_fire {
+            assert_eq!(
+                watch.look(&board, at(first_hung + n * every), false),
+                None,
+                "look {n}"
+            );
+        }
+        let fired = watch.look(&board, at(first_hung + looks_to_fire * every), false);
+        assert_eq!(
+            fired.map(|(name, _)| name),
+            Some(ServiceTaskKind::RouteReconcileSafety.id().to_owned())
+        );
+
+        // The same hang across a sleep starts over, and the stop silences it.
+        let mut watch = HangWatch::default();
+        assert_eq!(watch.look(&board, at(1_000), false), None);
+        assert_eq!(watch.look(&board, at(1_000 + 3_600), false), None);
+        for n in 1..=looks_to_fire {
+            assert_eq!(
+                watch.look(&board, at(4_600 + n * every), false),
+                None,
+                "after sleep {n}"
+            );
+        }
+        let would_fire = at(4_600 + (looks_to_fire + 1) * every);
+        assert_eq!(watch.look(&board, would_fire, true), None);
+        assert_eq!(watch.look(&board, would_fire + every * 1_000, false), None);
+        drop(tick);
+
+        // The resolver's serve loop gone silent.
+        let resolver = board.lease(
+            ServiceTaskKind::DnsResolver,
+            None,
+            Watch::Beats(Duration::from_secs(60)),
+        );
+        let silent_from = board.now_ms() + 61_000;
+        let mut watch = HangWatch::default();
+        let mut fired = None;
+        for n in 0..=looks_to_fire + 1 {
+            fired = fired.or(watch.look(&board, silent_from + n * every * 1_000, false));
+        }
+        assert_eq!(
+            fired.map(|(name, _)| name),
+            Some(ServiceTaskKind::DnsResolver.id().to_owned())
+        );
+        resolver.finish(ThreadExit::Stopped);
+        learner.finish(ThreadExit::Stopped);
+    }
+
+    /// On a fake clock: an acceptor idle between ticks (a backoff) or whose
+    /// ticks the pokes keep finishing is left alone; a tick no poke finishes
+    /// is given up on once past its deadline and seen hung for the limit.
+    #[test]
+    fn the_hang_watchdog_gives_up_on_an_accept_tick_no_poke_finishes() {
+        let (board, _health) = board();
+        let accept = board.tick_watch(
+            ServiceTaskKind::IpcAcceptLoop,
+            "accept",
+            ACCEPT_TICK_DEADLINE,
+        );
+        let start = board.now_ms() + 10_000;
+        let every_ms = HANG_WATCH_EVERY.as_secs() * 1_000;
+        let at = |n: u64| start + n * every_ms;
+        let enough = (ACCEPT_TICK_DEADLINE + HANG_RESTART_AFTER).as_secs() * 1_000 / every_ms + 4;
+
+        let mut watch = HangWatch::default();
+        for n in 0..=enough {
+            assert_eq!(watch.look(&board, at(n), false), None, "idle {n}");
+        }
+
+        // Each poke ended a tick; the next one began a moment before the look.
+        let mut watch = HangWatch::default();
+        for n in 0..=enough {
+            let _tick = accept.tick();
+            accept
+                .pulse
+                .last_seen
+                .store(at(n) - 1_000, Ordering::Relaxed);
+            assert_eq!(watch.look(&board, at(n), false), None, "poked {n}");
+        }
+
+        // One tick no poke ends.
+        let wedged_from = at(enough + 1);
+        let _tick = accept.tick();
+        accept.pulse.last_seen.store(wedged_from, Ordering::Relaxed);
+        let mut watch = HangWatch::default();
+        let fired = (1..=2 * enough).find_map(|n| {
+            watch
+                .look(&board, wedged_from + n * every_ms, false)
+                .map(|found| (n, found))
+        });
+        let (n, (name, seen)) = fired.expect("a wedged accept tick is given up on");
+        assert_eq!(name, "ipc-accept-loop:accept");
+        assert!(seen >= HANG_RESTART_AFTER);
+        assert!(
+            Duration::from_millis(n * every_ms) > ACCEPT_TICK_DEADLINE + HANG_RESTART_AFTER,
+            "not before the deadline plus the limit (look {n})"
+        );
+    }
+
+    #[test]
+    fn a_hung_accept_tick_degrades_ipc_but_never_blocks_it() {
+        let (board, health) = board();
+        let accept = board.tick_watch(
+            ServiceTaskKind::IpcAcceptLoop,
+            "accept",
+            Duration::from_millis(20),
+        );
+        let tick = accept.tick();
+        std::thread::sleep(Duration::from_millis(60));
+        board.audit();
+        assert_eq!(
+            component(&health, HealthComponent::Ipc).map(|c| c.0),
+            Some(ServiceHealthSeverity::Degraded)
+        );
+        drop(tick);
+        board.audit();
+        assert_eq!(component(&health, HealthComponent::Ipc), None);
     }
 }

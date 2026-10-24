@@ -52,6 +52,7 @@ GroupBox {
         }
         ThemedComboBox {
             id: systemFontCombo
+            accessibleLabel: root.uiRevision >= 0 ? root.tr("settings.field.system-font", "System font") : ""
             theme: root.uiTheme
             Layout.fillWidth: true
             model: [ "system-default", "segoe-ui", "arial", "tahoma", "verdana" ]

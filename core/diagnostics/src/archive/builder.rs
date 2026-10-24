@@ -666,8 +666,25 @@ fn redact_adapters_snapshot(
     snapshot: &mut nrr_shared::ipc_payloads::SnapshotInterfacesResponse,
     mode: crate::privacy::RedactionMode,
 ) {
-    use crate::privacy::redact::{redact_adapter_id, redact_ipv4_str};
+    use crate::privacy::redact::{redact_adapter_id, redact_ipv4_str, MARKER_REDACTED};
 
+    // An adapter's own name says whose it is: a tunnel adapter carries its
+    // provider's name. The logs hide it below `Sensitive`, and so does this.
+    if log_privacy_ceiling(mode) < crate::taxonomy::PrivacyClass::Sensitive {
+        let hide = |value: &mut String| {
+            if !value.is_empty() {
+                *value = MARKER_REDACTED.to_string();
+            }
+        };
+        for adapter in &mut snapshot.adapters {
+            hide(&mut adapter.name);
+            hide(&mut adapter.interface_description);
+        }
+        for row in &mut snapshot.rows {
+            hide(&mut row.name);
+            hide(&mut row.interface_description);
+        }
+    }
     if mode.shows_ip() {
         return;
     }
@@ -694,6 +711,11 @@ fn redact_adapters_snapshot(
         hide_addresses(&mut row.local_ip);
         hide_addresses(&mut row.gateway);
         hide_addresses(&mut row.dns_servers);
+        // The address the internet sees this machine at, the most identifying
+        // of them all.
+        if let Some(external) = row.observed_facts.external_ip.as_mut() {
+            hide_addresses(external);
+        }
     }
 }
 

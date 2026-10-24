@@ -17,7 +17,7 @@ pub const SERVICE: Key = key("settings.service.title", "Service management");
 pub const PRESETS: Key = key("settings.category.presets", "Presets and settings");
 pub const LOGS: Key = key("settings.group.logs-diagnostics", "Logs and diagnostics");
 pub const TRAFFIC: Key = key("settings.traffic.category", "Traffic statistics");
-pub const UPDATES: Key = key("settings.group.updates", "Check for updates");
+pub const ABOUT: Key = key("tui.settings.about.title", "About and updates");
 pub const TERMINAL: Key = key("tui.settings.terminal.title", "Terminal");
 
 // ── Common words and outcomes ────────────────────────────────────────────────
@@ -52,6 +52,10 @@ pub const PICK_HINT: Key = key(
 pub const CONFIRM: Key = key(
     "tui.settings.confirm",
     "Press Enter again to confirm, or Esc to cancel.",
+);
+pub const CONFIRM_GONE: Key = key(
+    "tui.settings.confirm-gone",
+    "The list changed while you were asked, and the row you were asked about is no longer there as it was. Nothing was done; choose it again.",
 );
 pub const MORE_ABOVE: Key = key("tui.settings.more-above", "{count} more lines above");
 
@@ -241,7 +245,7 @@ pub const LEAK_OFF_NOTE: Key = key(
 );
 pub const LEAK_SITES_NOTE: Key = key(
     "settings.routing.leak-protection.note-sites",
-    "What your rules send through the additional connection never goes out the main one. Everything else keeps working.",
+    "What your rules send through the additional connection never goes out the main one while strict blocking of shared addresses is on, as it is by default. Everything else keeps working, except sites that share an address with a routed one.",
 );
 pub const LEAK_EVERYTHING_NOTE: Key = key(
     "settings.routing.leak-protection.note-everything",
@@ -263,7 +267,7 @@ pub const PROTOCOL_LAST: Key = key(
 );
 pub const ALLOW_DNS: Key = key(
     "settings.routing.kill-switch.allow-dns-label",
-    "Allow name resolution over the main connection while blocked",
+    "While everything is held, look up site names over the main connection",
 );
 pub const ALLOW_DNS_NOTE: Key = key("settings.routing.kill-switch.allow-dns-note", "");
 pub const SHARED_STRICT: Key = key(
@@ -271,6 +275,20 @@ pub const SHARED_STRICT: Key = key(
     "Strict: also block addresses shared with regular sites (may break them)",
 );
 pub const SHARED_STRICT_NOTE: Key = key("settings.routing.kill-switch.shared-strict-note", "");
+pub const SHARED_SMART_WARNING: Key = key(
+    "settings.routing.kill-switch.shared-smart-warning",
+    "Leak protection strictness is reduced: shared addresses excluded from blocking — ",
+);
+pub const SHARED_SMART_UNAVAILABLE: Key = key(
+    "settings.routing.kill-switch.shared-smart-list-unavailable",
+    "The running service reports how many addresses were excluded, but not which ones.",
+);
+pub const SHARED_SMART_LIST: Key = key(
+    "settings.routing.kill-switch.shared-smart-list-title",
+    "Excluded addresses",
+);
+pub const SHOW_DETAILS: Key = key("action.show-details", "Show details");
+pub const HIDE_DETAILS: Key = key("action.hide-details", "Hide details");
 pub const SHARED_IP: Key = key(
     "settings.routing-behavior.shared-ip.label",
     "When a routed domain shares an IP address with other sites",
@@ -358,15 +376,15 @@ pub const DOH_AUTO: Key = key(
 );
 pub const DOH_AUTO_NOTE: Key = key(
     "settings.routing.doh-lockdown.auto-note",
-    "Blocks encrypted DNS in browsers while you have rules for the additional route, so the sites you route are seen and routed. Turn this off to set the blocking by hand.",
+    "Blocks encrypted DNS in browsers while your rules need to see site names, so the sites you route or block are seen and handled. Turn this off to set the blocking by hand.",
 );
 pub const DOH_AUTO_ON: Key = key(
     "settings.routing.doh-lockdown.auto-on",
-    "On: you have rules for the additional route.",
+    "On: your rules route or block sites by name.",
 );
 pub const DOH_AUTO_OFF: Key = key(
     "settings.routing.doh-lockdown.auto-off",
-    "Off: no rules for the additional route yet.",
+    "Off: none of your rules needs site names.",
 );
 pub const SUFFIX_TITLE: Key = key(
     "settings.routing.local-suffixes.title",
@@ -393,6 +411,19 @@ pub const HOSTS_TITLE: Key = key("settings.routing.hosts-group.title", "Hosts fi
 pub const HOSTS_BYPASS: Key = key(
     "settings.routing.hosts-bypass.label",
     "Resolve routed domains bypassing the hosts file",
+);
+pub const AUTO_SEED: Key = key(
+    "diag.cache.auto-seed-label",
+    "Seed the cache from browser history automatically at service start",
+);
+pub const AUTO_SEED_NOTE: Key = key(
+    "diag.cache.auto-seed-privacy-note",
+    "Only visited hostnames are read from local browser profiles — nothing is sent anywhere.",
+);
+pub const HOSTS_FILE: Key = key("settings.routing.hosts-file.label", "OS hosts file");
+pub const HOSTS_FILE_NOTE: Key = key(
+    "settings.routing.hosts-file.note",
+    "The OS hosts file can redirect or block a hostname before NetRuleRouter sees it (ad-block lists often map hosts to 127.0.0.1). NetRuleRouter never edits it — open the folder to inspect or edit it yourself (requires administrator).",
 );
 pub const LOCAL_TITLE: Key = key("settings.routing.local-networks.title", "Local networks");
 pub const FWD_TITLE: Key = key(
@@ -457,6 +488,37 @@ pub const LOCAL_MALFORMED: Key = key(
     "settings.routing.local-networks.reject-malformed",
     "{cidr} is not a network address. Write it as 10.0.2.0/24.",
 );
+pub const DOH_MANAGE: Key = key(
+    "settings.routing.doh-lockdown.resolvers.manage",
+    "Manage resolver list",
+);
+pub const DOH_HIDE: Key = key(
+    "settings.routing.doh-lockdown.resolvers.hide",
+    "Hide resolver list",
+);
+pub const DOH_REQUIRES_ADMIN: Key = key(
+    "settings.routing.doh-lockdown.resolvers.requires-admin",
+    "This is a shared, machine-wide list. Saving changes requires administrator approval.",
+);
+pub const DOH_DESCRIPTION: Key = key("settings.routing.doh-lockdown.resolvers.description", "Endpoints blocked when the lockdown is active. Add a public resolver by IP address or hostname; untick a row to keep it in the list but stop blocking it.");
+pub const DOH_KIND_IP: Key = key("settings.routing.doh-lockdown.resolvers.kind-ip", "IP");
+pub const DOH_KIND_HOST: Key = key("settings.routing.doh-lockdown.resolvers.kind-host", "Host");
+pub const DOH_EMPTY: Key = key(
+    "settings.routing.doh-lockdown.resolvers.empty",
+    "No resolvers in the list.",
+);
+pub const DOH_ADD_TARGET: Key = key(
+    "settings.routing.doh-lockdown.resolvers.add-target",
+    "IP address or hostname",
+);
+pub const DOH_ADD_COMMENT: Key = key(
+    "settings.routing.doh-lockdown.resolvers.add-comment",
+    "Note (provider / country)",
+);
+pub const NEED_RESOLVER: Key = key(
+    "tui.settings.routing.need-resolver",
+    "Type the resolver's address or name first.",
+);
 pub const NEED_NETWORK: Key = key(
     "tui.settings.routing.need-network",
     "Type the network first, for example 10.0.2.0/24.",
@@ -516,6 +578,10 @@ pub const SYSTEM_TITLE: Key = key(
 pub const RULE_LOCK: Key = key(
     "settings.routing.rule-lock.allow.label",
     "Allow users to change routing rules",
+);
+pub const RULE_LOCK_NOTE: Key = key(
+    "settings.routing.rule-lock.allow.tooltip",
+    "On (default): anyone signed in to this computer can add, edit and apply their own routing rules. Turn it off on company laptops so only an administrator changes the rules. Pausing routing and the route settings (connections, default route, leak protection) stay with each user.",
 );
 pub const SERVICE_DRIVEN: Key = key(
     "settings.diagnostics.rule-scope.service-driven.label",
@@ -665,6 +731,34 @@ pub const SERVICE_NO_MANAGER: Key = key(
 
 // ── Presets and settings ─────────────────────────────────────────────────────
 
+pub const MERGE_POLICY: Key = key(
+    "settings.general.merge-conflict.title",
+    "Merging file and app rules",
+);
+pub const MERGE_POLICY_NOTE: Key = key(
+    "settings.general.merge-conflict.description",
+    "When you merge a linked rules file with the rules the app is already enforcing, this decides who wins for a rule that exists on both sides but differs. \"Ask me\" keeps both and lets you pick per rule; \"File wins\" / \"Service wins\" resolve automatically.",
+);
+pub const MERGE_POLICY_UNION: Key = key(
+    "settings.general.merge-conflict.union",
+    "Ask me (resolve each conflict)",
+);
+pub const MERGE_POLICY_FILE_WINS: Key = key(
+    "settings.general.merge-conflict.file-wins",
+    "File wins (prefer the linked file)",
+);
+pub const MERGE_POLICY_SERVICE_WINS: Key = key(
+    "settings.general.merge-conflict.service-wins",
+    "Service wins (prefer the active rules)",
+);
+pub const MERGE_POLICY_SAVE_FAILED: Key = key(
+    "tui.rules.settings-not-written",
+    "Your settings file was not updated: {error}",
+);
+pub const MERGE_POLICY_NO_FILE: Key = key(
+    "errors.user-settings-unavailable",
+    "Your settings file could not be read or saved. Try again.",
+);
 pub const EXPORT_DESCRIPTION: Key = key(
     "settings.presets.full-settings-description",
     "Export adapter bindings, behavior mode, and rules-file paths as a single YAML file. Useful for backing up or transferring your settings.",
@@ -860,7 +954,84 @@ pub const TRAFFIC_RETENTION: Key = key(
     "settings.traffic.retention-days",
     "Keep daily history for (days)",
 );
+pub const STABILITY_TITLE: Key = key(
+    "settings.diagnostics.service-stability.title",
+    "Service stability",
+);
+pub const STABILITY_HELP: Key = key("settings.diagnostics.service-stability.help", "These options only affect the control channel (IPC). Network policy enforcement runs independently.");
+pub const TRACE_GUI: Key = key(
+    "settings.diagnostics.conn-trace.gui.label",
+    "Show connection trace in Diagnostics",
+);
+pub const TRACE_GUI_NOTE: Key = key("settings.diagnostics.conn-trace.gui.tooltip", "Lets the connection-trace panel in Diagnostics show what was observed. Takes effect immediately, no service restart. Switching it off hides the panel's contents only — it does not stop observation, which app routing and rule suggestions rely on.");
+pub const IPC_POLICY: Key = key(
+    "settings.diagnostics.service-stability.ipc.policy.label",
+    "Control-channel failure policy",
+);
+pub const IPC_RECOVERABLE: Key = key(
+    "settings.diagnostics.service-stability.ipc.policy.recoverable.label",
+    "Recoverable (recommended)",
+);
+pub const IPC_RECOVERABLE_NOTE: Key = key("settings.diagnostics.service-stability.ipc.policy.recoverable.help", "If the GUI ↔ service control channel fails, the supervisor restarts it automatically. Policy enforcement keeps running. After all retry attempts are exhausted, the GUI marks the channel as unavailable but the service continues operating.");
+pub const IPC_CRITICAL: Key = key(
+    "settings.diagnostics.service-stability.ipc.policy.critical.label",
+    "Critical (fail-fast)",
+);
+pub const IPC_CRITICAL_NOTE: Key = key("settings.diagnostics.service-stability.ipc.policy.critical.help", "Any control-channel failure puts the service into recovery mode. Policy enforcement halts until the operator restarts the service. Use for strict compliance scenarios.");
+pub const IPC_MAX_RESTARTS: Key = key(
+    "settings.diagnostics.service-stability.ipc.max-restarts.label",
+    "Max restart attempts",
+);
+pub const IPC_BACKOFF_BASE: Key = key(
+    "settings.diagnostics.service-stability.ipc.backoff-base.label",
+    "Initial backoff (ms)",
+);
+pub const IPC_BACKOFF_CAP: Key = key(
+    "settings.diagnostics.service-stability.ipc.backoff-cap.label",
+    "Max backoff (s)",
+);
+pub const IPC_CAP_BELOW_BASE: Key = key(
+    "settings.diagnostics.service-stability.ipc.cap-below-base",
+    "Max backoff must be greater than or equal to initial backoff.",
+);
+pub const CACHE_REFRESH_TITLE: Key = key(
+    "settings.diagnostics.cache-refresh.heading",
+    "Address cache refresh",
+);
+pub const CACHE_REFRESH: Key = key(
+    "settings.diagnostics.cache-refresh.label",
+    "Re-resolve routed sites every",
+);
+pub const CACHE_REFRESH_NOTE: Key = key("settings.diagnostics.cache-refresh.help", "How often a routed site's IP addresses are refreshed (1 min – 24 h). Site IPs rarely change, so a longer interval means less network activity; the last known address is always kept and used for routing and leak-protection until a fresh one is obtained, so lengthening this never weakens blocking.");
+pub const CACHE_REFRESH_UNIT: Key = key("settings.diagnostics.cache-refresh.unit", "min");
 pub const TRAFFIC_RESET: Key = key("settings.traffic.reset", "Reset statistics");
+pub const TRAFFIC_THROUGH_SECONDARY: Key = key(
+    "settings.traffic.through-secondary",
+    "Through additional adapter",
+);
+pub const TRAFFIC_THROUGH_PRIMARY: Key = key(
+    "settings.traffic.through-primary",
+    "Through primary adapter",
+);
+pub const TRAFFIC_ROLE_LOOPBACK: Key = key("settings.traffic.role-loopback", "Local (localhost)");
+pub const TRAFFIC_ROLE_VIRTUAL: Key = key("settings.traffic.role-virtual", "Virtual (VM)");
+pub const TRAFFIC_MERGE_QUESTION: Key = key("settings.traffic.history-merge.question", "\"{old}\" stopped appearing and \"{new}\" took its place. Is this the same connection, so its history should continue as one?");
+pub const TRAFFIC_MERGE_HINT: Key = key("settings.traffic.history-merge.hint", "Answered once. If they are different connections, their histories stay apart and you will not be asked again.");
+pub const TRAFFIC_MERGE_SAME: Key = key("settings.traffic.history-merge.same", "Same connection");
+pub const TRAFFIC_MERGE_DIFFERENT: Key = key(
+    "settings.traffic.history-merge.different",
+    "Different connections",
+);
+pub const TRAFFIC_EXPORT: Key = key("settings.traffic.export-csv", "Export CSV");
+pub const TRAFFIC_EXPORT_UNIT: Key = key("settings.traffic.export-unit", "Export units");
+pub const TRAFFIC_CSV_WRITTEN: Key = key(
+    "tui.settings.traffic.csv-written",
+    "Traffic statistics exported to {path}.",
+);
+pub const UNIT_BYTES: Key = key("diag.retention.size-unit.bytes", "Bytes");
+pub const UNIT_KB: Key = key("diag.retention.size-unit.kb", "KB");
+pub const UNIT_MB: Key = key("diag.retention.size-unit.mb", "MB");
+pub const UNIT_GB: Key = key("diag.retention.size-unit.gb", "GB");
 pub const TRAFFIC_RESET_DONE: Key = key(
     "tui.settings.traffic.reset-done",
     "Traffic statistics were reset.",
@@ -869,6 +1040,29 @@ pub const TRAFFIC_RESET_DONE: Key = key(
 // ── Updates ──────────────────────────────────────────────────────────────────
 
 pub const VERSION: Key = key("label.version", "Version");
+pub const LICENSE: Key = key("label.license", "License");
+pub const AUTHOR: Key = key("label.author", "Author");
+/// Each locale spells the rights holder its own way.
+pub const AUTHOR_NAME: Key = key("label.author-name", nrr_shared::gui_shell_v1().about.author);
+pub const AUTHOR_EMAIL: Key = key("label.author-email", "E-mail");
+pub const PROJECT: Key = key("label.project-url", "Project");
+pub const BUILD_CHANNEL: Key = key("label.build-channel", "Build channel");
+pub const THIRD_PARTY: Key = key("dialog.third-party.tab", "Third-party components");
+pub const VERDICT_GENUINE: Key = key("dialog.third-party.verdict-genuine", "Genuine");
+pub const VERDICT_UNTRUSTED: Key = key("dialog.third-party.verdict-untrusted", "Does not match");
+pub const VERDICT_MISSING: Key = key("dialog.third-party.verdict-missing", "Not installed");
+pub const VERDICT_NOT_APPLICABLE: Key = key(
+    "dialog.third-party.verdict-not-applicable",
+    "Attribution only",
+);
+pub const VERDICT_UNTRUSTED_NOTE: Key = key(
+    "dialog.third-party.verdict-untrusted-note",
+    "The file on disk is not the build shipped with the product, or its signature could not be confirmed. Reinstall the product.",
+);
+pub const VERDICT_MISSING_NOTE: Key = key(
+    "dialog.third-party.verdict-missing-note",
+    "The component is not installed, so the feature that needs it is unavailable. Everything else keeps working.",
+);
 pub const UPDATES_NOTE: Key = key(
     "tui.settings.updates.note",
     "This program does not check for new versions on its own.",
@@ -993,7 +1187,20 @@ pub fn all() -> Vec<Key> {
         PRESETS,
         LOGS,
         TRAFFIC,
-        UPDATES,
+        ABOUT,
+        LICENSE,
+        AUTHOR,
+        AUTHOR_NAME,
+        AUTHOR_EMAIL,
+        PROJECT,
+        BUILD_CHANNEL,
+        THIRD_PARTY,
+        VERDICT_GENUINE,
+        VERDICT_UNTRUSTED,
+        VERDICT_MISSING,
+        VERDICT_NOT_APPLICABLE,
+        VERDICT_UNTRUSTED_NOTE,
+        VERDICT_MISSING_NOTE,
         TERMINAL,
         ON,
         OFF,
@@ -1011,6 +1218,7 @@ pub fn all() -> Vec<Key> {
         EDIT_HINT,
         PICK_HINT,
         CONFIRM,
+        CONFIRM_GONE,
         MORE_ABOVE,
         HELP_FOCUS,
         HELP_ENTER,
@@ -1087,6 +1295,11 @@ pub fn all() -> Vec<Key> {
         ALLOW_DNS_NOTE,
         SHARED_STRICT,
         SHARED_STRICT_NOTE,
+        SHARED_SMART_WARNING,
+        SHARED_SMART_UNAVAILABLE,
+        SHARED_SMART_LIST,
+        SHOW_DETAILS,
+        HIDE_DETAILS,
         SHARED_IP,
         SHARED_IP_NOTE,
         SHARED_MAJORITY_IP,
@@ -1126,6 +1339,20 @@ pub fn all() -> Vec<Key> {
         SUFFIX_FIELD,
         HOSTS_TITLE,
         HOSTS_BYPASS,
+        HOSTS_FILE,
+        AUTO_SEED,
+        AUTO_SEED_NOTE,
+        DOH_MANAGE,
+        DOH_HIDE,
+        DOH_REQUIRES_ADMIN,
+        DOH_DESCRIPTION,
+        DOH_KIND_IP,
+        DOH_KIND_HOST,
+        DOH_EMPTY,
+        DOH_ADD_TARGET,
+        DOH_ADD_COMMENT,
+        NEED_RESOLVER,
+        HOSTS_FILE_NOTE,
         LOCAL_TITLE,
         FWD_TITLE,
         FWD_CHOICE,
@@ -1164,6 +1391,7 @@ pub fn all() -> Vec<Key> {
         AUTO_EAGER,
         SYSTEM_TITLE,
         RULE_LOCK,
+        RULE_LOCK_NOTE,
         SERVICE_DRIVEN,
         STOP_PERSIST,
         POLICY_DESCRIPTION,
@@ -1215,6 +1443,13 @@ pub fn all() -> Vec<Key> {
         SERVICE_DONE,
         SERVICE_QUERY_FAILED,
         SERVICE_NO_MANAGER,
+        MERGE_POLICY,
+        MERGE_POLICY_NOTE,
+        MERGE_POLICY_UNION,
+        MERGE_POLICY_FILE_WINS,
+        MERGE_POLICY_SERVICE_WINS,
+        MERGE_POLICY_SAVE_FAILED,
+        MERGE_POLICY_NO_FILE,
         EXPORT_DESCRIPTION,
         EXPORT_PATH,
         EXPORT_RUN,
@@ -1273,7 +1508,39 @@ pub fn all() -> Vec<Key> {
         REJECTED_DAYS_NOTE,
         ROLLEDBACK_DAYS_NOTE,
         ROLLEDBACK_COUNT_NOTE,
+        STABILITY_TITLE,
+        STABILITY_HELP,
+        TRACE_GUI,
+        TRACE_GUI_NOTE,
+        IPC_POLICY,
+        IPC_RECOVERABLE,
+        IPC_RECOVERABLE_NOTE,
+        IPC_CRITICAL,
+        IPC_CRITICAL_NOTE,
+        IPC_MAX_RESTARTS,
+        IPC_BACKOFF_BASE,
+        IPC_BACKOFF_CAP,
+        IPC_CAP_BELOW_BASE,
+        CACHE_REFRESH_TITLE,
+        CACHE_REFRESH,
+        CACHE_REFRESH_NOTE,
+        CACHE_REFRESH_UNIT,
         TRAFFIC_NOTE,
+        TRAFFIC_THROUGH_SECONDARY,
+        TRAFFIC_THROUGH_PRIMARY,
+        TRAFFIC_ROLE_LOOPBACK,
+        TRAFFIC_ROLE_VIRTUAL,
+        TRAFFIC_MERGE_QUESTION,
+        TRAFFIC_MERGE_HINT,
+        TRAFFIC_MERGE_SAME,
+        TRAFFIC_MERGE_DIFFERENT,
+        TRAFFIC_EXPORT,
+        TRAFFIC_EXPORT_UNIT,
+        TRAFFIC_CSV_WRITTEN,
+        UNIT_BYTES,
+        UNIT_KB,
+        UNIT_MB,
+        UNIT_GB,
         TRAFFIC_TODAY,
         TRAFFIC_SESSION,
         TRAFFIC_ALL_TIME,

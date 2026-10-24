@@ -49,20 +49,16 @@ fn every_offered_rule_type_has_its_texts_in_both_locales() {
     }
 }
 
+/// The list itself, and that it holds every rule type, is checked against the
+/// terminal's in `core/client-logic/tests/filter_lists.rs`; here, that the
+/// window's type filter shows that list and no copy of its own.
 #[test]
-fn every_offered_rule_type_can_be_filtered_for() {
+fn the_type_filter_shows_the_shared_list() {
     let section = repo_file("apps/desktop/qml/sections/RulesSection.qml");
-    let model = section
-        .lines()
-        .find(|line| line.contains("model: [ \"all\", \"zone\""))
-        .expect("the type filter's model is a literal list");
-    for rule_type in FreeRuleType::ALL {
-        assert!(
-            model.contains(&format!("\"{}\"", rule_type.slug())),
-            "the type filter does not offer `{}`: {model}",
-            rule_type.slug()
-        );
-    }
+    assert!(
+        section.contains("model: Rules.RULES_TYPE_FILTERS"),
+        "the type filter no longer reads Rules.RULES_TYPE_FILTERS"
+    );
 }
 
 #[test]

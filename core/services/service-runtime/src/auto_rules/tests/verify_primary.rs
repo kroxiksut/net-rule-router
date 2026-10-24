@@ -144,6 +144,8 @@ struct Setup {
     reapplied: Arc<Mutex<Vec<String>>>,
     bus: Arc<EventBus>,
     subscription: String,
+    /// What `keeps_names_off_main` answers.
+    off_main: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl Setup {
@@ -192,11 +194,16 @@ fn setup_over(
     engine.attach_author(Arc::clone(&author) as Arc<dyn AutoRuleAuthor>);
     let reapplied = Arc::new(Mutex::new(Vec::new()));
     let log = Arc::clone(&reapplied);
+    let off_main = Arc::new(std::sync::atomic::AtomicBool::new(false));
     engine.verify_runner.run_inline();
     engine.attach_verify_primary(crate::auto_rules::VerifyPrimaryWiring {
         probe: Arc::clone(&probe) as Arc<dyn PathProbe>,
         egress,
         include_subdomains: Arc::new(move |_sid: &str| subdomains),
+        keeps_names_off_main: {
+            let off_main = Arc::clone(&off_main);
+            Arc::new(move |_sid: &str| off_main.load(std::sync::atomic::Ordering::Relaxed))
+        },
         reapply: Some(Arc::new(move |sid: &str| {
             log.lock()
                 .unwrap_or_else(|p| p.into_inner())
@@ -213,6 +220,7 @@ fn setup_over(
         reapplied,
         bus,
         subscription,
+        off_main,
     }
 }
 
@@ -251,9 +259,10 @@ fn moved_ids(sid: &str) -> Vec<String> {
     let mut ids: Vec<String> = crate::verify_overlay::moved_for(sid)
         .1
         .iter()
-        .map(ToString::to_string)
+        .map(|verdict| verdict.key.to_string())
         .collect();
     ids.sort();
+    ids.dedup();
     ids
 }
 
@@ -355,6 +364,7 @@ fn a_slow_check_runs_off_the_tick_and_reaches_the_same_verdict() {
         probe: held as Arc<dyn PathProbe>,
         egress: Arc::new(BothLinks),
         include_subdomains: Arc::new(|_: &str| true),
+        keeps_names_off_main: Arc::new(|_: &str| false),
         reapply: None,
     });
     engine.tick(sid, later());
@@ -411,6 +421,54 @@ fn the_service_tick_checks_every_present_user() {
     for sid in users {
         assert_eq!(engine.verify_verdicts(sid).len(), 1, "{sid}");
     }
+}
+
+/// Under "everything" the promise is that nothing leaves over the main
+/// connection: a tunnel site that falls silent is not named there to find out,
+/// and the rule stays where it is written.
+#[test]
+fn a_tunnel_rule_host_is_never_named_over_the_main_connection_under_everything() {
+    let sid = "S-verify-off-main";
+    let s = setup(
+        sid,
+        book_with(Vec::new(), vec![verify_rule("proton.example")]),
+        PathVerdict::Answered,
+        PathVerdict::Silent,
+    );
+    s.off_main.store(true, std::sync::atomic::Ordering::Relaxed);
+    s.engine
+        .note_verify_candidate(sid, "mail.proton.example", &[HOST_IP]);
+    s.engine.tick(sid, later());
+    s.engine.tick(sid, later());
+    s.engine
+        .note_verify_candidate(sid, "mail.proton.example", &[HOST_IP]);
+    s.engine.tick(sid, after(1));
+    assert!(
+        s.probe.calls().iter().all(|(_, link)| *link == ADDITIONAL),
+        "{:?}",
+        s.probe.calls()
+    );
+    assert!(s.engine.verify_verdicts(sid).is_empty());
+    assert!(moved_ids(sid).is_empty());
+}
+
+/// The main route's own `?` rule is checked over the main route under any
+/// protection: that is the route the user wrote for it.
+#[test]
+fn a_main_route_rule_is_still_checked_both_ways_under_everything() {
+    let sid = "S-verify-off-main-primary";
+    let s = setup(
+        sid,
+        main_route_book(),
+        PathVerdict::Silent,
+        PathVerdict::Answered,
+    );
+    s.off_main.store(true, std::sync::atomic::Ordering::Relaxed);
+    s.engine
+        .note_verify_candidate(sid, "mail.proton.example", &[HOST_IP]);
+    s.engine.tick(sid, later());
+    s.engine.tick(sid, later());
+    assert_eq!(s.engine.verify_verdicts(sid).len(), 1);
 }
 
 #[test]
@@ -554,6 +612,7 @@ fn a_query_before_the_rules_are_read_still_counts() {
         probe: Arc::clone(&probe) as Arc<dyn PathProbe>,
         egress: Arc::new(BothLinks),
         include_subdomains: Arc::new(|_sid: &str| true),
+        keeps_names_off_main: Arc::new(|_sid: &str| false),
         reapply: None,
     });
     // No tick yet: the rules have not been read.

@@ -145,6 +145,19 @@ pub const UNROUTABLE_CONFIRM: Key = key(
     "dialog.unroutable-secondary.confirm-assign",
     "Assign anyway",
 );
+pub const HOLDS_NOW_TITLE: Key = key(
+    "dialog.leak-holds-now.role-title",
+    "Leak protection will hold all traffic",
+);
+pub const HOLDS_NOW_BODY: Key = key(
+    "dialog.leak-holds-now.role-body",
+    "Leak protection is set to Everything. Without an available additional connection, traffic is held right away: the internet stops until an available adapter is the additional connection again.",
+);
+pub const HOLDS_NOW_EFFECT: Key = key(
+    "dialog.leak-holds-now.effect",
+    "Your local network and what your rules send over the main connection keep working.",
+);
+pub const HOLDS_NOW_CONFIRM: Key = key("dialog.leak-holds-now.role-confirm", "Change anyway");
 
 pub const HELP_SELECT: Key = key(
     "tui.interfaces.help-select",
@@ -225,6 +238,10 @@ pub const ALL: &[Key] = &[
     UNROUTABLE_KILL_SWITCH_ON,
     UNROUTABLE_KILL_SWITCH_OFF,
     UNROUTABLE_CONFIRM,
+    HOLDS_NOW_TITLE,
+    HOLDS_NOW_BODY,
+    HOLDS_NOW_EFFECT,
+    HOLDS_NOW_CONFIRM,
     HELP_SELECT,
     HELP_PRIMARY,
     HELP_SECONDARY,

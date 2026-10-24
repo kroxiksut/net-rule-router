@@ -265,6 +265,16 @@ impl HealthAggregator {
         }
     }
 
+    /// When `component`'s own writer last recorded it, whatever named voices
+    /// say: the snapshot may show a louder voice with its own, older stamp.
+    pub fn recorded_at(&self, component: HealthComponent) -> Option<u64> {
+        let inner = self.inner.lock().ok()?;
+        inner
+            .components
+            .get(&component)
+            .map(|c| c.updated_at_epoch_secs)
+    }
+
     /// `source` has nothing to say about `component` any more.
     pub fn clear_as(&self, source: &'static str, component: HealthComponent) {
         if let Ok(mut inner) = self.inner.lock() {
@@ -719,6 +729,39 @@ mod tests {
         let snap = agg.snapshot();
         assert_eq!(snap.worst_severity, ServiceHealthSeverity::Blocking);
         assert_eq!(snap.state, ServiceRuntimeState::RecoveryRequired);
+    }
+
+    /// The watchdog reads the adapter monitor's own beat: a louder named
+    /// voice that went quiet a minute ago is not the monitor going quiet.
+    #[test]
+    fn the_writers_own_stamp_is_read_past_a_louder_voice() {
+        let agg = HealthAggregator::new();
+        agg.record(HealthComponent::Adapters, ServiceHealthSeverity::Ok, "tick");
+        agg.record_as(
+            "dns-upstream",
+            HealthComponent::Adapters,
+            ServiceHealthSeverity::Degraded,
+            "upstream",
+        );
+        let own = agg
+            .recorded_at(HealthComponent::Adapters)
+            .expect("recorded");
+        agg.inner
+            .lock()
+            .expect("not poisoned")
+            .sourced
+            .get_mut(&(HealthComponent::Adapters, "dns-upstream"))
+            .expect("voice")
+            .updated_at_epoch_secs = own - 60;
+        let shown = agg
+            .snapshot()
+            .components
+            .iter()
+            .find(|c| c.component == HealthComponent::Adapters)
+            .map(|c| c.updated_at_epoch_secs)
+            .expect("shown");
+        assert_eq!(shown, own - 60);
+        assert_eq!(agg.recorded_at(HealthComponent::Apply), None);
     }
 
     #[test]

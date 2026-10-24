@@ -517,6 +517,78 @@ fn the_cursor_stays_on_its_rule_when_the_list_is_read_again() {
     assert_eq!(switched, ["b.example"]);
 }
 
+/// The window's status, type and «added automatically» filters, the count of
+/// rules that will not apply with its «show them», and the five orders.
+#[test]
+fn the_rules_filter_by_state_type_and_origin_and_sort_five_ways() {
+    let mut off = rule("2", "domain", "off.example", "primary");
+    off["enabled"] = Value::Bool(false);
+    let mut auto = rule("3", "domain", "cdn.example", "secondary");
+    auto["origin"] = json!({
+        "kind": "auto", "reason": "site-companion", "anchor": "a.example", "added": "2026-10-01"
+    });
+    let fake = service(vec![
+        rule("1", "domain", "b.example", "secondary"),
+        off,
+        auto,
+        rule("4", "exact-ip", "192.0.2.7", "primary"),
+        rule("5", "domain", "not a host!", "secondary"),
+    ]);
+    let mut app = on_rules(&fake);
+    let shown = |app: &AppState| -> Vec<String> {
+        let table = &app.rules.table;
+        table
+            .visible()
+            .into_iter()
+            .map(|i| table.rows[i].rule.match_value.clone())
+            .collect()
+    };
+    assert_eq!(shown(&app).len(), 5);
+    let text = screen_text(&app, ScreenId::Rules);
+    assert!(
+        text.contains("1 rule(s) will not be applied") && text.contains("E: show them"),
+        "{text}"
+    );
+
+    answer(&mut app, &["E"]);
+    assert_eq!(shown(&app), ["not a host!"]);
+    answer(&mut app, &["S", "3"]);
+    assert_eq!(shown(&app), ["off.example"], "disabled only");
+    answer(&mut app, &["S", "1", "y", "4"]);
+    assert_eq!(shown(&app), ["192.0.2.7"], "exact IP only");
+    answer(&mut app, &["y", "1", "u"]);
+    assert_eq!(shown(&app), ["cdn.example"], "added automatically only");
+    let text = screen_text(&app, ScreenId::Rules);
+    assert!(text.contains("Auto-added only"), "{text}");
+    answer(&mut app, &["u"]);
+
+    answer(&mut app, &["O"]);
+    assert_eq!(
+        shown(&app),
+        [
+            "192.0.2.7",
+            "b.example",
+            "cdn.example",
+            "not a host!",
+            "off.example"
+        ],
+        "by value"
+    );
+    answer(&mut app, &["O", "O"]);
+    assert_eq!(app.rules.table.sort, super::table::SortMode::Route);
+    assert_eq!(
+        shown(&app),
+        [
+            "192.0.2.7",
+            "off.example",
+            "b.example",
+            "cdn.example",
+            "not a host!"
+        ],
+        "by route, then value"
+    );
+}
+
 /// From the menu no row is marked, so a toggle there switches nothing yet.
 #[test]
 fn a_toggle_from_the_menu_first_shows_the_rule_it_would_switch() {
@@ -620,6 +692,59 @@ fn edits_go_on_top_of_the_rules_changed_elsewhere() {
         ]
     );
     assert!(super::holds_unapplied(&app));
+}
+
+/// The service stores what was typed in its own spelling (`telegram` becomes
+/// `telegram.exe`). Remembered as typed, the applied set could not name the
+/// rule the user later deletes, and a merge with a change made elsewhere
+/// brought the deleted rule back, still routing.
+#[test]
+fn a_rule_deleted_after_an_apply_stays_deleted_through_a_merge() {
+    let fake = service(Vec::new());
+    let mut app = on_rules(&fake);
+    let typed = RuleRow {
+        id: String::new(),
+        enabled: true,
+        rule_type: RuleType::from_slug("application"),
+        match_value: "telegram".into(),
+        target_route: TargetRoute::Secondary,
+        verify: false,
+        comment: String::new(),
+        origin: None,
+    };
+    app.rules.table.import(vec![typed], false);
+    let in_force = json!({
+        "rows": [rule("1", "application", "telegram.exe", "secondary")],
+        "supported-rule-types": ["zone", "domain", "exact-ip", "application"]
+    });
+    fake.answer(IpcOperationName::RulesList, in_force);
+    super::finished(&mut app, super::apply::Finished::Applied { base: None });
+    drain(&mut app, &fake);
+
+    app.rules.table.rows.clear();
+    fake.answer(
+        IpcOperationName::RulesList,
+        json!({
+            "rows": [
+                rule("1", "application", "telegram.exe", "secondary"),
+                rule("2", "domain", "theirs.example", "secondary"),
+            ],
+            "supported-rule-types": ["zone", "domain", "exact-ip", "application"]
+        }),
+    );
+    super::rebase_edits(&mut app);
+    drain(&mut app, &fake);
+    if matches!(app.rules.mode, Mode::Merge(_)) {
+        answer(&mut app, &["y"]);
+        drain(&mut app, &fake);
+    }
+    let values: Vec<String> = app
+        .rules
+        .table
+        .rules()
+        .map(|r| r.match_value.clone())
+        .collect();
+    assert_eq!(values, ["theirs.example"], "the deleted rule came back");
 }
 
 // ── The main-route check ─────────────────────────────────────────────────────
@@ -756,7 +881,8 @@ mod main_route {
     #[test]
     fn the_order_puts_what_the_main_route_does_not_reach_first() {
         let mut app = on_rules(&service(every_verdict()));
-        answer(&mut app, &["O"]);
+        // Value, type, route, then the main route check.
+        answer(&mut app, &["O", "O", "O", "O"]);
         let text = screen_text(&app, ScreenId::Rules);
         assert!(text.contains("Sort: Main route check"), "{text}");
         let order = [
@@ -964,7 +1090,9 @@ mod main_route {
             ),
         );
         run_later(&mut app, &fake);
-        session.input("O", &mut app, &texts).expect("order");
+        for _ in 0..4 {
+            session.input("O", &mut app, &texts).expect("order");
+        }
         let text = String::from_utf8(session.into_inner()).expect("UTF-8");
         assert!(
             text.contains("c: check whether the main route reaches"),
@@ -1339,6 +1467,43 @@ old.example
         assert!(written.contains("example.com"), "{written}");
         assert!(!written.contains("old.example"), "{written}");
     }
+
+    /// The same apply over a bound file this program has no record of
+    /// writing: the rules there are the user's, so they stay and the user is
+    /// asked, as after a hand edit.
+    #[test]
+    fn an_apply_keeps_a_bound_file_the_program_never_wrote() {
+        let dir = Scratch::new("apply-keeps-own-file");
+        let (mut app, sets) = rules_with_settings(&dir, one_rule());
+        let file = app.rules.settings_file.clone().expect("settings file");
+        let set = sets.join("mine");
+        std::fs::create_dir_all(&set).expect("set");
+        super::super::own_settings::bind_written_set(&file, &set, None).expect("bind");
+        let primary = set.join("rules_primary.txt");
+        let users = "--- Domains\nmine.example\n";
+        std::fs::write(&primary, users).expect("the user's own file");
+
+        super::super::finished(
+            &mut app,
+            super::super::apply::Finished::Applied { base: None },
+        );
+
+        assert_eq!(
+            std::fs::read_to_string(&primary).expect("bound file"),
+            users,
+            "the user's rules were overwritten"
+        );
+        assert!(
+            matches!(
+                &app.rules.mode,
+                super::super::Mode::Choice(super::super::Choice {
+                    purpose: super::super::ChoicePurpose::HandEdited(_),
+                    ..
+                })
+            ),
+            "the user is not asked"
+        );
+    }
 }
 
 /// `v`: a rule for a VPN's gateway, the window's "Other VPNs (corporate)".
@@ -1588,6 +1753,40 @@ mod several_rules {
         assert!(said.contains("Left in the form to fix: 1."), "{said}");
     }
 
+    /// A long paste goes in whole up to what the field holds; past it, it
+    /// stops at a whole line and says how many lines were left out.
+    #[test]
+    fn a_long_paste_is_never_cut_in_the_middle_of_a_line() {
+        let fake = service(Vec::new());
+        let mut app = on_rules(&fake);
+        answer(&mut app, &["A", "2"]);
+        let names: Vec<String> = (0..2000).map(|n| format!("news-{n:05}.example")).collect();
+        crate::full::handle_paste(&mut app, &names.join("\r\n"), &texts_en());
+        let Mode::Bulk(form) = &app.rules.mode else {
+            panic!("the several-rules form is open");
+        };
+        assert_eq!(form.text, names.join("\n"));
+        assert!(!note(&app).contains("did not fit"));
+
+        let max = super::super::bulk::TEXT_MAX;
+        let line = "x".repeat(1000);
+        let lines = max / 1001 + 10;
+        let long = vec![line.as_str(); lines].join("\n");
+        crate::full::handle_paste(&mut app, &format!("\n{long}"), &texts_en());
+        let Mode::Bulk(form) = &app.rules.mode else {
+            panic!("the several-rules form is open");
+        };
+        assert!(form.text.len() <= max);
+        assert!(
+            form.text.ends_with(&format!("\n{line}")),
+            "a whole line last"
+        );
+        let taken = form.text.lines().filter(|l| *l == line).count();
+        let said = note(&app);
+        assert!(said.contains(&(lines - taken).to_string()), "{said}");
+        assert!(said.contains("did not fit"), "{said}");
+    }
+
     /// One word asks for its type on its own row, and is added as that type.
     #[test]
     fn one_word_takes_the_type_the_user_picks() {
@@ -1787,6 +1986,48 @@ mod recent {
 
         // It is in the list now: a second time adds nothing.
         answer(&mut app, &["U 1"]);
+        assert_eq!(app.rules.table.rows.len(), count);
+    }
+
+    /// The put-back numbers stand on the list as shown: while it is read
+    /// again `U` waits, and a question open when a different list lands is
+    /// withdrawn rather than answered against the new numbers.
+    #[test]
+    fn u_never_puts_back_by_a_number_the_list_has_moved_under() {
+        let fake = with_recent(
+            vec![rule("r1", "domain", "old.example", "primary")],
+            changes(),
+        );
+        let mut app = on_rules(&fake);
+        answer(&mut app, &["R", "3"]);
+        drain(&mut app, &fake);
+        let count = app.rules.table.rows.len();
+
+        super::super::recent::refresh(&mut app);
+        answer(&mut app, &["U 1"]);
+        assert_eq!(app.rules.table.rows.len(), count, "nothing while reading");
+        assert!(
+            screen_text(&app, ScreenId::Rules).contains("being read again"),
+            "the user is told to wait"
+        );
+        drain(&mut app, &fake);
+
+        answer(&mut app, &["U"]);
+        assert!(matches!(app.rules.mode, Mode::Choice(_)));
+        let now = chrono::Utc::now().timestamp();
+        fake.answer(
+            IpcOperationName::RulesRecentChangesList,
+            json!({ "changes": [
+                { "kind": "deleted", "at": now - 10, "rule": entry("other.example", "primary") },
+                { "kind": "deleted", "at": now - 180, "rule": entry("gone.example", "primary") }
+            ] }),
+        );
+        super::super::recent::refresh(&mut app);
+        drain(&mut app, &fake);
+        assert!(
+            matches!(app.rules.mode, Mode::List),
+            "the question is withdrawn"
+        );
         assert_eq!(app.rules.table.rows.len(), count);
     }
 
@@ -2191,6 +2432,39 @@ mod file_merge {
         );
     }
 
+    /// The policy chosen in either client decides both passes; a confirming
+    /// pass under another policy would reopen what the first one settled.
+    #[test]
+    fn the_shared_merge_policy_rides_both_passes() {
+        let dir = Scratch::new("file-merge-policy");
+        let fake = rules();
+        let mut app = bound(&dir, &fake);
+        let file = app.rules.settings_file.clone().expect("bound");
+        crate::screens::rules::own_settings::set_merge_policy(
+            &file,
+            nrr_shared::merge_dto::MergePolicyDto::FileWins,
+        )
+        .expect("policy");
+        fake.answer(
+            IpcOperationName::RulesMergePreview,
+            preview(
+                vec![entry("only-file.example")],
+                vec![clash()],
+                "{\"merged\":1}",
+            ),
+        );
+        answer(&mut app, &["F"]);
+        drain(&mut app, &fake);
+        answer(&mut app, &["1", "y"]);
+        drain(&mut app, &fake);
+        let sent = fake.sent(IpcOperationName::RulesMergePreview);
+        assert_eq!(sent.len(), 2, "{sent:?}");
+        assert!(
+            sent.iter().all(|request| request["policy"] == "file-wins"),
+            "{sent:?}"
+        );
+    }
+
     /// The rows on screen are not what the merge applied: they are read back,
     /// and the bound files are written from that read, not from the old rows.
     #[test]
@@ -2198,7 +2472,10 @@ mod file_merge {
         let dir = Scratch::new("file-merge-applied");
         let fake = rules();
         let mut app = bound(&dir, &fake);
+        let primary = dir.path().join("rules_primary.txt");
+        // What `confirm` leaves: the merge was built from the file as it is.
         app.rules.reload_after_apply = true;
+        app.rules.merged_from = vec![(primary.clone(), FILE_TEXT.to_owned())];
         super::super::finished(
             &mut app,
             super::super::apply::Finished::Applied {
@@ -2208,8 +2485,53 @@ mod file_merge {
         drain(&mut app, &fake);
         assert_eq!(fake.sent(IpcOperationName::RulesList).len(), 2);
         assert!(!app.rules.reload_after_apply);
-        let written = std::fs::read_to_string(dir.path().join("rules_primary.txt")).expect("file");
+        let written = std::fs::read_to_string(&primary).expect("file");
         assert!(!written.contains("only-file.example"), "{written}");
+    }
+
+    /// The file changed between the merge and its apply: that change is the
+    /// user's, not part of what was merged, so following the rules in force
+    /// asks instead of writing over it.
+    #[test]
+    fn a_file_edited_after_the_merge_is_not_followed_over() {
+        let dir = Scratch::new("file-merge-edited-after");
+        let fake = rules();
+        let mut app = bound(&dir, &fake);
+        let primary = dir.path().join("rules_primary.txt");
+        app.rules.reload_after_apply = true;
+        app.rules.merged_from = vec![(primary.clone(), FILE_TEXT.to_owned())];
+        let later = "--- Domains\nonly-file.example\nshared.example\nadded-later.example\n";
+        std::fs::write(&primary, later).expect("an edit after the merge");
+        super::super::finished(
+            &mut app,
+            super::super::apply::Finished::Applied {
+                base: Some("rev-9".into()),
+            },
+        );
+        drain(&mut app, &fake);
+        assert_eq!(
+            std::fs::read_to_string(&primary).expect("file"),
+            later,
+            "the edit made after the merge was overwritten"
+        );
+    }
+
+    /// An apply that did not go through leaves the files the user's: nothing
+    /// of the merge is taken, and a later write still asks.
+    #[test]
+    fn a_failed_merge_apply_takes_nothing() {
+        let dir = Scratch::new("file-merge-failed");
+        let fake = rules();
+        let mut app = bound(&dir, &fake);
+        let primary = dir.path().join("rules_primary.txt");
+        app.rules.reload_after_apply = true;
+        app.rules.merged_from = vec![(primary.clone(), FILE_TEXT.to_owned())];
+        super::super::finished(&mut app, super::super::apply::Finished::Expired);
+        let settings = app.rules.settings_file.clone().expect("settings file");
+        assert!(
+            super::super::own_settings::hand_edited(&settings, &primary),
+            "a merge that never applied made the file the program's"
+        );
     }
 
     fn nothing_to_show() -> Value {

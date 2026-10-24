@@ -3,6 +3,10 @@
 
 use super::*;
 
+/// The exit code of a process the hang watchdog ended. Any non-zero exit
+/// without a `Stopped` report is a crash to SCM, which runs its recovery.
+const HUNG_SERVICE_EXIT_CODE: i32 = 3;
+
 /// Build the production dependency bundle that `run_supervised_runtime`
 /// needs. Both SCM mode and console mode call this with the same
 /// artifacts; the only thing they differ on is the
@@ -65,6 +69,36 @@ pub(crate) fn build_supervised_runtime_deps(
     let task_liveness =
         Arc::new(TaskLiveness::new(Arc::clone(&health_agg)).with_event_bus(Arc::clone(&event_bus)));
     nrr_service_runtime::override_recheck::report_to(Arc::clone(&task_liveness));
+    // A wedged resolver or pass otherwise leaves the OS resolving through a
+    // listener that never answers, with the service "running". The redirect
+    // goes first and needs none of the service's locks; the exit is a crash to
+    // SCM, whose recovery starts the service again. The acceptor waits for a
+    // client inside its tick, so the watchdog pokes the pipe once per look and
+    // a tick that still does not end is the hang.
+    let accept_watch = task_liveness.tick_watch(
+        nrr_service_runtime::service_tasks::ServiceTaskKind::IpcAcceptLoop,
+        "accept",
+        nrr_service_runtime::task_liveness::ACCEPT_TICK_DEADLINE,
+    );
+    let self_poke = Arc::new(crate::named_pipe_server::SelfPoke::service_pipe());
+    if let Err(e) = nrr_service_runtime::task_liveness::spawn_hang_watchdog(
+        Arc::clone(&task_liveness),
+        Some(Arc::new(move || self_poke.poke())),
+        Arc::new(|_task: &str, _seen: std::time::Duration| {
+            let _ = nrr_platform_windows::dns_redirect::sweep_orphan_dns_state(
+                &nrr_platform_windows::dns_redirect::TransactedNrptStore,
+                &nrr_platform_windows::dns_redirect::WindowsSearchList,
+            );
+            std::process::exit(HUNG_SERVICE_EXIT_CODE);
+        }),
+    ) {
+        tracing::warn!(
+            target: "nrr::supervisor",
+            msg_key = "svc-hang-watchdog-spawn-failed",
+            error = %e,
+            "hang watchdog could not start; a wedged resolver or pass is reported in health only",
+        );
+    }
 
     // Drained by the resume watchdog; filled by whoever notices a binding worth
     // re-resolving (today the fail-closed posture heartbeat).
@@ -75,7 +109,10 @@ pub(crate) fn build_supervised_runtime_deps(
     // first component log is silent, so a boot that stops answering inside this
     // function is otherwise indistinguishable from one that stopped at its door.
     tracing::info!(target: "nrr::boot", msg_key = "svc-boot-stage-entered", stage = "open-state-db", "boot stage entered");
-    let settings_conn = open_settings_connection(&artifacts.topology.state_db_path);
+    // Never behind bootstrap's back: a blocked boot leaves the store alone.
+    let settings_conn = artifacts
+        .usable_state_db()
+        .and_then(open_settings_connection);
 
     // User-configurable FQDN cache refresh cadence (Settings →
     // service-stability). Read once at startup; it becomes the refresh FLOOR
@@ -442,7 +479,8 @@ pub(crate) fn build_supervised_runtime_deps(
             audit,
             Arc::clone(&sid_registry),
         )
-        .with_event_bus(Arc::clone(&event_bus)),
+        .with_event_bus(Arc::clone(&event_bus))
+        .with_accept_watch(accept_watch),
     );
 
     // ── Adapter monitor ─────────────────────────────────────────────────
@@ -940,12 +978,20 @@ pub(crate) fn build_supervised_runtime_deps(
                             stop_plan, within_deadline, FilterTeardown, LifecycleInputs,
                             RouteTeardown, FILTER_TEARDOWN_DEADLINE,
                         };
+                        // A wedged holder of either lock must not hold the stop.
+                        const STOP_PLAN_READ_WAIT: std::time::Duration =
+                            std::time::Duration::from_secs(2);
+                        const ROUTE_PASS_WAIT: std::time::Duration =
+                            std::time::Duration::from_secs(10);
                         let reason = nrr_service_runtime::lifecycle::teardown_reason();
                         let plan = stop_plan(
                             reason,
                             LifecycleInputs {
                                 leak_guard_armed: super::offline_reset::leak_guard_armed_anywhere(),
-                                keep_rule_routes_on_stop: read_routing_stop_persist(&conn),
+                                keep_rule_routes_on_stop: read_routing_stop_persist(
+                                    &conn,
+                                    STOP_PLAN_READ_WAIT,
+                                ),
                             },
                         );
                         if plan.routes == RouteTeardown::Keep
@@ -955,7 +1001,7 @@ pub(crate) fn build_supervised_runtime_deps(
                                 target: "nrr::lifecycle",
                                 msg_key = "svc-boot-teardown-kept-for-shutdown",
                                 reason = ?reason,
-                                "machine shutting down — filters and routes stay in force until the end; nothing of ours survives the power-off",
+                                "filters and routes stay in force through this stop: the machine is going down, or a new version takes over",
                             );
                             return;
                         }
@@ -987,7 +1033,7 @@ pub(crate) fn build_supervised_runtime_deps(
                             // Keep the /32 rule-routes on the VPN, remove NRR's
                             // overlays.
                             RouteTeardown::KeepRuleRoutes => {
-                                match coord.teardown_keep_rule_routes() {
+                                match coord.teardown_keep_rule_routes_within(ROUTE_PASS_WAIT) {
                                     Ok(delta) => tracing::info!(
                                         target: "nrr::route-coordinator",
                                         msg_key = "svc-boot-teardown-persist-routes",
@@ -1002,19 +1048,21 @@ pub(crate) fn build_supervised_runtime_deps(
                                     ),
                                 }
                             }
-                            RouteTeardown::RemoveAll => match coord.teardown() {
-                                Ok(_) => tracing::info!(
-                                    target: "nrr::route-coordinator",
-                                    msg_key = "svc-boot-teardown-full-restore",
-                                    "service stopping — all NRR routes torn down (routing restored to pristine)",
-                                ),
-                                Err(e) => tracing::warn!(
-                                    target: "nrr::route-coordinator",
-                                    msg_key = "svc-boot-teardown-full-failed",
-                                    error = %e,
-                                    "route teardown on shutdown failed",
-                                ),
-                            },
+                            RouteTeardown::RemoveAll => {
+                                match coord.teardown_within(ROUTE_PASS_WAIT) {
+                                    Ok(_) => tracing::info!(
+                                        target: "nrr::route-coordinator",
+                                        msg_key = "svc-boot-teardown-full-restore",
+                                        "service stopping — all NRR routes torn down (routing restored to pristine)",
+                                    ),
+                                    Err(e) => tracing::warn!(
+                                        target: "nrr::route-coordinator",
+                                        msg_key = "svc-boot-teardown-full-failed",
+                                        error = %e,
+                                        "route teardown on shutdown failed",
+                                    ),
+                                }
+                            }
                         }
                         if plan.filters != FilterTeardown::RemoveAll {
                             return;
@@ -1213,6 +1261,18 @@ pub(crate) fn build_supervised_runtime_deps(
                 }
             }) as VpnClientAppPersistFn
         });
+    // Asked only for a connection whose owner could not be read.
+    let several_served: nrr_service_runtime::conn_observation_consumer::SeveralServedFn = {
+        let registry = Arc::clone(&sid_registry);
+        let coord = route_coordinator.clone();
+        Arc::new(move || {
+            let active = registry.active_sids();
+            match coord.as_ref() {
+                Some(c) => c.served_sids(&active).len() > 1,
+                None => active.len() > 1,
+            }
+        })
+    };
     let (conn_observation_source, conn_observation_consumer, conn_observer_shutdown) =
         build_conn_trace_pair(
         &api,
@@ -1269,6 +1329,7 @@ pub(crate) fn build_supervised_runtime_deps(
                     FreshnessThresholds::default_production(),
                 )) as Arc<dyn FqdnCacheLookup>
             }),
+            several_served: Arc::clone(&several_served),
         },
         VpnLearningDeps {
             killswitch_drop_registry: &killswitch_drop_registry,
@@ -1290,9 +1351,11 @@ pub(crate) fn build_supervised_runtime_deps(
     }
     if let Some(dns_consumer) = dns_observation_consumer.as_ref() {
         let companion = match (auto_rules_engine.as_ref(), active_routing_sid.as_ref()) {
-            (Some(engine), Some(active_sid)) => {
-                Some(CompanionFromReverseDeps { engine, active_sid })
-            }
+            (Some(engine), Some(active_sid)) => Some(CompanionFromReverseDeps {
+                engine,
+                active_sid,
+                several_served: Arc::clone(&several_served),
+            }),
             _ => None,
         };
         spawn_fcrdns_learner_worker(
@@ -1496,6 +1559,7 @@ pub(crate) fn build_supervised_runtime_deps(
         auto_rules_engine.as_ref(),
         Arc::clone(&served_principals),
         Arc::clone(&task_liveness),
+        pause_coordinator.as_ref().map(|c| c.paused_view()),
     ) {
         fake_ip_controller.set_factory(stack_factory);
         true
@@ -1646,6 +1710,7 @@ pub(crate) fn build_supervised_runtime_deps(
             .as_ref()
             .map(|ring| Arc::clone(ring.outage_blocks())),
         Arc::clone(&task_liveness),
+        pause_coordinator.as_ref().map(|c| c.paused_view()),
     ) {
         dns_resolver_controller.set_factory(factory);
         dns_resolver_controller.set_sign_in_probe(resolver_may_arm);
@@ -1876,6 +1941,13 @@ pub(crate) fn build_supervised_runtime_deps(
             Arc::new(move || controller.shutdown())
         }),
         conn_observer_shutdown,
+        dns_redirect_release: Some(Arc::new(|| {
+            nrr_platform_windows::dns_redirect::sweep_orphan_dns_state(
+                &nrr_platform_windows::dns_redirect::TransactedNrptStore,
+                &nrr_platform_windows::dns_redirect::WindowsSearchList,
+            )
+            .is_clean()
+        })),
         rebind_requests: Some(rebind_requests),
         secondary_liveness_hook,
         secondary_external_address,

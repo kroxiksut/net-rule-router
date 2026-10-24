@@ -44,12 +44,16 @@ set(NRR_HOST_SOURCES
 # The PE resource script carries the icon and the version block, from the
 # template every Windows executable shares. A `.rc` has no compiler on Linux,
 # where the icon comes from the desktop entry the packaging step installs.
-# build.rs passes the cargo package version.
+# build.rs passes the cargo package version, and its four numbers with the
+# pre-release in the last.
 set(NRR_VERSION "0.0.0" CACHE STRING "Product version stamped into the executable")
+set(NRR_VERSION_COMMAS "" CACHE STRING "The four numbers of the version block")
 if(WIN32)
     set(APP_ICON_PATH "${CMAKE_CURRENT_SOURCE_DIR}/../../../../assets/icons/app/app.ico")
-    string(REGEX MATCH "^([0-9]+)\\.([0-9]+)\\.([0-9]+)" _nrr_version_core "${NRR_VERSION}")
-    set(NRR_VERSION_COMMAS "${CMAKE_MATCH_1},${CMAKE_MATCH_2},${CMAKE_MATCH_3},0")
+    if(NRR_VERSION_COMMAS STREQUAL "")
+        string(REGEX MATCH "^([0-9]+)\\.([0-9]+)\\.([0-9]+)" _nrr_version_core "${NRR_VERSION}")
+        set(NRR_VERSION_COMMAS "${CMAKE_MATCH_1},${CMAKE_MATCH_2},${CMAKE_MATCH_3},0")
+    endif()
     set(NRR_FILE_DESCRIPTION "NetRuleRouter (interface)")
     set(NRR_ORIGINAL_FILENAME "nrr_qt_native_host.exe")
     configure_file(

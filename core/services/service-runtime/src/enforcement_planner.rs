@@ -425,8 +425,14 @@ pub fn plan_route_rules_with_shapes(
                         flows.push(program_flow(base_ordinal + k as u32, vec![path]));
                     }
                 }
-                // Observed-destination /32s (slots APP_PATH_FANOUT_CAP+1+i) —
-                // ordinary host flows, so `coverage` (mirror for Block) applies.
+                // A program deny is its program flows and nothing wider: an
+                // observed-address block carries no program and would drop a
+                // shared address for every program of the user.
+                if rule.action == RuleAction::Block {
+                    continue;
+                }
+                // Observed-destination /32s (slots APP_PATH_FANOUT_CAP+1+i),
+                // ordinary host flows.
                 let destinations = gate.admit(pattern, link);
                 for (ip, refusal) in &destinations.refused {
                     // Only the address-rule claim is the user's own two rules
@@ -561,21 +567,31 @@ pub enum Ipv6Guard {
     /// destination keeps the family, which the blanket family cut never
     /// allowed.
     FiltersOnly,
-    /// The additional link carries IPv6: a rule host's v6 addresses ride it,
-    /// pinned and routed exactly as its v4 ones are.
+    /// The additional link has an IPv6 address and a way out for the family: a
+    /// rule host's v6 addresses ride it, pinned and routed exactly as its v4
+    /// ones are.
     FiltersAndRoutes,
 }
 
 impl Ipv6Guard {
     /// Derive the disposition from this pass's links. `secondary` is the
     /// additional link as the machine reports it now — `None` when it is
-    /// unbound or currently absent.
+    /// unbound or currently absent. An address alone does not carry the
+    /// family: a tunnel numbered `fd00::2` whose client routes only IPv4 would
+    /// get its rule hosts' AAAA answered and no route to send them.
     #[must_use]
     pub fn from_links(
         adapters: &[nrr_platform_api::adapters::AdapterInfo],
         secondary: Option<&nrr_platform_api::adapters::AdapterInfo>,
+        routes: &[nrr_platform_api::RouteEntry],
     ) -> Self {
-        if secondary.is_some_and(link_carries_ipv6) {
+        if secondary.is_some_and(|link| {
+            link_carries_ipv6(link)
+                && nrr_platform_api::interface_rows::derive_forwarding_next_hop_v6(
+                    routes, link.index,
+                )
+                .is_some()
+        }) {
             Self::FiltersAndRoutes
         } else if ipv6_policy_possible(adapters) {
             // Some OTHER link can carry the family — including one the user

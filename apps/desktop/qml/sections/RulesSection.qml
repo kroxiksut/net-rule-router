@@ -732,6 +732,14 @@ ColumnLayout {
     property var selectedRowIds: ({})
     property int selectedCount: 0
 
+    /// Open the selected rule for editing, from the keyboard or a double click.
+    function _editSelectedRule() {
+        if (root.selectedRule < 0 || section.rulesLocked) return
+        root.editingRule = root.selectedRule
+        root.ruleDialog.resetForEdit()
+        root.ruleDialog.open()
+    }
+
     function _ruleKeyAt(masterIndex) {
         if (masterIndex < 0 || !root.rulesModel || masterIndex >= root.rulesModel.count) return ""
         return Rules.mergeKey(root.rulesModel.get(masterIndex))
@@ -897,65 +905,21 @@ ColumnLayout {
             "{n} rule(s) deleted.").replace("{n}", String(indices.length))
     }
 
+    // The decisions live in `rules.js`, shared with the terminal client.
     function passesFilter(item) {
         if (!item) return false
-        if (filterEnabled === "enabled-only" && !item.enabled) return false
-        if (filterEnabled === "disabled-only" && item.enabled) return false
-        if (filterEnabled === "overridden" && section.overrideFor(item) === null) return false
-        if (filterEnabled === "with-errors") {
-            // Rule is "with errors" iff the backend validator marked the
-            // match value as invalid (status === "error"). Warnings don't
-            // disable the rule, so they're not counted here.
-            if (String(item.validationStatus || "valid") !== "error") return false
-        }
-        if (filterType !== "all" && Rules.canonicalRuleTypeSlug(item.ruleType) !== filterType) return false
-        if (filterRoute === "unsure") {
-            if (!Rules.rowIsVerify(item)) return false
-        } else if (filterRoute !== "all" && String(item.targetRoute || "") !== filterRoute) {
-            return false
-        }
-        if (filterAutoAddedOnly && String(item.originReason || "") === "") return false
-        if (filterRecent && !section.recentByKey[Rules.ruleValueKey(item)]) return false
-        if (searchText !== "") {
-            // The needle is normalized like a rule value too, for URL-shaped
-            // text without a scheme (`site.com/page`), which the search box
-            // leaves as typed.
-            var typed = String(searchText).trim().toLowerCase()
-            var needle = String(Rules.normalizeHostInput("domain", typed))
-            // Bare punctuation (`/`) normalizes to nothing, which would match all.
-            if (needle === "") needle = typed
-            // Search across both the Unicode value the
-            // user typed and its precomputed lowercase ACE form, so
-            // typing `xn--p1ai` finds `рф` and vice versa. Rows from
-            // before this field existed degrade to empty string.
-            var hay = (String(item.matchValue || "") + " "
-                + String(item.aceMatchValue || "") + " "
-                + String(item.comment || "")).toLowerCase()
-            // The text as typed too: a subnet's `/` and an IPv6 address's
-            // `:` read as URL punctuation to the host normalizer above.
-            if (hay.indexOf(needle) < 0 && hay.indexOf(typed) < 0) return false
-        }
-        return true
+        return Rules.rulePassesFilters(item, {
+            status: section.filterEnabled,
+            type: section.filterType,
+            route: section.filterRoute,
+            autoOnly: section.filterAutoAddedOnly,
+            recentOnly: section.filterRecent,
+            search: section.searchText
+        }, function () { return section.overrideFor(item) !== null },
+           function () { return !!section.recentByKey[Rules.ruleValueKey(item)] })
     }
     function compareRules(a, b) {
-        if (!a || !b) return 0
-        var cmp = 0
-        if (sortBy === "by-match-value") {
-            cmp = String(a.matchValue || "").localeCompare(String(b.matchValue || ""))
-        } else if (sortBy === "by-type") {
-            cmp = String(a.ruleType || "").localeCompare(String(b.ruleType || ""))
-            if (cmp === 0) cmp = String(a.matchValue || "").localeCompare(String(b.matchValue || ""))
-        } else if (sortBy === "by-route") {
-            cmp = String(a.targetRoute || "").localeCompare(String(b.targetRoute || ""))
-            if (cmp === 0) cmp = String(a.matchValue || "").localeCompare(String(b.matchValue || ""))
-        } else if (sortBy === "by-main-route") {
-            cmp = Rules.mainRouteRank(a.mainRoute) - Rules.mainRouteRank(b.mainRoute)
-            if (cmp === 0) cmp = String(a.matchValue || "").localeCompare(String(b.matchValue || ""))
-        } else {
-            // display-order: rule ids encode insertion order
-            cmp = String(a.id || "").localeCompare(String(b.id || ""))
-        }
-        return sortDir === "desc" ? -cmp : cmp
+        return Rules.compareRuleRows(a, b, section.sortBy, section.sortDir)
     }
     // Sorting now happens inside `rebuildDisplay()` (it sorts the
     // filtered snapshot with `compareRules` before populating `displayModel`).
@@ -1399,6 +1363,11 @@ ColumnLayout {
             }
             ThemedComboBox {
                 id: bundledPresetCombo
+                accessibleLabel: root.uiRevision >= 0
+                    ? (section._userPresetsActive
+                        ? root.tr("rules.bundled-preset.user-label", "My rule set:")
+                        : root.tr("rules.bundled-preset.label", "Bundled preset:"))
+                    : ""
                 theme: root.uiTheme
                 Layout.fillWidth: true
                 Layout.maximumWidth: 380
@@ -2321,6 +2290,7 @@ ColumnLayout {
             asynchronous: true
         }
         ThemedTextField {
+            accessibleLabel: root.uiRevision >= 0 ? root.tr("action.search", "Search") : ""
             theme: root.uiTheme
             Layout.fillWidth: true
             placeholderText: root.uiRevision >= 0
@@ -2385,9 +2355,10 @@ ColumnLayout {
         }
         ThemedComboBox {
             id: sortCombo
+            accessibleLabel: root.uiRevision >= 0 ? root.tr("rules.sort.label", "Sort") : ""
             theme: root.uiTheme
             implicitWidth: 220
-            model: [ "by-display-order", "by-match-value", "by-type", "by-route", "by-main-route" ]
+            model: Rules.RULES_SORT_COLUMNS
             function sortLabel(id) { return root.tr("rules.sort." + id, id) }
             labelResolver: function(item) { return sortCombo.sortLabel(item) }
             currentIndex: Pure.optionIndexByValue(model, "by-display-order", 0)
@@ -2427,9 +2398,10 @@ ColumnLayout {
         }
         ThemedComboBox {
             id: enabledFilterCombo
+            accessibleLabel: root.uiRevision >= 0 ? root.tr("rules.filter.enabled.label", "Status") : ""
             theme: root.uiTheme
             implicitWidth: 220
-            model: [ "all", "enabled-only", "disabled-only", "with-errors", "overridden" ]
+            model: Rules.RULES_STATUS_FILTERS
             function statusLabel(id) { return root.tr("rules.filter.enabled." + id, id) }
             labelResolver: function(item) { return enabledFilterCombo.statusLabel(item) }
             currentIndex: 0
@@ -2458,9 +2430,10 @@ ColumnLayout {
         }
         ThemedComboBox {
             id: typeFilterCombo
+            accessibleLabel: root.uiRevision >= 0 ? root.tr("rules.filter.type.label", "Type") : ""
             theme: root.uiTheme
             implicitWidth: 200
-            model: [ "all", "zone", "domain", "exact-ip", "ip-range", "subnet", "application" ]
+            model: Rules.RULES_TYPE_FILTERS
             function typeLabel(id) {
                 if (id === "all") return root.tr("rules.filter.type.all", "All types")
                 return root.tr("rules.filter.type." + id, root.tr("rules.type." + id, id))
@@ -2493,9 +2466,10 @@ ColumnLayout {
         }
         ThemedComboBox {
             id: routeFilterCombo
+            accessibleLabel: root.uiRevision >= 0 ? root.tr("rules.filter.route.label", "Route") : ""
             theme: root.uiTheme
             implicitWidth: 200
-            model: [ "all", "primary", "secondary", "block", "unsure" ]
+            model: Rules.RULES_ROUTE_FILTERS
             function routeLabelFor(id) {
                 if (id === "all") return root.tr("rules.filter.route.all", "All routes")
                 if (id === "unsure") return root.tr("rules.filter.route.unsure", "Unsure (?)")
@@ -2829,6 +2803,9 @@ ColumnLayout {
                     return Qt.Unchecked
                 }
                 onClicked: section._toggleSelectAllVisible()
+                Accessible.name: root.uiRevision >= 0
+                    ? root.tr("action.select-all", "Select all") : ""
+                Accessible.description: ToolTip.text
                 ToolTip.visible: hovered
                 ToolTip.delay: 400
                 ToolTip.text: root.tr("rules.column.select-tooltip",
@@ -3034,6 +3011,19 @@ ColumnLayout {
         // screenful above/below realised so scrolling doesn't thrash.
         reuseItems: true
         cacheBuffer: 600
+        // The keyboard reaches a rule as the mouse does: Tab into the list,
+        // arrows move the selection, Enter opens the rule for editing.
+        activeFocusOnTab: true
+        keyNavigationEnabled: true
+        currentIndex: -1
+        Accessible.role: Accessible.List
+        Accessible.name: root.tr("rules.nav.list", "Rules list")
+        onCurrentIndexChanged: {
+            if (currentIndex >= 0 && currentIndex < displayModel.count)
+                root.selectedRule = displayModel.get(currentIndex).masterIndex
+        }
+        Keys.onReturnPressed: section._editSelectedRule()
+        Keys.onEnterPressed: section._editSelectedRule()
         // Vertical scrollbar pinned to the VIEWPORT's right edge.
         // The ListView width == table contentWidth (wider than the
         // viewport when columns are widened), so the attached bar normally sits
@@ -3118,13 +3108,14 @@ ColumnLayout {
             MouseArea {
                 anchors.fill: parent
                 acceptedButtons: Qt.LeftButton
-                onClicked: root.selectedRule = model.masterIndex
+                onClicked: {
+                    root.selectedRule = model.masterIndex
+                    rulesListView.currentIndex = index
+                }
                 onDoubleClicked: {
                     root.selectedRule = model.masterIndex
-                    if (section.rulesLocked) return
-                    root.editingRule = root.selectedRule
-                    root.ruleDialog.resetForEdit()
-                    root.ruleDialog.open()
+                    rulesListView.currentIndex = index
+                    section._editSelectedRule()
                 }
             }
             ColumnLayout {
@@ -3145,6 +3136,7 @@ ColumnLayout {
                         Layout.alignment: Qt.AlignVCenter
                         checked: ruleDelegate.isSelectedForBulk
                         onToggled: section._setRowSelected(model.masterIndex, checked)
+                        Accessible.name: ToolTip.text + ": " + Pure.displayText(model.matchValue)
                         ToolTip.visible: hovered
                         ToolTip.delay: 400
                         ToolTip.text: root.tr("rules.action.select-row",
@@ -3290,6 +3282,10 @@ ColumnLayout {
                             section._setRuleEnabledAt(model.masterIndex, checked)
                             displayModel.setProperty(index, "enabled", checked)
                         }
+                        Accessible.name: (root.uiRevision >= 0
+                            ? root.tr("rules.column.enabled", "On") : "")
+                            + ": " + Pure.displayText(model.matchValue)
+                        Accessible.description: ToolTip.text
                         ToolTip.visible: hovered
                         ToolTip.delay: 400
                         ToolTip.text: checked

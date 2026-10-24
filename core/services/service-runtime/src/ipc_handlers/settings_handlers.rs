@@ -774,8 +774,17 @@ impl CheckedIpcHandler for RoutingPauseToggleHandler {
         request: &IpcRequestEnvelope,
         ctx: &IpcRequestContext,
     ) -> Result<Self::Checked, IpcError> {
-        let req = decode("routing.pause.toggle", request)?;
+        let req: RoutingPauseToggleRequest = decode("routing.pause.toggle", request)?;
         require_sid("routing.pause.toggle", ctx)?;
+        if let Some(reason) = req.reason.as_deref() {
+            if !pause_reason_acceptable(reason) {
+                return Err(IpcError {
+                    code: IpcErrorCode::MalformedRequest,
+                    message: "routing.pause.toggle reason too long or not printable".to_owned(),
+                    diagnostics_id: None,
+                });
+            }
+        }
         Ok(req)
     }
 
@@ -795,6 +804,15 @@ impl CheckedIpcHandler for RoutingPauseToggleHandler {
             Err(e) => Err(map_settings_write_error(e)),
         }
     }
+}
+
+/// The stored row and the audit line quote the reason; every snapshot repeats it.
+fn pause_reason_acceptable(reason: &str) -> bool {
+    reason
+        .chars()
+        .nth(nrr_shared::ipc_payloads::ROUTING_PAUSE_REASON_MAX_CHARS)
+        .is_none()
+        && !reason.chars().any(char::is_control)
 }
 
 // ── Autostart ────────────────────────────────────────────────────────────────
@@ -1361,6 +1379,40 @@ mod tests {
         let parsed: RoutingPauseDto = serde_json::from_value(value).unwrap();
         assert!(parsed.paused);
         assert_eq!(parsed.pause_reason.as_deref(), Some("user request"));
+    }
+
+    #[test]
+    fn a_pause_reason_too_long_or_with_control_characters_is_refused_before_any_write() {
+        let w = Arc::new(FakePauseWriter {
+            last: Mutex::new(None),
+        });
+        let h = RoutingPauseToggleHandler::new(w.clone());
+        let longest = "\u{44f}".repeat(nrr_shared::ipc_payloads::ROUTING_PAUSE_REASON_MAX_CHARS);
+        for bad in [
+            format!("{longest}x"),
+            "line\nbreak".to_owned(),
+            "a".repeat(4096),
+        ] {
+            let err = h
+                .precheck(
+                    &req(
+                        IpcOperationName::RoutingPauseToggle,
+                        serde_json::json!({"paused": true, "reason": bad}),
+                    ),
+                    &plain_ctx("S-A"),
+                )
+                .expect_err("refused");
+            assert_eq!(err.code, IpcErrorCode::MalformedRequest);
+        }
+        assert!(w.last.lock().unwrap().is_none(), "nothing stored");
+        h.precheck(
+            &req(
+                IpcOperationName::RoutingPauseToggle,
+                serde_json::json!({"paused": true, "reason": longest}),
+            ),
+            &plain_ctx("S-A"),
+        )
+        .expect("the limit itself is accepted, counted in characters");
     }
 
     // ── Autostart ────────────────────────────────────────────────────────────

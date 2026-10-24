@@ -122,10 +122,12 @@ pub const COUNTER_OVERLAY: [(Ipv4Addr, u8); 4] = [
 /// prefixes: each `P/N` the tunnel installs is answered by its two `/(N+1)`
 /// halves via the primary — one bit longer, so longest-prefix picks the
 /// primary regardless of metric, and nothing the tunnel installed is
-/// touched. A `/1` pair yields exactly the classic four `/2`s; an empty list
-/// (the tunnel's catch-alls are not visible, or were stripped) falls back to
-/// them as well. Rule `/32`s stay longer than anything here, so they keep
-/// riding the tunnel. Deduplicated and sorted for a stable reconcile.
+/// touched. A `/1` pair yields exactly the classic four `/2`s. A tunnel that
+/// takes nothing gets nothing: four `/2`s against no catch-all would carry the
+/// rest past whatever full tunnel of another client the OS table routes it
+/// to. A table that could not be read is read as [`ASSUMED_CATCH_ALLS`]. Rule
+/// `/32`s stay longer than anything here, so they keep riding the tunnel.
+/// Deduplicated and sorted for a stable reconcile.
 /// Prefixes narrower than [`TUNNEL_CATCH_ALL_MAX_PREFIX`] are not answered, so
 /// every half stays a length [`is_owned_shape`] recognises.
 pub fn counter_overlay_for(tunnel_catch_alls: &[(Ipv4Addr, u8)]) -> Vec<(Ipv4Addr, u8)> {
@@ -141,13 +143,17 @@ pub fn counter_overlay_for(tunnel_catch_alls: &[(Ipv4Addr, u8)]) -> Vec<(Ipv4Add
             ]
         })
         .collect();
-    if halves.is_empty() {
-        return COUNTER_OVERLAY.to_vec();
-    }
     halves.sort_unstable_by_key(|&(d, n)| (u32::from(d), n));
     halves.dedup();
     halves
 }
+
+/// What the bound tunnel is taken to install when the route table could not
+/// be read: the classic redirect pair, which the classic `/2`s answer.
+pub const ASSUMED_CATCH_ALLS: [(Ipv4Addr, u8); 2] = [
+    (Ipv4Addr::new(0, 0, 0, 0), 1),
+    (Ipv4Addr::new(128, 0, 0, 0), 1),
+];
 
 fn prefix_mask(n: u8) -> u32 {
     if n == 0 {
@@ -160,7 +166,10 @@ fn prefix_mask(n: u8) -> u32 {
 /// The on-link and peer routes a tunnel client installs to steer the internet
 /// into itself — the set [`counter_overlay_for`] has to out-specific. Wide
 /// unicast prefixes on `ifindex` only: host routes are the tunnel's own
-/// address, and the multicast block is on every interface.
+/// address, and the multicast block is on every interface. A private range
+/// (`10.0.0.0/8` from a corporate tunnel, its own `100.64.0.0/10`) is the
+/// network the tunnel exists to reach, not the internet: answered via the
+/// primary, its hosts no rule names became unreachable.
 pub fn tunnel_catch_all_prefixes(routes: &[RouteEntry], ifindex: u32) -> Vec<(Ipv4Addr, u8)> {
     let mut out: Vec<(Ipv4Addr, u8)> = routes
         .iter()
@@ -175,6 +184,8 @@ pub fn tunnel_catch_all_prefixes(routes: &[RouteEntry], ifindex: u32) -> Vec<(Ip
                 && !r.is_ours
                 && r.prefix_length <= TUNNEL_CATCH_ALL_MAX_PREFIX
                 && d.octets()[0] < 224
+                && !nrr_shared::ip_block::IpBlock::new(IpAddr::V4(*d), r.prefix_length)
+                    .is_some_and(nrr_domain::ip_network_policy::is_private)
         })
         .map(|(r, d)| (d, r.prefix_length))
         .collect();

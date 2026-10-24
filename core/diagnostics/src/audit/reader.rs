@@ -650,17 +650,17 @@ impl AuditReader {
 /// What the SERVICE did on its own behalf, and events with no actor at all,
 /// are facts about the machine and visible to everyone. Everything else belongs
 /// to whoever performed it. A service event that names one principal in its
-/// payload (`sid`) is about that principal, not the machine.
+/// payload (`sid`), or that the service filed under a user's `actor_id_hash`,
+/// is about that user, not the machine.
 fn event_is_visible_to(
     event: &AuditEvent,
     my_actor_hash: Option<&str>,
     my_principal: Option<&str>,
 ) -> bool {
     if event.actor_kind == crate::audit::ActorKind::Service.as_str() {
-        return match named_principal(event) {
-            Some(named) => my_principal == Some(named.as_str()),
-            None => true,
-        };
+        if let Some(named) = named_principal(event) {
+            return my_principal == Some(named.as_str());
+        }
     }
     match (event.actor_id_hash.as_deref(), my_actor_hash) {
         (None, _) => true,
@@ -669,11 +669,20 @@ fn event_is_visible_to(
     }
 }
 
-/// The principal an event's payload names, if it names one.
+/// The principal an event's payload names, if it names one. `principal` is
+/// how lines written before `sid` became the one field named the user; the
+/// chain keeps them as written, so they are read as they are.
 fn named_principal(event: &AuditEvent) -> Option<String> {
     let payload = event.payload_summary_json.as_deref()?;
     let value: serde_json::Value = serde_json::from_str(payload).ok()?;
-    value.get("sid")?.as_str().map(str::to_owned)
+    if let Some(sid) = value.get("sid") {
+        return sid.as_str().map(str::to_owned);
+    }
+    value
+        .get("principal")?
+        .as_str()
+        .filter(|p| *p != nrr_domain::user_principal::BASELINE_PRINCIPAL)
+        .map(str::to_owned)
 }
 
 fn list_audit_files(dir: &Path) -> Vec<PathBuf> {
@@ -982,6 +991,42 @@ mod tests {
         assert_eq!(
             ids(&DiagnosticsAudience::Principal("S-1-5-21-mine".into())),
             ["about-mine", "machine"]
+        );
+        assert_eq!(ids(&DiagnosticsAudience::Machine).len(), 3);
+    }
+
+    /// The end of a user's confirmed override is filed by the service under
+    /// that user's actor hash with the rule's program path in the payload;
+    /// the hash scopes it as it scopes a user's own actions.
+    #[test]
+    fn a_service_event_filed_under_a_users_hash_is_that_users() {
+        let dir = tempfile::tempdir().expect("temp");
+        let writer = AuditWriter::open(AuditWriterConfig::new(dir.path()));
+        write_actor_event(
+            &writer,
+            "ended-mine",
+            ActorKind::Service,
+            Some("S-1-5-21-mine"),
+        );
+        write_actor_event(
+            &writer,
+            "ended-theirs",
+            ActorKind::Service,
+            Some("S-1-5-21-theirs"),
+        );
+        write_actor_event(&writer, "machine", ActorKind::Service, None);
+        drop(writer);
+        let reader = AuditReader::new(dir.path());
+        let ids = |audience: &DiagnosticsAudience| -> Vec<String> {
+            reader
+                .scan(&AuditQueryFilter::new(), audience)
+                .into_iter()
+                .map(|e| e.event_id)
+                .collect()
+        };
+        assert_eq!(
+            ids(&DiagnosticsAudience::Principal("S-1-5-21-mine".into())),
+            ["ended-mine", "machine"]
         );
         assert_eq!(ids(&DiagnosticsAudience::Machine).len(), 3);
     }

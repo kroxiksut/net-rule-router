@@ -544,7 +544,7 @@ impl AutoRulesEngine {
         // A host the main link carries has nothing to move. Checked BEFORE
         // parking, not only before the popup: an offer sitting in the inbox for
         // a site that works is the same false statement, made quietly.
-        let behavior = self.main_link_behavior(&host);
+        let behavior = self.main_link_behavior(sid, &host);
         if behavior == PrimaryBehavior::Responds {
             tracing::debug!(
                 target: "nrr::auto-rules",

@@ -131,6 +131,13 @@ const DELIBERATE_STOP_MARKER: &str = "deliberate-stop";
 /// silence a later unasked one.
 const DELIBERATE_STOP_FRESHNESS: Duration = Duration::from_secs(120);
 
+/// Beside the deliberate-stop marker: the stop is an installer's, which starts
+/// the service again on new files, so the stop leaves protection in place for
+/// the new instance. Administrators only, like the other marker: anyone else
+/// could make a stop keep its blocks. `scripts/lib/service-paths.ps1` writes
+/// the same file.
+const UPGRADE_STOP_MARKER: &str = "upgrade-stop";
+
 /// The marker path, only while the data root is a real directory a trusted
 /// account owns: anyone may create folders in ProgramData, and a planted root
 /// or a link in it would steer an elevated write onto another file.
@@ -168,6 +175,36 @@ fn mark_deliberate_stop() {
     let _ = crate::pinned_file::create_new(&program_data, &path);
 }
 
+/// Say that the next stop is an upgrade's.
+fn mark_upgrade_stop() {
+    let Some(path) = marker_in_data_root(UPGRADE_STOP_MARKER) else {
+        return;
+    };
+    let Some(program_data) = crate::system_shell::program_data_directory() else {
+        return;
+    };
+    let _ = std::fs::remove_file(&path);
+    let _ = crate::pinned_file::create_new(&program_data, &path);
+}
+
+/// Whether the stop under way is an installer's. Consumes the marker; a stale
+/// one counts for nothing, so an upgrade that never stopped the service cannot
+/// make a later stop keep its blocks.
+#[must_use]
+pub fn take_upgrade_stop_marker() -> bool {
+    let Some(path) = marker_in_data_root(UPGRADE_STOP_MARKER) else {
+        return false;
+    };
+    let fresh = std::fs::symlink_metadata(&path)
+        .ok()
+        .filter(std::fs::Metadata::is_file)
+        .and_then(|meta| meta.modified().ok())
+        .and_then(|at| at.elapsed().ok())
+        .is_some_and(|age| age <= DELIBERATE_STOP_FRESHNESS);
+    let _ = std::fs::remove_file(&path);
+    fresh
+}
+
 /// Ask SCM for a wanted stop. A refused request (a service still starting
 /// accepts no control) takes its mark back: left behind, it would excuse the
 /// next stop nobody asked for and keep the service down.
@@ -197,6 +234,80 @@ pub fn take_deliberate_stop_marker() -> bool {
         .is_some_and(|age| age <= DELIBERATE_STOP_FRESHNESS);
     let _ = std::fs::remove_file(&path);
     fresh
+}
+
+/// Left by a stop that found the service already down: SCM may hold a restart
+/// scheduled after a crash, and nothing cancels a scheduled restart. The start
+/// it makes reads this and ends at once.
+const STAY_STOPPED_MARKER: &str = "stay-stopped";
+
+fn mark_stay_stopped() {
+    let Some(path) = marker_in_data_root(STAY_STOPPED_MARKER) else {
+        return;
+    };
+    let Some(program_data) = crate::system_shell::program_data_directory() else {
+        return;
+    };
+    let _ = std::fs::remove_file(&path);
+    let _ = crate::pinned_file::create_new(&program_data, &path);
+}
+
+/// An asked-for start outranks an earlier "stay stopped": every path that
+/// requests a start calls this first. The marker sits in the administrators-
+/// only data root, so an unprivileged caller's call is a no-op by design.
+pub fn clear_stay_stopped() {
+    if let Some(path) = marker_in_data_root(STAY_STOPPED_MARKER) {
+        let _ = std::fs::remove_file(path);
+    }
+}
+
+/// Who asked for a stop. Only the verb may leave a crashed service down: an
+/// install replacing the copy starts it again or leaves it as found, and a
+/// marker written there would eat the next start anyone requests.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum StopCaller {
+    Verb,
+    Install,
+}
+
+/// Whether a stop that found the service crashed asks it to stay down.
+fn stays_stopped(caller: StopCaller, found_crashed: bool) -> bool {
+    found_crashed && caller == StopCaller::Verb
+}
+
+/// Whether this start is a restart SCM scheduled before a stop asked the
+/// service to stay down. Consumes the marker.
+#[must_use]
+pub fn take_stay_stopped_marker() -> bool {
+    let Some(path) = marker_in_data_root(STAY_STOPPED_MARKER) else {
+        return false;
+    };
+    let written = std::fs::symlink_metadata(&path)
+        .ok()
+        .filter(std::fs::Metadata::is_file)
+        .and_then(|meta| meta.modified().ok());
+    let _ = std::fs::remove_file(&path);
+    let boot = crate::event_log::current_boot_started_at_ms()
+        .map(|ms| std::time::UNIX_EPOCH + Duration::from_millis(ms));
+    written.is_some_and(|written| stay_stopped_applies(written, std::time::SystemTime::now(), boot))
+}
+
+/// Only while a scheduled restart can still fire (its longest delay plus a
+/// minute), and never across a boot: a boot starts the service on purpose.
+fn stay_stopped_applies(
+    written: std::time::SystemTime,
+    now: std::time::SystemTime,
+    boot: Option<std::time::SystemTime>,
+) -> bool {
+    let longest_delay = failure_action_plan(&RecoveryPolicy::production())
+        .into_iter()
+        .map(|(_, delay)| delay)
+        .max()
+        .unwrap_or_default();
+    let fresh = now
+        .duration_since(written)
+        .is_ok_and(|age| age <= longest_delay + Duration::from_secs(60));
+    fresh && boot.is_some_and(|boot| written >= boot)
 }
 
 /// Why the service was stopped by something other than its own verbs.
@@ -598,6 +709,8 @@ impl ServiceControlPort for WindowsServiceControl {
             status = service.query_status().map_err(map_service_error)?;
         }
         if matches!(step, StartStep::Request | StartStep::LetStopFinish) {
+            // An asked-for start outranks an earlier "stay stopped".
+            clear_stay_stopped();
             if let Err(e) = service.start::<&str>(&[]) {
                 if !is_already_running(&e) {
                     return Err(match map_service_error(e) {
@@ -654,33 +767,7 @@ impl ServiceControlPort for WindowsServiceControl {
     }
 
     fn stop(&self, timeout: Duration) -> Result<(), ServiceControlError> {
-        // Taken first: a service already down may have a restart scheduled by
-        // SCM, and only the actions decide whether it fires.
-        let hold = hold_recovery().ok();
-        let result = (|| {
-            let manager = open_manager(ServiceManagerAccess::CONNECT)?;
-            let service = manager
-                .open_service(
-                    WINDOWS_SERVICE_NAME,
-                    ServiceAccess::QUERY_STATUS | ServiceAccess::STOP,
-                )
-                .map_err(map_service_error)?;
-
-            let status = service.query_status().map_err(map_service_error)?;
-            if status.current_state == ServiceState::Stopped {
-                return Ok(());
-            }
-
-            let _ = stop_deliberately(&service);
-            wait_for_stopped(&service, timeout)
-        })();
-        if let Some(hold) = hold {
-            match recovery_after_stop(result.is_ok()) {
-                RecoveryAfterStop::LeaveOff => hold.leave_off(),
-                RecoveryAfterStop::PutBack => drop(hold),
-            }
-        }
-        result
+        self.stop_as(timeout, StopCaller::Verb)
     }
 
     fn kill(&self) -> Result<(), ServiceControlError> {
@@ -912,6 +999,51 @@ enum Placement {
 }
 
 impl WindowsServiceControl {
+    /// Stop for `caller`; see [`StopCaller`] for what differs.
+    fn stop_as(&self, timeout: Duration, caller: StopCaller) -> Result<(), ServiceControlError> {
+        // Taken first: a service already down may have a restart scheduled by
+        // SCM, and only the actions decide whether it fires.
+        let hold = hold_recovery().ok();
+        let result = (|| {
+            let manager = open_manager(ServiceManagerAccess::CONNECT)?;
+            let service = manager
+                .open_service(
+                    WINDOWS_SERVICE_NAME,
+                    ServiceAccess::QUERY_STATUS | ServiceAccess::STOP,
+                )
+                .map_err(map_service_error)?;
+
+            let status = service.query_status().map_err(map_service_error)?;
+            if status.current_state == ServiceState::Stopped {
+                // Only a failed exit can have a restart scheduled behind it.
+                let failed = !matches!(
+                    status.exit_code,
+                    windows_service::service::ServiceExitCode::Win32(0)
+                );
+                return Ok(failed);
+            }
+
+            if caller == StopCaller::Install {
+                mark_upgrade_stop();
+            }
+            if stop_deliberately(&service).is_err() && caller == StopCaller::Install {
+                let _ = take_upgrade_stop_marker();
+            }
+            wait_for_stopped(&service, timeout).map(|()| false)
+        })();
+        if stays_stopped(caller, matches!(result, Ok(true))) {
+            mark_stay_stopped();
+        }
+        let result = result.map(drop);
+        if let Some(hold) = hold {
+            match recovery_after_stop(result.is_ok()) {
+                RecoveryAfterStop::LeaveOff => hold.leave_off(),
+                RecoveryAfterStop::PutBack => drop(hold),
+            }
+        }
+        result
+    }
+
     /// The binary to register for `source`: itself when only administrators
     /// can change it (or in a development build, whose binary lives in the
     /// build directory by design), else the protected copy, written or updated
@@ -956,13 +1088,12 @@ impl WindowsServiceControl {
                 Placement::Register(target.clone())
             }
             CopyPlan::Update { restart } => {
-                self.stop(COPY_UPDATE_STOP_BUDGET).map_err(|e| {
-                    ServiceControlError::InvalidState {
+                self.stop_as(COPY_UPDATE_STOP_BUDGET, StopCaller::Install)
+                    .map_err(|e| ServiceControlError::InvalidState {
                         detail: format!(
                             "the service did not stop, so its files were not replaced: {e}"
                         ),
-                    }
-                })?;
+                    })?;
                 write_protected_copy(&dir, &payload)?;
                 if restart {
                     self.start(COPY_UPDATE_START_BUDGET)?;
@@ -1033,7 +1164,11 @@ fn refresh_registration(
         .is_ok_and(|service| {
             let _ = service.set_description(WINDOWS_SERVICE_DESCRIPTION);
             service.query_config().is_ok_and(|config| {
-                configure_recovery(&service, &spec.recovery, &config.executable_path).is_ok()
+                // SCM hands back the command line, quoted; the after-crash
+                // command quotes the path itself, and a doubly quoted one
+                // never runs.
+                let binary = registered_binary_of(&config.executable_path);
+                configure_recovery(&service, &spec.recovery, &binary).is_ok()
             })
         });
     ServiceInstallReport {
@@ -1141,6 +1276,17 @@ fn failure_action_plan(policy: &RecoveryPolicy) -> Vec<(ServiceActionType, Durat
     plan
 }
 
+/// The binary behind the command line SCM registered (`"path" args`).
+fn registered_binary_of(command_line: &Path) -> PathBuf {
+    nrr_platform_api::autostart::executable_of_command_line(&command_line.to_string_lossy())
+}
+
+/// The command SCM runs once the restarts are spent: the service binary's own
+/// `after-crash` verb, the path quoted exactly once.
+fn after_crash_command(binary: &Path) -> OsString {
+    OsString::from(format!("\"{}\" after-crash", binary.display()))
+}
+
 /// Configure SCM failure actions for an already-registered service.
 fn configure_recovery(
     service: &Service,
@@ -1152,7 +1298,7 @@ fn configure_recovery(
     let actions = failure_action_plan(policy);
     let command = policy
         .release_network_when_exhausted
-        .then(|| OsString::from(format!("\"{}\" after-crash", binary.display())));
+        .then(|| after_crash_command(binary));
     let actions: Vec<ServiceAction> = actions
         .into_iter()
         .map(|(action_type, delay)| ServiceAction { action_type, delay })
@@ -1498,10 +1644,57 @@ mod tests {
         assert!(!sweep_routes(api as std::sync::Arc<dyn RouteTablePort>));
     }
 
+    /// Only the stop verb asks a crashed service to stay down; an install
+    /// replacing the copy over one must not eat the start that follows.
+    #[test]
+    fn only_the_stop_verb_asks_a_crashed_service_to_stay_down() {
+        assert!(stays_stopped(StopCaller::Verb, true));
+        assert!(!stays_stopped(StopCaller::Install, true));
+        assert!(!stays_stopped(StopCaller::Verb, false));
+        assert!(!stays_stopped(StopCaller::Install, false));
+    }
+
+    /// A reinstall reads the registered command line back from SCM, quotes
+    /// and all; the after-crash command must not quote it a second time.
+    #[test]
+    fn a_reinstall_does_not_quote_the_registered_path_twice() {
+        let registered = Path::new(r#""C:\Program Files\NetRuleRouter Service\nrr-service.exe""#);
+        let command = after_crash_command(&registered_binary_of(registered));
+        assert_eq!(
+            command,
+            OsString::from(
+                r#""C:\Program Files\NetRuleRouter Service\nrr-service.exe" after-crash"#
+            )
+        );
+        let bare = Path::new(r"C:\NRR\nrr-service.exe");
+        assert_eq!(
+            after_crash_command(&registered_binary_of(bare)),
+            OsString::from(r#""C:\NRR\nrr-service.exe" after-crash"#)
+        );
+    }
+
     #[test]
     fn a_confirmed_stop_leaves_the_actions_off_and_a_failed_one_puts_them_back() {
         assert_eq!(recovery_after_stop(true), RecoveryAfterStop::LeaveOff);
         assert_eq!(recovery_after_stop(false), RecoveryAfterStop::PutBack);
+    }
+
+    /// The marker outlives every restart SCM may have scheduled, and no boot.
+    #[test]
+    fn stay_stopped_holds_through_the_longest_restart_delay_and_never_past_a_boot() {
+        let boot = std::time::UNIX_EPOCH + Duration::from_secs(1_000_000);
+        let written = boot + Duration::from_secs(600);
+        let after = |secs| written + Duration::from_secs(secs);
+        // The slowest scheduled restart is five minutes away.
+        assert!(stay_stopped_applies(written, after(5), Some(boot)));
+        assert!(stay_stopped_applies(written, after(300), Some(boot)));
+        assert!(!stay_stopped_applies(written, after(400), Some(boot)));
+        // Written before this boot: the boot start is wanted.
+        let rebooted = written + Duration::from_secs(10);
+        assert!(!stay_stopped_applies(written, after(20), Some(rebooted)));
+        assert!(!stay_stopped_applies(written, after(20), None));
+        // A clock set back is no evidence either way: not fresh.
+        assert!(!stay_stopped_applies(after(30), written, Some(boot)));
     }
 
     #[test]
@@ -1546,6 +1739,15 @@ mod tests {
         policy.exhausted_restart_delay_ms = 0;
         let plan = failure_action_plan(&policy);
         assert_eq!(plan[plan.len() - 1].0, ServiceActionType::None);
+    }
+
+    #[test]
+    fn the_scripts_write_the_same_upgrade_stop_marker() {
+        let lib = include_str!("../../../../scripts/lib/service-paths.ps1");
+        assert!(
+            lib.contains(&format!("'{UPGRADE_STOP_MARKER}'")),
+            "service-paths.ps1 must name the marker file {UPGRADE_STOP_MARKER}"
+        );
     }
 
     #[test]

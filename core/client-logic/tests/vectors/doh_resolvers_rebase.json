@@ -1,0 +1,154 @@
+{
+  "description": "pure.js dohResolversRebase: the editor's resolver rows laid over a fresh read of the machine's list",
+  "cases": [
+    {
+      "name": "nothing changed anywhere",
+      "input": {
+        "base": [{ "target-kind": "ip", "target": "198.51.100.1", "comment": "a", "enabled": true }],
+        "edited": [{ "target-kind": "ip", "target": "198.51.100.1", "comment": "a", "enabled": true }],
+        "fresh": [{ "target-kind": "ip", "target": "198.51.100.1", "comment": "a", "enabled": true }]
+      },
+      "expected": {
+        "resolvers": [{ "target-kind": "ip", "target": "198.51.100.1", "comment": "a", "enabled": true }],
+        "removed": false
+      }
+    },
+    {
+      "name": "an editor that never read the list adds to what the service holds",
+      "input": {
+        "base": [],
+        "edited": [{ "target-kind": "host", "target": "mine.example", "comment": "", "enabled": true }],
+        "fresh": [
+          { "target-kind": "ip", "target": "198.51.100.1", "comment": "seed", "enabled": true },
+          { "target-kind": "host", "target": "dns.example", "comment": "seed", "enabled": true }
+        ]
+      },
+      "expected": {
+        "resolvers": [
+          { "target-kind": "ip", "target": "198.51.100.1", "comment": "seed", "enabled": true },
+          { "target-kind": "host", "target": "dns.example", "comment": "seed", "enabled": true },
+          { "target-kind": "host", "target": "mine.example", "comment": "", "enabled": true }
+        ],
+        "removed": false
+      }
+    },
+    {
+      "name": "a row another client added meanwhile survives",
+      "input": {
+        "base": [{ "target-kind": "ip", "target": "198.51.100.1", "comment": "", "enabled": true }],
+        "edited": [
+          { "target-kind": "ip", "target": "198.51.100.1", "comment": "", "enabled": true },
+          { "target-kind": "ip", "target": "203.0.113.9", "comment": "mine", "enabled": true }
+        ],
+        "fresh": [
+          { "target-kind": "ip", "target": "198.51.100.1", "comment": "", "enabled": true },
+          { "target-kind": "host", "target": "other.example", "comment": "theirs", "enabled": true }
+        ]
+      },
+      "expected": {
+        "resolvers": [
+          { "target-kind": "ip", "target": "198.51.100.1", "comment": "", "enabled": true },
+          { "target-kind": "host", "target": "other.example", "comment": "theirs", "enabled": true },
+          { "target-kind": "ip", "target": "203.0.113.9", "comment": "mine", "enabled": true }
+        ],
+        "removed": false
+      }
+    },
+    {
+      "name": "a row the user removed goes and the write says so",
+      "input": {
+        "base": [
+          { "target-kind": "ip", "target": "198.51.100.1", "comment": "", "enabled": true },
+          { "target-kind": "ip", "target": "198.51.100.2", "comment": "", "enabled": true }
+        ],
+        "edited": [{ "target-kind": "ip", "target": "198.51.100.2", "comment": "", "enabled": true }],
+        "fresh": [
+          { "target-kind": "ip", "target": "198.51.100.1", "comment": "", "enabled": true },
+          { "target-kind": "ip", "target": "198.51.100.2", "comment": "", "enabled": true }
+        ]
+      },
+      "expected": {
+        "resolvers": [{ "target-kind": "ip", "target": "198.51.100.2", "comment": "", "enabled": true }],
+        "removed": true
+      }
+    },
+    {
+      "name": "a row another client removed stays removed",
+      "input": {
+        "base": [
+          { "target-kind": "ip", "target": "198.51.100.1", "comment": "", "enabled": true },
+          { "target-kind": "ip", "target": "198.51.100.2", "comment": "", "enabled": true }
+        ],
+        "edited": [
+          { "target-kind": "ip", "target": "198.51.100.1", "comment": "", "enabled": true },
+          { "target-kind": "ip", "target": "198.51.100.2", "comment": "", "enabled": false }
+        ],
+        "fresh": [{ "target-kind": "ip", "target": "198.51.100.1", "comment": "", "enabled": true }]
+      },
+      "expected": {
+        "resolvers": [{ "target-kind": "ip", "target": "198.51.100.1", "comment": "", "enabled": true }],
+        "removed": false
+      }
+    },
+    {
+      "name": "the user's untick wins, the other client's note stays",
+      "input": {
+        "base": [{ "target-kind": "ip", "target": "198.51.100.1", "comment": "old", "enabled": true }],
+        "edited": [{ "target-kind": "ip", "target": "198.51.100.1", "comment": "old", "enabled": false }],
+        "fresh": [{ "target-kind": "ip", "target": "198.51.100.1", "comment": "new note", "enabled": true }]
+      },
+      "expected": {
+        "resolvers": [{ "target-kind": "ip", "target": "198.51.100.1", "comment": "new note", "enabled": false }],
+        "removed": false
+      }
+    },
+    {
+      "name": "addresses match without regard to case or spaces",
+      "input": {
+        "base": [{ "target-kind": "ip", "target": "2001:DB8::1", "comment": "", "enabled": true }],
+        "edited": [{ "target-kind": "ip", "target": "2001:DB8::1", "comment": "", "enabled": false }],
+        "fresh": [{ "target-kind": "ip", "target": " 2001:db8::1 ", "comment": "", "enabled": true }]
+      },
+      "expected": {
+        "resolvers": [{ "target-kind": "ip", "target": " 2001:db8::1 ", "comment": "", "enabled": false }],
+        "removed": false
+      }
+    },
+    {
+      "name": "an addition someone else made too is listed once",
+      "input": {
+        "base": [],
+        "edited": [{ "target-kind": "host", "target": "Dup.Example", "comment": "mine", "enabled": true }],
+        "fresh": [{ "target-kind": "host", "target": "dup.example", "comment": "theirs", "enabled": true }]
+      },
+      "expected": {
+        "resolvers": [{ "target-kind": "host", "target": "dup.example", "comment": "theirs", "enabled": true }],
+        "removed": false
+      }
+    },
+    {
+      "name": "loose rows: missing kind is host, missing enabled is on, blank targets dropped",
+      "input": {
+        "base": [],
+        "edited": [{ "target": "x.example" }, { "target": "  " }],
+        "fresh": [{ "target": "" }]
+      },
+      "expected": {
+        "resolvers": [{ "target-kind": "host", "target": "x.example", "comment": "", "enabled": true }],
+        "removed": false
+      }
+    },
+    {
+      "name": "the user cleared the list on purpose",
+      "input": {
+        "base": [{ "target-kind": "ip", "target": "198.51.100.1", "comment": "", "enabled": true }],
+        "edited": [],
+        "fresh": [{ "target-kind": "ip", "target": "198.51.100.1", "comment": "", "enabled": true }]
+      },
+      "expected": {
+        "resolvers": [],
+        "removed": true
+      }
+    }
+  ]
+}

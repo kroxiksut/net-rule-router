@@ -419,17 +419,17 @@ impl AutoRulesEngine {
             .cloned()
             .unwrap_or_default();
         for offer in offers.iter_mut() {
-            self.refresh_self_signed_behavior(&mut offer.dto);
+            self.refresh_self_signed_behavior(sid, &mut offer.dto);
         }
         offers
     }
 
     /// What the main link currently does with `hostname`. `Unknown` when no
     /// source is wired, which is how a self-signed offer behaved before one was.
-    pub(super) fn main_link_behavior(&self, hostname: &str) -> PrimaryBehavior {
+    pub(super) fn main_link_behavior(&self, sid: &str, hostname: &str) -> PrimaryBehavior {
         self.primary_behavior_of
             .as_ref()
-            .map_or(PrimaryBehavior::Unknown, |read| read(hostname))
+            .map_or(PrimaryBehavior::Unknown, |read| read(sid, hostname))
     }
 
     /// Re-stamp a self-signed offer with the main link's CURRENT verdict.
@@ -438,12 +438,12 @@ impl AutoRulesEngine {
     /// carries fresh evidence by construction. An offer a host made about
     /// itself is parked once and never recomputed, so without this it would
     /// keep asserting a failure that has since stopped happening.
-    pub(super) fn refresh_self_signed_behavior(&self, dto: &mut AutoRuleCandidateDto) {
+    pub(super) fn refresh_self_signed_behavior(&self, sid: &str, dto: &mut AutoRuleCandidateDto) {
         // A program has no host verdict; its own measure withdraws the offer.
         if !is_self_signed_signal(&dto.signal) || is_app_offer(dto) {
             return;
         }
-        let behavior = self.main_link_behavior(&dto.proposed_match);
+        let behavior = self.main_link_behavior(sid, &dto.proposed_match);
         if behavior != PrimaryBehavior::Unknown {
             dto.primary_behavior = primary_behavior_slug(behavior).to_string();
         }

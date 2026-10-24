@@ -28,12 +28,13 @@ pub fn service_control() -> Option<Box<dyn ServiceControlPort>> {
     ))
 }
 
-/// The host's service manager, when this build has one.
+/// The host's service manager, when this build has one. `systemctl` never
+/// asks here: a refusal comes back as "access denied", and the console
+/// elevates the whole verb once through `pkexec` when asked to.
 #[cfg(target_os = "linux")]
 pub fn service_control() -> Option<Box<dyn ServiceControlPort>> {
-    Some(Box::new(
-        nrr_platform_linux::service_control::LinuxServiceControl::new(),
-    ))
+    use nrr_platform_linux::service_control::{LinuxServiceControl, PasswordPrompt};
+    Some(Box::new(LinuxServiceControl::new(PasswordPrompt::Never)))
 }
 
 /// The host's service manager, when this build has one.

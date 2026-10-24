@@ -114,7 +114,9 @@ impl UpstreamProbe for UdpUpstreamProbe {
         {
             return false;
         }
-        let mut buf = [0u8; 512];
+        // A smaller buffer fails the receive on Windows, and a live server that
+        // answers big is still a live server.
+        let mut buf = [0u8; crate::dns_resolver_ports::MAX_REPLY_DATAGRAM];
         let Ok(n) = sock.recv(&mut buf) else {
             return false;
         };
@@ -512,8 +514,13 @@ impl UpstreamDnsPool {
     /// stale), for a caller waiting for ANY server to answer. Honours the
     /// pool's floors, so calling it every few seconds costs one sweep each.
     pub fn reprobe(&self) -> Option<SocketAddr> {
-        self.reselect(None)
-            .map(|ip| SocketAddr::from((ip, self.port)))
+        let ip = self.reselect(None)?;
+        // `reselect` keeps the previous server when nothing answered; the
+        // redirect may come back only on one that answered, never on that.
+        if self.dark.load(Ordering::Relaxed) {
+            return None;
+        }
+        Some(SocketAddr::from((ip, self.port)))
     }
 
     /// The OS reported a network change. Re-selects at most once per
@@ -870,6 +877,26 @@ mod tests {
         pool.set_excluded_interfaces(Arc::new(|| vec![9]));
         assert_eq!(pool.reprobe(), None);
         assert!(pool.upstream_dark());
+    }
+
+    /// The redirect comes back on `reprobe` answering a server, so that answer
+    /// must mean a server answered just now. A VPN that lets no outside DNS
+    /// through, or a laptop woken with no network: the server that answered
+    /// before is silent, every sweep and every quick recheck after it says so,
+    /// and the system DNS is never pointed back at a resolver with nowhere to
+    /// ask.
+    #[test]
+    fn a_silent_server_is_never_reported_as_answering_again() {
+        let probe = ScriptedProbe::new(vec![ip(1)]);
+        let pool = pool(vec![ip(1), ip(2)], probe.clone());
+        assert_eq!(pool.refresh().map(|s| s.ip()), Some(IpAddr::V4(ip(1))));
+        probe.set_alive(Vec::new());
+        assert_eq!(pool.reprobe(), None, "the sweep found nobody");
+        assert_eq!(pool.reprobe(), None, "a recheck right after the sweep");
+        assert!(pool.upstream_dark());
+        probe.set_alive(vec![ip(2)]);
+        // The quick recheck window is still open: no fresh answer yet either.
+        assert_eq!(pool.reprobe(), None, "nothing probed, nothing answered");
     }
 
     fn corporate_and_home() -> (UpstreamDnsCandidate, UpstreamDnsCandidate) {
@@ -1483,5 +1510,27 @@ mod tests {
         );
         std::thread::sleep(Duration::from_millis(700));
         assert!(!second_ran.load(Ordering::SeqCst));
+    }
+
+    /// A live server that answers past 512 bytes is still live: on Windows a
+    /// smaller buffer fails the receive and the probe would pass it over.
+    #[test]
+    fn a_server_answering_past_a_classic_datagram_still_responds() {
+        let server = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).expect("bind fake dns");
+        let addr = server.local_addr().expect("fake dns addr");
+        server
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .expect("cfg fake dns");
+        let answered = std::thread::spawn(move || {
+            let mut buf = [0u8; 2048];
+            let (n, src) = server.recv_from(&mut buf).expect("the probe asks");
+            let mut reply = buf[..n].to_vec();
+            reply[2] |= 0x80;
+            reply.resize(4000, 0);
+            server.send_to(&reply, src).expect("reply sent");
+        });
+
+        assert!(UdpUpstreamProbe::default().responds(addr));
+        answered.join().expect("fake server finished");
     }
 }

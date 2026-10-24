@@ -56,7 +56,8 @@ use crate::rules_revision::{
 };
 use crate::validation::{
     canonical_app_pattern, canonical_host_name, canonical_ip_address, canonical_ip_range,
-    canonical_name_pattern, canonical_subnet, settle_verify, HostNameKind, ValidationError,
+    canonical_name_pattern, canonical_subnet, settle_verify, suffix_or_zone, HostNameKind,
+    ValidationError,
 };
 use crate::RuleId;
 
@@ -361,7 +362,7 @@ fn decode_address_match(
             CanonicalAddressMatch::ExactFqdn(respelled(HostNameKind::Domain, value))
         }
         AddressMatchDto::SuffixDomain { suffix } => {
-            CanonicalAddressMatch::SuffixDomain(respelled(HostNameKind::Domain, suffix))
+            suffix_or_zone(respelled(HostNameKind::Domain, suffix))
         }
         AddressMatchDto::AnyZoneDomain { base } => {
             let base = crate::AddressMatch::domain_value_name(&base).to_string();
@@ -1345,6 +1346,57 @@ mod tests {
         assert_eq!(spelled["f1"], "example.com");
         assert_eq!(spelled["s1"], "cdn.example");
         assert_eq!(spelled["bad"], "192.168.1.1");
+    }
+
+    /// `*.ru` sent by a client is the zone the rules file makes of it: the
+    /// same tier against a literal address, the same canonical hash.
+    #[test]
+    fn a_one_label_suffix_decodes_as_the_zone_the_file_reads() {
+        let dto = |address_match: AddressMatchDto| CanonicalRulesJsonV1 {
+            schema_version: RULES_JSON_SCHEMA_VERSION,
+            primary: vec![RuleDto {
+                id: "r-1".into(),
+                enabled: true,
+                address_match: Some(address_match),
+                app_match: None,
+                comment: String::new(),
+                action: nrr_shared::rules_json::RuleAction::Route,
+                origin: None,
+            }],
+            secondary: vec![],
+        };
+        let from_suffix = decode(
+            dto(AddressMatchDto::SuffixDomain {
+                suffix: "RU.".into(),
+            }),
+            HostPlatform::Windows,
+        )
+        .expect("decode suffix");
+        let from_zone = decode(
+            dto(AddressMatchDto::Zone { name: "ru".into() }),
+            HostPlatform::Windows,
+        )
+        .expect("decode zone");
+        assert_eq!(
+            from_suffix.rule_book.primary.rules()[0].address_match,
+            Some(CanonicalAddressMatch::Zone("ru".into()))
+        );
+        assert_eq!(
+            to_canonical_string(&encode(&from_suffix)).expect("encode suffix"),
+            to_canonical_string(&encode(&from_zone)).expect("encode zone")
+        );
+
+        let deep = decode(
+            dto(AddressMatchDto::SuffixDomain {
+                suffix: "example.ru".into(),
+            }),
+            HostPlatform::Windows,
+        )
+        .expect("decode deep suffix");
+        assert_eq!(
+            deep.rule_book.primary.rules()[0].address_match,
+            Some(CanonicalAddressMatch::SuffixDomain("example.ru".into()))
+        );
     }
 
     #[test]

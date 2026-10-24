@@ -600,6 +600,7 @@ GroupBox {
                 text: root.tr("settings.traffic.retention-days", "Keep daily history for (days)")
             }
             ThemedSpinBox {
+                accessibleLabel: root.uiRevision >= 0 ? root.tr("settings.traffic.retention-days", "Keep daily history for (days)") : ""
                 theme: root.uiTheme
                 Layout.preferredWidth: 140
                 editable: true
@@ -741,15 +742,9 @@ GroupBox {
         return pad(d.getDate()) + "." + pad(d.getMonth() + 1) + " " + pad(d.getHours()) + ":" + pad(d.getMinutes())
     }
 
-    // Merge one changed field into the current settings and persist.
+    // One changed field; the controller lays it over a fresh read.
     function _save(patch) {
         if (!ctrl) return
-        var s = ctrl.settings
-        ctrl.applySettings({
-            enabled: patch.enabled !== undefined ? patch.enabled : s.enabled,
-            countLoopback: patch.countLoopback !== undefined ? patch.countLoopback : s.countLoopback,
-            countVirtual: patch.countVirtual !== undefined ? patch.countVirtual : s.countVirtual,
-            retentionDays: patch.retentionDays !== undefined ? patch.retentionDays : s.retentionDays
-        })
+        ctrl.applyPatch(patch)
     }
 }

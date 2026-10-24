@@ -1,0 +1,45 @@
+{
+  "description": "pure.js firstRunWrites: what the first-run setup writes when it ends; a user already set up keeps the service's values unless a choice changed",
+  "cases": [
+    {
+      "name": "a new user's protection and answers always go",
+      "input": { "held": null, "level": "sites", "doh": true, "touched": false },
+      "expected": { "protection": true, "stability": true }
+    },
+    {
+      "name": "a new user who changed nothing still writes",
+      "input": { "held": null, "level": "off", "doh": false, "touched": true },
+      "expected": { "protection": true, "stability": true }
+    },
+    {
+      "name": "closed untouched by a user already set up writes nothing",
+      "input": { "held": { "level": "everything", "doh": false }, "level": "everything", "doh": false, "touched": false },
+      "expected": { "protection": false, "stability": false }
+    },
+    {
+      "name": "a lowered level is written",
+      "input": { "held": { "level": "everything", "doh": false }, "level": "sites", "doh": false, "touched": false },
+      "expected": { "protection": true, "stability": false }
+    },
+    {
+      "name": "lockdown switched on is written",
+      "input": { "held": { "level": "sites", "doh": false }, "level": "sites", "doh": true, "touched": false },
+      "expected": { "protection": true, "stability": false }
+    },
+    {
+      "name": "a changed answer sends the answers only",
+      "input": { "held": { "level": "sites", "doh": true }, "level": "sites", "doh": true, "touched": true },
+      "expected": { "protection": false, "stability": true }
+    },
+    {
+      "name": "both changed",
+      "input": { "held": { "level": "off", "doh": true }, "level": "everything", "doh": true, "touched": true },
+      "expected": { "protection": true, "stability": true }
+    },
+    {
+      "name": "lockdown switched off is written",
+      "input": { "held": { "level": "off", "doh": true }, "level": "off", "doh": false, "touched": false },
+      "expected": { "protection": true, "stability": false }
+    }
+  ]
+}

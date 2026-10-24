@@ -4,6 +4,7 @@
 //! row, so a refusal for want of rights is told as the GUI tells it, in the
 //! feed, after the setup has handed over.
 
+use nrr_client_logic::route_policy::first_run_writes;
 use nrr_client_logic::stability::{merge_write, patch_changes_nothing, patch_for_platform};
 use nrr_ipc_client::{ipc_error_to_wire, ipc_operation_timeout, IpcClient, IpcClientError};
 use nrr_shared::ipc::IpcOperationName as Op;
@@ -86,7 +87,9 @@ pub fn send(app: &mut AppState) {
     if state.stability_sent || !app.link.is_connected() {
         return;
     }
-    if state.protection_at_start.is_some() && !state.stability_touched {
+    let held = state.protection_at_start;
+    let chosen = (state.leak_protection, state.doh_lockdown);
+    if !first_run_writes(held, chosen, state.stability_touched).stability {
         return;
     }
     let partial = patch(state.fake_ip, state.diagnostic_logs);

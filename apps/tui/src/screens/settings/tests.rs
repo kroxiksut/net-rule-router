@@ -6,7 +6,7 @@ use nrr_shared::ipc::IpcOperationName;
 use nrr_shared::user_settings::{UserSettingsStore, USER_SETTINGS_FILE_NAME};
 use serde_json::json;
 
-use super::items::{ItemId, PrefField};
+use super::items::{ItemId, LogField, PrefField, RevisionField};
 use super::*;
 use crate::link::Link;
 use crate::plain::PlainSession;
@@ -172,6 +172,7 @@ fn everything_while_the_additional_connection_is_down_waits_for_a_yes() {
             assert_eq!(
                 app.settings.mode,
                 Mode::ConfirmingPick {
+                    id: ItemId::Policy("leak-protection"),
                     slug: "everything",
                     why: route_policy::LeakProtectionConfirm::HoldsNow,
                 }
@@ -230,6 +231,7 @@ fn a_default_route_that_raises_protection_while_the_additional_connection_is_dow
             assert_eq!(
                 app.settings.mode,
                 Mode::ConfirmingPick {
+                    id: ItemId::Policy("mode"),
                     slug: "prefer-secondary-when-available",
                     why: route_policy::LeakProtectionConfirm::HoldsNow,
                 },
@@ -250,6 +252,50 @@ fn a_default_route_that_raises_protection_while_the_additional_connection_is_dow
         let settled = if level == "off" { "off" } else { "everything" };
         assert_eq!(sent[0]["leak-protection"], json!(settled), "{case}");
     }
+}
+
+/// The tray raised protection to "Routed sites" after this section loaded
+/// with it off: the default-route pick asks on the level the service holds now.
+#[test]
+fn a_protection_change_made_elsewhere_is_read_before_the_route_pick_decides() {
+    let mut fixture = Fixture::healthy();
+    if let Some(bound) = fixture.secondary.as_mut() {
+        bound.availability = Some("unavailable");
+    }
+    let mut snapshot = snapshot_json(&fixture);
+    snapshot["route-policy"]["leak-protection"] = json!("off");
+    let fake = FakeService::new(ConnectionStatus::Connected);
+    fake.answer(IpcOperationName::SnapshotInitialGet, snapshot.clone());
+    fake.answer(IpcOperationName::RoutePolicyUpdate, json!({}));
+    fake.answer(
+        IpcOperationName::BlockNoticeMutesList,
+        json!({ "mutes": [] }),
+    );
+    let mut app = app_at(Link::Connected, Some(&fixture));
+    app.settings.clock = Clock {
+        now_ms: fixed_now,
+        utc_offset: utc,
+    };
+    app.open(ScreenId::Settings);
+    answer(&mut app, "c2");
+    drain(&mut app, &fake);
+    snapshot["route-policy"]["leak-protection"] = json!("sites");
+    fake.answer(IpcOperationName::SnapshotInitialGet, snapshot);
+    let row = row_of(&app, Category::Routing, ItemId::Policy("mode"));
+    answer(&mut app, &format!("i{row} 2"));
+    drain(&mut app, &fake);
+    assert!(
+        fake.sent(IpcOperationName::RoutePolicyUpdate).is_empty(),
+        "nothing is sent before the yes"
+    );
+    assert_eq!(
+        app.settings.mode,
+        Mode::ConfirmingPick {
+            id: ItemId::Policy("mode"),
+            slug: "prefer-secondary-when-available",
+            why: route_policy::LeakProtectionConfirm::HoldsNow,
+        }
+    );
 }
 
 fn policy_of(value: serde_json::Value) -> Map<String, Value> {
@@ -511,6 +557,28 @@ fn an_export_needs_a_file_name_first() {
 }
 
 #[test]
+fn the_merge_policy_is_read_from_and_saved_to_the_shared_settings() {
+    let dir = Scratch::new("settings-merge-policy");
+    let file = dir.path().join(USER_SETTINGS_FILE_NAME);
+    UserSettingsStore::at(file.clone())
+        .update(|s| s.merge_policy = "file-wins".to_string())
+        .expect("seed");
+    let mut app = on_settings();
+    app.rules.settings_file = Some(file.clone());
+    answer(&mut app, "c5");
+    assert_eq!(app.settings.merge_policy, MergePolicyDto::FileWins);
+
+    let row = row_of(&app, Category::Presets, ItemId::MergePolicy);
+    answer(&mut app, &format!("i{row} 3"));
+    assert_eq!(said(&app), texts_en().get(text::SAVED));
+    let recorded = UserSettingsStore::at(file)
+        .load()
+        .expect("read")
+        .expect("file");
+    assert_eq!(recorded.merge_policy, "service-wins");
+}
+
+#[test]
 fn the_terminals_own_options_are_saved_to_its_file() {
     let dir = Scratch::new("settings-prefs");
     let path = dir.path().join("tui.json");
@@ -715,6 +783,90 @@ fn the_routing_rows_are_the_shared_decision() {
     }
 }
 
+/// The window's About in words, and the third-party list with each verdict;
+/// a list with nothing shipped shows no heading at all.
+#[test]
+fn about_names_the_build_and_each_shipped_component_with_its_verdict() {
+    use nrr_shared::ipc_payloads::ThirdPartyComponentsListResponse;
+    let mut app = on_settings();
+    let texts = texts_en();
+    let lines = |app: &AppState| -> Vec<String> {
+        items::items(app, Category::Updates)
+            .iter()
+            .map(|item| item.label.resolve(&texts))
+            .collect()
+    };
+    app.settings.data.third_party = Loadable::Ready(ThirdPartyComponentsListResponse::default());
+    let shown = lines(&app);
+    assert!(shown.iter().any(|l| l == "License: MPL-2.0"), "{shown:?}");
+    assert!(
+        shown
+            .iter()
+            .any(|l| l.starts_with("Author: ") && l.len() > 8),
+        "{shown:?}"
+    );
+    assert!(
+        !shown.iter().any(|l| l == "Third-party components"),
+        "{shown:?}"
+    );
+
+    let component = |verdict: &str| -> serde_json::Value {
+        json!({
+            "kind": "binary", "key": "k-" , "displayName": "Example driver",
+            "publisher": "Example", "version": "1.2", "licenseName": "MIT",
+            "licensePath": "", "homepage": "", "requiredFor": "fake-ip",
+            "sha256MatchesShipped": false,
+            "signature": { "status": "not-checked" }, "verdict": verdict
+        })
+    };
+    let list: ThirdPartyComponentsListResponse = serde_json::from_value(json!({
+        "components": [component("genuine"), component("untrusted")]
+    }))
+    .expect("component list");
+    app.settings.data.third_party = Loadable::Ready(list);
+    let shown = lines(&app);
+    assert!(
+        shown.iter().any(|l| l == "Third-party components"),
+        "{shown:?}"
+    );
+    assert!(
+        shown
+            .iter()
+            .any(|l| l == "Example driver 1.2 (MIT) — Genuine"),
+        "{shown:?}"
+    );
+    let at = shown
+        .iter()
+        .position(|l| l == "Example driver 1.2 (MIT) — Does not match")
+        .unwrap_or_else(|| panic!("{shown:?}"));
+    assert!(shown[at + 1].contains("Reinstall the product"), "{shown:?}");
+}
+
+/// The OS hosts file is named beside the bypass toggle, read only, as the
+/// window shows it; an OS with no such file shows no row.
+#[test]
+fn the_hosts_file_is_named_under_its_toggle() {
+    let mut app = on_settings();
+    routing_with(&mut app, json!({}), json!({}));
+    let texts = texts_en();
+    let lines = |app: &AppState| -> Vec<String> {
+        items::items(app, Category::Routing)
+            .iter()
+            .map(|item| item.label.resolve(&texts))
+            .collect()
+    };
+    app.settings.hosts_file_path = "/etc/hosts".into();
+    let shown = lines(&app);
+    let at = shown
+        .iter()
+        .position(|l| l == "OS hosts file: /etc/hosts")
+        .unwrap_or_else(|| panic!("{shown:?}"));
+    assert!(shown[at + 1].contains("never edits it"), "{shown:?}");
+
+    app.settings.hosts_file_path.clear();
+    assert!(!lines(&app).iter().any(|l| l.starts_with("OS hosts file")));
+}
+
 /// With leak protection off the routing refinements stay offered: the service
 /// honours them at every level. "DNS through the tunnel" waits for a bound
 /// additional connection instead, in either enforcement mode.
@@ -834,6 +986,397 @@ fn a_local_network_is_answered_by_its_row() {
         json!([{ "cidr": "2001:db8:5:7::/64", "allowed": true }])
     );
     assert_eq!(said(&app), texts_en().get(text::SAVED));
+}
+
+/// Turning the automatic browser-history seed on also seeds now, as the
+/// window does; turning it off only writes the setting.
+#[test]
+fn the_automatic_history_seed_also_seeds_now_when_switched_on() {
+    let fake = service();
+    fake.answer(
+        IpcOperationName::SeedFromBrowserHistory,
+        json!({ "started": true, "already-running": false }),
+    );
+    let mut app = on_settings();
+    answer(&mut app, "c2");
+    drain(&mut app, &fake);
+    routing_with(
+        &mut app,
+        json!({ "browser-history-auto-seed": false }),
+        json!({}),
+    );
+    let row = row_of(
+        &app,
+        Category::Routing,
+        ItemId::Policy("browser-history-auto-seed"),
+    );
+    answer(&mut app, &format!("i{row}"));
+    drain(&mut app, &fake);
+    assert_eq!(fake.sent(IpcOperationName::SeedFromBrowserHistory).len(), 1);
+    let ops = fake.operations();
+    let at = |op| ops.iter().position(|o| *o == op);
+    assert!(
+        at(IpcOperationName::RoutePolicyUpdate) < at(IpcOperationName::SeedFromBrowserHistory),
+        "the seed runs once the setting is written: {ops:?}"
+    );
+}
+
+/// A write the service refused leaves the setting off, so nothing is read
+/// from the browser either.
+#[test]
+fn the_history_seed_waits_for_the_setting_to_be_written() {
+    let fake = FakeService::new(ConnectionStatus::Connected);
+    fake.answer(
+        IpcOperationName::SnapshotInitialGet,
+        snapshot_json(&Fixture::healthy()),
+    );
+    fake.answer(
+        IpcOperationName::BlockNoticeMutesList,
+        json!({ "mutes": [] }),
+    );
+    fake.answer(
+        IpcOperationName::SeedFromBrowserHistory,
+        json!({ "started": true, "already-running": false }),
+    );
+    let mut app = on_settings();
+    answer(&mut app, "c2");
+    drain(&mut app, &fake);
+    routing_with(
+        &mut app,
+        json!({ "browser-history-auto-seed": false }),
+        json!({}),
+    );
+    let row = row_of(
+        &app,
+        Category::Routing,
+        ItemId::Policy("browser-history-auto-seed"),
+    );
+    answer(&mut app, &format!("i{row}"));
+    drain(&mut app, &fake);
+    assert!(fake
+        .operations()
+        .contains(&IpcOperationName::RoutePolicyUpdate));
+    assert!(fake
+        .sent(IpcOperationName::SeedFromBrowserHistory)
+        .is_empty());
+}
+
+/// The window's control-channel policy and cache refresh, set from Logs: the
+/// policy goes as one object, a cap below the base is refused before sending.
+#[test]
+fn the_control_channel_and_the_cache_refresh_are_set_from_logs() {
+    let fake = service();
+    let row = json!({
+        "ipc-accept-policy": { "kind": "recoverable", "max-restarts": 20,
+                               "backoff-base-ms": 2000, "backoff-cap-ms": 5000 },
+        "conn-trace-gui": true,
+        "cache-refresh-interval-secs": 300
+    });
+    fake.answer(IpcOperationName::ServiceStabilityConfigGet, row.clone());
+    fake.answer(IpcOperationName::ServiceStabilityConfigSet, row);
+    let mut app = on_settings();
+    app.settings.supports = PlatformProfile::windows().supports;
+    answer(&mut app, "c6");
+    drain(&mut app, &fake);
+    let texts = texts_en();
+    let shown: Vec<String> = items::items(&app, Category::Logs)
+        .iter()
+        .map(|item| item.label.resolve(&texts))
+        .collect();
+    for label in [
+        "Show connection trace in Diagnostics",
+        "Control-channel failure policy",
+        "Max restart attempts",
+        "Address cache refresh",
+    ] {
+        assert!(shown.iter().any(|l| l == label), "{label}: {shown:?}");
+    }
+
+    let refresh = row_of(&app, Category::Logs, ItemId::CacheRefresh);
+    answer(&mut app, &format!("i{refresh} 10"));
+    drain(&mut app, &fake);
+    let sent = fake.sent(IpcOperationName::ServiceStabilityConfigSet);
+    assert_eq!(
+        sent.last().expect("a write")["config"]["cache-refresh-interval-secs"],
+        json!(600)
+    );
+
+    let cap = row_of(
+        &app,
+        Category::Logs,
+        ItemId::IpcNumber(items::IpcField::BackoffCapSecs),
+    );
+    answer(&mut app, &format!("i{cap} 1"));
+    drain(&mut app, &fake);
+    assert_eq!(said(&app), texts_en().get(text::IPC_CAP_BELOW_BASE));
+    assert_eq!(
+        fake.sent(IpcOperationName::ServiceStabilityConfigSet).len(),
+        sent.len(),
+        "nothing sent"
+    );
+
+    let policy = row_of(&app, Category::Logs, ItemId::IpcPolicy);
+    answer(&mut app, &format!("i{policy} 2"));
+    drain(&mut app, &fake);
+    let sent = fake.sent(IpcOperationName::ServiceStabilityConfigSet);
+    assert_eq!(
+        sent.last().expect("a write")["config"]["ipc-accept-policy"],
+        json!({ "kind": "critical" })
+    );
+}
+
+/// Under the smart shared-address mode the count is said and the addresses
+/// open on demand; the strict mode and a zero count say nothing.
+#[test]
+fn the_shared_addresses_left_open_are_counted_and_listed_on_demand() {
+    let mut app = on_settings();
+    answer(&mut app, "c2");
+    app.settings.supports = PlatformProfile::windows().supports;
+    routing_with(
+        &mut app,
+        json!({ "leak-protection": "sites", "kill-switch-strict-shared-ips": false }),
+        json!({ "enforcement-mode": "resolver" }),
+    );
+    let texts = texts_en();
+    let lines = |app: &AppState| -> Vec<String> {
+        items::items(app, Category::Routing)
+            .iter()
+            .map(|item| item.label.resolve(&texts))
+            .collect()
+    };
+    if !shown_routing_rows(&app).contains(&"kill-switch-strict-shared-ips") {
+        return;
+    }
+    assert!(!lines(&app)
+        .iter()
+        .any(|l| l.contains("strictness is reduced")));
+
+    let snapshot = app.snapshot.as_mut().expect("snapshot");
+    snapshot.kill_switch_shared_ip_exemptions = 2;
+    snapshot.kill_switch_shared_ip_exemption_addresses =
+        vec!["198.51.100.1".into(), "198.51.100.2".into()];
+    let shown = lines(&app);
+    assert!(
+        shown
+            .iter()
+            .any(|l| l.ends_with("excluded from blocking — 2")),
+        "{shown:?}"
+    );
+    assert!(!shown.iter().any(|l| l.contains("198.51.100.1")), "closed");
+
+    let details = row_of(&app, Category::Routing, ItemId::SharedExemptionsDetails);
+    answer(&mut app, &format!("i{details}"));
+    let shown = lines(&app);
+    assert!(shown.iter().any(|l| l == "Excluded addresses"), "{shown:?}");
+    assert!(
+        shown.iter().any(|l| l.trim() == "198.51.100.2"),
+        "{shown:?}"
+    );
+
+    app.snapshot
+        .as_mut()
+        .expect("snapshot")
+        .kill_switch_shared_ip_exemption_addresses
+        .clear();
+    assert!(lines(&app).iter().any(|l| l.contains("but not which ones")));
+
+    routing_with(
+        &mut app,
+        json!({ "leak-protection": "sites", "kill-switch-strict-shared-ips": true }),
+        json!({ "enforcement-mode": "resolver" }),
+    );
+    assert!(!lines(&app)
+        .iter()
+        .any(|l| l.contains("strictness is reduced")));
+}
+
+/// Traffic by route and adapter, the one-time history question answered by
+/// its keys, and the CSV written to a new file only.
+#[test]
+fn traffic_names_each_route_answers_the_history_question_and_exports_csv() {
+    let fake = service();
+    let row = |key: &str, name: &str, role: &str, bytes: u64| {
+        json!({ "adapter-key": key, "display-name": name, "role": role,
+                "in-bytes": bytes, "out-bytes": bytes / 2 })
+    };
+    let stats = json!({
+        "today": [row("a", "Ethernet", "primary", 4096), row("b", "Example Tunnel", "secondary", 2048)],
+        "session": [], "all-time": [],
+        "settings": { "enabled": true, "count-loopback": false, "count-virtual": false,
+                      "retention-days": 30 },
+        "history-merge": { "old-key": "old", "old-name": "Example VPN v2",
+                           "new-key": "new", "new-name": "Example VPN v3",
+                           "shared-token": "example" },
+        "csv": "date;adapter;role;received;sent\n"
+    });
+    fake.answer(IpcOperationName::TrafficStatsGet, stats);
+    fake.answer(
+        IpcOperationName::TrafficHistoryMergeSet,
+        json!({ "old-key": "old", "new-key": "new", "merged": true }),
+    );
+    let mut app = on_settings();
+    answer(&mut app, "c7");
+    drain(&mut app, &fake);
+    let shown: Vec<String> = items::items(&app, Category::Traffic)
+        .iter()
+        .map(|item| item.label.resolve(&texts_en()))
+        .collect();
+    let tunnel = shown
+        .iter()
+        .position(|l| l.contains("Through additional adapter — Example Tunnel"))
+        .unwrap_or_else(|| panic!("{shown:?}"));
+    let main = shown
+        .iter()
+        .position(|l| l.contains("Through primary adapter — Ethernet"))
+        .unwrap_or_else(|| panic!("{shown:?}"));
+    assert!(tunnel < main, "the additional route comes first: {shown:?}");
+    assert!(
+        shown
+            .iter()
+            .any(|l| l.contains("\"Example VPN v2\" stopped appearing")),
+        "{shown:?}"
+    );
+
+    let same = row_of(&app, Category::Traffic, ItemId::TrafficMerge(true));
+    answer(&mut app, &format!("i{same}"));
+    drain(&mut app, &fake);
+    let sent = fake.sent(IpcOperationName::TrafficHistoryMergeSet);
+    assert_eq!(
+        sent,
+        vec![json!({ "old-key": "old", "new-key": "new", "merged": true })]
+    );
+
+    let dir = Scratch::new("settings-traffic-csv");
+    let file = dir.path().join("traffic.csv");
+    let export = row_of(&app, Category::Traffic, ItemId::TrafficExport);
+    answer(&mut app, &format!("i{export}"));
+    assert_eq!(said(&app), texts_en().get(text::EXPORT_NEED_PATH));
+    let path = row_of(&app, Category::Traffic, ItemId::TrafficExportPath);
+    answer(&mut app, &format!("i{path} {}", file.display()));
+    let unit = row_of(&app, Category::Traffic, ItemId::TrafficExportUnit);
+    answer(&mut app, &format!("i{unit} 4"));
+    answer(&mut app, &format!("i{export}"));
+    drain(&mut app, &fake);
+    assert_eq!(
+        std::fs::read_to_string(&file).expect("the CSV is written"),
+        "date;adapter;role;received;sent\n"
+    );
+    let asked = fake.sent(IpcOperationName::TrafficStatsGet);
+    let last = asked.last().expect("an export read");
+    assert_eq!(last["export-unit"], json!("gb"));
+    assert_eq!(
+        last["export-to-day"].as_i64().unwrap_or_default()
+            - last["export-from-day"].as_i64().unwrap_or_default(),
+        30,
+        "the range is the retained history"
+    );
+
+    answer(&mut app, &format!("i{export}"));
+    drain(&mut app, &fake);
+    assert!(said(&app).contains("already exists"), "{}", said(&app));
+}
+
+/// The DoH/DoT resolver list opens on demand and every change sends the
+/// whole list, as the window's save does; a typed address is told from a name.
+#[test]
+fn the_doh_resolver_list_is_edited_as_a_whole() {
+    let fake = service();
+    let stored = json!([
+        { "target-kind": "ip", "target": "198.51.100.8", "comment": "Example", "enabled": true },
+        { "target-kind": "host", "target": "dns.example", "comment": "", "enabled": true }
+    ]);
+    fake.answer(
+        IpcOperationName::DohResolversGet,
+        json!({ "resolvers": stored.clone() }),
+    );
+    fake.answer(
+        IpcOperationName::DohResolversSet,
+        json!({ "resolvers": stored }),
+    );
+    let mut app = on_settings();
+    answer(&mut app, "c2");
+    drain(&mut app, &fake);
+    assert!(
+        fake.sent(IpcOperationName::DohResolversGet).is_empty(),
+        "read only when opened"
+    );
+
+    let manage = row_of(&app, Category::Routing, ItemId::DohManage);
+    answer(&mut app, &format!("i{manage}"));
+    drain(&mut app, &fake);
+    assert_eq!(fake.sent(IpcOperationName::DohResolversGet).len(), 1);
+
+    let second = row_of(&app, Category::Routing, ItemId::DohResolver(1));
+    answer(&mut app, &format!("i{second}"));
+    drain(&mut app, &fake);
+    let sent = fake.sent(IpcOperationName::DohResolversSet);
+    assert_eq!(sent.len(), 1, "{sent:?}");
+    assert_eq!(sent[0]["resolvers"][0]["enabled"], json!(true));
+    assert_eq!(sent[0]["resolvers"][1]["enabled"], json!(false));
+
+    let add = row_of(&app, Category::Routing, ItemId::DohAdd);
+    answer(&mut app, &format!("i{add}"));
+    drain(&mut app, &fake);
+    assert_eq!(said(&app), texts_en().get(text::NEED_RESOLVER));
+    assert_eq!(fake.sent(IpcOperationName::DohResolversSet).len(), 1);
+
+    let target = row_of(&app, Category::Routing, ItemId::DohNewTarget);
+    answer(&mut app, &format!("i{target} 2001:db8::53"));
+    answer(&mut app, &format!("i{add}"));
+    drain(&mut app, &fake);
+    let sent = fake.sent(IpcOperationName::DohResolversSet);
+    assert_eq!(sent.len(), 2, "{sent:?}");
+    assert_eq!(
+        sent[1]["resolvers"][2],
+        json!({ "target-kind": "ip", "target": "2001:db8::53", "comment": "", "enabled": true })
+    );
+}
+
+/// The list is the machine's: a change goes over a fresh read, so a resolver
+/// another client added since the list opened survives, and removing a row
+/// says so to the service.
+#[test]
+fn a_doh_resolver_change_keeps_what_another_client_added() {
+    let fake = service();
+    let opened = json!([
+        { "target-kind": "ip", "target": "198.51.100.8", "comment": "", "enabled": true },
+        { "target-kind": "host", "target": "dns.example", "comment": "", "enabled": true }
+    ]);
+    fake.answer(
+        IpcOperationName::DohResolversGet,
+        json!({ "resolvers": opened.clone() }),
+    );
+    fake.answer(
+        IpcOperationName::DohResolversSet,
+        json!({ "resolvers": opened }),
+    );
+    let mut app = on_settings();
+    answer(&mut app, "c2");
+    drain(&mut app, &fake);
+    let manage = row_of(&app, Category::Routing, ItemId::DohManage);
+    answer(&mut app, &format!("i{manage}"));
+    drain(&mut app, &fake);
+
+    fake.answer(
+        IpcOperationName::DohResolversGet,
+        json!({ "resolvers": [
+            { "target-kind": "ip", "target": "198.51.100.8", "comment": "", "enabled": true },
+            { "target-kind": "host", "target": "dns.example", "comment": "", "enabled": true },
+            { "target-kind": "host", "target": "theirs.example", "comment": "", "enabled": true }
+        ] }),
+    );
+    let remove = row_of(&app, Category::Routing, ItemId::DohResolverRemove(0));
+    answer(&mut app, &format!("i{remove}"));
+    answer(&mut app, "y");
+    drain(&mut app, &fake);
+    let sent = fake.sent(IpcOperationName::DohResolversSet);
+    assert_eq!(sent.len(), 1, "{sent:?}");
+    let targets: Vec<&str> = sent[0]["resolvers"]
+        .as_array()
+        .map(|rows| rows.iter().filter_map(|r| r["target"].as_str()).collect())
+        .unwrap_or_default();
+    assert_eq!(targets, vec!["dns.example", "theirs.example"]);
+    assert_eq!(sent[0]["drop-seeded"], json!(true));
 }
 
 #[test]
@@ -1077,4 +1620,138 @@ fn revision_retention_resets_to_the_service_defaults_and_says_when_it_last_ran()
         vec![serde_json::to_value(RetentionSettingsSetRequest::DEFAULT).expect("encode")],
         "the reset sends the service's own defaults"
     );
+}
+
+/// The retention, log-retention and traffic sets replace every field: each
+/// edit is laid over a fresh read, so what another client changed since the
+/// screen loaded is not written back.
+#[test]
+fn whole_set_writes_keep_what_another_client_changed() {
+    let fake = service();
+    let revisions = |rejected: u32| {
+        json!({
+            "superseded-days": 30, "superseded-count-cap": 100, "rejected-days": rejected,
+            "rolledback-days": 14, "rolledback-count-cap": 20, "pin-lkg": true,
+            "updated-at": 1_700_000_000u64
+        })
+    };
+    let logs = |audit_days: u32| {
+        json!({
+            "log-max-age-days": 14, "log-max-size-bytes": 10_485_760u64,
+            "audit-max-age-days": audit_days, "audit-max-size-bytes": 10_485_760u64,
+            "updated-at": 1_700_000_000u64
+        })
+    };
+    fake.answer(IpcOperationName::RetentionSettingsGet, revisions(7));
+    fake.answer(IpcOperationName::RetentionSettingsSet, revisions(7));
+    fake.answer(IpcOperationName::LogRetentionConfigGet, logs(90));
+    fake.answer(IpcOperationName::LogRetentionConfigSet, logs(90));
+    let mut app = on_settings();
+    answer(&mut app, "c6");
+    drain(&mut app, &fake);
+
+    fake.answer(IpcOperationName::RetentionSettingsGet, revisions(3));
+    let rolledback = row_of(
+        &app,
+        Category::Logs,
+        ItemId::Revisions(RevisionField::RolledbackDays),
+    );
+    answer(&mut app, &format!("i{rolledback} 9"));
+    drain(&mut app, &fake);
+    let sent = fake.sent(IpcOperationName::RetentionSettingsSet);
+    assert_eq!(sent.len(), 1, "{sent:?}");
+    assert_eq!(sent[0]["rolledback-days"], json!(9));
+    assert_eq!(sent[0]["rejected-days"], json!(3), "{sent:?}");
+
+    fake.answer(IpcOperationName::LogRetentionConfigGet, logs(30));
+    let age = row_of(
+        &app,
+        Category::Logs,
+        ItemId::LogRetention(LogField::LogsAge),
+    );
+    answer(&mut app, &format!("i{age} 21"));
+    drain(&mut app, &fake);
+    let sent = fake.sent(IpcOperationName::LogRetentionConfigSet);
+    assert_eq!(sent.len(), 1, "{sent:?}");
+    assert_eq!(sent[0]["log-max-age-days"], json!(21));
+    assert_eq!(sent[0]["audit-max-age-days"], json!(30), "{sent:?}");
+
+    let stats = |loopback: bool| {
+        json!({
+            "today": [], "session": [], "all-time": [],
+            "settings": { "enabled": true, "count-loopback": loopback,
+                          "count-virtual": false, "retention-days": 30 }
+        })
+    };
+    fake.answer(IpcOperationName::TrafficStatsGet, stats(false));
+    fake.answer(IpcOperationName::TrafficStatsSet, json!({}));
+    answer(&mut app, "c7");
+    drain(&mut app, &fake);
+    fake.answer(IpcOperationName::TrafficStatsGet, stats(true));
+    let days = row_of(&app, Category::Traffic, ItemId::TrafficRetention);
+    answer(&mut app, &format!("i{days} 60"));
+    drain(&mut app, &fake);
+    let sent = fake.sent(IpcOperationName::TrafficStatsSet);
+    assert_eq!(sent.len(), 1, "{sent:?}");
+    assert_eq!(sent[0]["settings"]["retention-days"], json!(60));
+    assert_eq!(
+        sent[0]["settings"]["count-loopback"],
+        json!(true),
+        "{sent:?}"
+    );
+}
+
+/// A yes acts on the row it was asked about, found again by what it says: a
+/// list read while the question is up moves the row, and a row by number
+/// would then be another one. A row gone by then is not acted on.
+#[test]
+fn a_confirmed_removal_acts_on_the_row_asked_about_not_its_number() {
+    use nrr_shared::ipc_payloads::VpnGatewayDto;
+    let gw = |address: &str| VpnGatewayDto {
+        address: address.to_owned(),
+        program: String::new(),
+    };
+    let fake = service();
+    let mut snapshot = snapshot_json(&Fixture::healthy());
+    snapshot["confirmed-vpn-gateways"] = json!([
+        { "address": "198.51.100.2", "program": "" },
+        { "address": "198.51.100.3", "program": "" }
+    ]);
+    fake.answer(IpcOperationName::SnapshotInitialGet, snapshot);
+    fake.answer(
+        IpcOperationName::RouteVpnGatewaysSet,
+        json!({ "gateways": [{ "address": "198.51.100.3", "program": "" }] }),
+    );
+    let mut app = on_settings();
+    answer(&mut app, "c2");
+    drain(&mut app, &fake);
+    let second = ItemId::Provider(super::providers::ProviderRow::RemoveGateway(1));
+
+    app.vpn_gateway_trust.confirmed =
+        vec![gw("198.51.100.1"), gw("198.51.100.2"), gw("198.51.100.3")];
+    let row = row_of(&app, Category::Routing, second);
+    answer(&mut app, &format!("i{row}"));
+    assert!(matches!(app.settings.mode, Mode::Confirming { .. }));
+    // The window removed the first one meanwhile.
+    app.vpn_gateway_trust.confirmed = vec![gw("198.51.100.2"), gw("198.51.100.3")];
+    answer(&mut app, "yes");
+    drain(&mut app, &fake);
+    let sent = fake.sent(IpcOperationName::RouteVpnGatewaysSet);
+    assert_eq!(sent.len(), 1, "{sent:?}");
+    assert_eq!(
+        sent[0]["gateways"],
+        json!([{ "address": "198.51.100.3", "program": "" }]),
+        "the one asked about is removed, not the one now in its place"
+    );
+
+    app.vpn_gateway_trust.confirmed =
+        vec![gw("198.51.100.1"), gw("198.51.100.2"), gw("198.51.100.3")];
+    let row = row_of(&app, Category::Routing, second);
+    answer(&mut app, &format!("i{row}"));
+    app.vpn_gateway_trust.confirmed = vec![gw("198.51.100.1"), gw("198.51.100.3")];
+    answer(&mut app, "yes");
+    drain(&mut app, &fake);
+    assert_eq!(fake.sent(IpcOperationName::RouteVpnGatewaysSet).len(), 1);
+    assert_eq!(app.settings.mode, Mode::Browse);
+    assert!(said(&app).contains("list changed"), "{}", said(&app));
 }

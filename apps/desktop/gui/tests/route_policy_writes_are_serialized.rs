@@ -146,7 +146,9 @@ fn run_node(program: &str) -> Option<String> {
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
-        .ok()?;
+        .unwrap_or_else(|e| {
+            panic!("this check runs the QML JavaScript through node; install Node.js ({e})")
+        });
     child
         .stdin
         .as_mut()

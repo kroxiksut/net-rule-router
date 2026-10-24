@@ -12,7 +12,7 @@
 //! between. Windows decorates the results with type prefixes and semicolons
 //! (`"type:  5 cdn.example;::ffff:192.0.2.1;2001:db8::1;"`).
 
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+use std::net::IpAddr;
 
 use super::DnsObservation;
 
@@ -41,9 +41,15 @@ pub fn parse_query_completed(bytes: &[u8]) -> Option<DnsObservation> {
     while start > results_from && units.at(start - 1) != 0 {
         start -= 1;
     }
-    let results = || (start..end).map(move |i| units.at(i));
-    let mut ipv4s = ipv4_tokens(results());
-    let ipv6s = ipv6_tokens(results(), &mut ipv4s);
+    let mut ipv4s = Vec::new();
+    let mut ipv6s = Vec::new();
+    for_each_record::<MAX_RECORD>((start..end).map(|i| units.at(i)), |record| {
+        match record.and_then(record_address) {
+            Some(IpAddr::V4(v4)) => push_distinct(&mut ipv4s, v4),
+            Some(IpAddr::V6(v6)) => push_distinct(&mut ipv6s, v6),
+            None => {}
+        }
+    });
     if ipv4s.is_empty() && ipv6s.is_empty() {
         return None;
     }
@@ -91,89 +97,71 @@ fn push_distinct<T: PartialEq>(out: &mut Vec<T>, value: T) {
     }
 }
 
-/// Calls `flush` with every maximal run of ASCII bytes `admits` accepts, a run
-/// longer than `N` passed as `None`. Fixed-size buffer: the scan never
-/// allocates.
-fn for_each_token<const N: usize>(
+/// Longest record kept: a `type:  28 ` prefix plus a scoped mapped address.
+const MAX_RECORD: usize = 64;
+
+/// Calls `flush` with every `;`-separated record of the results, trimmed; a
+/// record longer than `N` or holding a non-ASCII unit is passed as `None`.
+/// Fixed-size buffer: the scan never allocates.
+fn for_each_record<const N: usize>(
     units: impl Iterator<Item = u16>,
-    admits: impl Fn(u8) -> bool,
     mut flush: impl FnMut(Option<&str>),
 ) {
-    fn emit(token: &[u8], overlong: bool, flush: &mut impl FnMut(Option<&str>)) {
-        if token.is_empty() {
+    fn emit(record: &[u8], damaged: bool, flush: &mut impl FnMut(Option<&str>)) {
+        if damaged {
+            flush(None);
             return;
         }
-        flush(if overlong {
-            None
-        } else {
-            std::str::from_utf8(token).ok()
-        });
-    }
-    let mut token = [0u8; N];
-    let mut len = 0usize;
-    let mut overlong = false;
-    for unit in units {
-        match u8::try_from(unit) {
-            Ok(b) if admits(b) => {
-                if len < N {
-                    token[len] = b;
-                    len += 1;
-                } else {
-                    overlong = true;
-                }
-            }
-            _ => {
-                emit(&token[..len], overlong, &mut flush);
-                len = 0;
-                overlong = false;
-            }
+        let text = std::str::from_utf8(record).map_or("", str::trim_ascii);
+        if !text.is_empty() {
+            flush(Some(text));
         }
     }
-    emit(&token[..len], overlong, &mut flush);
+    let mut record = [0u8; N];
+    let mut len = 0usize;
+    let mut damaged = false;
+    for unit in units {
+        match u8::try_from(unit) {
+            Ok(b';') => {
+                emit(&record[..len], damaged, &mut flush);
+                len = 0;
+                damaged = false;
+            }
+            Ok(b) if b.is_ascii() => {
+                if len < N {
+                    record[len] = b;
+                    len += 1;
+                } else {
+                    damaged = true;
+                }
+            }
+            _ => damaged = true,
+        }
+    }
+    emit(&record[..len], damaged, &mut flush);
 }
 
-/// Every distinct dotted-quad IPv4 in a results string, in order; a token is a
-/// maximal run of ASCII digits and dots.
-fn ipv4_tokens(units: impl Iterator<Item = u16>) -> Vec<Ipv4Addr> {
-    // "255.255.255.255": anything longer is no address.
-    const MAX_TOKEN: usize = 15;
-    let mut out = Vec::new();
-    for_each_token::<MAX_TOKEN>(
-        units,
-        |b| b.is_ascii_digit() || b == b'.',
-        |token| {
-            if let Some(ip) = token.and_then(|t| t.parse::<Ipv4Addr>().ok()) {
-                push_distinct(&mut out, ip);
+/// The address one results record names, or `None`. A record is an address
+/// alone (`192.0.2.1`, `::ffff:192.0.2.1`) or one behind a `type: 1` /
+/// `type: 28` prefix, parsed whole. Any other record, a CNAME name
+/// (`type:  5 cdn.example`) above all, is dropped whole: a run of digits and
+/// dots inside a name the remote server chose was never an answer.
+fn record_address(record: &str) -> Option<IpAddr> {
+    let value = match record.strip_prefix("type:") {
+        Some(rest) => {
+            let rest = rest.trim_ascii_start();
+            let digits = rest.len() - rest.trim_start_matches(|c: char| c.is_ascii_digit()).len();
+            let (rtype, value) = rest.split_at(digits);
+            if !matches!(rtype, "1" | "28") {
+                return None;
             }
-        },
-    );
-    out
-}
-
-/// Every distinct IPv6 in a results string, in order; a token is a maximal run
-/// of hex digits, colons and dots holding a colon. A mapped one goes to
-/// `ipv4s` instead, as the IPv4 address it is.
-fn ipv6_tokens(units: impl Iterator<Item = u16>, ipv4s: &mut Vec<Ipv4Addr>) -> Vec<Ipv6Addr> {
-    // "ffff:ffff:ffff:ffff:ffff:ffff:255.255.255.255".
-    const MAX_TOKEN: usize = 45;
-    let mut out = Vec::new();
-    for_each_token::<MAX_TOKEN>(
-        units,
-        |b| b.is_ascii_hexdigit() || b == b':' || b == b'.',
-        |token| {
-            let Some(ip) = token
-                .filter(|t| t.contains(':'))
-                .and_then(|t| t.parse::<Ipv6Addr>().ok())
-            else {
-                return;
-            };
-            match IpAddr::V6(ip).to_canonical() {
-                IpAddr::V4(v4) => push_distinct(ipv4s, v4),
-                IpAddr::V6(v6) => push_distinct(&mut out, v6),
-            }
-        },
-    );
-    out
+            value.trim_ascii_start()
+        }
+        None => record,
+    };
+    // A link-local AAAA carries its zone, which no address parser takes.
+    let value = value.split_once('%').map_or(value, |(address, _)| address);
+    value.parse::<IpAddr>().ok().map(|ip| ip.to_canonical())
 }
 
 #[cfg(test)]

@@ -30,7 +30,7 @@ impl SecondaryRouteCoordinator {
             .resolve_from(sid, Some(reading))
             .secondary
             .and_then(|t| adapters.iter().find(|a| a.index == t.interface_index));
-        Ipv6Guard::from_links(adapters, secondary)
+        Ipv6Guard::from_links(adapters, secondary, reading.routes().unwrap_or_default())
     }
 
     /// resolve everything the

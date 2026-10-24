@@ -22,7 +22,7 @@ use std::collections::{HashSet, VecDeque};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::atomic::Ordering;
 
-use nrr_domain::canonical::{CanonicalRule, CanonicalRuleSet, VerifyKey};
+use nrr_domain::canonical::{CanonicalRule, CanonicalRuleSet, VerifyKey, VerifyMove};
 use nrr_domain::decision_matching::match_suffix_domain;
 use nrr_domain::RuleAction;
 use nrr_shared::ipc_payloads::{StatusUpdateEvent, VerifyVerdictDto};
@@ -39,6 +39,9 @@ pub struct VerifyPrimaryWiring {
     /// The principal's "include subdomains" setting: with it on, an exact rule
     /// also routes its subdomains, so it is also what their check is about.
     pub include_subdomains: Arc<dyn Fn(&str) -> bool + Send + Sync>,
+    /// Whether the principal's leak protection keeps everything off the main
+    /// connection: a tunnel rule's host is then never named there.
+    pub keeps_names_off_main: Arc<dyn Fn(&str) -> bool + Send + Sync>,
     /// Re-applies one principal's policy at once after its verdicts moved a
     /// rule. `None` leaves it to the next enforcement pass, which counts the
     /// verdicts among its inputs.
@@ -90,7 +93,8 @@ pub(super) struct VerifyCheck {
     target: Ipv4Addr,
     port: Option<u16>,
     written_source: Ipv4Addr,
-    other_source: Ipv4Addr,
+    /// `None` when the other link may not hear this host's name.
+    other_source: Option<Ipv4Addr>,
     /// Misses already on the written link: the control probe runs only when
     /// this one makes the second.
     misses_before: u8,
@@ -148,7 +152,18 @@ impl VerifyCheck {
         );
         let control = (verdict == PathVerdict::Silent
             && self.misses_before.saturating_add(1) >= WRITTEN_LINK_MISSES)
-            .then(|| self.probe_over(self.other_source));
+            .then(|| match self.other_source {
+                Some(source) => self.probe_over(source),
+                None => {
+                    tracing::info!(
+                        target: "nrr::auto-rules",
+                        sid = %self.sid,
+                        host = %self.host,
+                        "? rule destination silent over the tunnel; not asked over the main connection, which leak protection keeps it off",
+                    );
+                    PathVerdict::Indeterminate
+                }
+            });
         self.outcome(verdict, control)
     }
 }
@@ -235,6 +250,8 @@ fn push_finished(finished: &Mutex<Vec<VerifyOutcome>>, outcome: VerifyOutcome) {
 /// "Does not open where it is written, opens on the other link".
 struct Verdict {
     host: String,
+    /// Every host proven so far, `host` first: what enforcement moves.
+    proven: std::collections::BTreeSet<String>,
     since_ms: i64,
     dismissed: bool,
 }
@@ -509,6 +526,8 @@ impl AutoRulesEngine {
             RouteRole::Primary => main,
             RouteRole::Secondary => additional,
         };
+        // Read before the state lock: it asks the policy store.
+        let off_main = (wiring.keeps_names_off_main)(sid);
         let job = {
             let mut states = self.verify.lock().unwrap_or_else(|p| p.into_inner());
             let Some(state) = states.get_mut(sid) else {
@@ -542,7 +561,8 @@ impl AutoRulesEngine {
                 target,
                 port: candidate.port,
                 written_source: link(written),
-                other_source: link(other_route(written)),
+                other_source: (!(off_main && written == RouteRole::Secondary))
+                    .then(|| link(other_route(written))),
                 misses_before: state.misses.get(host).copied().unwrap_or(0),
                 probe: Arc::clone(&wiring.probe),
             };
@@ -655,13 +675,23 @@ impl AutoRulesEngine {
             let Some(state) = states.get_mut(sid) else {
                 return;
             };
-            if !state.rules.contains(key) || state.verdicts.contains_key(key) {
+            if !state.rules.contains(key) {
+                return;
+            }
+            // A second host of the same wide rule moves on its own proof.
+            if let Some(verdict) = state.verdicts.get_mut(key) {
+                if !verdict.proven.insert(host.to_owned()) {
+                    return;
+                }
+                drop(states);
+                self.verdicts_changed(sid, true);
                 return;
             }
             state.verdicts.insert(
                 key.clone(),
                 Verdict {
                     host: host.to_owned(),
+                    proven: std::iter::once(host.to_owned()).collect(),
                     since_ms: unix_ms(now),
                     dismissed: false,
                 },
@@ -675,7 +705,7 @@ impl AutoRulesEngine {
             host = %host,
             from = written.slug(),
             to = other_route(written).slug(),
-            "the route a ? rule is written for does not reach this host and the other route does; the rule uses the other route until restart, and the move is offered",
+            "the route a ? rule is written for does not reach this host and the other route does; until restart this host uses the other route (a rule for one site moves whole), and the move is offered",
         );
         self.verdicts_changed(sid, true);
     }
@@ -687,7 +717,16 @@ impl AutoRulesEngine {
             let states = self.verify.lock().unwrap_or_else(|p| p.into_inner());
             states.get(sid).map_or((HashSet::new(), 0), |state| {
                 (
-                    state.verdicts.keys().cloned().collect::<HashSet<_>>(),
+                    state
+                        .verdicts
+                        .iter()
+                        .flat_map(|(key, verdict)| {
+                            verdict.proven.iter().map(|host| VerifyMove {
+                                key: key.clone(),
+                                host: host.clone(),
+                            })
+                        })
+                        .collect::<HashSet<_>>(),
                     state.pending_count(),
                 )
             })

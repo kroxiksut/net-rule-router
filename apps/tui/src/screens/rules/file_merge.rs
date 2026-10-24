@@ -9,7 +9,7 @@
 //! be the applied ones first, as in the window, whose merge ignores unapplied
 //! edits.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use nrr_client_logic::rebase::{Conflict, ConflictKind, MergeView};
 use nrr_client_logic::rules_table::{RuleRow, RuleType, TargetRoute};
@@ -46,8 +46,8 @@ pub fn start(app: &mut AppState) -> bool {
         rules.note = Some(Note::new(text::FILES_DIRTY));
         return true;
     }
-    let texts = match read_bound(app) {
-        Ok(Some(texts)) => texts,
+    let (texts, policy) = match read_bound(app) {
+        Ok(Some(bound)) => bound,
         Ok(None) => {
             app.rules.note = Some(Note::new(text::FILES_NONE));
             return true;
@@ -59,13 +59,13 @@ pub fn start(app: &mut AppState) -> bool {
     };
     app.rules.note = None;
     app.rules.busy = Some(Busy::Previewing);
-    app.outbox.push(merge_job(texts, Vec::new(), false));
+    app.outbox.push(merge_job(texts, policy, Vec::new(), false));
     true
 }
 
-/// The text of each bound file, `""` for a route with none; `None` when no
-/// file is bound at all.
-fn read_bound(app: &AppState) -> Result<Option<[String; 2]>, Box<Note>> {
+/// The text of each bound file, `""` for a route with none, and the merge
+/// policy chosen in either client; `None` when no file is bound at all.
+fn read_bound(app: &AppState) -> Result<Option<([String; 2], MergePolicyDto)>, Box<Note>> {
     let Some(settings_file) = app.rules.settings_file.as_deref() else {
         return Ok(None);
     };
@@ -92,18 +92,22 @@ fn read_bound(app: &AppState) -> Result<Option<[String; 2]>, Box<Note>> {
             Err(error) => return Err(Box::new(super::read_failed(path, error))),
         }
     }
-    Ok(Some(texts))
+    Ok(Some((
+        texts,
+        MergePolicyDto::from_slug(&settings.merge_policy),
+    )))
 }
 
 fn ask(
     client: &dyn IpcClient,
     texts: &[String; 2],
+    policy: MergePolicyDto,
     resolutions: Vec<ConflictResolutionDto>,
 ) -> Result<MergeResultDto, Failure> {
     let request = MergePreviewRequest {
         primary_text: texts[0].clone(),
         secondary_text: texts[1].clone(),
-        policy: MergePolicyDto::Union,
+        policy,
         resolutions,
         keep_secondary: Vec::new(),
         include_child_processes: false,
@@ -117,11 +121,12 @@ fn ask(
 /// first pass, to show.
 fn merge_job(
     texts: [String; 2],
+    policy: MergePolicyDto,
     resolutions: Vec<ConflictResolutionDto>,
     last: bool,
 ) -> crate::backend::Job {
     Box::new(move |client: &dyn IpcClient| {
-        let answer = ask(client, &texts, resolutions);
+        let answer = ask(client, &texts, policy, resolutions);
         Reply::new(move |app| {
             app.rules.busy = None;
             match answer {
@@ -213,8 +218,34 @@ pub fn confirm(app: &mut AppState, texts: [String; 2], picks: &[(String, bool)])
             },
         })
         .collect();
+    // The same policy as the first pass, or conflicts it settled come back open.
+    let policy = app
+        .rules
+        .settings_file
+        .as_deref()
+        .and_then(|file| own_settings::merge_policy(file).ok())
+        .unwrap_or_default();
+    app.rules.merged_from = bound_paths(app)
+        .into_iter()
+        .zip(texts.iter())
+        .filter_map(|(path, text)| path.map(|path| (path, text.clone())))
+        .collect();
     app.rules.busy = Some(Busy::Previewing);
-    app.outbox.push(merge_job(texts, resolutions, true));
+    app.outbox.push(merge_job(texts, policy, resolutions, true));
+}
+
+/// The file bound to each route, primary first.
+fn bound_paths(app: &AppState) -> [Option<PathBuf>; 2] {
+    let Some(settings) = app
+        .rules
+        .settings_file
+        .as_deref()
+        .and_then(|file| own_settings::read(file).ok())
+    else {
+        return [None, None];
+    };
+    [settings.rules_files.primary, settings.rules_files.secondary]
+        .map(|path| (!path.is_empty()).then(|| PathBuf::from(path)))
 }
 
 fn merged(app: &mut AppState, result: &MergeResultDto) {

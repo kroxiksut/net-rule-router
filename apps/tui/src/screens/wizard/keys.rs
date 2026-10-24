@@ -87,7 +87,7 @@ pub const LEAK_OFF_NOTE: Key = key(
 );
 pub const LEAK_SITES_NOTE: Key = key(
     "settings.routing.leak-protection.note-sites",
-    "What your rules send through the additional connection never goes out the main one. Everything else keeps working.",
+    "What your rules send through the additional connection never goes out the main one while strict blocking of shared addresses is on, as it is by default. Everything else keeps working, except sites that share an address with a routed one.",
 );
 pub const LEAK_EVERYTHING_NOTE: Key = key(
     "settings.routing.leak-protection.note-everything",

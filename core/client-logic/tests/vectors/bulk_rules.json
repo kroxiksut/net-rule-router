@@ -388,6 +388,37 @@
       }
     },
     {
+      "name": "a check on an ipv6 literal is dropped with a note",
+      "input": {
+        "text": "?2001:db8::1\n?192.0.2.7\n--- IP\n?2001:db8::2\n",
+        "route": "secondary",
+        "os": "windows",
+        "verdicts": {
+          "exact-ip|2001:db8::1": {
+            "status": "valid"
+          },
+          "exact-ip|192.0.2.7": {
+            "status": "valid"
+          },
+          "exact-ip|2001:db8::2": {
+            "status": "valid"
+          }
+        }
+      },
+      "expected": {
+        "rows": [
+          "1 exact-ip warning add secondary on - dialog.rule.verify-ipv6 - - - 2001:db8::1",
+          "2 exact-ip ok add secondary on ? - - - - 192.0.2.7",
+          "4 exact-ip warning add secondary on - dialog.rule.verify-ipv6 - - - 2001:db8::2"
+        ],
+        "lines": 4,
+        "excess": 0,
+        "bound": "",
+        "counts": "3/0/0/0",
+        "remaining": ""
+      }
+    },
+    {
       "name": "deny chosen above drops a check",
       "input": {
         "text": "?example.com\nexample.org\n",
@@ -965,11 +996,11 @@
     {
       "name": "a turned-off program with +children is a disabled rule, as the file reads it",
       "input": {
-        "text": "--- Windows\n# codex.exe +children\n# codex.exe\ntool.exe +children\n# see notes +children\n",
+        "text": "--- Windows\n# codex.exe +children\n# helper.exe\ntool.exe +children\n# see notes +children\n",
         "route": "secondary",
         "os": "windows",
         "verdicts": {
-          "application|codex.exe": {
+          "application|helper.exe": {
             "status": "valid"
           },
           "application|codex.exe +children": {
@@ -983,7 +1014,7 @@
       "expected": {
         "rows": [
           "2 application ok add secondary off - - - - - codex.exe +children",
-          "3 application ok add secondary off - - - - - codex.exe",
+          "3 application ok add secondary off - - - - - helper.exe",
           "4 application ok add secondary on - - - - - tool.exe +children"
         ],
         "lines": 5,
@@ -1074,7 +1105,7 @@
       },
       "expected": {
         "rows": [
-          "1 - error keep primary on - rules.paste.unrecognized - - - --- Domains",
+          "1 - error keep primary on - rules.paste.unrecognized - - - ---  Domains",
           "2 - error keep primary on - rules.paste.unrecognized - - - ---",
           "3 - error keep primary on - rules.paste.unrecognized - - - ----- Domains",
           "4 domain ok add primary on - - - - - example.com"
@@ -1186,6 +1217,78 @@
         "bound": "",
         "counts": "2/0/1/0",
         "remaining": "--- Domains\n\"example.com\""
+      }
+    },
+    {
+      "name": "a hash inside a program value stays in it, a one-word note under IP is a note",
+      "input": {
+        "text": "--- Windows\nC:\\Projects\\C#\\tool.exe  # build tool\n# c#tool.exe\n--- IP\n# Office\n192.0.2.7\n",
+        "route": "secondary",
+        "os": "windows",
+        "verdicts": {
+          "application|C:\\Projects\\C#\\tool.exe": {
+            "status": "valid"
+          },
+          "application|c#tool.exe": {
+            "status": "valid"
+          },
+          "exact-ip|192.0.2.7": {
+            "status": "valid"
+          }
+        }
+      },
+      "expected": {
+        "rows": [
+          "2 application ok add secondary on - - - - #build tool C:\\Projects\\C#\\tool.exe",
+          "3 application ok add secondary off - - - - - c#tool.exe",
+          "6 exact-ip ok add secondary on - - - - - 192.0.2.7"
+        ],
+        "lines": 6,
+        "excess": 0,
+        "bound": "",
+        "counts": "3/0/0/0",
+        "remaining": ""
+      }
+    },
+    {
+      "name": "a program's flags do not make it a second rule",
+      "input": {
+        "text": "Telegram.exe +override\ncodex.exe\ncodex.exe +children\n",
+        "route": "secondary",
+        "os": "windows",
+        "existing": [
+          {
+            "type": "application",
+            "value": "Telegram.exe",
+            "route": "secondary"
+          }
+        ],
+        "verdicts": {
+          "application|Telegram.exe +override": {
+            "status": "valid"
+          },
+          "application|Telegram.exe": {
+            "status": "valid"
+          },
+          "application|codex.exe": {
+            "status": "valid"
+          },
+          "application|codex.exe +children": {
+            "status": "valid"
+          }
+        }
+      },
+      "expected": {
+        "rows": [
+          "1 application duplicate drop secondary on - rules.paste.already-present - - - Telegram.exe +override",
+          "2 application ok add secondary on - - - - - codex.exe",
+          "3 application duplicate drop secondary on - rules.paste.same-as-line line=2 - - codex.exe +children"
+        ],
+        "lines": 3,
+        "excess": 0,
+        "bound": "",
+        "counts": "1/0/0/2",
+        "remaining": ""
       }
     }
   ]

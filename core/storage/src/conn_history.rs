@@ -8,7 +8,7 @@
 //!
 //! Rows arrive already folded per hour by the service; this layer adds them
 //! up, ages them out per user, keeps the file under a byte cap by removing the
-//! oldest hours of the whole machine first, and counts what the cap removed.
+//! oldest hour of whoever holds the most rows, and counts what the cap removed.
 
 use std::cell::RefCell;
 
@@ -50,6 +50,35 @@ pub struct ConnHistoryEntry {
     pub block_reason: String,
 }
 
+/// Where the previous page ended: the sort key of its last entry (its clipped
+/// last time stands for its hour), so the next page starts after it whatever
+/// was written in between.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ConnHistoryCursor {
+    pub last_ms: i64,
+    pub program: String,
+    pub host: String,
+    pub remote_ip: String,
+    pub route: String,
+    pub verdict: String,
+    pub blocked_by: String,
+}
+
+impl ConnHistoryCursor {
+    /// The cursor that continues after `entry`.
+    pub fn after(entry: &ConnHistoryEntry) -> Self {
+        Self {
+            last_ms: entry.last_ms,
+            program: entry.program.clone(),
+            host: entry.host.clone(),
+            remote_ip: entry.remote_ip.clone(),
+            route: entry.route.clone(),
+            verdict: entry.verdict.clone(),
+            blocked_by: entry.blocked_by.clone(),
+        }
+    }
+}
+
 /// What [`SqliteConnHistoryStore::list`] reads.
 #[derive(Clone, Debug, Default)]
 pub struct ConnHistoryQuery<'a> {
@@ -61,7 +90,8 @@ pub struct ConnHistoryQuery<'a> {
     pub program: Option<&'a str>,
     /// An exact verdict slug.
     pub verdict: Option<&'a str>,
-    pub offset: u32,
+    /// Continue after this entry; `None` starts from the newest.
+    pub after: Option<&'a ConnHistoryCursor>,
     pub limit: u32,
 }
 
@@ -151,8 +181,11 @@ impl SqliteConnHistoryStore {
         tx.commit().map_err(|e| db_err("commit", e))
     }
 
-    /// The period's destinations, most recently used first, each one's hours
-    /// added up. Reads `limit` rows from `offset`.
+    /// The period's destinations, latest hour first, each one's hours added
+    /// up; first and last times are clipped to the period. Reads `limit` rows
+    /// after the cursor. The order is by hour, not by last time: a write
+    /// under a pinned period end moves a last time but never an hour, so a
+    /// walk over pages neither repeats nor skips a destination.
     pub fn list(&self, q: &ConnHistoryQuery<'_>) -> StorageResult<Vec<ConnHistoryEntry>> {
         let conn = self.conn.borrow();
         let from_hour = q.from_ms.div_euclid(HOUR_MS);
@@ -162,7 +195,8 @@ impl SqliteConnHistoryStore {
         // user's read the `(principal, hour)` key and scan the whole file.
         let sql = format!(
             "SELECT program, host, remote_ip, route, verdict, blocked_by,
-                    MIN(first_ms), MAX(last_ms), SUM(attempts), MAX(block_reason)
+                    MAX(MIN(first_ms), ?4), MAX(MIN(last_ms, ?5)), SUM(attempts),
+                    MAX(block_reason)
              FROM conn_history
              WHERE {}
                AND hour BETWEEN ?2 AND ?3
@@ -170,8 +204,14 @@ impl SqliteConnHistoryStore {
                AND (?6 IS NULL OR program LIKE ?6 ESCAPE '\\')
                AND (?7 IS NULL OR verdict = ?7)
              GROUP BY program, host, remote_ip, route, verdict, blocked_by
-             ORDER BY MAX(last_ms) DESC, program, remote_ip
-             LIMIT ?8 OFFSET ?9",
+             HAVING ?9 IS NULL
+                 OR MAX(hour) < ?9
+                 OR (MAX(hour) = ?9
+                     AND (program, host, remote_ip, route, verdict, blocked_by)
+                         > (?10, ?11, ?12, ?13, ?14, ?15))
+             ORDER BY MAX(hour) DESC,
+                      program, host, remote_ip, route, verdict, blocked_by
+             LIMIT ?8",
             if q.principal.is_some() {
                 "principal = ?1"
             } else {
@@ -181,6 +221,7 @@ impl SqliteConnHistoryStore {
         let mut stmt = conn
             .prepare_cached(&sql)
             .map_err(|e| db_err("prepare list", e))?;
+        let after = q.after;
         let rows = stmt
             .query_map(
                 params![
@@ -192,7 +233,13 @@ impl SqliteConnHistoryStore {
                     program,
                     q.verdict,
                     i64::from(q.limit),
-                    i64::from(q.offset),
+                    after.map(|c| c.last_ms.div_euclid(HOUR_MS)),
+                    after.map(|c| c.program.as_str()),
+                    after.map(|c| c.host.as_str()),
+                    after.map(|c| c.remote_ip.as_str()),
+                    after.map(|c| c.route.as_str()),
+                    after.map(|c| c.verdict.as_str()),
+                    after.map(|c| c.blocked_by.as_str()),
                 ],
                 |r| {
                     Ok(ConnHistoryEntry {
@@ -306,29 +353,40 @@ impl SqliteConnHistoryStore {
         Ok((pages.max(0) as u64).saturating_mul(pragma("page_size")?.max(0) as u64))
     }
 
-    /// Removes whole hours, oldest first across every user, until the rows fit
-    /// in `max_bytes`, and adds what went to each user's removal count.
-    /// Returns the rows removed.
+    /// Removes whole hours until the rows fit in `max_bytes`: each pass takes
+    /// the oldest hour of the user holding the most rows, so one user's
+    /// burst never costs another their week. What went is added to that
+    /// user's removal count. Returns the rows removed.
     pub fn enforce_cap(&self, max_bytes: u64) -> StorageResult<u64> {
         let mut removed = 0u64;
         while self.used_bytes()? > max_bytes {
             let mut conn = self.conn.borrow_mut();
             let tx = conn.transaction().map_err(|e| db_err("begin", e))?;
-            let oldest: Option<i64> = tx
-                .query_row("SELECT MIN(hour) FROM conn_history", [], |r| r.get(0))
+            let oldest: Option<(String, i64)> = tx
+                .query_row(
+                    "SELECT principal, MIN(hour) FROM conn_history
+                     GROUP BY principal ORDER BY COUNT(*) DESC, principal LIMIT 1",
+                    [],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+                .optional()
                 .map_err(|e| db_err("oldest hour", e))?;
-            let Some(hour) = oldest else {
+            let Some((principal, hour)) = oldest else {
                 break;
             };
             tx.execute(
                 "INSERT INTO conn_history_removed (principal, rows)
-                 SELECT principal, COUNT(*) FROM conn_history WHERE hour = ?1 GROUP BY principal
+                 SELECT principal, COUNT(*) FROM conn_history
+                 WHERE principal = ?1 AND hour = ?2 GROUP BY principal
                  ON CONFLICT(principal) DO UPDATE SET rows = rows + excluded.rows",
-                params![hour],
+                params![principal, hour],
             )
             .map_err(|e| db_err("count removed", e))?;
             let n = tx
-                .execute("DELETE FROM conn_history WHERE hour = ?1", params![hour])
+                .execute(
+                    "DELETE FROM conn_history WHERE principal = ?1 AND hour = ?2",
+                    params![principal, hour],
+                )
                 .map_err(|e| db_err("remove hour", e))?;
             tx.commit().map_err(|e| db_err("commit", e))?;
             removed = removed.saturating_add(n as u64);
@@ -541,14 +599,105 @@ mod tests {
             })
             .expect("page 1");
         assert_eq!(first[0].remote_ip, "192.0.2.4");
+        let cursor = ConnHistoryCursor::after(&first[1]);
         let second = s
             .list(&ConnHistoryQuery {
                 limit: 2,
-                offset: 2,
+                after: Some(&cursor),
                 ..all(Some("S-1"))
             })
             .expect("page 2");
         assert_eq!(second[0].remote_ip, "192.0.2.2");
+    }
+
+    #[test]
+    fn a_page_continues_after_its_cursor_whatever_was_written_meanwhile() {
+        let (_dir, s) = store();
+        // Four destinations last used in the same hour; the order within it
+        // is the full group key, so two with one address still sort alike
+        // from page to page.
+        let mut rows: Vec<_> = (0..4)
+            .map(|n| row("S-1", 10, "app.exe", &format!("192.0.2.{n}"), 1))
+            .collect();
+        rows[2].host = "other.example".into();
+        rows[2].remote_ip = "192.0.2.1".into();
+        s.upsert(&rows).expect("upsert");
+        let to_ms = 10 * HOUR_MS + 30;
+        let page = |after: Option<&ConnHistoryCursor>| {
+            s.list(&ConnHistoryQuery {
+                limit: 2,
+                after,
+                to_ms,
+                ..all(Some("S-1"))
+            })
+            .expect("page")
+        };
+        let first = page(None);
+        let cursor = ConnHistoryCursor::after(&first[1]);
+        // A destination not shown yet is used again before page 2 is read,
+        // in the same hour past the pinned end and in a newer hour: it keeps
+        // its place either way.
+        let mut same_hour = row("S-1", 10, "app.exe", "192.0.2.3", 1);
+        same_hour.first_ms = 10 * HOUR_MS + 40;
+        same_hour.last_ms = 10 * HOUR_MS + 40;
+        s.upsert(&[same_hour, row("S-1", 12, "app.exe", "192.0.2.3", 1)])
+            .expect("newer");
+        let second = page(Some(&cursor));
+        let mut seen: Vec<(String, String)> = first
+            .iter()
+            .chain(&second)
+            .map(|e| (e.remote_ip.clone(), e.host.clone()))
+            .collect();
+        assert_eq!(seen.len(), 4, "every destination once");
+        seen.sort();
+        seen.dedup();
+        assert_eq!(seen.len(), 4, "none twice");
+        assert!(page(Some(&ConnHistoryCursor::after(&second[1]))).is_empty());
+    }
+
+    #[test]
+    fn first_and_last_times_are_clipped_to_the_period() {
+        let (_dir, s) = store();
+        s.upsert(&[row("S-1", 10, "app.exe", "192.0.2.1", 3)])
+            .expect("upsert");
+        let got = s
+            .list(&ConnHistoryQuery {
+                from_ms: 10 * HOUR_MS + 15,
+                to_ms: 10 * HOUR_MS + 18,
+                ..all(Some("S-1"))
+            })
+            .expect("list");
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].first_ms, 10 * HOUR_MS + 15);
+        assert_eq!(got[0].last_ms, 10 * HOUR_MS + 18);
+        assert_eq!(got[0].attempts, 3, "hours are folded; attempts stay whole");
+    }
+
+    #[test]
+    fn the_cap_takes_from_the_heaviest_user_not_from_the_oldest_rows() {
+        let (_dir, s) = store();
+        let mut rows = vec![row("S-2", 0, "light.exe", "192.0.2.9", 1)];
+        for hour in 1..40 {
+            for n in 0..50 {
+                rows.push(row(
+                    "S-1",
+                    hour,
+                    &format!("program-{n}.exe"),
+                    "192.0.2.1",
+                    1,
+                ));
+            }
+        }
+        s.upsert(&rows).expect("upsert");
+        let before = s.used_bytes().expect("used");
+        assert!(s.enforce_cap(before / 2).expect("cap") > 0);
+        assert_eq!(
+            s.list(&all(Some("S-2"))).expect("S-2").len(),
+            1,
+            "the light user's oldest row stays"
+        );
+        assert_eq!(s.removed_for(Some("S-2")).expect("S-2"), 0);
+        assert!(s.removed_for(Some("S-1")).expect("S-1") > 0);
     }
 
     #[test]

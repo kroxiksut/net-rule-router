@@ -81,6 +81,10 @@ returns the code from the table. Check your files ahead of time with
 `nrr-serviced provision-check --primary <file>` on Linux: it changes nothing
 and returns the same codes.
 
+When the program is installed but its background service could not be
+registered or started, the EXE installer returns 15; the MSI undoes the
+installation and returns 1603.
+
 ## See also
 
 - [Rules file format](rules-file-format.md)

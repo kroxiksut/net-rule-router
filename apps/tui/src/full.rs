@@ -154,7 +154,11 @@ pub fn handle_paste(app: &mut AppState, text: &str, texts: &Texts) {
     if app.help_open {
         return;
     }
-    let target = screen(app.screen).text_target(app);
+    let current = screen(app.screen);
+    let target = current.text_target(app);
+    if target == paste::TextTarget::Lines && current.on_paste(app, text) {
+        return;
+    }
     for key in paste::keys_for(text, target) {
         handle_key(app, key, texts);
     }

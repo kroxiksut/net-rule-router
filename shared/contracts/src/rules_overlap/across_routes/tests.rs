@@ -75,11 +75,24 @@ fn the_longer_suffix_wins_whichever_route_holds_it() {
 #[test]
 fn a_suffix_beats_the_zone_of_the_same_name() {
     let found = overlaps(&book(
+        vec![zone("P1", "corp.example")],
+        vec![suffix("S1", "corp.example")],
+    ));
+    assert_eq!(found.len(), 1, "{found:?}");
+    assert_eq!(found[0].winner.rule_id, "S1");
+}
+
+/// `*.example` is the zone `example` to the service, so the two are one rule
+/// written twice and the main route keeps it.
+#[test]
+fn a_one_label_suffix_is_the_zone_of_that_name() {
+    let found = overlaps(&book(
         vec![zone("P1", "example")],
         vec![suffix("S1", "example")],
     ));
     assert_eq!(found.len(), 1, "{found:?}");
-    assert_eq!(found[0].winner.rule_id, "S1");
+    assert_eq!(found[0].kind, RouteOverlapKind::Duplicate);
+    assert_eq!(found[0].winner.rule_id, "P1");
 }
 
 #[test]
@@ -114,17 +127,27 @@ fn the_same_rule_on_both_routes_is_a_duplicate_the_main_route_wins() {
     assert_eq!(found[0].winner.route, "primary");
 }
 
+/// Coverage adds no subdomain twin beside a suffix rule of the same name, so
+/// the exact rule keeps only its own host and the suffix keeps the rest.
 #[test]
-fn a_name_and_its_suffix_are_one_rule_under_coverage() {
-    let found = find_route_overlaps(
-        &book(
-            vec![suffix("P1", "site.example")],
-            vec![exact("S1", "site.example")],
+fn a_name_beside_the_other_routes_suffix_stays_exact_under_coverage() {
+    for (primary, secondary, winner) in [
+        (
+            suffix("P1", "site.example"),
+            exact("S1", "site.example"),
+            "S1",
         ),
-        true,
-    );
-    assert_eq!(found.len(), 1, "{found:?}");
-    assert_eq!(found[0].kind, RouteOverlapKind::Duplicate);
+        (
+            exact("P1", "site.example"),
+            suffix("S1", "site.example"),
+            "P1",
+        ),
+    ] {
+        let found = find_route_overlaps(&book(vec![primary], vec![secondary]), true);
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert_eq!(found[0].kind, RouteOverlapKind::Nested, "{found:?}");
+        assert_eq!(found[0].winner.rule_id, winner, "{found:?}");
+    }
 }
 
 #[test]

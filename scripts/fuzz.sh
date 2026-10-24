@@ -13,7 +13,8 @@
 #   ./scripts/fuzz.sh --target dns_wire_query
 #   ./scripts/fuzz.sh --list
 #
-# New inputs the fuzzer finds go to fuzz/work/<target>/ (ignored by git); the
+# New inputs the fuzzer finds go to fuzz/work/<target>/ (ignored by git), those
+# of the pass at a target's production bound to fuzz/work/<target>-large/; the
 # committed seeds stay in fuzz/corpus/<target>/. A crash lands in
 # fuzz/artifacts/<target>/ with the libFuzzer report on stderr.
 
@@ -92,7 +93,38 @@ timeout_secs=10
 rss_limit_mb=2048
 max_len=65536
 
+# Targets whose production bound is above the default input size. libFuzzer
+# never produces an input longer than -max_len, so the branches at the bound (a
+# frame near 4 MiB, a rules file near 1 MiB) are reached only in a second pass
+# at that bound; the pass keeps its own corpus so the fast one stays small.
+large_max_len() {
+  case "$1" in
+    ipc_frame | ipc_payloads) echo 4194308 ;;
+    provisioning_bundle) echo 7340032 ;;
+    rules_file | rules_file_readers | preset_file | bulk_rules) echo 1048576 ;;
+    conn_trace_groups | user_settings) echo 262144 ;;
+    process_command_line) echo 131072 ;;
+    log_free_text_paths) echo 69632 ;;
+    *) echo "" ;;
+  esac
+}
+
 cyan "[fuzz] ${#targets[@]} target(s), ${seconds}s each, timeout ${timeout_secs}s, rss limit ${rss_limit_mb} MB"
+
+# One libFuzzer run; prints nothing, returns its exit status.
+run_target() {
+  local target="$1" work_dir="$2" seed_dir="$3" len="$4"
+  (
+    cd "$repo_root"
+    cargo +nightly fuzz run --fuzz-dir "$fuzz_dir" "$target" \
+      "$work_dir" "$seed_dir" -- \
+      -max_total_time="$seconds" \
+      -timeout="$timeout_secs" \
+      -rss_limit_mb="$rss_limit_mb" \
+      -max_len="$len" \
+      -print_final_stats=1
+  )
+}
 
 failed=()
 passed=()
@@ -104,16 +136,14 @@ for target in "${targets[@]}"; do
   mkdir -p "$work_dir" "$seed_dir"
   cyan "[fuzz] ($index/${#targets[@]}) $target, started $(date +%H:%M)"
   status=0
-  (
-    cd "$repo_root"
-    cargo +nightly fuzz run --fuzz-dir "$fuzz_dir" "$target" \
-      "$work_dir" "$seed_dir" -- \
-      -max_total_time="$seconds" \
-      -timeout="$timeout_secs" \
-      -rss_limit_mb="$rss_limit_mb" \
-      -max_len="$max_len" \
-      -print_final_stats=1
-  ) || status=$?
+  run_target "$target" "$work_dir" "$seed_dir" "$max_len" || status=$?
+  large="$(large_max_len "$target")"
+  if [ "$status" -eq 0 ] && [ -n "$large" ]; then
+    large_dir="$fuzz_dir/work/$target-large"
+    mkdir -p "$large_dir"
+    cyan "[fuzz] ($index/${#targets[@]}) $target at its production bound, max_len $large"
+    run_target "$target" "$large_dir" "$seed_dir" "$large" || status=$?
+  fi
   if [ "$status" -eq 0 ]; then
     passed+=("$target")
   else

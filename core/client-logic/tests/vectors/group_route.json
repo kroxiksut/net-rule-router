@@ -10,6 +10,7 @@
     { "name": "first covering rule wins", "input": { "rules": [ { "value": "a*.exe", "route": "primary", "enabled": true }, { "value": "a.exe", "route": "secondary", "enabled": true } ], "programs": ["a.exe"] }, "expected": "primary" },
     { "name": "programs that differ are mixed", "input": { "rules": [ { "value": "a.exe", "route": "secondary", "enabled": true } ], "programs": ["a.exe", "b.exe"] }, "expected": "mixed" },
     { "name": "a deny is a route of its own", "input": { "rules": [ { "value": "a.exe", "route": "block", "enabled": true } ], "programs": ["a.exe"] }, "expected": "block" },
-    { "name": "non-ASCII names", "input": { "rules": [ { "value": "ПРОГРАММА.exe", "route": "secondary", "enabled": true } ], "programs": ["программа.exe"] }, "expected": "secondary" }
+    { "name": "non-ASCII names", "input": { "rules": [ { "value": "ПРОГРАММА.exe", "route": "secondary", "enabled": true } ], "programs": ["программа.exe"] }, "expected": "secondary" },
+    { "name": "flags on a rule do not hide it", "input": { "rules": [ { "value": "VBoxHeadless.exe +children", "route": "secondary", "enabled": true } ], "programs": ["vboxheadless.exe"] }, "expected": "secondary" }
   ]
 }

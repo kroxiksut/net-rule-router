@@ -15,6 +15,10 @@
 //! so the client's NEXT resolution returns the real address and it connects
 //! directly. Self-healing on the second connection; nothing severs mid-flow.
 //!
+//! The same probe keeps peer-to-peer and crypto programs off the relay: a host
+//! such a program reached through it is excluded the same way, so one torrent
+//! client cannot fill the flow cap every relayed host shares.
+//!
 //! Everything is best-effort. A failed owner lookup, a full work queue, or a
 //! failed flush all just leave the flow relaying as before — self-heal never
 //! affects routing correctness, only convenience.
@@ -33,9 +37,9 @@ use crate::service_tasks::ServiceTaskKind;
 use crate::task_liveness::{TaskLiveness, ThreadExit, ThreadLease, Watch};
 
 /// A shared, session-scoped set of hostnames the answerers must keep on their
-/// REAL address even though fake-IP is on. Populated at runtime (currently by
-/// the VPN self-heal); consulted by both the rule-host and direct-host
-/// answerers before they allocate a fake address.
+/// REAL address even though fake-IP is on. Populated at runtime by the
+/// self-heal (VPN servers, peer-to-peer programs' hosts); consulted by both
+/// the rule-host and direct-host answerers before they allocate a fake address.
 ///
 /// In-memory only, by design: on a service restart the set is empty again and
 /// the self-heal re-detects the VPN's flow and re-excludes its server, which is
@@ -105,6 +109,10 @@ impl RuntimeHostExclusions {
 pub enum HealVerdict {
     /// A new exclusion was installed and DNS was flushed.
     Excluded,
+    /// A peer-to-peer or crypto program's host was excluded: that group keeps
+    /// real addresses. DNS is flushed by the caller, at a bounded rate — such
+    /// a program can name many hosts in a burst.
+    ExcludedPeerGroup,
     /// Decided, with nothing to do: the owner is not a VPN client, the host is
     /// shared platform infrastructure, it is not a hostname at all, or it was
     /// already excluded. Re-probing would reach the same answer.
@@ -160,6 +168,18 @@ pub fn probe_and_heal(
             &image,
         );
     if !confirmed_here && !looks_like_vpn(&image) {
+        if keeps_real_addresses(&image) && !is_platform_infrastructure(hostname) {
+            if !exclusions.insert(hostname) {
+                return HealVerdict::Settled;
+            }
+            tracing::debug!(
+                target: "nrr::fake-ip",
+                hostname,
+                image = %image,
+                "relayed flow belongs to a peer-to-peer program — its host keeps the real address from now on",
+            );
+            return HealVerdict::ExcludedPeerGroup;
+        }
         tracing::debug!(
             target: "nrr::fake-ip",
             hostname,
@@ -196,6 +216,14 @@ pub fn probe_and_heal(
         "a VPN client is reaching its server through the relay — excluding the server from fake-IP and flushing DNS so it reconnects directly",
     );
     HealVerdict::Excluded
+}
+
+/// Whether the program `image` names belongs to a group that keeps real
+/// addresses: its peers are bare addresses, and the relay's flow cap is shared
+/// by every relayed host on the machine.
+fn keeps_real_addresses(image: &str) -> bool {
+    nrr_platform_api::classify_app(image)
+        .is_some_and(nrr_platform_api::AppGroupKind::excluded_from_fake_ip)
 }
 
 /// App-platform / telemetry zones a VPN client routinely contacts that can
@@ -294,6 +322,11 @@ impl VpnSelfHealObserver {
     /// table, not a slow owner lookup.
     const PROBE_WORK_DEADLINE: std::time::Duration = std::time::Duration::from_secs(60);
 
+    /// Floor between two DNS flushes for peer-group exclusions. One flush makes
+    /// every program on the machine resolve again, and a skipped one costs at
+    /// most the virtual answer's short TTL.
+    const PEER_GROUP_FLUSH_INTERVAL: std::time::Duration = std::time::Duration::from_secs(10);
+
     #[must_use]
     pub fn new(
         owner_lookup: Arc<dyn FlowOwnerLookup>,
@@ -322,6 +355,7 @@ impl VpnSelfHealObserver {
                 // named — leaves it eligible, because the very first flow to a host
                 // is the one most likely to race the connection table.
                 let mut attempts: HashMap<String, u8> = HashMap::new();
+                let mut last_peer_group_flush: Option<std::time::Instant> = None;
                 while let Ok(job) = rx.recv() {
                     let _probe = lease.as_ref().map(ThreadLease::work);
                     let key = normalize_hostname(&job.hostname);
@@ -349,6 +383,15 @@ impl VpnSelfHealObserver {
                             attempts.insert(key, Self::MAX_INCONCLUSIVE_PROBES);
                             if let Some(persist) = persist.as_ref() {
                                 persist(&job.hostname);
+                            }
+                        }
+                        HealVerdict::ExcludedPeerGroup => {
+                            attempts.insert(key, Self::MAX_INCONCLUSIVE_PROBES);
+                            if last_peer_group_flush
+                                .is_none_or(|at| at.elapsed() >= Self::PEER_GROUP_FLUSH_INTERVAL)
+                            {
+                                last_peer_group_flush = Some(std::time::Instant::now());
+                                flush();
                             }
                         }
                         HealVerdict::Settled => {
@@ -556,6 +599,64 @@ mod tests {
             client,
             fake,
             "assistant.example",
+        );
+        assert_eq!(healed, HealVerdict::Settled);
+        assert!(ex.is_empty());
+    }
+
+    /// A torrent client under a suffix rule would otherwise hold relay slots
+    /// for every tracker it names; its host keeps the real address instead.
+    /// The flush is the caller's, rate-limited.
+    #[test]
+    fn a_peer_to_peer_programs_host_is_excluded_without_a_flush_here() {
+        let owner = MockFlowOwnerLookup::new();
+        let client = addr("10.0.0.2:51000");
+        let fake = addr("198.18.0.12:443");
+        owner.set_owner(client, fake, "qbittorrent.exe");
+        let ex = RuntimeHostExclusions::new();
+        let flush = || panic!("the worker flushes for peer groups, at its own rate");
+
+        let healed = probe_and_heal(
+            &owner,
+            &no_confirmations(),
+            &ex,
+            &flush,
+            client,
+            fake,
+            "tracker.example",
+        );
+        assert_eq!(healed, HealVerdict::ExcludedPeerGroup);
+        assert!(ex.contains("tracker.example"));
+
+        let again = probe_and_heal(
+            &owner,
+            &no_confirmations(),
+            &ex,
+            &flush,
+            client,
+            fake,
+            "tracker.example",
+        );
+        assert_eq!(again, HealVerdict::Settled, "already excluded");
+    }
+
+    #[test]
+    fn a_peer_to_peer_flow_to_platform_infrastructure_is_not_excluded() {
+        let owner = MockFlowOwnerLookup::new();
+        let client = addr("10.0.0.2:51000");
+        let fake = addr("198.18.0.13:443");
+        owner.set_owner(client, fake, "qbittorrent.exe");
+        let ex = RuntimeHostExclusions::new();
+        let flush = || panic!("must not flush for platform infrastructure");
+
+        let healed = probe_and_heal(
+            &owner,
+            &no_confirmations(),
+            &ex,
+            &flush,
+            client,
+            fake,
+            "update.microsoft.com",
         );
         assert_eq!(healed, HealVerdict::Settled);
         assert!(ex.is_empty());

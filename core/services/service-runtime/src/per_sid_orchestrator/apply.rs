@@ -290,31 +290,45 @@ impl PerSidApplyOrchestrator {
         // `compute_filters_for_sid` path. No-policy / no-active-rules install
         // nothing but still record the SID so a later on_disconnect / recompile
         // stays consistent.
-        let filters =
-            match self.compute_filters_for_sid(sid, true, rules_override, ComputeIntent::Apply)? {
-                ComputedFilterSet::NoPolicy => {
-                    // No policy → record the SID as known (so a later on_disconnect
-                    // doesn't panic) but install nothing. Anything this SID was
-                    // carrying has to come down: the empty state would otherwise
-                    // orphan it.
-                    self.delete_superseded_filters(sid, &previously_installed, &[]);
-                    self.upsert_state(sid, Vec::new());
-                    self.emit_audit(sid, PerSidApplyAuditKind::Applied, 0, "no-policy");
-                    return Ok(0);
+        // A book or policy row that does not read is this user's failure, and
+        // the health card hears of it the same way as a refused filter set.
+        let computed =
+            match self.compute_filters_for_sid(sid, true, rules_override, ComputeIntent::Apply) {
+                Ok(computed) => computed,
+                Err(e) => {
+                    self.emit_audit(
+                        sid,
+                        PerSidApplyAuditKind::Failed,
+                        0,
+                        &format!("install for {sid}: {e}"),
+                    );
+                    return Err(e);
                 }
-                ComputedFilterSet::NoActiveRules => {
-                    self.delete_superseded_filters(sid, &previously_installed, &[]);
-                    self.upsert_state(sid, Vec::new());
-                    let kind = if was_known {
-                        PerSidApplyAuditKind::Updated
-                    } else {
-                        PerSidApplyAuditKind::Applied
-                    };
-                    self.emit_audit(sid, kind, 0, "no-active-rules");
-                    return Ok(0);
-                }
-                ComputedFilterSet::Install(plan) => plan.filters,
             };
+        let filters = match computed {
+            ComputedFilterSet::NoPolicy => {
+                // No policy → record the SID as known (so a later on_disconnect
+                // doesn't panic) but install nothing. Anything this SID was
+                // carrying has to come down: the empty state would otherwise
+                // orphan it.
+                self.delete_superseded_filters(sid, &previously_installed, &[]);
+                self.upsert_state(sid, Vec::new());
+                self.emit_audit(sid, PerSidApplyAuditKind::Applied, 0, "no-policy");
+                return Ok(0);
+            }
+            ComputedFilterSet::NoActiveRules => {
+                self.delete_superseded_filters(sid, &previously_installed, &[]);
+                self.upsert_state(sid, Vec::new());
+                let kind = if was_known {
+                    PerSidApplyAuditKind::Updated
+                } else {
+                    PerSidApplyAuditKind::Applied
+                };
+                self.emit_audit(sid, kind, 0, "no-active-rules");
+                return Ok(0);
+            }
+            ComputedFilterSet::Install(plan) => plan.filters,
+        };
         // Route before block — same ordering invariant the reconcile enforces
         // (see `reconcile_to_desired`). A cold install lands the whole pin set
         // at once, so every destination it covers must already be routed.
@@ -574,8 +588,15 @@ impl PerSidApplyOrchestrator {
             .collect();
 
         if to_add.is_empty() && to_remove.is_empty() {
-            if audit_no_op {
-                self.emit_audit(
+            // Once per run of passes that changed nothing.
+            let first_quiet = audit_no_op
+                && self
+                    .quiet_since_noop
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .insert(sid.to_owned());
+            if first_quiet {
+                self.emit_noop_audit(
                     sid,
                     PerSidApplyAuditKind::Updated,
                     0,
@@ -847,6 +868,13 @@ impl PerSidApplyOrchestrator {
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .clear();
+        self.outage_hold_state
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clear();
+        if let Some(status) = self.block_all_posture_status.as_ref() {
+            status.set_outage(false);
+        }
         self.fail_closed_state
             .lock()
             .unwrap_or_else(|p| p.into_inner())
@@ -1167,6 +1195,22 @@ impl PerSidApplyOrchestrator {
     }
 
     fn emit_audit(&self, sid: &str, kind: PerSidApplyAuditKind, filter_count: u32, message: &str) {
+        self.quiet_since_noop
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .remove(sid);
+        self.emit_noop_audit(sid, kind, filter_count, message);
+    }
+
+    /// [`Self::emit_audit`] for a pass that changed nothing: it leaves the
+    /// user marked as quiet.
+    fn emit_noop_audit(
+        &self,
+        sid: &str,
+        kind: PerSidApplyAuditKind,
+        filter_count: u32,
+        message: &str,
+    ) {
         self.audit.emit(PerSidApplyAuditRecord {
             sid: sid.to_string(),
             kind,
@@ -1181,9 +1225,8 @@ impl PerSidApplyOrchestrator {
     /// - SIDs installed but not in `snapshot` → `remove_for_sid`.
     /// - SIDs in both → unchanged.
     ///
-    /// Errors are accumulated; the first error stops reconciliation
-    /// for the remaining SIDs but already-applied changes are kept
-    /// (consistent with the WFP transactions inside install/remove).
+    /// One user's failure never stalls the others: every SID is visited, the
+    /// first error comes back after the full pass, and what applied stays.
     pub fn reconcile(&self, snapshot: &[String]) -> Result<(), OrchestratorError> {
         let _membership = self
             .membership_lock
@@ -1267,21 +1310,45 @@ impl PerSidApplyOrchestrator {
             g.keys().cloned().collect()
         };
         let mut fresh = std::collections::BTreeSet::new();
+        // A user whose book or policy does not read (a persistent failure) must
+        // not keep the next one unprotected or a departed one's set in the
+        // engine: the pass visits every SID and reports the first failure after.
+        let mut first_err: Option<OrchestratorError> = None;
+        let mut note = |sid: &str, stage: &'static str, e: OrchestratorError| {
+            tracing::error!(
+                target: "nrr::per_sid_orchestrator",
+                msg_key = "persid-apply-reconcile-sid-failed",
+                sid = %sid,
+                stage,
+                error = %e,
+                "membership pass: one user failed; the others are still visited",
+            );
+            if first_err.is_none() {
+                first_err = Some(e);
+            }
+        };
         for sid in want.difference(&have) {
-            self.install_for_sid(sid)?;
-            fresh.insert(sid.clone());
+            match self.install_for_sid(sid) {
+                Ok(_) => {
+                    fresh.insert(sid.clone());
+                }
+                Err(e) => note(sid, "install", e),
+            }
         }
         for sid in have.difference(&want) {
-            self.remove_for_sid(sid)?;
+            if let Err(e) = self.remove_for_sid(sid) {
+                note(sid, "remove", e);
+            }
         }
         let outcome = self.follow_route_table_owner(&fresh);
         // The first pass over somebody present is what a deferred start waits
-        // for; a pass over nobody claims nothing and settles nothing, and a
-        // failed one leaves the inherited blocks standing for the next.
-        if !want.is_empty() && outcome.is_ok() {
+        // for; a pass over nobody claims nothing and settles nothing. A user
+        // whose install failed tracks nothing, so the blocks they inherited
+        // are their only protection until their book reads: left standing.
+        if !want.is_empty() && outcome.is_ok() && first_err.is_none() {
             self.adopt_orphans_after_pass();
         }
-        outcome
+        outcome.and(first_err.map_or(Ok(()), Err))
     }
 
     /// Delete filters from `previous` that `kept` no longer contains. A

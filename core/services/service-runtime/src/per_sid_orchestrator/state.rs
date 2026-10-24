@@ -160,6 +160,9 @@ pub struct PerSidApplyOrchestrator {
     /// because the pass, started on the older view, installed last. Taken
     /// before any per-SID lock, never inside one.
     pub(super) membership_lock: Mutex<()>,
+    /// Users whose last audited apply changed nothing: a repeat of it is the
+    /// same record again, and a loop of requests would write it unbounded.
+    pub(super) quiet_since_noop: Mutex<std::collections::HashSet<String>>,
     /// The decider the membership writers consult under that lock. `None`
     /// (tests, a degraded boot) leaves `reconcile(snapshot)` as the only way
     /// to change membership.
@@ -270,6 +273,9 @@ pub struct PerSidApplyOrchestrator {
     /// block-all set. Only transitions trigger a flush — the leak-guard
     /// reconcile recomputes every few seconds and must not flush steadily.
     pub(super) block_all_flush_state: Mutex<HashMap<String, bool>>,
+    /// The users whose last compute held everything because their additional
+    /// link could not be found.
+    pub(super) outage_hold_state: Mutex<std::collections::HashSet<String>>,
     /// Per SID, the highest standing filter volume already reported above the
     /// alarm line. The reconcile recomputes every few seconds, so the watchdog
     /// speaks only on a NEW peak — a plain rising edge went quiet after the

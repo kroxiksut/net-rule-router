@@ -16,15 +16,16 @@ ComboBox {
     // caller also gates whatever acts on the selection.
     property var itemEnabledResolver: null
 
-    // Accessible baseline, declared once here instead of at 34 call sites.
-    // Qt derives a name from `text` only for `AbstractButton`, and a combo box
-    // has no `text`, so without this a screen reader announces a bare "combo
-    // box" and the user is told nothing about which one. The tooltip is
-    // mirrored into the description for the same reason a tooltip may never be
-    // the only carrier of meaning: it is unreachable from the keyboard.
-    // A caller that sets either property overrides what is declared here.
+    // The visible label beside the box. A screen reader hears it with the
+    // value ("Theme: Dark"); the value alone does not say which box it is.
+    property string accessibleLabel: ""
+
+    // The tooltip is mirrored into the description: it is unreachable from
+    // the keyboard. A caller that sets either property overrides these.
     Accessible.role: Accessible.ComboBox
-    Accessible.name: root.displayText
+    Accessible.name: root.accessibleLabel !== ""
+        ? root.accessibleLabel.replace(/:\s*$/, "") + ": " + root.displayText
+        : root.displayText
     Accessible.description: root.ToolTip.text
 
     function _labelFor(item) {

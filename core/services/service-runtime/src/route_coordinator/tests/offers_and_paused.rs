@@ -166,7 +166,12 @@ fn recompute_mode_a_counter_overlay_via_derived_pppoe_primary() {
     pppoe.friendly_name = "WAN Miniport (PPPOE)".into();
     pppoe.description = "WAN Miniport (PPPOE)".into();
     api.set_adapter_infos(vec![vpn, pppoe]);
-    api.set_route_table(vec![route_entry([0, 0, 0, 0], 0, [0, 0, 0, 0], 15, 10)]);
+    api.set_route_table(vec![
+        route_entry([0, 0, 0, 0], 0, [0, 0, 0, 0], 15, 10),
+        // The VPN's redirect pair, which the overlay answers.
+        route_entry([0, 0, 0, 0], 1, [0, 0, 0, 0], 78, 0),
+        route_entry([128, 0, 0, 0], 1, [0, 0, 0, 0], 78, 0),
+    ]);
     let rules = Arc::new(FakeRules::new());
     rules.set_secondary(
         "S-IVANOV",
@@ -198,6 +203,8 @@ fn recompute_mode_a_emits_counter_overlay_via_derived_primary() {
     api.set_adapter_infos(vec![vpn]);
     api.set_route_table(vec![
         route_entry([0, 0, 0, 0], 0, [192, 168, 1, 1], 12, 25), // OS default on eth
+        route_entry([0, 0, 0, 0], 1, [0, 0, 0, 0], 78, 0),      // the VPN's redirect
+        route_entry([128, 0, 0, 0], 1, [0, 0, 0, 0], 78, 0),
     ]);
     let rules = Arc::new(FakeRules::new());
     rules.set_secondary(
@@ -222,6 +229,42 @@ fn recompute_mode_a_emits_counter_overlay_via_derived_primary() {
             .iter()
             .all(|r| r.interface_index == 12 && r.next_hop == Ipv4Addr::new(192, 168, 1, 1)),
         "counter-overlay must route via the derived primary gateway, not the secondary"
+    );
+}
+
+/// A split tunnel takes nothing to answer. Four /2s via the main link would
+/// carry everything outside the rules past another client's full tunnel the
+/// OS table sends it to: a work VPN's "everything through us" bypassed.
+#[test]
+fn recompute_mode_a_puts_no_overlay_against_a_tunnel_that_takes_nothing() {
+    let api = Arc::new(MockWindowsApi::new());
+    let vpn = adapter("examplevpnvpn", 78, true, true, Some([10, 0, 0, 1]));
+    let vpn_id = vpn.stable_id();
+    let work = adapter("workvpn", 90, true, true, Some([172, 16, 0, 1]));
+    api.set_adapter_infos(vec![vpn, work]);
+    api.set_route_table(vec![
+        route_entry([0, 0, 0, 0], 0, [192, 168, 1, 1], 12, 25),
+        route_entry([10, 1, 0, 0], 16, [0, 0, 0, 0], 78, 0), // split routes only
+        route_entry([0, 0, 0, 0], 0, [172, 16, 0, 1], 90, 1), // the work VPN takes all
+    ]);
+    let rules = Arc::new(FakeRules::new());
+    rules.set_secondary(
+        "S-IVANOV",
+        CanonicalRuleSet::from_rules(vec![ip_rule("r1", 203, 0, 113, 138)]),
+    );
+    let policy = Arc::new(FakePolicy::new());
+    policy.bind_secondary("S-IVANOV", &vpn_id);
+    let coord = coordinator_with_policy(Arc::clone(&api), Arc::clone(&rules), policy);
+
+    coord.recompute_active(&["S-IVANOV".to_string()]).unwrap();
+
+    let table = api.get_ip_forward_table().unwrap();
+    assert!(!table.iter().any(|r| r.prefix_length == 2), "{table:?}");
+    assert!(
+        table
+            .iter()
+            .any(|r| r.prefix_length == 32 && r.interface_index == 78),
+        "the rule still rides the bound tunnel"
     );
 }
 

@@ -24,6 +24,10 @@ const MAX_ECHOES_IN_FLIGHT: usize = 32;
 /// Hop limit of the answers we build; they cross only the adapter.
 const ECHO_ANSWER_HOP_LIMIT: u8 = 64;
 
+/// "Communication administratively prohibited" (RFC 1812): the answer to an
+/// echo the relay may not carry.
+const ICMP_COMMUNICATION_PROHIBITED: u8 = 13;
+
 /// Answers built off the poll loop, waiting for it to write them.
 #[derive(Default)]
 pub(super) struct EchoAnswers {
@@ -42,9 +46,16 @@ impl FakeIpStack {
             return false;
         };
         // No socket table lists an echo, so on a machine serving several users
-        // its owner is unknown and the probe is dropped, never sent for someone
-        // else.
+        // its owner is unknown and the probe is never sent for someone else.
+        // The tool is told so: silence reads as the host being down.
         let Ok(target) = self.relay.for_owner(target, source, destination, None) else {
+            let prohibited = EchoOutcome::Unreachable {
+                from: call.destination,
+                code: ICMP_COMMUNICATION_PROHIBITED,
+            };
+            if let Some(packet) = build_echo_answer(&call, prohibited) {
+                self.device.write_client_packet(&packet);
+            }
             return true;
         };
         let answers = Arc::clone(&self.echo_answers);

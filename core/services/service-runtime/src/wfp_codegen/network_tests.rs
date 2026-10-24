@@ -398,17 +398,41 @@ fn a_network_block_and_an_equal_route_network_go_to_the_block() {
     assert_eq!(w.action, WfpAction::Block);
 }
 
+/// Past the cap the network is skipped, never widened: a bare /8 permit would
+/// outrank the tunnel hosts inside it, and a bare /8 deny would drop them.
 #[test]
-fn carving_past_the_cap_falls_back_to_the_bare_network_and_says_so() {
+fn carving_past_the_cap_skips_the_network_and_says_so() {
     // Twenty addresses inside a /8 would carve it into ~480 pieces.
     let inside: Vec<CanonicalRule> = (0..20u8)
         .map(|i| exact(&format!("s-{i}"), &format!("10.{i}.0.1")))
         .collect();
     let out = generate(&book(
         vec![subnet("p-net", "10.0.0.0/8", RuleAction::Route)],
+        inside.clone(),
+    ));
+    assert!(out.primary_dest_networks.is_empty());
+    assert!(
+        out.filters
+            .iter()
+            .all(|f| f.remote_subnet.is_none() && f.remote_subnet_v6.is_none()),
+        "no filter of the network: {:?}",
+        out.filters
+    );
+    // Every tunnel host inside keeps its own permit, and no main permit covers it.
+    for i in 0..20u8 {
+        let at = ip(&format!("10.{i}.0.1"));
+        let w = winner(&out.filters, at).expect("the host keeps its rule");
+        assert_eq!(w.action, WfpAction::Permit);
+    }
+    let denied = generate(&book(
+        vec![subnet("b-net", "10.0.0.0/8", RuleAction::Block)],
         inside,
     ));
-    assert_eq!(out.primary_dest_networks, vec![block("10.0.0.0/8")]);
+    assert!(
+        !denied.filters.iter().any(|f| f.action == WfpAction::Block),
+        "a deny past the cap drops nothing: {:?}",
+        denied.filters
+    );
     assert!(
         out.diagnostics.iter().any(|d| matches!(
             d,

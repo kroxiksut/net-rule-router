@@ -315,6 +315,7 @@ Dialog {
                                         color: root._textColor()
                                     }
                                     ThemedComboBox {
+                                        accessibleLabel: root._tr("dialog.preset-review.what-is-this", "What is this?")
                                         theme: root.ownerRoot ? root.ownerRoot.uiTheme : null
                                         Layout.fillWidth: true
                                         textRole: "label"

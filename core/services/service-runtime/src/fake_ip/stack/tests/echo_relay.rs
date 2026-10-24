@@ -116,3 +116,41 @@ fn an_echo_to_an_address_nobody_holds_is_not_carried() {
     assert!(dialer.dials().is_empty());
     assert!(state.written_packets().is_empty());
 }
+
+/// Owners are read from socket tables, and no table lists an echo.
+struct OwnerNeverReadable;
+
+impl relay::FlowOwners for OwnerNeverReadable {
+    fn owner_of(
+        &self,
+        _client: SocketAddr,
+        _destination: SocketAddr,
+        _transport: Option<nrr_platform_api::fake_ip::FlowTransport>,
+    ) -> relay::FlowOwner {
+        relay::FlowOwner::Refused("owner-unreadable")
+    }
+}
+
+/// With two users served an echo's owner is unknown: it is not carried for
+/// anyone, and the tool hears "prohibited" from the name instead of timing out
+/// as if the host were down.
+#[test]
+fn an_echo_whose_owner_cannot_be_read_is_answered_prohibited_not_dropped() {
+    let dialer = Arc::new(dialer::MockRelayDialer::new());
+    dialer.set_echo_outcome(EchoOutcome::Reply);
+    let (stack, state, fake) = stack_with(Arc::clone(&dialer));
+    let mut stack = stack.with_flow_owners(Arc::new(OwnerNeverReadable));
+
+    state.push_inbound(echo_request(fake, 64));
+    let written = step_until_written(&mut stack, &state);
+
+    assert!(dialer.dials().is_empty(), "never sent for someone else");
+    assert_eq!(written.len(), 1);
+    let ip = Ipv4Packet::new_checked(&written[0][..]).expect("ipv4");
+    assert_eq!((ip.src_addr(), ip.dst_addr()), (fake, CLIENT));
+    assert_eq!(
+        (ip.payload()[0], ip.payload()[1]),
+        (3, 13),
+        "destination unreachable, administratively prohibited"
+    );
+}

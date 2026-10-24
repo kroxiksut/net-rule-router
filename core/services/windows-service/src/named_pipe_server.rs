@@ -23,22 +23,24 @@
 //!
 //! ## Pipe instance lifecycle
 //!
-//! Each `accept_one` tick creates one pipe instance via `CreateNamedPipeW`
-//! and blocks on `ConnectNamedPipe`; a connecting client hands the instance
-//! to a worker thread and the next tick creates a fresh one. Active
-//! instances = 1 accepting + up to 32 workers. A tick that starts with no
-//! worker holds no instance at all, so it demands the FIRST instance: if
-//! anyone else took the name in the meantime the create fails with
-//! `ACCESS_DENIED` instead of quietly joining their pipe. At the cap, a new connection
-//! is busy-closed and the tick returns `Idle` without charging the
-//! supervisor's retry budget.
+//! Each `accept_one` tick blocks on `ConnectNamedPipe` over one listening
+//! instance; once a client connects, the NEXT instance is created before the
+//! connected one goes to a worker or is closed, and it waits for the next
+//! tick. The name never falls to zero instances, so no other process can
+//! claim it between ticks: the DACL lets nobody else add an instance, and
+//! only the very first create, with `FILE_FLAG_FIRST_PIPE_INSTANCE`, could
+//! race them, and fails loudly with `ACCESS_DENIED` if it lost. The held
+//! instance belongs to the server, so a rebind keeps the name too. At the
+//! cap, a new connection is busy-closed and the tick returns `Idle` without
+//! charging the supervisor's retry budget.
 //!
 //! ## Shutdown
 //!
-//! `request_shutdown()` sets a flag and wakes any pending `ConnectNamedPipe`
-//! by self-connecting via `CreateFileW`; the woken tick re-checks the flag
-//! and returns `ShutdownRequested` instead of handing off the self
-//! connection. Workers watch the same flag and exit their dispatch loop.
+//! `request_shutdown()` sets a flag, closes the held instance and wakes any
+//! pending `ConnectNamedPipe` by self-connecting via `CreateFileW`; the woken
+//! tick re-checks the flag and returns `ShutdownRequested` instead of handing
+//! off the self connection. Workers watch the same flag and exit their
+//! dispatch loop.
 //!
 //! ## Testability
 //!
@@ -53,7 +55,7 @@
 
 use std::io::{Read, Write};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, PoisonError};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
@@ -64,8 +66,9 @@ use windows::Win32::Storage::FileSystem::{
     FILE_FLAG_FIRST_PIPE_INSTANCE, FILE_FLAG_OVERLAPPED, PIPE_ACCESS_DUPLEX,
 };
 use windows::Win32::System::Pipes::{
-    ConnectNamedPipe, CreateNamedPipeW, DisconnectNamedPipe, NAMED_PIPE_MODE, PIPE_READMODE_BYTE,
-    PIPE_REJECT_REMOTE_CLIENTS, PIPE_TYPE_MESSAGE, PIPE_UNLIMITED_INSTANCES, PIPE_WAIT,
+    ConnectNamedPipe, CreateNamedPipeW, DisconnectNamedPipe, GetNamedPipeClientProcessId,
+    NAMED_PIPE_MODE, PIPE_READMODE_BYTE, PIPE_REJECT_REMOTE_CLIENTS, PIPE_TYPE_MESSAGE,
+    PIPE_UNLIMITED_INSTANCES, PIPE_WAIT,
 };
 use windows::Win32::System::Threading::{CreateEventW, WaitForSingleObject};
 use windows::Win32::System::IO::{CancelIoEx, GetOverlappedResult, OVERLAPPED};
@@ -75,6 +78,7 @@ use nrr_service_runtime::ipc_push::{
     adopt_subscription, flush_push_frames, SubscriptionChange, PUSH_BATCH_SIZE,
     PUSH_SAFETY_INTERVAL,
 };
+use nrr_service_runtime::task_liveness::TickWatch;
 use nrr_service_runtime::{
     AcceptError, AcceptErrorCategory, AcceptOutcome, ActiveSidRegistry, EventBus, IpcAcceptor,
     IpcAuditEmitter, IpcBindError, IpcError, IpcErrorCode, IpcRequestContext, IpcRequestEnvelope,
@@ -133,6 +137,48 @@ struct SendableHandle(HANDLE);
 // it spawns the worker; the worker is the sole owner thereafter.
 unsafe impl Send for SendableHandle {}
 
+/// The listening instance that holds the pipe name between accept ticks.
+#[derive(Default)]
+struct HeldInstance(Mutex<Option<SendableHandle>>);
+
+impl HeldInstance {
+    fn take(&self) -> Option<HANDLE> {
+        self.0
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take()
+            .map(|h| h.0)
+    }
+
+    fn hold(&self, pipe: HANDLE) {
+        let previous = self
+            .0
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .replace(SendableHandle(pipe));
+        close_unconnected(previous.map(|h| h.0));
+    }
+
+    fn release(&self) {
+        close_unconnected(self.take());
+    }
+}
+
+impl Drop for HeldInstance {
+    fn drop(&mut self) {
+        self.release();
+    }
+}
+
+fn close_unconnected(pipe: Option<HANDLE>) {
+    if let Some(pipe) = pipe {
+        // SAFETY: an instance we created and no worker owns; closed once.
+        unsafe {
+            let _ = CloseHandle(pipe);
+        }
+    }
+}
+
 /// Null-terminated UTF-16 form of a pipe path, built once per server rather
 /// than on every accept tick.
 fn wide_pipe_name(name: &str) -> Arc<[u16]> {
@@ -159,6 +205,10 @@ pub struct WindowsNamedPipeServer {
     /// [`PIPE_NAME`] in production; a private name per server in tests, so a
     /// test never reaches a live service or a neighbour test's instance.
     pipe_name: Arc<[u16]>,
+    /// The accept ticks the hang watchdog watches. A watched server takes a
+    /// connection from its own process as the watchdog's poke.
+    accept_watch: Option<TickWatch>,
+    held: Arc<HeldInstance>,
 }
 
 impl WindowsNamedPipeServer {
@@ -176,6 +226,8 @@ impl WindowsNamedPipeServer {
             event_bus: None,
             per_sid: Arc::default(),
             pipe_name: wide_pipe_name(&Self::unique_test_pipe_name()),
+            accept_watch: None,
+            held: Arc::default(),
         }
     }
 
@@ -218,7 +270,15 @@ impl WindowsNamedPipeServer {
             event_bus: None,
             per_sid: Arc::default(),
             pipe_name: wide_pipe_name(PIPE_NAME),
+            accept_watch: None,
+            held: Arc::default(),
         }
+    }
+
+    /// Let the hang watchdog see every accept tick.
+    pub fn with_accept_watch(mut self, watch: TickWatch) -> Self {
+        self.accept_watch = Some(watch);
+        self
     }
 }
 
@@ -238,6 +298,9 @@ impl IpcServer for WindowsNamedPipeServer {
             event_bus: self.event_bus.clone(),
             per_sid: Arc::clone(&self.per_sid),
             pipe_name: Arc::clone(&self.pipe_name),
+            accept_watch: self.accept_watch.clone(),
+            held: Arc::clone(&self.held),
+            in_connect: Arc::new(AtomicBool::new(false)),
         }))
     }
 }
@@ -280,38 +343,24 @@ pub struct WindowsNamedPipeAcceptor {
     event_bus: Option<Arc<EventBus>>,
     /// Null-terminated UTF-16 pipe path, shared with the server.
     pipe_name: Arc<[u16]>,
+    accept_watch: Option<TickWatch>,
+    held: Arc<HeldInstance>,
+    /// A tick is waiting in `ConnectNamedPipe`, so a shutdown must wake it.
+    in_connect: Arc<AtomicBool>,
 }
 
-impl IpcAcceptor for WindowsNamedPipeAcceptor {
-    fn accept_one(&self) -> AcceptOutcome {
-        if self.shutdown_requested.load(Ordering::SeqCst) {
-            return AcceptOutcome::ShutdownRequested;
-        }
-        tracing::trace!(
-            target: "nrr::ipc",
-            active_count = self.active_count.load(Ordering::SeqCst),
-            "accept tick"
-        );
-
-        // Create a pending pipe instance with FILE_FLAG_OVERLAPPED. The
-        // handle_connection worker uses TWO threads on the same pipe
-        // handle (reader sub-thread for ReadFile + main thread for
-        // WriteFile responses + push frames). On a synchronous handle
-        // Windows serialises all I/O on a single kernel I/O lock —
-        // ReadFile (waiting for next request) would block WriteFile
-        // (sending response to current request), and the connection
-        // would deadlock after the first round-trip. With
-        // FILE_FLAG_OVERLAPPED each I/O takes its own OVERLAPPED + event
-        // and the kernel does not serialise. See `PipeIo::read` / `write`
-        // below for the overlapped wait pattern.
-        //
-        // SAFETY: self.pipe_name is null-terminated UTF-16; security pointer
-        // is valid for the duration of CreateNamedPipeW (held by Arc<self>).
-        let holds_no_instance = self.active_count.load(Ordering::SeqCst) == 0;
+impl WindowsNamedPipeAcceptor {
+    fn create_instance(&self, first: bool) -> Result<HANDLE, AcceptOutcome> {
+        // FILE_FLAG_OVERLAPPED: the worker reads on one thread and writes
+        // responses and push frames on another; on a synchronous handle the
+        // kernel serialises both on one lock and the connection deadlocks after
+        // the first round-trip.
         let mut open_mode = PIPE_ACCESS_DUPLEX | FILE_FLAG_OVERLAPPED;
-        if holds_no_instance {
+        if first {
             open_mode |= FILE_FLAG_FIRST_PIPE_INSTANCE;
         }
+        // SAFETY: self.pipe_name is null-terminated UTF-16; the security
+        // pointer is valid for the call (held by Arc<self>).
         let pipe = unsafe {
             CreateNamedPipeW(
                 PCWSTR(self.pipe_name.as_ptr()),
@@ -324,24 +373,70 @@ impl IpcAcceptor for WindowsNamedPipeAcceptor {
                 Some(self.security.as_ptr()),
             )
         };
-        if pipe.is_invalid() {
-            // SAFETY: GetLastError is thread-local; safe to read.
-            let code = unsafe { windows::Win32::Foundation::GetLastError().0 };
-            if holds_no_instance && code == ERROR_ACCESS_DENIED.0 {
-                tracing::error!(
-                    target: "nrr::ipc",
-                    msg_key = "svc-ipc-pipe-name-taken",
-                    "the service pipe name is held by another process; clients may be talking to it"
-                );
-                return AcceptOutcome::Err(AcceptError {
-                    category: AcceptErrorCategory::PipeNameTaken,
-                    message: "pipe name is held by another process".to_string(),
-                });
-            }
-            return AcceptOutcome::Err(AcceptError {
-                category: AcceptErrorCategory::PipeCreate,
-                message: format!("CreateNamedPipeW failed: 0x{code:08X}"),
-            });
+        if !pipe.is_invalid() {
+            return Ok(pipe);
+        }
+        // SAFETY: GetLastError is thread-local; safe to read.
+        let code = unsafe { windows::Win32::Foundation::GetLastError().0 };
+        if first && code == ERROR_ACCESS_DENIED.0 {
+            tracing::error!(
+                target: "nrr::ipc",
+                msg_key = "svc-ipc-pipe-name-taken",
+                "the service pipe name is held by another process; clients may be talking to it"
+            );
+            return Err(AcceptOutcome::Err(AcceptError {
+                category: AcceptErrorCategory::PipeNameTaken,
+                message: "pipe name is held by another process".to_string(),
+            }));
+        }
+        Err(AcceptOutcome::Err(AcceptError {
+            category: AcceptErrorCategory::PipeCreate,
+            message: format!("CreateNamedPipeW failed: 0x{code:08X}"),
+        }))
+    }
+
+    /// Claim the next instance while the current one is still open. Without
+    /// it the name is merely un-held for a moment, as before: the next tick
+    /// creates one, demanding the first instance if no worker holds any.
+    fn hold_next(&self) {
+        match self.create_instance(false) {
+            Ok(next) => self.held.hold(next),
+            Err(_) => tracing::warn!(
+                target: "nrr::ipc",
+                "the next service pipe instance could not be created ahead of the handoff"
+            ),
+        }
+    }
+}
+
+impl IpcAcceptor for WindowsNamedPipeAcceptor {
+    fn accept_one(&self) -> AcceptOutcome {
+        if self.shutdown_requested.load(Ordering::SeqCst) {
+            self.held.release();
+            return AcceptOutcome::ShutdownRequested;
+        }
+        let _tick = self.accept_watch.as_ref().map(TickWatch::tick);
+        tracing::trace!(
+            target: "nrr::ipc",
+            active_count = self.active_count.load(Ordering::SeqCst),
+            "accept tick"
+        );
+
+        let pipe = match self.held.take() {
+            Some(pipe) => pipe,
+            // Holding nothing at all, only the first instance will do.
+            None => match self.create_instance(self.active_count.load(Ordering::SeqCst) == 0) {
+                Ok(pipe) => pipe,
+                Err(outcome) => return outcome,
+            },
+        };
+        // Published before the flag is read, as `request_shutdown` does the
+        // reverse: one of the two always sees the other.
+        self.in_connect.store(true, Ordering::SeqCst);
+        if self.shutdown_requested.load(Ordering::SeqCst) {
+            self.in_connect.store(false, Ordering::SeqCst);
+            close_unconnected(Some(pipe));
+            return AcceptOutcome::ShutdownRequested;
         }
 
         tracing::trace!(target: "nrr::ipc", "pipe instance created, awaiting connect");
@@ -395,6 +490,7 @@ impl IpcAcceptor for WindowsNamedPipeAcceptor {
         unsafe {
             let _ = CloseHandle(connect_event);
         }
+        self.in_connect.store(false, Ordering::SeqCst);
         tracing::trace!(target: "nrr::ipc", connected, "connect completed");
 
         // Re-check shutdown — if request_shutdown ran during ConnectNamedPipe,
@@ -408,10 +504,25 @@ impl IpcAcceptor for WindowsNamedPipeAcceptor {
             return AcceptOutcome::ShutdownRequested;
         }
 
+        // Before this instance is closed or handed over, whichever way the
+        // tick goes from here.
+        self.hold_next();
+
         if !connected {
             // SAFETY: pipe is valid; we close on transient error path. The
             // supervisor will tick again without charging policy budget.
             unsafe {
+                let _ = CloseHandle(pipe);
+            }
+            return AcceptOutcome::Idle;
+        }
+
+        // The watchdog's poke has done its job by ending this tick; served, it
+        // would be rejected and logged at every look.
+        if self.accept_watch.is_some() && client_is_this_process(pipe) {
+            // SAFETY: pipe is the handle we created above.
+            unsafe {
+                let _ = DisconnectNamedPipe(pipe);
                 let _ = CloseHandle(pipe);
             }
             return AcceptOutcome::Idle;
@@ -479,8 +590,12 @@ impl IpcAcceptor for WindowsNamedPipeAcceptor {
         // after our self-connect sees them and exits.
         self.shutdown_requested.store(true, Ordering::SeqCst);
         self.worker_shutdown.store(true, Ordering::SeqCst);
-
-        wake_pending_accept(&self.pipe_name);
+        // Closed before the wake, or the wake could connect to it instead of
+        // the instance the tick waits on.
+        self.held.release();
+        if self.in_connect.load(Ordering::SeqCst) {
+            wake_pending_accept(&self.pipe_name);
+        }
     }
 
     fn join_workers(&self) {
@@ -501,10 +616,13 @@ impl Drop for WindowsNamedPipeAcceptor {
     fn drop(&mut self) {
         // Best-effort: signal shutdown so any pending accept_one tick exits.
         // Workers are NOT joined here — supervisor owns drain ordering and
-        // must call join_workers() explicitly.
+        // must call join_workers() explicitly. The held instance stays with
+        // the server: a rebind drops this acceptor and keeps the name.
         self.shutdown_requested.store(true, Ordering::SeqCst);
         self.worker_shutdown.store(true, Ordering::SeqCst);
-        wake_pending_accept(&self.pipe_name);
+        if self.in_connect.load(Ordering::SeqCst) {
+            wake_pending_accept(&self.pipe_name);
+        }
     }
 }
 
@@ -512,10 +630,21 @@ impl Drop for WindowsNamedPipeAcceptor {
 /// woken tick sees the shutdown flag. Best-effort: with no instance up the
 /// open fails and the next tick's flag check does the job.
 fn wake_pending_accept(pipe_name_wide: &[u16]) {
-    // SAFETY: `pipe_name_wide` is null-terminated UTF-16; the handle is
-    // closed right away.
+    if let Some(client) = open_client(pipe_name_wide) {
+        // SAFETY: the handle was just opened here and is closed once.
+        unsafe {
+            let _ = CloseHandle(client);
+        }
+    }
+}
+
+/// A client end of our own pipe; `None` when no instance is listening. Never
+/// waits for one.
+fn open_client(pipe_name_wide: &[u16]) -> Option<HANDLE> {
+    // SAFETY: `pipe_name_wide` is null-terminated UTF-16; the caller owns the
+    // returned handle.
     unsafe {
-        if let Ok(client) = CreateFileW(
+        CreateFileW(
             PCWSTR(pipe_name_wide.as_ptr()),
             nrr_shared::ipc_transport::SERVICE_PIPE_CLIENT_ACCESS,
             FILE_SHARE_NONE,
@@ -523,8 +652,58 @@ fn wake_pending_accept(pipe_name_wide: &[u16]) {
             OPEN_EXISTING,
             FILE_FLAG_OVERLAPPED,
             HANDLE::default(),
-        ) {
-            let _ = CloseHandle(client);
+        )
+    }
+    .ok()
+}
+
+/// Whether the client on `pipe` is this process.
+fn client_is_this_process(pipe: HANDLE) -> bool {
+    let mut pid: u32 = 0;
+    // SAFETY: `pipe` is a connected pipe handle we own; `pid` outlives the call.
+    let found = unsafe { GetNamedPipeClientProcessId(pipe, &mut pid as *mut u32) }.is_ok();
+    found && pid == std::process::id()
+}
+
+/// The hang watchdog's poke at the service pipe: it ends a waiting accept tick,
+/// so a live acceptor turns once per look. The client end is held until the
+/// next poke, so the acceptor reads its pid from an open connection.
+pub struct SelfPoke {
+    pipe_name: Arc<[u16]>,
+    held: Mutex<Option<SendableHandle>>,
+}
+
+impl SelfPoke {
+    pub fn service_pipe() -> Self {
+        Self::of(wide_pipe_name(PIPE_NAME))
+    }
+
+    fn of(pipe_name: Arc<[u16]>) -> Self {
+        Self {
+            pipe_name,
+            held: Mutex::new(None),
+        }
+    }
+
+    pub fn poke(&self) {
+        let mut held = self.held.lock().unwrap_or_else(PoisonError::into_inner);
+        close_held(held.take());
+        *held = open_client(&self.pipe_name).map(SendableHandle);
+    }
+}
+
+impl Drop for SelfPoke {
+    fn drop(&mut self) {
+        let held = self.held.get_mut().unwrap_or_else(PoisonError::into_inner);
+        close_held(held.take());
+    }
+}
+
+fn close_held(handle: Option<SendableHandle>) {
+    if let Some(handle) = handle {
+        // SAFETY: opened by `open_client`, owned by the poke, closed once.
+        unsafe {
+            let _ = CloseHandle(handle.0);
         }
     }
 }
@@ -1406,6 +1585,69 @@ mod tests {
         acceptor.join_workers();
     }
 
+    /// Whoever asks for the first instance of the name between ticks — after a
+    /// served client left, and across a rebind — is refused: the service still
+    /// holds it. A process that got it would sit where clients look for the
+    /// service.
+    #[test]
+    fn the_pipe_name_stays_held_between_ticks_and_across_a_rebind() {
+        fn first_instance_free(name: &str) -> bool {
+            let wide: Vec<u16> = name.encode_utf16().chain(std::iter::once(0)).collect();
+            // SAFETY: wide is null-terminated UTF-16; a handle we get is closed.
+            let pipe = unsafe {
+                CreateNamedPipeW(
+                    PCWSTR(wide.as_ptr()),
+                    PIPE_ACCESS_DUPLEX | FILE_FLAG_FIRST_PIPE_INSTANCE,
+                    PIPE_MODE,
+                    PIPE_UNLIMITED_INSTANCES,
+                    PIPE_BUFFER_SIZE,
+                    PIPE_BUFFER_SIZE,
+                    0,
+                    None,
+                )
+            };
+            let free = !pipe.is_invalid();
+            close_unconnected(free.then_some(pipe));
+            free
+        }
+
+        let server = WindowsNamedPipeServer::new(empty_router(), empty_audit());
+        let pipe_name = server.pipe_name();
+        let acceptor: Arc<dyn IpcAcceptor> = Arc::from(server.bind().expect("bind"));
+        let acc_for_thread = Arc::clone(&acceptor);
+        let supervisor = thread::spawn(move || acc_for_thread.accept_one());
+        let client = connect_test_client(&pipe_name).expect("client connects");
+        let mut io = PipeIo::new(client).expect("test PipeIo::new");
+        let _: IpcResponseEnvelope = read_frame(&mut io).expect("read forbidden frame");
+        // SAFETY: client handle owned by this test.
+        unsafe {
+            let _ = CloseHandle(client);
+        }
+        assert!(matches!(
+            supervisor.join().expect("supervisor"),
+            AcceptOutcome::Connected
+        ));
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while acceptor.active_connections() > 0 {
+            assert!(Instant::now() < deadline, "the worker never finished");
+            thread::sleep(Duration::from_millis(10));
+        }
+
+        assert!(
+            !first_instance_free(&pipe_name),
+            "no tick runs and no client is served, yet the name is held"
+        );
+        drop(acceptor);
+        let rebound = server.bind().expect("rebind");
+        assert!(!first_instance_free(&pipe_name), "a rebind keeps the name");
+
+        rebound.request_shutdown();
+        assert!(
+            first_instance_free(&pipe_name),
+            "a stopped service lets the name go"
+        );
+    }
+
     /// Pending `accept_one` returns `ShutdownRequested` after
     /// `request_shutdown` is called — supervisor's stop signal is honoured
     /// even when the tick is mid-`ConnectNamedPipe`.
@@ -1484,6 +1726,42 @@ mod tests {
                 "round {round} expected Connected, got {outcome:?}",
             );
         }
+
+        acceptor.request_shutdown();
+        acceptor.join_workers();
+    }
+
+    /// The hang watchdog's poke ends a waiting tick, and a watched acceptor
+    /// takes it quietly: no worker, no rejection.
+    #[test]
+    fn a_self_poke_ends_a_watched_accept_tick_without_serving_it() {
+        let board = Arc::new(nrr_service_runtime::task_liveness::TaskLiveness::new(
+            Arc::new(nrr_service_runtime::HealthAggregator::new()),
+        ));
+        let watch = board.tick_watch(
+            nrr_service_runtime::service_tasks::ServiceTaskKind::IpcAcceptLoop,
+            "accept",
+            Duration::from_secs(60),
+        );
+        let server =
+            WindowsNamedPipeServer::new(empty_router(), empty_audit()).with_accept_watch(watch);
+        let poke = SelfPoke::of(Arc::clone(&server.pipe_name));
+        let acceptor: Arc<dyn IpcAcceptor> = Arc::from(server.bind().expect("bind"));
+
+        let acc_for_thread = Arc::clone(&acceptor);
+        let supervisor = thread::spawn(move || acc_for_thread.accept_one());
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !supervisor.is_finished() {
+            assert!(Instant::now() < deadline, "the poke never ended the tick");
+            poke.poke();
+            thread::sleep(Duration::from_millis(50));
+        }
+        let outcome = supervisor.join().expect("supervisor thread");
+        assert!(
+            matches!(outcome, AcceptOutcome::Idle),
+            "expected Idle, got {outcome:?}"
+        );
+        assert_eq!(acceptor.active_connections(), 0);
 
         acceptor.request_shutdown();
         acceptor.join_workers();

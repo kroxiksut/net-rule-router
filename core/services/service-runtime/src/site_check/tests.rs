@@ -53,9 +53,10 @@ impl EgressSources for Links {
     }
 }
 
-/// Routes by exact name; everything else takes the main route.
+/// Routes by exact name; everything else takes the main route. `covered`
+/// names the hosts the caller's own rules cover, `None` for every host.
 #[derive(Default)]
-struct Routes(HashMap<String, String>);
+struct Routes(HashMap<String, String>, Option<Vec<String>>);
 
 impl SiteRoutes for Routes {
     fn route_for(&self, _sid: &str, name: &str, _address: Option<Ipv4Addr>) -> String {
@@ -63,6 +64,12 @@ impl SiteRoutes for Routes {
             .get(name)
             .cloned()
             .unwrap_or_else(|| "none".to_owned())
+    }
+
+    fn covers(&self, _sid: &str, name: &str) -> bool {
+        self.1
+            .as_ref()
+            .is_none_or(|covered| covered.iter().any(|n| n == name))
     }
 }
 
@@ -72,6 +79,15 @@ fn routes(pairs: &[(&str, &str)]) -> Arc<Routes> {
             .iter()
             .map(|(n, r)| ((*n).to_owned(), (*r).to_owned()))
             .collect(),
+        None,
+    ))
+}
+
+/// No rule of the caller's names any host but `covered`.
+fn covering(covered: &[&str]) -> Arc<Routes> {
+    Arc::new(Routes(
+        HashMap::new(),
+        Some(covered.iter().map(|n| (*n).to_owned()).collect()),
     ))
 }
 
@@ -85,6 +101,7 @@ struct Fixture {
     trace: Option<Arc<ConnectionTraceRing>>,
     https: Option<Arc<dyn HttpsHead>>,
     links: (Option<Ipv4Addr>, Option<Ipv4Addr>),
+    traffic_held: Option<TrafficHeld>,
 }
 
 impl Fixture {
@@ -95,6 +112,7 @@ impl Fixture {
             trace: None,
             https: None,
             links: (Some(MAIN), Some(TUNNEL)),
+            traffic_held: None,
         }
     }
 
@@ -107,6 +125,7 @@ impl Fixture {
             engine: None,
             trace: self.trace.clone(),
             https: self.https.clone(),
+            traffic_held: self.traffic_held.clone(),
         })
     }
 }
@@ -415,5 +434,102 @@ fn only_a_dotted_host_name_is_checked() {
     let long = "a".repeat(300);
     for bad in ["", "localhost", "203.0.113.1", "a b.example", long.as_str()] {
         assert_eq!(normalise_host(bad), None, "{bad}");
+    }
+}
+
+#[test]
+fn held_traffic_is_not_answered_for_by_the_services_own_socket() {
+    let mut f = Fixture::new();
+    f.cache.set_ips("site.example", vec![ip(1)]);
+    f.cache.set_ips("login.site.example", vec![ip(2)]);
+    f.https = Some(Arc::new(Redirecting));
+    f.traffic_held = Some(Arc::new(|sid: &str| sid == ALICE) as TrafficHeld);
+
+    let report = f.checker(routes(&[])).check(ALICE, "site.example");
+
+    assert_eq!(report.verdict, SITE_CHECK_VERDICT_ROUTE_DOWN);
+    assert!(
+        f.probe.asked.lock().unwrap().is_empty(),
+        "nothing leaves while the caller's traffic is held"
+    );
+    assert!(
+        report.names[0].redirects.is_empty(),
+        "no HTTPS request either"
+    );
+
+    let other = f.checker(routes(&[])).check(BOB, "site.example");
+    assert_eq!(
+        other.verdict, SITE_CHECK_VERDICT_FINE,
+        "only the held user's"
+    );
+}
+
+#[test]
+fn the_shared_cache_answers_only_for_names_the_callers_rules_or_traffic_name() {
+    let mut f = Fixture::new();
+    // Another user signed in here: the machine's cache knows their names.
+    f.cache.set_ips("bank.example", vec![ip(1)]);
+    f.cache.set_ips("login.bank.example", vec![ip(2)]);
+    f.cache.set_ips("own.example", vec![ip(3)]);
+    f.cache.set_ips("cdn.own.example", vec![ip(4)]);
+    let ring = Arc::new(ConnectionTraceRing::new(16));
+    ring.push(row(BOB, 2, &["login.bank.example"]));
+    let mut v6 = row(ALICE, 9, &["cdn.own.example"]);
+    v6.remote = SocketAddr::new(IpAddr::V6(std::net::Ipv6Addr::LOCALHOST), 443);
+    ring.push(v6);
+    f.trace = Some(ring);
+
+    let report = f.checker(covering(&[])).check(ALICE, "bank.example");
+    assert_eq!(report.names[0].answer, "no-address");
+    assert!(
+        report.names.iter().all(|n| n.address.is_empty()),
+        "no address from somebody else's visit: {:?}",
+        names(&report)
+    );
+    assert!(
+        !report.names.iter().any(|n| n.name == "login.bank.example"),
+        "a guessed sign-in nobody of the caller's used stays out"
+    );
+    assert!(f.probe.asked.lock().unwrap().is_empty());
+
+    let report = f
+        .checker(covering(&["own.example"]))
+        .check(ALICE, "own.example");
+    let address = |name: &str| {
+        report
+            .names
+            .iter()
+            .find(|n| n.name == name)
+            .map(|n| n.address.clone())
+    };
+    assert_eq!(
+        address("own.example"),
+        Some(ip(3).to_string()),
+        "a rule names it"
+    );
+    assert_eq!(
+        address("cdn.own.example"),
+        Some(ip(4).to_string()),
+        "the caller's own traffic named it"
+    );
+}
+
+#[test]
+fn only_a_rule_on_the_name_itself_counts_as_covering_it() {
+    for yes in ["exact-fqdn", "suffix-domain", "zone"] {
+        assert!(rule_matched_reason(&format!(
+            "diag.explain.reason.rule-matched-{yes}"
+        )));
+    }
+    for no in [
+        "diag.explain.reason.rule-matched-exact-ip",
+        "diag.explain.reason.rule-matched-subnet",
+        "diag.explain.reason.blocked-by-ip-rule",
+        "diag.explain.reason.no-rule-match",
+        "diag.explain.reason.rules-paused",
+        "diag.explain.reason.rule-shape-not-enforced",
+        "diag.explain.reason.rule-withheld",
+    ] {
+        assert!(!rule_matched_reason(no), "{no}");
     }
 }

@@ -236,3 +236,136 @@ fn a_failed_dial_resets_the_client_instead_of_stalling_it() {
     }
     assert_eq!(stack.flow_count(), 0, "the failed flow is reaped");
 }
+
+/// The upstream accepts the connection and then refuses every write: the
+/// tunnel died, or the server reset an idle keep-alive connection just as the
+/// browser wrote a new request on it. The program must see a reset, as from a
+/// socket of its own, not a request that went nowhere.
+struct WriteRefusingDialer;
+struct WriteRefusingStream;
+impl std::io::Read for WriteRefusingStream {
+    fn read(&mut self, _buf: &mut [u8]) -> std::io::Result<usize> {
+        std::thread::sleep(Duration::from_millis(20));
+        Err(std::io::Error::from(std::io::ErrorKind::TimedOut))
+    }
+}
+impl std::io::Write for WriteRefusingStream {
+    fn write(&mut self, _buf: &[u8]) -> std::io::Result<usize> {
+        Err(std::io::Error::from(std::io::ErrorKind::ConnectionReset))
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+impl dialer::RelayWriteHalf for WriteRefusingStream {
+    fn shutdown_write(&mut self) -> Result<(), dialer::RelayError> {
+        Ok(())
+    }
+}
+impl dialer::RelayStream for WriteRefusingStream {
+    fn shutdown_write(&mut self) -> Result<(), dialer::RelayError> {
+        Ok(())
+    }
+    fn into_split(self: Box<Self>) -> Result<dialer::RelaySplit, dialer::RelayError> {
+        Ok(dialer::RelaySplit {
+            reader: Box::new(WriteRefusingStream),
+            writer: Box::new(WriteRefusingStream),
+        })
+    }
+}
+impl dialer::RelayDialer for WriteRefusingDialer {
+    fn connect_tcp(
+        &self,
+        _target: &dialer::UpstreamTarget,
+    ) -> Result<Box<dyn dialer::RelayStream>, dialer::RelayError> {
+        Ok(Box::new(WriteRefusingStream))
+    }
+    fn connect_udp(
+        &self,
+        _target: &dialer::UpstreamTarget,
+    ) -> Result<Box<dyn dialer::RelayDatagram>, dialer::RelayError> {
+        Err(dialer::RelayError::Upstream {
+            detail: "udp not used in this test".to_string(),
+        })
+    }
+}
+
+#[test]
+fn an_upstream_that_refuses_the_write_resets_the_client() {
+    use nrr_platform_api::fake_ip::{FakeIpAllocator, FakeIpScope};
+
+    const MTU: u16 = 1500;
+    let client_addr = std::net::Ipv4Addr::new(10, 0, 0, 1);
+    let mut allocator = FakeIpAllocator::default();
+    let fake_v4 = allocator.allocate("gone.test").expect("allocate").v4;
+    let relay = RelayCore::new(
+        Arc::new(StdMutex::new(allocator)),
+        FakeIpScope::enabled(Vec::<String>::new()),
+        Arc::new(
+            relay::StaticUpstreamResolver::new()
+                .with("gone.test", &[std::net::IpAddr::V4(fake_v4)]),
+        ),
+        Arc::new(relay::FixedRouteSelector(nrr_shared::RouteRole::Primary)),
+    );
+    let c2s: PacketQueue = Arc::new(StdMutex::new(VecDeque::new()));
+    let s2c: PacketQueue = Arc::new(StdMutex::new(VecDeque::new()));
+    let mut stack = FakeIpStack::new(
+        Box::new(PipeTunDevice {
+            inbound: Arc::clone(&c2s),
+            outbound: Arc::clone(&s2c),
+            mtu: MTU,
+        }),
+        &FakeIpPoolConfig::default(),
+        relay,
+        Arc::new(WriteRefusingDialer),
+        StackWaker::new(),
+    );
+    let mut client_device = PipeClientDevice {
+        inbound: Arc::clone(&s2c),
+        outbound: Arc::clone(&c2s),
+        mtu: usize::from(MTU),
+    };
+    let mut client = Interface::new(
+        Config::new(HardwareAddress::Ip),
+        &mut client_device,
+        SmolInstant::from_millis(0),
+    );
+    client.update_ip_addrs(|addrs| {
+        let _ = addrs.push(IpCidr::new(IpAddress::Ipv4(client_addr), 24));
+    });
+    let _ = client
+        .routes_mut()
+        .add_default_ipv4_route(std::net::Ipv4Addr::new(10, 0, 0, 2));
+    let mut client_sockets = SocketSet::new(Vec::new());
+    let handle = client_sockets.add(tcp::Socket::new(
+        tcp::SocketBuffer::new(vec![0u8; 8192]),
+        tcp::SocketBuffer::new(vec![0u8; 8192]),
+    ));
+    client_sockets
+        .get_mut::<tcp::Socket>(handle)
+        .connect(client.context(), (IpAddress::Ipv4(fake_v4), 443), 49601)
+        .expect("connect initiates");
+
+    let mut now_ms = 0u64;
+    let mut sent = false;
+    let mut reset = false;
+    for _ in 0..3000 {
+        now_ms += 5;
+        let t = SmolInstant::from_millis(i64::try_from(now_ms).unwrap_or(i64::MAX));
+        client.poll(t, &mut client_device, &mut client_sockets);
+        let socket = client_sockets.get_mut::<tcp::Socket>(handle);
+        if !sent && socket.state() == tcp::State::Established {
+            sent = socket.send_slice(b"GET / HTTP/1.1\r\n\r\n").is_ok();
+        }
+        if sent && socket.state() == tcp::State::Closed {
+            reset = true;
+            break;
+        }
+        for _ in 0..4 {
+            stack.step(now_ms).expect("stack step");
+        }
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    assert!(sent, "the connection was established and the request sent");
+    assert!(reset, "a write the server refused must reset the client");
+}

@@ -11,8 +11,14 @@
 //! the caller was elevated, and a hash of who they are. The payload itself is
 //! not — a rules payload carries the user's hostnames, and the audit file is a
 //! security record, not a copy of their policy.
+//!
+//! An unelevated caller has a budget of records per hour. Past it its requests
+//! are counted rather than written, and the count is written once the next
+//! hour opens: a process looping on a cheap request would otherwise fill the
+//! trail and push a year of history out through retention.
 
-use std::sync::Arc;
+use std::collections::{BTreeMap, HashMap};
+use std::sync::{Arc, Mutex};
 
 use nrr_diagnostics::audit::kind::AuditEventKind;
 use nrr_diagnostics::audit::writer::AuditEventInput;
@@ -29,6 +35,22 @@ where
     S: AuditSink<Event = AuditEventInput>,
 {
     sink: Arc<S>,
+    spend: Mutex<HashMap<String, Spend>>,
+    clock: fn() -> i64,
+}
+
+/// Records one unelevated principal writes per [`BUDGET_WINDOW_MS`]: far above
+/// what a person clicks, far below what a loop sends.
+const PRINCIPAL_BUDGET: u32 = 120;
+const BUDGET_WINDOW_MS: i64 = 3_600_000;
+/// Principals whose spending is remembered; past it the stalest is forgotten.
+const MAX_TRACKED_PRINCIPALS: usize = 64;
+
+#[derive(Default)]
+struct Spend {
+    window_start: i64,
+    written: u32,
+    unrecorded: BTreeMap<&'static str, u32>,
 }
 
 impl<S> ProductionIpcAuditEmitter<S>
@@ -36,7 +58,76 @@ where
     S: AuditSink<Event = AuditEventInput>,
 {
     pub fn new(sink: Arc<S>) -> Self {
-        Self { sink }
+        Self {
+            sink,
+            spend: Mutex::new(HashMap::new()),
+            clock: now_ms,
+        }
+    }
+
+    #[cfg(test)]
+    fn with_clock(mut self, clock: fn() -> i64) -> Self {
+        self.clock = clock;
+        self
+    }
+
+    /// Spends one record of `principal`'s budget. `Err` carries nothing to
+    /// write (the request is counted); `Ok` carries the counts of a window
+    /// that just closed, to be written first.
+    fn spend(
+        &self,
+        principal: &str,
+        operation: &'static str,
+        now: i64,
+    ) -> Result<BTreeMap<&'static str, u32>, ()> {
+        let mut spend = self.spend.lock().unwrap_or_else(|p| p.into_inner());
+        if !spend.contains_key(principal) && spend.len() >= MAX_TRACKED_PRINCIPALS {
+            let stalest = spend
+                .iter()
+                .min_by_key(|(_, s)| s.window_start)
+                .map(|(k, _)| k.clone());
+            if let Some(stalest) = stalest {
+                spend.remove(&stalest);
+            }
+        }
+        let entry = spend.entry(principal.to_owned()).or_default();
+        let mut closed = BTreeMap::new();
+        if now.saturating_sub(entry.window_start) >= BUDGET_WINDOW_MS {
+            closed = std::mem::take(&mut entry.unrecorded);
+            entry.window_start = now;
+            entry.written = 0;
+        }
+        if entry.written >= PRINCIPAL_BUDGET {
+            *entry.unrecorded.entry(operation).or_default() += 1;
+            return Err(());
+        }
+        entry.written += 1;
+        Ok(closed)
+    }
+
+    fn append(
+        &self,
+        ctx: &IpcRequestContext,
+        risk_level: Option<String>,
+        summary: serde_json::Value,
+        now: i64,
+    ) -> Result<(), String> {
+        self.sink
+            .append(AuditEventInput {
+                event_id: next_audit_event_id(),
+                kind: AuditEventKind::PrivilegedRequestAdmitted,
+                created_at: now,
+                actor_kind: ActorKind::User,
+                // Hashed, never the SID itself: the trail must survive being
+                // read by someone who should not learn who is on this machine.
+                actor_id_hash: nrr_diagnostics::audit::actor_id_hash(ctx.caller_stored()),
+                revision_id: None,
+                risk_level,
+                result: AuditEventResult::Success,
+                reason_code: reason::service::IPC_PRIVILEGED_REQUEST,
+                payload_summary_json: Some(summary.to_string()),
+            })
+            .map_err(|e| e.to_string())
     }
 }
 
@@ -49,29 +140,32 @@ where
         request: &IpcRequestEnvelope,
         ctx: &IpcRequestContext,
     ) -> Result<(), String> {
+        let now = (self.clock)();
+        let operation = request.operation.slug();
+        if !ctx.caller_is_elevated {
+            match self.spend(ctx.caller_stored(), operation, now) {
+                // Counted: the window's total is written when it closes.
+                Err(()) => return Ok(()),
+                Ok(closed) if !closed.is_empty() => self.append(
+                    ctx,
+                    None,
+                    serde_json::json!({
+                        "unrecorded": closed,
+                        "window-secs": BUDGET_WINDOW_MS / 1000,
+                        "elevated": false,
+                    }),
+                    now,
+                )?,
+                Ok(_) => {}
+            }
+        }
         let summary = serde_json::json!({
-            "operation": request.operation.slug(),
+            "operation": operation,
             "class": request.operation_class.slug(),
             "elevated": ctx.caller_is_elevated,
             "profile": format!("{:?}", ctx.client_profile),
-        })
-        .to_string();
-        self.sink
-            .append(AuditEventInput {
-                event_id: next_audit_event_id(),
-                kind: AuditEventKind::PrivilegedRequestAdmitted,
-                created_at: now_ms(),
-                actor_kind: ActorKind::User,
-                // Hashed, never the SID itself: the trail must survive being
-                // read by someone who should not learn who is on this machine.
-                actor_id_hash: nrr_diagnostics::audit::actor_id_hash(ctx.caller_stored()),
-                revision_id: None,
-                risk_level: risk_of(request),
-                result: AuditEventResult::Success,
-                reason_code: reason::service::IPC_PRIVILEGED_REQUEST,
-                payload_summary_json: Some(summary),
-            })
-            .map_err(|e| e.to_string())
+        });
+        self.append(ctx, risk_of(request), summary, now)
     }
 }
 
@@ -195,6 +289,55 @@ mod tests {
             Some("S-1-5-21-A"),
             "the actor is hashed, never stored raw",
         );
+    }
+
+    static CLOCK_MS: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
+    fn test_clock() -> i64 {
+        CLOCK_MS.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// An unelevated process looping on a cheap request writes its budget and
+    /// then only a count, so the trail's history is not pushed out by one
+    /// program; the count is not lost but written when the hour closes. An
+    /// elevated caller is never limited.
+    #[test]
+    fn an_unelevated_caller_writes_its_budget_and_then_a_count() {
+        CLOCK_MS.store(10 * BUDGET_WINDOW_MS, std::sync::atomic::Ordering::SeqCst);
+        let sink = Arc::new(RecordingSink::default());
+        let emitter = ProductionIpcAuditEmitter::new(Arc::clone(&sink)).with_clock(test_clock);
+        let user = IpcRequestContext {
+            caller_is_elevated: false,
+            ..ctx()
+        };
+        for _ in 0..PRINCIPAL_BUDGET + 30 {
+            emitter
+                .record_request(&envelope(), &user)
+                .expect("accounted");
+        }
+        let written = || sink.events.lock().unwrap_or_else(|p| p.into_inner()).len();
+        assert_eq!(written(), PRINCIPAL_BUDGET as usize);
+
+        emitter.record_request(&envelope(), &ctx()).expect("admin");
+        assert_eq!(
+            written(),
+            PRINCIPAL_BUDGET as usize + 1,
+            "an admin is never limited"
+        );
+
+        CLOCK_MS.fetch_add(BUDGET_WINDOW_MS, std::sync::atomic::Ordering::SeqCst);
+        emitter
+            .record_request(&envelope(), &user)
+            .expect("next hour");
+        let events = sink.events.lock().unwrap_or_else(|p| p.into_inner());
+        let count = events[events.len() - 2]
+            .payload_summary_json
+            .clone()
+            .expect("summary");
+        assert!(count.contains("\"mutation.submit\":30"), "{count}");
+        assert!(events.last().is_some_and(|e| e
+            .payload_summary_json
+            .as_deref()
+            .is_some_and(|s| s.contains("\"operation\""))));
     }
 
     #[test]

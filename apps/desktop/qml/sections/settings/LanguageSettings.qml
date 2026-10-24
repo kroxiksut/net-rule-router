@@ -21,6 +21,7 @@ GroupBox {
         }
         ThemedComboBox {
             id: languageCombo
+            accessibleLabel: root.uiRevision >= 0 ? root.tr("settings.group.language", "Language") : ""
             theme: root.uiTheme
             Layout.fillWidth: true
             model: root.availableLanguageIds()

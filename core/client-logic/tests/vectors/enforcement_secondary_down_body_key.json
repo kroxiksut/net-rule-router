@@ -1,0 +1,68 @@
+{
+  "description": "pure.js enforcementSecondaryDownBodyKey: what the additional connection being down means for the user's leak protection",
+  "cases": [
+    {
+      "name": "off: the rules' sites go over the main one",
+      "input": {
+        "level": "off"
+      },
+      "expected": "notifications.enforcement.secondary-down.body-off"
+    },
+    {
+      "name": "routed sites: they are held",
+      "input": {
+        "level": "sites"
+      },
+      "expected": "notifications.enforcement.secondary-down.body"
+    },
+    {
+      "name": "everything: the internet waits",
+      "input": {
+        "level": "everything"
+      },
+      "expected": "notifications.enforcement.secondary-down.body-everything"
+    },
+    {
+      "name": "not read yet keeps the held wording",
+      "input": {
+        "level": ""
+      },
+      "expected": "notifications.enforcement.secondary-down.body"
+    },
+    {
+      "name": "a spelling the service never sends",
+      "input": {
+        "level": "Everything"
+      },
+      "expected": "notifications.enforcement.secondary-down.body"
+    },
+    {
+      "name": "a level with spaces around is not trimmed by the service",
+      "input": {
+        "level": " off"
+      },
+      "expected": "notifications.enforcement.secondary-down.body"
+    },
+    {
+      "name": "a level from a newer build keeps the held wording",
+      "input": {
+        "level": "strict"
+      },
+      "expected": "notifications.enforcement.secondary-down.body"
+    },
+    {
+      "name": "the empty route policy of a user who never saved one",
+      "input": {
+        "level": "none"
+      },
+      "expected": "notifications.enforcement.secondary-down.body"
+    },
+    {
+      "name": "upper-case off is not off",
+      "input": {
+        "level": "OFF"
+      },
+      "expected": "notifications.enforcement.secondary-down.body"
+    }
+  ]
+}

@@ -21,12 +21,10 @@ use windows::Win32::System::Threading::{
     GetCurrentProcess, OpenProcess, OpenProcessToken, PROCESS_QUERY_LIMITED_INFORMATION,
 };
 
-/// Prefix of a real interactive user's SID (a machine-local or domain
-/// account: `S-1-5-21-<authority>-<rid>`). Service accounts — LocalSystem
-/// (`S-1-5-18`), LocalService (`-19`), NetworkService (`-20`) — never match, so
-/// the console-mode fallback below can safely distinguish "a user is running
-/// me" from "I am a service account".
-const INTERACTIVE_USER_SID_PREFIX: &str = "S-1-5-21-";
+// A person's SID (local, domain or Entra ID account), never a service account:
+// the console-mode fallback relies on it to tell "a user is running me" from
+// "I am a service account".
+use nrr_platform_api::types::is_user_account_sid;
 
 /// Every user signed in interactively, console user first, each once: the
 /// console session, then attached remote sessions, then disconnected ones (a
@@ -211,7 +209,7 @@ fn ordered_session_users(
 ) -> Vec<String> {
     let mut users: Vec<String> = Vec::new();
     let mut push = |sid: &str| {
-        if sid.starts_with(INTERACTIVE_USER_SID_PREFIX) && !users.iter().any(|u| u == sid) {
+        if is_user_account_sid(sid) && !users.iter().any(|u| u == sid) {
             users.push(sid.to_string());
         }
     };
@@ -261,7 +259,7 @@ fn active_console_user_sid_via_wts() -> Option<String> {
 /// service account under SCM — is unit-testable without the Win32 calls.
 fn console_fallback_sid(own_process_sid: Option<String>) -> Option<String> {
     match own_process_sid {
-        Some(sid) if sid.starts_with(INTERACTIVE_USER_SID_PREFIX) => Some(sid),
+        Some(sid) if is_user_account_sid(&sid) => Some(sid),
         _ => None,
     }
 }
@@ -426,6 +424,24 @@ mod tests {
             vec![ALICE.to_string(), BOB.to_string()],
         );
         assert!(ordered_session_users(Some("S-1-5-18"), &[]).is_empty());
+    }
+
+    #[test]
+    fn an_entra_id_user_is_served_like_a_local_one() {
+        use SessionState::*;
+        const CLOUD: &str = "S-1-12-1-111-222-333-444";
+        assert_eq!(
+            ordered_session_users(Some(CLOUD), &[at(Active, ALICE), at(Active, "S-1-5-18")]),
+            vec![CLOUD.to_string(), ALICE.to_string()],
+        );
+        assert_eq!(
+            ordered_session_users(None, &[at(Disconnected, CLOUD)]),
+            vec![CLOUD.to_string()],
+        );
+        assert_eq!(
+            console_fallback_sid(Some(CLOUD.to_string())),
+            Some(CLOUD.to_string())
+        );
     }
 
     #[test]

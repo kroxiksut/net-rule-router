@@ -41,10 +41,29 @@ fn placeholder_rows_are_never_announced_as_live() {
     );
 }
 
-/// The provenance on the wire is the enumeration's own, and the probe is asked
-/// for only when the caller asked for it.
+/// Answers for every row the filter picks, without the network.
+fn answering_probe(
+    rows: &mut [nrr_platform_api::InterfaceRouteRow],
+    wanted: &dyn Fn(&nrr_platform_api::InterfaceRouteRow) -> bool,
+) {
+    for row in rows.iter_mut() {
+        if wanted(row) {
+            row.observed_facts.external_ip = Some("198.51.100.77".to_owned());
+        }
+    }
+}
+
+fn external_of<'a>(resp: &'a SnapshotInterfacesResponse, id: &str) -> Option<&'a str> {
+    resp.rows
+        .iter()
+        .find(|row| row.persistent_id == id)
+        .and_then(|row| row.observed_facts.external_ip.as_deref())
+}
+
+/// The provenance on the wire is the enumeration's own; the probe runs in the
+/// service, only when a user asked for it.
 #[test]
-fn snapshot_reports_the_enumerations_provenance_and_forwards_the_probe_flag() {
+fn snapshot_reports_the_enumerations_provenance_and_probes_only_on_request() {
     let rows = Arc::new(MockInterfaceRows::new(
         InterfacesDataSource::LinuxLive,
         nrr_platform_api::fallback_rows(),
@@ -52,13 +71,83 @@ fn snapshot_reports_the_enumerations_provenance_and_forwards_the_probe_flag() {
     let provider = MonitoredAdaptersSnapshotProvider::new(
         Arc::new(MockWindowsApi::new()) as Arc<dyn RouteTablePort>,
         Arc::clone(&rows) as Arc<dyn InterfaceRowsPort>,
+    )
+    .with_external_probe(answering_probe);
+    let plain = provider.adapters_snapshot(false);
+    assert_eq!(plain.data_source, InterfacesDataSource::LinuxLive.title());
+    assert!(plain
+        .rows
+        .iter()
+        .all(|r| r.observed_facts.external_ip.is_none()));
+    let probed = provider.adapters_snapshot_probing_external_ip();
+    assert!(probed
+        .rows
+        .iter()
+        .any(|r| r.observed_facts.external_ip.is_some()));
+    assert_eq!(
+        rows.probe_requests(),
+        [false, false],
+        "the port never probes"
+    );
+}
+
+/// One user's check leaves only by the connections they bound, and what it
+/// found is shown to them, not to another user.
+#[test]
+fn an_external_address_check_is_the_askers_own() {
+    use nrr_platform_api::interface_rows::{
+        PREVIEW_ETHERNET_PERSISTENT_ID, PREVIEW_VPN_PERSISTENT_ID,
+    };
+    const ALICE: &str = "S-1-5-21-1-2-3-1001";
+    const BOB: &str = "S-1-5-21-1-2-3-1002";
+    let provider = MonitoredAdaptersSnapshotProvider::new(
+        Arc::new(MockWindowsApi::new()) as Arc<dyn RouteTablePort>,
+        Arc::new(MockInterfaceRows::new(
+            InterfacesDataSource::LinuxLive,
+            nrr_platform_api::fallback_rows(),
+        )) as Arc<dyn InterfaceRowsPort>,
+    )
+    .with_external_probe(answering_probe)
+    .with_caller_bindings(Arc::new(|sid: &str| match sid {
+        ALICE => Some(vec![PREVIEW_ETHERNET_PERSISTENT_ID.to_owned()]),
+        BOB => Some(vec![PREVIEW_VPN_PERSISTENT_ID.to_owned()]),
+        _ => None,
+    }));
+
+    let checked = provider.adapters_snapshot_probing_external_ip_for(ALICE);
+    assert_eq!(
+        external_of(&checked, PREVIEW_ETHERNET_PERSISTENT_ID),
+        Some("198.51.100.77")
     );
     assert_eq!(
-        provider.adapters_snapshot(false).data_source,
-        InterfacesDataSource::LinuxLive.title()
+        external_of(&checked, PREVIEW_VPN_PERSISTENT_ID),
+        None,
+        "another user's tunnel is not probed"
     );
-    provider.adapters_snapshot_probing_external_ip();
-    assert_eq!(rows.probe_requests(), [false, true]);
+    assert_eq!(
+        external_of(
+            &provider.adapters_snapshot_for(false, ALICE),
+            PREVIEW_ETHERNET_PERSISTENT_ID
+        ),
+        Some("198.51.100.77"),
+        "remembered for the one who checked"
+    );
+    assert_eq!(
+        external_of(
+            &provider.adapters_snapshot_for(false, BOB),
+            PREVIEW_ETHERNET_PERSISTENT_ID
+        ),
+        None,
+        "and not shown to anyone else"
+    );
+    let unknown = provider.adapters_snapshot_probing_external_ip_for("S-1-5-21-unreadable");
+    assert!(
+        unknown
+            .rows
+            .iter()
+            .all(|r| r.observed_facts.external_ip.is_none()),
+        "bindings that cannot be read probe nothing"
+    );
 }
 
 /// A plain refresh shows what the service sends; unscored rows turned every

@@ -96,6 +96,27 @@ const REARM_STOP_BUDGET: Duration = Duration::from_secs(3);
 /// costs anyway.
 const CONN_HISTORY_STOP_BUDGET: Duration = Duration::from_secs(3);
 
+/// The whole stop's hard limit: the filter strip's own deadline and a little
+/// room for the steps around it. Past it the stop stops reporting progress and
+/// ends with an error, so the service manager restarts the service and the
+/// next start clears what is left; a stop pending forever has no way out but a
+/// kill, which leaves everything in place.
+pub const STOP_HARD_LIMIT: Duration =
+    Duration::from_secs(crate::lifecycle_matrix::FILTER_TEARDOWN_DEADLINE.as_secs() + 15);
+
+/// What the route and filter teardown gets even when the steps before it used
+/// up the limit: removing our routes is what the stop is for.
+const ROUTE_TEARDOWN_FLOOR: Duration = Duration::from_secs(1);
+
+/// Set when the last stop outran [`STOP_HARD_LIMIT`].
+static STOP_OVERRAN: AtomicBool = AtomicBool::new(false);
+
+/// Did the last stop outrun [`STOP_HARD_LIMIT`]? The controller then reports
+/// the stop as a failure, which is what makes the service manager restart it.
+pub fn stop_overran() -> bool {
+    STOP_OVERRAN.load(Ordering::SeqCst)
+}
+
 /// Write the last minute of connection history, within its budget. Run once
 /// the observers and the tasks have stopped, so nothing is folded after it.
 fn flush_conn_history_at_stop(history: Option<&Arc<crate::conn_history::ConnHistory>>) {
@@ -112,7 +133,7 @@ fn flush_conn_history_at_stop(history: Option<&Arc<crate::conn_history::ConnHist
 /// that waits on an in-flight callback, a WFP transaction). Reaching the route
 /// and filter strip matters more than finishing any one of them, so a step that
 /// overruns is left to finish on its own and the teardown moves on.
-fn teardown_step<F>(name: &'static str, budget: Duration, work: F)
+fn teardown_step<F>(name: &'static str, budget: Duration, work: F) -> StepEnd
 where
     F: FnOnce() + Send + 'static,
 {
@@ -138,24 +159,100 @@ where
             error = %e,
             "teardown step could not be spawned — skipped",
         );
-        return;
+        return StepEnd::NotSpawned;
     }
     match done_rx.recv_timeout(budget) {
-        Ok(()) => tracing::info!(
-            target: "nrr::lifecycle",
-            msg_key = "supervised-teardown-step-finished",
-            step = name,
-            elapsed_ms = began.elapsed().as_millis() as u64,
-            "teardown step finished",
-        ),
-        Err(_) => tracing::warn!(
-            target: "nrr::lifecycle",
-            msg_key = "supervised-teardown-step-overran-budget",
-            step = name,
-            budget_ms = budget.as_millis() as u64,
-            "teardown step outran its budget — detached, continuing",
-        ),
+        Ok(()) => {
+            tracing::info!(
+                target: "nrr::lifecycle",
+                msg_key = "supervised-teardown-step-finished",
+                step = name,
+                elapsed_ms = began.elapsed().as_millis() as u64,
+                "teardown step finished",
+            );
+            StepEnd::Finished
+        }
+        Err(_) => {
+            tracing::warn!(
+                target: "nrr::lifecycle",
+                msg_key = "supervised-teardown-step-overran-budget",
+                step = name,
+                budget_ms = budget.as_millis() as u64,
+                "teardown step outran its budget — detached, continuing",
+            );
+            StepEnd::Overran
+        }
     }
+}
+
+/// How a [`teardown_step`] ended.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum StepEnd {
+    Finished,
+    Overran,
+    NotSpawned,
+}
+
+/// Run the route and filter teardown within `budget`; `false` when it outran
+/// it. With no thread to spare it runs here, unbounded, as it always did:
+/// skipping it would leave every route and filter behind.
+fn run_route_teardown(hook: &RouteRecomputeHook, budget: Duration) -> bool {
+    let detached = Arc::clone(hook);
+    match teardown_step("route-and-filter-teardown", budget, move || detached()) {
+        StepEnd::Finished => true,
+        StepEnd::Overran => false,
+        StepEnd::NotSpawned => {
+            hook();
+            true
+        }
+    }
+}
+
+/// Re-report `Stopping` every `tick` until `done`, for at most `hard_limit`.
+/// Returns `true` when the limit ran out first: from then on the progress a
+/// service manager reads as "still going" is no longer claimed.
+fn report_stop_progress(
+    controller: &dyn ServiceController,
+    done: &AtomicBool,
+    tick: Duration,
+    poll: Duration,
+    hard_limit: Duration,
+) -> bool {
+    let began = Instant::now();
+    let mut since_report = Duration::ZERO;
+    let mut explained = false;
+    while !done.load(Ordering::Relaxed) {
+        if began.elapsed() >= hard_limit {
+            tracing::error!(
+                target: "nrr::lifecycle",
+                msg_key = "supervised-stop-hard-limit",
+                limit_secs = hard_limit.as_secs(),
+                "the stop outran its hard limit; it ends with an error so the service is started again and the next start clears what is left",
+            );
+            return true;
+        }
+        std::thread::sleep(poll);
+        since_report += poll;
+        if since_report >= tick && !done.load(Ordering::Relaxed) {
+            since_report = Duration::ZERO;
+            controller.report(ServiceRuntimeState::Stopping);
+        }
+        // Every step before the route/filter teardown is time-boxed, so past
+        // this point the wait is that one, and what can take long in it is a
+        // filtering engine that has stopped answering. Said once: a silent
+        // hang invites the kill that leaves the filters in place.
+        if !explained && began.elapsed() >= STOP_SLOW_EXPLAIN && !done.load(Ordering::Relaxed) {
+            explained = true;
+            tracing::warn!(
+                target: "nrr::lifecycle",
+                msg_key = "supervised-stop-taking-long",
+                elapsed_secs = began.elapsed().as_secs(),
+                deadline_secs = crate::lifecycle_matrix::FILTER_TEARDOWN_DEADLINE.as_secs(),
+                "stop is taking unusually long — waiting on the packet-filter teardown. The stop goes on without it at the deadline; filters left behind are cleared by the next start or a reboot",
+            );
+        }
+    }
+    false
 }
 
 // ── SupervisedRuntimeDeps ────────────────────────────────────────────────────
@@ -393,6 +490,12 @@ pub struct SupervisedRuntimeDeps {
     /// the supervisor had to detach never releases it — so the ETW session and
     /// the machine-wide filtering-engine options would outlive the process.
     pub conn_observer_shutdown: Option<Arc<dyn Fn() + Send + Sync>>,
+    /// Hands the system DNS back after everything else, whatever the
+    /// resolver's own stop did: a stop step that hung kept its redirect to the
+    /// listener that is about to die, and on Windows that NRPT rule outlives a
+    /// reboot. `true` when nothing of ours is left. `None` where the OS does it
+    /// on its own (Linux: `ExecStopPost`).
+    pub dns_redirect_release: Option<Arc<dyn Fn() -> bool + Send + Sync>>,
 }
 
 /// A cheap, idempotent "recompute the active user's routes now" callback.
@@ -605,6 +708,7 @@ pub fn run_supervised_runtime(
     // A second runtime in the same process (tests, console restart) must not be
     // born already tearing down.
     crate::lifecycle::clear_teardown();
+    STOP_OVERRAN.store(false, Ordering::SeqCst);
     controller.report(ServiceRuntimeState::Starting);
 
     let blocked = !artifacts.is_ready_to_run();
@@ -912,41 +1016,18 @@ pub fn run_supervised_runtime(
 
     // SCM reads a rising checkpoint as progress; reporting `Stopping` once and
     // then parking in a blocking OS call is what makes a slow stop read as a
-    // wedged one. Keep reporting for as long as teardown runs.
+    // wedged one. Keep reporting while teardown runs, up to the hard limit.
     let teardown_done = AtomicBool::new(false);
+    let mut overran = false;
     std::thread::scope(|scope| {
-        scope.spawn(|| {
-            let mut since_report = Duration::ZERO;
-            let mut elapsed = Duration::ZERO;
-            let mut explained = false;
-            while !teardown_done.load(Ordering::Relaxed) {
-                std::thread::sleep(STOP_PROGRESS_POLL);
-                since_report += STOP_PROGRESS_POLL;
-                elapsed += STOP_PROGRESS_POLL;
-                if since_report >= STOP_PROGRESS_TICK && !teardown_done.load(Ordering::Relaxed) {
-                    since_report = Duration::ZERO;
-                    controller.report(ServiceRuntimeState::Stopping);
-                }
-                // Every step before the route/filter teardown is time-boxed, so
-                // past this point the wait is that one — and the only thing in
-                // it that can take long is a filtering engine that has stopped
-                // answering. Say so once: without this the stop is a silent
-                // hang, and the natural reaction (kill it) is the one that
-                // leaves the filters in place.
-                if !explained
-                    && elapsed >= STOP_SLOW_EXPLAIN
-                    && !teardown_done.load(Ordering::Relaxed)
-                {
-                    explained = true;
-                    tracing::warn!(
-                        target: "nrr::lifecycle",
-                        msg_key = "supervised-stop-taking-long",
-                        elapsed_secs = elapsed.as_secs(),
-                        deadline_secs = crate::lifecycle_matrix::FILTER_TEARDOWN_DEADLINE.as_secs(),
-                        "stop is taking unusually long — waiting on the packet-filter teardown. The stop goes on without it at the deadline; filters left behind are cleared by the next start or a reboot",
-                    );
-                }
-            }
+        let progress = scope.spawn(|| {
+            report_stop_progress(
+                controller,
+                &teardown_done,
+                STOP_PROGRESS_TICK,
+                STOP_PROGRESS_POLL,
+                STOP_HARD_LIMIT,
+            )
         });
 
         // Mode B (live re-arm): terminally shut the resolver down FIRST, so its serve
@@ -1030,28 +1111,36 @@ pub fn run_supervised_runtime(
         // on a machine shutdown. A crash skips this; the next start adopts or
         // strips what was left.
         if let Some(teardown) = deps.route_teardown_hook.as_ref() {
-            let hook_began = Instant::now();
-            tracing::info!(
-                target: "nrr::lifecycle",
-                msg_key = "supervised-teardown-step-entered",
-                step = "route-and-filter-teardown",
-                "teardown step entered",
-            );
-            teardown();
-            tracing::info!(
-                target: "nrr::lifecycle",
-                msg_key = "supervised-teardown-step-finished",
-                step = "route-and-filter-teardown",
-                elapsed_ms = hook_began.elapsed().as_millis() as u64,
-                "teardown step finished",
-            );
+            let budget = STOP_HARD_LIMIT
+                .saturating_sub(teardown_began.elapsed())
+                .max(ROUTE_TEARDOWN_FLOOR);
+            if !run_route_teardown(teardown, budget) {
+                overran = true;
+            }
+        }
+        // Last on the network, still before `Stopped`: names must work once
+        // the resolver is gone.
+        if let Some(release) = deps.dns_redirect_release.as_ref() {
+            if !release() {
+                tracing::warn!(
+                    target: "nrr::lifecycle",
+                    msg_key = "supervised-stop-dns-release-incomplete",
+                    "the system DNS could not all be handed back at stop; the next start retries",
+                );
+            }
         }
         // After the filters: a stop that runs short of time spends it on the
         // network, not on history.
         flush_conn_history_at_stop(deps.conn_history.as_ref());
 
         teardown_done.store(true, Ordering::Relaxed);
+        if progress.join().unwrap_or(false) {
+            overran = true;
+        }
     });
+    if overran {
+        STOP_OVERRAN.store(true, Ordering::SeqCst);
+    }
 
     // Before `Stopped`: once SCM sees it the process may be killed at any moment,
     // and a mark written afterwards is lost.

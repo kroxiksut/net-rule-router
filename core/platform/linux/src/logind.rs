@@ -20,16 +20,11 @@
 //! - `lingering` — no session, but the user enabled linger
 //!   (`loginctl enable-linger`), so their services keep running. This is the
 //!   `screen`-after-logout case working as intended.
-//! - `closing` — on the way out; not counted, or a logout would keep enforcing
-//!   for a user who is gone.
-//!
-//! ## The gap this does NOT cover, stated plainly
-//!
-//! A user who leaves processes behind WITHOUT linger (a bare `nohup`) has no
-//! logind user state once their last session closes. Their traffic can outlive
-//! the answer this module gives. logind is the authority on logins, not on
-//! processes, and inventing a second authority here would produce two truths
-//! about who is present.
+//! - `closing` — signed out, but processes left in their sessions (`tmux`,
+//!   `nohup`, a download) still run, as they do wherever `KillUserProcesses=no`.
+//!   Counted: dropping the user there would release that traffic from their
+//!   protection onto the main link. logind removes the user once the last of
+//!   those processes exits.
 
 #![cfg(target_os = "linux")]
 
@@ -47,6 +42,8 @@ pub struct LiveUser {
     /// running. Worth distinguishing in a log line: "nobody is logged in but we
     /// are still enforcing for them" is surprising until it is explained.
     pub lingering: bool,
+    /// Signed out, with processes still running in their closed sessions.
+    pub leaving: bool,
 }
 
 /// One row of `loginctl list-users --json=short`.
@@ -213,7 +210,8 @@ fn sign_in_facts(uids: &[u32]) -> Option<HashMap<u32, SignInFacts>> {
 /// The people among `users`. A display manager's greeter is an online user in
 /// logind (`fly-dm`, `gdm`, `lightdm` on the seat), and counted as present it
 /// gets a table and can be picked as the owner of the system one over the
-/// administrator signed in over SSH. A person has a `user*` session or linger;
+/// administrator signed in over SSH. A person has a `user*` session, linger, or
+/// processes left behind at sign-out (a closing greeter is still nobody);
 /// facts are asked for only when there is somebody to choose between or a
 /// system account to tell apart, so the usual tick costs nothing more.
 fn people(
@@ -230,7 +228,7 @@ fn people(
     };
     let people = users
         .into_iter()
-        .filter(|u| u.lingering || facts.contains_key(&u.uid))
+        .filter(|u| u.lingering || (u.leaving && !system_account(u)) || facts.contains_key(&u.uid))
         .collect();
     (people, facts)
 }
@@ -394,15 +392,20 @@ fn parse_live_users(
 ///
 /// - `active` / `online` — a session exists, attached or not.
 /// - `lingering` — no session, but linger keeps their services running.
-/// - anything else, `closing` included — not counted. A state this version does
-///   not know is not evidence of presence.
+/// - `closing` — signed out, their left-behind processes still running.
+/// - anything else — not counted. A state this version does not know is not
+///   evidence of presence.
 fn to_live_user(row: LoginctlUser, state: &str) -> Option<LiveUser> {
     let state = state.to_ascii_lowercase();
-    let live = matches!(state.as_str(), "active" | "online" | "lingering");
+    let live = matches!(
+        state.as_str(),
+        "active" | "online" | "lingering" | "closing"
+    );
     live.then(|| LiveUser {
         uid: row.uid,
         name: row.user,
         lingering: row.linger || state == "lingering",
+        leaving: state == "closing",
     })
 }
 
@@ -465,7 +468,33 @@ mod tests {
             uid,
             name: format!("u{uid}"),
             lingering,
+            leaving: false,
         }
+    }
+
+    fn leaving(uid: u32) -> LiveUser {
+        LiveUser {
+            leaving: true,
+            ..live(uid, false)
+        }
+    }
+
+    /// A user signed out with `tmux` still running has no live session, so no
+    /// facts; beside another person they stay present, or their processes
+    /// would leave their protection. A closing greeter is still nobody.
+    #[test]
+    fn a_user_signed_out_with_processes_left_stays_a_person() {
+        let users = vec![leaving(1001), live(1000, false), leaving(102)];
+        let (found, facts) = people(users, 999, |_| {
+            Some(HashMap::from([(1000, SignInFacts::default())]))
+        });
+        assert_eq!(uids(&found), [1001, 1000]);
+        assert!(
+            !facts.contains_key(&1001),
+            "no sign-in time to own the system table"
+        );
+        let (alone, _) = people(vec![leaving(102)], 999, |_| Some(HashMap::new()));
+        assert!(alone.is_empty());
     }
 
     fn uids(users: &[LiveUser]) -> Vec<u32> {
@@ -524,8 +553,8 @@ mod tests {
             HashMap::from([(1000, "active".to_string()), (1001, "closing".to_string())])
         })
         .expect("parses");
-        assert_eq!(users.len(), 1, "closing and vanished users are not live");
-        assert_eq!(users[0].uid, 1000);
+        assert_eq!(uids(&users), [1000, 1001], "a vanished user is not live");
+        assert!(users[1].leaving);
     }
 
     #[test]
@@ -572,12 +601,15 @@ mod tests {
         );
     }
 
+    /// Signed out with `nohup` or `tmux` still running and no linger: logind
+    /// holds the user in `closing` while those processes live, and so does
+    /// their protection.
     #[test]
-    fn a_user_on_the_way_out_does_not_count() {
-        // Enforcing for someone who just logged out would outlive them.
+    fn a_user_whose_processes_outlive_the_logout_still_counts() {
         let users = listed(r#"[{"uid":1000,"user":"alice","linger":false,"state":"closing"}]"#)
             .expect("parses");
-        assert!(users.is_empty());
+        assert_eq!(uids(&users), [1000]);
+        assert!(users[0].leaving && !users[0].lingering);
     }
 
     #[test]
@@ -601,9 +633,8 @@ mod tests {
                 {"uid":1002,"user":"c","linger":false,"state":"closing"}]"#,
         )
         .expect("parses");
-        assert_eq!(users.len(), 2, "the closing one is dropped");
-        assert_eq!(users[0].uid, 1000);
-        assert_eq!(users[1].uid, 1001);
+        assert_eq!(uids(&users), [1000, 1001, 1002]);
+        assert!(!users[1].leaving && users[2].leaving);
     }
 
     #[test]

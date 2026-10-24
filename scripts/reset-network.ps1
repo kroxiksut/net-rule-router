@@ -16,11 +16,15 @@
 #      a user's machine, where no repo exists,
 #   2. the repo build (`target\{debug,release}\nrr-service.exe`),
 #   3. emergency mode, plain PowerShell only: drop our NRPT rule, our routes
-#      and our WFP filters by the same signatures `cleanup` uses,
+#      and our WFP filters by the same signatures `cleanup` uses, and hand back
+#      the DNS suffix list and the BFE options the service noted it changed,
 #   4. restart the Base Filtering Engine when our filters could not be deleted
 #      one by one — our filters do not survive it, but neither does anyone
 #      else's, and Windows 11 refuses it,
 #   5. reboot — never without an explicit yes, and the default answer is no.
+#
+# Exits 1 when a step failed, so neither a caller nor the user reads an
+# incomplete reset as a working network.
 #
 # Self-elevates via UAC (WFP, NRPT and the route table all need Administrator).
 # Needs lib\service-paths.ps1 beside it; the package ships scripts\ whole.
@@ -134,26 +138,49 @@ else {
 }
 
 # ── Step 3-4: emergency mode ─────────────────────────────────────────────────
+# What could not be undone; any entry makes the reset incomplete.
+$failures = New-Object System.Collections.Generic.List[string]
 $filtersGone = $false
+$bfeRunning = $true
 if (-not $cleanupOk) {
     Write-Host "==> emergency mode: PowerShell only" -ForegroundColor Yellow
 
     # The same marker-scoped sweep the uninstaller falls back to
     # (lib\service-paths.ps1), so the two cannot drift apart.
-    $null = Remove-NrrDnsRedirect
+    if (-not (Remove-NrrDnsRedirect)) { $failures.Add('DNS redirect (NRPT)') }
+    if (-not (Restore-NrrDnsSearchList)) { $failures.Add('DNS suffix search list') }
 
     # Same signature the binary's offline reset adopts: host routes, overlay
-    # halves and network-rule routes, each at its own metric.
+    # halves and network-rule routes, each at its own metric. Each route on its
+    # own: one refusal must not keep the rest in place.
     Write-Host "--> removing our routes (metrics $routeMetric and $networkRouteMetric)" -ForegroundColor Cyan
     try {
         $ours = @(Get-NetRoute -ErrorAction Stop | Where-Object { Test-NrrOwnedRoute $_ })
+        $removed = 0
+        $refused = 0
         foreach ($route in $ours) {
-            Remove-NetRoute -InputObject $route -Confirm:$false -ErrorAction Stop
+            try {
+                Remove-NetRoute -InputObject $route -Confirm:$false -ErrorAction Stop
+                $removed += 1
+            }
+            catch {
+                $reason = $_.Exception.Message
+                # Gone in the meantime (its interface went) is what was wanted.
+                $still = @(Get-NetRoute -InterfaceIndex $route.InterfaceIndex `
+                        -DestinationPrefix $route.DestinationPrefix -ErrorAction SilentlyContinue |
+                    Where-Object { $_.NextHop -eq $route.NextHop -and $_.RouteMetric -eq $route.RouteMetric })
+                if ($still.Count -gt 0) {
+                    $refused += 1
+                    Write-Warning "Route $($route.DestinationPrefix) via $($route.NextHop) stays: $reason"
+                }
+            }
         }
-        Write-Host "    routes removed: $($ours.Count)"
+        Write-Host "    routes removed: $removed of $($ours.Count)"
+        if ($refused -gt 0) { $failures.Add("routes ($refused left)") }
     }
     catch {
         Write-Warning "Route sweep failed: $($_.Exception.Message)"
+        $failures.Add('routes')
     }
 
     $filtersGone = Remove-NrrWfpFilters
@@ -186,6 +213,7 @@ if (-not $cleanupOk -and -not $filtersGone) {
     $stopCode = Invoke-NativeCommand -FilePath $net -ArgumentList @('stop', 'bfe', '/y') -Quiet
     if (-not (Wait-ServiceStatus -Name BFE -Status Stopped -Seconds 5)) {
         Write-Warning "BFE did not stop (net.exe exit $stopCode); our filters may still be in place."
+        $failures.Add('WFP filters (BFE did not stop)')
     }
     $null = Invoke-NativeCommand -FilePath $net -ArgumentList @('start', 'bfe') -Quiet
     $bfeRunning = Wait-ServiceStatus -Name BFE -Status Running -Seconds 30
@@ -202,11 +230,22 @@ if (-not $cleanupOk -and -not $filtersGone) {
     }
     else {
         Write-Warning "BFE is not running - reboot to restore filtering."
+        $failures.Add('Base Filtering Engine (not running)')
     }
 }
 
+# Asked of BFE itself, so only once it runs again.
+if (-not $cleanupOk -and $bfeRunning -and -not (Restore-NrrWfpEngineOptions)) {
+    $failures.Add('BFE options')
+}
+
 # ── Step 5: reboot, only on an explicit yes ─────────────────────────────────
-Write-Host "Network reset complete." -ForegroundColor Green
+if ($failures.Count -eq 0) {
+    Write-Host "Network reset complete." -ForegroundColor Green
+}
+else {
+    Write-Warning "Network reset is incomplete: $($failures -join ', ') could not be undone. Reboot to clear what is left."
+}
 
 $doReboot = $Reboot.IsPresent
 if (-not $doReboot -and -not [Environment]::UserInteractive) {
@@ -224,3 +263,6 @@ if ($doReboot) {
 else {
     Write-Host "Not rebooting. A reboot fully clears any remainder."
 }
+
+if ($failures.Count -gt 0) { exit 1 }
+exit 0

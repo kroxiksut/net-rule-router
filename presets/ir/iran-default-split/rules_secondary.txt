@@ -19,6 +19,7 @@
 *.tiktok.com
 *.discord.com
 *.reddit.com
+*.redditmail.com
 *.linkedin.com
 *.telegram.org
 *.t.me

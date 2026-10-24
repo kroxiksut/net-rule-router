@@ -10,7 +10,7 @@ use nrr_shared::ipc_payloads::{
 };
 use nrr_shared::wire_fields::struct_wire_fields;
 
-const REVISION: u32 = 2;
+const REVISION: u32 = 3;
 
 const REQUEST_FIELDS: [&str; 29] = [
     "allow-dns-over-primary",

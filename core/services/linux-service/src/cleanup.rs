@@ -249,7 +249,8 @@ pub(crate) struct SystemHost {
 
 impl CleanupHost for SystemHost {
     fn service_run_state(&self) -> Result<Option<ServiceRunState>, String> {
-        nrr_platform_linux::service_control::LinuxServiceControl::new()
+        use nrr_platform_linux::service_control::{LinuxServiceControl, PasswordPrompt};
+        LinuxServiceControl::new(PasswordPrompt::Never)
             .query()
             .map(|report| report.map(|r| r.run_state))
             .map_err(|e| e.to_string())
@@ -284,7 +285,9 @@ impl CleanupHost for SystemHost {
     /// table: only we write those.
     fn stop_service(&self) -> Result<(), String> {
         use nrr_platform_api::service_control::{ServiceControlPort, STOP_FOR_RESET_BUDGET};
-        nrr_platform_linux::service_control::LinuxServiceControl::new()
+        use nrr_platform_linux::service_control::{LinuxServiceControl, PasswordPrompt};
+        // Runs as root (checked above): nobody to ask.
+        LinuxServiceControl::new(PasswordPrompt::Never)
             .stop_or_kill(STOP_FOR_RESET_BUDGET)
             .map_err(|e| e.to_string())
     }
@@ -374,6 +377,7 @@ mod tests {
             nm_conf_dir: root.join("nm"),
             resolvconf_record_dirs: vec![root.join("resolvconf")],
             resolved_stub: root.join("stub-resolv.conf"),
+            nsswitch_conf: root.join("nsswitch.conf"),
         }
     }
 

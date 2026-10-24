@@ -166,11 +166,14 @@ pub fn fail_closed_block_apps_for(
     if !protocols.wants_ale_block() {
         return Vec::new();
     }
+    // Both families, as the pair it stands in for.
     app_patterns
         .iter()
         .take(APP_KILLSWITCH_MAX_APPS)
         .enumerate()
-        .map(|(idx, pattern)| ale_block_app(sid, pattern, idx as u64, app_takeover))
+        .flat_map(|(idx, pattern)| {
+            [false, true].map(|v6| ale_block_app(sid, pattern, idx as u64, app_takeover, v6))
+        })
         .collect()
 }
 
@@ -180,17 +183,33 @@ pub fn fail_closed_block_apps_for(
 /// keep working for the app even with the tunnel unresolved, unless the app
 /// takes all its addresses ([`app_block_band`]); the id folds the band tag for
 /// the same upgrade reason as [`block_app_off_secondary`].
-fn ale_block_app(sid: &str, pattern: &str, idx: u64, app_takeover: bool) -> WfpFilterSpec {
+fn ale_block_app(
+    sid: &str,
+    pattern: &str,
+    idx: u64,
+    app_takeover: bool,
+    v6: bool,
+) -> WfpFilterSpec {
     let (weight, band) = app_block_band(idx, app_takeover);
     WfpFilterSpec {
-        layer: WfpLayerKey::AleAuthConnectV4,
+        layer: super::ale_layer_for(v6),
         action: WfpAction::Block,
         remote_ip: None,
         remote_ip_set: Vec::new(),
         remote_ip_set_v6: Vec::new(),
         remote_port: None,
         weight,
-        id: filter_id_for(sid, KILLSWITCH_ROLE, band, "ks-app-fc-block", pattern),
+        id: filter_id_for(
+            sid,
+            KILLSWITCH_ROLE,
+            band,
+            if v6 {
+                "ks-app-fc-block-v6"
+            } else {
+                "ks-app-fc-block"
+            },
+            pattern,
+        ),
         user_sid: Some(sid.to_string()),
         app_pattern: Some(pattern.to_string()),
         local_interface_luid: None,

@@ -1378,4 +1378,78 @@ mod tests {
         }
         assert_eq!(MergePolicy::from_slug("nonsense"), MergePolicy::Union);
     }
+
+    fn program_rule(
+        id: &str,
+        name: &str,
+        children: bool,
+        override_requested: bool,
+    ) -> CanonicalRule {
+        CanonicalRule {
+            id: RuleId(id.to_string()),
+            enabled: true,
+            address_match: None,
+            app_match: Some(crate::canonical::CanonicalAppMatch {
+                pattern: crate::canonical::CanonicalAppPattern::Exact(name.to_string()),
+                include_child_processes: children,
+                override_requested,
+            }),
+            comment: String::new(),
+            action: crate::canonical::RuleAction::Route,
+            origin: None,
+        }
+    }
+
+    /// `+override` added to a program in the file, as the documentation says
+    /// to, reaches the merged book. Keyed apart, the two read as a file-only
+    /// and a service-only rule, and the duplicate removal kept the plain one:
+    /// "applied", with the request gone.
+    #[test]
+    fn an_override_added_in_the_file_survives_the_merge() {
+        let file = book(
+            vec![],
+            vec![program_rule("r-f", "Telegram.exe", false, true)],
+        );
+        let service = book(
+            vec![],
+            vec![program_rule("r-s", "Telegram.exe", false, false)],
+        );
+        let out = merge_rule_books(&file, &service, MergePolicy::Union, SubdomainCoverage::Off);
+        assert_eq!(
+            out.conflicts.len(),
+            1,
+            "one program, two answers: a conflict"
+        );
+        let merged: Vec<&CanonicalRule> = out.merged.secondary.rules().iter().collect();
+        assert_eq!(merged.len(), 1, "{merged:?}");
+        let flags = merged[0].app_match.as_ref().map(|m| m.override_requested);
+        assert_eq!(
+            flags,
+            Some(true),
+            "the file's request is the default answer"
+        );
+    }
+
+    /// `+children` is the same program with a flag: one rule after the merge,
+    /// not two lines naming one program.
+    #[test]
+    fn children_added_in_the_file_merge_into_one_rule() {
+        let file = book(vec![], vec![program_rule("r-f", "codex.exe", true, false)]);
+        let service = book(vec![], vec![program_rule("r-s", "codex.exe", false, false)]);
+        let out = merge_rule_books(
+            &file,
+            &service,
+            MergePolicy::FileWins,
+            SubdomainCoverage::Off,
+        );
+        let merged = out.merged.secondary.rules();
+        assert_eq!(merged.len(), 1, "{merged:?}");
+        assert_eq!(
+            merged[0]
+                .app_match
+                .as_ref()
+                .map(|m| m.include_child_processes),
+            Some(true)
+        );
+    }
 }

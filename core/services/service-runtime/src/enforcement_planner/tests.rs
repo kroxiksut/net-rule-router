@@ -1490,7 +1490,7 @@ fn slice4d_fail_closed_and_app_kill_switch_match_current_codegen() {
     // longer earn rescue permits: the block sits below the primary rule
     // band, so the primary rules' own permits carry them.
     let cur = app_kill_switch_filters(sid, &apps, luid, KillSwitchProtocols::ALL);
-    assert_eq!(cur.len(), 4, "2 apps × (permit + block)");
+    assert_eq!(cur.len(), 8, "2 apps × 2 families × (permit + block)");
     let low = lower_kill_switch(
         &plan(plan_app_kill_switch(sid, &apps, KillSwitchProtocols::ALL)),
         luid,
@@ -1499,13 +1499,17 @@ fn slice4d_fail_closed_and_app_kill_switch_match_current_codegen() {
 
     // (B) primary-app exemption — one unconditional ALE permit per app.
     let cur = primary_app_exempt_filters(sid, &apps);
-    assert_eq!(cur.len(), 2, "one exempt permit per app, no block");
+    assert_eq!(
+        cur.len(),
+        4,
+        "one exempt permit per app and family, no block"
+    );
     let low = lower_catch_all_kill_switch(&plan(plan_primary_app_exempt(sid, &apps)), luid);
     assert_equiv(&cur, &low, "primary-app-exempt");
 
     // (D) fail-closed per-app blocks.
     let cur = fail_closed_block_apps(sid, &apps, KillSwitchProtocols::ALL);
-    assert_eq!(cur.len(), 2, "one block per app");
+    assert_eq!(cur.len(), 4, "one block per app and family");
     let low = lower_kill_switch(
         &plan(plan_fail_closed_apps(sid, &apps, KillSwitchProtocols::ALL)),
         luid,
@@ -2129,10 +2133,14 @@ fn the_planned_counter_overlay_answers_the_tunnel_it_is_given() {
         overlay(&redirect_set, true),
         crate::route_codegen::counter_overlay_for(&redirect_set)
     );
+    assert!(
+        overlay(&[], true).is_empty(),
+        "a tunnel that takes nothing is answered with nothing"
+    );
     assert_eq!(
-        overlay(&[], true),
+        overlay(&crate::route_codegen::ASSUMED_CATCH_ALLS, true),
         crate::route_codegen::COUNTER_OVERLAY.to_vec(),
-        "an unknown tunnel keeps the classic /2 set"
+        "an unread table keeps the classic /2 set"
     );
     assert!(
         overlay(&redirect_set, false).is_empty(),
@@ -2198,8 +2206,8 @@ fn an_app_and_address_rule_plans_nothing_and_is_reported() {
     }
 }
 
-/// A network carved past the cap loses its narrower rules without a filter to
-/// show for it; both planners report it as the same conflict.
+/// A network carved past the cap is skipped, not widened over its narrower
+/// rules; both planners report it as the same conflict.
 #[test]
 fn a_network_carved_past_the_cap_is_a_conflict_in_both_planners() {
     use crate::wfp_codegen::{generate_filters, CodegenInput};
@@ -2232,7 +2240,14 @@ fn a_network_carved_past_the_cap_is_a_conflict_in_both_planners() {
         families: crate::enforcement_planner::FamilyScope::V4Only,
         packet_blocks: true,
     });
-    let (_, report) = plan_route_rules(&rb, sid, &planner_input(&cache, &resolver, &obs));
+    let (flows, report) = plan_route_rules(&rb, sid, &planner_input(&cache, &resolver, &obs));
+    assert!(
+        !flows.iter().any(|f| matches!(
+            f.flow.dst,
+            DstMatch::SubnetV4 { .. } | DstMatch::SubnetV6 { .. }
+        )),
+        "the network plans no flow: {flows:?}"
+    );
 
     let codegen = crate::rule_conflicts::over_cap_networks(
         &current
@@ -2441,4 +2456,55 @@ fn the_block_all_names_resolvers_of_both_families() {
         ]
     );
     assert!(dns_permits(false).is_empty());
+}
+
+/// A WireGuard profile numbered `fd00::2` whose client routes only IPv4: the
+/// address alone said "carries IPv6", AAAA for rule hosts went out, and the
+/// route codegen had no next hop to send them by. The family rides the tunnel
+/// only with a way out for it.
+#[test]
+fn a_tunnel_with_an_ipv6_address_but_no_ipv6_route_does_not_carry_the_family() {
+    use nrr_platform_api::adapters::{AdapterInfo, IfOperStatus, InterfaceType};
+    use nrr_platform_api::{RouteEntry, RouteTableRef};
+    let link = |index: u32, v6: &str| AdapterInfo {
+        index,
+        adapter_name: format!("dev{index}"),
+        description: String::new(),
+        friendly_name: format!("link{index}"),
+        mac: None,
+        interface_type: InterfaceType::Ethernet,
+        oper_status: IfOperStatus::Up,
+        ipv4_addresses: Vec::new(),
+        ipv6_addresses: vec![v6.parse().expect("v6")],
+        gateways: Vec::new(),
+    };
+    let tunnel = link(9, "fd00::2");
+    let adapters = vec![link(2, "2001:db8::10"), tunnel.clone()];
+    let v4_only = vec![RouteEntry {
+        destination: "0.0.0.0".parse().expect("v4"),
+        prefix_length: 0,
+        next_hop: "10.0.0.1".parse().expect("v4"),
+        interface_index: 9,
+        metric: 1,
+        is_ours: false,
+        table: RouteTableRef::Main,
+    }];
+    assert_eq!(
+        Ipv6Guard::from_links(&adapters, Some(&tunnel), &v4_only),
+        Ipv6Guard::FiltersOnly
+    );
+    let mut with_v6 = v4_only;
+    with_v6.push(RouteEntry {
+        destination: "::".parse().expect("v6"),
+        prefix_length: 0,
+        next_hop: "fe80::1".parse().expect("v6"),
+        interface_index: 9,
+        metric: 1,
+        is_ours: false,
+        table: RouteTableRef::Main,
+    });
+    assert_eq!(
+        Ipv6Guard::from_links(&adapters, Some(&tunnel), &with_v6),
+        Ipv6Guard::FiltersAndRoutes
+    );
 }

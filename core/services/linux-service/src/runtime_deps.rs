@@ -229,7 +229,7 @@ pub(crate) fn build_runtime_deps(
                     target: "nrr::enforcement",
                     msg_key = "linux-svc-policy-kept-for-shutdown",
                     reason = ?reason,
-                    "machine shutting down — filters and routes stay in force until the end",
+                    "filters and routes stay in force through this stop: the machine is going down, or a new version takes over",
                 );
             }
             if let Err(reason) = cycle.teardown_with(plan) {
@@ -311,6 +311,7 @@ pub(crate) fn build_runtime_deps(
                     Arc::new(move |sid: &str| posture.armed_for(sid))
                         as nrr_service_runtime::dns_stack::PrincipalFlag
                 }),
+                paused: ipc.routing_pause_terms.as_ref().map(|t| t.paused_view()),
                 fake_assembly: None,
                 fake_ip_running: None,
                 fake_ip_secondary_ready: None,
@@ -454,6 +455,7 @@ pub(crate) fn build_runtime_deps(
         dns_observation_consumer: None,
         sign_in_gate: None,
         fake_ip_shutdown: None,
+        dns_redirect_release: None,
         conn_observer_shutdown: None,
         conn_observation_source: None,
         conn_observation_consumer: None,
@@ -622,6 +624,14 @@ pub(crate) fn build_ipc_server(
                 Arc::clone(&stack.service_resolver),
                 Arc::clone(&stack.block_notice_center),
                 Arc::clone(&stack.block_notice_journal),
+                Some(nrr_service_runtime::site_check::held_under_everything(
+                    stack.fail_closed_posture.clone(),
+                    Arc::new(
+                        nrr_service_runtime::production_handlers_misc::ProductionRoutePolicySource::new(
+                            Arc::clone(&stack.state_conn),
+                        ),
+                    ),
+                )),
             );
             // The daemon's confirmations; an enforcement pass before this
             // saw none, so the protection held.
@@ -1134,7 +1144,8 @@ pub(crate) fn build_policy_stack(
     events: Arc<EventBus>,
     dns_capture: crate::dns_stack::DnsCapture,
 ) -> Option<PolicyStack> {
-    let conn = open_state_connection(&artifacts.topology.state_db_path)?;
+    // Never behind bootstrap's back: a blocked boot leaves the store alone.
+    let conn = open_state_connection(artifacts.usable_state_db()?)?;
     let state_conn = Arc::clone(&conn);
     let conn_for_stability = Arc::clone(&conn);
 
@@ -1315,7 +1326,7 @@ pub(crate) fn build_policy_stack(
         // started working, and would keep standing after the reason went away.
         .with_primary_behavior_source({
             let stalls = nrr_service_runtime::primary_stall_registry::global_primary_stalls();
-            Arc::new(move |hostname: &str| stalls.behavior_of_subtree(hostname))
+            Arc::new(move |sid: &str, hostname: &str| stalls.behavior_of_subtree(sid, hostname))
         })
         // The user's mode decides which offers change anything.
         .with_behavior_mode_source({

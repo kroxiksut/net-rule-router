@@ -67,6 +67,50 @@ jobs:
         # on Linux. Twice already a module landed with direct Win32 calls and no
         # `cfg` guard, and a test asserted the host OS outright — both broke the
         # Linux build and both were found only by someone running WSL by hand.
-        # Enforcement tests that need root (nftables, live routes) skip loudly
-        # on their own; they are not this job's business.
+        # Enforcement tests that need root (nftables, live routes) run in the
+        # privileged job below.
         run: bash scripts/check.sh --require-cargo-deny --require-qmllint
+
+  # The `#[ignore]` tests: nftables, live routes, link and DNS observers. They
+  # need root, which this throwaway runner grants through sudo.
+  privileged:
+    runs-on: ubuntu-latest
+
+    env:
+      NRR_SKIP_QT_HOST: "1"
+      # Only the test binaries run as root; cargo, the build and its cache stay
+      # with the runner user, so no root-owned file lands in `target`.
+      CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER: "sudo -E"
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Read pinned toolchain
+        id: toolchain
+        shell: bash
+        run: echo "channel=$(grep '^channel' rust-toolchain.toml | cut -d'"' -f2)" >> "$GITHUB_OUTPUT"
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
+        with:
+          toolchain: ${{ steps.toolchain.outputs.channel }}
+          targets: x86_64-unknown-linux-gnu
+
+      - name: Cache Rust artifacts
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+
+      - name: Install nftables
+        env:
+          DEBIAN_FRONTEND: noninteractive
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends nftables
+
+      # The same crates and thread count as `check.sh --include-privileged`:
+      # one thread, because the tests share the route table and nftables.
+      # `--tests` keeps rustdoc out: under `--ignored` it would compile
+      # `ignore` doc examples. The pump cost is a measurement, not a check.
+      - name: Run privileged tests
+        run: >-
+          cargo test --locked -p nrr-platform-linux -p nrr-service-runtime --tests --
+          --ignored --test-threads=1
+          --skip the_pump_cost_at_scale

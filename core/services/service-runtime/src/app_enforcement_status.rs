@@ -222,7 +222,10 @@ impl SharedIpExemptionStatus {
 /// adapter unavailable" banner (dismissible via a preference — deliberately
 /// running the service with the VPN down is a legitimate setup).
 #[derive(Clone, Default)]
-pub struct BlockAllPostureStatus(Arc<Mutex<bool>>);
+pub struct BlockAllPostureStatus {
+    armed: Arc<Mutex<bool>>,
+    outage: Arc<Mutex<bool>>,
+}
 
 impl BlockAllPostureStatus {
     /// Construct disarmed.
@@ -233,14 +236,27 @@ impl BlockAllPostureStatus {
     /// Replace the stored armed flag. A poisoned lock is skipped (best-effort
     /// diagnostics must never panic the apply path).
     pub fn set(&self, armed: bool) {
-        if let Ok(mut guard) = self.0.lock() {
+        if let Ok(mut guard) = self.armed.lock() {
             *guard = armed;
         }
     }
 
     /// The last stored armed flag. A poisoned lock recovers the inner value.
     pub fn armed(&self) -> bool {
-        *self.0.lock().unwrap_or_else(|p| p.into_inner())
+        *self.armed.lock().unwrap_or_else(|p| p.into_inner())
+    }
+
+    /// Replace "everything is held because the additional link is gone". The
+    /// catch-all over a live tunnel is armed too, and is not that.
+    pub fn set_outage(&self, holding: bool) {
+        if let Ok(mut guard) = self.outage.lock() {
+            *guard = holding;
+        }
+    }
+
+    /// What the "internet waits for the additional connection" banner shows.
+    pub fn holding_for_outage(&self) -> bool {
+        *self.outage.lock().unwrap_or_else(|p| p.into_inner())
     }
 }
 

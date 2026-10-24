@@ -20,16 +20,20 @@ pub struct AutoProbeCadence {
 }
 
 /// Each principal's own opt-in and repeat window, read from their stored
-/// policy. An unreadable policy is not consent.
+/// policy. An unreadable policy is not consent, and neither is protection that
+/// keeps everything off the main connection: the pass would name the
+/// suggested sites there.
 pub fn stored_auto_probe_cadence(
     state_conn: Arc<std::sync::Mutex<rusqlite::Connection>>,
 ) -> Arc<dyn Fn(&str) -> AutoProbeCadence + Send + Sync> {
     Arc::new(move |sid: &str| {
         let guard = state_conn.lock().unwrap_or_else(|p| p.into_inner());
         match nrr_storage::route_bindings::RouteBindingsRepository::new(&guard).load_for_sid(sid) {
-            Ok(record) => {
-                auto_probe_cadence(record.primary_probe_auto, record.primary_probe_repeat_secs)
-            }
+            Ok(record) => auto_probe_cadence(
+                record.primary_probe_auto
+                    && !crate::production_rules_provider::keeps_names_off_main(&record),
+                record.primary_probe_repeat_secs,
+            ),
             Err(_) => AutoProbeCadence {
                 enabled: false,
                 repeat: Duration::from_secs(300),

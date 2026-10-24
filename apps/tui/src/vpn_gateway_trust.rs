@@ -1,8 +1,8 @@
 //! "Let this VPN connect?" — the terminal UI's answer when leak protection
 //! stopped another VPN reaching its server over the main link.
 //!
-//! The Status screen lists the service's pending gateways; `a` allows every
-//! one of them. The write replaces the caller's whole list, so it starts from
+//! The Status screen lists the service's pending gateways; `a` allows the
+//! first, the next is asked after it. The write replaces the caller's whole list, so it starts from
 //! a fresh read of what the service holds and adds the answer with the same
 //! decision the window makes, from `nrr-client-logic`.
 
@@ -44,11 +44,11 @@ pub const ALLOWED_MANY: Key = key(
 );
 pub const HINT: Key = key(
     "tui.status.vpn-gateway-hint",
-    "a: allow these VPNs to reach their servers while leak protection is on.",
+    "a: allow the first VPN listed to reach its server while leak protection is on. The others are asked one at a time after it.",
 );
 pub const HELP: Key = key(
     "tui.help.status-vpn-gateway",
-    "a: allow the listed VPNs to reach their servers, so leak protection lets them connect",
+    "a: allow the first listed VPN to reach its server, so leak protection lets it connect",
 );
 
 #[cfg(test)]
@@ -141,30 +141,25 @@ pub fn rewrite(
     Ok(response.gateways)
 }
 
-/// Allow every pending gateway. `false` when there is nothing to allow, the
-/// service is away or a write is in flight.
-pub fn allow_pending(app: &mut AppState) -> bool {
+/// Allow the first pending gateway, as the window asks each address. `false`
+/// when there is nothing to allow, the service is away or a write is in
+/// flight.
+pub fn allow_first(app: &mut AppState) -> bool {
     let state = &app.vpn_gateway_trust;
-    if state.pending.is_empty() || state.busy || !app.link.is_connected() {
+    if state.busy || !app.link.is_connected() {
         return false;
     }
-    let offers = offers(&state.pending);
-    if offers.is_empty() {
+    let Some(offer) = offers(&state.pending).into_iter().next() else {
         return false;
-    }
+    };
     app.vpn_gateway_trust.busy = true;
-    app.outbox.push(allow_job(offers));
+    app.outbox.push(allow_job(offer));
     true
 }
 
-fn allow_job(offers: Vec<GatewayOffer>) -> Job {
+fn allow_job(offer: GatewayOffer) -> Job {
     Box::new(move |client: &dyn IpcClient| {
-        let addresses: Vec<String> = offers.iter().map(|o| o.address.clone()).collect();
-        let result = rewrite(client, |existing| {
-            offers.iter().fold(existing.to_vec(), |list, offer| {
-                confirmed_gateways(&list, offer)
-            })
-        });
+        let result = rewrite(client, |existing| confirmed_gateways(existing, &offer));
         Reply::new(move |app| {
             let state = &mut app.vpn_gateway_trust;
             state.busy = false;
@@ -172,9 +167,12 @@ fn allow_job(offers: Vec<GatewayOffer>) -> Job {
                 Ok(stored) => {
                     state.confirmed = stored;
                     // The service republishes its list on the next compute;
-                    // until then the question is answered.
-                    state.pending.clear();
-                    Ok(addresses)
+                    // until then this question is answered and the next is up.
+                    let address = offer.address.as_str();
+                    state
+                        .pending
+                        .retain(|g| !g.address.trim().eq_ignore_ascii_case(address));
+                    Ok(vec![offer.address])
                 }
                 Err(error) => Err(ipc_error_to_wire(&error).1),
             });

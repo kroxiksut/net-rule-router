@@ -13,9 +13,20 @@ use super::*;
 /// every OS, and both live enumerations call this one copy so a row cannot mean
 /// one thing on Windows and another on Linux.
 pub fn apply_external_ip_probes(rows: &mut [InterfaceRouteRow]) {
+    apply_external_ip_probes_where(rows, &|_| true);
+}
+
+/// [`apply_external_ip_probes`] for the rows `wanted` picks; every other row
+/// is marked skipped. The check is the asking user's, so it leaves only
+/// through their own connections.
+pub fn apply_external_ip_probes_where(
+    rows: &mut [InterfaceRouteRow],
+    wanted: &dyn Fn(&InterfaceRouteRow) -> bool,
+) {
     let targets = rows
         .iter()
         .enumerate()
+        .filter(|(_, row)| wanted(row))
         .filter_map(|(index, row)| {
             external_probe_target(row.availability_status, &row.local_ip)
                 .map(|source| (index, source))

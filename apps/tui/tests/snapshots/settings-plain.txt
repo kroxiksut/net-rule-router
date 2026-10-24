@@ -20,7 +20,7 @@ Settings sections:
     c5. Presets and settings
     c6. Logs and diagnostics
     c7. Traffic statistics
-    c8. Check for updates
+    c8. About and updates
     c9. Terminal
 Commands on this screen:
   c and a number, for example c2: open that section
@@ -38,7 +38,7 @@ Settings sections:
     c5. Presets and settings
     c6. Logs and diagnostics
     c7. Traffic statistics
-    c8. Check for updates
+    c8. About and updates
     c9. Terminal
 Commands on this screen:
   c and a number, for example c2: open that section
@@ -86,7 +86,7 @@ Settings sections:
     c5. Presets and settings
     c6. Logs and diagnostics
     c7. Traffic statistics
-    c8. Check for updates
+    c8. About and updates
   > c9. Terminal
 Commands on this screen:
   c and a number, for example c2: open that section

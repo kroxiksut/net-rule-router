@@ -203,19 +203,6 @@ fn per_ip_paths_never_emit_v6() {
         KillSwitchProtocols::ALL
     ))
     .is_empty());
-    assert!(v6_filters(&app_kill_switch_filters(
-        "S",
-        &["a.exe".to_string()],
-        LUID,
-        KillSwitchProtocols::ALL,
-    ))
-    .is_empty());
-    assert!(v6_filters(&fail_closed_block_apps(
-        "S",
-        &["a.exe".to_string()],
-        KillSwitchProtocols::ALL
-    ))
-    .is_empty());
 }
 
 #[test]

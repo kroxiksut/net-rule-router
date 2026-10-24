@@ -129,6 +129,26 @@ Item {
         })
     }
 
+    // The write replaces all four fields, so a change (`patch`, the fields the
+    // user touched) goes over a fresh read rather than the copy last polled.
+    function applyPatch(patch) {
+        var p = patch || {}
+        var shown = controller.settings || {}
+        controller.settings = Object.assign({}, shown, p)
+        if (!bridgeReady()) return
+        var corr = ownerRoot.rpc.rpcTrafficStatsGet({ "day": controller.epochDay() })
+        if (!corr || corr === "") return
+        ownerRoot.rpc.registerRpcCallback(corr, function(ok, r, code, msg) {
+            if (!ok || !r) {
+                // Nothing written; show what the service holds again.
+                controller.refresh()
+                return
+            }
+            var fresh = controller._applySettingsPayload(r["settings"] || {})
+            controller.applySettings(Object.assign({}, fresh, p))
+        })
+    }
+
     // Persist the settings; optimistic local update, next poll reconciles.
     function applySettings(obj) {
         controller.settings = obj

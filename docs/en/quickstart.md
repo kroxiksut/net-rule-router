@@ -77,7 +77,9 @@ routing does not apply.
    - **Off** (the default) — if the additional connection drops, traffic
      continues over your main connection.
    - **Routed sites** — what your rules send through the additional
-     connection never goes out the main one. Everything else keeps working.
+     connection never goes out the main one while strict blocking of shared
+     addresses is on, as it is by default. Everything else keeps working,
+     except sites that share an address with a routed one.
      Offered with the main-connection default route.
    - **Everything** — nothing leaves except through the additional
      connection, your local network and what your rules send over the main
@@ -115,7 +117,7 @@ seven ways, listed here from the strongest rule to the weakest:
 
 The narrower rule wins: a site's own name beats its address, an address beats
 the network around it, a network beats the zone. A rule that names the zone
-(`example.by`) beats `example.*` for that zone. A rule names either an address or an
+(`*.example.by`) beats `example.*` for that zone. A rule names either an address or an
 application: a rule that limits an address to one application cannot be
 carried out yet, so the service refuses it.
 

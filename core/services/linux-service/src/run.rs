@@ -138,6 +138,10 @@ pub fn run() -> ExitCode {
     let interval = watchdog_interval(std::env::var("WATCHDOG_USEC").ok().as_deref())
         .unwrap_or(DEFAULT_WATCHDOG_PING);
     let stop = StopToken::new();
+    // Left by an upgrade that never stopped us; it must not speak for a later
+    // stop.
+    let _ = nrr_service_runtime::lifecycle::take_upgrade_stop_marker(&artifacts.topology.data_dir);
+    let data_dir_for_signal = artifacts.topology.data_dir.clone();
 
     // Catch the stop signals before anything is enforced — DNS capture below
     // already rewrites the machine — so no window exists in which policy is
@@ -151,6 +155,9 @@ pub fn run() -> ExitCode {
         let reason = if nrr_platform_linux::systemd::SystemdShutdownProbe.machine_is_shutting_down()
         {
             StopReason::MachineShutdown
+        } else if nrr_service_runtime::lifecycle::take_upgrade_stop_marker(&data_dir_for_signal) {
+            // The package scripts restart us on new files.
+            StopReason::Upgrade
         } else {
             StopReason::ServiceStop
         };
@@ -170,6 +177,9 @@ pub fn run() -> ExitCode {
         );
     }
 
+    // The same stage lines as the Windows service: `service-live-check` finds
+    // the latest start by them on both systems.
+    tracing::info!(target: "nrr::boot", msg_key = "svc-boot-stage-entered", stage = "build-deps", "boot stage entered");
     // The same supervised runtime the Windows service runs — supervisor, health
     // aggregation, IPC accept task, retention jobs.
     let health = Arc::new(HealthAggregator::new());
@@ -236,6 +246,7 @@ pub fn run() -> ExitCode {
     );
     // READY comes from here, once the runtime reports the socket bound.
     let controller = LogController::new(health, notify);
+    tracing::info!(target: "nrr::boot", msg_key = "svc-boot-stage-entered", stage = "run-runtime", "boot stage entered");
     run_supervised_runtime(&controller, &stop, artifacts, deps);
 
     tracing::info!(
@@ -243,6 +254,11 @@ pub fn run() -> ExitCode {
         msg_key = "linux-svc-runtime-stopped",
         "linux-service runtime stopped",
     );
+    // A stop cut off at its hard limit left things behind; the failure is what
+    // makes them visible to systemd and to the next start.
+    if nrr_service_runtime::supervised_runtime::stop_overran() {
+        return ExitCode::FAILURE;
+    }
     ExitCode::SUCCESS
 }
 
@@ -259,13 +275,9 @@ impl Heartbeats {
     /// `None` = no evidence either way (a component that is not wired, or an
     /// acceptor that has not accepted yet), never evidence of death.
     fn readings(&self) -> [(&'static str, Option<u64>); 3] {
-        let adapters = self
-            .health
-            .snapshot()
-            .components
-            .iter()
-            .find(|c| c.component == HealthComponent::Adapters)
-            .map(|c| c.updated_at_epoch_secs);
+        // The monitor's own record: a louder named voice on the same component
+        // carries its own stamp and must not read as a stalled monitor.
+        let adapters = self.health.recorded_at(HealthComponent::Adapters);
         let accept = self.accept.load(Ordering::Relaxed);
         [
             ("adapter-monitor", adapters),
@@ -276,6 +288,20 @@ impl Heartbeats {
             ("ipc-accept", (accept != 0).then_some(accept)),
         ]
     }
+}
+
+/// The beats of what actually runs. A start parked in recovery runs only the
+/// acceptor, so the pass beat frozen at the cycle's creation (and any other
+/// stamp left from before) is no evidence: counted, it would have the watchdog
+/// kill, in a loop, the very instance kept up to show why it is parked.
+fn running_beats<const N: usize>(
+    readings: [(&'static str, Option<u64>); N],
+    parked_in_recovery: bool,
+) -> [(&'static str, Option<u64>); N] {
+    if !parked_in_recovery {
+        return readings;
+    }
+    readings.map(|(name, beat)| (name, beat.filter(|_| name == "ipc-accept")))
 }
 
 /// Ping systemd on its own thread at half the declared timeout, for as long as
@@ -298,7 +324,11 @@ fn spawn_watchdog(interval: Duration, stop: StopToken, beats: Heartbeats) {
                 // turn once, and refresh its beat, before the next look.
                 let _ = std::os::unix::net::UnixStream::connect(SOCKET_PATH);
                 std::thread::sleep(interval);
-                let stale = ages.stale(started.elapsed(), window, &beats.readings());
+                let readings = running_beats(
+                    beats.readings(),
+                    nrr_service_runtime::lifecycle::recovery_required(),
+                );
+                let stale = ages.stale(started.elapsed(), window, &readings);
                 if !stale.is_empty() {
                     tracing::error!(
                         target: "nrr::lifecycle",
@@ -716,6 +746,38 @@ mod tests {
         assert!(ages
             .stale(at(800), WINDOW, &[("ipc-accept", Some(NOW))])
             .is_empty());
+    }
+
+    /// A start parked in recovery runs no pass, so its frozen pass stamp is no
+    /// evidence: the watchdog keeps pinging through ten minutes of it, where
+    /// the frozen beat itself withholds the ping after the window.
+    #[test]
+    fn a_start_parked_in_recovery_is_not_killed_by_the_watchdog() {
+        // The pass stamp and a stray adapter stamp stay where they were; the
+        // acceptor keeps turning.
+        let beats = |now: u64, parked: bool| {
+            running_beats(
+                [
+                    ("adapter-monitor", Some(NOW)),
+                    ("enforcement", Some(NOW)),
+                    ("ipc-accept", Some(NOW + now)),
+                ],
+                parked,
+            )
+        };
+        let mut parked = BeatAges::default();
+        for now in (0..=600).step_by(15) {
+            assert!(
+                parked.stale(at(now), WINDOW, &beats(now, true)).is_empty(),
+                "parked start withheld at {now} s"
+            );
+        }
+        let mut running = BeatAges::default();
+        assert!(running.stale(at(0), WINDOW, &beats(0, false)).is_empty());
+        assert_eq!(
+            running.stale(at(75), WINDOW, &beats(75, false)),
+            vec!["adapter-monitor", "enforcement"]
+        );
     }
 
     /// The acceptor is poked once per interval, so a long interval must not

@@ -769,6 +769,7 @@ QtObject {
             // copy of the rules.
             skipApply: false,
             onComplete: function(summary) {
+                if (root.boundFilesController) root.boundFilesController.tableFromFiles = true
                 // Compose status with the
                 // imported-rules count and any preserved-passthrough
                 // suffix. Setting statusLine inside the callback

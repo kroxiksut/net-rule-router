@@ -905,6 +905,7 @@ Dialog {
             }
             ThemedComboBox {
                 id: ruleTypeCombo
+                accessibleLabel: root.uiRevision >= 0 ? root.tr("label.rule-type", "Rule type") : ""
                 theme: root.uiTheme
                 visible: !ruleDialog.bulkMode
                 Layout.fillWidth: true
@@ -1089,6 +1090,7 @@ Dialog {
             }
             ThemedTextField {
                 id: matchValueField
+                accessibleLabel: root.uiRevision >= 0 ? root.tr("label.match-value", "Match value") : ""
                 theme: root.uiTheme
                 visible: !ruleDialog.bulkMode
                 Layout.fillWidth: true
@@ -1480,6 +1482,7 @@ Dialog {
             }
             ThemedTextField {
                 id: ruleCommentField
+                accessibleLabel: root.uiRevision >= 0 ? root.tr("label.comment", "Comment") : ""
                 theme: root.uiTheme
                 visible: !ruleDialog.bulkMode
                 Layout.fillWidth: true

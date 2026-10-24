@@ -467,8 +467,19 @@ fn a_narrow_routing_domain_is_a_claimed_namespace_and_the_catch_all_is_not() {
     assert_eq!(scopes[0].servers, vec![Ipv4Addr::new(198, 51, 100, 1)]);
 }
 
+fn files_with_nsswitch(dir: &std::path::Path, nsswitch: Option<&str>) -> DnsFiles {
+    let mut files = DnsFiles::system(dir);
+    files.nsswitch_conf = dir.join("nsswitch.conf");
+    if let Some(text) = nsswitch {
+        std::fs::write(&files.nsswitch_conf, text).expect("nsswitch");
+    }
+    files
+}
+
 #[test]
 fn only_stub_and_static_mode_put_resolved_between_programs_and_dns() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let files = files_with_nsswitch(dir.path(), Some("hosts: files dns\n"));
     for (mode, carries) in [
         ("stub", true),
         ("static", true),
@@ -477,8 +488,48 @@ fn only_stub_and_static_mode_put_resolved_between_programs_and_dns() {
     ] {
         let fake = FakeResolved::machine();
         *fake.mode.lock().expect("lock") = mode.into();
-        assert_eq!(resolved_redirect_available(&fake), carries, "{mode}");
+        assert_eq!(
+            resolved_redirect_available(&fake, &files),
+            carries,
+            "{mode}"
+        );
     }
+}
+
+/// Fedora, Arch and Ubuntu ask resolved through nss-resolve. With
+/// `resolv.conf` in `uplink` mode the file names the servers, and taking the
+/// file over left every glibc program (curl, apt, Firefox) resolving rule
+/// hosts past us: rules by name silently did nothing for them.
+#[test]
+fn nss_resolve_puts_resolved_between_programs_and_dns_in_any_mode() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let files = files_with_nsswitch(
+        dir.path(),
+        Some("# comment\nhosts:      mymachines resolve [!UNAVAIL=return] files myhostname dns\n"),
+    );
+    for mode in ["uplink", "foreign"] {
+        let fake = FakeResolved::machine();
+        *fake.mode.lock().expect("lock") = mode.into();
+        assert!(resolved_redirect_available(&fake, &files), "{mode}");
+    }
+    let no_file = files_with_nsswitch(&dir.path().join("none"), None);
+    let fake = FakeResolved::machine();
+    *fake.mode.lock().expect("lock") = "uplink".into();
+    assert!(!resolved_redirect_available(&fake, &no_file));
+}
+
+#[test]
+fn only_a_resolve_source_on_the_hosts_line_counts() {
+    assert!(nsswitch_hosts_ask_resolved("hosts: files resolve dns"));
+    assert!(!nsswitch_hosts_ask_resolved("hosts: files dns"));
+    assert!(!nsswitch_hosts_ask_resolved(
+        "networks: resolve\nhosts: files dns"
+    ));
+    assert!(!nsswitch_hosts_ask_resolved(
+        "# hosts: files resolve\nhosts: files dns"
+    ));
+    assert!(!nsswitch_hosts_ask_resolved("hosts: files [resolve] dns"));
+    assert!(!nsswitch_hosts_ask_resolved(""));
 }
 
 #[test]

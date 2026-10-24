@@ -102,4 +102,9 @@ fuzz_target!(|data: &[u8]| {
         RuleOverrideGrantRequest,
         RuleOverrideRevokeRequest,
     );
+    if let Ok(list) = serde_json::from_value::<ConnHistoryListRequest>(value) {
+        if let Some(cursor) = list.pagination.cursor {
+            let _ = ConnHistoryPageKey::decode(&cursor);
+        }
+    }
 });

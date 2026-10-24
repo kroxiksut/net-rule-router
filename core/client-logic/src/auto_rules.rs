@@ -441,6 +441,19 @@ pub fn count_served_by_main_link(groups: &[SuggestionGroup]) -> usize {
         .count()
 }
 
+/// Groups a site named exactly `consumer` relies on; an empty name keeps all
+/// (`filterAutoRuleGroups`).
+pub fn filter_by_consumer(groups: &[SuggestionGroup], consumer: &str) -> Vec<SuggestionGroup> {
+    if consumer.is_empty() {
+        return groups.to_vec();
+    }
+    groups
+        .iter()
+        .filter(|g| g.consumers.iter().any(|c| c.hostname == consumer))
+        .cloned()
+        .collect()
+}
+
 /// Groups whose domain, a host, or a site relying on them contains `query`,
 /// ignoring case; an empty query keeps all (`searchAutoRuleGroups`).
 pub fn search(groups: &[SuggestionGroup], query: &str) -> Vec<SuggestionGroup> {

@@ -49,7 +49,7 @@ impl AutoRulesEngine {
                     .filter(|c| !offer_covered(snapshot, &c.dto))
                     .filter_map(|c| {
                         let mut dto = c.dto.clone();
-                        self.refresh_self_signed_behavior(&mut dto);
+                        self.refresh_self_signed_behavior(sid, &mut dto);
                         // A host that answers on the main link has nothing left
                         // to offer about itself — the inbox drops it outright
                         // rather than showing it greyed out, because unlike a
@@ -114,7 +114,7 @@ impl AutoRulesEngine {
                 return false;
             }
             if is_self_signed_signal(&c.dto.signal)
-                && self.main_link_behavior(host) == PrimaryBehavior::Responds
+                && self.main_link_behavior(sid, host) == PrimaryBehavior::Responds
             {
                 answered += 1;
                 return false;

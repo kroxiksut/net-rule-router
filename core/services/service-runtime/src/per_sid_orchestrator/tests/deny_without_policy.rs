@@ -163,3 +163,75 @@ fn a_user_without_a_policy_row_reads_ipv6_off_on_the_board() {
         Some(crate::enforcement_planner::Ipv6Guard::Off)
     );
 }
+
+/// A program deny for a user with no connections keeps its loopback permits:
+/// the program still reaches a local proxy or dev server, as it does with a
+/// policy.
+#[test]
+fn a_program_deny_without_connections_keeps_loopback_open() {
+    let api = Arc::new(MockWindowsApi::new());
+    let session = Arc::new(WfpSession::open(Arc::clone(&api) as Arc<dyn WindowsApiPort>).unwrap());
+    let source = Arc::new(ScriptedSource::default());
+    let rules = Arc::new(ScriptedRules::default());
+    let cache: Arc<dyn FqdnCacheLookup> = Arc::new(MockFqdnCacheLookup::new());
+    let audit = Arc::new(CollectAudit::default());
+    let resolver = nrr_platform_api::MockAppPathResolver::new().with(
+        "evil.exe",
+        vec![std::path::PathBuf::from(r"C:\Apps\evil.exe")],
+    );
+    let orch = PerSidApplyOrchestrator::new(
+        session,
+        Arc::clone(&source) as Arc<dyn RoutePolicySource>,
+        Arc::clone(&rules) as Arc<dyn RulesProvider>,
+        cache,
+        Arc::clone(&audit) as Arc<dyn PerSidApplyAudit>,
+    )
+    .with_app_resolver(Arc::new(resolver));
+    let deny = CanonicalRule {
+        id: RuleId("deny-app".into()),
+        enabled: true,
+        address_match: None,
+        app_match: Some(nrr_domain::canonical::CanonicalAppMatch {
+            pattern: nrr_domain::canonical::CanonicalAppPattern::Exact("evil.exe".into()),
+            include_child_processes: false,
+            override_requested: false,
+        }),
+        comment: String::new(),
+        action: nrr_domain::RuleAction::Block,
+        origin: None,
+    };
+    rules.set(ActiveRulesSnapshot {
+        rule_book: CanonicalRuleBook {
+            primary: CanonicalRuleSet::from_rules(vec![deny]),
+            secondary: CanonicalRuleSet::default(),
+        },
+    });
+
+    assert!(orch.install_for_sid(SID).unwrap() > 0);
+    let live = api.wfp_filters.lock().unwrap().clone();
+    let app = |f: &&nrr_platform_api::types::WfpFilterRecord| {
+        f.app_pattern.as_deref() == Some(r"C:\Apps\evil.exe")
+    };
+    assert!(live
+        .iter()
+        .filter(app)
+        .any(|f| f.action == WfpAction::Block));
+    let permits: Vec<_> = live
+        .iter()
+        .filter(app)
+        .filter(|f| f.action == WfpAction::Permit)
+        .collect();
+    assert!(
+        permits
+            .iter()
+            .any(|f| f.remote_subnet == Some((Ipv4Addr::new(127, 0, 0, 0), 8))),
+        "v4 loopback stays open: {live:?}"
+    );
+    assert!(
+        permits
+            .iter()
+            .any(|f| f.remote_subnet_v6 == Some((std::net::Ipv6Addr::LOCALHOST, 128))),
+        "v6 loopback stays open: {live:?}"
+    );
+    assert_eq!(permits.len(), 2, "nothing but loopback is permitted");
+}

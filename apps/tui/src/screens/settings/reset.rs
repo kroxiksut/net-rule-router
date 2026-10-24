@@ -249,11 +249,29 @@ fn stop_service(probe: RegistrationProbe) -> Outcome {
 
 /// Runs the steps the machine names until it finishes or stops. The terminal
 /// cannot elevate itself, so a refusal where rights are needed ends the run.
+/// Clearing every user's data is the step that needs them, so it runs first:
+/// refused, it stops the reset before the logs or anything else are erased.
 pub(super) fn drive(client: &dyn IpcClient, everyone: bool, stop: &dyn Fn() -> Outcome) -> Next {
+    let mut purged = None;
+    if everyone {
+        let outcome = run_step(client, Step::PurgePrincipalData, true, stop);
+        if outcome == Outcome::Forbidden {
+            return Next::NeedsElevation {
+                step: Step::PurgePrincipalData,
+            };
+        }
+        purged = Some(outcome);
+    }
     let mut done = Vec::new();
     loop {
         match next(false, &done) {
-            Next::Run(step) => done.push((step, run_step(client, step, everyone, stop))),
+            Next::Run(step) => {
+                let outcome = match (step, purged) {
+                    (Step::PurgePrincipalData, Some(outcome)) => outcome,
+                    _ => run_step(client, step, everyone, stop),
+                };
+                done.push((step, outcome));
+            }
             end => return end,
         }
     }
@@ -286,9 +304,12 @@ pub fn full_reset(
     settings_file: Option<std::path::PathBuf>,
 ) -> Job {
     Box::new(move |client: &dyn IpcClient| {
-        let settings_cleared = clear_user_settings(settings_file.as_deref());
         start_if_stopped(probe().as_deref(), client, ANSWER_WAIT);
         let end = drive(client, everyone, &|| stop_service(probe));
+        // The local file goes last: a reset stopped for want of rights keeps
+        // the bound files and the choices a reinstalled service is restored from.
+        let settings_cleared =
+            matches!(end, Next::Finish { .. }) && clear_user_settings(settings_file.as_deref());
         Reply::new(move |app| match end {
             Next::Finish { cleared: true } if settings_cleared => {
                 app.settings.reset.others = Loadable::Ready(0);

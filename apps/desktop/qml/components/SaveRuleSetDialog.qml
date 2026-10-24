@@ -74,6 +74,7 @@ Dialog {
         }
         ThemedTextField {
             id: nameField
+            accessibleLabel: saveRuleSetDialog.root.tr("settings.presets.save-as-set.name-placeholder", "Set name")
             theme: saveRuleSetDialog.root.uiTheme
             Layout.fillWidth: true
             placeholderText: saveRuleSetDialog.root.tr("settings.presets.save-as-set.name-placeholder",

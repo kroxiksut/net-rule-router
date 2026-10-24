@@ -249,6 +249,14 @@ pub const ENF_SECONDARY_DOWN_BODY: Key = key(
     "notifications.enforcement.secondary-down.body",
     "Everything your rules send there is being held until it comes back — that is the protection doing its job, not a fault. Start the connection, or move those rules to the main one.",
 );
+pub const ENF_SECONDARY_DOWN_BODY_OFF: Key = key(
+    "notifications.enforcement.secondary-down.body-off",
+    "Sites your rules send there go over the main connection until it comes back: leak protection is off. Start the connection, or turn leak protection on to hold them instead.",
+);
+pub const ENF_SECONDARY_DOWN_BODY_EVERYTHING: Key = key(
+    "notifications.enforcement.secondary-down.body-everything",
+    "The internet waits until it comes back, except your local network and what your rules send over the main connection — that is the protection doing its job, not a fault. Start the connection.",
+);
 pub const ENF_UNREADABLE_TITLE: Key = key(
     "notifications.enforcement.adapters-unreadable.title",
     "Cannot read the list of connections",
@@ -294,7 +302,11 @@ pub const VPN_TRUST_BODY: Key = key(
 );
 pub const VPN_TRUST_HINT: Key = key(
     "notifications.vpn-client-trust.tui-hint",
-    "t: confirm these as your VPN (with the programs each ships with in its protected folder).",
+    "t: confirm {name} as your VPN. The other programs are asked one at a time after it.",
+);
+pub const VPN_TRUST_HINT_BUNDLE: Key = key(
+    "notifications.vpn-client-trust.tui-hint-bundle",
+    "t: confirm {name} as your VPN. T: confirm it together with the {count} program(s) it ships with in its protected folder. The other programs are asked one at a time after it.",
 );
 pub const VPN_TRUST_DONE: Key = key(
     "notifications.vpn-client-trust.tui-done",
@@ -498,6 +510,39 @@ pub const BLOCK_ALL_ARMED: Key = key(
     "settings.routing.kill-switch.block-all-active-banner",
     "Leak protection is holding all traffic: the additional connection can't be found (down, not started, or reinstalled under a new ID). The internet waits until it returns; reconnect the VPN or assign the adapter again.",
 );
+pub const PROTECTION_VOLUME_HIGH: Key = key(
+    "status.protection-volume-high",
+    "Rules on this computer, yours and other users' together, take {count} Windows network filters. That many can make the Windows filtering service unstable. Narrow wide rules (a domain with all its subdomains, a zone) or remove the ones you no longer need.",
+);
+pub const REVISION_INTEGRITY: Key = key(
+    "status.revision-integrity-banner",
+    "The rule set was changed outside the app, so it was not applied — the service is running on the last verified version.",
+);
+pub const REVISION_INTEGRITY_TITLE: Key = key(
+    "diag.alert.kind.untrusted-revision-rejected",
+    "Rule set changed outside the app",
+);
+pub const VPN_SPLIT_TITLE: Key = key(
+    "interfaces.mode.prefer-primary",
+    "Main connection — selected sites through the additional one",
+);
+pub const VPN_SPLIT_COUNTED: Plural = Plural {
+    stem: "status.vpn-split-conflict.",
+    one: "Your additional adapter \"{name}\" is up and carrying exactly what you asked it to: your {count} rule goes through it, everything else stays on your main connection. That is selective routing doing its job — nothing here needs fixing. If you would rather send everything through it, switch the mode in Settings → Routing behavior.",
+    other: "Your additional adapter \"{name}\" is up and carrying exactly what you asked it to: your {count} rules go through it, everything else stays on your main connection. That is selective routing doing its job — nothing here needs fixing. If you would rather send everything through it, switch the mode in Settings → Routing behavior.",
+};
+pub const RULES_EMPTY: Key = key(
+    "status.empty-rules-banner",
+    "No rules are active — the service isn't routing anything. The rule set is empty (it may have been reset). Add rules or import a preset.",
+);
+pub const POLICY_INACTIVE_NO_ADAPTER: Key = key(
+    "status.policy-inactive-no-adapter",
+    "The service is running, but your rules are not being applied: no additional adapter is assigned to them yet, so there is nowhere to route them. Assign one in Interfaces and routes.",
+);
+pub const POLICY_INACTIVE_BLOCKING: Key = key(
+    "status.policy-inactive-kill-switch-blocking",
+    "Leak protection is on and no additional adapter is assigned, so everything your rules send that way is being blocked. Assign an adapter in Interfaces and routes, or turn leak protection off.",
+);
 pub const PROTECTION_MACHINE_WIDE_CUT: Key = key(
     "status.protection.machine-wide-cut-by-another-user",
     "Another user of this computer switched on leak protection. Part of it cannot be limited to one account, so IPv6 and ping are off for everyone until they switch it off.",
@@ -649,6 +694,8 @@ pub const ALL: &[Key] = &[
     ENF_PRIMARY_DOWN_BODY,
     ENF_SECONDARY_DOWN_TITLE,
     ENF_SECONDARY_DOWN_BODY,
+    ENF_SECONDARY_DOWN_BODY_OFF,
+    ENF_SECONDARY_DOWN_BODY_EVERYTHING,
     ENF_UNREADABLE_TITLE,
     ENF_UNREADABLE_BODY,
     ENF_UNKNOWN_TITLE,
@@ -662,6 +709,7 @@ pub const ALL: &[Key] = &[
     VPN_TRUST_TITLE,
     VPN_TRUST_BODY,
     VPN_TRUST_HINT,
+    VPN_TRUST_HINT_BUNDLE,
     VPN_TRUST_DONE,
     VPN_TRUST_FAILED,
     crate::vpn_trust::HELP,
@@ -724,6 +772,13 @@ pub const ALL: &[Key] = &[
     PROTECTION_COVERAGE_TITLE,
     PROTECTION_BLANKET_BLOCK_NOT_ARMED,
     BLOCK_ALL_ARMED,
+    PROTECTION_VOLUME_HIGH,
+    REVISION_INTEGRITY,
+    REVISION_INTEGRITY_TITLE,
+    VPN_SPLIT_TITLE,
+    RULES_EMPTY,
+    POLICY_INACTIVE_NO_ADAPTER,
+    POLICY_INACTIVE_BLOCKING,
     PROTECTION_MACHINE_WIDE_CUT,
     HELP_TITLE,
     HELP_SCREENS,
@@ -752,10 +807,14 @@ mod tests {
     use serde_json::Value;
 
     #[test]
-    fn backlog_plural_family_is_in_both_locale_files() {
+    fn plural_families_are_in_both_locale_files() {
         for language in ["en", "ru"] {
             let root = locale(language);
-            for id in super::BLOCK_NOTICE_BACKLOG_COUNTED.required_ids() {
+            let families = [
+                super::BLOCK_NOTICE_BACKLOG_COUNTED,
+                super::VPN_SPLIT_COUNTED,
+            ];
+            for id in families.iter().flat_map(|plural| plural.required_ids()) {
                 assert!(lookup(&root, &id).is_some(), "{language}.json lacks {id}");
             }
         }

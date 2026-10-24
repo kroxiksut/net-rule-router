@@ -22,8 +22,8 @@ Notifications:
   No notifications.
 Commands on this screen:
   r: restore your settings to a service that lost them
-  t: confirm the listed programs as your VPN, so leak protection keeps them working
-  a: allow the listed VPNs to reach their servers, so leak protection lets them connect
+  t: confirm the first listed program as your VPN (T: with the programs it ships with), so leak protection keeps it working
+  a: allow the first listed VPN to reach its server, so leak protection lets it connect
   p: confirm the suggested main connection; another one is chosen under Interfaces and routes
   v: send the blocked site named under the state over the additional route; you are asked first
 Type a screen number, h for help or q to quit, then press Enter.
@@ -32,6 +32,7 @@ Screen: Cache
 Service: OK
 Cache:
   Loading cache entries...
+  Shown: All sources · Any freshness · All routes
   c: Clear app cache   o: Clear OS DNS cache
 Cache entries:
 Selected entry:
@@ -40,6 +41,8 @@ Commands on this screen:
   d and a row number: show that entry, for example d 3
   / and text: search the cache on the service, for example /example.com; / on its own clears the search
   c: clear the app cache   o: flush the operating system's DNS cache (each asks first)
+  f: freshness, t: source, w: route; each press shows the next choice of that filter
+  b: seed the cache from browser history (only names that match your rules)
   r: read again from the service. Lists do not refresh by themselves, so nothing moves while you read.
 Type a screen number, h for help or q to quit, then press Enter.
 Cache: Entries on the service: 12.
@@ -65,6 +68,7 @@ Screen: Cache
 Service: OK
 Cache:
   Entries on the service: 12.
+  Shown: All sources · Any freshness · All routes
   Clear the app cache? Names are resolved again as programs use them.
   y: yes   n: no
 Cache entries:
@@ -91,6 +95,8 @@ Commands on this screen:
   d and a row number: show that entry, for example d 3
   / and text: search the cache on the service, for example /example.com; / on its own clears the search
   c: clear the app cache   o: flush the operating system's DNS cache (each asks first)
+  f: freshness, t: source, w: route; each press shows the next choice of that filter
+  b: seed the cache from browser history (only names that match your rules)
   r: read again from the service. Lists do not refresh by themselves, so nothing moves while you read.
 Type a screen number, h for help or q to quit, then press Enter.
 Not understood: x
@@ -100,6 +106,7 @@ Screen: Cache
 Service: OK
 Cache:
   Entries on the service: 12.
+  Shown: All sources · Any freshness · All routes
   c: Clear app cache   o: Clear OS DNS cache
 Cache entries:
   > 1. host0.example.com → 192.0.2.20 · Additional (VPN) · Fresh
@@ -125,6 +132,8 @@ Commands on this screen:
   d and a row number: show that entry, for example d 3
   / and text: search the cache on the service, for example /example.com; / on its own clears the search
   c: clear the app cache   o: flush the operating system's DNS cache (each asks first)
+  f: freshness, t: source, w: route; each press shows the next choice of that filter
+  b: seed the cache from browser history (only names that match your rules)
   r: read again from the service. Lists do not refresh by themselves, so nothing moves while you read.
 Type a screen number, h for help or q to quit, then press Enter.
 
@@ -132,6 +141,7 @@ Screen: Cache
 Service: OK
 Cache:
   Entries on the service: 12.
+  Shown: All sources · Any freshness · All routes
   Flush the operating system's DNS cache?
   y: yes   n: no
 Cache entries:
@@ -158,6 +168,8 @@ Commands on this screen:
   d and a row number: show that entry, for example d 3
   / and text: search the cache on the service, for example /example.com; / on its own clears the search
   c: clear the app cache   o: flush the operating system's DNS cache (each asks first)
+  f: freshness, t: source, w: route; each press shows the next choice of that filter
+  b: seed the cache from browser history (only names that match your rules)
   r: read again from the service. Lists do not refresh by themselves, so nothing moves while you read.
 Type a screen number, h for help or q to quit, then press Enter.
 
@@ -165,6 +177,7 @@ Screen: Cache
 Service: OK
 Cache:
   Entries on the service: 12.
+  Shown: All sources · Any freshness · All routes
   Clearing…
 Cache entries:
   > 1. host0.example.com → 192.0.2.20 · Additional (VPN) · Fresh
@@ -190,6 +203,8 @@ Commands on this screen:
   d and a row number: show that entry, for example d 3
   / and text: search the cache on the service, for example /example.com; / on its own clears the search
   c: clear the app cache   o: flush the operating system's DNS cache (each asks first)
+  f: freshness, t: source, w: route; each press shows the next choice of that filter
+  b: seed the cache from browser history (only names that match your rules)
   r: read again from the service. Lists do not refresh by themselves, so nothing moves while you read.
 Type a screen number, h for help or q to quit, then press Enter.
 Cache: Could not flush the OS DNS cache.

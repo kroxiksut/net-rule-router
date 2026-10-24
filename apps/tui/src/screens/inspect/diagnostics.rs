@@ -156,6 +156,7 @@ pub struct DiagState {
     archive: Archive,
     log: Log,
     audit: AuditTrail,
+    pub(super) restart: super::audit_restart::Restart,
     /// "Current session" in the log starts when this program did.
     session_start_ms: i64,
 }
@@ -182,6 +183,7 @@ impl Default for DiagState {
             archive: Archive::default(),
             log: Log::default(),
             audit: AuditTrail::default(),
+            restart: Default::default(),
             session_start_ms: now,
         }
     }
@@ -256,8 +258,24 @@ fn submit(
     dry_run: bool,
     token: Option<&str>,
 ) -> Result<Value, String> {
+    submit_kind(
+        client,
+        MutationKind::SecurityAlertAck,
+        payload,
+        dry_run,
+        token,
+    )
+}
+
+pub(super) fn submit_kind(
+    client: &dyn IpcClient,
+    kind: MutationKind,
+    payload: Value,
+    dry_run: bool,
+    token: Option<&str>,
+) -> Result<Value, String> {
     let request = MutationSubmitRequest {
-        mutation_kind: MutationKind::SecurityAlertAck,
+        mutation_kind: kind,
         payload,
         dry_run,
     };
@@ -906,6 +924,14 @@ impl Screen for DiagnosticsScreen {
     }
 
     fn on_key(&self, app: &mut AppState, key: KeyEvent) -> bool {
+        if app.inspect.diag.restart.reviewing() {
+            match answer_key(key) {
+                Some(Answer::Yes) => super::audit_restart::answer(app, true),
+                Some(Answer::No) => super::audit_restart::answer(app, false),
+                None => {}
+            }
+            return true;
+        }
         if matches!(app.inspect.diag.ack, Ack::Review { .. }) {
             match answer_key(key) {
                 Some(Answer::Yes) => acknowledge_reviewed(app),
@@ -945,6 +971,14 @@ impl Screen for DiagnosticsScreen {
     }
 
     fn on_line(&self, app: &mut AppState, line: &str) -> bool {
+        if app.inspect.diag.restart.reviewing() {
+            match answer_line(line) {
+                Some(Answer::Yes) => super::audit_restart::answer(app, true),
+                Some(Answer::No) => super::audit_restart::answer(app, false),
+                None => return false,
+            }
+            return true;
+        }
         if matches!(app.inspect.diag.ack, Ack::Review { .. }) {
             match answer_line(line) {
                 Some(Answer::Yes) => acknowledge_reviewed(app),
@@ -966,6 +1000,7 @@ impl Screen for DiagnosticsScreen {
 }
 
 fn overview_key(app: &mut AppState, key: KeyEvent) -> bool {
+    let offered = restart_offered(&app.inspect.diag);
     let state = &mut app.inspect.diag;
     match key.code {
         KeyCode::Char('a') => acknowledge_selected(app),
@@ -976,6 +1011,7 @@ fn overview_key(app: &mut AppState, key: KeyEvent) -> bool {
         }
         KeyCode::Char('m') => return super::site_check::move_sign_in(app),
         KeyCode::Char('x') => export(app),
+        KeyCode::Char('k') if offered => super::audit_restart::start(app),
         KeyCode::Char('r') => load_status(app),
         code => {
             let len = state.alerts.len();
@@ -986,6 +1022,7 @@ fn overview_key(app: &mut AppState, key: KeyEvent) -> bool {
 }
 
 fn overview_line(app: &mut AppState, line: &str) -> bool {
+    let offered = restart_offered(&app.inspect.diag);
     let state = &mut app.inspect.diag;
     match command(line) {
         ("a", number) => {
@@ -998,6 +1035,7 @@ fn overview_line(app: &mut AppState, line: &str) -> bool {
         ("e", host) => probe(app, host, "", ""),
         ("c", host) => super::site_check::start(app, host),
         ("m", "") => return super::site_check::move_sign_in(app),
+        ("k", "") if offered => super::audit_restart::start(app),
         ("x", "") => export(app),
         ("r", "") => load_status(app),
         _ => return false,
@@ -1277,6 +1315,11 @@ fn alert_lines(state: &DiagState, texts: &Texts) -> Vec<ViewLine> {
         Some(_) => Segment::state(texts.get(keys::AUDIT_OK), StateTone::Good),
         None => Segment::plain(texts.get(keys::NO_DATA)),
     }]));
+    lines.extend(super::audit_restart::lines(
+        &state.restart,
+        restart_offered(state),
+        texts,
+    ));
     let unread = state.alerts.iter().filter(|a| a.state == "active").count();
     if unread > 0 {
         lines.push(ViewLine::new(vec![Segment::state(
@@ -1315,6 +1358,19 @@ fn alert_lines(state: &DiagState, texts: &Texts) -> Vec<ViewLine> {
     }
     lines.extend(ack_lines(state, texts));
     lines
+}
+
+/// The window offers the restart only for a broken chain the service can
+/// restart on this platform.
+fn restart_offered(state: &DiagState) -> bool {
+    nrr_shared::platform_profile::PlatformProfile::current()
+        .supports
+        .audit_chain_restart
+        && state
+            .status
+            .as_ref()
+            .filter(|s| s.origin != DiagnosticsDataOrigin::Unavailable)
+            .is_some_and(|s| !s.security_status.audit_chain_ok)
 }
 
 fn alert_row(texts: &Texts, alert: &AlertItem) -> String {

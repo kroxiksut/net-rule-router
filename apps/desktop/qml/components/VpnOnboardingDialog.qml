@@ -32,6 +32,9 @@ Window {
     property var picked: []
     /// The confirmed set the picker opened over (`exe-path`/`display-name`).
     property var storedApps: []
+    /// The stored set could not be read: nothing is offered for saving, since
+    /// a save would be worked out over a set nobody has seen.
+    property bool storedUnread: false
     readonly property var rows: Pure.vpnPickerRows(root.found.concat(root.picked), root.storedApps)
     /// Ticked paths. Reassigned, never mutated, so bindings re-evaluate.
     property var selectedPaths: []
@@ -42,11 +45,21 @@ Window {
     signal pickConfirmed(var rows, var selected)
     /// Fired when the user says they do not use a VPN (or dismisses).
     signal skipped()
+
+    // Escape closes, as the title bar's close does: "I don't use a VPN" is an
+    // answer, and a key press must not give it.
+    Shortcut {
+        sequences: ["Esc"]
+        context: Qt.WindowShortcut
+        onActivated: root.close()
+    }
     /// Fired when the user opens the file picker.
     signal manualPickRequested()
     /// Fired when the user wants a kernel tunnel's link bound as the
     /// secondary route; the dialog has already closed.
     signal kernelTunnelAdapterRequested(string interfaceName)
+    /// Fired when the user asks to read the stored set again.
+    signal retryReadRequested()
 
     function tr(key, fallback) {
         return ownerRoot && typeof ownerRoot.tr === "function"
@@ -56,6 +69,7 @@ Window {
 
     /// `stored`: the confirmed set as the service holds it.
     function open(stored) {
+        storedUnread = false
         storedApps = stored || []
         found = []
         picked = []
@@ -64,6 +78,17 @@ Window {
         scanRan = false
         visible = true
         scan()
+    }
+
+    function openUnread() {
+        storedUnread = true
+        storedApps = []
+        found = []
+        picked = []
+        selectedPaths = []
+        scanFailed = false
+        scanRan = false
+        visible = true
     }
 
     function _samePath(a, b) {
@@ -294,9 +319,29 @@ Window {
                 + "helper. All of them will keep working over your main link.")
         }
 
+        RowLayout {
+            Layout.fillWidth: true
+            visible: root.storedUnread
+            spacing: root.ownerRoot ? root.ownerRoot.uiTheme.spacingSm : 8
+            Label {
+                Layout.fillWidth: true
+                Layout.preferredWidth: 0
+                wrapMode: Text.WordWrap
+                color: root.ownerRoot ? root.ownerRoot.mutedTextColor : "gray"
+                text: root.tr("vpn-onboarding.not-read",
+                    "Your VPN programs could not be read, so they cannot be changed now.")
+            }
+            ThemedButton {
+                theme: root.ownerRoot ? root.ownerRoot.uiTheme : null
+                text: root.tr("action.retry", "Try again")
+                onClicked: root.retryReadRequested()
+            }
+        }
+
         // Scan control + busy indicator.
         RowLayout {
             Layout.fillWidth: true
+            visible: !root.storedUnread
             spacing: root.ownerRoot ? root.ownerRoot.uiTheme.spacingSm : 8
             ThemedButton {
                 theme: root.ownerRoot ? root.ownerRoot.uiTheme : null
@@ -325,7 +370,7 @@ Window {
         Label {
             Layout.fillWidth: true
             wrapMode: Text.WordWrap
-            visible: !root.scanning && root.found.length === 0
+            visible: !root.scanning && !root.storedUnread && root.found.length === 0
             color: root.ownerRoot ? root.ownerRoot.mutedTextColor : "gray"
             text: root.scanFailed
                 ? root.tr("vpn-onboarding.scan-failed",
@@ -347,7 +392,7 @@ Window {
                 flat: true
                 text: root._allSelected()
                     ? root.tr("vpn-onboarding.clear-selection", "Clear selection")
-                    : root.tr("vpn-onboarding.select-all", "Select all")
+                    : root.tr("action.select-all", "Select all")
                 onClicked: root._toggleSelectAll()
             }
             Item { Layout.fillWidth: true }
@@ -554,6 +599,7 @@ Window {
             flat: true
             Layout.fillWidth: true
             wrapText: true
+            visible: !root.storedUnread
             text: root.tr("vpn-onboarding.manual-pick",
                 "My VPN isn't listed / pick it manually")
             onClicked: root._pickFileFor("")
@@ -575,11 +621,11 @@ Window {
                 theme: root.ownerRoot ? root.ownerRoot.uiTheme : null
                 // Over a stored set this only closes: taking programs back is
                 // an untick and a save, never a side effect of "no VPN".
-                text: root.storedApps.length > 0
+                text: root.storedApps.length > 0 || root.storedUnread
                     ? root.tr("action.cancel", "Cancel")
                     : root.tr("vpn-onboarding.skip", "I don't use a VPN")
                 onClicked: {
-                    var hadStored = root.storedApps.length > 0
+                    var hadStored = root.storedApps.length > 0 || root.storedUnread
                     root.close()
                     if (!hadStored) root.skipped()
                 }
@@ -590,7 +636,8 @@ Window {
                 highlighted: true
                 // Nothing ticked over a stored set is a choice too: it takes
                 // them all back.
-                enabled: root._selectedCount() > 0 || root.storedApps.length > 0
+                enabled: !root.storedUnread
+                    && (root._selectedCount() > 0 || root.storedApps.length > 0)
                 text: root._selectedCount() > 0
                     ? root.tr("vpn-onboarding.confirm", "This is my VPN")
                     : root.tr("action.save", "Save")

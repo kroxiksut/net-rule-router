@@ -309,6 +309,7 @@ Item {
                         ownerRoot.tr("status.app-unresolved-more", "+{n} more")))
             })
         }
+        onRetryReadRequested: ownerRoot.openVpnOnboarding()
         onSkipped: {
             ownerRoot.statusLine = ownerRoot.tr("vpn-onboarding.skipped-status",
                 "No VPN set up. You can set one up later from Settings -> Routing.")

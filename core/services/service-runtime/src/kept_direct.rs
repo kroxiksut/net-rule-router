@@ -16,6 +16,7 @@ use nrr_shared::ip_block::IpBlock;
 struct Published {
     local: Vec<IpBlock>,
     foreign: Vec<IpBlock>,
+    tunnel_servers: Vec<IpAddr>,
 }
 
 /// Every user's last published segments.
@@ -25,7 +26,14 @@ struct PerUser(BTreeMap<String, Published>);
 impl PerUser {
     fn publish(&mut self, sid: &str, facts: &NetworkRouteFacts) {
         let (local, foreign) = facts.kept_direct_blocks();
-        self.0.insert(sid.to_owned(), Published { local, foreign });
+        self.0.insert(
+            sid.to_owned(),
+            Published {
+                local,
+                foreign,
+                tunnel_servers: facts.tunnel_servers.clone(),
+            },
+        );
     }
 
     fn facts(&self, sid: &str) -> NetworkRouteFacts {
@@ -33,6 +41,7 @@ impl PerUser {
         NetworkRouteFacts {
             lan_segments: published.local,
             foreign_tunnel_routes: published.foreign,
+            tunnel_servers: published.tunnel_servers,
             ..NetworkRouteFacts::default()
         }
     }

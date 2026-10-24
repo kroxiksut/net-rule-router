@@ -43,7 +43,9 @@ fn run_pure(body: &str) -> Option<Value> {
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
-        .ok()?;
+        .unwrap_or_else(|e| {
+            panic!("this check runs the QML JavaScript through node; install Node.js ({e})")
+        });
     let Some(stdin) = child.stdin.as_mut() else {
         panic!("stdin was piped")
     };
@@ -171,4 +173,61 @@ fn an_answer_sheet_is_not_recorded_as_the_users_choice() {
     );
     let policy = repo_file("apps/desktop/qml/flows/RoutePolicyController.qml");
     assert!(function_body(&policy, "applyFirstRunProtections").contains("o.origin = origin ||"));
+}
+
+#[test]
+fn the_tray_restores_the_protection_the_window_would() {
+    let tray = repo_file("apps/desktop/qml/Tray.qml");
+    let check = function_body(&tray, "_checkSettingsLost");
+    assert!(
+        check.contains("tray._restoreProtection(state,"),
+        "the tray's check no longer switches lost protection back on:\n{check}"
+    );
+    assert!(
+        check.contains("tray._settingsLostKeys(state)"),
+        "the count must leave out the keys the protection restore sends:\n{check}"
+    );
+    let keys = function_body(&tray, "_settingsLostKeys");
+    assert!(
+        keys.contains("Pure.routePolicyProtectionToRestore("),
+        "{keys}"
+    );
+    let protection = function_body(&tray, "_restoreProtection");
+    assert!(
+        protection.contains("Pure.routePolicyProtectionRestore("),
+        "{protection}"
+    );
+    assert!(
+        protection.contains("tray._noteProtectionRestored(keys)"),
+        "the user is told what went back on:\n{protection}"
+    );
+    let restore = function_body(&tray, "_restoreSettings");
+    assert!(
+        restore.contains("tray._restoreProtection(state,"),
+        "\"Restore my settings\" must send the protection too:\n{restore}"
+    );
+    // "Restored" is said only for a write that went.
+    let note = function_body(&tray, "_noteSettingsRestored");
+    assert!(
+        note.contains("\"status.settings-restore-nothing\""),
+        "{note}"
+    );
+
+    if let Some(out) = run_pure(
+        r#"var req = routePolicyProtectionRestore(
+            { "leak-protection": "everything", "doh-lockdown-enabled": true },
+            { "mode": "prefer-primary", "leak-protection": "off", "doh-lockdown-enabled": false });
+        console.log(JSON.stringify([req["apply-only"], req["leak-protection"], req["doh-lockdown-enabled"]]))"#,
+    ) {
+        assert_eq!(
+            out,
+            json!([
+                ["doh-lockdown-enabled", "leak-protection"],
+                "everything",
+                true
+            ])
+        );
+    } else {
+        eprintln!("node not available — skipping the protection-restore check");
+    }
 }

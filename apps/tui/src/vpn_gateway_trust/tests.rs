@@ -96,8 +96,9 @@ fn a_push_replaces_the_pending_list_and_an_empty_one_withdraws_it() {
     assert!(effects.contains(&Effect::Refresh), "{effects:?}");
 }
 
-/// Allowing writes what the service already holds plus every pending
-/// gateway, takes the stored list back and announces the address.
+/// Allowing writes what the service already holds plus the first pending
+/// gateway, takes the stored list back and announces the address; the next
+/// gateway stays asked.
 #[test]
 fn allowing_sends_the_stored_list_with_the_pending_gateways_added() {
     let fake = FakeService::new(ConnectionStatus::Connected);
@@ -117,21 +118,25 @@ fn allowing_sends_the_stored_list_with_the_pending_gateways_added() {
         dto("203.0.113.20", ""),
         dto("198.51.100.7", ""),
     ];
-    assert!(allow_pending(&mut app));
+    assert!(allow_first(&mut app));
     run(&mut app, &fake);
 
     let sent = fake.sent(IpcOperationName::RouteVpnGatewaysSet);
     assert_eq!(sent.len(), 1, "{sent:?}");
     assert_eq!(sent[0], stored, "existing first, each address once");
     assert!(!app.vpn_gateway_trust.busy);
-    assert!(app.vpn_gateway_trust.pending.is_empty());
+    assert_eq!(
+        app.vpn_gateway_trust.pending,
+        vec![dto("198.51.100.7", "")],
+        "one answer, one address"
+    );
     assert_eq!(app.vpn_gateway_trust.confirmed.len(), 2);
 
     let texts = texts_en();
     announce(&mut app, &texts, Instant::now());
     let notice = app.notices.last().expect("the outcome");
     assert!(
-        notice.body.contains("203.0.113.20") && notice.body.contains("198.51.100.7"),
+        notice.body.contains("203.0.113.20") && !notice.body.contains("198.51.100.7"),
         "{notice:?}"
     );
 }
@@ -146,7 +151,7 @@ fn a_refused_write_keeps_the_question_and_warns() {
     );
     let mut app = app_at(Link::Connected, Some(&Fixture::healthy()));
     app.vpn_gateway_trust.pending = vec![dto("203.0.113.20", "")];
-    assert!(allow_pending(&mut app));
+    assert!(allow_first(&mut app));
     run(&mut app, &fake);
     assert_eq!(app.vpn_gateway_trust.pending.len(), 1);
     announce(&mut app, &texts_en(), Instant::now());
@@ -157,9 +162,9 @@ fn a_refused_write_keeps_the_question_and_warns() {
 #[test]
 fn nothing_is_sent_while_offline_or_with_nothing_pending() {
     let mut app = app_at(Link::Connected, Some(&Fixture::healthy()));
-    assert!(!allow_pending(&mut app));
+    assert!(!allow_first(&mut app));
     app.vpn_gateway_trust.pending = vec![dto("203.0.113.20", "")];
     app.link = Link::Offline;
-    assert!(!allow_pending(&mut app));
+    assert!(!allow_first(&mut app));
     assert!(app.outbox.take().is_empty());
 }

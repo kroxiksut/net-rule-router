@@ -484,6 +484,7 @@ pub fn lower_doh_foreign_vetoes(
         .iter()
         .filter_map(|f| match &f.egress {
             EgressConstraint::OnlyVia(EgressRef::Adapter(name)) => egress.adapter(&name.0),
+            EgressConstraint::OnlyVia(EgressRef::Secondary) => Some(egress.secondary),
             _ => None,
         })
         .collect();
@@ -497,6 +498,12 @@ pub fn lower_doh_foreign_vetoes(
                         && f.action == WfpAction::Permit
                         && f.local_interface_luid == Some(*luid)
                         && (f.user_sid.is_none() || f.user_sid == sid)
+                        // Ours only beside the block-all's egress to any address.
+                        && (*luid != egress.secondary
+                            || (f.remote_ip.is_none()
+                                && f.remote_ip_set.is_empty()
+                                && f.remote_ip_set_v6.is_empty()
+                                && f.remote_subnet.is_none()))
                 })
             })
             .collect();

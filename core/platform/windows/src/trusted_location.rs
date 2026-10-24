@@ -411,6 +411,109 @@ fn wide(text: &OsStr) -> Vec<u16> {
     text.encode_wide().chain(std::iter::once(0)).collect()
 }
 
+/// `FILE_LIST_DIRECTORY` on a folder, `FILE_READ_DATA` on a file.
+const LIST_DIRECTORY: u32 = 0x1;
+
+/// Whether the account `sid` may list `dir`, judged by the folder's own DACL
+/// for that account and the groups the system resolves for it.
+pub fn sid_may_list(dir: &Path, sid: &str) -> Result<bool, String> {
+    use windows::Win32::Foundation::LUID;
+    use windows::Win32::Security::Authorization::{
+        AuthzAccessCheck, AuthzFreeContext, AuthzFreeResourceManager,
+        AuthzInitializeContextFromSid, AuthzInitializeResourceManager, ConvertStringSidToSidW,
+        AUTHZ_ACCESS_CHECK_FLAGS, AUTHZ_ACCESS_REPLY, AUTHZ_ACCESS_REQUEST,
+        AUTHZ_AUDIT_EVENT_HANDLE, AUTHZ_CLIENT_CONTEXT_HANDLE, AUTHZ_RESOURCE_MANAGER_HANDLE,
+        AUTHZ_RM_FLAG_NO_AUDIT,
+    };
+    use windows::Win32::Security::GROUP_SECURITY_INFORMATION;
+
+    let wide_path = wide(dir.as_os_str());
+    let mut raw = PSECURITY_DESCRIPTOR::default();
+    // SAFETY: NUL-terminated path borrowed for the call; the descriptor is
+    // LocalAlloc'd and owned by `descriptor` below.
+    let status = unsafe {
+        GetNamedSecurityInfoW(
+            PCWSTR(wide_path.as_ptr()),
+            SE_FILE_OBJECT,
+            OWNER_SECURITY_INFORMATION | GROUP_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION,
+            None,
+            None,
+            None,
+            None,
+            &mut raw,
+        )
+    };
+    if status != ERROR_SUCCESS {
+        return Err(format!("read permissions: Win32 error {}", status.0));
+    }
+    let descriptor = SecurityDescriptor(raw);
+    let wide_sid = wide(OsStr::new(sid));
+    let mut account = PSID::default();
+    // SAFETY: NUL-terminated input; the SID is LocalAlloc'd and freed below.
+    unsafe { ConvertStringSidToSidW(PCWSTR(wide_sid.as_ptr()), &mut account) }
+        .map_err(|e| format!("read SID: {e}"))?;
+    let mut manager = AUTHZ_RESOURCE_MANAGER_HANDLE::default();
+    let mut context = AUTHZ_CLIENT_CONTEXT_HANDLE::default();
+    // SAFETY: every handle is initialised by the call that fills it and freed
+    // once below; the request and reply point at locals alive for the check,
+    // and the descriptor outlives it.
+    let granted = unsafe {
+        let checked = AuthzInitializeResourceManager(
+            AUTHZ_RM_FLAG_NO_AUDIT.0,
+            None,
+            None,
+            None,
+            PCWSTR::null(),
+            &mut manager,
+        )
+        .and_then(|()| {
+            AuthzInitializeContextFromSid(
+                0,
+                account,
+                manager,
+                None,
+                LUID::default(),
+                None,
+                &mut context,
+            )
+        })
+        .and_then(|()| {
+            let request = AUTHZ_ACCESS_REQUEST {
+                DesiredAccess: LIST_DIRECTORY,
+                ..AUTHZ_ACCESS_REQUEST::default()
+            };
+            let mut mask = 0u32;
+            let mut error = 0u32;
+            let mut reply = AUTHZ_ACCESS_REPLY {
+                ResultListLength: 1,
+                GrantedAccessMask: &mut mask,
+                Error: &mut error,
+                ..AUTHZ_ACCESS_REPLY::default()
+            };
+            AuthzAccessCheck(
+                AUTHZ_ACCESS_CHECK_FLAGS(0),
+                context,
+                &request,
+                AUTHZ_AUDIT_EVENT_HANDLE::default(),
+                descriptor.0,
+                None,
+                &mut reply,
+                None,
+            )
+            .map(|()| error == 0 && mask & LIST_DIRECTORY != 0)
+        });
+        if !context.is_invalid() {
+            let _ = AuthzFreeContext(context);
+        }
+        if !manager.is_invalid() {
+            let _ = AuthzFreeResourceManager(manager);
+        }
+        let _ = LocalFree(HLOCAL(account.0));
+        checked
+    };
+    granted.map_err(|e| format!("access check: {e}"))
+}
+
 /// A LocalAlloc'd self-relative security descriptor, freed on drop.
 struct SecurityDescriptor(PSECURITY_DESCRIPTOR);
 
@@ -509,6 +612,33 @@ mod tests {
             .output()
             .expect("run icacls");
         assert!(done.status.success(), "icacls /setowner: {done:?}");
+    }
+
+    /// A folder closed to everyone but SYSTEM is not listable for a person;
+    /// the system folder is.
+    #[test]
+    fn only_a_folder_open_to_the_account_lists_for_it() {
+        let me = crate::win32_ffi::console_session::current_process_user_sid().expect("own SID");
+        let windows = crate::system_shell::system32_exe("cmd.exe");
+        let system32 = windows.parent().expect("System32");
+        assert_eq!(sid_may_list(system32, &me), Ok(true));
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let icacls = |args: &[&str]| {
+            std::process::Command::new(crate::system_shell::system32_exe("icacls.exe"))
+                .arg(dir.path())
+                .args(args)
+                .output()
+                .expect("run icacls")
+        };
+        assert_eq!(sid_may_list(dir.path(), &me), Ok(true), "a folder it made");
+        let closed = icacls(&["/inheritance:r", "/grant:r", "*S-1-5-18:(OI)(CI)F", "/Q"]);
+        assert!(closed.status.success(), "icacls: {closed:?}");
+        let verdict = sid_may_list(dir.path(), &me);
+        // The owner keeps the right to change the DACL, so it can open it
+        // again for the temp folder to be removed.
+        let _ = icacls(&["/reset", "/Q"]);
+        assert_eq!(verdict, Ok(false));
     }
 
     #[test]

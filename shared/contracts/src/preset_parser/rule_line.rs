@@ -29,12 +29,20 @@ pub fn is_disabled_rule_value(rule_type: ParsedRuleType, value: &str) -> bool {
     } else {
         value
     };
-    if looks_like_a_rule_value(value) {
-        return true;
-    }
     let value = value.trim();
+    // The section's type is judged before the one-word rule: a heading like
+    // `# Office` under `--- IP` is a note, not a disabled address the
+    // validator then refuses the whole file for.
+    if rule_type == ParsedRuleType::Application {
+        return looks_like_a_rule_value(value)
+            || names_a_program_image(value)
+            || names_a_place(value);
+    }
+    // Marks the line parser left on the value (`!?`, which takes neither) do
+    // not make an address prose: the validator refuses the pair instead.
+    let value = value.trim_start_matches([DENY_PREFIX, VERIFY_PRIMARY_PREFIX]);
     match rule_type {
-        ParsedRuleType::Application => names_a_program_image(value) || names_a_place(value),
+        ParsedRuleType::Application => false,
         ParsedRuleType::Subnet => crate::ip_block::IpBlock::parse(value).is_some(),
         // Both bounds addresses, any family: the validator settles the rest,
         // as it does for the enabled line.
@@ -42,8 +50,22 @@ pub fn is_disabled_rule_value(rule_type: ParsedRuleType, value: &str) -> bool {
             first.trim().parse::<std::net::IpAddr>().is_ok()
                 && last.trim().parse::<std::net::IpAddr>().is_ok()
         }),
-        ParsedRuleType::Zone | ParsedRuleType::Domain | ParsedRuleType::ExactIp => false,
+        ParsedRuleType::ExactIp => value.parse::<std::net::IpAddr>().is_ok(),
+        ParsedRuleType::Zone | ParsedRuleType::Domain => looks_like_a_host_value(value),
     }
+}
+
+/// One word shaped like a host name or a zone: letters, digits, `.`, `-`, `_`
+/// and `*`, any non-ASCII letter among them (the validator judges the IDN).
+/// `# TODO:` and `# see below` are notes; `# Office` is a zone turned off.
+fn looks_like_a_host_value(value: &str) -> bool {
+    !value.is_empty()
+        && value.chars().all(|c| {
+            !c.is_whitespace()
+                && (!c.is_ascii()
+                    || c.is_ascii_alphanumeric()
+                    || matches!(c, '.' | '-' | '_' | '*'))
+        })
 }
 
 /// The half of [`is_disabled_rule_value`] that needs no rule type: a value with
@@ -56,6 +78,43 @@ pub fn is_disabled_rule_value(rule_type: ParsedRuleType, value: &str) -> bool {
 pub fn looks_like_a_rule_value(value: &str) -> bool {
     let value = value.trim();
     !value.is_empty() && !value.contains(char::is_whitespace)
+}
+
+/// Splits a rule line's body at its inline comment: `(value, comment)`, both
+/// untrimmed, the comment without its `#`. A comment starts at a `#` that
+/// opens the body or follows whitespace, so a `#` inside a value
+/// (`C:\Tools\C#\tool.exe`) stays in it; a leading quoted program value, after
+/// any `!`/`?` mark, is skipped whole. One reading for both parsers and the
+/// bulk entry.
+#[must_use]
+pub fn split_inline_comment(body: &str) -> (&str, Option<&str>) {
+    let marks = body.len()
+        - body
+            .trim_start_matches([DENY_PREFIX, VERIFY_PRIMARY_PREFIX])
+            .len();
+    let from = body[marks..]
+        .strip_prefix(PROGRAM_VALUE_QUOTE)
+        .and_then(|quoted| closing_quote_end(quoted).map(|end| marks + 1 + end))
+        .unwrap_or(0);
+    let mut prev_space = from == 0;
+    for (offset, c) in body[from..].char_indices() {
+        if c == '#' && prev_space {
+            let at = from + offset;
+            return (&body[..at], Some(&body[at + 1..]));
+        }
+        prev_space = c.is_whitespace();
+    }
+    (body, None)
+}
+
+/// The byte just past the quote closing a value that opened before `s`: the
+/// first quote followed by whitespace or the end.
+fn closing_quote_end(s: &str) -> Option<usize> {
+    s.char_indices().find_map(|(at, c)| {
+        let end = at + c.len_utf8();
+        (c == PROGRAM_VALUE_QUOTE && s[end..].chars().next().is_none_or(char::is_whitespace))
+            .then_some(end)
+    })
 }
 
 /// Encloses a program rule's value whose bare spelling would not read back:
@@ -78,7 +137,8 @@ pub fn unquote_program_value(value: &str) -> Option<&str> {
 
 /// A program rule's value as its line spells it: in quotes where the bare
 /// value would read back as something else — a note, when the line is
-/// disabled, or a shorter value, when it starts and ends with a quote itself.
+/// disabled, or a shorter value, when it starts and ends with a quote itself
+/// or carries a `#` that would start a comment.
 /// Any other value comes back as given, so a file that reads back whole keeps
 /// its bytes. `value` may carry the flags a table keeps on it
 /// ([`stored_rule_value`]); they stay outside the quotes.
@@ -86,6 +146,7 @@ pub fn unquote_program_value(value: &str) -> Option<&str> {
 pub fn program_value_on_line(value: &str, enabled: bool) -> std::borrow::Cow<'_, str> {
     let (bare, flags) = split_rule_flags(value);
     let misread = unquote_program_value(&bare).is_some()
+        || split_inline_comment(&bare).1.is_some()
         || (!enabled && !is_disabled_rule_value(ParsedRuleType::Application, &bare));
     if bare.is_empty() || !misread {
         return std::borrow::Cow::Borrowed(value);
@@ -191,14 +252,8 @@ pub(super) fn parse_rule_line(
         (raw, false)
     };
 
-    // Split inline comment at the first `#` past the value body.
-    let (match_value, comment) = match body.find('#') {
-        Some(hash_idx) => {
-            let (val, rest) = body.split_at(hash_idx);
-            (val, &rest[1..])
-        }
-        None => (body, ""),
-    };
+    let (match_value, comment) = split_inline_comment(body);
+    let comment = comment.unwrap_or_default();
 
     // Words rejoined and the flags taken off before the disabled-rule check,
     // which would read `exe +children` as a file extension and drop the rule.
@@ -281,29 +336,52 @@ pub struct RuleFlags {
     pub override_requested: bool,
 }
 
-/// `value` with its words rejoined by one space and every [`CHILDREN_FLAG`]
-/// and [`OVERRIDE_FLAG`] after the first word taken off, and which there were.
+/// `value`, trimmed, with every [`CHILDREN_FLAG`] and [`OVERRIDE_FLAG`] after
+/// the first word taken off, and which there were. The whitespace between the
+/// words that stay is kept as written (`C:\My  Tools\app.exe` is another
+/// folder than `C:\My Tools\app.exe`); one space closes the gap a flag leaves.
 /// Any other later word, the retired `+block` among them, stays for validation
 /// to judge.
 #[must_use]
 pub fn split_rule_flags(value: &str) -> (String, RuleFlags) {
     let mut out = String::with_capacity(value.len());
     let mut flags = RuleFlags::default();
-    for (idx, token) in value.split_whitespace().enumerate() {
-        if idx > 0 && token == CHILDREN_FLAG {
-            flags.children = true;
+    // End of the previous word, while that word was kept.
+    let mut kept_end: Option<usize> = None;
+    for (idx, (start, token)) in words_with_offsets(value).enumerate() {
+        let flag = idx > 0 && (token == CHILDREN_FLAG || token == OVERRIDE_FLAG);
+        if flag {
+            flags.children |= token == CHILDREN_FLAG;
+            flags.override_requested |= token == OVERRIDE_FLAG;
+            kept_end = None;
             continue;
         }
-        if idx > 0 && token == OVERRIDE_FLAG {
-            flags.override_requested = true;
-            continue;
-        }
-        if !out.is_empty() {
-            out.push(' ');
+        match kept_end {
+            Some(end) => out.push_str(&value[end..start]),
+            None if !out.is_empty() => out.push(' '),
+            None => {}
         }
         out.push_str(token);
+        kept_end = Some(start + token.len());
     }
     (out, flags)
+}
+
+/// The whitespace-separated words of `s` with the byte offset of each.
+fn words_with_offsets(s: &str) -> impl Iterator<Item = (usize, &str)> {
+    let mut next = 0;
+    std::iter::from_fn(move || {
+        let tail = &s[next..];
+        let start = next + (tail.len() - tail.trim_start().len());
+        if start == s.len() {
+            return None;
+        }
+        let len = s[start..]
+            .find(char::is_whitespace)
+            .unwrap_or(s.len() - start);
+        next = start + len;
+        Some((start, &s[start..next]))
+    })
 }
 
 /// The value a rules table keeps for a parsed rule: `value`, with ` +children`

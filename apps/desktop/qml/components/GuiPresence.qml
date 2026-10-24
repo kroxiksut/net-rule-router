@@ -1,4 +1,5 @@
 import QtQuick 2.15
+import "../lib/pure.js" as Pure
 
 // "Is the main window there, and is the user looking at it?" — plus the rules
 // files that window is working with.
@@ -40,8 +41,8 @@ QtObject {
     property bool publishing: false
 
     /// `function() -> { active, visible, rulesPathPrimary, rulesPathSecondary,
-    /// rulesFolder, includeComments }`, supplied by the window. Called on every
-    /// publish.
+    /// rulesFolder, includeComments, notices }`, supplied by the window. Called
+    /// on every publish. `notices`: the notification settings the tray honours.
     property var snapshotProvider: null
 
     property string _path: ""
@@ -74,6 +75,8 @@ QtObject {
             "rules-folder": String(snap.rulesFolder || ""),
             "include-comments": snap.includeComments !== false
         }
+        var notices = _noticesOf(snap.notices)
+        if (notices !== null) payload["notices"] = notices
         nrrNativeBridge.writeTextFile(path, JSON.stringify(payload))
     }
 
@@ -86,7 +89,7 @@ QtObject {
         if (path === "" || typeof nrrNativeBridge.writeTextFile !== "function") return
         var snap = {}
         try { snap = snapshotProvider() || {} } catch (e) { snap = {} }
-        nrrNativeBridge.writeTextFile(path, JSON.stringify({
+        var payload = {
             "at": Date.now(),
             "gone": true,
             "active": false,
@@ -95,19 +98,29 @@ QtObject {
             "rules-path-secondary": String(snap.rulesPathSecondary || ""),
             "rules-folder": String(snap.rulesFolder || ""),
             "include-comments": snap.includeComments !== false
-        }))
+        }
+        var notices = _noticesOf(snap.notices)
+        if (notices !== null) payload["notices"] = notices
+        nrrNativeBridge.writeTextFile(path, JSON.stringify(payload))
+    }
+
+    /// The notification settings in their published shape, or null when the
+    /// source holds none. Both ends go through it: the file is the user's to edit.
+    function _noticesOf(raw) {
+        return Pure.trayNoticePrefsOf(raw)
     }
 
     /// Read the published snapshot.
     /// Returns `{ known, windowRunning, windowVisible, windowActive,
-    /// rulesPathPrimary, rulesPathSecondary, rulesFolder, includeComments }`.
+    /// rulesPathPrimary, rulesPathSecondary, rulesFolder, includeComments, at,
+    /// notices }`.
     /// `known` is false when no window has ever published on this machine — the
     /// caller then has no rules paths and cannot compare anything.
     function read() {
         var blank = {
             known: false, windowRunning: false, windowVisible: false, windowActive: false,
             rulesPathPrimary: "", rulesPathSecondary: "", rulesFolder: "",
-            includeComments: true
+            includeComments: true, at: 0, notices: null
         }
         var path = _resolvePath()
         if (path === "") return blank
@@ -144,7 +157,10 @@ QtObject {
             rulesFolder: String(parsed["rules-folder"] || ""),
             // The user's "comments in rules files" choice; absent means the
             // shipped default (on).
-            includeComments: parsed["include-comments"] !== false
+            includeComments: parsed["include-comments"] !== false,
+            at: Number(parsed.at) || 0,
+            // Null from a window that predates them.
+            notices: _noticesOf(parsed.notices)
         }
     }
 

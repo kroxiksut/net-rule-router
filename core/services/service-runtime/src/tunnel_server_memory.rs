@@ -57,6 +57,21 @@ fn load_for(conn: &Mutex<rusqlite::Connection>, sid: &str) -> Vec<Ipv4Addr> {
         .unwrap_or_default()
 }
 
+/// One user's servers, or, while none are theirs yet, the machine-wide rows
+/// an older release kept for everyone: until a tunnel of theirs is seen, those
+/// are the servers known to carry it, and a blanket block armed without them
+/// would seal the reconnect.
+fn load_for_principal(conn: &Mutex<rusqlite::Connection>, sid: &str) -> Vec<Ipv4Addr> {
+    let guard = conn.lock().unwrap_or_else(|p| p.into_inner());
+    let repo = VpnBootstrapEndpointsRepository::new(&guard);
+    match repo.load_ips(sid) {
+        Ok(own) if own.is_empty() && sid != MACHINE_SCOPE => {
+            repo.load_ips(MACHINE_SCOPE).unwrap_or_default()
+        }
+        found => found.unwrap_or_default(),
+    }
+}
+
 /// The write and read halves of the machine-wide server set, over one state
 /// connection. A failed write is logged and dropped: the live set still
 /// protects this run.
@@ -77,7 +92,7 @@ pub fn persistence_over(
 pub fn persisted_servers_by_principal(
     conn: Arc<Mutex<rusqlite::Connection>>,
 ) -> PrincipalServersLoadFn {
-    Arc::new(move |sid: &str| load_for(&conn, sid))
+    Arc::new(move |sid: &str| load_for_principal(&conn, sid))
 }
 
 /// Remembered servers for a planner without a route coordinator, one set per
@@ -291,5 +306,35 @@ mod tests {
         persist(&[ip(9)]);
         assert_eq!(load(), vec![ip(9)]);
         assert_eq!(persisted_servers_by_principal(conn)(ALICE), vec![ip(7)]);
+    }
+
+    /// Rows an older release kept machine-wide carry a user who has no set of
+    /// their own yet; once their tunnel is seen, their own set answers.
+    #[test]
+    fn the_machine_wide_rows_carry_a_user_until_their_own_server_is_seen() {
+        use nrr_storage::{open_connection, repository::MigrationRunner, SqliteMigrationRunner};
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("nrr_service_state.db");
+        let open = || {
+            let runner = SqliteMigrationRunner::for_state_db(open_connection(&path).expect("open"));
+            runner.run_pending_migrations().expect("migrate");
+            Arc::new(Mutex::new(runner.into_connection()))
+        };
+
+        let conn = open();
+        VpnBootstrapEndpointsRepository::new(&conn.lock().expect("lock"))
+            .upsert_observed(MACHINE_SCOPE, &[ip(5)], 1)
+            .expect("legacy row");
+        let first_run = TunnelServerMemory::over_state_db(conn);
+        assert_eq!(first_run.remembered(ALICE), vec![ip(5)]);
+        first_run.observe(ALICE, &[ip(8)]);
+        drop(first_run);
+
+        let state = open();
+        assert_eq!(
+            TunnelServerMemory::over_state_db(Arc::clone(&state)).remembered(ALICE),
+            vec![ip(8)]
+        );
+        assert_eq!(persisted_servers_by_principal(state)(BOB), vec![ip(5)]);
     }
 }

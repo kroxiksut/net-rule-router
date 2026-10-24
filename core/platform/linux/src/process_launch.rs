@@ -87,12 +87,22 @@ fn start_ticks(stat: &str) -> Option<u64> {
         .ok()
 }
 
-/// A regular file with an execute bit or a `#!` line. Opened without blocking
-/// and never as a controlling terminal: the path is in a folder its owner
-/// writes, and what sits there may change between the look and the open.
+/// A regular file with an execute bit or a `#!` line. The path is in a folder
+/// its owner writes, and what sits there may be swapped for a link to a device
+/// between any look and any open: the object is first taken by `O_PATH`, which
+/// opens no driver, judged by `fstat`, and only a regular file is then read,
+/// through its own descriptor rather than the path again.
 fn runs_by_itself(path: &Path) -> bool {
     use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
-    let Ok(meta) = std::fs::metadata(path) else {
+    use std::os::unix::io::AsRawFd;
+    let Ok(handle) = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_PATH | libc::O_CLOEXEC)
+        .open(path)
+    else {
+        return false;
+    };
+    let Ok(meta) = handle.metadata() else {
         return false;
     };
     if !meta.is_file() {
@@ -101,10 +111,11 @@ fn runs_by_itself(path: &Path) -> bool {
     if meta.permissions().mode() & 0o111 != 0 {
         return true;
     }
+    let same_object = format!("/proc/self/fd/{}", handle.as_raw_fd());
     let Ok(file) = std::fs::OpenOptions::new()
         .read(true)
         .custom_flags(libc::O_NONBLOCK | libc::O_NOCTTY)
-        .open(path)
+        .open(same_object)
     else {
         return false;
     };
@@ -194,5 +205,25 @@ mod tests {
         assert!(!runs_by_itself(&notes));
         assert!(!runs_by_itself(dir.path()));
         assert!(!runs_by_itself(&dir.path().join("missing")));
+    }
+
+    /// A folder its owner writes can point a name at a device between the
+    /// look and the open; the device is never opened. A link to a real script
+    /// still counts, as the path the process named resolves to it.
+    #[test]
+    fn a_link_swapped_to_a_device_is_refused_without_opening_it() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let device = dir.path().join("tool");
+        std::os::unix::fs::symlink("/dev/null", &device).expect("link");
+        assert!(!runs_by_itself(&device));
+        let script = dir.path().join("real");
+        std::fs::write(&script, b"#!/bin/sh\n").expect("write");
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o644)).expect("mode");
+        let link = dir.path().join("via-link");
+        std::os::unix::fs::symlink(&script, &link).expect("link");
+        assert!(runs_by_itself(&link));
+        let dangling = dir.path().join("dangling");
+        std::os::unix::fs::symlink(dir.path().join("nowhere"), &dangling).expect("link");
+        assert!(!runs_by_itself(&dangling));
     }
 }

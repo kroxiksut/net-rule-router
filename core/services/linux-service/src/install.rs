@@ -16,7 +16,7 @@ use std::process::ExitCode;
 use nrr_platform_api::service_control::{
     ServiceControlPort, ServiceInstallSpec, ServiceUninstallSpec,
 };
-use nrr_platform_linux::service_control::LinuxServiceControl;
+use nrr_platform_linux::service_control::{LinuxServiceControl, PasswordPrompt};
 use nrr_platform_linux::systemd::SYSTEMD_UNIT_NAME;
 
 /// `install` verb: register THIS binary as the service. `ExecStart` points at
@@ -30,7 +30,9 @@ pub fn install_service() -> ExitCode {
             return ExitCode::from(1);
         }
     };
-    match LinuxServiceControl::new().install(&ServiceInstallSpec::production_defaults(binary_path))
+    // Already root under `pkexec` or a package script: nobody to ask.
+    match LinuxServiceControl::new(PasswordPrompt::Never)
+        .install(&ServiceInstallSpec::production_defaults(binary_path))
     {
         Ok(_) => {
             println!("Installed and enabled '{SYSTEMD_UNIT_NAME}'.");
@@ -47,7 +49,9 @@ pub fn install_service() -> ExitCode {
 /// place. Deleting service-owned data is the application-removal path, and the
 /// daemon never takes that decision on its own.
 pub fn uninstall_service() -> ExitCode {
-    match LinuxServiceControl::new().uninstall(&ServiceUninstallSpec::keep_data()) {
+    match LinuxServiceControl::new(PasswordPrompt::Never)
+        .uninstall(&ServiceUninstallSpec::keep_data())
+    {
         Ok(_) => {
             // Stopping the unit ran its stop hook; a daemon already dead
             // without one would leave the machine's DNS on a gone listener.

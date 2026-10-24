@@ -75,8 +75,9 @@ pub fn find_route_overlaps(
     include_subdomains: bool,
 ) -> Vec<RouteOverlap> {
     let mut found = addresses::find(&dto.primary, &dto.secondary);
-    let primary = name_rules(&dto.primary, PRIMARY, include_subdomains);
-    let secondary = name_rules(&dto.secondary, SECONDARY, include_subdomains);
+    let suffixed = suffix_names(dto);
+    let primary = name_rules(&dto.primary, PRIMARY, include_subdomains, &suffixed);
+    let secondary = name_rules(&dto.secondary, SECONDARY, include_subdomains, &suffixed);
     let primary_by_name = index_by_name(&primary, |r| r.name.as_str());
     let secondary_by_name = index_by_name(&secondary, |r| r.name.as_str());
 
@@ -171,10 +172,31 @@ fn is_below(host: &str, parent: &str) -> bool {
         && host.as_bytes()[host.len() - parent.len() - 1] == b'.'
 }
 
+/// Names an app-less suffix rule of either route claims. Under coverage the
+/// engine gives an exact rule no subdomain twin when one exists: the twin would
+/// tie with it and hand the subdomains to the main route.
+fn suffix_names(dto: &CanonicalRulesJsonV1) -> std::collections::HashSet<String> {
+    dto.primary
+        .iter()
+        .chain(&dto.secondary)
+        .filter(|rule| rule.app_match.is_none())
+        .filter_map(|rule| {
+            let address = rule.address_match.as_ref()?;
+            if matches!(address, AddressMatchDto::SuffixDomain { .. }) {
+                folded_rule_name(address)
+            } else {
+                None
+            }
+        })
+        .filter(|name| name.contains('.'))
+        .collect()
+}
+
 fn name_rules<'a>(
     rules: &'a [RuleDto],
     route: &'static str,
     include_subdomains: bool,
+    suffixed: &std::collections::HashSet<String>,
 ) -> Vec<NameRule<'a>> {
     rules
         .iter()
@@ -182,20 +204,28 @@ fn name_rules<'a>(
         .filter_map(|rule| {
             let address = rule.address_match.as_ref()?;
             let (written_type, value, kind) = match address {
-                // Under coverage `x` is enforced as `*.x`; comparing it as one
-                // keeps `x` against `*.x` a duplicate rather than a nesting.
+                // Under coverage `x` is enforced as `*.x` too, unless a suffix
+                // rule already names `x`: then it stays the exact name.
                 AddressMatchDto::ExactFqdn { value } => (
                     "exact-fqdn",
                     value.as_str(),
-                    if include_subdomains {
+                    if include_subdomains && !suffixed.contains(&folded_rule_name(address)?) {
                         NameKind::Suffix
                     } else {
                         NameKind::Exact
                     },
                 ),
-                AddressMatchDto::SuffixDomain { suffix } => {
-                    ("suffix-domain", suffix.as_str(), NameKind::Suffix)
-                }
+                // A whole top-level domain is a zone however it was written,
+                // as the service decodes it.
+                AddressMatchDto::SuffixDomain { suffix } => (
+                    "suffix-domain",
+                    suffix.as_str(),
+                    if suffix.trim_matches('.').contains('.') {
+                        NameKind::Suffix
+                    } else {
+                        NameKind::Zone
+                    },
+                ),
                 AddressMatchDto::Zone { name } => ("zone", name.as_str(), NameKind::Zone),
                 _ => return None,
             };

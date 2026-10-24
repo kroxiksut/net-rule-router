@@ -10,9 +10,9 @@ mod js_harness;
 use js_harness::{arg, check, check_cases, lit, load_vectors, merged, text, Case, JsLib};
 use nrr_client_logic::auto_rules::{
     any_zone_site, count_dismissed_hosts, count_served_by_main_link, count_shown_pending_hosts,
-    filter_by_status, filter_served_by_main_link, group_rows, is_self_signed_row, main_route_rank,
-    notice_due, notice_kind, registrable_domain, rows_shown_by_default, search, sort_groups,
-    SortMode, SuggestionGroup, SuggestionHost,
+    filter_by_consumer, filter_by_status, filter_served_by_main_link, group_rows,
+    is_self_signed_row, main_route_rank, notice_due, notice_kind, registrable_domain,
+    rows_shown_by_default, search, sort_groups, SortMode, SuggestionGroup, SuggestionHost,
 };
 use nrr_shared::ipc_payloads::{
     AutoRuleCandidateDto, AutoRuleDismissedEntryDto, StatusUpdateEvent,
@@ -95,11 +95,12 @@ fn group_shape(group: &SuggestionGroup) -> Value {
     })
 }
 
-const PIPELINE: &str = "(function (c, d, showDismissed, showServed, query, sort) { \
+const PIPELINE: &str = "(function (c, d, showDismissed, showServed, consumer, query, sort) { \
     var merged = groupAutoRuleRows(c, d); \
     var byStatus = filterAutoRuleGroupsByStatus(merged, showDismissed); \
     var byMainLink = filterAutoRuleGroupsServedByMainLink(byStatus, showServed); \
-    var shown = sortAutoRuleGroups(searchAutoRuleGroups(byMainLink, query), sort); \
+    var byConsumer = filterAutoRuleGroups(byMainLink, consumer); \
+    var shown = sortAutoRuleGroups(searchAutoRuleGroups(byConsumer, query), sort); \
     return { \
         dismissed: countDismissedAutoRuleHosts(merged), \
         served: countAutoRuleHostsServedByMainLink(byStatus), \
@@ -137,11 +138,12 @@ fn suggestion_groups_match_js() {
         &mut JsLib::pure(),
         |input| {
             format!(
-                "{PIPELINE}({}, {}, {}, {}, {}, {})",
+                "{PIPELINE}({}, {}, {}, {}, {}, {}, {})",
                 lit(&input["candidates"]),
                 lit(&input["dismissed"]),
                 arg(input, "show-dismissed"),
                 arg(input, "show-served"),
+                lit(&json!(text(input, "consumer"))),
                 arg(input, "query"),
                 arg(input, "sort")
             )
@@ -156,8 +158,9 @@ fn suggestion_groups_match_js() {
             let merged_groups = group_rows(&candidates, &dismissed);
             let by_status = filter_by_status(&merged_groups, show_dismissed);
             let by_main_link = filter_served_by_main_link(&by_status, show_served);
+            let by_consumer = filter_by_consumer(&by_main_link, text(input, "consumer"));
             let shown = sort_groups(
-                &search(&by_main_link, text(input, "query")),
+                &search(&by_consumer, text(input, "query")),
                 SortMode::from_slug(text(input, "sort")),
             );
             json!({

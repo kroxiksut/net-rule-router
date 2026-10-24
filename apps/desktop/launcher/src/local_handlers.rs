@@ -131,6 +131,9 @@ pub fn handle_local_request(
         "local.user-settings.rules-files-hand-edited" => Ok(
             crate::user_settings_bridge::rules_files_hand_edited(payload)?,
         ),
+        "local.user-settings.rules-file-write" => {
+            Ok(crate::user_settings_bridge::rules_file_write(payload)?)
+        }
         other => Err(LocalHandlerError::UnknownOperation(other.to_string())),
     }
 }
