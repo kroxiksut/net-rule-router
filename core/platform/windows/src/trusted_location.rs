@@ -635,10 +635,17 @@ mod tests {
         let closed = icacls(&["/inheritance:r", "/grant:r", "*S-1-5-18:(OI)(CI)F", "/Q"]);
         assert!(closed.status.success(), "icacls: {closed:?}");
         let verdict = sid_may_list(dir.path(), &me);
+        // What the check saw, for a machine where it differs from ours.
+        let acl = String::from_utf8_lossy(&icacls(&[]).stdout).into_owned();
+        let groups = std::process::Command::new(crate::system_shell::system32_exe("whoami.exe"))
+            .args(["/user", "/groups", "/fo", "list"])
+            .output()
+            .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
+            .unwrap_or_default();
         // The owner keeps the right to change the DACL, so it can open it
         // again for the temp folder to be removed.
         let _ = icacls(&["/reset", "/Q"]);
-        assert_eq!(verdict, Ok(false));
+        assert_eq!(verdict, Ok(false), "acl:\n{acl}\naccount:\n{groups}");
     }
 
     #[test]

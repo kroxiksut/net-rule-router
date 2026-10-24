@@ -7,7 +7,7 @@ This file fixes the baseline for local checks, CI, naming, and dependency policy
 The workspace baseline is green when all of the following pass:
 - `cargo fmt --all --check`
 - `cargo clippy --workspace --all-targets -- -D warnings`
-- `cargo test --workspace`
+- `cargo nextest run --workspace` followed by `cargo test --workspace --doc` (nextest does not run doctests); `cargo test --workspace` when cargo-nextest is not installed
 - `cargo deny check advisories licenses bans sources`
 - `qmllint` over every published `.qml` file reports no warning with id `syntax` in its JSON output (skipped with a warning when Qt is absent locally; CI requires it)
 

@@ -2369,8 +2369,10 @@ mod cli_tests {
             }
         }
         let _guard = Guard(table);
+        // Forges the refusal whatever the key order; a batch that names the
+        // host and comes out unforged fails loudly instead of applying clean.
         let cli = fake(
-            r#"sed 's/{"payload":{"protocol":"ip","field":"daddr"}},"right":"192.0.2.99"/{"fib":{"result":"oif","flags":["daddr","iif"]}},"right":0/' | nft "$@""#,
+            r#"in=$(cat); out=$(printf '%s' "$in" | sed 's/{"match":{[^]]*"right":"192\.0\.2\.99"}}/{"match":{"left":{"fib":{"result":"oif","flags":["daddr","iif"]}},"op":"==","right":0}}/'); case "$in" in *'"192.0.2.99"'*) [ "$out" != "$in" ] || { echo 'fake nft: the refusal was not forged' >&2; exit 97; };; esac; printf '%s' "$out" | nft "$@""#,
         );
         // Accepts: a refused drop is not skipped but refuses the whole set.
         let host = |last: u8, comment: &str| NftRule {

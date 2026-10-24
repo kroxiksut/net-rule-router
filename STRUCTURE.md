@@ -159,7 +159,7 @@ The root `Cargo.toml` `members` list is the authority; add a crate there and her
 - `bootstrap` — Prerequisite check and workspace initialization
 - `build` — Compile binaries (dev or release profile)
 - `run` — Launch individual components (GUI, tray, service)
-- `check` — Canonical quality gate (fmt, clippy, test, cargo-deny)
+- `check` — Canonical quality gate (fmt, clippy, test through cargo-nextest when installed, cargo-deny)
 - `clean-sync-duplicates` — Remove file-sync conflict copies identical to their original; stop on one that differs
 - `install-service` / `uninstall-service` / `service-status` / `service-smoke` — Service lifecycle for development. `install-service.ps1` stages the built binaries into an administrators-only directory and registers the service from there; the SCM never points at `target\`
 - `speed-probe` — Read-only per-adapter reachability and download-speed probe (`curl` pinned to each adapter's source address)
