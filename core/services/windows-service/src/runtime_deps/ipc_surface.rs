@@ -879,6 +879,47 @@ pub(super) fn build(inputs: IpcSurfaceInputs<'_>) -> IpcSurface {
                     conn_for_probe,
                 )),
             });
+            // A site that does not open while none of the user's surfaces
+            // runs: their tray is started for one card, unless they muted it.
+            if let Some(mutes) = block_notice_mute_store.clone() {
+                use nrr_service_runtime::ipc_handlers::providers::AutoRuleProbeRunner;
+                fn now_unix_ms() -> i64 {
+                    let now = nrr_service_runtime::conn_observation_consumer::now_unix_ms();
+                    i64::try_from(now).unwrap_or(i64::MAX)
+                }
+                let bus = Arc::clone(&event_bus);
+                let gate = Arc::new(nrr_service_runtime::site_notice::SiteNoticeGate::new(
+                    Arc::new(
+                        nrr_platform_windows::site_notice::WindowsSiteNotice::beside_this_binary(),
+                    ),
+                    mutes,
+                    Arc::new(move |sid: &str| bus.has_subscriber_for(sid)),
+                ));
+                let told = Arc::clone(&gate);
+                engine.attach_site_not_opening(Arc::new(move |sid: &str, host: &str| {
+                    told.site_not_opening(sid, host, now_unix_ms());
+                }));
+                let runner = Arc::clone(&probe_runner);
+                let cadence = nrr_service_runtime::service_tasks::stored_auto_probe_cadence(
+                    Arc::clone(conn_for_probe),
+                );
+                engine.attach_main_link_blocked_parked(Arc::new(
+                    move |sid: &str, id: &str, host: &str| {
+                        let now = now_unix_ms();
+                        if !gate.would_tell(sid, host, now) {
+                            return;
+                        }
+                        // With their own opt-in to automatic checks the
+                        // additional link is asked first, and its answer
+                        // tells; without it nothing is sent to ask.
+                        if cadence(sid).enabled {
+                            let _ = runner.probe(sid, &[id.to_owned()], &[]);
+                        } else {
+                            gate.site_not_opening(sid, host, now);
+                        }
+                    },
+                ));
+            }
             deps = deps.with_auto_rule_probe(probe_runner);
             // "Is it us or the site?": the same probe and links, the caller's
             // own trace and ledger, and the routes the explain probe answers.

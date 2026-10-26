@@ -5,8 +5,10 @@
 //! outright.
 //! 1. ExactFqdn — exact hostname (always before SuffixDomain for the same hostname)
 //! 2. SuffixDomain — longest suffix domain (`*.label`); covers the apex `label`
-//!    itself and every subdomain of it — see [`match_suffix_domain`]
-//! 3. ExactIp, Subnet / Zone (tiers 3a/3b) — order per [`ZonePriorityPolicy`]
+//!    itself and every subdomain of it — see [`match_suffix_domain`]. A zone of
+//!    several labels competes here too, without its apex — see
+//!    [`zone_ranks_as_suffix`]
+//! 3. ExactIp, Subnet / single-label Zone (tiers 3a/3b) — order per [`ZonePriorityPolicy`]
 //!    (default: addresses first; an exact address before any network, then the
 //!    longest prefix)
 //! 4. Application — full path, exact name, folder (deeper first; "this folder
@@ -39,9 +41,9 @@ use crate::canonical::{
 };
 use crate::decision_lookup::LookupResult;
 use crate::decision_matching::{
-    match_any_zone_domain, match_suffix_domain, match_zone, AppFilterResult, ConflictMarker,
-    MatchClass, NoMatchReason, RequestedRouteDecision, RuleMatchCandidate, SpecificityScore,
-    ZonePriorityPolicy,
+    match_any_zone_domain, match_suffix_domain, match_zone, zone_ranks_as_suffix, AppFilterResult,
+    ConflictMarker, MatchClass, NoMatchReason, RequestedRouteDecision, RuleMatchCandidate,
+    SpecificityScore, ZonePriorityPolicy,
 };
 use crate::decision_normalization::{
     NormalizedAppIdentity, NormalizedDecisionInput, NormalizedHostname, NormalizedIp,
@@ -238,6 +240,26 @@ fn collect_suffix_domain(
                     ));
                 }
             }
+            // A zone of several labels is a subdomain rule without its apex,
+            // still called a zone in an explanation. Beside `*.` of its name in
+            // its own set it adds nothing: that rule claims the same hosts.
+            if let Some(CanonicalAddressMatch::Zone(zone_name)) = &rule.address_match {
+                if zone_ranks_as_suffix(zone_name)
+                    && match_zone(hostname, zone_name)
+                    && !rule_book
+                        .set_for(role)
+                        .holds_suffix(zone_name, &rule.app_match)
+                {
+                    out.push(make_candidate(
+                        &rule.id,
+                        role,
+                        MatchClass::Zone,
+                        SpecificityScore::label_count(zone_name),
+                        eval_app_filter(rule, app_identity),
+                        rule.action,
+                    ));
+                }
+            }
             // `base.*` is `*.base.<zone>` at this host, unless a rule names
             // that suffix outright: a rule written with its zone is the
             // narrower one.
@@ -272,14 +294,12 @@ fn collect_zone(
                 continue;
             }
             if let Some(CanonicalAddressMatch::Zone(zone_name)) = &rule.address_match {
-                if match_zone(hostname, zone_name) {
+                // A zone of several labels already competed with the suffixes.
+                if !zone_ranks_as_suffix(zone_name) && match_zone(hostname, zone_name) {
                     out.push(make_candidate(
                         &rule.id,
                         role,
                         MatchClass::Zone,
-                        // By label count, not a flat 1: `corp.intra` is
-                        // narrower than `intra` and must beat it, the same way
-                        // an exact host beats the suffix it sits under.
                         SpecificityScore::label_count(zone_name),
                         eval_app_filter(rule, app_identity),
                         rule.action,
@@ -397,7 +417,8 @@ fn collect_application(
 /// Ineligible candidates (`AppFilterResult::NotMatched`) are discarded first.
 /// Among eligible candidates the highest [`SpecificityScore`] wins.
 ///
-/// Ties follow enforcement. A Block beats a route of the same specificity:
+/// At equal specificity a zone beats a suffix (it leaves out the apex). Ties
+/// follow enforcement. A Block beats a route of the same specificity:
 /// its filters sit in a band above every route and the address arbiter keeps
 /// a block on a tie. Between two routes the main one wins, because its weight
 /// band sits above the secondary one. The tie is still marked
@@ -411,15 +432,19 @@ fn select_winner(mut candidates: Vec<RuleMatchCandidate>) -> Option<RuleMatchCan
     candidates.sort_by(|a, b| {
         b.specificity
             .cmp(&a.specificity)
+            .then_with(|| apex_rank(a.match_class).cmp(&apex_rank(b.match_class)))
             .then_with(|| action_rank(a.action).cmp(&action_rank(b.action)))
             .then_with(|| role_rank(a.route_role).cmp(&role_rank(b.route_role)))
             .then_with(|| a.rule_id.as_str().cmp(b.rule_id.as_str()))
     });
     let top_specificity = candidates[0].specificity;
+    let top_apex = apex_rank(candidates[0].match_class);
     let top_role = candidates[0].route_role;
-    let conflict = candidates[1..]
-        .iter()
-        .any(|c| c.specificity == top_specificity && c.route_role != top_role);
+    let conflict = candidates[1..].iter().any(|c| {
+        c.specificity == top_specificity
+            && apex_rank(c.match_class) == top_apex
+            && c.route_role != top_role
+    });
     let mut winner = candidates.remove(0);
     winner.conflict = if conflict {
         ConflictMarker::Detected
@@ -437,6 +462,15 @@ fn role_rank(role: RouteRole) -> u8 {
     match role {
         RouteRole::Primary => 0,
         RouteRole::Secondary => 1,
+    }
+}
+
+/// Between equally long names a zone, which leaves out its own name, is the
+/// narrower rule: it only meets a suffix here when it has several labels.
+fn apex_rank(class: MatchClass) -> u8 {
+    match class {
+        MatchClass::Zone => 0,
+        _ => 1,
     }
 }
 

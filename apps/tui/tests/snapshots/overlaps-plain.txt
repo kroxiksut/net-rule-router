@@ -26,6 +26,10 @@ Commands on this screen:
   a: allow the first listed VPN to reach its server, so leak protection lets it connect
   p: confirm the suggested main connection; another one is chosen under Interfaces and routes
   v: send the blocked site named under the state over the additional route; you are asked first
+  x N: dismiss notification N   X: dismiss all
+  m N: stop showing notifications like N   H: hide or show addresses in block notifications
+  For a blocked connection N: v N: send it over the additional route   s N: snooze   w N: why it was blocked
+  For a site that does not open in notification N: c N: check whether the network or the site is at fault
 Type a screen number, h for help or q to quit, then press Enter.
 
 Screen: Overlaps

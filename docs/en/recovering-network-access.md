@@ -29,7 +29,11 @@ If it does happen, there are two ways to recover.
 
 ## Option 1 — Reboot
 
-The simplest fix. Traffic filters and routes clear on restart.
+The simplest fix. Traffic filters and routes clear on restart. With leak
+protection set to **Everything** the restart keeps you safe instead: the
+internet waits from the moment the computer starts until the service is running
+again, so nothing leaves while it boots. If the service does not start, use
+Option 2.
 
 On Windows the DNS redirect is kept in the system settings and survives a
 restart. The service removes it as it starts with Windows, and if the service

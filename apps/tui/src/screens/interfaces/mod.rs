@@ -6,7 +6,10 @@
 pub mod keys;
 
 use crossterm::event::{KeyCode, KeyEvent};
-use nrr_client_logic::adapters::{display_name, held_other_role, role_hint, unroutable_reason};
+use nrr_client_logic::adapters::{
+    adapter_passes_filter, adapter_sort_rank, display_name, held_other_role, role_hint,
+    unroutable_reason,
+};
 use nrr_client_logic::Route;
 use nrr_shared::display_text::display_text;
 use nrr_shared::ipc_payloads::InterfaceRowDto;
@@ -34,6 +37,17 @@ pub struct InterfacesState {
     cursor: usize,
     cursor_key: Option<String>,
     show_bluetooth: bool,
+    /// The window's «Show unavailable adapters» switched off.
+    hide_unavailable: bool,
+    /// What the list is narrowed to, as the window's search field.
+    search: String,
+    /// The search being typed in full mode; `None` while not typing.
+    typing: Option<String>,
+    /// Index into [`k::SORT_KEYS`].
+    sort: usize,
+    /// External addresses seen this session, by adapter, with when: shown
+    /// while the service cannot be asked, as the window shows its cache.
+    last_external: std::collections::BTreeMap<String, (String, String)>,
     question: Option<Question>,
     /// The highlighted answer of the question.
     answer: usize,
@@ -76,6 +90,7 @@ enum Outcome {
     Placeholder,
     ProbeDone,
     ProbeFailed(String),
+    Resent,
     Cancelled,
     /// The setup handed over; with the number of rules it imported, if any.
     SetupFinished(Option<usize>),
@@ -108,8 +123,74 @@ pub fn protection_failed(app: &mut AppState, failure: WriteFailure) {
     app.interfaces.outcome = Some(Outcome::ProtectionFailed(failure));
 }
 
+/// The list as the window shows it: narrowed by the search and the
+/// unavailable switch, then in the chosen order (the first one keeps the
+/// service's, bound adapters first).
 fn rows(app: &AppState) -> Vec<InterfaceRowDto> {
-    adapters(app, app.interfaces.show_bluetooth)
+    let state = &app.interfaces;
+    let mut rows: Vec<InterfaceRowDto> = adapters(app, state.show_bluetooth)
+        .into_iter()
+        .filter(|row| adapter_passes_filter(row, !state.hide_unavailable, &state.search))
+        .collect();
+    let sort_by = k::SORT_KEYS[state.sort % k::SORT_KEYS.len()];
+    if sort_by != k::SORT_KEYS[0] {
+        rows.sort_by_key(|row| std::cmp::Reverse(adapter_sort_rank(row, sort_by)));
+    }
+    rows
+}
+
+/// Note the external addresses a read brought, for when the service is gone.
+fn remember_external(app: &mut AppState) {
+    let at = chrono::Local::now().format("%H:%M").to_string();
+    let seen: Vec<(String, String)> = adapters(app, true)
+        .iter()
+        .filter_map(|row| {
+            let ip = row.observed_facts.external_ip.as_deref()?;
+            (!ip.is_empty()).then(|| (row_key(row), ip.to_owned()))
+        })
+        .collect();
+    for (key, ip) in seen {
+        app.interfaces.last_external.insert(key, (ip, at.clone()));
+    }
+}
+
+/// Send the bindings the service holds back to it, so it resolves them again:
+/// the window's «Send adapter to the service» for a remembered adapter.
+fn resend(app: &mut AppState) {
+    if app.interfaces.busy.is_some() {
+        return;
+    }
+    if !app.link.is_connected() {
+        app.interfaces.outcome = Some(Outcome::NeedsService);
+        return;
+    }
+    app.interfaces.busy = Some(Busy::Saving);
+    app.interfaces.outcome = None;
+    app.outbox
+        .push(super::binding::bindings_resend(|app, result| {
+            app.interfaces.busy = None;
+            app.interfaces.outcome = Some(match result {
+                Ok(()) => Outcome::Resent,
+                Err(failure) => Outcome::Failed(failure),
+            });
+        }));
+    refresh(app);
+}
+
+fn search_for(app: &mut AppState, text: &str) {
+    app.interfaces.search = text.trim().to_owned();
+    app.interfaces.cursor = 0;
+}
+
+fn next_sort(app: &mut AppState) {
+    app.interfaces.sort = (app.interfaces.sort + 1) % k::SORT_KEYS.len();
+}
+
+/// The service reports the route's adapter switched off.
+fn switched_off(app: &AppState, route: Route) -> bool {
+    app.enforcement_down
+        .get(route.as_str())
+        .is_some_and(|down| down.status == "secondary-down")
 }
 
 /// The chosen row: the chosen adapter wherever it moved to, else the position.
@@ -208,7 +289,10 @@ fn probe(app: &mut AppState) {
     app.outbox.push(adapters_read(true, |app, result| {
         app.interfaces.busy = None;
         app.interfaces.outcome = Some(match result {
-            Ok(()) => Outcome::ProbeDone,
+            Ok(()) => {
+                remember_external(app);
+                Outcome::ProbeDone
+            }
             Err(code) => Outcome::ProbeFailed(code),
         });
     }));
@@ -216,7 +300,11 @@ fn probe(app: &mut AppState) {
 
 fn refresh(app: &mut AppState) {
     // A plain re-read says nothing on success: arriving here is not a report.
-    app.outbox.push(adapters_read(false, |_, _| {}));
+    app.outbox.push(adapters_read(false, |app, result| {
+        if result.is_ok() {
+            remember_external(app);
+        }
+    }));
 }
 
 fn answer_count(app: &AppState, question: &Question) -> usize {
@@ -286,6 +374,10 @@ impl Screen for InterfacesScreen {
             k::HELP_CHECK,
             k::HELP_REFRESH,
             k::HELP_BLUETOOTH,
+            k::HELP_SEARCH,
+            k::HELP_SORT,
+            k::HELP_UNAVAILABLE,
+            k::HELP_RESEND,
         ]
     }
 
@@ -295,6 +387,10 @@ impl Screen for InterfacesScreen {
             k::HELP_CHECK,
             k::HELP_REFRESH,
             k::HELP_BLUETOOTH,
+            k::HELP_SEARCH,
+            k::HELP_SORT,
+            k::HELP_UNAVAILABLE,
+            k::HELP_RESEND,
         ]
     }
 
@@ -309,10 +405,25 @@ impl Screen for InterfacesScreen {
     }
 
     fn captures_keys(&self, app: &AppState) -> bool {
-        app.interfaces.question.is_some()
+        app.interfaces.question.is_some() || app.interfaces.typing.is_some()
     }
 
     fn on_key(&self, app: &mut AppState, key: KeyEvent) -> bool {
+        if let Some(typed) = app.interfaces.typing.as_mut() {
+            match key.code {
+                KeyCode::Char(c) => typed.push(c),
+                KeyCode::Backspace => {
+                    typed.pop();
+                }
+                KeyCode::Enter => {
+                    let typed = app.interfaces.typing.take().unwrap_or_default();
+                    search_for(app, &typed);
+                }
+                KeyCode::Esc => app.interfaces.typing = None,
+                _ => return false,
+            }
+            return true;
+        }
         if let Some(question) = app.interfaces.question.clone() {
             let count = answer_count(app, &question);
             if let Some(next) = choice::moved(app.interfaces.answer, count, key.code) {
@@ -354,6 +465,10 @@ impl Screen for InterfacesScreen {
             'x' => probe(app),
             'r' => refresh(app),
             'b' => app.interfaces.show_bluetooth = !app.interfaces.show_bluetooth,
+            '/' => app.interfaces.typing = Some(app.interfaces.search.clone()),
+            'o' => next_sort(app),
+            'u' => app.interfaces.hide_unavailable = !app.interfaces.hide_unavailable,
+            'e' => resend(app),
             _ => return false,
         }
         true
@@ -378,6 +493,10 @@ impl Screen for InterfacesScreen {
             "x" => probe(app),
             "r" => refresh(app),
             "b" => app.interfaces.show_bluetooth = !app.interfaces.show_bluetooth,
+            "o" => next_sort(app),
+            "u" => app.interfaces.hide_unavailable = !app.interfaces.hide_unavailable,
+            "e" => resend(app),
+            line if line.starts_with('/') => search_for(app, &line[1..]),
             _ => return false,
         }
         true
@@ -443,7 +562,7 @@ fn panels(app: &AppState, texts: &Texts) -> Vec<Panel> {
     if let Some(row) = rows.get(cursor_index(app, &rows)) {
         panels.push(panel(
             texts.fill(k::DETAILS_TITLE, &[("name", display_name(row))]),
-            detail_lines(row, texts),
+            detail_lines(app, row, texts),
         ));
     }
     panels
@@ -462,7 +581,25 @@ fn role_lines(app: &AppState, rows: &[InterfaceRowDto], texts: &Texts) -> Vec<Vi
         } else if let Some(bound) = binding(app, route) {
             let name = display_text(&bound.display_name);
             segments.push(Segment::plain(format!("{name} — ")));
-            segments.push(Segment::state(texts.get(k::REMEMBERED), StateTone::Caution));
+            let off = switched_off(app, route);
+            segments.push(Segment::state(
+                texts.get(if off {
+                    k::REMEMBERED_SWITCHED_OFF
+                } else {
+                    k::REMEMBERED
+                }),
+                StateTone::Caution,
+            ));
+            lines.push(ViewLine::new(segments));
+            lines.push(ViewLine::text(format!(
+                "  {}",
+                texts.get(if off {
+                    k::SWITCHED_OFF_HINT
+                } else {
+                    k::RECOVERY_HINT
+                })
+            )));
+            continue;
         } else {
             segments.push(Segment::state(
                 texts.get(common::NOT_SELECTED),
@@ -477,11 +614,49 @@ fn role_lines(app: &AppState, rows: &[InterfaceRowDto], texts: &Texts) -> Vec<Vi
     lines
 }
 
+/// What narrows or orders the list, when anything does.
+fn list_state_line(app: &AppState, texts: &Texts) -> Option<ViewLine> {
+    let state = &app.interfaces;
+    let mut parts = Vec::new();
+    if let Some(typed) = &state.typing {
+        parts.push(format!(
+            "{} {}_",
+            texts.get(k::SEARCH_PROMPT),
+            display_text(typed)
+        ));
+    } else if !state.search.is_empty() {
+        parts.push(format!(
+            "{}: {}",
+            texts.get(k::SEARCH_LABEL),
+            display_text(&state.search)
+        ));
+    }
+    let sort_by = k::SORT_KEYS[state.sort % k::SORT_KEYS.len()];
+    if sort_by != k::SORT_KEYS[0] {
+        parts.push(format!(
+            "{}: {}",
+            texts.get(k::SORT_LABEL),
+            texts.dynamic(&format!("interfaces.sort.{sort_by}"), sort_by)
+        ));
+    }
+    if state.hide_unavailable {
+        parts.push(texts.get(k::UNAVAILABLE_HIDDEN));
+    }
+    (!parts.is_empty()).then(|| ViewLine::text(parts.join(" · ")))
+}
+
 fn adapter_lines(app: &AppState, rows: &[InterfaceRowDto], texts: &Texts) -> Vec<ViewLine> {
+    let mut lines: Vec<ViewLine> = list_state_line(app, texts).into_iter().collect();
     if rows.is_empty() {
-        return vec![ViewLine::text(texts.get(k::NO_ADAPTERS))];
+        lines.push(ViewLine::text(texts.get(k::NO_ADAPTERS)));
+        return lines;
     }
     let cursor = cursor_index(app, rows);
+    lines.extend(adapter_rows(rows, cursor, texts));
+    lines
+}
+
+fn adapter_rows(rows: &[InterfaceRowDto], cursor: usize, texts: &Texts) -> Vec<ViewLine> {
     rows.iter()
         .enumerate()
         .map(|(i, row)| {
@@ -506,7 +681,7 @@ fn adapter_lines(app: &AppState, rows: &[InterfaceRowDto], texts: &Texts) -> Vec
         .collect()
 }
 
-fn detail_lines(row: &InterfaceRowDto, texts: &Texts) -> Vec<ViewLine> {
+fn detail_lines(app: &AppState, row: &InterfaceRowDto, texts: &Texts) -> Vec<ViewLine> {
     let mut lines = Vec::new();
     let mut what = Vec::new();
     if !row.kind.is_empty() {
@@ -578,6 +753,18 @@ fn detail_lines(row: &InterfaceRowDto, texts: &Texts) -> Vec<ViewLine> {
     }
     if !seen.is_empty() {
         lines.push(ViewLine::text(seen.join(" • ")));
+    }
+    // While the service cannot be asked, the address it last reported.
+    let fresh = facts
+        .external_ip
+        .as_deref()
+        .is_some_and(|ip| !ip.is_empty());
+    if !fresh && !app.link.is_connected() {
+        if let Some((ip, at)) = app.interfaces.last_external.get(&row_key(row)) {
+            lines.push(ViewLine::text(
+                texts.get(k::LAST_KNOWN).replace("%1", ip).replace("%2", at),
+            ));
+        }
     }
     let class = &row.recommendation.class;
     if !class.is_empty() {
@@ -676,6 +863,7 @@ fn result_line(app: &AppState, texts: &Texts) -> Option<ViewLine> {
         Outcome::NeedsService => texts.get(k::NEEDS_SERVICE),
         Outcome::Placeholder => texts.get(k::PLACEHOLDER_BODY),
         Outcome::ProbeDone => texts.get(k::PROBE_DONE),
+        Outcome::Resent => texts.get(k::RESENT),
         Outcome::ProbeFailed(code) => {
             format!("{}{}", texts.get(k::PROBE_FAILED), error_text(code, texts))
         }

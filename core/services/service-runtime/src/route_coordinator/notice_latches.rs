@@ -38,6 +38,14 @@ impl SecondaryRouteCoordinator {
         true
     }
 
+    /// [`Self::note_anchor_once`] for a bound adapter's new connection name.
+    pub(super) fn note_rename_once(&self, sid: &str, role: &str, id: &str, name: &str) -> bool {
+        self.rename_persisted
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .insert(format!("{sid}|{role}|{id}|{name}"))
+    }
+
     /// Returns `true` the first time this `(sid, role, anchor)` is offered for
     /// persistence, `false` while it repeats — the reconcile re-derives the same
     /// anchor every cycle, and the reloaded binding only shows it a cycle later.

@@ -67,6 +67,10 @@ everyone signed in share it.
   user's traffic to that address goes through a connection they did not
   choose. If that matters, give everyone the same additional connection, or
   avoid having people with different VPNs signed in at once.
+- **Known limitation.** While leak protection set to **Everything** holds one
+  user's traffic back, IPv6, ping and VPN protocols such as IPsec are held back
+  for every signed-in user, and the others are told so (see
+  [known limitations](known-limitations.md#leak-protection-on-windows-reaches-other-users)).
 
 Background services of the computer follow the routes that are in place,
 so leak protection covers them for every address a signed-in user routes.

@@ -93,10 +93,6 @@ impl PerSidApplyOrchestrator {
             // Default: fake-IP out of the plan. Production wires a live
             // provider via `with_fake_ip_context_provider`.
             fake_ip_context: Arc::new(|| None),
-            // Default: no known-direct exemptions (strict block-all).
-            // Production wires the session registry via
-            // `with_known_direct_registry`.
-            known_direct: None,
             // Default: no shared posture status → block-all state is log-only.
             // Production wires one via `with_block_all_posture_status`.
             block_all_posture_status: None,
@@ -121,16 +117,7 @@ impl PerSidApplyOrchestrator {
             service_account_dns_log: crate::enforcement_planner::ServiceAccountDnsLog::default(),
             foreign_cut_seen: Mutex::new(std::collections::HashMap::new()),
             ike_service_images: Vec::new(),
-            peer_replan: None,
         }
-    }
-
-    /// Wire the full-pass request a block-all transition makes: another user's
-    /// plan reads who else holds a block-all, and nothing else of theirs moved.
-    #[must_use]
-    pub fn with_peer_replan(mut self, request: PeerReplanRequest) -> Self {
-        self.peer_replan = Some(request);
-        self
     }
 
     /// Wire the one decider of who holds a filter set (see
@@ -330,21 +317,8 @@ impl PerSidApplyOrchestrator {
         self
     }
 
-    /// wire the known-direct registry so the block-all
-    /// exempts destinations positively established as direct (non-rule) hosts.
-    #[must_use]
-    pub fn with_known_direct_registry(
-        mut self,
-        registry: Arc<crate::known_direct::KnownDirectRegistry>,
-    ) -> Self {
-        self.known_direct = Some(registry);
-        self
-    }
-
-    /// whether ANY tracked SID currently has the fail-closed
-    /// catch-all block-all armed. The Mode-B direct-answer gate keys on this: a
-    /// direct host needs its exemption installed BEFORE the answer only while
-    /// the catch-all is armed.
+    /// Whether ANY tracked SID currently has the fail-closed catch-all
+    /// block-all armed.
     pub fn any_block_all_armed(&self) -> bool {
         self.block_all_flush_state
             .lock()
@@ -360,17 +334,6 @@ impl PerSidApplyOrchestrator {
             .unwrap_or_else(|p| p.into_inner())
             .get(sid)
             .is_some_and(|armed| *armed)
-    }
-
-    /// Whether a principal other than `sid` holds a block-all: the IPv6 packet
-    /// layer cannot be scoped to one user, so a second blocker means the
-    /// machine-wide block would cut somebody else's IPv6.
-    pub(super) fn other_principals_hold_block_all(&self, sid: &str) -> bool {
-        self.block_all_flush_state
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .iter()
-            .any(|(other, armed)| *armed && other.as_str() != sid)
     }
 
     /// Whether ANY tracked SID currently has the guard blocking because its

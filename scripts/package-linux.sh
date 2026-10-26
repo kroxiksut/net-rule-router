@@ -491,8 +491,8 @@ stage_gui() {
   install -m 0755 "$native_host" "$root$libexec/nrr_qt_native_host"
   ln -s "$libexec/$NRR_DESKTOP_GUI_ID" "$root$NRR_COMMAND_LINK_DIR/$NRR_DESKTOP_GUI_ID"
   ln -s "$libexec/$NRR_DESKTOP_TRAY_ID" "$root$NRR_COMMAND_LINK_DIR/$NRR_DESKTOP_TRAY_ID"
-  # The QML addresses its icons three levels up from itself, so it keeps the
-  # checkout's depth, as in the Windows package.
+  # The launcher looks for the QML at the checkout's path and hands the QML the
+  # `assets` folder beside the binary, as in the Windows package.
   copy_payload apps/desktop/qml "$root$libexec/apps/desktop/qml"
   copy_payload assets/icons "$root$libexec/assets/icons"
   copy_payload assets/images "$root$libexec/assets/images"

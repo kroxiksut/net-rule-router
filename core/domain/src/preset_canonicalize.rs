@@ -132,6 +132,35 @@ impl PresetRulesCanonicalizeOutcome {
 
 // ── Pipeline ──────────────────────────────────────────────────────────────────
 
+/// The rules of a parsed file that [`canonicalize_preset_rules`] left out
+/// because no book may apply their value (its `warnings` name them), as
+/// stored rules: an import keeps them aside, shown as not working, instead of
+/// losing them from the user's set.
+pub fn preset_rules_kept_aside(
+    parse_outcome: &ParseOutcome,
+    platform: HostPlatform,
+    include_child_processes: bool,
+    warnings: &[ValidationWarning],
+) -> Vec<nrr_shared::rules_json::RuleDto> {
+    let left_out: std::collections::HashSet<&crate::RuleId> = warnings
+        .iter()
+        .filter_map(|w| match w {
+            ValidationWarning::RuleOnNoDestinationDropped { rule_id, .. }
+            | ValidationWarning::AppPatternRefusedDropped { rule_id, .. } => Some(rule_id),
+            _ => None,
+        })
+        .collect();
+    if left_out.is_empty() {
+        return Vec::new();
+    }
+    rules_file_to_route_rule_set(&parse_outcome.parsed, platform, include_child_processes)
+        .rules
+        .iter()
+        .filter(|rule| left_out.contains(&rule.id))
+        .filter_map(crate::rules_json_codec::encode_written_rule)
+        .collect()
+}
+
 /// Canonicalizes the rules from a parsed preset file for one route.
 ///
 /// This is the bridge between the parse stage (`parse_rules_file`) and the

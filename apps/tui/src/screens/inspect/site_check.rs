@@ -1,8 +1,8 @@
 //! "Is it us or the site?" — the GUI's site check in Diagnostics.
 //! `diagnostics.site-check.run` starts it on the service and
 //! `diagnostics.site-check.result` is read until it is done; the verdict's own
-//! step follows: the cookie how-to, or the sign-in names moved through the
-//! Rules screen's "several rules", which the user confirms.
+//! step follows: the cookie how-to, the sign-in names moved through the
+//! Rules screen's "several rules", which the user confirms, or the trace.
 
 use std::time::{Duration, Instant};
 
@@ -12,13 +12,15 @@ use nrr_shared::display_text::display_text;
 use nrr_shared::ipc::IpcOperationName;
 use nrr_shared::ipc_payloads::{
     SiteCheckNameDto, SiteCheckReport, SiteCheckRequest, SiteCheckStatus, SITE_CHECK_STATE_DONE,
-    SITE_CHECK_VERDICT_FINE, SITE_CHECK_VERDICT_SIGN_IN_SPLIT,
+    SITE_CHECK_VERDICT_FINE, SITE_CHECK_VERDICT_NOT_ANSWERING, SITE_CHECK_VERDICT_ROUTE_DOWN,
+    SITE_CHECK_VERDICT_SIGN_IN_SPLIT,
 };
 use serde_json::json;
 
 use super::{bad_response, call, error_text, keys, queue, unencodable};
 use crate::backend::{Job, Reply};
 use crate::i18n::Texts;
+use crate::screens::ScreenId;
 use crate::state::AppState;
 use crate::view::{Segment, StateTone, ViewLine};
 
@@ -221,5 +223,25 @@ pub fn lines(app: &AppState, texts: &Texts, typing: Option<&str>) -> Vec<ViewLin
     if report.verdict == SITE_CHECK_VERDICT_SIGN_IN_SPLIT && !report.move_names.is_empty() {
         lines.push(ViewLine::text(texts.get(keys::SITE_MOVE)));
     }
+    if leads_to_trace(report) {
+        lines.push(ViewLine::text(texts.get(keys::SITE_TRACE)));
+    }
     lines
+}
+
+/// The site does not answer where it is routed: what its connections did is
+/// in the trace.
+fn leads_to_trace(report: &SiteCheckReport) -> bool {
+    report.verdict == SITE_CHECK_VERDICT_NOT_ANSWERING
+        || report.verdict == SITE_CHECK_VERDICT_ROUTE_DOWN
+}
+
+/// The verdict's step to the connection trace. `false` when the last check
+/// did not lead there.
+pub fn open_trace(app: &mut AppState) -> bool {
+    if !matches!(app.inspect.site.result.as_ref(), Some(Ok(r)) if leads_to_trace(r)) {
+        return false;
+    }
+    app.open(ScreenId::Trace);
+    true
 }

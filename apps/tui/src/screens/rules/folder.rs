@@ -9,8 +9,10 @@ use nrr_client_logic::rule_sets::{
 use nrr_client_logic::Route;
 use nrr_shared::user_settings::UserSettingsError;
 
+use nrr_shared::display_text::display_text;
+
 use super::{files, own_settings, text, Note};
-use crate::state::AppState;
+use crate::state::{AppState, NoticeLevel};
 
 /// The answer to the folder prompt that goes back to the shipped sets.
 pub const CLEAR: &str = "-";
@@ -23,6 +25,34 @@ pub fn prompt_text(app: &AppState) -> String {
         .and_then(own_settings::rules_folder)
         .map(|folder| folder.display().to_string())
         .unwrap_or_default()
+}
+
+/// After a set was read from `dir`: offer the folder it sits in as the
+/// rule-set folder, as the window's one-time banner does — only while none is
+/// set, never the shipped tree, and once a run, since the feed cannot be
+/// answered here; `o` takes the answer. A write needs no offer: it sets the
+/// folder itself when there is none.
+pub fn offer(app: &mut AppState, dir: &Path) {
+    if app.rules.folder_offered {
+        return;
+    }
+    let Some(file) = app.rules.settings_file.as_deref() else {
+        return;
+    };
+    if own_settings::rules_folder(file).is_some()
+        || own_settings::inside_shipped(dir, files::presets_root().as_deref())
+    {
+        return;
+    }
+    let Some(folder) = own_settings::sets_folder_of(dir) else {
+        return;
+    };
+    app.rules.folder_offered = true;
+    let shown = display_text(&folder.display().to_string()).into_owned();
+    let [title, offer, how] = &app.rules.folder_offer_words;
+    let body = format!("{offer} {}", how.replace("{dir}", &shown));
+    let title = title.clone();
+    app.note_in_feed(NoticeLevel::Info, title, body);
 }
 
 /// The answer to the folder prompt: `-` clears the folder, a folder that

@@ -25,6 +25,7 @@ use std::collections::{BTreeSet, HashSet};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
 use nrr_domain::canonical::{CanonicalAddressMatch, CanonicalRuleBook, CanonicalRuleSet};
+use nrr_domain::decision_matching::zone_ranks_as_suffix;
 use nrr_domain::rule_shape::{rule_verdict, RuleShapeSupport};
 use nrr_domain::RuleAction;
 use nrr_shared::ip_block::IpBlock;
@@ -250,10 +251,14 @@ fn network_beating_claims(
                 cache.hostnames_for_suffix_domain(suffix, SUFFIX_FANOUT_BACKSTOP),
                 &mut out,
             ),
-            Some(CanonicalAddressMatch::Zone(zone)) if order == ZoneVsIpOrder::ZoneFirst => hosts(
-                cache.hostnames_under_suffix(zone, SUFFIX_FANOUT_BACKSTOP),
-                &mut out,
-            ),
+            Some(CanonicalAddressMatch::Zone(zone))
+                if order == ZoneVsIpOrder::ZoneFirst || zone_ranks_as_suffix(zone) =>
+            {
+                hosts(
+                    cache.hostnames_under_suffix(zone, SUFFIX_FANOUT_BACKSTOP),
+                    &mut out,
+                )
+            }
             _ => {}
         }
     }

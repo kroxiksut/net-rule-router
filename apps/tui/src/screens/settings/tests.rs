@@ -525,6 +525,40 @@ fn hiding_a_notice_kind_for_a_week_sends_its_deadline() {
     assert_eq!(mutes.len(), 1);
 }
 
+/// "Tell me a site does not open, even with the tray closed" is offered only
+/// where the service can start the tray to tell it, and turning it off is a
+/// mute the service keeps for good.
+#[test]
+fn the_site_notice_is_offered_where_the_tray_can_be_started_and_turned_off_for_good() {
+    let fake = service();
+    let off = json!({ "scope": { "kind": "notice", "notice": "site-not-opening" } });
+    fake.answer(
+        IpcOperationName::BlockNoticeMutesSet,
+        json!({ "mutes": [off.clone()] }),
+    );
+    let mut app = on_settings();
+    app.settings.supports = PlatformProfile::windows().supports;
+    answer(&mut app, "c1");
+    drain(&mut app, &fake);
+    let row = row_of(
+        &app,
+        Category::Notifications,
+        ItemId::HideKind("site-not-opening"),
+    );
+    // Options: show, a day, 7 days, 30 days, for good.
+    answer(&mut app, &format!("i{row} 5"));
+    drain(&mut app, &fake);
+    assert_eq!(fake.sent(IpcOperationName::BlockNoticeMutesSet), [off]);
+
+    app.settings.supports = PlatformProfile::linux().supports;
+    assert!(
+        !items::items(&app, Category::Notifications)
+            .iter()
+            .any(|item| item.id == ItemId::HideKind("site-not-opening")),
+        "offered where nothing could start the tray"
+    );
+}
+
 #[test]
 fn a_change_without_the_service_is_refused_in_words() {
     let fake = service();
@@ -590,6 +624,30 @@ fn the_terminals_own_options_are_saved_to_its_file() {
     assert!(app.settings.prefs.ascii);
     assert!(prefs::load(&path).ascii);
     assert_eq!(said(&app), texts_en().get(text::PREF_SAVED));
+}
+
+/// "Hide addresses" is also reached where the other notice settings are, and
+/// the feed's block notices follow it from the same saved choice.
+#[test]
+fn hiding_block_addresses_is_a_notification_setting_and_is_saved() {
+    let dir = Scratch::new("settings-hide-addresses");
+    let path = dir.path().join("tui.json");
+    let fake = service();
+    let mut app = on_settings();
+    if !app.settings.supports.block_notices {
+        return;
+    }
+    app.settings.prefs_path = Some(path.clone());
+    answer(&mut app, "c1");
+    drain(&mut app, &fake);
+    let row = row_of(
+        &app,
+        Category::Notifications,
+        ItemId::Pref(PrefField::HideBlockAddresses),
+    );
+    answer(&mut app, &format!("i{row}"));
+    assert!(crate::feed::hide_addresses(&app));
+    assert!(prefs::load(&path).hide_block_addresses);
 }
 
 #[test]
@@ -1754,4 +1812,506 @@ fn a_confirmed_removal_acts_on_the_row_asked_about_not_its_number() {
     assert_eq!(fake.sent(IpcOperationName::RouteVpnGatewaysSet).len(), 1);
     assert_eq!(app.settings.mode, Mode::Browse);
     assert!(said(&app).contains("list changed"), "{}", said(&app));
+}
+
+/// The open section's words as the screen draws them.
+fn section_text(app: &mut AppState, category: Category) -> String {
+    app.settings.open = Some(category);
+    let view = screen(ScreenId::Settings).view(app, &texts_en());
+    view.panels
+        .iter()
+        .flat_map(|panel| panel.lines.iter().map(|line| line.plain_text()))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// Rules switched off say since when and for how long, as the window does;
+/// a pause the service reports by a push carries its start too, and a resume
+/// takes the line away.
+#[test]
+fn a_pause_says_since_when_and_how_long_is_left() {
+    use crate::backend::{BackendEvent, PushEvent};
+    use nrr_shared::ipc_payloads::StatusUpdateEvent;
+    let mut app = on_settings();
+    routing_with(&mut app, json!({}), json!({}));
+    let since_secs = u64::try_from(NOW_MS / 1000 - 3600).expect("positive");
+    let snapshot = app.snapshot.as_mut().expect("snapshot");
+    snapshot.routing_paused = true;
+    snapshot.routing_paused_at = Some(since_secs);
+    snapshot.routing_pause_resumes_at_ms = Some(NOW_MS + 30 * 60_000);
+    let text = section_text(&mut app, Category::Routing);
+    assert!(text.contains("Rules are disabled · 30 min left"), "{text}");
+    assert!(text.contains("Paused since 2023-11-14 21:13"), "{text}");
+
+    let snapshot = app.snapshot.as_mut().expect("snapshot");
+    snapshot.routing_pause_until_restart = true;
+    let text = section_text(&mut app, Category::Routing);
+    assert!(
+        text.contains("Rules are disabled · until restart"),
+        "{text}"
+    );
+
+    let texts = texts_en();
+    let push = |app: &mut AppState, paused: bool, paused_at: Option<u64>| {
+        app.apply(
+            BackendEvent::Push(PushEvent::Status(Box::new(
+                StatusUpdateEvent::RoutingPauseStateChanged {
+                    sid: "S-1".into(),
+                    paused,
+                    paused_at,
+                    resumes_at_ms: None,
+                    until_restart: false,
+                },
+            ))),
+            &texts,
+            std::time::Instant::now(),
+        );
+    };
+    push(&mut app, false, None);
+    push(&mut app, true, Some(since_secs + 60));
+    let text = section_text(&mut app, Category::Routing);
+    assert!(text.contains("Paused since 2023-11-14 21:14"), "{text}");
+    push(&mut app, false, None);
+    let text = section_text(&mut app, Category::Routing);
+    assert!(!text.contains("Paused since"), "{text}");
+    assert!(!text.contains("Rules are disabled"), "{text}");
+}
+
+/// The default route explains the route chosen, and what routing by address
+/// cannot promise, without the window's link markup.
+#[test]
+fn the_default_route_explains_the_route_chosen() {
+    let mut app = on_settings();
+    let note = |app: &AppState| {
+        items::items(app, Category::Routing)
+            .into_iter()
+            .find(|item| item.id == ItemId::Policy("mode"))
+            .and_then(|item| item.note)
+            .map(|note| note.resolve(&texts_en()))
+            .unwrap_or_default()
+    };
+    routing_with(&mut app, json!({ "mode": "prefer-primary" }), json!({}));
+    let primary = note(&app);
+    assert!(
+        primary.contains("Only the sites, IPs and apps"),
+        "{primary}"
+    );
+    assert!(primary.contains("Routing works by IP address"), "{primary}");
+    assert!(primary.contains("2ip.ru"), "{primary}");
+    assert!(
+        !primary.contains('<') && !primary.contains("href"),
+        "{primary}"
+    );
+
+    routing_with(
+        &mut app,
+        json!({ "mode": "prefer-secondary-when-available" }),
+        json!({}),
+    );
+    let secondary = note(&app);
+    assert!(
+        secondary.contains("All traffic goes through the additional"),
+        "{secondary}"
+    );
+    assert!(
+        !secondary.contains("Only the sites, IPs and apps"),
+        "{secondary}"
+    );
+}
+
+/// The fake-IP switch names the state of the driver it loads, from the
+/// service's check; a build that ships none shows no line.
+#[test]
+fn fake_ip_names_its_drivers_state() {
+    use nrr_shared::ipc_payloads::ThirdPartyComponentsListResponse;
+    let fake = service();
+    fake.answer(
+        IpcOperationName::ServiceStabilityConfigGet,
+        json!({ "enforcement-mode": "resolver", "fake-ip-enabled": true }),
+    );
+    let driver = |verdict: &str| {
+        json!({ "components": [{
+            "kind": "binary", "key": "wintun", "displayName": "Wintun",
+            "publisher": "WireGuard LLC", "version": "0.14", "licenseName": "Prebuilt",
+            "licensePath": "", "homepage": "", "requiredFor": "fake-ip",
+            "sha256MatchesShipped": false,
+            "signature": { "status": "not-checked" }, "verdict": verdict
+        }] })
+    };
+    fake.answer(
+        IpcOperationName::ThirdPartyComponentsList,
+        driver("untrusted"),
+    );
+    let mut app = on_settings();
+    let mut supports = PlatformProfile::windows().supports;
+    supports.fake_ip = true;
+    app.settings.supports = supports;
+    open_category(&mut app, Category::Routing);
+    drain(&mut app, &fake);
+    assert!(
+        fake.operations()
+            .contains(&IpcOperationName::ThirdPartyComponentsList),
+        "{:?}",
+        fake.operations()
+    );
+    let text = section_text(&mut app, Category::Routing);
+    assert!(
+        text.contains("Virtual-adapter driver (Wintun): Does not match"),
+        "{text}"
+    );
+
+    let list: ThirdPartyComponentsListResponse =
+        serde_json::from_value(driver("genuine")).expect("list");
+    app.settings.data.third_party = Loadable::Ready(list);
+    let text = section_text(&mut app, Category::Routing);
+    assert!(
+        text.contains("Virtual-adapter driver (Wintun): Genuine"),
+        "{text}"
+    );
+
+    app.settings.data.third_party = Loadable::Ready(ThirdPartyComponentsListResponse::default());
+    let text = section_text(&mut app, Category::Routing);
+    assert!(!text.contains("Virtual-adapter driver"), "{text}");
+}
+
+/// Asking to clear the logs first says what would go, from a dry run that
+/// deletes nothing; only a yes sends the real clear, and a no sends nothing.
+#[test]
+fn clearing_the_logs_previews_what_would_go_and_deletes_only_on_yes() {
+    let fake = service();
+    fake.answer(
+        IpcOperationName::LogsClear,
+        json!({ "files-deleted": 3, "bytes-freed": 2048, "dry-run": true }),
+    );
+    let mut app = on_settings();
+    open_category(&mut app, Category::Logs);
+    drain(&mut app, &fake);
+    let row = row_of(&app, Category::Logs, ItemId::ClearLogs);
+    answer(&mut app, &format!("i{row}"));
+    drain(&mut app, &fake);
+    let sent = fake.sent(IpcOperationName::LogsClear);
+    assert_eq!(sent.len(), 1, "{sent:?}");
+    assert_eq!(
+        sent[0]["dry-run"],
+        json!(true),
+        "the preview deletes nothing"
+    );
+    let text = section_text(&mut app, Category::Logs);
+    assert!(text.contains("Would delete 3 files (2.0 KiB)"), "{text}");
+    assert!(text.contains("audit trail will not be affected"), "{text}");
+
+    answer(&mut app, "no");
+    drain(&mut app, &fake);
+    assert_eq!(fake.sent(IpcOperationName::LogsClear).len(), 1);
+    assert_eq!(app.settings.mode, Mode::Browse);
+
+    answer(&mut app, &format!("i{row}"));
+    drain(&mut app, &fake);
+    answer(&mut app, "yes");
+    drain(&mut app, &fake);
+    let sent = fake.sent(IpcOperationName::LogsClear);
+    let real: Vec<_> = sent
+        .iter()
+        .filter(|s| s["dry-run"] == json!(false))
+        .collect();
+    assert_eq!(real.len(), 1, "{sent:?}");
+}
+
+/// A service manager holding one stopped service registered from `REGISTERED`,
+/// counting the starts asked of it.
+mod registered_elsewhere {
+    use std::path::PathBuf;
+    use std::sync::atomic::{AtomicU32, Ordering};
+    use std::sync::OnceLock;
+    use std::time::Duration;
+
+    use nrr_platform_api::service_control::{
+        ServiceControlError, ServiceControlPort, ServiceInstallReport, ServiceInstallSpec,
+        ServiceRunState, ServiceStatusReport, ServiceUninstallReport, ServiceUninstallSpec,
+    };
+
+    pub static REGISTERED: OnceLock<PathBuf> = OnceLock::new();
+    pub static STARTS: AtomicU32 = AtomicU32::new(0);
+
+    struct Manager;
+
+    impl ServiceControlPort for Manager {
+        fn install(
+            &self,
+            _spec: &ServiceInstallSpec,
+        ) -> Result<ServiceInstallReport, ServiceControlError> {
+            Err(ServiceControlError::Unsupported {
+                operation: "install",
+            })
+        }
+
+        fn uninstall(
+            &self,
+            _spec: &ServiceUninstallSpec,
+        ) -> Result<ServiceUninstallReport, ServiceControlError> {
+            Err(ServiceControlError::Unsupported {
+                operation: "uninstall",
+            })
+        }
+
+        fn start(&self, _timeout: Duration) -> Result<(), ServiceControlError> {
+            STARTS.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+
+        fn stop(&self, _timeout: Duration) -> Result<(), ServiceControlError> {
+            Ok(())
+        }
+
+        fn query(&self) -> Result<Option<ServiceStatusReport>, ServiceControlError> {
+            Ok(Some(ServiceStatusReport {
+                run_state: ServiceRunState::Stopped,
+                start_mode: None,
+                binary_path: REGISTERED.get().cloned(),
+                running_since: None,
+            }))
+        }
+    }
+
+    pub fn probe() -> Option<Box<dyn ServiceControlPort>> {
+        Some(Box::new(Manager))
+    }
+}
+
+type ConsoleAnswer = Result<
+    (
+        Box<dyn nrr_platform_api::path_registration::PathRegistrationPort>,
+        std::path::PathBuf,
+    ),
+    String,
+>;
+
+fn no_console() -> ConsoleAnswer {
+    Err("no console in this test".to_owned())
+}
+
+/// A service the system starts from another folder is named as such, with
+/// both paths, and is not started from there: the start is refused with the
+/// command that re-registers it from this folder.
+#[test]
+fn a_service_registered_elsewhere_is_named_and_not_started_from_there() {
+    use std::sync::atomic::Ordering;
+    let scratch = Scratch::new("tui-service-elsewhere");
+    let registered = scratch.path().join("old").join("nrr-service.bin");
+    let shipped = scratch.path().join("new").join("nrr-service.bin");
+    for (path, bytes) in [(&registered, b"old build"), (&shipped, b"new build")] {
+        std::fs::create_dir_all(path.parent().expect("a folder")).expect("folder");
+        std::fs::write(path, bytes).expect("binary");
+    }
+    registered_elsewhere::REGISTERED
+        .set(registered.clone())
+        .expect("set once");
+    let fake = service();
+    let mut app = on_settings();
+    app.settings.service_probe = registered_elsewhere::probe;
+    app.settings.expected_service = Some(shipped.clone());
+    app.settings.console_port = no_console;
+    open_category(&mut app, Category::Service);
+    drain(&mut app, &fake);
+    let text = section_text(&mut app, Category::Service);
+    assert!(
+        text.contains("starts the background service from another folder"),
+        "{text}"
+    );
+    assert!(
+        text.contains(&format!(
+            "Registered: {} · This application: {}",
+            registered.display(),
+            shipped.display()
+        )),
+        "{text}"
+    );
+    assert!(text.contains("auto-restart"), "{text}");
+    assert!(
+        text.contains("Service logs folder: ") || text.contains("logs folder path unavailable"),
+        "{text}"
+    );
+
+    let row = row_of(&app, Category::Service, ItemId::ServiceStart);
+    answer(&mut app, &format!("i{row}"));
+    drain(&mut app, &fake);
+    assert_eq!(registered_elsewhere::STARTS.load(Ordering::SeqCst), 0);
+    assert!(said(&app).contains("was not started"), "{}", said(&app));
+    assert!(said(&app).contains("reinstall"), "{}", said(&app));
+}
+
+/// A binary replaced under its running process is named as needing a
+/// restart; the same file started after it was written is not.
+#[test]
+fn a_service_still_running_the_previous_build_asks_for_a_restart() {
+    use nrr_platform_api::service_control::{ServiceRunState, ServiceStatusReport};
+    let scratch = Scratch::new("tui-service-stale");
+    let binary = scratch.path().join("nrr-service.bin");
+    std::fs::write(&binary, b"new build").expect("binary");
+    let report = |since: std::time::SystemTime| ServiceStatusReport {
+        run_state: ServiceRunState::Running,
+        start_mode: None,
+        binary_path: Some(binary.clone()),
+        running_since: Some(since),
+    };
+    let mut app = on_settings();
+    let mut shown = |since| {
+        let report = report(since);
+        app.settings.data.service_check = Some(ServiceCheck {
+            registration: RegistrationCheck::of(Some(&report), Some(&binary)),
+            older: false,
+        });
+        app.settings.data.service = Loadable::Ready(ServiceInfo::Registered(report));
+        section_text(&mut app, Category::Service)
+    };
+    let long_ago = std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(60);
+    let text = shown(long_ago);
+    assert!(
+        text.contains("still running the previous version"),
+        "{text}"
+    );
+    assert!(!text.contains("another folder"), "{text}");
+    let later = std::time::SystemTime::now() + std::time::Duration::from_secs(3600);
+    let text = shown(later);
+    assert!(!text.contains("previous version"), "{text}");
+}
+
+/// A service that reported an older build on connecting is named as one,
+/// with where it runs from, even when it is registered from this folder.
+#[test]
+fn an_older_service_build_is_named_with_where_it_runs_from() {
+    use nrr_platform_api::service_control::{ServiceRunState, ServiceStatusReport};
+    let mut app = on_settings();
+    let report = ServiceStatusReport {
+        run_state: ServiceRunState::Running,
+        start_mode: None,
+        binary_path: None,
+        running_since: None,
+    };
+    app.settings.data.service_check = Some(ServiceCheck {
+        registration: RegistrationCheck::of(Some(&report), None),
+        older: true,
+    });
+    app.settings.data.service = Loadable::Ready(ServiceInfo::Registered(report));
+    let text = section_text(&mut app, Category::Service);
+    assert!(
+        text.contains("an older build than this application"),
+        "{text}"
+    );
+    assert!(
+        text.contains("Registered: Unknown · This application: Unknown"),
+        "{text}"
+    );
+}
+
+mod console_store {
+    use std::path::PathBuf;
+    use std::sync::OnceLock;
+
+    use nrr_platform_api::path_registration::{
+        MockPathRegistration, PathListStyle, PathRegistrationError, PathRegistrationPlan,
+        PathRegistrationPort, PathRegistrationReport, PathRegistrationRequest, PathRemovalPlan,
+    };
+
+    pub static FOLDER: OnceLock<PathBuf> = OnceLock::new();
+    static STORE: OnceLock<MockPathRegistration> = OnceLock::new();
+
+    fn store() -> &'static MockPathRegistration {
+        STORE.get_or_init(|| MockPathRegistration::new(PathListStyle::host(), ""))
+    }
+
+    /// The one in-memory user list, kept across the screen's calls.
+    struct Shared;
+
+    impl PathRegistrationPort for Shared {
+        fn style(&self) -> PathListStyle {
+            store().style()
+        }
+        fn plan(
+            &self,
+            request: &PathRegistrationRequest,
+        ) -> Result<PathRegistrationPlan, PathRegistrationError> {
+            store().plan(request)
+        }
+        fn apply(
+            &self,
+            plan: &PathRegistrationPlan,
+        ) -> Result<PathRegistrationReport, PathRegistrationError> {
+            store().apply(plan)
+        }
+        fn plan_removal(
+            &self,
+            request: &PathRegistrationRequest,
+        ) -> Result<PathRemovalPlan, PathRegistrationError> {
+            store().plan_removal(request)
+        }
+        fn apply_removal(
+            &self,
+            plan: &PathRemovalPlan,
+        ) -> Result<PathRegistrationReport, PathRegistrationError> {
+            store().apply_removal(plan)
+        }
+    }
+
+    pub fn port() -> super::ConsoleAnswer {
+        let folder = FOLDER.get().cloned().ok_or("no folder")?;
+        Ok((Box::new(Shared), folder))
+    }
+
+    pub fn list() -> String {
+        store().current_list()
+    }
+}
+
+/// The console is offered onto the user's PATH and taken back off, each
+/// answer told against what was there, as the window tells it; open
+/// terminals are told they still need the line.
+#[test]
+fn the_console_is_put_on_path_and_taken_off_again() {
+    let scratch = Scratch::new("tui-console-path");
+    let folder = scratch.path().join("bin");
+    std::fs::create_dir_all(&folder).expect("folder");
+    console_store::FOLDER.set(folder.clone()).expect("set once");
+    let fake = service();
+    let mut app = on_settings();
+    app.settings.service_probe = || None;
+    app.settings.console_port = console_store::port;
+    open_category(&mut app, Category::Service);
+    drain(&mut app, &fake);
+    let text = section_text(&mut app, Category::Service);
+    assert!(text.contains("Command-line console"), "{text}");
+    assert!(
+        text.contains("can only be run from its own folder"),
+        "{text}"
+    );
+    assert!(
+        text.contains(&format!("Console folder: {}", folder.display())),
+        "{text}"
+    );
+
+    let row = row_of(&app, Category::Service, ItemId::ConsolePath);
+    answer(&mut app, &format!("i{row}"));
+    drain(&mut app, &fake);
+    assert_eq!(said(&app), "The console was added to your PATH.");
+    let ours = folder.to_string_lossy().into_owned();
+    assert!(
+        console_store::list().contains(&ours),
+        "{}",
+        console_store::list()
+    );
+    let text = section_text(&mut app, Category::Service);
+    assert!(text.contains("Remove console from PATH"), "{text}");
+    assert!(text.contains("Terminals that are already open"), "{text}");
+
+    answer(&mut app, &format!("i{row}"));
+    drain(&mut app, &fake);
+    assert_eq!(said(&app), "The console was removed from your PATH.");
+    assert!(
+        !console_store::list().contains(&ours),
+        "{}",
+        console_store::list()
+    );
+    let text = section_text(&mut app, Category::Service);
+    assert!(text.contains("Add console to PATH"), "{text}");
+    assert!(!text.contains("Terminals that are already open"), "{text}");
 }

@@ -53,7 +53,8 @@ impl<W: Write> PlainSession<W> {
             .iter()
             .skip(app.notices.len().saturating_sub(fresh))
         {
-            writeln!(self.out, "{}", strip_controls(&notice_line(notice, texts)))?;
+            let line = notice_line(notice, crate::feed::hide_addresses(app), texts);
+            writeln!(self.out, "{}", strip_controls(&line))?;
         }
         self.notices_seen = app.notice_count;
 
@@ -240,12 +241,19 @@ fn strip_controls(text: &str) -> String {
         .collect()
 }
 
-fn notice_line(notice: &Notice, texts: &Texts) -> String {
+/// Under the number the feed's commands name it by.
+pub(crate) fn notice_line(notice: &Notice, hide_addresses: bool, texts: &Texts) -> String {
     let level = match notice.level {
         NoticeLevel::Warning => keys::LEVEL_WARNING,
         NoticeLevel::Info => keys::LEVEL_INFO,
     };
-    format!("{}: {} — {}", texts.get(level), notice.title, notice.body)
+    format!(
+        "{}. {}: {} — {}",
+        notice.id,
+        texts.get(level),
+        notice.title,
+        notice.shown_body(hide_addresses)
+    )
 }
 
 /// One typed line is bounded: the rest of an overlong one arrives as the next.

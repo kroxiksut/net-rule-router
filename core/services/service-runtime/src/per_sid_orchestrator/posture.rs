@@ -197,13 +197,6 @@ impl PerSidApplyOrchestrator {
         if let Some(status) = self.block_all_posture_status.as_ref() {
             status.set(self.any_block_all_armed());
         }
-        // Another armed user's plan decides its machine-wide IPv6 packet cut by
-        // who else blocks, so this edge changes their plan too.
-        if self.other_principals_hold_block_all(sid) {
-            if let Some(request) = self.peer_replan.as_ref() {
-                request();
-            }
-        }
         match self.dns_cache_control.flush_resolver_cache() {
             Ok(()) => {
                 tracing::info!(
@@ -476,16 +469,10 @@ impl PerSidApplyOrchestrator {
         protocols: crate::killswitch_codegen::KillSwitchProtocols,
         posture: FailClosedPosture,
     ) -> Vec<WfpFilterSpec> {
-        let FailClosedPosture {
-            block_all,
-            machine_has_other_principals,
-        } = posture;
+        let FailClosedPosture { block_all } = posture;
         if block_all {
-            let mut out = crate::killswitch_codegen::fail_closed_block_all_filters_for(
-                sid,
-                exemptions,
-                protocols,
-                machine_has_other_principals,
+            let mut out = crate::killswitch_codegen::fail_closed_block_all_filters(
+                sid, exemptions, protocols,
             );
             out.extend(named_destination_blocks_under_block_all(
                 sid,
@@ -513,6 +500,7 @@ impl PerSidApplyOrchestrator {
     pub(super) fn clear_app_enforcement_status(&self, sid: &str) {
         if let Some(status) = self.app_enforcement_status.as_ref() {
             status.set_unresolved(sid, Vec::new());
+            status.set_unrouted(sid, &[]);
             status.set_rule_conflicts(sid, Vec::new());
         }
     }

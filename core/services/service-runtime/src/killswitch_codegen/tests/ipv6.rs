@@ -233,7 +233,6 @@ fn the_v6_block_spares_the_tunnel_endpoint_and_the_local_prefix() {
         &[server],
         &[(lan, 64)],
         KillSwitchProtocols::ALL,
-        false,
     );
     for layer in [
         WfpLayerKey::AleAuthConnectV6,
@@ -304,52 +303,4 @@ fn the_v6_pin_set_skips_the_scopes_that_must_never_be_cut() {
         out.is_empty(),
         "every input was an address that must never be cut"
     );
-}
-
-/// The transport layer has no user condition, so with another principal on
-/// the machine the v6 cut must live at the ALE layer alone: any block below it
-/// would take that principal's IPv6 down with ours.
-#[test]
-fn with_other_principals_the_v6_cut_has_no_filter_below_ale() {
-    let server: Ipv6Addr = "2001:db8::1".parse().unwrap();
-    let lan = ("2001:db8:1::".parse::<Ipv6Addr>().unwrap(), 64u8);
-    let out = catch_all_v6_filters("S", 7, &[server], &[lan], KillSwitchProtocols::ALL, true);
-    assert!(
-        out.iter().all(|f| f.layer == WfpLayerKey::AleAuthConnectV6),
-        "a machine-wide v6 filter survived"
-    );
-    assert!(
-        out.iter().any(|f| f.layer == WfpLayerKey::AleAuthConnectV6
-            && f.action == WfpAction::Block
-            && f.user_sid.as_deref() == Some("S")),
-        "the per-SID ALE v6 block must remain"
-    );
-    assert!(out
-        .iter()
-        .any(|f| f.layer == WfpLayerKey::AleAuthConnectV6 && f.local_interface_luid == Some(7)));
-    assert!(out
-        .iter()
-        .any(|f| f.remote_subnet_v6 == Some((server, 128))));
-}
-
-/// The block-all honours the flag: with another principal holding a block, no
-/// machine-wide v6 filter is emitted at all.
-#[test]
-fn the_flag_reaches_the_block_all() {
-    let ex = FailClosedExemptions {
-        secondary_luid: 7,
-        ..FailClosedExemptions::default()
-    };
-    let alone = fail_closed_block_all_filters_for("S", &ex, KillSwitchProtocols::ALL, false);
-    let shared = fail_closed_block_all_filters_for("S", &ex, KillSwitchProtocols::ALL, true);
-    assert!(alone
-        .iter()
-        .any(|f| f.layer == WfpLayerKey::OutboundTransportV6));
-    assert!(shared
-        .iter()
-        .all(|f| f.layer != WfpLayerKey::OutboundTransportV6));
-    // The v4 packet layer (named protocols) is untouched by the flag.
-    assert!(shared
-        .iter()
-        .any(|f| f.layer == WfpLayerKey::OutboundTransportV4));
 }

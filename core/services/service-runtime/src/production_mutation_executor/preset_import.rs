@@ -163,6 +163,27 @@ impl ProductionMutationExecutor {
             _ => None,
         };
 
+        let mut inactive = nrr_domain::rules_revision::UnrecognizedRules::default();
+        let primary_set = primary_set.map(|(set, kept)| {
+            inactive.primary = kept;
+            set
+        });
+        let secondary_set = secondary_set.map(|(set, kept)| {
+            inactive.secondary = kept;
+            set
+        });
+        // A route the file does not replace keeps its rules that do not work.
+        if primary_set.is_none() || secondary_set.is_none() {
+            if let Some(in_force) = self.inactive_in_force(principal) {
+                if primary_set.is_none() {
+                    inactive.primary = in_force.primary;
+                }
+                if secondary_set.is_none() {
+                    inactive.secondary = in_force.secondary;
+                }
+            }
+        }
+
         // For single-route imports the OTHER route is carried over from the
         // book in force (the baseline for a user who never diverged).
         // Each match arm's `expect()` is an invariant: the `target` discriminant
@@ -193,6 +214,7 @@ impl ProductionMutationExecutor {
         };
 
         let mut content = RulesRevisionContent::new(book);
+        content.inactive = inactive;
         // The file replaces what the user can see; what this build cannot show
         // them stays, as on every other rewrite.
         if let Some(carried) = self.unrecognized_in_force(principal) {

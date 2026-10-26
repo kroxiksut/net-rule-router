@@ -104,6 +104,8 @@ struct TrayContextPayload {
     route_primary_label: String,
     route_secondary_label: String,
     icon_file_url: Option<String>,
+    /// Root of every icon and image the tray QML draws (`ui_surface::assets_root_url`).
+    assets_root_url: Option<String>,
     /// The service log folder (`ui_surface::logs_folder_url`). The C++ host
     /// opens this rather than resolving a path of its own.
     logs_folder_url: Option<String>,
@@ -162,6 +164,7 @@ struct TrayThemeContext {
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct TrayContextUrls {
     pub icon_file_url: Option<String>,
+    pub assets_root_url: Option<String>,
     pub logs_folder_url: Option<String>,
 }
 
@@ -196,6 +199,7 @@ pub fn write_qt_tray_context_file(
         route_primary_label: preferences.route_primary_label.clone(),
         route_secondary_label: preferences.route_secondary_label.clone(),
         icon_file_url: urls.icon_file_url,
+        assets_root_url: urls.assets_root_url,
         logs_folder_url: urls.logs_folder_url,
         show_notifications: preferences.show_notifications,
         notify_suggestion_changes: preferences.notify_suggestion_changes,
@@ -462,6 +466,43 @@ mod tests {
         let carried = &parsed[HOST_ANSWER_DEADLINES_CONTEXT_KEY];
         assert_eq!(carried["defaultMs"], 1234);
         assert_eq!(carried["operationsMs"]["mutation.submit"], 5678);
+    }
+
+    /// `Tray.qml` builds its icon from this root alone; under any other key the
+    /// tray falls back to no icon at all.
+    #[test]
+    fn tray_context_carries_the_assets_root() {
+        use nrr_ui_support::theme::resolve_theme;
+        use nrr_ui_support::tray::tray_runtime_snapshot;
+        use nrr_ui_support::ui_preferences::UiPreferences;
+
+        let shell = nrr_shared::gui_shell_v1();
+        let preferences = UiPreferences::default();
+        let theme = resolve_theme(preferences.theme_mode);
+        let runtime = tray_runtime_snapshot(
+            &shell,
+            true,
+            None,
+            theme.effective_mode,
+            nrr_ui_support::tray::TrayServiceLink::Unknown,
+        );
+        let urls = super::TrayContextUrls {
+            assets_root_url: Some("file:///C:/NetRuleRouter/assets".to_string()),
+            ..super::TrayContextUrls::default()
+        };
+        let path = super::write_qt_tray_context_file(
+            &runtime,
+            &preferences.language,
+            &preferences,
+            urls,
+            super::HostAnswerDeadlines::default(),
+            &[],
+        )
+        .expect("context file is written to the temp dir");
+        let raw = std::fs::read_to_string(&path).expect("context file is readable");
+        let _ = std::fs::remove_file(&path);
+        let parsed: serde_json::Value = serde_json::from_str(&raw).expect("context file is JSON");
+        assert_eq!(parsed["assetsRootUrl"], "file:///C:/NetRuleRouter/assets");
     }
 
     /// The tray's add-rule window builds its type list from this field alone;

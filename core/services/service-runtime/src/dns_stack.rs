@@ -69,10 +69,8 @@ pub struct DnsStackInputs {
     /// exemption): never judged unchanged. Absent, such a request uses
     /// `recompute_hook`.
     pub forced_recompute_hook: Option<crate::supervised_runtime::RouteRecomputeHook>,
-    pub known_direct: Option<Arc<crate::known_direct::KnownDirectRegistry>>,
-    pub block_all_armed: Option<Flag>,
-    /// "Is the guard blocking an unresolved additional link?" — wider than
-    /// `block_all_armed`. Absent keeps the fail-open on a missed deadline.
+    /// "Is the guard blocking an unresolved additional link?" Absent keeps the
+    /// fail-open on a missed deadline.
     pub fail_closed_armed: Option<Flag>,
     /// The same posture per user. With it a rule host is withheld only while
     /// the guard of a user whose rule names it holds.
@@ -487,11 +485,8 @@ fn build_dns_resolver_instance(
                 scope_gate,
             ));
         listener = listener.with_fake_ip(answerer);
-        if let Some(block_armed) = inputs.block_all_armed.clone() {
-            let running_for_direct = Arc::clone(&running);
-            let armed: Flag = Arc::new(move || block_armed() && running_for_direct());
-            listener = listener.with_direct_fake_ip(Arc::new(assembly.direct_answerer(armed)));
-        }
+        // Under "everything" a host no rule names belongs to the tunnel, and
+        // waits with it: no virtual address carries it out the main link.
         // Collateral rescue is live whenever the stack is: the collateral
         // egresses the wrong link in every posture.
         listener = listener
@@ -506,21 +501,6 @@ fn build_dns_resolver_instance(
             engine: Arc::clone(engine),
             active_sid: Arc::clone(active_sid),
         }));
-    }
-    // Under the armed block-all a direct host's steered answer drives a bounded
-    // reconcile before it is sent, so its first connect is not cut by the
-    // catch-all. 900 ms covers the measured reconcile distribution.
-    if let (Some(registry), Some(armed)) =
-        (inputs.known_direct.as_ref(), inputs.block_all_armed.clone())
-    {
-        listener = listener.with_direct_answer_gate(Arc::new(
-            crate::dns_resolver_ports::ReconcilingDirectAnswerGate::new(
-                Arc::clone(registry),
-                reconciler,
-                armed,
-                Duration::from_millis(900),
-            ),
-        ));
     }
     tracing::info!(
         target: "nrr::dns-resolver",

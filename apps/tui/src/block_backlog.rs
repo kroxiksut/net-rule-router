@@ -12,10 +12,11 @@ use nrr_shared::ipc_payloads::{
 };
 
 use crate::backend::{Job, Reply};
+use crate::feed::About;
 use crate::i18n::Texts;
 use crate::keys;
 use crate::screens::suggestions::call;
-use crate::state::{AppState, Effect, NoticeLevel};
+use crate::state::{AppState, Effect, Notice, NoticeLevel};
 
 #[derive(Debug, Default)]
 pub struct BlockBacklogState {
@@ -75,6 +76,8 @@ pub fn announce(app: &mut AppState, texts: &Texts, now: std::time::Instant) -> V
         return Vec::new();
     }
     let mut body = texts.counted(keys::BLOCK_NOTICE_BACKLOG_COUNTED, summary.count);
+    // Hiding addresses drops the list, as the window's card does.
+    let private = body.clone();
     if !summary.shown.is_empty() {
         let shown: Vec<_> = summary.shown.iter().map(|d| display_text(d)).collect();
         let mut list = shown.join(", ");
@@ -88,12 +91,14 @@ pub fn announce(app: &mut AppState, texts: &Texts, now: std::time::Instant) -> V
         body.push(' ');
         body.push_str(&texts.fill(keys::BLOCK_NOTICE_BACKLOG_DESTINATIONS, &[("list", list)]));
     }
-    app.notify(
+    let notice = Notice::new(
         NoticeLevel::Warning,
         texts.get(keys::BLOCK_NOTICE_BACKLOG_TITLE),
         body,
-        now,
     )
+    .private(private)
+    .about(About::Kind("block-notice-backlog"));
+    app.post(notice, Some(now))
 }
 
 #[cfg(test)]

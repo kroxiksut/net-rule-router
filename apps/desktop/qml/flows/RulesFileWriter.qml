@@ -77,6 +77,10 @@ QtObject {
             if (typeof done === "function") done(!!ok, !!changed, String(code || ""))
         }
         if (!canWrite) {
+            // A window whose QML is newer than its native part: without this
+            // line the skipped write leaves no trace at all.
+            console.log("[bound-file] not written: this window's native part has no rules-file writer:",
+                        route, path)
             finish(false, false)
             return
         }

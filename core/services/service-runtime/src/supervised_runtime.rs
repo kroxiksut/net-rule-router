@@ -347,6 +347,9 @@ pub struct SupervisedRuntimeDeps {
     /// coordinator isn't available (no WFP/orchestrator). Built by the
     /// wiring layer as a closure over the coordinator + active-SID registry.
     pub route_recompute_hook: Option<RouteRecomputeHook>,
+    /// Forgets the link a first contact would route through once its adapter
+    /// is gone. `None` where no route coordinator runs.
+    pub link_gone_hook: Option<LinkGoneHook>,
     /// The same pass for requests that follow what the observation ticks
     /// learnt: they may wait for a window and share one pass. `None` falls
     /// back to `route_recompute_hook`.
@@ -500,6 +503,9 @@ pub struct SupervisedRuntimeDeps {
 
 /// A cheap, idempotent "recompute the active user's routes now" callback.
 pub type RouteRecomputeHook = Arc<dyn Fn() + Send + Sync>;
+
+/// Told the interface indexes of adapters that stopped carrying traffic.
+pub type LinkGoneHook = Arc<dyn Fn(&[u32]) + Send + Sync>;
 
 /// Returns the routing-active SID (Free single-active-user), or `None`.
 pub type ActiveRoutingSidFn = Arc<dyn Fn() -> Option<String> + Send + Sync>;
@@ -890,7 +896,7 @@ pub fn run_supervised_runtime(
             // Shares the wake latch with the clock-gap watchdog: one wake, one re-arm.
             match crate::power_resume::PowerResumeRearm::start_deduped(
                 observer.as_ref(),
-                reviving(&supervisor, Arc::clone(hook)),
+                resume_hook(&supervisor, Arc::clone(hook), &deps.adapter_monitor),
                 crate::power_resume::RESUME_DEBOUNCE,
                 Some(Arc::clone(&liveness)),
                 deps.rebind_requests.clone(),
@@ -1243,6 +1249,22 @@ fn reviving(
     })
 }
 
+/// What a wake does, whichever source saw it: the adapter monitor re-reads at
+/// once — its state is from before the sleep, and the changes it finds reach
+/// the consumers of any other change — and the re-arm runs.
+fn resume_hook(
+    supervisor: &ServiceSupervisor,
+    hook: Arc<dyn Fn() + Send + Sync>,
+    monitor: &Arc<nrr_platform_api::AdapterMonitor>,
+) -> Arc<dyn Fn() + Send + Sync> {
+    let monitor = Arc::clone(monitor);
+    let rearm = reviving(supervisor, hook);
+    Arc::new(move || {
+        monitor.request_refresh();
+        rearm();
+    })
+}
+
 fn spawn_production_tasks(
     supervisor: &ServiceSupervisor,
     deps: &SupervisedRuntimeDeps,
@@ -1254,6 +1276,7 @@ fn spawn_production_tasks(
         Arc::clone(&deps.adapter_monitor),
         Arc::clone(&health),
         deps.route_recompute_hook.clone(),
+        deps.link_gone_hook.clone(),
         deps.event_bus.clone(),
     )) {
         tracing::error!(
@@ -1308,7 +1331,8 @@ fn spawn_production_tasks(
     ) {
         if let Err(e) = supervisor.spawn(crate::power_resume::build_resume_watchdog_task(
             requests,
-            reviving(supervisor, hook),
+            reviving(supervisor, Arc::clone(&hook)),
+            resume_hook(supervisor, hook, &deps.adapter_monitor),
         )) {
             tracing::warn!(
                 target: "nrr::supervisor",

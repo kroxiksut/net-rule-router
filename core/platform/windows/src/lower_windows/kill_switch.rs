@@ -19,6 +19,7 @@ use super::*;
 /// | `KillSwitchBlock` | — | `ConnectOnly` | `HostV4` | **packed ALE block** (`KILLSWITCH_BLOCK_BASE` band), narrowed to `flow.protocol` (4d fail-closed). |
 /// | `KillSwitchBlock` | — | `ConnectOnly` | `Program` | **ALE app block** (proto-agnostic) (4d fail-closed). |
 /// | `KillSwitchBlock` | — | `AllPackets` | `HostV4` | **packed packet block** (`PACKET_BLOCK_BASE` band) (4d fail-closed). |
+/// | `AppTakeover` | `OnlyVia(Secondary)` / `Any` | `ConnectOnly` | `Program` | the **ALE app pair** / **app block** above, the block at `APP_TAKEOVER_BLOCK_BASE`. |
 ///
 /// The neutral plan stays PER-DESTINATION — which addresses are pinned is
 /// policy. Packing them into few filters is Windows mechanism (WFP ORs
@@ -172,6 +173,39 @@ fn lower_kill_switch_flows(flows: &[&FlowRule], secondary_luid: u64) -> Vec<WfpF
                     }
                     _ => {}
                 }
+            }
+            // 4d under "application rules take all their addresses": the same
+            // app pair or fail-closed block, its block raised over the primary
+            // rule band.
+            PrecedenceClass::AppTakeover => {
+                let (
+                    Coverage::ConnectOnly,
+                    dst @ (DstMatch::Any | DstMatch::SubnetV6 { prefix: 0, .. }),
+                    Some(pat),
+                ) = (flow.coverage, flow.flow.dst, app.as_deref())
+                else {
+                    continue;
+                };
+                let v6 = dst != DstMatch::Any;
+                match (flow.verdict, &flow.egress) {
+                    (Verdict::Permit, EgressConstraint::OnlyVia(EgressRef::Secondary)) => {
+                        out.push(ale_app_egress_permit(
+                            pat,
+                            secondary_luid,
+                            KILLSWITCH_PERMIT_BASE + ord,
+                            user_sid.clone(),
+                            v6,
+                        ));
+                    }
+                    (Verdict::Block, EgressConstraint::Any) => {}
+                    _ => continue,
+                }
+                out.push(ale_app_block(
+                    pat,
+                    APP_TAKEOVER_BLOCK_BASE + ord,
+                    user_sid,
+                    v6,
+                ));
             }
             _ => {}
         }

@@ -1768,13 +1768,27 @@ fn executor_without_a_stability_provider_leaves_the_gate_open() {
 // ── Tamper gate at the executor ──────────────────────────────────────
 
 /// Any principal's rule book is empty: enough for the author to append to.
-struct EmptyBook;
+/// What is stored, read like production does, or an empty book before the first write.
+struct StoredOrEmpty(crate::production_rules_provider::ProductionRulesProvider);
 
-impl crate::per_sid_orchestrator::RulesProvider for EmptyBook {
+impl crate::per_sid_orchestrator::RulesProvider for StoredOrEmpty {
     fn active_rules(&self) -> Option<crate::per_sid_orchestrator::ActiveRulesSnapshot> {
         Some(crate::per_sid_orchestrator::ActiveRulesSnapshot {
             rule_book: CanonicalRuleBook::default(),
         })
+    }
+
+    fn stored_rules_for(
+        &self,
+        principal: &str,
+    ) -> Option<crate::per_sid_orchestrator::ActiveRulesSnapshot> {
+        self.0
+            .stored_rules_for(principal)
+            .or_else(|| self.active_rules())
+    }
+
+    fn base_revision_for(&self, principal: &str) -> Option<String> {
+        self.0.base_revision_for(principal)
     }
 }
 
@@ -1829,7 +1843,11 @@ fn an_active_blocking_alert_refuses_auto_authored_rules_until_acknowledged() {
         let exec = ProductionMutationExecutor::new(Arc::clone(&coord))
             .with_alerts_repo(Arc::clone(&alerts));
         let author = crate::auto_rules::ProductionAutoRuleAuthor::new(
-            Arc::new(EmptyBook),
+            Arc::new(StoredOrEmpty(
+                crate::production_rules_provider::ProductionRulesProvider::new(Arc::clone(
+                    &state_conn,
+                )),
+            )),
             Arc::new(exec) as Arc<dyn MutationExecutor>,
         );
         let now = SystemTime::now();
@@ -1884,7 +1902,15 @@ fn an_active_blocking_alert_refuses_auto_authored_rules_until_acknowledged() {
             )
             .expect("companion acceptance after acknowledgement");
         assert_eq!(accepted.authored, 1);
-        assert!(coord.current_active_for(SID_A).unwrap().is_some());
+        let in_force = coord
+            .current_active_for(SID_A)
+            .unwrap()
+            .expect("own rules")
+            .rules_json;
+        assert!(
+            in_force.contains("blocked.example") && in_force.contains("cdn.example"),
+            "the second rule never replaces the first: {in_force}"
+        );
     }
 }
 
@@ -2263,6 +2289,18 @@ fn rules_update(body: String) -> StoredMutation {
     }
 }
 
+/// `stored` as a client that read the rules first sends it: built on the
+/// rules in force for `principal`.
+fn read_first(
+    exec: &ProductionMutationExecutor,
+    principal: &str,
+    mut stored: StoredMutation,
+) -> StoredMutation {
+    let base = exec.coordinator.base_revision_for(principal).expect("base");
+    stored.payload[nrr_shared::ipc_payloads::BASE_REVISION_KEY] = serde_json::Value::from(base);
+    stored
+}
+
 fn refusal_code(outcome: MutationOutcome) -> String {
     match outcome {
         MutationOutcome::Failed(e) => e.code,
@@ -2279,13 +2317,19 @@ fn a_book_past_the_app_budget_stays_editable_but_cannot_grow() {
     let (exec, _conn) = build_test_executor();
     seed_active_book(&exec, SID, book_json(10, 2_500));
 
-    let own_edit = exec.execute(rules_update(book_json(11, 2_500)), SID);
+    let own_edit = exec.execute(
+        read_first(&exec, SID, rules_update(book_json(11, 2_500))),
+        SID,
+    );
     assert!(
         matches!(own_edit, MutationOutcome::Completed(_)),
         "{own_edit:?}"
     );
     assert_eq!(
-        refusal_code(exec.execute(rules_update(book_json(11, 2_501)), SID)),
+        refusal_code(exec.execute(
+            read_first(&exec, SID, rules_update(book_json(11, 2_501))),
+            SID
+        )),
         "auto-rule-cap-exceeded"
     );
     let preview = exec.preview(
@@ -2304,13 +2348,19 @@ fn a_book_past_the_app_budget_stays_editable_but_cannot_grow() {
         preview.risk_signals
     );
 
-    let shrunk = exec.execute(rules_update(book_json(11, 2_400)), SID);
+    let shrunk = exec.execute(
+        read_first(&exec, SID, rules_update(book_json(11, 2_400))),
+        SID,
+    );
     assert!(
         matches!(shrunk, MutationOutcome::Completed(_)),
         "{shrunk:?}"
     );
     assert_eq!(
-        refusal_code(exec.execute(rules_update(book_json(11, 2_450)), SID)),
+        refusal_code(exec.execute(
+            read_first(&exec, SID, rules_update(book_json(11, 2_450))),
+            SID
+        )),
         "auto-rule-cap-exceeded",
         "the allowance follows the book down, never back up"
     );
@@ -2323,7 +2373,10 @@ fn a_book_under_the_app_budget_cannot_cross_it() {
     let (exec, _conn) = build_test_executor();
     seed_active_book(&exec, SID, book_json(10, 1_999));
     assert_eq!(
-        refusal_code(exec.execute(rules_update(book_json(10, 2_001)), SID)),
+        refusal_code(exec.execute(
+            read_first(&exec, SID, rules_update(book_json(10, 2_001))),
+            SID
+        )),
         "auto-rule-cap-exceeded"
     );
 }
@@ -2338,7 +2391,10 @@ fn another_users_large_book_lends_no_allowance() {
     seed_active_book(&exec, OWNER, book_json(10, 2_500));
     seed_active_book(&exec, OTHER, book_json(10, 5));
     assert_eq!(
-        refusal_code(exec.execute(rules_update(book_json(10, 2_500)), OTHER)),
+        refusal_code(exec.execute(
+            read_first(&exec, OTHER, rules_update(book_json(10, 2_500))),
+            OTHER
+        )),
         "auto-rule-cap-exceeded"
     );
 }
@@ -3045,10 +3101,18 @@ fn seeded_baseline() -> (
 #[test]
 fn an_undiverged_user_is_reviewed_against_the_baseline() {
     let (exec, _conn) = seeded_baseline();
+    let base = exec
+        .coordinator
+        .base_revision_for(UNDIVERGED)
+        .expect("base");
     let preview = |book: String| {
         exec.preview(
             MutationKind::RulesUpdate,
-            &serde_json::json!({ "rules-json": book, "content-hash": "client-supplied" }),
+            &serde_json::json!({
+                "rules-json": book,
+                "content-hash": "client-supplied",
+                "base-revision": base,
+            }),
             UNDIVERGED,
         )
     };
@@ -3083,7 +3147,11 @@ fn an_undiverged_user_confirming_the_baseline_stays_on_it() {
 
     // A real edit still diverges.
     let edited = exec.execute(
-        rules_update_of(&book_of(&["a.example", "b.example"], &["vpn.example"])),
+        read_first(
+            &exec,
+            UNDIVERGED,
+            rules_update_of(&book_of(&["a.example", "b.example"], &["vpn.example"])),
+        ),
         UNDIVERGED,
     );
     assert!(
@@ -3121,6 +3189,52 @@ fn a_one_route_import_on_the_baseline_keeps_its_other_route() {
         "baseline secondary kept: {own}"
     );
     assert!(!own.contains("a.example"), "{own}");
+}
+
+/// The administrator rewriting the baseline and one user going back to it
+/// leave every other user's own rules where they were.
+#[test]
+fn baseline_edits_and_resets_never_touch_another_users_own_rules() {
+    const OTHER: &str = "S-1-5-21-1-2-3-1002";
+    let (exec, conn) = seeded_baseline();
+    for (who, mine) in [(UNDIVERGED, "mine.example"), (OTHER, "theirs.example")] {
+        let base = exec.coordinator.base_revision_for(who).expect("base");
+        let own = exec.execute(
+            update_built_on(&book_of(&["a.example", mine], &["vpn.example"]), &base),
+            who,
+        );
+        assert!(matches!(own, MutationOutcome::Completed(_)), "{own:?}");
+    }
+    let own_of = |who: &str| {
+        let g = conn.lock().unwrap();
+        nrr_storage::revisions::RevisionsRepository::new(&g)
+            .get_active_for(who)
+            .unwrap()
+            .map(|r| r.rules_json)
+            .unwrap_or_default()
+    };
+
+    let admin = exec.execute(
+        rules_update_of(&book_of(&["new-baseline.example"], &[])),
+        nrr_storage::BASELINE_PRINCIPAL,
+    );
+    assert!(matches!(admin, MutationOutcome::Completed(_)), "{admin:?}");
+    assert!(own_of(UNDIVERGED).contains("mine.example"));
+    assert!(own_of(OTHER).contains("theirs.example"));
+
+    let reset = exec.execute(
+        StoredMutation {
+            kind: MutationKind::RulesResetToBaseline,
+            payload: serde_json::json!({}),
+            correlation_id: None,
+            issuer_sid: UNDIVERGED.to_string(),
+            caller_is_elevated: false,
+        },
+        UNDIVERGED,
+    );
+    assert!(matches!(reset, MutationOutcome::Completed(_)), "{reset:?}");
+    assert!(!own_of(UNDIVERGED).contains("mine.example"), "asked for");
+    assert!(own_of(OTHER).contains("theirs.example"), "never asked for");
 }
 
 // ── Two writers ─────────────────────────────────────────────────────────
@@ -3215,6 +3329,70 @@ fn of_two_writers_on_one_base_the_second_is_refused_not_applied() {
         exec.execute(update_built_on(&second_book, new_base), UNDIVERGED),
         MutationOutcome::Completed(_)
     ));
+}
+
+/// A write that does not say what it was built from was built from nothing.
+/// A client that never read the rules — a failed read, edits made while the
+/// service was away — must not replace a rule it never saw: the rule the tray
+/// added stays, and the client is told to merge.
+#[test]
+fn a_write_that_names_no_base_cannot_drop_a_rule_it_never_saw() {
+    let (exec, conn) = seeded_baseline();
+    let base = exec
+        .coordinator
+        .base_revision_for(UNDIVERGED)
+        .expect("base");
+    let tray = exec.execute(
+        update_built_on(
+            &book_of(&["a.example", "tray.example"], &["vpn.example"]),
+            &base,
+        ),
+        UNDIVERGED,
+    );
+    assert!(matches!(tray, MutationOutcome::Completed(_)), "{tray:?}");
+
+    let blind = rules_update_of(&book_of(
+        &["a.example", "offline.example"],
+        &["vpn.example"],
+    ));
+    let preview = exec.preview(MutationKind::RulesUpdate, &blind.payload, UNDIVERGED);
+    assert!(
+        preview.risk_signals.iter().any(|s| matches!(
+            s,
+            RiskSignalDto::ChangeRefused { code, .. } if code == "rules-changed-elsewhere"
+        )),
+        "{preview:?}"
+    );
+    match exec.execute(blind, UNDIVERGED) {
+        MutationOutcome::Failed(e) => assert_eq!(e.code, "rules-changed-elsewhere"),
+        other => panic!("a blind write is refused: {other:?}"),
+    }
+    let in_force = {
+        let g = conn.lock().unwrap();
+        nrr_storage::revisions::RevisionsRepository::new(&g)
+            .get_active_for(UNDIVERGED)
+            .unwrap()
+            .expect("own")
+            .rules_json
+    };
+    assert!(in_force.contains("tray.example"), "{in_force}");
+}
+
+/// Nothing to lose, nothing to name: the first rules of a user who has none
+/// in force land without a base, and so does the administrator's baseline,
+/// which is copied over on purpose.
+#[test]
+fn a_write_over_no_rules_needs_no_base() {
+    let (exec, _conn) = build_test_executor();
+    let first = exec.execute(rules_update_of(&book_of(&["a.example"], &[])), UNDIVERGED);
+    assert!(matches!(first, MutationOutcome::Completed(_)), "{first:?}");
+
+    let (exec, _conn) = seeded_baseline();
+    let again = exec.execute(
+        rules_update_of(&book_of(&["b.example"], &[])),
+        nrr_storage::BASELINE_PRINCIPAL,
+    );
+    assert!(matches!(again, MutationOutcome::Completed(_)), "{again:?}");
 }
 
 /// A writer that passed the early check and then waited for another
@@ -3387,4 +3565,199 @@ fn a_new_rule_on_another_users_folder_is_refused() {
         ALICE_PRINCIPAL,
     );
     assert!(refused_with(&review, PATH_IN_OTHER_USERS_PROFILE_CODE));
+}
+
+// ── Rules that do not work are kept ─────────────────────────────────────
+
+const KEPT_USER: &str = "S-1-5-21-1-2-3-1010";
+
+/// A book holding `extra` beside a working rule, as a client sends it.
+fn book_with(extra: serde_json::Value) -> String {
+    serde_json::json!({
+        "schema-version": 1,
+        "primary": [
+            {
+                "id": "r-0000",
+                "enabled": true,
+                "address-match": { "kind": "exact-fqdn", "value": "a.example" },
+                "comment": "",
+                "action": "route",
+            },
+            extra,
+        ],
+        "secondary": [],
+    })
+    .to_string()
+}
+
+fn broadcast_rule() -> serde_json::Value {
+    serde_json::json!({
+        "id": "r-0001",
+        "enabled": true,
+        "address-match": { "kind": "exact-ipv4", "address": "255.255.255.255" },
+        "comment": "office printer",
+        "action": "route",
+    })
+}
+
+fn stored_json(conn: &Arc<std::sync::Mutex<rusqlite::Connection>>, who: &str) -> String {
+    let g = conn.lock().unwrap();
+    nrr_storage::revisions::RevisionsRepository::new(&g)
+        .get_active_for(who)
+        .unwrap()
+        .map(|r| r.rules_json)
+        .unwrap_or_default()
+}
+
+/// A rule whose value no book may apply is kept in the user's set, listed as
+/// not working and never applied; sending it back keeps it, and only leaving it
+/// out — the user's delete — removes it.
+#[test]
+fn a_rule_that_does_not_work_is_kept_until_the_user_deletes_it() {
+    use crate::ipc_handlers::providers::RulesSnapshotProvider;
+    use nrr_shared::ipc_payloads::RulesRouteFilter;
+
+    let (exec, conn) = build_test_executor();
+    let saved = exec.execute(rules_update_of(&book_with(broadcast_rule())), KEPT_USER);
+    assert!(matches!(saved, MutationOutcome::Completed(_)), "{saved:?}");
+    assert!(stored_json(&conn, KEPT_USER).contains("255.255.255.255"));
+
+    let applied = crate::production_rules_provider::decode_rules_snapshot(
+        &stored_json(&conn, KEPT_USER),
+        "test",
+    )
+    .expect("the book loads");
+    assert_eq!(applied.rule_book.primary.rules().len(), 1, "never applied");
+
+    let listed =
+        crate::production_handlers_misc::ProductionRulesSnapshotProvider::new(Arc::clone(&conn))
+            .rules_snapshot_for(RulesRouteFilter::All, KEPT_USER);
+    let row = listed
+        .rows
+        .iter()
+        .find(|r| r.match_value == "255.255.255.255")
+        .expect("listed");
+    assert_eq!(row.validation_status, "error");
+    assert_eq!(row.comment.as_deref(), Some("office printer"));
+
+    // An unrelated edit that sends it back keeps it.
+    let edited = exec.execute(
+        read_first(
+            &exec,
+            KEPT_USER,
+            rules_update_of(&book_with(broadcast_rule()).replace("a.example", "b.example")),
+        ),
+        KEPT_USER,
+    );
+    assert!(
+        matches!(edited, MutationOutcome::Completed(_)),
+        "{edited:?}"
+    );
+    assert!(stored_json(&conn, KEPT_USER).contains("255.255.255.255"));
+
+    // Left out, it is gone: that is how the user deletes it.
+    let deleted = exec.execute(
+        read_first(&exec, KEPT_USER, rules_update_of(&gui_book("b.example"))),
+        KEPT_USER,
+    );
+    assert!(
+        matches!(deleted, MutationOutcome::Completed(_)),
+        "{deleted:?}"
+    );
+    assert!(!stored_json(&conn, KEPT_USER).contains("255.255.255.255"));
+}
+
+/// A rules file is the user's: a line the service cannot apply is kept aside
+/// rather than lost from the set, and a one-route import keeps the other
+/// route's such rules too.
+#[test]
+fn an_import_keeps_the_lines_it_cannot_apply() {
+    let (exec, conn) = build_test_executor();
+    // `--- Windows` is the program section only where the reader runs it.
+    let exec = exec.with_host_platform(HostPlatform::Windows);
+    let both = serde_json::json!({
+        "primary-bytes-b64": b64("--- IP\n203.0.113.7\n0.0.0.0 # nowhere\n"),
+        "secondary-bytes-b64": b64("--- Windows\nchrome.exe\n*\n"),
+        "include-child-processes": false,
+    });
+    let outcome = exec.execute_preset_import(&both, KEPT_USER);
+    assert!(
+        matches!(outcome, MutationOutcome::Completed(_)),
+        "{outcome:?}"
+    );
+    let stored = stored_json(&conn, KEPT_USER);
+    assert!(
+        stored.contains("0.0.0.0") && stored.contains("nowhere"),
+        "{stored}"
+    );
+    assert!(stored.contains(r#""value":"*""#), "{stored}");
+
+    let primary_only = serde_json::json!({
+        "primary-bytes-b64": b64("--- IP\n203.0.113.8\n"),
+        "include-child-processes": false,
+    });
+    let outcome = exec.execute_preset_import(
+        &read_first_payload(&exec, KEPT_USER, primary_only),
+        KEPT_USER,
+    );
+    assert!(
+        matches!(outcome, MutationOutcome::Completed(_)),
+        "{outcome:?}"
+    );
+    let stored = stored_json(&conn, KEPT_USER);
+    assert!(
+        !stored.contains("0.0.0.0"),
+        "the file replaced its route: {stored}"
+    );
+    assert!(
+        stored.contains(r#""value":"*""#),
+        "the other route keeps its own: {stored}"
+    );
+}
+
+fn read_first_payload(
+    exec: &ProductionMutationExecutor,
+    principal: &str,
+    mut payload: serde_json::Value,
+) -> serde_json::Value {
+    payload[nrr_shared::ipc_payloads::BASE_REVISION_KEY] =
+        serde_json::Value::from(exec.coordinator.base_revision_for(principal).expect("base"));
+    payload
+}
+
+/// The service's own suggestions are written from the applied book, which
+/// leaves out the rules that do not work: accepting one must not delete them.
+#[test]
+fn an_accepted_suggestion_keeps_the_rules_that_do_not_work() {
+    use crate::auto_rules::{AuthoredMatchKind, AuthoredRule, AutoRuleAuthor};
+    use nrr_shared::AutoRuleReason;
+
+    let (exec, conn) = build_test_executor();
+    let exec = Arc::new(exec);
+    assert!(matches!(
+        exec.execute(rules_update_of(&book_with(broadcast_rule())), KEPT_USER),
+        MutationOutcome::Completed(_)
+    ));
+    let author = crate::auto_rules::ProductionAutoRuleAuthor::new(
+        Arc::new(crate::production_rules_provider::ProductionRulesProvider::new(Arc::clone(&conn))),
+        Arc::clone(&exec) as Arc<dyn MutationExecutor>,
+    );
+    let authored = author
+        .author(
+            KEPT_USER,
+            &AutoRuleReason::UserConfirmed,
+            &[AuthoredRule {
+                route: RouteRole::Secondary,
+                match_kind: AuthoredMatchKind::SuffixDomain,
+                value: "cdn.example".into(),
+                anchor: "cdn.example".into(),
+            }],
+            std::time::SystemTime::now(),
+            "c-kept",
+        )
+        .expect("authored");
+    assert_eq!(authored, 1);
+    let stored = stored_json(&conn, KEPT_USER);
+    assert!(stored.contains("cdn.example"), "{stored}");
+    assert!(stored.contains("255.255.255.255"), "{stored}");
 }

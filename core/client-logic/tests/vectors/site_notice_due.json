@@ -1,0 +1,16 @@
+{
+  "description": "pure.js siteNoticeDue / nrr_shared::site_notice::site_notice_due",
+  "cases": [
+    { "name": "never told", "input": { "muted": false, "lastAny": null, "siteShown": null, "answered": false, "now": 100000000 }, "expected": true },
+    { "name": "muted", "input": { "muted": true, "lastAny": null, "siteShown": null, "answered": false, "now": 100000000 }, "expected": false },
+    { "name": "another site a minute ago", "input": { "muted": false, "lastAny": 99940000, "siteShown": null, "answered": false, "now": 100000000 }, "expected": false },
+    { "name": "another site half an hour ago", "input": { "muted": false, "lastAny": 98200000, "siteShown": null, "answered": false, "now": 100000000 }, "expected": true },
+    { "name": "half an hour less a millisecond", "input": { "muted": false, "lastAny": 98200001, "siteShown": null, "answered": false, "now": 100000000 }, "expected": false },
+    { "name": "same site an hour ago, unanswered", "input": { "muted": false, "lastAny": 96400000, "siteShown": 96400000, "answered": false, "now": 100000000 }, "expected": false },
+    { "name": "same site an hour ago, answered", "input": { "muted": false, "lastAny": 96400000, "siteShown": 96400000, "answered": true, "now": 100000000 }, "expected": true },
+    { "name": "answered but within the half hour", "input": { "muted": false, "lastAny": 99999000, "siteShown": 99999000, "answered": true, "now": 100000000 }, "expected": false },
+    { "name": "same site a day ago", "input": { "muted": false, "lastAny": 13600000, "siteShown": 13600000, "answered": false, "now": 100000000 }, "expected": true },
+    { "name": "clock went back", "input": { "muted": false, "lastAny": 200000000, "siteShown": 200000000, "answered": false, "now": 100000000 }, "expected": true },
+    { "name": "muted even when answered", "input": { "muted": true, "lastAny": null, "siteShown": null, "answered": true, "now": 100000000 }, "expected": false }
+  ]
+}

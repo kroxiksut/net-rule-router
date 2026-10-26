@@ -31,7 +31,8 @@ pub(super) struct OwnerGuard<'a> {
     /// Networks of somebody else's tunnels, which service accounts and
     /// forwarded traffic reach as the owner does.
     pub foreign_networks: &'a [crate::killswitch_codegen::ForeignTunnelNetwork],
-    /// The owner's blanket block with the tunnel gone, and what it leaves open.
+    /// The owner's blanket and what it leaves open: with the tunnel gone, or
+    /// through it (the LUID set) while it is up.
     pub block_all: Option<&'a crate::killswitch_codegen::FailClosedExemptions>,
     /// The networks the owner's main-link rules route, which that blanket
     /// leaves open as the owner's rule filters do.

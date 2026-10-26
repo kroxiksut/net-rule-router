@@ -9,10 +9,10 @@ use nrr_shared::platform_profile::PlatformProfile;
 use serde_json::Value;
 
 use super::apply::Review;
-use super::form::{offered_types, route_options, Field, Form};
+use super::form::{offered_types, route_options, Field, Form, Reach};
 use super::table::{
-    route_label, type_filter_label, RouteFilter, Row, SortMode, StatusFilter, Verdict,
-    VerdictStatus, PAGE, TYPE_FILTERS,
+    route_label, type_filter_label, OtherOsRow, RouteFilter, Row, SortMode, StatusFilter, Table,
+    Verdict, VerdictStatus, PAGE, TYPE_FILTERS,
 };
 
 /// Lines of the changes view's entry list one window shows.
@@ -21,7 +21,7 @@ pub const REVIEW_PAGE: usize = 12;
 const FORM_OVERLAPS: usize = 3;
 use super::{
     bulk, gateway, main_route, merge, overrides, recent, spare, text, verdicts, Busy, Choice,
-    ChoicePurpose, Input, InputPurpose, Mode, Phase, SetList,
+    ChoicePurpose, Input, InputPurpose, Mode, Phase, SaveTarget, SetList,
 };
 use crate::i18n::Texts;
 use crate::keys;
@@ -101,10 +101,34 @@ fn state_lines(app: &AppState, texts: &Texts) -> Vec<ViewLine> {
     let rules = &app.rules;
     let table = &rules.table;
     let mut lines = Vec::new();
+    if rules.admin_locked {
+        lines.push(ViewLine::new(vec![Segment::state(
+            texts.get(text::LOCKED_TITLE),
+            StateTone::Caution,
+        )]));
+        lines.push(ViewLine::text(texts.get(text::LOCKED_BODY)));
+    }
     if rules.baseline {
         lines.push(ViewLine::new(vec![Segment::state(
             texts.get(text::BASELINE_NOTE),
             StateTone::Caution,
+        )]));
+    }
+    if !rules.bound_paths.is_empty() {
+        let paths: Vec<String> = rules
+            .bound_paths
+            .iter()
+            .map(|p| display_text(p).into_owned())
+            .collect();
+        lines.push(ViewLine::new(vec![
+            Segment::strong(format!("{} ", texts.get(text::SAVES_TO))),
+            Segment::plain(paths.join("; ")),
+        ]));
+    }
+    let marked = table.marked().len();
+    if marked > 0 {
+        lines.push(ViewLine::new(vec![Segment::strong(
+            texts.fill(text::MARKED_COUNT, &[("n", marked.to_string())]),
         )]));
     }
     if rules.unrecognized > 0 {
@@ -187,6 +211,12 @@ fn state_lines(app: &AppState, texts: &Texts) -> Vec<ViewLine> {
     }
     if table.auto_only {
         filter.push(Segment::plain(format!(" · {}", texts.get(text::AUTO_ONLY))));
+    }
+    if table.hide_not_working {
+        filter.push(Segment::plain(format!(
+            " · {}",
+            texts.get(text::NOT_WORKING_HIDDEN)
+        )));
     }
     if !table.search.is_empty() {
         filter.push(Segment::strong(format!(" · {}: ", texts.get(text::SEARCH))));
@@ -312,8 +342,9 @@ fn row_lines(
     let rule = &row.rule;
     let switch = texts.get(if rule.enabled { text::ON } else { text::OFF });
     let lead = format!(
-        "{}{n}. [{switch}] {}  {}  {} — ",
+        "{}{n}.{}[{switch}] {}  {}  {} — ",
         if chosen { "> " } else { "  " },
+        if row.marked { "*" } else { " " },
         rule.id,
         type_label(&rule.rule_type, texts),
         display_text(&rule.match_value),
@@ -339,6 +370,10 @@ fn row_lines(
     }
     if let Some(mark) = recent::mark_text(app, rule, texts) {
         tail.push_str(&format!(" · {mark}"));
+    }
+    // In words too: a screen reader does not say what the star means.
+    if row.marked {
+        tail.push_str(&format!(" · {}", texts.get(text::ROW_MARKED)));
     }
     let mut first = if chosen {
         vec![Segment::selected(format!("{lead}{route}{tail}"))]
@@ -438,6 +473,7 @@ fn list_lines(app: &AppState, texts: &Texts) -> Vec<ViewLine> {
             ViewLine::new(vec![Segment::strong(texts.get(text::EMPTY_TITLE))]),
             ViewLine::text(texts.get(text::EMPTY_BODY)),
         ];
+        lines.extend(other_os_lines(table, texts));
         lines.extend(recent::extra_lines(app, texts));
         return lines;
     }
@@ -450,6 +486,7 @@ fn list_lines(app: &AppState, texts: &Texts) -> Vec<ViewLine> {
                 texts.fill(text::NONE_SHOWN, &[("total", total)]),
             ));
         }
+        lines.extend(other_os_lines(table, texts));
         lines.extend(recent::extra_lines(app, texts));
         return lines;
     }
@@ -501,7 +538,36 @@ fn list_lines(app: &AppState, texts: &Texts) -> Vec<ViewLine> {
             texts,
         ));
     }
+    // After the last page: they are not rows the cursor reaches.
+    if last == visible.len() {
+        lines.extend(other_os_lines(table, texts));
+    }
     lines.extend(recent::extra_lines(app, texts));
+    lines
+}
+
+/// Another OS's programs in the files: read only, each with its system.
+fn other_os_lines(table: &Table, texts: &Texts) -> Vec<ViewLine> {
+    let rows = table.other_os_rows();
+    if rows.is_empty() {
+        return Vec::new();
+    }
+    let mut lines = vec![ViewLine::new(vec![Segment::strong(
+        texts.get(text::OTHER_OS_TITLE),
+    )])];
+    for OtherOsRow { os, row } in &rows {
+        let rule = &row.rule;
+        let switch = texts.get(if rule.enabled { text::ON } else { text::OFF });
+        let mut line = format!(
+            "   [{switch}] {os}  {} \u{2014} {}",
+            display_text(&rule.match_value),
+            route_text(&rule.target_route, texts),
+        );
+        if !rule.comment.is_empty() {
+            line.push_str(&format!("  # {}", display_text(&rule.comment)));
+        }
+        lines.push(ViewLine::text(line));
+    }
     lines
 }
 
@@ -512,6 +578,7 @@ fn input_lines(input: &Input, texts: &Texts) -> Vec<ViewLine> {
         InputPurpose::Export => text::EXPORT_QUESTION,
         InputPurpose::RulesFolder => text::FOLDER_QUESTION,
         InputPurpose::VerdictFolder => text::VERDICTS_FOLDER_QUESTION,
+        InputPurpose::ExportRoute(_) => text::EXPORT_ROUTE_QUESTION,
     };
     vec![
         ViewLine::new(vec![Segment::strong(texts.get(question))]),
@@ -643,12 +710,28 @@ fn form_lines(app: &AppState, form: &Form, texts: &Texts) -> Vec<ViewLine> {
                 continue;
             }
         };
-        lines.push(ViewLine::new(vec![
+        let mut segments = vec![
             Segment::plain(marker(current)),
             Segment::strong(format!("{}: ", texts.get(label))),
             Segment::plain(value),
-        ]));
+        ];
+        if field == Field::Comment {
+            let used = form.comment_used().to_string();
+            let max = Form::comment_max().to_string();
+            segments.push(Segment::muted(format!(
+                "  {}",
+                texts.fill(text::COMMENT_COUNTER, &[("used", used), ("max", max)])
+            )));
+        }
+        lines.push(ViewLine::new(segments));
         match field {
+            Field::Comment if form.comment_used() >= Form::comment_max() => {
+                let max = Form::comment_max().to_string();
+                lines.push(ViewLine::text(format!(
+                    "     {}",
+                    texts.fill(text::COMMENT_MAX_LENGTH, &[("max", max)])
+                )));
+            }
             Field::Type => {
                 if current {
                     let types = offered_types();
@@ -703,6 +786,7 @@ fn form_lines(app: &AppState, form: &Form, texts: &Texts) -> Vec<ViewLine> {
                 // service, and the subfolders switch of a folder rule.
                 let verdict_key = form.verdict().map(|v| v.message_key);
                 lines.extend(super::coverage::lines(form, verdict_key.as_deref(), texts));
+                lines.extend(host_hint_lines(form, current, texts));
                 if form.names_folder() {
                     let tick = texts.get(if form.with_subfolders() {
                         text::TICKED
@@ -769,6 +853,49 @@ fn form_lines(app: &AppState, form: &Form, texts: &Texts) -> Vec<ViewLine> {
     lines
 }
 
+/// Under a host value: how far the rule reaches, the subdomains switch, the
+/// warning about a public registry, and the ASCII form of a Unicode name.
+fn host_hint_lines(form: &Form, current: bool, texts: &Texts) -> Vec<ViewLine> {
+    let indent = |line: String| ViewLine::text(format!("     {line}"));
+    let mut out = Vec::new();
+    if let Some(reach) = form.reach() {
+        let (key, host) = match reach {
+            Reach::AnyZone(host) => (text::COVERAGE_ANY_ZONE, host),
+            Reach::WithSubdomains(host) => (text::COVERAGE_WITH_SUBDOMAINS, host),
+            Reach::ExactOnly(host) => (text::COVERAGE_EXACT_ONLY, host),
+        };
+        out.push(indent(texts.fill(key, &[("host", display_text(&host))])));
+    }
+    if form.subdomains_offered() {
+        let tick = texts.get(if form.with_subdomains() {
+            text::TICKED
+        } else {
+            text::UNTICKED
+        });
+        out.push(indent(format!(
+            "{tick} {}",
+            texts.get(text::INCLUDE_SUBDOMAINS)
+        )));
+        if current {
+            out.push(indent(texts.get(text::SUBDOMAINS_KEY)));
+        }
+    }
+    let value = display_text(form.value.trim());
+    if form.names_public_suffix() {
+        out.push(indent(
+            texts.fill(text::PUBLIC_SUFFIX_WARNING, &[("value", &value)]),
+        ));
+    } else if form.states_suffix_reach() {
+        out.push(indent(texts.fill(text::SUFFIX_REACH, &[("value", &value)])));
+    }
+    if let Some(ace) = form.punycode() {
+        out.push(indent(
+            texts.fill(text::PUNYCODE_HINT, &[("ace", display_text(&ace))]),
+        ));
+    }
+    out
+}
+
 /// Which rules of the other route the rule in the form meets, and which one
 /// wins, before it is saved.
 fn overlap_lines(form: &Form, texts: &Texts) -> Vec<ViewLine> {
@@ -802,7 +929,17 @@ pub fn choice_len(purpose: &ChoicePurpose) -> usize {
         ChoicePurpose::Delete(_)
         | ChoicePurpose::Reload
         | ChoicePurpose::Overwrite(_)
+        | ChoicePurpose::Shipped(_)
+        | ChoicePurpose::ClearAll
         | ChoicePurpose::RemoveSpare(_) => 2,
+        ChoicePurpose::ExportRoute => 3,
+        ChoicePurpose::Marked => super::MARKED_ACTIONS,
+        ChoicePurpose::DeleteMarked => 2,
+        ChoicePurpose::ImportReview(flow) => match flow.set.questions.get(flow.at) {
+            Some(super::files::ReviewQuestion::Duplicate { .. }) => 3,
+            Some(super::files::ReviewQuestion::Unknown { .. }) => text::PRESET_CLASSIFY.len(),
+            None => 0,
+        },
         ChoicePurpose::HandEdited(_) => 3,
         ChoicePurpose::ChangedElsewhere => 2,
     }
@@ -879,11 +1016,106 @@ fn choice_lines(app: &AppState, choice: &Choice, texts: &Texts) -> Vec<ViewLine>
             set_list_details(list, texts),
             list.sets.iter().map(|p| p.label.clone()).collect(),
         ),
-        ChoicePurpose::Overwrite(path) => (
-            get(text::OVERWRITE_QUESTION),
-            vec![path.display().to_string()],
-            vec![get(text::OVERWRITE), get(text::CANCEL)],
+        ChoicePurpose::Overwrite(target) => {
+            let (question, action) = match target {
+                SaveTarget::Set(_) => (text::OVERWRITE_QUESTION, text::OVERWRITE),
+                SaveTarget::Route(..) => (text::OVERWRITE_FILE_QUESTION, text::OVERWRITE_FILE),
+            };
+            (
+                get(question),
+                vec![display_text(&target.shown()).into_owned()],
+                vec![get(action), get(text::CANCEL)],
+            )
+        }
+        ChoicePurpose::Shipped(target) => (
+            get(text::SHIPPED_TITLE),
+            vec![
+                get(text::SHIPPED_BODY),
+                display_text(&target.shown()).into_owned(),
+            ],
+            vec![get(text::SHIPPED_CONFIRM), get(text::CANCEL)],
         ),
+        ChoicePurpose::ExportRoute => (
+            get(text::ROUTE_QUESTION),
+            Vec::new(),
+            vec![
+                get(text::EXPORT_PRIMARY),
+                get(text::EXPORT_SECONDARY),
+                get(text::CANCEL),
+            ],
+        ),
+        ChoicePurpose::ClearAll => (
+            get(text::CLEAR_ALL_TITLE),
+            vec![get(text::CLEAR_ALL_BODY)],
+            vec![get(text::CLEAR_ALL_CONFIRM), get(text::CANCEL)],
+        ),
+        ChoicePurpose::Marked => {
+            let n = app.rules.table.marked().len().to_string();
+            let move_to = |name: &String| format!("{}: {name}", get(text::BULK_MOVE));
+            (
+                get(text::MARKED_QUESTION),
+                vec![texts.fill(text::MARKED_COUNT, &[("n", n)])],
+                vec![
+                    get(text::BULK_ENABLE),
+                    get(text::BULK_DISABLE),
+                    move_to(&app.rules.route_names[0]),
+                    move_to(&app.rules.route_names[1]),
+                    get(text::BULK_DENY),
+                    get(text::BULK_DELETE),
+                    get(text::BULK_UNMARK),
+                ],
+            )
+        }
+        ChoicePurpose::ImportReview(flow) => {
+            use super::files::ReviewQuestion;
+            let progress = format!(
+                "{} ({}/{})",
+                get(text::PRESET_INTRO),
+                flow.at + 1,
+                flow.set.questions.len()
+            );
+            match flow.set.questions.get(flow.at) {
+                Some(ReviewQuestion::Duplicate { name, occurrences }) => (
+                    texts.fill(
+                        text::PRESET_DUPLICATE_ROW,
+                        &[
+                            ("name", display_text(name).into_owned()),
+                            ("n", occurrences.to_string()),
+                        ],
+                    ),
+                    vec![progress, get(text::PRESET_DUPLICATE_HINT)],
+                    vec![
+                        get(text::PRESET_MERGE),
+                        get(text::PRESET_LAST_WINS),
+                        get(text::PRESET_IGNORE),
+                    ],
+                ),
+                Some(ReviewQuestion::Unknown { name, lines }) => (
+                    format!(
+                        "{} — {}",
+                        texts.fill(
+                            text::PRESET_UNKNOWN_ROW,
+                            &[
+                                ("name", display_text(name).into_owned()),
+                                ("n", lines.to_string()),
+                            ],
+                        ),
+                        get(text::PRESET_WHAT)
+                    ),
+                    vec![progress, get(text::PRESET_UNKNOWN_HINT)],
+                    text::PRESET_CLASSIFY.iter().map(|k| get(*k)).collect(),
+                ),
+                None => (progress, Vec::new(), Vec::new()),
+            }
+        }
+        ChoicePurpose::DeleteMarked => {
+            let n = app.rules.table.marked().len().to_string();
+            (
+                get(text::BULK_DELETE_TITLE),
+                vec![texts.fill(text::BULK_DELETE_BODY, &[("n", n)])],
+                vec![get(text::BULK_DELETE_CONFIRM), get(text::CANCEL)],
+            )
+        }
         ChoicePurpose::ChangedElsewhere => (
             get(text::CHANGED_ELSEWHERE_QUESTION),
             vec![get(text::CHANGED_ELSEWHERE_DETAIL)],

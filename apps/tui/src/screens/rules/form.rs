@@ -1,5 +1,6 @@
 //! The add and edit form (the GUI's `RuleEditDialog` and `saveRule`).
 
+use nrr_client_logic::public_suffix::is_public_suffix_value;
 use nrr_client_logic::rule_form::form_rule_value;
 use nrr_client_logic::rule_value_class::misplaced_target_type;
 use nrr_client_logic::rules_overlaps::overlaps_of_rule;
@@ -134,6 +135,18 @@ pub struct Form {
     overlaps_for: Option<OverlapInputs>,
     /// What a rule by path covers for the user, asked of the service.
     pub coverage: Coverage,
+    /// The machine-wide subdomain setting, as last read with the overlaps.
+    pub include_subdomains: bool,
+}
+
+/// How far a domain rule reaches (the GUI's coverage line), with the host it
+/// names.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Reach {
+    /// `site.*`: the site in every zone, with its subdomains.
+    AnyZone(String),
+    WithSubdomains(String),
+    ExactOnly(String),
 }
 
 impl Form {
@@ -151,6 +164,7 @@ impl Form {
             overlaps: Vec::new(),
             overlaps_for: None,
             coverage: Coverage::default(),
+            include_subdomains: true,
         }
     }
 
@@ -169,6 +183,7 @@ impl Form {
             overlaps: Vec::new(),
             overlaps_for: None,
             coverage: Coverage::default(),
+            include_subdomains: true,
         })
     }
 
@@ -321,6 +336,92 @@ impl Form {
         true
     }
 
+    /// How far the domain rule on screen reaches, the machine-wide subdomain
+    /// setting folded in; `None` for another type or a refused value.
+    pub fn reach(&self) -> Option<Reach> {
+        let value = self.value.trim();
+        if self.rule_type != RuleType::Domain || value.is_empty() {
+            return None;
+        }
+        if self.verdict()?.status == VerdictStatus::Error {
+            return None;
+        }
+        if let Some(site) = value.strip_suffix(".*") {
+            let site = site.strip_prefix("*.").unwrap_or(site);
+            return Some(Reach::AnyZone(site.to_owned()));
+        }
+        Some(match value.strip_prefix("*.") {
+            Some(bare) => Reach::WithSubdomains(bare.to_owned()),
+            None if self.include_subdomains => Reach::WithSubdomains(value.to_owned()),
+            None => Reach::ExactOnly(value.to_owned()),
+        })
+    }
+
+    /// The "include subdomains" switch, offered only while the setting is
+    /// off: with it on, the service expands every bare domain anyway.
+    pub fn subdomains_offered(&self) -> bool {
+        self.rule_type == RuleType::Domain
+            && !self.include_subdomains
+            && !self.value.trim().ends_with(".*")
+    }
+
+    pub fn with_subdomains(&self) -> bool {
+        self.value.trim().starts_with("*.")
+    }
+
+    /// Ctrl+F on a domain rule: `*.` in front of the value or taken away.
+    pub fn toggle_subdomains(&mut self) -> bool {
+        if !self.subdomains_offered() {
+            return false;
+        }
+        let value = self.value.trim();
+        self.value = match value.strip_prefix("*.") {
+            Some(bare) => bare.to_owned(),
+            None => format!("*.{value}"),
+        };
+        self.duplicate = None;
+        true
+    }
+
+    /// Ctrl+F: the subfolders of a folder rule, the subdomains of a domain.
+    pub fn toggle_scope(&mut self) -> bool {
+        self.toggle_subfolders() || self.toggle_subdomains()
+    }
+
+    /// A domain rule over a registry of strangers' names (`co.uk`, `com`).
+    pub fn names_public_suffix(&self) -> bool {
+        matches!(self.rule_type, RuleType::Domain | RuleType::SuffixDomain)
+            && is_public_suffix_value(self.value.trim())
+    }
+
+    /// A suffix rule matches names the user never listed; a public suffix
+    /// gets the stronger warning instead.
+    pub fn states_suffix_reach(&self) -> bool {
+        self.rule_type == RuleType::SuffixDomain
+            && !self.value.trim().is_empty()
+            && !self.names_public_suffix()
+    }
+
+    /// The ASCII form of an internationalised host as typed; `None` when the
+    /// host is ASCII or does not convert.
+    pub fn punycode(&self) -> Option<String> {
+        if !self.rule_type.is_hostlike() {
+            return None;
+        }
+        let value = self.value.trim();
+        let ace = ace::encode(value);
+        (!value.is_empty() && ace != value).then_some(ace)
+    }
+
+    /// The comment's length against what an import accepts.
+    pub fn comment_used(&self) -> usize {
+        self.comment.chars().count()
+    }
+
+    pub const fn comment_max() -> usize {
+        COMMENT_MAX
+    }
+
     pub fn type_char(&mut self, c: char) {
         match self.field {
             Field::Value => {
@@ -407,6 +508,7 @@ impl Form {
     /// Find the pairs the rule would take part in against the rest of the
     /// list; a keystroke that changes none of their inputs finds nothing new.
     pub fn refresh_overlaps(&mut self, table: &Table, include_subdomains: bool) {
+        self.include_subdomains = include_subdomains;
         let inputs = (
             self.rule_type.clone(),
             self.value.clone(),
@@ -476,7 +578,9 @@ impl Form {
         if self.editing.is_none() && table.user_rule_count() >= FREE_MAX_RULES {
             return Saved::Limit;
         }
-        let mut comment = self.comment.clone();
+        // A longer comment from elsewhere is cut as the GUI's field cuts it:
+        // the rules file refuses it whole.
+        let mut comment: String = self.comment.chars().take(COMMENT_MAX).collect();
         if comment.is_empty() && self.rule_type.is_hostlike() && !self.value.is_ascii() {
             let ace = ace::encode(&self.value);
             if ace != self.value {

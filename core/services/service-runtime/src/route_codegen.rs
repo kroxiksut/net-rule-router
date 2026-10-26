@@ -329,7 +329,8 @@ pub fn generate_secondary_routes(
         ownership,
         app_observations,
         secondary_rules,
-    );
+    )
+    .with_declined(denied);
 
     for rule in secondary_rules.rules() {
         if !rule.enabled {
@@ -386,11 +387,6 @@ pub fn generate_secondary_routes(
                 continue;
             }
             for (ip, reason) in destinations.refused {
-                // Declined by the shared-address policy is reported by that
-                // policy, not here.
-                if denied.contains(&ip) {
-                    continue;
-                }
                 out.diagnostics.push(match reason {
                     // The other link's rules already claim this address, by
                     // name or by literal. An app rule learns its destinations
@@ -418,15 +414,12 @@ pub fn generate_secondary_routes(
                             ip,
                         }
                     }
+                    // The shared-address policy reports its own.
+                    AppDestinationRefusal::DeclinedShared => continue,
                 });
             }
             let mut per_rule = 0usize;
             for ip in destinations.admitted {
-                // Shared with a direct destination and declined by policy —
-                // dropped from the route exactly as it is from the filter set.
-                if denied.contains(&ip) {
-                    continue;
-                }
                 // App observations are IPv4: nothing records a v6 destination
                 // for a process yet.
                 if !push_route(IpAddr::V4(ip), target, &mut seen, &mut out, &mut per_rule) {

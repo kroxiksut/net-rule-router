@@ -1,0 +1,107 @@
+{
+  "description": "pure.js connTraceLearnedRoutes: a connection NetRuleRouter held, followed within 10 s by the same program reaching the same address over the additional route, is paired with the earliest such success; a block with no success, a success much later, a rule's block and a foreign block are never paired",
+  "cases": [
+    {
+      "name": "a hold then a tunnel success of the same program and address pair up, newest first as the service sends them",
+      "input": {
+        "rows": [
+          { "process": "claude.exe", "process_path": "C:\\Apps\\claude.exe", "remote": "160.79.104.10:443", "verdict": "permit", "blocked_by": "", "block_reason": "", "egress_role": "secondary", "observed_at_ms": 1003000 },
+          { "process": "claude.exe", "process_path": "C:\\Apps\\claude.exe", "remote": "160.79.104.10:443", "verdict": "block", "blocked_by": "netrulerouter", "block_reason": "route-unavailable", "egress_role": "primary", "observed_at_ms": 1000000 }
+        ]
+      },
+      "expected": [ { "held": 1, "routed": 0 } ]
+    },
+    {
+      "name": "a block with no success after it stays a block",
+      "input": {
+        "rows": [
+          { "process": "claude.exe", "process_path": "C:\\Apps\\claude.exe", "remote": "160.79.104.10:443", "verdict": "block", "blocked_by": "netrulerouter", "block_reason": "route-unavailable", "egress_role": "primary", "observed_at_ms": 1000000 },
+          { "process": "claude.exe", "process_path": "C:\\Apps\\claude.exe", "remote": "160.79.104.10:443", "verdict": "permit", "blocked_by": "", "block_reason": "", "egress_role": "primary", "observed_at_ms": 1002000 },
+          { "process": "claude.exe", "process_path": "C:\\Apps\\claude.exe", "remote": "160.79.104.11:443", "verdict": "permit", "blocked_by": "", "block_reason": "", "egress_role": "secondary", "observed_at_ms": 1002000 },
+          { "process": "other.exe", "process_path": "C:\\Apps\\other.exe", "remote": "160.79.104.10:443", "verdict": "permit", "blocked_by": "", "block_reason": "", "egress_role": "secondary", "observed_at_ms": 1002000 }
+        ]
+      },
+      "expected": []
+    },
+    {
+      "name": "a success much later leaves two rows; a success before the block does not explain it",
+      "input": {
+        "rows": [
+          { "process": "claude.exe", "process_path": "C:\\Apps\\claude.exe", "remote": "160.79.104.10:443", "verdict": "permit", "blocked_by": "", "block_reason": "", "egress_role": "secondary", "observed_at_ms": 1060000 },
+          { "process": "claude.exe", "process_path": "C:\\Apps\\claude.exe", "remote": "160.79.104.10:443", "verdict": "block", "blocked_by": "netrulerouter", "block_reason": "route-unavailable", "egress_role": "primary", "observed_at_ms": 1000000 },
+          { "process": "claude.exe", "process_path": "C:\\Apps\\claude.exe", "remote": "160.79.104.10:443", "verdict": "permit", "blocked_by": "", "block_reason": "", "egress_role": "secondary", "observed_at_ms": 999000 }
+        ]
+      },
+      "expected": []
+    },
+    {
+      "name": "the user's own block rule and a foreign firewall are never folded",
+      "input": {
+        "rows": [
+          { "process": "claude.exe", "process_path": "C:\\Apps\\claude.exe", "remote": "160.79.104.10:443", "verdict": "block", "blocked_by": "netrulerouter", "block_reason": "blocked-by-rule", "egress_role": "primary", "observed_at_ms": 1000000 },
+          { "process": "claude.exe", "process_path": "C:\\Apps\\claude.exe", "remote": "160.79.104.10:443", "verdict": "block", "blocked_by": "other", "block_reason": "", "egress_role": "primary", "observed_at_ms": 1000500 },
+          { "process": "claude.exe", "process_path": "C:\\Apps\\claude.exe", "remote": "160.79.104.10:443", "verdict": "permit", "blocked_by": "", "block_reason": "", "egress_role": "secondary", "observed_at_ms": 1001000 }
+        ]
+      },
+      "expected": []
+    },
+    {
+      "name": "several holds share the earliest success; another port and protocol of the same address still count; the edge of the window is inside",
+      "input": {
+        "rows": [
+          { "process": "claude.exe", "process_path": "C:\\Apps\\claude.exe", "remote": "160.79.104.10:80", "verdict": "block", "blocked_by": "netrulerouter", "block_reason": "unattributed", "egress_role": "primary", "observed_at_ms": 1000000 },
+          { "process": "claude.exe", "process_path": "C:\\Apps\\claude.exe", "remote": "160.79.104.10:443", "verdict": "block", "blocked_by": "netrulerouter", "block_reason": "route-unavailable", "egress_role": "primary", "observed_at_ms": 1004000 },
+          { "process": "claude.exe", "process_path": "C:\\Apps\\claude.exe", "remote": "160.79.104.10:443", "verdict": "permit", "blocked_by": "", "block_reason": "", "egress_role": "secondary", "observed_at_ms": 1012000 },
+          { "process": "claude.exe", "process_path": "C:\\Apps\\claude.exe", "remote": "160.79.104.10:443", "verdict": "permit", "blocked_by": "", "block_reason": "", "egress_role": "secondary", "observed_at_ms": 1010000 }
+        ]
+      },
+      "expected": [ { "held": 0, "routed": 3 }, { "held": 1, "routed": 3 } ]
+    },
+    {
+      "name": "a success at the same instant pairs, one past the window does not",
+      "input": {
+        "rows": [
+          { "process": "a.exe", "process_path": "/opt/a/a", "remote": "[2001:db8::1]:443", "verdict": "block", "blocked_by": "netrulerouter", "block_reason": "", "egress_role": "primary", "observed_at_ms": 5000 },
+          { "process": "a.exe", "process_path": "/opt/a/a", "remote": "[2001:db8::1]:443", "verdict": "permit", "blocked_by": "", "block_reason": "", "egress_role": "secondary", "observed_at_ms": 5000 },
+          { "process": "b.exe", "process_path": "", "remote": "198.51.100.7:443", "verdict": "block", "blocked_by": "netrulerouter", "block_reason": "route-unavailable", "egress_role": "primary", "observed_at_ms": 7000 },
+          { "process": "b.exe", "process_path": "", "remote": "198.51.100.7:443", "verdict": "permit", "blocked_by": "", "block_reason": "", "egress_role": "secondary", "observed_at_ms": 17001 }
+        ]
+      },
+      "expected": [ { "held": 0, "routed": 1 } ]
+    },
+    {
+      "name": "an unknown program, an unknown time or an empty address proves nothing",
+      "input": {
+        "rows": [
+          { "process": "?", "process_path": "", "remote": "198.51.100.7:443", "verdict": "block", "blocked_by": "netrulerouter", "block_reason": "route-unavailable", "egress_role": "primary", "observed_at_ms": 7000 },
+          { "process": "?", "process_path": "", "remote": "198.51.100.7:443", "verdict": "permit", "blocked_by": "", "block_reason": "", "egress_role": "secondary", "observed_at_ms": 7500 },
+          { "process": "c.exe", "process_path": "C:\\c.exe", "remote": "198.51.100.8:443", "verdict": "block", "blocked_by": "netrulerouter", "block_reason": "route-unavailable", "egress_role": "primary", "observed_at_ms": 0 },
+          { "process": "c.exe", "process_path": "C:\\c.exe", "remote": "198.51.100.8:443", "verdict": "permit", "blocked_by": "", "block_reason": "", "egress_role": "secondary", "observed_at_ms": 100 },
+          { "process": "d.exe", "process_path": "C:\\d.exe", "remote": "", "verdict": "block", "blocked_by": "netrulerouter", "block_reason": "route-unavailable", "egress_role": "primary", "observed_at_ms": 7000 },
+          { "process": "d.exe", "process_path": "C:\\d.exe", "remote": "", "verdict": "permit", "blocked_by": "", "block_reason": "", "egress_role": "secondary", "observed_at_ms": 7100 }
+        ]
+      },
+      "expected": []
+    },
+    {
+      "name": "two programs of one name in different folders are different programs",
+      "input": {
+        "rows": [
+          { "process": "app.exe", "process_path": "C:\\A\\app.exe", "remote": "198.51.100.9:443", "verdict": "block", "blocked_by": "netrulerouter", "block_reason": "route-unavailable", "egress_role": "primary", "observed_at_ms": 7000 },
+          { "process": "app.exe", "process_path": "C:\\B\\app.exe", "remote": "198.51.100.9:443", "verdict": "permit", "blocked_by": "", "block_reason": "", "egress_role": "secondary", "observed_at_ms": 7500 }
+        ]
+      },
+      "expected": []
+    },
+    {
+      "name": "a bare address and one spaced around read as the same destination; an empty list pairs nothing",
+      "input": {
+        "rows": [
+          { "process": "e.exe", "process_path": "", "remote": " 198.51.100.10 ", "verdict": "block", "blocked_by": "netrulerouter", "block_reason": "route-unavailable", "egress_role": "primary", "observed_at_ms": 7000 },
+          { "process": "e.exe", "process_path": "", "remote": "198.51.100.10:443", "verdict": "permit", "blocked_by": "", "block_reason": "", "egress_role": "secondary", "observed_at_ms": 7200 }
+        ]
+      },
+      "expected": [ { "held": 0, "routed": 1 } ]
+    }
+  ]
+}

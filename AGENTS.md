@@ -133,7 +133,7 @@ Evaluation order, first match wins (a literal-IP Block vetoes every route on its
 2. Subdomain / suffix — longest base domain first
 3. Exact IP — beats any network containing it
 4. Subnet / IP range — between networks the longer prefix wins; an identical network on both routes is an error
-5. Zone — TLD or internal domain suffix (e.g. `.ru`, `.com`, `.intra`); hostname must end with `.{zone_name}`; anything named inside it wins
+5. Zone — TLD or internal domain suffix (e.g. `.ru`, `.com`, `.intra`); hostname must end with `.{zone_name}`; anything named inside it wins. A zone of several labels (`corp.example.com`) ranks at tier 2 as a suffix without its apex (`zone_ranks_as_suffix`)
 6. Application
 7. Default route
 
@@ -153,6 +153,7 @@ Enforcement is GENERATED from the rule book (codegen + the address-ownership arb
 - **A security gate never trusts state an attacker can write.** Anything that relaxes an integrity check (a key reset awaiting acknowledgement, say) rests on state protected like the secret it guards — the re-sign marker sits beside the signing key — never on an unsigned DB row such as an "alert active" flag.
 - **A state-changing IPC operation is validated before it is audited.** Its handler is a `CheckedIpcHandler` registered with `register_checked`: `precheck` decodes and validates, the router audits only an accepted request, and `execute` sees only the checked value. `ipc_handlers_test.rs` holds every mutating operation to this.
 - **Never execute a path received over IPC.** A privileged process runs only binaries it locates itself (the broker: its own sibling); a path from the wire is at most a hint that must agree. Check-then-run leaves a junction-swap window.
+- **A file is checked and used through one handle.** Whatever a trust check judges — who owns a file, who may change it or its folder, whether it is a link — it judges on the handle that is then run or read, opened without following links; reopening the path afterwards reads whatever a rename or a junction put there in between, whether the file is executed or only read. A check that answers yes or no for a path and leaves the caller to open it is a defect: it returns the opened file or a refusal. Where nothing can be held open (a path registered with the service manager), the answer lasts only because the folder is one that administrators alone can change, and that is what gets checked.
 - **Structure outranks names.** A link the user bound, or the sole holder of a default route in its address family, is never a foreign tunnel exempt from block-all, whatever it is called (PPPoE and mobile broadband are uplinks). `route_coordinator/exemptions.rs::foreign_tunnel_indexes` is the one definition.
 - **Connection resets are owner-scoped.** After a rule change only the rule owner's own flows are torn down. Never reset by address alone: that hits other users and CDN neighbours. One definition: `routed_host_flow_refresh.rs`.
 - **Application patterns go through `nrr_shared::glob::glob_match`.** `*` is the only wildcard, `?` is literal; a second matcher is a second opinion the codegen does not share.

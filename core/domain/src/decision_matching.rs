@@ -156,6 +156,17 @@ pub fn match_zone(hostname: &str, zone_name: &str) -> bool {
     hostname.as_bytes()[boundary] == b'.' && hostname[boundary + 1..].eq(zone_name)
 }
 
+/// Whether a zone rule ranks with the subdomain rules rather than below every
+/// address. A zone of several labels (`corp.example.com`) is one site's subtree,
+/// a subdomain rule without its apex, so it beats a wider suffix and an exact
+/// IP; only a single-label zone (`ru`, `intra`) is the widest claim there is.
+///
+/// The one definition the engine, the address arbiter and every planner read.
+#[must_use]
+pub fn zone_ranks_as_suffix(zone_name: &str) -> bool {
+    zone_name.contains('.')
+}
+
 // ── match_suffix_domain ───────────────────────────────────────────────────────
 
 /// Returns `true` if `hostname` is covered by the `SuffixDomain(label)` rule

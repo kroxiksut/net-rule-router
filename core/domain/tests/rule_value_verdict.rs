@@ -6,7 +6,9 @@
 #![allow(clippy::expect_used, clippy::panic)]
 
 use nrr_domain::canonical::CanonicalAddressMatch;
-use nrr_domain::preset_canonicalize::{canonicalize_preset_rules, PresetRulesCanonicalizeOutcome};
+use nrr_domain::preset_canonicalize::{
+    canonicalize_preset_rules, preset_rules_kept_aside, PresetRulesCanonicalizeOutcome,
+};
 use nrr_domain::rule_value_validation::{
     drop_rules_refused_outright, rules_with_refused_values, validate_rule_value, RefusedRuleValue,
 };
@@ -298,6 +300,16 @@ fn the_service_refuses_exactly_the_rows_the_table_marks_as_errors() {
             value: value.to_string(),
         })
         .collect();
+    // A value no book may apply is not refused: it is kept and shown as not
+    // working.
+    let outright: Vec<String> = drop_rules_refused_outright(&mut submitted.clone())
+        .into_iter()
+        .map(|r| r.rule_id)
+        .collect();
+    let expected: Vec<RefusedRuleValue> = expected
+        .into_iter()
+        .filter(|r| !outright.contains(&r.rule_id))
+        .collect();
     assert!(!expected.is_empty());
     assert_eq!(rules_with_refused_values(&submitted, None), expected);
 }
@@ -360,11 +372,11 @@ fn the_address_class_is_named_in_the_verdict() {
     }
 }
 
-/// A stored book with a rule on no destination loads without exactly that
-/// rule, and saving what was read does not bring it back.
+/// A stored book with a rule on no destination loads; that rule is kept aside,
+/// never applied, and saving what was read keeps it.
 #[test]
-fn a_stored_book_drops_its_rules_on_no_destination_and_keeps_the_rest() {
-    let mut stored = CanonicalRulesJsonV1 {
+fn a_stored_book_keeps_its_rules_on_no_destination_aside() {
+    let stored = CanonicalRulesJsonV1 {
         schema_version: RULES_JSON_SCHEMA_VERSION,
         primary: vec![
             wire_rule("r-1", "exact-ip", "203.0.113.7"),
@@ -376,24 +388,7 @@ fn a_stored_book_drops_its_rules_on_no_destination_and_keeps_the_rest() {
             wire_rule("r-5", "exact-ip", "::"),
         ],
     };
-    // Unread, the book cannot be decoded: the decoder refuses the address.
-    assert!(decode(stored.clone(), HostPlatform::Windows).is_err());
-
-    let dropped = drop_rules_refused_outright(&mut stored);
-    assert_eq!(
-        dropped,
-        vec![
-            RefusedRuleValue {
-                rule_id: "r-2".into(),
-                value: "255.255.255.255".into(),
-            },
-            RefusedRuleValue {
-                rule_id: "r-5".into(),
-                value: "::".into(),
-            },
-        ]
-    );
-    let read = decode(stored, HostPlatform::Windows).expect("the rest loads");
+    let read = decode(stored, HostPlatform::Windows).expect("the book loads");
     let ids = |set: &nrr_domain::canonical::CanonicalRuleSet| -> Vec<String> {
         set.rules()
             .iter()
@@ -404,21 +399,22 @@ fn a_stored_book_drops_its_rules_on_no_destination_and_keeps_the_rest() {
     primary.sort();
     assert_eq!(primary, ["r-1", "r-3"]);
     assert_eq!(ids(&read.rule_book.secondary), ["r-4"]);
+    let kept = |rules: &[RuleDto]| rules.iter().map(|r| r.id.clone()).collect::<Vec<_>>();
+    assert_eq!(kept(&read.inactive.primary), ["r-2"]);
+    assert_eq!(kept(&read.inactive.secondary), ["r-5"]);
 
-    // Saved as read, then read again: nothing to drop, nothing came back.
-    let mut saved = encode(&read);
-    assert!(drop_rules_refused_outright(&mut saved).is_empty());
-    assert_eq!(saved.primary.len() + saved.secondary.len(), 3);
+    let saved = encode(&read);
+    assert_eq!(saved.primary.len() + saved.secondary.len(), 5);
     assert_eq!(decode(saved, HostPlatform::Windows).expect("decode"), read);
 }
 
 /// An application value the pipeline refuses (too long, a control character
-/// other than tab, the bare `*`) in a stored book is dropped the same way, the
-/// rest loads, and saving what was read does not bring it back.
+/// other than tab, the bare `*`) in a stored book is kept aside the same way,
+/// and saving what was read keeps it.
 #[test]
-fn a_stored_book_drops_its_refused_application_rows_and_keeps_the_rest() {
+fn a_stored_book_keeps_its_refused_application_rows_aside() {
     let long = format!("{}.exe", "a".repeat(300));
-    let mut stored = CanonicalRulesJsonV1 {
+    let stored = CanonicalRulesJsonV1 {
         schema_version: RULES_JSON_SCHEMA_VERSION,
         primary: vec![
             wire_rule("r-1", "application", "chrome.exe"),
@@ -431,58 +427,77 @@ fn a_stored_book_drops_its_refused_application_rows_and_keeps_the_rest() {
             wire_rule("r-6", "application", "chrome*.exe"),
         ],
     };
-    assert!(decode(stored.clone(), HostPlatform::Windows).is_err());
-
-    let dropped = drop_rules_refused_outright(&mut stored);
-    assert_eq!(
-        refused_ids(dropped.clone()),
-        ["r-2", "r-3", "r-5"].map(String::from)
-    );
-    assert_eq!(dropped[0].value, long);
-    let read = decode(stored, HostPlatform::Windows).expect("the rest loads");
+    let read = decode(stored, HostPlatform::Windows).expect("the book loads");
     assert_eq!(
         read.rule_book.primary.rules().len() + read.rule_book.secondary.rules().len(),
         3
     );
+    let kept: Vec<&str> = read
+        .inactive
+        .primary
+        .iter()
+        .chain(&read.inactive.secondary)
+        .map(|r| r.id.as_str())
+        .collect();
+    assert_eq!(kept, ["r-2", "r-3", "r-5"]);
 
-    let mut saved = encode(&read);
-    assert!(drop_rules_refused_outright(&mut saved).is_empty());
+    let saved = encode(&read);
+    assert_eq!(saved.primary.len() + saved.secondary.len(), 6);
     assert_eq!(decode(saved, HostPlatform::Windows).expect("decode"), read);
 }
 
-/// Reading the book in force dropped a refused application row, so it is
-/// never spared: resubmitting it is a new value.
+/// A value no book may apply is never refused at the gate, new or not: it is
+/// kept and shown as not working. Any other refused value still is, unless
+/// the book in force holds it.
 #[test]
-fn a_refused_application_in_force_is_not_spared() {
+fn a_value_no_book_may_apply_is_kept_rather_than_refused() {
     let long = format!("{}.exe", "a".repeat(300));
-    let carried = book(vec![
+    let submitted = book(vec![
         wire_rule("r-0000", "application", &long),
-        wire_rule("r-0001", "domain", "192.168.1.1"),
+        wire_rule("r-0001", "exact-ip", "255.255.255.255"),
+        wire_rule("r-0002", "domain", "192.168.1.1"),
     ]);
     assert_eq!(
-        rules_with_refused_values(&carried, Some(&carried)),
-        vec![RefusedRuleValue {
-            rule_id: "r-0000".into(),
-            value: long,
-        }]
+        refused_ids(rules_with_refused_values(&submitted, None)),
+        ["r-0002".to_string()]
     );
+    assert!(rules_with_refused_values(&submitted, Some(&submitted)).is_empty());
 }
 
-/// The book in force spares an old refused value, but never a rule on no
-/// destination: reading that book dropped it, so resubmitting it is new.
+/// What the import leaves out of the set is handed back as the user wrote it,
+/// to be kept aside and shown as not working rather than lost.
 #[test]
-fn a_rule_on_no_destination_in_force_is_not_spared() {
-    let carried = book(vec![
-        wire_rule("r-0000", "exact-ip", "255.255.255.255"),
-        wire_rule("r-0001", "domain", "192.168.1.1"),
-    ]);
+fn a_rules_file_import_keeps_the_rules_it_cannot_apply() {
+    let long = format!("{}.exe", "a".repeat(300));
+    let parsed = parse_rules_file(&format!(
+        "--- IP
+203.0.113.7
+255.255.255.255 # bcast
+--- Windows
+chrome.exe
+*
+{long}
+"
+    ));
+    let outcome =
+        canonicalize_preset_rules(&parsed, RouteRole::Primary, HostPlatform::Windows, false);
+    assert_eq!(outcome.rule_set().expect("imports").rules().len(), 2);
+    let kept = preset_rules_kept_aside(&parsed, HostPlatform::Windows, false, outcome.warnings());
+    let values: Vec<String> = kept
+        .iter()
+        .flat_map(|r| nrr_domain::rule_value_validation::wire_rule_values(r).map(|(_, v)| v))
+        .collect();
     assert_eq!(
-        rules_with_refused_values(&carried, Some(&carried)),
-        vec![RefusedRuleValue {
-            rule_id: "r-0000".into(),
-            value: "255.255.255.255".into(),
-        }]
+        values,
+        ["255.255.255.255".to_string(), "*".to_string(), long]
     );
+    assert_eq!(kept[0].comment, "bcast");
+    let mut stored = CanonicalRulesJsonV1 {
+        schema_version: RULES_JSON_SCHEMA_VERSION,
+        primary: kept,
+        secondary: vec![],
+    };
+    assert_eq!(drop_rules_refused_outright(&mut stored).len(), 3);
 }
 
 /// A rules file is stored data too: the rule is dropped with a warning, the
@@ -575,4 +590,26 @@ fn a_children_flag_is_warned_as_not_in_effect() {
         !nrr_domain::rule_value_validation::validate_rule_value("application", "codex.exe")
             .is_warning()
     );
+}
+
+/// The form says a network or a range of one address is kept as that IP
+/// address, so the type the table shows after saving is no surprise.
+#[test]
+fn one_address_written_as_a_network_is_said_to_be_kept_as_an_ip() {
+    for (rule_type, value) in [
+        ("subnet", "192.0.2.7/32"),
+        ("ip-range", "192.0.2.7-192.0.2.7"),
+    ] {
+        let verdict = validate_rule_value(rule_type, value);
+        assert!(verdict.is_warning(), "{rule_type} {value}: {verdict:?}");
+        assert_eq!(
+            verdict.message_key(),
+            "rules.validation.match-value-warning.single-address"
+        );
+        assert_eq!(
+            verdict.args().get("address").map(String::as_str),
+            Some("192.0.2.7")
+        );
+    }
+    assert!(!validate_rule_value("subnet", "192.0.2.0/31").is_warning());
 }

@@ -12,7 +12,9 @@
 //! system location (Linux) never asks.
 
 use std::io::Read;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+
+use crate::service_control::ServiceStatusReport;
 
 /// Whether this install registers a protected copy rather than the binary it
 /// was given. A development build registers its build output in place: that is
@@ -105,6 +107,92 @@ pub fn same_stream(mut a: impl Read, mut b: impl Read) -> std::io::Result<bool> 
         if n == 0 {
             return Ok(true);
         }
+    }
+}
+
+/// How the registered service stands against the one shipped beside a client:
+/// the window and the terminal tell the user the same thing from it.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct RegistrationCheck {
+    /// What the service manager starts, when it says.
+    pub registered_path: Option<PathBuf>,
+    /// The service binary shipped with this client, when it is there.
+    pub expected_path: Option<PathBuf>,
+    /// The manager starts another binary than the shipped one.
+    pub registered_elsewhere: bool,
+    /// The registered file was replaced after its process started, so the
+    /// previous build is what runs.
+    pub binary_replaced: bool,
+}
+
+impl RegistrationCheck {
+    /// Unprivileged, and answerable with the service stopped.
+    #[must_use]
+    pub fn of(report: Option<&ServiceStatusReport>, expected: Option<&Path>) -> Self {
+        let registered = report
+            .and_then(|r| r.binary_path.clone())
+            .filter(|p| !p.as_os_str().is_empty());
+        let registered_elsewhere = match (registered.as_deref(), expected) {
+            (Some(registered), Some(expected)) => registered_elsewhere(registered, expected),
+            _ => false,
+        };
+        // An update written over the same folder changes neither the
+        // registration nor the version string, yet the process still runs
+        // the code it loaded before.
+        let binary_replaced = report
+            .and_then(binary_is_newer_than_process)
+            .unwrap_or(false);
+        Self {
+            registered_path: registered,
+            expected_path: expected.map(Path::to_path_buf),
+            registered_elsewhere,
+            binary_replaced,
+        }
+    }
+
+    /// The registration is right and only a restart runs the update.
+    #[must_use]
+    pub fn restart_needed(&self) -> bool {
+        self.binary_replaced && !self.registered_elsewhere
+    }
+}
+
+/// Whether the registered binary on disk is newer than the process running
+/// from it. `None` whenever that cannot be established (service stopped, no
+/// start time from the OS, unreadable file): "unknown" must never become a
+/// prompt telling the user their service is stale.
+#[must_use]
+pub fn binary_is_newer_than_process(report: &ServiceStatusReport) -> Option<bool> {
+    let started = report.running_since?;
+    let path = report.binary_path.as_ref()?;
+    let modified = std::fs::metadata(path).ok()?.modified().ok()?;
+    // A second of slack: the file timestamp and the process clock come from
+    // different sources, and a start that races its own binary's write would
+    // otherwise report itself stale.
+    Some(modified > started + std::time::Duration::from_secs(1))
+}
+
+/// Whether the service manager starts another binary than `expected`. A
+/// byte-identical copy is this binary: an install from a folder ordinary
+/// accounts can change registers exactly such a copy, and offering to
+/// "update" it would only write the same copy again.
+#[must_use]
+pub fn registered_elsewhere(registered: &Path, expected: &Path) -> bool {
+    !same_path(registered, expected) && !same_contents(registered, expected)
+}
+
+/// Case- and spelling-insensitive path comparison. Canonicalisation resolves
+/// `\\?\` prefixes, 8.3 names and links; a path that cannot be canonicalised
+/// falls back to a plain case-insensitive compare.
+fn same_path(left: &Path, right: &Path) -> bool {
+    match (
+        std::fs::canonicalize(left).ok(),
+        std::fs::canonicalize(right).ok(),
+    ) {
+        (Some(a), Some(b)) => a == b,
+        _ => left
+            .to_string_lossy()
+            .eq_ignore_ascii_case(&right.to_string_lossy()),
     }
 }
 
@@ -210,5 +298,68 @@ mod tests {
         assert!(same_contents(&a, &b));
         assert!(!same_contents(&a, &c));
         assert!(!same_contents(&a, &dir.path().join("missing")));
+    }
+
+    #[test]
+    fn a_protected_copy_of_our_own_service_is_not_registered_elsewhere() {
+        let shipped_dir = tempfile::tempdir().expect("shipped dir");
+        let copy_dir = tempfile::tempdir().expect("copy dir");
+        let shipped = shipped_dir.path().join("service.bin");
+        let copy = copy_dir.path().join("service.bin");
+        std::fs::write(&shipped, b"this build").expect("shipped");
+        std::fs::write(&copy, b"this build").expect("copy");
+        assert!(!registered_elsewhere(&copy, &shipped));
+        assert!(!registered_elsewhere(&shipped, &shipped));
+
+        std::fs::write(&copy, b"an older build").expect("older copy");
+        assert!(registered_elsewhere(&copy, &shipped));
+        assert!(
+            registered_elsewhere(&copy_dir.path().join("gone.bin"), &shipped),
+            "a registered binary that cannot be read is not taken for ours"
+        );
+    }
+
+    fn report(path: &Path, running_since: Option<std::time::SystemTime>) -> ServiceStatusReport {
+        ServiceStatusReport {
+            run_state: crate::service_control::ServiceRunState::Running,
+            start_mode: None,
+            binary_path: Some(path.to_path_buf()),
+            running_since,
+        }
+    }
+
+    /// A file replaced after its process started asks for a restart; a
+    /// stopped service or a file written before the start never does, and a
+    /// registration elsewhere asks for re-registering instead.
+    #[test]
+    fn only_a_binary_replaced_under_a_running_process_asks_for_a_restart() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let registered = dir.path().join("service.bin");
+        std::fs::write(&registered, b"new build").expect("binary");
+        let long_ago = std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1);
+        let replaced = RegistrationCheck::of(Some(&report(&registered, Some(long_ago))), None);
+        assert!(replaced.binary_replaced && replaced.restart_needed());
+
+        let unknown = RegistrationCheck::of(Some(&report(&registered, None)), None);
+        assert!(
+            !unknown.binary_replaced,
+            "no start time is not a stale service"
+        );
+        let later = std::time::SystemTime::now() + std::time::Duration::from_secs(3600);
+        let fresh = RegistrationCheck::of(Some(&report(&registered, Some(later))), None);
+        assert!(!fresh.binary_replaced);
+
+        let shipped = dir.path().join("shipped.bin");
+        std::fs::write(&shipped, b"another build").expect("shipped");
+        let elsewhere =
+            RegistrationCheck::of(Some(&report(&registered, Some(long_ago))), Some(&shipped));
+        assert!(elsewhere.registered_elsewhere && !elsewhere.restart_needed());
+        assert_eq!(
+            elsewhere.registered_path.as_deref(),
+            Some(registered.as_path())
+        );
+        assert_eq!(elsewhere.expected_path.as_deref(), Some(shipped.as_path()));
+
+        assert!(!RegistrationCheck::of(None, Some(&shipped)).registered_elsewhere);
     }
 }

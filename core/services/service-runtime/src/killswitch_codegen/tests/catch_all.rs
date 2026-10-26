@@ -99,7 +99,6 @@ fn every_emitted_filter_is_expressible_at_its_layer() {
         primary_dest_ips: vec![ip(198, 51, 100, 200)],
         allow_dns_over_primary: true,
         dns_servers: Vec::new(),
-        known_direct_ips: vec![ip(203, 0, 113, 68)],
         probe_target_ips: vec![ip(10, 91, 192, 1)],
         secondary_luid: 0,
         guest_network_luids: Vec::new(),
@@ -684,7 +683,6 @@ fn the_user_less_layers_keep_the_networks_and_the_interface() {
         &[],
         &[],
         KillSwitchProtocols::ALL,
-        false,
     ));
     let networks = [
         foreign_net(FOREIGN, "10.77.0.0/16"),

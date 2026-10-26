@@ -420,6 +420,9 @@ pub(super) fn build_conn_trace_pair(
     // while the user sits on a routed site is the half-broken page. The name
     // comes from the recent-resolution memory the resolver already keeps — no
     // extra lookup, and an address nobody resolved is simply not reported.
+    let mut main_link_engine: Option<
+        nrr_service_runtime::conn_observation_consumer::MainLinkHealthHook,
+    > = None;
     if let Some(engine) = vpn_learning.auto_rules_engine {
         let recent = nrr_service_runtime::recent_rule_addresses::global_recent_rule_addresses();
         let engine_health = Arc::clone(engine);
@@ -453,48 +456,26 @@ pub(super) fn build_conn_trace_pair(
         }
         // How the host fares on the primary link. The offer is "move this into
         // the tunnel", so whether it already works without one is the fact that
-        // most changes the user's answer.
-        let sid_for_health = Arc::clone(active_sid);
-        // The same signal feeds two readers with different scopes. The engine
-        // keeps it only for hosts it already tracks as companion candidates and
-        // drops it for anything else; the registry keeps it for every named
-        // destination, which is the only record of "this host does not open"
-        // for a host nobody has a theory about yet.
-        let stalls = nrr_service_runtime::primary_stall_registry::global_primary_stalls();
-        let served = Arc::clone(&several_served);
-        consumer_builder = consumer_builder.with_companion_primary_health(Arc::new(
-            move |owner, hostname, stalled| {
-                let event = if stalled {
-                    nrr_domain::companion_affinity::PrimaryHealthEvent::Stalled
-                } else {
-                    nrr_domain::companion_affinity::PrimaryHealthEvent::Completed
-                };
-                let Some(sid) = suggestion_owner(owner, &sid_for_health, &served) else {
-                    return;
-                };
-                let report = stalls.note(&sid, hostname, event);
-                if let Some(report) = report.as_ref() {
-                    nrr_service_runtime::primary_stall_registry::log_report(report);
-                }
-                engine_health.note_primary_health(&sid, hostname, event);
+        // most changes the user's answer. The engine keeps it only for hosts it
+        // already tracks; the register below keeps it for every named host.
+        main_link_engine = Some(Arc::new(
+            move |health: nrr_service_runtime::conn_observation_consumer::MainLinkHealth<'_>| {
+                engine_health.note_primary_health(health.sid, health.hostname, health.event);
                 // A verdict that just turned to "stalls" is the product
-                // finding out, by measurement, that the main link will
-                // not carry this site. Offering the additional route is
-                // the whole point of having noticed. Only on the CHANGE:
-                // the registry stays silent while the verdict holds, so
-                // this cannot fire per packet.
-                if report.is_some_and(|r| {
+                // finding out, by measurement, that the main link will not
+                // carry this site. Only on the CHANGE: the register stays
+                // silent while the verdict holds.
+                if health.report.is_some_and(|r| {
                     r.behavior == nrr_domain::companion_affinity::PrimaryBehavior::Stalls
                 }) {
-                    // Evidence for the threshold, recorded exactly where the
-                    // offer is born: this is the moment the product decides a
-                    // host is worth asking about.
+                    // Evidence for the threshold, recorded where the offer is
+                    // born.
                     let reached = nrr_service_runtime::navigation_registry::global_navigation()
-                        .counts_of(owner, hostname);
-                    nrr_service_runtime::navigation_registry::log_counts(hostname, &reached);
+                        .counts_of(health.owner, health.hostname);
+                    nrr_service_runtime::navigation_registry::log_counts(health.hostname, &reached);
                     engine_health.note_main_link_blocked_host(
-                        &sid,
-                        hostname,
+                        health.sid,
+                        health.hostname,
                         reached,
                         std::time::SystemTime::now(),
                     );
@@ -586,14 +567,30 @@ pub(super) fn build_conn_trace_pair(
                 },
             ));
         }
-        // Names for the hosts the rule index cannot name. Health-only: a
-        // rule-less name may say how a host fares, never bring it into
-        // companion discovery.
-        consumer_builder = consumer_builder.with_health_name_fallback({
-            let observed = nrr_service_runtime::observed_host_names::global_observed_host_names();
-            Arc::new(move |ip| observed.lookup(ip))
-        });
     }
+    // Stage 0, whether or not the suggestions engine runs: hosts whose
+    // connections stall on the main link are named from what the service
+    // already remembers and filed in the stall register the diagnostics read.
+    // A rule-less name may say how a host fares, never bring it into
+    // companion discovery.
+    consumer_builder = consumer_builder.with_main_link_diagnostics(
+        nrr_service_runtime::conn_observation_consumer::MainLinkDiagnostics {
+            rule_host_names: {
+                let recent =
+                    nrr_service_runtime::recent_rule_addresses::global_recent_rule_addresses();
+                Arc::new(move |ip| recent.lookup(ip))
+            },
+            observed_names: {
+                let observed =
+                    nrr_service_runtime::observed_host_names::global_observed_host_names();
+                Arc::new(move |ip| observed.lookup(ip))
+            },
+            routing: Arc::clone(active_sid),
+            several_served: Arc::clone(&several_served),
+            stalls: nrr_service_runtime::primary_stall_registry::global_primary_stalls(),
+            engine: main_link_engine,
+        },
+    );
     // Block-notice reporting: the observer decides which OUR drops are
     // notice-worthy (see `conn_observation_consumer::block_reason_for`); the
     // center folds them into episodes and logs the survivors. Always wired —

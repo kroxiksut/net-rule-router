@@ -113,6 +113,50 @@ pub fn classify_section_lenient(name: &str) -> Option<ParsedRuleType> {
     }
 }
 
+/// `true` for the application section of an OS other than the one running:
+/// its rules ride through a write as passthrough text and apply only there.
+pub fn is_other_os_app_section(name: &str) -> bool {
+    app_section_os_label(name).is_some() && classify_section_lenient(name).is_none()
+}
+
+/// How the OS of an application section is named to the user, whatever case
+/// the file spells it in; `None` for any other section.
+pub fn app_section_os_label(name: &str) -> Option<&'static str> {
+    match name.to_ascii_lowercase().as_str() {
+        "windows" => Some("Windows"),
+        "linux" => Some("Linux"),
+        "macos" => Some("macOS"),
+        _ => None,
+    }
+}
+
+/// The rules of another OS's application section, read from its passthrough
+/// text so a table can show them. Display only: the text itself is what a
+/// write carries. Empty for any other section.
+pub fn other_os_app_rules(section_name: &str, raw_text: &str) -> Vec<ParsedRule> {
+    if !is_other_os_app_section(section_name) {
+        return Vec::new();
+    }
+    let mut rules: Vec<ParsedRule> = Vec::new();
+    for (idx, raw_line) in raw_text.split('\n').enumerate() {
+        let line = raw_line.strip_suffix('\r').unwrap_or(raw_line);
+        if is_syntax_hint_line(line) {
+            continue;
+        }
+        let id_hint = u32::try_from(rules.len() + 1).unwrap_or(u32::MAX);
+        if let Some(rule) = parse_rule_line(
+            line,
+            ParsedRuleType::Application,
+            section_name,
+            id_hint,
+            idx + 1,
+        ) {
+            rules.push(rule);
+        }
+    }
+    rules
+}
+
 /// `true` when a section name denotes the app-authored section, whose entries
 /// carry a structured provenance comment. Case-insensitive, matching
 /// [`classify_section_lenient`].

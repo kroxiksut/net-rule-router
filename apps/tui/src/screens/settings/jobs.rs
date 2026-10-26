@@ -10,7 +10,9 @@ use nrr_client_logic::review::{operation_outcome, Outcome};
 use nrr_client_logic::rollback::{rollback_verdict, RollbackPhase};
 use nrr_client_logic::{doh_resolvers, route_policy, stability};
 use nrr_ipc_client::{ipc_operation_timeout, IpcClient};
+use nrr_platform_api::console_path;
 use nrr_platform_api::service_control::ServiceControlError;
+use nrr_platform_api::service_placement::RegistrationCheck;
 use nrr_shared::ipc::IpcOperationName as Op;
 use nrr_shared::ipc_payloads::{
     ApplyFailurePolicyDto, BlockNoticeMuteDto, BlockNoticeMuteScopeDto,
@@ -284,7 +286,12 @@ pub fn write_local_networks(decisions: Vec<(String, bool)>, forget: Vec<String>)
 pub fn load_stability() -> Job {
     job(|client| {
         let result = loaded(call(client, Op::ServiceStabilityConfigGet, json!({})).map(object));
-        Reply::new(move |app| app.settings.data.stability = result)
+        Reply::new(move |app| {
+            if let Loadable::Ready(config) = &result {
+                crate::screens::rules::adopt_edit_permission(app, config);
+            }
+            app.settings.data.stability = result;
+        })
     })
 }
 
@@ -440,10 +447,90 @@ fn query_service(probe: RegistrationProbe) -> Result<ServiceInfo, Failure> {
 
 /// Asks the service manager, not the service: the question matters most when
 /// the service does not answer.
-pub fn load_service(probe: RegistrationProbe) -> Job {
-    job(move |_| {
+pub fn load_service(probe: RegistrationProbe, expected: Option<std::path::PathBuf>) -> Job {
+    job(move |client| {
         let result = loaded(query_service(probe));
-        Reply::new(move |app| app.settings.data.service = result)
+        let check = service_check(&result, expected.as_deref(), client);
+        let logs_folder = nrr_platform_api::paths::logs_folder_to_show();
+        Reply::new(move |app| {
+            let data = &mut app.settings.data;
+            data.service = result;
+            data.service_check = check;
+            data.logs_folder = Loadable::Ready(logs_folder);
+        })
+    })
+}
+
+/// Whether the registered service is the one shipped beside this terminal,
+/// and whether it runs an older build than this one, by the version it
+/// reported on connecting.
+fn service_check(
+    info: &Loadable<ServiceInfo>,
+    expected: Option<&std::path::Path>,
+    client: &dyn IpcClient,
+) -> Option<super::ServiceCheck> {
+    let Loadable::Ready(ServiceInfo::Registered(report)) = info else {
+        return None;
+    };
+    let service_version = client
+        .negotiate_info()
+        .map(|info| info.service_version)
+        .unwrap_or_default();
+    Some(super::ServiceCheck {
+        registration: RegistrationCheck::of(Some(report), expected),
+        older: nrr_shared::version_order::version_is_newer(
+            env!("CARGO_PKG_VERSION"),
+            &service_version,
+        ),
+    })
+}
+
+pub fn load_console(port: super::ConsolePort) -> Job {
+    job(move |_| {
+        let result = port()
+            .and_then(|(port, directory)| console_path::state(port.as_ref(), &directory))
+            .map_err(Failure::detail);
+        Reply::new(move |app| app.settings.data.console = loaded(result))
+    })
+}
+
+/// Adds the console's folder to the user's PATH, or takes our entry off; the
+/// answer is told against what was there before, as the window tells it.
+pub fn console_path_change(port: super::ConsolePort, add: bool, was_present: bool) -> Job {
+    job(move |_| {
+        let result = port().and_then(|(port, directory)| {
+            if add {
+                console_path::register(port.as_ref(), &directory)
+            } else {
+                console_path::unregister(port.as_ref(), &directory)
+            }
+        });
+        Reply::new(move |app| {
+            let s = &mut app.settings;
+            match result {
+                Ok(state) => {
+                    s.data.console = Loadable::Ready(state);
+                    s.console_hint = add;
+                    s.done(Words::Key(match (add, was_present) {
+                        (true, true) => text::CONSOLE_ALREADY,
+                        (true, false) => text::CONSOLE_ADDED,
+                        (false, true) => text::CONSOLE_REMOVED,
+                        (false, false) => text::CONSOLE_NOT_PRESENT,
+                    }));
+                }
+                Err(detail) => s.say(
+                    Words::Join(vec![
+                        Words::Key(if add {
+                            text::CONSOLE_ADD_FAILED
+                        } else {
+                            text::CONSOLE_REMOVE_FAILED
+                        }),
+                        Words::Raw(format!(" {detail}")),
+                    ]),
+                    Some(StateTone::Bad),
+                ),
+            }
+        })
     })
 }
 
@@ -524,6 +611,7 @@ pub fn write_stability(partial: Map<String, Value>) -> Job {
             })
         })();
         written(result, Words::Key(text::SAVED), |app, config| {
+            crate::screens::rules::adopt_edit_permission(app, &config);
             app.settings.data.stability = Loadable::Ready(config);
         })
     })
@@ -788,6 +876,20 @@ pub fn rollback_run(token: String, target: RollbackTargetDto) -> Job {
 }
 
 /// Clears the operational logs only; the audit trail is never touched here.
+/// What clearing the logs would delete, asked of the service while the
+/// question is up; a dry run deletes nothing.
+pub fn preview_clear_logs() -> Job {
+    job(|client| {
+        let result = read::<LogsClearResponse>(
+            client,
+            Op::LogsClear,
+            json!({ "dry-run": true, "include-archives": false }),
+        )
+        .map(|answer| (answer.files_deleted, answer.bytes_freed));
+        Reply::new(move |app| app.settings.log_clear_preview = loaded(result))
+    })
+}
+
 pub fn clear_logs() -> Job {
     job(|client| {
         let result = read::<LogsClearResponse>(

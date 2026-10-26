@@ -32,6 +32,7 @@ fn under_root_the_rules_go_to_the_baseline_and_the_title_says_so() {
         correlation_id: "c".into(),
         admin_baseline,
         base_revision: None,
+        reset_to_baseline: false,
     };
     for baseline in [true, false] {
         let fake = FakeService::new(ConnectionStatus::Connected);
@@ -561,6 +562,18 @@ fn the_rules_filter_by_state_type_and_origin_and_sort_five_ways() {
     let text = screen_text(&app, ScreenId::Rules);
     assert!(text.contains("Auto-added only"), "{text}");
     answer(&mut app, &["u"]);
+
+    // The rules that do not work are kept and shown; `H` leaves them out and
+    // brings them back, and asking for the errors still finds them.
+    answer(&mut app, &["H"]);
+    assert_eq!(shown(&app).len(), 4);
+    assert!(!shown(&app).contains(&"not a host!".to_string()));
+    let text = screen_text(&app, ScreenId::Rules);
+    assert!(text.contains("rules that do not work are hidden"), "{text}");
+    answer(&mut app, &["E"]);
+    assert_eq!(shown(&app), ["not a host!"]);
+    answer(&mut app, &["S", "1", "H"]);
+    assert_eq!(shown(&app).len(), 5);
 
     answer(&mut app, &["O"]);
     assert_eq!(
@@ -1468,6 +1481,117 @@ old.example
         assert!(!written.contains("old.example"), "{written}");
     }
 
+    /// Another OS's programs and a section of a newer build sit in the bound
+    /// file, and this session imported nothing: the rewrite keeps them.
+    #[test]
+    fn an_apply_keeps_the_sections_this_build_does_not_apply() {
+        let dir = Scratch::new("apply-keeps-passthrough");
+        let (mut app, sets) = rules_with_settings(&dir, one_rule());
+        let file = app.rules.settings_file.clone().expect("settings file");
+        let set = sets.join("mine");
+        std::fs::create_dir_all(&set).expect("set");
+        super::super::own_settings::bind_written_set(&file, &set, None).expect("bind");
+        let primary = set.join("rules_primary.txt");
+        let other_os = if cfg!(target_os = "linux") {
+            "MacOS"
+        } else {
+            "Linux"
+        };
+        std::fs::write(
+            &primary,
+            format!("--- Domains\nold.example\n--- {other_os}\nfirefox\n# thunderbird\n--- Ports\n443\n"),
+        )
+        .expect("old file");
+        super::super::own_settings::note_written(&file, std::slice::from_ref(&primary))
+            .expect("note");
+
+        super::super::finished(
+            &mut app,
+            super::super::apply::Finished::Applied { base: None },
+        );
+
+        let written = std::fs::read_to_string(&primary).expect("bound file");
+        assert!(written.contains("example.com"), "{written}");
+        assert!(
+            written.contains(&format!("--- {other_os}\nfirefox\n# thunderbird\n")),
+            "another OS's rules were lost: {written}"
+        );
+        assert!(written.contains("--- Ports\n443\n"), "{written}");
+    }
+
+    /// Another system's section written twice in a bound file: the rewrite
+    /// after an apply keeps the programs of both copies, not only the last.
+    #[test]
+    fn an_apply_keeps_both_copies_of_a_section_written_twice() {
+        let dir = Scratch::new("apply-keeps-doubled");
+        let (mut app, sets) = rules_with_settings(&dir, one_rule());
+        let file = app.rules.settings_file.clone().expect("settings file");
+        let set = sets.join("mine");
+        std::fs::create_dir_all(&set).expect("set");
+        super::super::own_settings::bind_written_set(&file, &set, None).expect("bind");
+        let primary = set.join("rules_primary.txt");
+        std::fs::write(
+            &primary,
+            "--- Domains\nold.example\n--- MacOS\nfirst.app\n--- Domains\nmore.example\n\
+             --- MacOS\nsecond.app\n",
+        )
+        .expect("old file");
+        super::super::own_settings::note_written(&file, std::slice::from_ref(&primary))
+            .expect("note");
+        super::super::files::take_bound_passthrough(&mut app.rules.table, Some(&file));
+
+        super::super::finished(
+            &mut app,
+            super::super::apply::Finished::Applied { base: None },
+        );
+
+        let written = std::fs::read_to_string(&primary).expect("bound file");
+        assert!(
+            written.contains("first.app"),
+            "the first copy was lost: {written}"
+        );
+        assert!(written.contains("second.app"), "{written}");
+    }
+
+    /// Another OS's programs in a bound file are shown, read only and under
+    /// `H`, and never become rules sent to the service.
+    #[test]
+    fn another_os_programs_in_a_bound_file_are_shown_and_not_sent() {
+        let dir = Scratch::new("other-os-shown");
+        let fake = service(one_rule());
+        let mut app = on_rules(&fake);
+        let file = dir.path().join(USER_SETTINGS_FILE_NAME);
+        app.rules.settings_file = Some(file.clone());
+        let set = dir.path().join("sets").join("mine");
+        std::fs::create_dir_all(&set).expect("set");
+        super::super::own_settings::bind_written_set(&file, &set, None).expect("bind");
+        let other_os = if cfg!(target_os = "linux") {
+            "MacOS"
+        } else {
+            "Linux"
+        };
+        std::fs::write(
+            set.join("rules_secondary.txt"),
+            format!("--- {other_os}\nfirefox  # browser\n"),
+        )
+        .expect("bound file");
+
+        answer(&mut app, &["r"]);
+        drain(&mut app, &fake);
+        let text = super::screen_text(&app, ScreenId::Rules);
+        assert!(text.contains("Rules for other systems"), "{text}");
+        assert!(text.contains("firefox"), "{text}");
+        assert_eq!(
+            app.rules.table.rows.len(),
+            1,
+            "it became a rule of the list"
+        );
+
+        answer(&mut app, &["H"]);
+        let text = super::screen_text(&app, ScreenId::Rules);
+        assert!(!text.contains("firefox"), "{text}");
+    }
+
     /// The same apply over a bound file this program has no record of
     /// writing: the rules there are the user's, so they stay and the user is
     /// asked, as after a hand edit.
@@ -1503,6 +1627,432 @@ old.example
             ),
             "the user is not asked"
         );
+    }
+
+    /// The user sees where the rules are saved, including files the window
+    /// bound meanwhile; a file name is shown, never obeyed as terminal codes.
+    #[test]
+    fn the_screen_says_which_files_the_rules_are_saved_to() {
+        let dir = Scratch::new("bound-paths-line");
+        let (mut app, sets) = rules_with_settings(&dir, one_rule());
+        let shown = |app: &AppState| super::screen_text(app, ScreenId::Rules);
+        assert!(!shown(&app).contains("Saves to:"), "{}", shown(&app));
+
+        let primary = sets.join("rules_primary.txt").display().to_string();
+        let hostile = sets.join("evil\u{1b}[2Jname.txt").display().to_string();
+        seed(&app, |s| {
+            s.set_primary_file(&primary);
+            s.set_secondary_file(&hostile);
+        });
+        crate::screens::screen(ScreenId::Rules).on_show(&mut app);
+        let text = shown(&app);
+        let line = text
+            .lines()
+            .find(|l| l.starts_with("Saves to:"))
+            .unwrap_or_else(|| panic!("no saves-to line: {text}"));
+        assert!(line.contains("rules_primary.txt"), "{line}");
+        assert!(line.contains("name.txt"), "{line}");
+        assert!(
+            !line.contains('\u{1b}'),
+            "an escape reached the screen: {line:?}"
+        );
+    }
+
+    /// A set read from a folder of the user's own, with no rule-set folder
+    /// chosen yet, offers the folder it sits in once on the feed; with one
+    /// chosen, or for a set written (which chooses one itself), nothing is said.
+    #[test]
+    fn an_import_offers_its_folder_once_while_none_is_chosen() {
+        let offers = |app: &AppState| {
+            app.notices
+                .iter()
+                .filter(|n| n.title == "Your rule-set folder")
+                .count()
+        };
+        let set_in = |sets: &Path, name: &str| {
+            let dir = sets.join(name);
+            std::fs::create_dir_all(&dir).expect("set folder");
+            std::fs::write(
+                dir.join("rules_primary.txt"),
+                "example.org
+",
+            )
+            .expect("rules file");
+            dir.display().to_string()
+        };
+
+        let dir = Scratch::new("folder-offer");
+        let (mut app, sets) = rules_with_settings(&dir, Vec::new());
+        super::super::on_texts(&mut app, &texts_en());
+        let first = set_in(&sets, "first");
+        let second = set_in(&sets, "second");
+        answer(&mut app, &["i", &first]);
+        answer(&mut app, &["i", &second]);
+        if matches!(app.rules.mode, super::super::Mode::Choice(_)) {
+            answer(&mut app, &["1"]);
+        }
+        assert_eq!(offers(&app), 1, "offered other than once");
+        let body = &app
+            .notices
+            .iter()
+            .find(|n| n.title == "Your rule-set folder")
+            .expect("offered")
+            .body;
+        assert!(body.contains(&sets.display().to_string()), "{body}");
+        assert!(body.contains("press o"), "{body}");
+
+        let chosen = Scratch::new("folder-offer-chosen");
+        let (mut app, sets) = rules_with_settings(&chosen, Vec::new());
+        super::super::on_texts(&mut app, &texts_en());
+        let folder = sets.display().to_string();
+        seed(&app, |s| s.set_rules_folder(&folder));
+        answer(&mut app, &["i", &set_in(&sets, "third")]);
+        assert_eq!(offers(&app), 0, "offered with a folder chosen");
+
+        let written = Scratch::new("folder-offer-written");
+        let (mut app, sets) = rules_with_settings(&written, one_rule());
+        super::super::on_texts(&mut app, &texts_en());
+        answer(&mut app, &["x", &sets.join("fourth").display().to_string()]);
+        assert_eq!(offers(&app), 0, "offered after a write");
+    }
+
+    fn two_routes() -> Vec<serde_json::Value> {
+        vec![
+            rule("1", "suffix-domain", "main.example", "primary"),
+            rule("2", "suffix-domain", "tunnel.example", "secondary"),
+        ]
+    }
+
+    /// One route saved alone holds that route's rules only, becomes that
+    /// route's file, and leaves the other route's binding as it was.
+    #[test]
+    fn one_route_is_saved_to_its_own_file_and_bound() {
+        let dir = Scratch::new("export-route");
+        let (mut app, sets) = rules_with_settings(&dir, two_routes());
+        super::super::on_texts(&mut app, &texts_en());
+        let other = path_text(&sets.join("kept.txt"));
+        seed(&app, |s| s.set_primary_file(&other));
+        let file = sets.join("tunnel.txt");
+        answer(&mut app, &["X", "2", &file.display().to_string()]);
+
+        let written = std::fs::read_to_string(&file).expect("written");
+        assert!(written.contains("tunnel.example"), "{written}");
+        assert!(!written.contains("main.example"), "{written}");
+        let bound = settings(&app).rules_files;
+        assert_eq!(bound.secondary, path_text(&file));
+        assert_eq!(bound.primary, other, "the other route's file was rebound");
+
+        // A second save to the same file asks before replacing it.
+        answer(&mut app, &["X", "2", &file.display().to_string()]);
+        assert!(
+            matches!(
+                app.rules.mode,
+                super::super::Mode::Choice(super::super::Choice {
+                    purpose: super::super::ChoicePurpose::Overwrite(_),
+                    ..
+                })
+            ),
+            "replaced without asking"
+        );
+    }
+
+    /// A save into the sets shipped with the program, which the next update
+    /// replaces, is asked about; cancelled, nothing is written there.
+    #[test]
+    fn a_save_into_the_shipped_sets_asks_first() {
+        let Some(shipped) = super::super::files::presets_root() else {
+            return;
+        };
+        let dir = Scratch::new("export-shipped");
+        let (mut app, _) = rules_with_settings(&dir, two_routes());
+        super::super::on_texts(&mut app, &texts_en());
+        let file = shipped.join(format!("nrr-test-{}.txt", std::process::id()));
+        answer(&mut app, &["X", "1", &file.display().to_string()]);
+        let asked = matches!(
+            app.rules.mode,
+            super::super::Mode::Choice(super::super::Choice {
+                purpose: super::super::ChoicePurpose::Shipped(_),
+                ..
+            })
+        );
+        answer(&mut app, &["2"]);
+        let written = file.exists();
+        let _ = std::fs::remove_file(&file);
+        assert!(asked, "saved into the shipped sets without asking");
+        assert!(!written, "a cancelled save was written");
+    }
+
+    /// Clearing every rule is asked first, with the safe answer chosen; once
+    /// confirmed the list is empty and the rules files are no longer written,
+    /// yet they stay on disk.
+    #[test]
+    fn clearing_all_rules_asks_then_empties_the_list_and_keeps_the_files() {
+        let dir = Scratch::new("clear-all");
+        let (mut app, sets) = rules_with_settings(&dir, two_routes());
+        super::super::on_texts(&mut app, &texts_en());
+        let file = sets.join("rules_primary.txt");
+        std::fs::write(&file, "main.example\n").expect("rules file");
+        let bound = path_text(&file);
+        seed(&app, |s| s.set_primary_file(&bound));
+
+        answer(&mut app, &["W"]);
+        match &app.rules.mode {
+            super::super::Mode::Choice(choice) => {
+                assert_eq!(choice.cursor, 1, "the destructive answer is preselected");
+            }
+            other => panic!("cleared without asking: {other:?}"),
+        }
+        answer(&mut app, &["1"]);
+        assert!(app.rules.table.rows.is_empty());
+        assert!(settings(&app).rules_files.primary.is_empty());
+        assert!(file.exists(), "the rules file was deleted");
+    }
+
+    /// A set with a section of another system written twice and a section
+    /// nobody knows: both are asked about before anything lands. Kept whole,
+    /// the twice-written section loses nothing of its first copy; the unknown
+    /// one, told to be domains, becomes rules.
+    #[test]
+    fn an_import_asks_about_doubled_and_unknown_sections_and_loses_nothing() {
+        let dir = Scratch::new("import-review");
+        let (mut app, sets) = rules_with_settings(&dir, Vec::new());
+        super::super::on_texts(&mut app, &texts_en());
+        let set = sets.join("mixed");
+        std::fs::create_dir_all(&set).expect("set");
+        std::fs::write(
+            set.join("rules_secondary.txt"),
+            "--- Domains\na.example\n--- MacOS\nfirst.app\n--- Corp\nintra.example\n\
+             --- MacOS\nsecond.app\n--- Domains\nb.example\n",
+        )
+        .expect("rules file");
+        answer(&mut app, &["i", &set.display().to_string()]);
+        assert!(
+            matches!(app.rules.mode, super::super::Mode::Choice(_)),
+            "imported without asking"
+        );
+        assert!(
+            app.rules.table.rows.is_empty(),
+            "rules landed before the answers"
+        );
+        // MacOS twice: keep all. Corp: the third answer, Domains.
+        answer(&mut app, &["1", "3"]);
+        let values: Vec<String> = app
+            .rules
+            .table
+            .rows
+            .iter()
+            .map(|r| r.rule.match_value.clone())
+            .collect();
+        for value in ["a.example", "b.example", "intra.example"] {
+            assert!(
+                values.contains(&value.to_owned()),
+                "{value} missing: {values:?}"
+            );
+        }
+        let kept = app.rules.table.passthrough[1]
+            .get("MacOS")
+            .cloned()
+            .unwrap_or_default();
+        assert!(
+            kept.contains("first.app") && kept.contains("second.app"),
+            "{kept:?}"
+        );
+        assert!(!app.rules.table.passthrough[1].contains_key("Corp"));
+    }
+
+    /// Esc on the import's question drops the import: nothing lands.
+    #[test]
+    fn leaving_the_import_review_imports_nothing() {
+        let dir = Scratch::new("import-review-cancel");
+        let (mut app, sets) = rules_with_settings(&dir, Vec::new());
+        super::super::on_texts(&mut app, &texts_en());
+        let set = sets.join("odd");
+        std::fs::create_dir_all(&set).expect("set");
+        std::fs::write(
+            set.join("rules_primary.txt"),
+            "--- Domains\na.example\n--- Corp\nintra.example\n",
+        )
+        .expect("rules file");
+        answer(&mut app, &["i", &set.display().to_string()]);
+        crate::screens::screen(ScreenId::Rules).on_key(
+            &mut app,
+            crossterm::event::KeyEvent::new(
+                crossterm::event::KeyCode::Esc,
+                crossterm::event::KeyModifiers::NONE,
+            ),
+        );
+        assert!(app.rules.table.rows.is_empty());
+    }
+
+    /// The demo rules join the list once; asked again, nothing doubles.
+    #[test]
+    fn the_demo_rules_are_added_once() {
+        let dir = Scratch::new("demo-rules");
+        let (mut app, _) = rules_with_settings(&dir, Vec::new());
+        super::super::on_texts(&mut app, &texts_en());
+        if super::super::files::demo_dir(false).is_none() {
+            return;
+        }
+        answer(&mut app, &["L"]);
+        let first = app.rules.table.rows.len();
+        assert!(first > 0, "{}", note(&app));
+        app.rules.mode = super::super::Mode::List;
+        app.rules.busy = None;
+        answer(&mut app, &["L"]);
+        assert_eq!(app.rules.table.rows.len(), first, "demo rules doubled");
+    }
+
+    fn reset_service(requires_review: bool) -> FakeService {
+        let fake = FakeService::new(nrr_ipc_client::ConnectionStatus::Connected);
+        fake.answer(
+            IpcOperationName::MutationSubmit,
+            json!({
+                "confirmation-token": "t",
+                "review-summary": {
+                    "diff-summary": "",
+                    "provenance": "",
+                    "risk-level": "medium",
+                    "requires-review": requires_review,
+                    "changed-fields": ["rules"]
+                }
+            }),
+        );
+        fake
+    }
+
+    /// Back to the baseline: the service is asked for the reset itself, never
+    /// for a rules write; once it is in force the list is read again, and the
+    /// user's bound file keeps the rules they had.
+    #[test]
+    fn a_reset_to_the_baseline_is_reviewed_and_leaves_the_users_file_alone() {
+        let dir = Scratch::new("reset-baseline");
+        let (mut app, sets) = rules_with_settings(&dir, one_rule());
+        super::super::on_texts(&mut app, &texts_en());
+        let file = sets.join("rules_primary.txt");
+        std::fs::write(&file, "--- Domains\nmine.example\n").expect("rules file");
+        let bound = path_text(&file);
+        seed(&app, |s| s.set_primary_file(&bound));
+        let fake = reset_service(true);
+
+        answer(&mut app, &["Z"]);
+        drain(&mut app, &fake);
+        let sent = fake.sent(IpcOperationName::MutationSubmit);
+        assert_eq!(sent.len(), 1, "{sent:?}");
+        assert_eq!(sent[0]["mutation-kind"], "rules-reset-to-baseline");
+        assert!(sent[0]["payload"].get("rules-json").is_none(), "{sent:?}");
+        assert!(
+            matches!(app.rules.mode, super::super::Mode::Review(_)),
+            "the reset was not shown first"
+        );
+
+        app.rules.mode = super::super::Mode::List;
+        super::super::finished(
+            &mut app,
+            super::super::apply::Finished::Applied { base: None },
+        );
+        assert!(
+            matches!(app.rules.busy, Some(super::super::Busy::Loading)),
+            "the list was not read again"
+        );
+        let kept = std::fs::read_to_string(&file).expect("rules file");
+        assert!(
+            kept.contains("mine.example"),
+            "the user's file was rewritten: {kept}"
+        );
+    }
+
+    /// Nothing of the user's own to drop: said so, nothing applied.
+    #[test]
+    fn a_reset_with_nothing_of_ones_own_says_so() {
+        let dir = Scratch::new("reset-baseline-noop");
+        let (mut app, _) = rules_with_settings(&dir, one_rule());
+        super::super::on_texts(&mut app, &texts_en());
+        let fake = reset_service(false);
+        answer(&mut app, &["Z"]);
+        drain(&mut app, &fake);
+        assert!(matches!(app.rules.mode, super::super::Mode::List));
+        assert!(note(&app).contains("already in effect"), "{}", note(&app));
+        assert_eq!(fake.sent(IpcOperationName::MutationSubmit).len(), 1);
+    }
+
+    fn three_rules() -> Vec<serde_json::Value> {
+        vec![
+            rule("1", "suffix-domain", "one.example", "primary"),
+            rule("2", "suffix-domain", "two.example", "primary"),
+            rule("3", "suffix-domain", "three.example", "primary"),
+        ]
+    }
+
+    fn values(app: &AppState) -> Vec<String> {
+        app.rules
+            .table
+            .rows
+            .iter()
+            .map(|r| r.rule.match_value.clone())
+            .collect()
+    }
+
+    /// An action on the selected rules touches those and no other: the third
+    /// rule, never selected, keeps its route, its switch and its place.
+    #[test]
+    fn an_action_on_selected_rules_leaves_the_others_alone() {
+        let dir = Scratch::new("marked-move");
+        let (mut app, _) = rules_with_settings(&dir, three_rules());
+        super::super::on_texts(&mut app, &texts_en());
+        answer(&mut app, &["* 1 2", "B", "4"]);
+        let routes: Vec<_> = app
+            .rules
+            .table
+            .rows
+            .iter()
+            .map(|r| r.rule.target_route.clone())
+            .collect();
+        assert_eq!(
+            routes,
+            vec![
+                nrr_client_logic::rules_table::TargetRoute::Secondary,
+                nrr_client_logic::rules_table::TargetRoute::Secondary,
+                nrr_client_logic::rules_table::TargetRoute::Primary,
+            ]
+        );
+        answer(&mut app, &["B", "2"]);
+        let enabled: Vec<bool> = app
+            .rules
+            .table
+            .rows
+            .iter()
+            .map(|r| r.rule.enabled)
+            .collect();
+        assert_eq!(enabled, vec![false, false, true]);
+    }
+
+    /// Deleting the selected rules is asked first with the safe answer
+    /// chosen; confirmed, only those go.
+    #[test]
+    fn deleting_selected_rules_asks_then_removes_only_them() {
+        let dir = Scratch::new("marked-delete");
+        let (mut app, _) = rules_with_settings(&dir, three_rules());
+        super::super::on_texts(&mut app, &texts_en());
+        answer(&mut app, &["* 2", "B", "6"]);
+        match &app.rules.mode {
+            super::super::Mode::Choice(choice) => assert_eq!(choice.cursor, 1),
+            other => panic!("deleted without asking: {other:?}"),
+        }
+        answer(&mut app, &["1"]);
+        assert_eq!(values(&app), vec!["one.example", "three.example"]);
+    }
+
+    /// Nothing selected: the action says how to select instead of acting on
+    /// the rule under the cursor.
+    #[test]
+    fn with_nothing_selected_the_action_touches_nothing() {
+        let dir = Scratch::new("marked-none");
+        let (mut app, _) = rules_with_settings(&dir, three_rules());
+        super::super::on_texts(&mut app, &texts_en());
+        answer(&mut app, &["B"]);
+        assert!(matches!(app.rules.mode, super::super::Mode::List));
+        assert!(note(&app).contains("select them with *"), "{}", note(&app));
+        assert_eq!(values(&app).len(), 3);
     }
 }
 
@@ -2575,6 +3125,29 @@ mod file_merge {
         assert!(!written.contains("only-file.example"), "{written}");
     }
 
+    /// The file lacks a rule in force and adds nothing of its own: there is
+    /// nothing to merge, the rule is written to the file, and the note names
+    /// it — "spelled otherwise" would hide that the file was missing a rule.
+    #[test]
+    fn a_rule_in_force_missing_from_the_file_is_named_when_written_to_it() {
+        let dir = Scratch::new("file-merge-missing");
+        let fake = rules();
+        let mut app = bound(&dir, &fake);
+        super::super::on_texts(&mut app, &crate::testing::texts_en());
+        let own = super::super::apply::pending_from(&app.rules.table, false, None)
+            .expect("book")
+            .rules_json;
+        fake.answer(
+            IpcOperationName::RulesMergePreview,
+            preview(Vec::new(), Vec::new(), &own),
+        );
+        answer(&mut app, &["F"]);
+        drain(&mut app, &fake);
+        let shown = screen_text(&app, ScreenId::Rules);
+        assert!(shown.contains("missing from your rules file"), "{shown}");
+        assert!(shown.contains("only-service.example"), "{shown}");
+    }
+
     #[test]
     fn a_file_already_in_line_is_left_alone_and_the_note_says_they_match() {
         let dir = Scratch::new("file-merge-match");
@@ -2687,4 +3260,243 @@ fn c_removes_the_rules_a_wildcard_of_the_same_route_covers() {
     assert!(matches!(app.rules.mode, Mode::List));
     let note = app.rules.note.as_ref().map(|n| n.text(&texts_en()));
     assert_eq!(note.as_deref(), Some("Nothing is covered twice right now."));
+}
+
+/// An administrator's lock is known before the user tries a change: the
+/// screen says so at once and refuses edits, while search stays open; a
+/// terminal started as administrator passes the lock, as the service lets it.
+#[test]
+fn the_administrators_lock_shows_at_once_and_stops_edits_but_not_search() {
+    use crossterm::event::KeyCode;
+    let locked_by = |elevated: bool| {
+        let fake = service(vec![rule("1", "domain", "a.example", "secondary")]);
+        fake.answer(
+            IpcOperationName::ServiceStabilityConfigGet,
+            json!({ "allow-user-rule-edits": false }),
+        );
+        let mut app = on_rules(&fake);
+        app.rules.elevated = elevated;
+        let reply = apply::edit_permission_job()(&fake);
+        (reply.0)(&mut app);
+        app
+    };
+
+    let mut app = locked_by(false);
+    let text = screen_text(&app, ScreenId::Rules);
+    assert!(
+        text.contains("Rules are managed by your administrator"),
+        "{text}"
+    );
+    for code in [
+        KeyCode::Char('a'),
+        KeyCode::Enter,
+        KeyCode::Char('t'),
+        KeyCode::Char('s'),
+    ] {
+        press_key(&mut app, code);
+        assert!(
+            matches!(app.rules.mode, Mode::List),
+            "{code:?} left the list"
+        );
+    }
+    press_key(&mut app, KeyCode::Char('t'));
+    assert!(
+        app.rules.table.rows[0].rule.enabled,
+        "a locked rule was switched off"
+    );
+    assert!(
+        screen_text(&app, ScreenId::Rules).contains("cannot be changed here"),
+        "{}",
+        screen_text(&app, ScreenId::Rules)
+    );
+    answer(&mut app, &["a"]);
+    assert!(
+        matches!(app.rules.mode, Mode::List),
+        "line mode opened the form"
+    );
+    press_key(&mut app, KeyCode::Char('/'));
+    assert!(matches!(app.rules.mode, Mode::Input(_)), "search is closed");
+
+    let mut admin = locked_by(true);
+    assert!(!screen_text(&admin, ScreenId::Rules).contains("managed by your administrator"));
+    press_key(&mut admin, KeyCode::Char('a'));
+    assert!(
+        matches!(admin.rules.mode, Mode::Form(_)),
+        "the administrator was locked out"
+    );
+}
+
+/// The hints the GUI's rule window gives while a value is typed.
+mod form_hints {
+    use super::*;
+    use crossterm::event::KeyCode;
+
+    fn subdomains_off(app: &mut AppState) {
+        app.snapshot
+            .as_mut()
+            .and_then(|s| s.route_policy.as_mut())
+            .expect("the fixture has a route policy")
+            .include_subdomains = false;
+    }
+
+    fn form_of(app: &AppState) -> &super::super::form::Form {
+        match &app.rules.mode {
+            Mode::Form(form) => form,
+            other => panic!("the form is open: {other:?}"),
+        }
+    }
+
+    /// A domain rule says how far it reaches, in the words of the setting
+    /// that decides it, before it is saved.
+    #[test]
+    fn a_domain_rule_says_how_far_it_reaches() {
+        let fake = service(Vec::new());
+        let mut app = on_rules(&fake);
+        answer(&mut app, &ADD_DOMAIN);
+        answer(&mut app, &["example.com"]);
+        let shown = screen_text(&app, ScreenId::Rules);
+        assert!(
+            shown.contains("Covers example.com and every subdomain of it."),
+            "{shown}"
+        );
+        assert!(!shown.contains("Include subdomains"), "{shown}");
+
+        let mut app = on_rules(&fake);
+        answer(&mut app, &ADD_DOMAIN);
+        answer(&mut app, &["example.*"]);
+        let shown = screen_text(&app, ScreenId::Rules);
+        assert!(
+            shown.contains("Covers example in every zone (example.com, example.net"),
+            "{shown}"
+        );
+    }
+
+    /// With subdomains off machine-wide a bare domain covers itself alone,
+    /// and the form offers the switch that adds them.
+    #[test]
+    fn with_subdomains_off_the_form_offers_them_and_the_switch_adds_them() {
+        let fake = service(Vec::new());
+        let mut app = on_rules(&fake);
+        subdomains_off(&mut app);
+        answer(&mut app, &ADD_DOMAIN);
+        answer(&mut app, &["example.com"]);
+        let shown = screen_text(&app, ScreenId::Rules);
+        assert!(
+            shown
+                .contains("Covers example.com only. Type *.example.com to include its subdomains."),
+            "{shown}"
+        );
+        assert!(shown.contains("[ ] Include subdomains"), "{shown}");
+
+        answer(&mut app, &["!f"]);
+        assert_eq!(form_of(&app).value, "*.example.com");
+        let shown = screen_text(&app, ScreenId::Rules);
+        assert!(
+            shown.contains("Covers example.com and every subdomain of it."),
+            "{shown}"
+        );
+        assert!(shown.contains("[x] Include subdomains"), "{shown}");
+        answer(&mut app, &["!f"]);
+        assert_eq!(form_of(&app).value, "example.com");
+    }
+
+    /// A rule on a registry would route every stranger's site under it; the
+    /// form says so for the registry and stays quiet for a site.
+    #[test]
+    fn a_rule_on_a_public_registry_is_warned_and_a_site_is_not() {
+        let fake = service(Vec::new());
+        for (value, warned) in [
+            ("co.uk", true),
+            ("*.com", true),
+            ("example.co.uk", false),
+            ("example.com", false),
+        ] {
+            let mut app = on_rules(&fake);
+            answer(&mut app, &ADD_DOMAIN);
+            answer(&mut app, &[value]);
+            let shown = screen_text(&app, ScreenId::Rules);
+            assert_eq!(
+                shown.contains("is a public registry, not one service"),
+                warned,
+                "{value}: {shown}"
+            );
+        }
+    }
+
+    /// An internationalised name shows the form that reaches the network as
+    /// it is typed, key by key; an ASCII name shows none.
+    #[test]
+    fn an_internationalised_name_shows_its_ascii_form_as_typed() {
+        let fake = service(Vec::new());
+        let mut app = on_rules(&fake);
+        press_key(&mut app, KeyCode::Char('a'));
+        for c in "пример.рф".chars() {
+            press_key(&mut app, KeyCode::Char(c));
+        }
+        let shown = screen_text(&app, ScreenId::Rules);
+        assert!(shown.contains("Punycode: xn--e1afmkfd.xn--p1ai"), "{shown}");
+
+        let mut app = on_rules(&fake);
+        press_key(&mut app, KeyCode::Char('a'));
+        for c in "example.com".chars() {
+            press_key(&mut app, KeyCode::Char(c));
+        }
+        assert!(!screen_text(&app, ScreenId::Rules).contains("Punycode:"));
+    }
+
+    /// The comment shows its length against the limit; a longer paste is cut
+    /// to the limit and the form says where the limit is.
+    #[test]
+    fn the_comment_counts_against_its_limit_and_a_long_paste_is_said_to_be_cut() {
+        let fake = service(Vec::new());
+        let mut app = on_rules(&fake);
+        answer(&mut app, &ADD_DOMAIN);
+        answer(&mut app, &["example.com", "", "", "abc"]);
+        let shown = screen_text(&app, ScreenId::Rules);
+        assert!(shown.contains("abc  3/200"), "{shown}");
+        assert!(!shown.contains("Up to 200 characters"), "{shown}");
+
+        let mut app = on_rules(&fake);
+        answer(&mut app, &ADD_DOMAIN);
+        let long = "x".repeat(250);
+        answer(&mut app, &["example.com", "", "", &long]);
+        assert_eq!(form_of(&app).comment.chars().count(), 200);
+        let shown = screen_text(&app, ScreenId::Rules);
+        assert!(shown.contains("200/200"), "{shown}");
+        assert!(shown.contains("Up to 200 characters"), "{shown}");
+    }
+
+    /// A rule whose comment is longer than the rules file takes (written by
+    /// another tool) shows it over the limit, and a save writes what the
+    /// file accepts instead of a file the import refuses.
+    #[test]
+    fn a_longer_comment_from_elsewhere_is_shown_over_the_limit_and_saved_cut() {
+        let fake = service(Vec::new());
+        let mut app = on_rules(&fake);
+        app.rules.table.import(
+            vec![RuleRow {
+                id: String::new(),
+                enabled: true,
+                rule_type: RuleType::Domain,
+                match_value: "example.com".into(),
+                target_route: TargetRoute::Secondary,
+                verify: false,
+                comment: "y".repeat(250),
+                origin: None,
+            }],
+            true,
+        );
+        answer(&mut app, &["e 1"]);
+        let shown = screen_text(&app, ScreenId::Rules);
+        assert!(shown.contains("250/200"), "{shown}");
+        assert!(shown.contains("Up to 200 characters"), "{shown}");
+        // Type, value, route, unsure, comment, enabled: Enter on the last saves.
+        answer(&mut app, &["", "", "", "", "", ""]);
+        assert!(
+            matches!(app.rules.mode, Mode::List),
+            "saved: {}",
+            screen_text(&app, ScreenId::Rules)
+        );
+        assert_eq!(app.rules.table.rows[0].rule.comment.chars().count(), 200);
+    }
 }

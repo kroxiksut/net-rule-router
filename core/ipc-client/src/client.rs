@@ -434,19 +434,20 @@ fn worker_loop(inner: Arc<ClientInner>) {
                 slow_backoff.reset();
             }
             HandshakeResult::ProtocolMismatch { server_version } => {
-                transport::close_pipe(pipe.0);
+                // Status first: whoever sees the pipe close already reads why.
                 inner.set_status(ConnectionStatus::ProtocolMismatch {
                     server_version,
                     client_version: CLIENT_PROTOCOL_VERSION,
                 });
+                transport::close_pipe(pipe.0);
                 // Terminal: stop reconnect attempts. Wait for shutdown
                 // signal (block on request channel with periodic checks).
                 wait_for_shutdown_or_force_reconnect(&inner, &request_rx);
                 continue;
             }
             HandshakeResult::Refused { message } => {
-                transport::close_pipe(pipe.0);
                 inner.set_status(ConnectionStatus::Refused { reason: message });
+                transport::close_pipe(pipe.0);
                 // Deliberately the slow schedule: the service is up and has
                 // already answered. Hammering it re-runs the refusal — and the
                 // audit entry that goes with it — several times a minute.

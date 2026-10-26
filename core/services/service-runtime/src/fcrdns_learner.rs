@@ -24,9 +24,8 @@
 //! Only a name whose forward record actually contains the dropped IP is trusted.
 //!
 //! No exemption is ever blanket: a confirmed name that matches a rule goes
-//! through the normal rule-gated cache path, and one that matches none has only
-//! its confirmed addresses registered as known-direct, so block-all stops cutting
-//! a plain primary-path site. Every learned fact is one a legitimate DNS query
+//! through the normal rule-gated cache path, and one that matches none is only
+//! reported, never let out. Every learned fact is one a legitimate DNS query
 //! would have produced anyway.
 //!
 //! Mechanism-free by construction: the reverse/forward resolver and the
@@ -58,13 +57,9 @@ pub trait ConfirmedHostSink: Send + Sync {
     fn record_confirmed(&self, hostname: &str, addresses: &[Ipv4Addr]) -> bool;
 
     /// A forward-confirmed name that matched NO rule (so
-    /// [`Self::record_confirmed`] refused it) is a POSITIVELY-direct
-    /// destination: the name provably owns the dropped IP, and no rule routes
-    /// it to the secondary. The production impl registers its addresses in the
-    /// known-direct registry so the block-all stops cutting it (a plain
-    /// primary-path site the resolver never saw because the browser resolved
-    /// it over DoH). Default `false` = direct-learning off
-    /// (existing sinks/tests keep the strict behaviour).
+    /// [`Self::record_confirmed`] refused it): the name provably owns the
+    /// dropped IP. The production impl reports it to companion discovery and
+    /// keeps nothing. `true` when the sink kept it.
     fn record_confirmed_direct(&self, _hostname: &str, _addresses: &[Ipv4Addr]) -> bool {
         false
     }
@@ -75,8 +70,7 @@ pub trait ConfirmedHostSink: Send + Sync {
 pub enum LearnOutcome {
     /// A forward-confirmed, rule-matching name was cached.
     Learned,
-    /// A forward-confirmed name matched NO rule and was
-    /// registered as a known-DIRECT destination (block-all exemption).
+    /// A forward-confirmed name matched NO rule and the sink kept it.
     LearnedDirect,
     /// PTR/forward produced no name the dropped IP could be confirmed against,
     /// or no sink kept a confirmed name — nothing recorded.
@@ -87,7 +81,7 @@ pub enum LearnOutcome {
 }
 
 /// FCrDNS learner: forward-confirms an NRR-dropped IP into a rule-gated cache
-/// entry or, where direct learning is allowed, a known-direct address when no
+/// entry or, where direct learning is allowed, a direct-host report when no
 /// rule matches the name. Bounds its own cost with per-IP dedup (each dropped IP is attempted at
 /// most once per session) and a hard per-session attempt cap, so a flood of
 /// block-all drops cannot turn into an unbounded PTR/A query storm.
@@ -410,7 +404,7 @@ mod tests {
 
     #[test]
     fn confirmed_non_rule_host_is_learned_direct() {
-        // Forward-confirmed, matches no rule → known-direct.
+        // Forward-confirmed, matches no rule → reported as direct.
         let ip = Ipv4Addr::new(203, 0, 113, 68);
         let l = direct_learner(&[(ip, &["blog.test"])], &[("blog.test", &[ip])], ".example");
         assert_eq!(l.learn(ip), LearnOutcome::LearnedDirect);

@@ -6,11 +6,13 @@
 //! `nrr-cli`. Two renderers over one screen model: full-screen, and `--plain`
 //! line mode for screen readers.
 
+mod app_groups_offer;
 mod args;
 mod backend;
 mod block_backlog;
 mod block_route;
 mod elevation_prompt;
+mod feed;
 mod forwarded_traffic;
 mod full;
 mod i18n;
@@ -24,12 +26,14 @@ mod platform;
 mod primary_suggestion;
 mod restore;
 mod screens;
+mod site_notices;
 mod state;
 #[cfg(test)]
 mod testing;
 mod view;
 mod vpn_gateway_trust;
 mod vpn_trust;
+mod window_parked;
 
 use std::io::IsTerminal;
 use std::process::ExitCode;
@@ -166,8 +170,14 @@ fn run(
     };
     let mut app = AppState::new(first, options.bell);
     app.settings.prefs = saved;
+    screens::inspect::diagnostics::restore_archive_options(&mut app);
+    app.site_notices = prefs_path
+        .as_deref()
+        .map(site_notices::load)
+        .unwrap_or_default();
     app.settings.prefs_path = prefs_path;
     app.rules.baseline = platform::edits_baseline();
+    app.rules.elevated = platform::runs_elevated();
     screens::rules::on_texts(&mut app, texts);
     // The baseline's editor is not the user whose folder and files these are;
     // a root-owned copy in their profile would also lock the GUI out of it.
@@ -240,13 +250,12 @@ fn start_licence_and_sheet(app: &mut AppState, texts: &Texts) {
         .flatten()
         .map_or(0, |settings| settings.accepted_eula);
     let executable = std::env::current_exe().ok();
-    let candidates = nrr_shared::first_run_sheet::candidate_paths(
+    let candidates = nrr_platform_api::paths::first_run_sheet_candidates(
         executable.as_deref().and_then(std::path::Path::parent),
-        nrr_platform_api::paths::machine_first_run_dir().as_deref(),
     );
     let machine_files = platform::machine_files();
     let sheet = nrr_shared::first_run_sheet::search(&candidates, &|path| {
-        machine_files.untrusted_because(path)
+        machine_files.open_admin_authored(path)
     })
     .found
     .map(|loaded| loaded.answers);

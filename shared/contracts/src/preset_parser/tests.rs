@@ -1514,3 +1514,51 @@ fn a_disabled_line_keeps_its_marks_and_stays_a_rule() {
             .collect::<Vec<_>>()
     );
 }
+
+/// Another OS's programs are shown as the rules they are: a disabled one stays
+/// a rule, a quoted path keeps its spaces, `+children` leaves the value, and
+/// prose is no rule. Read as passthrough, the section never reached the table.
+#[test]
+fn another_os_programs_read_as_rules_for_the_table() {
+    let parsed = parse_canonical_rules(&format!(
+        "--- {FOREIGN_A}\nfirefox +children  # browser\n# thunderbird\n\"/opt/My App/app\"\n# keep these for the laptop\n"
+    ));
+    let block = &parsed.passthrough[0];
+    let rules = other_os_app_rules(&block.section_name, &block.raw_text);
+    let seen: Vec<(String, bool, bool, &str)> = rules
+        .iter()
+        .map(|r| {
+            (
+                r.match_value.clone(),
+                r.enabled,
+                r.children,
+                r.comment.as_str(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        seen,
+        vec![
+            ("firefox".to_owned(), true, true, "browser"),
+            ("thunderbird".to_owned(), false, false, ""),
+            ("/opt/My App/app".to_owned(), true, false, ""),
+        ]
+    );
+    assert!(rules
+        .iter()
+        .all(|r| r.rule_type == ParsedRuleType::Application));
+}
+
+/// The running OS's own section is a rule section, and a section of a newer
+/// build names no programs: neither yields rows a second time.
+#[test]
+fn only_another_os_application_section_yields_display_rules() {
+    assert!(other_os_app_rules(NATIVE_APP, "firefox\n").is_empty());
+    assert!(other_os_app_rules("Ports", "443\n").is_empty());
+    assert!(other_os_app_rules("Domains", "example.com\n").is_empty());
+    assert_eq!(
+        other_os_app_rules(&FOREIGN_B.to_ascii_lowercase(), "app\n").len(),
+        1,
+        "section names are read without regard to case"
+    );
+}

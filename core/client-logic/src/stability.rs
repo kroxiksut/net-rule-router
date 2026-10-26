@@ -42,6 +42,14 @@ pub const STRUCTURED_KEYS: [&str; 1] = ["ipc-accept-policy"];
 /// recorded intent.
 pub const INTENT_EXCLUDED_KEYS: [&str; 1] = ["allow-user-rule-edits"];
 
+/// Whether the administrator's lock keeps this caller from changing rules
+/// (the window's `ruleEditsLocked`). Only an explicit `false` locks, so a
+/// service that predates the setting never locks by omission; the service
+/// lets an elevated caller through.
+pub fn rule_edits_locked(config: &Map<String, Value>, elevated: bool) -> bool {
+    !elevated && config.get(INTENT_EXCLUDED_KEYS[0]) == Some(&Value::Bool(false))
+}
+
 /// A service-side clamp: `non_positive` is what zero or less resolves to.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Clamp {
@@ -235,4 +243,29 @@ pub fn any_key_applies(supports: Option<&Map<String, Value>>) -> bool {
         || KEY_CAPABILITY
             .iter()
             .any(|(_, capability)| profile_supports(supports, capability))
+}
+
+#[cfg(test)]
+mod rule_edit_lock_tests {
+    use super::rule_edits_locked;
+    use serde_json::{json, Map, Value};
+
+    fn config(value: Value) -> Map<String, Value> {
+        json!({ "allow-user-rule-edits": value })
+            .as_object()
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    /// A lock the reader misses lets the user compose edits that bounce; a
+    /// lock read out of nothing shuts a user out of their own rules.
+    #[test]
+    fn only_an_explicit_refusal_locks_and_never_an_administrator() {
+        assert!(rule_edits_locked(&config(json!(false)), false));
+        assert!(!rule_edits_locked(&config(json!(false)), true));
+        assert!(!rule_edits_locked(&config(json!(true)), false));
+        assert!(!rule_edits_locked(&config(Value::Null), false));
+        assert!(!rule_edits_locked(&config(json!("false")), false));
+        assert!(!rule_edits_locked(&Map::new(), false));
+    }
 }

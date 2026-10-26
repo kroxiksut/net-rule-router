@@ -446,9 +446,181 @@ pub fn group_trace_rows(
     groups
 }
 
+/// How soon a success over the additional route must follow a held connection
+/// for the two to read as one story: held while the address was learned, then
+/// routed. Later than this, the hold is its own event and stays a block.
+pub const LEARNED_ROUTE_WINDOW_MS: i64 = 10_000;
+
+/// The fields of a trace row the learned-route fold reads.
+#[derive(Clone, Copy, Debug)]
+pub struct TraceOutcomeRef<'a> {
+    pub process: &'a str,
+    pub process_path: &'a str,
+    pub remote: &'a str,
+    pub verdict: &'a str,
+    pub blocked_by: &'a str,
+    pub block_reason: &'a str,
+    pub egress_role: &'a str,
+    pub observed_at_ms: i64,
+}
+
+/// A held connection and the success over the additional route that followed
+/// it: the list shows `routed` alone, saying it was held first.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct LearnedRoute {
+    pub held: usize,
+    pub routed: usize,
+}
+
+/// The address part of a trace endpoint: `[v6]:port`, `v4:port` or bare.
+fn endpoint_address(remote: &str) -> &str {
+    let s = js::trim(remote);
+    if let Some(rest) = s.strip_prefix('[') {
+        return rest.find(']').map_or(rest, |close| &rest[..close]);
+    }
+    match (s.find(':'), s.rfind(':')) {
+        (Some(first), Some(last)) if first == last => &s[..last],
+        _ => s,
+    }
+}
+
+/// Who and where a row went: the program by path, by name where the path is
+/// missing, and the address without its port. `None` when either is unknown,
+/// since a pair of strangers proves nothing.
+fn outcome_key(row: &TraceOutcomeRef<'_>) -> Option<String> {
+    let address = endpoint_address(row.remote);
+    let program = if !row.process_path.is_empty() {
+        format!("p{}", row.process_path)
+    } else if !row.process.is_empty() && row.process != "?" {
+        format!("n{}", row.process)
+    } else {
+        return None;
+    };
+    (!address.is_empty()).then(|| format!("{program}\n{address}"))
+}
+
+/// A hold an app rule's own learning explains: ours, and not a rule's block.
+fn is_held(row: &TraceOutcomeRef<'_>) -> bool {
+    row.verdict == "block"
+        && row.blocked_by == "netrulerouter"
+        && matches!(row.block_reason, "route-unavailable" | "unattributed" | "")
+        && row.observed_at_ms > 0
+}
+
+fn is_routed(row: &TraceOutcomeRef<'_>) -> bool {
+    row.verdict == "permit" && row.egress_role == "secondary" && row.observed_at_ms > 0
+}
+
+/// Each held connection followed within [`LEARNED_ROUTE_WINDOW_MS`] by the
+/// same program reaching the same address over the additional route
+/// (`connTraceLearnedRoutes` in `pure.js`), paired with the earliest such
+/// success; by `held`, in input order. Several holds may share one success.
+/// Run on a read of the trace, never per connection.
+#[must_use]
+pub fn conn_trace_learned_routes(rows: &[TraceOutcomeRef<'_>]) -> Vec<LearnedRoute> {
+    let mut routed: HashMap<String, Vec<(i64, usize)>> = HashMap::new();
+    for (i, row) in rows.iter().enumerate() {
+        if is_routed(row) {
+            if let Some(key) = outcome_key(row) {
+                routed.entry(key).or_default().push((row.observed_at_ms, i));
+            }
+        }
+    }
+    for successes in routed.values_mut() {
+        successes.sort_unstable();
+    }
+    rows.iter()
+        .enumerate()
+        .filter(|(_, row)| is_held(row))
+        .filter_map(|(held, row)| {
+            let successes = routed.get(&outcome_key(row)?)?;
+            let at = successes.partition_point(|&(t, _)| t < row.observed_at_ms);
+            let &(t, routed) = successes.get(at)?;
+            (t - row.observed_at_ms <= LEARNED_ROUTE_WINDOW_MS)
+                .then_some(LearnedRoute { held, routed })
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn outcome<'a>(
+        verdict: &'a str,
+        egress_role: &'a str,
+        remote: &'a str,
+        observed_at_ms: i64,
+    ) -> TraceOutcomeRef<'a> {
+        TraceOutcomeRef {
+            process: "claude.exe",
+            process_path: r"C:\Apps\claude.exe",
+            remote,
+            verdict,
+            blocked_by: if verdict == "block" {
+                "netrulerouter"
+            } else {
+                ""
+            },
+            block_reason: if verdict == "block" {
+                "route-unavailable"
+            } else {
+                ""
+            },
+            egress_role,
+            observed_at_ms,
+        }
+    }
+
+    /// The first contact to a new address is held, then routed: the user must
+    /// see one row that went over the tunnel, not "it works but blocks".
+    #[test]
+    fn a_hold_then_a_tunnel_success_reads_as_one_routed_row() {
+        let rows = [
+            outcome("permit", "secondary", "160.79.104.10:443", 1_003_000),
+            outcome("block", "primary", "160.79.104.10:443", 1_000_000),
+        ];
+        assert_eq!(
+            conn_trace_learned_routes(&rows),
+            vec![LearnedRoute { held: 1, routed: 0 }]
+        );
+    }
+
+    /// Nothing went through afterwards: the block is real and must stay one.
+    #[test]
+    fn a_hold_without_a_success_stays_a_block() {
+        let rows = [
+            outcome("block", "primary", "160.79.104.10:443", 1_000_000),
+            outcome("permit", "primary", "160.79.104.10:443", 1_002_000),
+            outcome("permit", "secondary", "160.79.104.11:443", 1_002_000),
+        ];
+        assert!(conn_trace_learned_routes(&rows).is_empty());
+    }
+
+    /// A success long after is no evidence the hold was the learning step.
+    #[test]
+    fn a_success_much_later_leaves_two_rows() {
+        let rows = [
+            outcome("block", "primary", "160.79.104.10:443", 1_000_000),
+            outcome("permit", "secondary", "160.79.104.10:443", 1_060_000),
+        ];
+        assert!(conn_trace_learned_routes(&rows).is_empty());
+    }
+
+    /// The user's own Block rule and a foreign firewall are never folded away.
+    #[test]
+    fn a_rule_block_or_a_foreign_block_is_never_folded() {
+        let mut by_rule = outcome("block", "primary", "160.79.104.10:443", 1_000_000);
+        by_rule.block_reason = "blocked-by-rule";
+        let mut foreign = outcome("block", "primary", "160.79.104.10:443", 1_000_500);
+        foreign.blocked_by = "other";
+        let rows = [
+            by_rule,
+            foreign,
+            outcome("permit", "secondary", "160.79.104.10:443", 1_001_000),
+        ];
+        assert!(conn_trace_learned_routes(&rows).is_empty());
+    }
 
     #[test]
     fn ports_brackets_and_zones_are_read_through() {

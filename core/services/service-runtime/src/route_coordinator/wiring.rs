@@ -30,6 +30,7 @@ impl SecondaryRouteCoordinator {
             gone_grace: super::notice_latches::GONE_GRACE,
             not_usable_logged: Mutex::new(HashMap::new()),
             anchor_persisted: Mutex::new(std::collections::HashSet::new()),
+            rename_persisted: Mutex::new(std::collections::HashSet::new()),
             enforcement_status: crate::app_enforcement_status::RouteEnforcementStatus::new(),
             unassigned_tunnel_notified: Mutex::new(HashMap::new()),
             too_wide_local_network_notified: Default::default(),

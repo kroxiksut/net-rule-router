@@ -11,6 +11,110 @@ use nrr_shared::product_identity::TUN_ADAPTER_NAME;
 
 use crate::{js, Route};
 
+/// A field as the window's mapped row has it: a missing address reads `-`.
+fn or_dash(value: &str) -> &str {
+    if value.is_empty() {
+        "-"
+    } else {
+        value
+    }
+}
+
+/// Whether the row stays in the list (`adapterPassesFilter`): unavailable
+/// ones only when asked for, and `search` (any case) in its name,
+/// description, address, resolvers or type.
+pub fn adapter_passes_filter(row: &InterfaceRowDto, show_unavailable: bool, search: &str) -> bool {
+    if !show_unavailable && row.availability == "unavailable" {
+        return false;
+    }
+    let q = search.trim().to_lowercase();
+    if q.is_empty() {
+        return true;
+    }
+    format!(
+        "{} {} {} {} {}",
+        row.name,
+        row.interface_description,
+        or_dash(&row.local_ip),
+        or_dash(&row.dns_servers),
+        row.interface_type
+    )
+    .to_lowercase()
+    .contains(&q)
+}
+
+/// A loopback adapter is a local address space, never a route
+/// (`adapterIsLoopback`).
+fn adapter_is_loopback(row: &InterfaceRowDto) -> bool {
+    [
+        row.name.as_str(),
+        row.interface_type.as_str(),
+        row.interface_description.as_str(),
+        row.derived_assessment.classification.as_str(),
+    ]
+    .iter()
+    .any(|text| text.to_lowercase().contains("loopback"))
+}
+
+/// Whether the row names a resolver (`adapterHasConfiguredDns`); the
+/// placeholders of a row without one read as none.
+fn adapter_has_configured_dns(row: &InterfaceRowDto) -> bool {
+    let raw = or_dash(&row.dns_servers).trim().to_lowercase();
+    !raw.is_empty() && !["\u{2014}", "-", "none", "(none)", "n/a"].contains(&raw.as_str())
+}
+
+/// Where the row stands in the list sorted by `sort_by` (`adapterSortRank`):
+/// `default`, `vpn-like` or `primary-candidate`, higher first. A bound adapter
+/// leads whatever the order, loopback sinks.
+pub fn adapter_sort_rank(row: &InterfaceRowDto, sort_by: &str) -> i32 {
+    if adapter_is_loopback(row) {
+        return -10_000;
+    }
+    match row.selected_role.as_deref() {
+        Some("primary") => return 1_000_000,
+        Some("secondary") => return 900_000,
+        _ => {}
+    }
+    let rec = row.recommendation.class.as_str();
+    let vpn = row.derived_assessment.vpn_tunnel_likelihood.as_str();
+    let virt = row.derived_assessment.virtual_interface_likelihood.as_str();
+    let dns = i32::from(adapter_has_configured_dns(row));
+    match sort_by {
+        "vpn-like" => {
+            dns + match (vpn, virt) {
+                ("likely", _) => 100,
+                ("possible", _) => 60,
+                (_, "likely") => 40,
+                (_, "possible") => 25,
+                _ => 0,
+            }
+        }
+        "primary-candidate" => {
+            dns + match rec {
+                "preferred-primary" => 100,
+                "allowed-but-not-recommended" => 40,
+                "preferred-secondary" => 30,
+                "not-recommended" => 0,
+                _ => 10,
+            }
+        }
+        _ => {
+            let availability = match row.availability.as_str() {
+                "available" => 50,
+                "requires-check" => 20,
+                _ => 0,
+            };
+            let recommendation = match rec {
+                "preferred-primary" => 40,
+                "preferred-secondary" => 25,
+                "allowed-but-not-recommended" => 10,
+                _ => 0,
+            };
+            availability + dns * 30 + recommendation
+        }
+    }
+}
+
 /// Why an adapter cannot carry traffic out.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum UnroutableReason {

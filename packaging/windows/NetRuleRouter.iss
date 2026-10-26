@@ -204,12 +204,21 @@ end;
 
 { The MSI installs into the same folder, and an older build must not replace a
   newer one: both end Setup before anything changes. }
+function MsiInstalled(): Boolean;
+begin
+  { Raises when Windows Installer cannot be asked: read as no MSI install. }
+  try
+    Result := IsMsiProductInstalled(MsiUpgradeCode, 0);
+  except
+    Log('Windows Installer query failed: ' + GetExceptionMessage());
+    Result := False;
+  end;
+end;
+
 function InitializeSetup(): Boolean;
-var
-  ErrorCode: Cardinal;
 begin
   Result := True;
-  if IsMsiProductInstalled(MsiUpgradeCode, 0, ErrorCode) then
+  if MsiInstalled() then
   begin
     SuppressibleMsgBox(CustomMessage('MsiInstalled'), mbError, MB_OK, IDOK);
     Result := False;

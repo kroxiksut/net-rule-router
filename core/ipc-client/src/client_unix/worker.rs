@@ -81,18 +81,19 @@ pub(super) fn worker_loop(inner: Arc<ClientInner>) {
             }
             NegotiateParse::ProtocolMismatch { server_version } => {
                 // Terminal until shutdown / force-reconnect, and the service
-                // gets its connection slot back for that whole time.
-                drop(stream);
+                // gets its connection slot back for that whole time. Status
+                // first: whoever sees the socket close already reads why.
                 inner.set_status(ConnectionStatus::ProtocolMismatch {
                     server_version,
                     client_version: CLIENT_PROTOCOL_VERSION,
                 });
+                drop(stream);
                 wait_for_shutdown_or_force_reconnect(&inner, &request_rx);
                 continue;
             }
             NegotiateParse::Refused { message } => {
-                drop(stream);
                 inner.set_status(ConnectionStatus::Refused { reason: message });
+                drop(stream);
                 // The service is up and has answered; the fast schedule would
                 // re-run the refusal and its audit entry several times a second.
                 let delay = slow_backoff.next_delay();

@@ -116,8 +116,9 @@ seven ways, listed here from the strongest rule to the weakest:
 | Application | `chrome.exe`, `C:\Apps\Tool\*` | that program wherever it is installed, or every program in that folder |
 
 The narrower rule wins: a site's own name beats its address, an address beats
-the network around it, a network beats the zone. A rule that names the zone
-(`*.example.by`) beats `example.*` for that zone. A rule names either an address or an
+the network around it, a network beats the zone. A zone of several labels
+(`corp.example.com`) counts as its subdomains and beats `*.example.com`. A rule
+that names the zone (`*.example.by`) beats `example.*` for that zone. A rule names either an address or an
 application: a rule that limits an address to one application cannot be
 carried out yet, so the service refuses it.
 

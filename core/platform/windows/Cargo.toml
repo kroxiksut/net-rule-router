@@ -99,6 +99,9 @@ windows = { version = "0.58", features = [
     # resolve the active console user's token for the service-driven routing
     # scope (enforce the console user's policy from boot, with no app running).
     "Win32_System_RemoteDesktop",
+    # CreateEnvironmentBlock: the user's own environment for the tray the
+    # service starts in their session (site_notice).
+    "Win32_System_Environment",
     # CryptProtectData / CryptUnprotectData
     # (per-user DPAPI, no CRYPTPROTECT_LOCAL_MACHINE) protect the
     # DB-MAC signing key at rest. CRYPT_INTEGER_BLOB + CRYPTPROTECT_FLAGS

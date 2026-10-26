@@ -16,8 +16,7 @@ use windows::core::{PCWSTR, PWSTR};
 use windows::Win32::Foundation::{LocalFree, BOOL, ERROR_SUCCESS, HLOCAL};
 use windows::Win32::Security::Authorization::{
     ConvertSidToStringSidW, ConvertStringSecurityDescriptorToSecurityDescriptorW,
-    GetNamedSecurityInfoW, ProgressInvokeNever, SetNamedSecurityInfoW, TreeResetNamedSecurityInfoW,
-    SDDL_REVISION_1, SE_FILE_OBJECT,
+    GetNamedSecurityInfoW, SDDL_REVISION_1, SE_FILE_OBJECT,
 };
 use windows::Win32::Security::{
     GetAce, GetSecurityDescriptorDacl, GetSecurityDescriptorOwner, ACCESS_ALLOWED_ACE, ACL,
@@ -68,14 +67,6 @@ const TRUSTED_SIDS: &[&str] = &[
     "S-1-5-80-956008885-3418522649-1831038044-1853292631-2271478464",
 ];
 
-/// SYSTEM and Administrators own the tree and alone may touch it.
-const SERVICE_TREE_SDDL: &str = "O:BAD:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)";
-
-/// As above, plus read and execute for Users (`0x1200a9`: FILE_GENERIC_READ |
-/// FILE_GENERIC_EXECUTE): the application and the console compare their own
-/// copy of the service binary with the one registered.
-const PROGRAM_TREE_SDDL: &str = "O:BAD:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;0x1200a9;;;BU)";
-
 /// Who besides the trusted accounts could change `binary`, if anyone: an
 /// account named in a description, or `None` when only trusted accounts can.
 pub fn untrusted_writer(binary: &Path) -> Result<Option<String>, String> {
@@ -102,50 +93,149 @@ pub fn untrusted_writer(binary: &Path) -> Result<Option<String>, String> {
     Ok(None)
 }
 
-/// Who besides the trusted accounts could have written `file` or swapped it,
-/// if anyone. A reparse point at the file or its folder counts: what it points
-/// at is not what an administrator placed. Adding new files to the folder does
-/// not: ProgramData lets every user do that, and it changes no existing file.
-pub fn untrusted_author(file: &Path) -> Result<Option<String>, String> {
-    let dir = file.parent();
-    for path in std::iter::once(file).chain(dir) {
-        let meta = std::fs::symlink_metadata(path)
-            .map_err(|e| format!("inspect {}: {e}", path.display()))?;
-        if meta.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
-            return Ok(Some(format!("{} is a link", path.display())));
-        }
-    }
-    if !std::fs::symlink_metadata(file)
-        .map_err(|e| format!("inspect {}: {e}", file.display()))?
-        .is_file()
-    {
-        return Ok(Some(format!("{} is not a regular file", file.display())));
-    }
-    if let Some(found) = untrusted_rights(file, REPLACES_FILE)? {
-        return Ok(Some(format!("{found} can change {}", file.display())));
-    }
-    for ancestor in dir.into_iter().flat_map(Path::ancestors) {
-        if ancestor.as_os_str().is_empty() {
-            break;
-        }
-        if let Some(found) = untrusted_rights(ancestor, REPLACES_SUBTREE)? {
-            return Ok(Some(format!(
-                "{found} can replace what is inside {}",
-                ancestor.display()
-            )));
-        }
-    }
-    Ok(None)
-}
-
-/// [`untrusted_author`] behind the neutral port.
+/// [`open_admin_authored`] behind the neutral port.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct WindowsAdminAuthoredFiles;
 
 impl nrr_platform_api::admin_authored::AdminAuthoredFiles for WindowsAdminAuthoredFiles {
-    fn untrusted_because(&self, path: &Path) -> Option<String> {
-        untrusted_author(path).unwrap_or_else(Some)
+    fn open_admin_authored(&self, path: &Path) -> nrr_platform_api::admin_authored::AdminAuthored {
+        use nrr_platform_api::admin_authored::AdminAuthored;
+        match open_admin_authored(path) {
+            Ok(Some(file)) => AdminAuthored::Opened(file),
+            Ok(None) => AdminAuthored::Missing,
+            Err(why) => AdminAuthored::Refused(why),
+        }
     }
+}
+
+/// `file` opened for reading when no ordinary account could have placed,
+/// changed or swapped it, judged on the handle that is returned: opened as
+/// the entry itself rather than a link's target, held without sharing write
+/// or delete. Its folder and every folder above are judged on handles held
+/// meanwhile: none may be a link, only trusted accounts may replace what is
+/// inside, and nobody else may add files to the folder itself — one anyone
+/// may add to is not an administrator's install folder, whoever wrote this
+/// file. `Ok(None)` when absent, wherever it would have been: a copy of the
+/// program in an open folder with no sheet beside it has nothing to report.
+pub fn open_admin_authored(file: &Path) -> Result<Option<std::fs::File>, String> {
+    open_trusting(file, &is_trusted).or_else(|why| match std::fs::symlink_metadata(file) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        _ => Err(why),
+    })
+}
+
+fn open_trusting(
+    file: &Path,
+    trusted: &dyn Fn(&str) -> bool,
+) -> Result<Option<std::fs::File>, String> {
+    use std::os::windows::fs::OpenOptionsExt;
+    const FILE_SHARE_READ: u32 = 0x1;
+    let dir = file
+        .parent()
+        .filter(|dir| !dir.as_os_str().is_empty())
+        .ok_or_else(|| format!("{} has no folder", file.display()))?;
+    // Each folder from the drive down is held, so none can be renamed or
+    // replaced until the file is open, and each is judged on its handle.
+    let mut chain: Vec<&Path> = dir
+        .ancestors()
+        .take_while(|ancestor| !ancestor.as_os_str().is_empty())
+        .collect();
+    chain.reverse();
+    let mut held = Vec::with_capacity(chain.len());
+    for folder in chain {
+        let handle = match open_to_judge(folder) {
+            Ok(handle) => handle,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => return Err(format!("open {}: {e}", folder.display())),
+        };
+        judged_in_place(&handle, folder, false)?;
+        let descriptor = SecurityDescriptor::of_handle(&handle)?;
+        if let Some(found) = untrusted_rights_in(&descriptor, REPLACES_SUBTREE, trusted)? {
+            return Err(format!(
+                "{found} can replace what is inside {}",
+                folder.display()
+            ));
+        }
+        if folder == dir && open_to_everyone_in(&descriptor)? {
+            return Err(format!("anyone can add files to {}", dir.display()));
+        }
+        held.push(handle);
+    }
+    let opened = match std::fs::OpenOptions::new()
+        .read(true)
+        .share_mode(FILE_SHARE_READ)
+        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+        .open(file)
+    {
+        Ok(opened) => opened,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(format!("open {}: {e}", file.display())),
+    };
+    judged_in_place(&opened, file, true)?;
+    let descriptor = SecurityDescriptor::of_handle(&opened)?;
+    if let Some(found) = untrusted_rights_in(&descriptor, REPLACES_FILE, trusted)? {
+        return Err(format!("{found} can change {}", file.display()));
+    }
+    drop(held);
+    Ok(Some(opened))
+}
+
+const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+
+/// A folder opened to read its permissions, never through a link; held
+/// without sharing delete, so it cannot be renamed while held. A folder some
+/// process holds with delete access is opened without the pin: where each
+/// handle resolves is still checked.
+fn open_to_judge(path: &Path) -> std::io::Result<std::fs::File> {
+    use std::os::windows::fs::OpenOptionsExt;
+    const FILE_READ_ATTRIBUTES: u32 = 0x80;
+    const READ_CONTROL: u32 = 0x2_0000;
+    const FILE_SHARE_READ: u32 = 0x1;
+    const FILE_SHARE_WRITE: u32 = 0x2;
+    const FILE_SHARE_DELETE: u32 = 0x4;
+    const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+    const ERROR_SHARING_VIOLATION: i32 = 32;
+    let open = |share: u32| {
+        std::fs::OpenOptions::new()
+            // Listing is data access: without it the share mode is not
+            // enforced and the folder could be renamed while held.
+            .access_mode(LIST_DIRECTORY | FILE_READ_ATTRIBUTES | READ_CONTROL)
+            .share_mode(share)
+            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
+            .open(path)
+    };
+    match open(FILE_SHARE_READ | FILE_SHARE_WRITE) {
+        Err(e) if e.raw_os_error() == Some(ERROR_SHARING_VIOLATION) => {
+            open(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+        }
+        other => other,
+    }
+}
+
+/// The handle holds what `path` names: not a link, of the expected kind, and
+/// resolved to that same place, so no link higher up redirected the open.
+fn judged_in_place(handle: &std::fs::File, path: &Path, is_file: bool) -> Result<(), String> {
+    let meta = handle
+        .metadata()
+        .map_err(|e| format!("inspect {}: {e}", path.display()))?;
+    if meta.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+        return Err(format!("{} is a link", path.display()));
+    }
+    if is_file != meta.is_file() || (!is_file && !meta.is_dir()) {
+        return Err(format!(
+            "{} is not a {}",
+            path.display(),
+            if is_file { "regular file" } else { "folder" }
+        ));
+    }
+    let resolved = crate::pinned_file::final_path(handle)
+        .map_err(|e| format!("resolve {}: {e}", path.display()))?;
+    if !(crate::pinned_file::resolves_under(&resolved, path)
+        && crate::pinned_file::resolves_under(path, &resolved))
+    {
+        return Err(format!("{} resolves elsewhere", path.display()));
+    }
+    Ok(())
 }
 
 /// Why the service tree could not be locked down.
@@ -166,86 +256,582 @@ impl std::fmt::Display for LockdownError {
     }
 }
 
+/// An entry another account owned, moved out of the way, and where it went.
+#[derive(Debug, PartialEq, Eq)]
+pub struct SetAside {
+    pub from: PathBuf,
+    pub to: PathBuf,
+}
+
 /// Make `root` and everything under it owned by Administrators and reachable
-/// by SYSTEM and Administrators only: explicit entries anywhere below are
-/// dropped, and children inherit the root's protected DACL. A reparse point
-/// anywhere in the tree refuses the whole operation — the reset would follow
-/// it out of the tree.
+/// by SYSTEM and Administrators only (`nrr_platform_api::data_tree_access`
+/// decides, keeping an entry someone made stricter). A reparse point anywhere
+/// in the tree, the root included, refuses the whole operation: a reset
+/// through it would land outside the tree.
+///
+/// Entries owned by anyone else are taken over: the caller vetted the tree.
 pub fn lock_down_service_tree(root: &Path) -> Result<(), LockdownError> {
-    lock_down_tree(root, SERVICE_TREE_SDDL)
+    let options = Lockdown::production(TreeRule::Service);
+    lock_down(root, &options).map(drop)
+}
+
+/// [`lock_down_service_tree`] for a tree nobody vetted, such as at every
+/// service start: an entry owned outside SYSTEM and the administrators is
+/// moved into `root\<aside>` first, so the reset that makes Administrators its
+/// owner never passes it off as administrators' own work.
+pub fn secure_service_tree(root: &Path, aside: &str) -> Result<Vec<SetAside>, LockdownError> {
+    let mut options = Lockdown::production(TreeRule::Service);
+    options.aside = Some(aside);
+    lock_down(root, &options)
 }
 
 /// [`lock_down_service_tree`] for a folder of programs the service runs: the
 /// same owner and protection, but Users may read and execute what is inside.
 pub fn lock_down_program_tree(root: &Path) -> Result<(), LockdownError> {
-    lock_down_tree(root, PROGRAM_TREE_SDDL)
+    lock_down(root, &Lockdown::production(TreeRule::Program)).map(drop)
 }
 
-fn lock_down_tree(root: &Path, sddl: &str) -> Result<(), LockdownError> {
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TreeRule {
+    /// SYSTEM and Administrators, as `data_tree_access` plans it.
+    Service,
+    /// SYSTEM and Administrators, plus read and execute for Users.
+    Program,
+}
+
+struct Lockdown<'a> {
+    rule: TreeRule,
+    /// Unset only in tests: handing ownership to Administrators needs elevation.
+    set_owner: bool,
+    aside: Option<&'a str>,
+    trusted_owner: &'a dyn Fn(&str) -> bool,
+    /// The SID written and read as Administrators; a test stands its own
+    /// account in, since its unelevated token cannot use the group.
+    administrators: &'a str,
+}
+
+const ADMINISTRATORS_SID: &str = "S-1-5-32-544";
+
+impl Lockdown<'static> {
+    fn production(rule: TreeRule) -> Self {
+        Self {
+            rule,
+            set_owner: true,
+            aside: None,
+            trusted_owner: &owner_counts_as_trusted,
+            administrators: ADMINISTRATORS_SID,
+        }
+    }
+}
+
+/// SYSTEM, Administrators, TrustedInstaller, or an administrator's own
+/// account: where a policy makes an administrator the owner of what they
+/// create, a stop marker or a staged file is theirs.
+fn owner_counts_as_trusted(sid: &str) -> bool {
+    is_trusted(sid) || is_administrator(sid).unwrap_or(false)
+}
+
+/// The root is held open by handle from the start, without following a link
+/// and without letting anyone rename it; every entry below is checked on its
+/// own handle, link and location both, before its permissions are written.
+/// The low-level write propagates nothing by name, so the tree is walked here.
+fn lock_down(root: &Path, options: &Lockdown<'_>) -> Result<Vec<SetAside>, LockdownError> {
+    // Before anything is written, so a tree with a link stays as found.
     if let Some(link) = first_reparse_point(root).map_err(LockdownError::Failed)? {
         return Err(LockdownError::Link(link));
     }
-    let descriptor = SecurityDescriptor::from_sddl(sddl).map_err(LockdownError::Failed)?;
-    let (owner, dacl) = descriptor.owner_and_dacl().map_err(LockdownError::Failed)?;
-    let wide = wide(root.as_os_str());
-    // The root first, on its own: from then on nobody else can plant an entry
-    // directly under it, which narrows the window the recursive reset below
-    // leaves between the link scan and the reset.
-    // SAFETY: `wide` is a NUL-terminated path borrowed for the call; `owner`
-    // and `dacl` point into `descriptor`, which outlives it.
-    let status = unsafe {
-        SetNamedSecurityInfoW(
-            PCWSTR(wide.as_ptr()),
-            SE_FILE_OBJECT,
-            LOCKED_DOWN_INFO,
-            owner,
-            PSID::default(),
-            Some(dacl),
-            None,
-        )
-    };
-    if status != ERROR_SUCCESS {
-        return Err(failed_reset(root, status.0));
-    }
-    // SAFETY: as above; no progress callback.
-    let status = unsafe {
-        TreeResetNamedSecurityInfoW(
-            PCWSTR(wide.as_ptr()),
-            SE_FILE_OBJECT,
-            LOCKED_DOWN_INFO,
-            owner,
-            PSID::default(),
-            Some(dacl),
-            None,
-            BOOL(0),
-            None,
-            ProgressInvokeNever,
-            None,
-        )
-    };
-    if status != ERROR_SUCCESS {
-        return Err(failed_reset(root, status.0));
-    }
-    // A link that appeared during the reset is reported, so the caller does
-    // not take the tree for clean.
+    let pinned = open_root(root, options.set_owner)?;
+    let root_final = crate::pinned_file::final_path(&pinned)
+        .map_err(|e| failed(root, "resolve", &e.to_string()))?;
+    let passed = secure_root(&pinned, root, options)?;
+    // From here on nobody else can add an entry to the root.
     if let Some(link) = first_reparse_point(root).map_err(LockdownError::Failed)? {
         return Err(LockdownError::Link(link));
     }
-    Ok(())
+    let set_aside = match options.aside {
+        Some(aside) => set_aside_foreign(root, &root_final, aside, options)?,
+        None => Vec::new(),
+    };
+    let mut pending = children_of(root, &passed)?;
+    while let Some((path, inherited)) = pending.pop() {
+        let passed = secure_entry(&path, &root_final, &inherited, options)?;
+        if let Some(passed) = passed {
+            pending.extend(children_of(&path, &passed)?);
+        }
+    }
+    // A link that appeared meanwhile is reported, so the caller does not take
+    // the tree for clean.
+    if let Some(link) = first_reparse_point(root).map_err(LockdownError::Failed)? {
+        return Err(LockdownError::Link(link));
+    }
+    Ok(set_aside)
 }
 
-const LOCKED_DOWN_INFO: windows::Win32::Security::OBJECT_SECURITY_INFORMATION =
-    windows::Win32::Security::OBJECT_SECURITY_INFORMATION(
+/// Pinned: open without `FILE_SHARE_DELETE`, so it cannot be renamed and
+/// replaced while held. A handle someone else holds with delete access only
+/// loses the pin; the walk below still checks where every entry resolves.
+fn open_root(root: &Path, set_owner: bool) -> Result<std::fs::File, LockdownError> {
+    const ERROR_SHARING_VIOLATION: i32 = 32;
+    let opened = match open_entry(root, set_owner, false) {
+        Err(e) if e.raw_os_error() == Some(ERROR_SHARING_VIOLATION) => {
+            open_entry(root, set_owner, true)
+        }
+        other => other,
+    }
+    .map_err(|e| failed(root, "open", &e.to_string()))?;
+    let meta = opened
+        .metadata()
+        .map_err(|e| failed(root, "inspect", &e.to_string()))?;
+    if meta.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+        return Err(LockdownError::Link(root.to_path_buf()));
+    }
+    if !meta.is_dir() {
+        return Err(failed(root, "inspect", "not a directory"));
+    }
+    Ok(opened)
+}
+
+/// Opens the entry itself, never what a link at it points to.
+fn open_entry(path: &Path, set_owner: bool, share_delete: bool) -> std::io::Result<std::fs::File> {
+    use std::os::windows::fs::OpenOptionsExt;
+    const FILE_READ_ATTRIBUTES: u32 = 0x80;
+    const READ_CONTROL: u32 = 0x2_0000;
+    const FILE_SHARE_READ: u32 = 0x1;
+    const FILE_SHARE_WRITE: u32 = 0x2;
+    const FILE_SHARE_DELETE: u32 = 0x4;
+    const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+    const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+    let access =
+        // LIST_DIRECTORY (read data on a file) is data access, without which
+        // the share mode, and so the pin, is not enforced.
+        LIST_DIRECTORY | FILE_READ_ATTRIBUTES | READ_CONTROL | WRITE_DAC | if set_owner { WRITE_OWNER } else { 0 };
+    let share =
+        FILE_SHARE_READ | FILE_SHARE_WRITE | if share_delete { FILE_SHARE_DELETE } else { 0 };
+    std::fs::OpenOptions::new()
+        .access_mode(access)
+        .share_mode(share)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
+        .open(path)
+}
+
+/// Writes the root's descriptor unless it is already strict enough; returns
+/// what the root passes on to the entries below it.
+fn secure_root(
+    pinned: &std::fs::File,
+    root: &Path,
+    options: &Lockdown<'_>,
+) -> Result<Vec<Ace>, LockdownError> {
+    use nrr_platform_api::data_tree_access::{passed_on, plan_root, RootPlan};
+    let aces = match options.rule {
+        TreeRule::Program => program_aces(),
+        TreeRule::Service => {
+            let observed =
+                observe(pinned, options).map_err(|e| failed(root, "read permissions of", &e))?;
+            match plan_root(&observed) {
+                RootPlan::Keep => return Ok(aces_of(&passed_on(&observed.grants))),
+                RootPlan::Apply(grants) => aces_of(&grants),
+            }
+        }
+    };
+    let sddl = render(&aces, Rendered::Root, options);
+    write_descriptor(
+        pinned,
+        &sddl,
+        PROTECTED_DACL_SECURITY_INFORMATION.0,
+        options.set_owner,
+    )
+    .map_err(|e| failed(root, "reset permissions on", &e))?;
+    Ok(aces)
+}
+
+/// One entry below the root. `Some(passed on)` for a folder to walk into.
+fn secure_entry(
+    path: &Path,
+    root_final: &Path,
+    inherited: &[Ace],
+    options: &Lockdown<'_>,
+) -> Result<Option<Vec<Ace>>, LockdownError> {
+    use nrr_platform_api::data_tree_access::{passed_on, plan_entry, EntryPlan};
+    let entry = open_entry(path, options.set_owner, true)
+        .map_err(|e| failed(path, "open", &e.to_string()))?;
+    let meta = entry
+        .metadata()
+        .map_err(|e| failed(path, "inspect", &e.to_string()))?;
+    let resolved = crate::pinned_file::final_path(&entry)
+        .map_err(|e| failed(path, "resolve", &e.to_string()))?;
+    if meta.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+        || !crate::pinned_file::resolves_under(&resolved, root_final)
+    {
+        return Err(LockdownError::Link(path.to_path_buf()));
+    }
+    if options.rule == TreeRule::Service {
+        let observed =
+            observe(&entry, options).map_err(|e| failed(path, "read permissions of", &e))?;
+        if plan_entry(&observed, meta.is_dir()) == EntryPlan::Keep {
+            return Ok(meta.is_dir().then(|| aces_of(&passed_on(&observed.grants))));
+        }
+    }
+    let shape = if meta.is_dir() {
+        Rendered::Folder
+    } else {
+        Rendered::File
+    };
+    let sddl = render(inherited, shape, options);
+    write_descriptor(&entry, &sddl, UNPROTECTED_DACL_INFO, options.set_owner)
+        .map_err(|e| failed(path, "reset permissions on", &e))?;
+    Ok(meta.is_dir().then(|| inherited.to_vec()))
+}
+
+fn children_of(dir: &Path, passed: &[Ace]) -> Result<Vec<(PathBuf, Vec<Ace>)>, LockdownError> {
+    let entries = std::fs::read_dir(dir).map_err(|e| failed(dir, "list", &e.to_string()))?;
+    entries
+        .map(|entry| {
+            entry
+                .map(|entry| (entry.path(), passed.to_vec()))
+                .map_err(|e| failed(dir, "list", &e.to_string()))
+        })
+        .collect()
+}
+
+/// Moves every topmost entry below `root` that `trusted_owner` does not
+/// accept into `root\<aside>`. Runs after the root is locked, so nothing new
+/// can be planted meanwhile; the aside folder itself is never searched.
+fn set_aside_foreign(
+    root: &Path,
+    root_final: &Path,
+    aside: &str,
+    options: &Lockdown<'_>,
+) -> Result<Vec<SetAside>, LockdownError> {
+    let aside_dir = root.join(aside);
+    let mut foreign = Vec::new();
+    let mut pending: Vec<PathBuf> = children_of(root, &[])?
+        .into_iter()
+        .map(|(path, _)| path)
+        .filter(|path| *path != aside_dir)
+        .collect();
+    while let Some(path) = pending.pop() {
+        let descriptor = SecurityDescriptor::of_file(&path).map_err(LockdownError::Failed)?;
+        let (owner, _) = descriptor.owner_and_dacl().map_err(LockdownError::Failed)?;
+        let owner = sid_string(owner).map_err(LockdownError::Failed)?;
+        if !(options.trusted_owner)(&owner) {
+            foreign.push(path);
+        } else if std::fs::symlink_metadata(&path).is_ok_and(|meta| meta.is_dir()) {
+            pending.extend(children_of(&path, &[])?.into_iter().map(|(path, _)| path));
+        }
+    }
+    if foreign.is_empty() {
+        return Ok(Vec::new());
+    }
+    match std::fs::create_dir(&aside_dir) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+        Err(e) => return Err(failed(&aside_dir, "create", &e.to_string())),
+    }
+    let held = open_entry(&aside_dir, false, true)
+        .map_err(|e| failed(&aside_dir, "open", &e.to_string()))?;
+    let resolved = crate::pinned_file::final_path(&held)
+        .map_err(|e| failed(&aside_dir, "resolve", &e.to_string()))?;
+    let is_link = held
+        .metadata()
+        .map(|meta| meta.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 || !meta.is_dir())
+        .unwrap_or(true);
+    if is_link || !crate::pinned_file::resolves_under(&resolved, root_final) {
+        return Err(LockdownError::Link(aside_dir));
+    }
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |since| since.as_millis());
+    foreign
+        .into_iter()
+        .enumerate()
+        .map(|(index, from)| {
+            let name = from.file_name().map_or_else(
+                || "entry".to_string(),
+                |name| name.to_string_lossy().into_owned(),
+            );
+            let to = aside_dir.join(format!("{stamp}-{index}-{name}"));
+            std::fs::rename(&from, &to).map_err(|e| failed(&from, "set aside", &e.to_string()))?;
+            Ok(SetAside { from, to })
+        })
+        .collect()
+}
+
+fn failed(path: &Path, what: &str, detail: &str) -> LockdownError {
+    LockdownError::Failed(format!("{what} {}: {detail}", path.display()))
+}
+
+/// An allow entry as written: an SDDL account alias and its access mask.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Ace {
+    account: &'static str,
+    mask: u32,
+}
+
+const FILE_ALL_ACCESS: u32 = 0x1F_01FF;
+/// FILE_GENERIC_READ | FILE_GENERIC_EXECUTE.
+const READ_AND_EXECUTE: u32 = 0x12_00A9;
+
+/// Users may read and execute: the application and the console compare their
+/// own copy of the service binary with the one registered.
+fn program_aces() -> Vec<Ace> {
+    vec![
+        Ace {
+            account: "SY",
+            mask: FILE_ALL_ACCESS,
+        },
+        Ace {
+            account: "BA",
+            mask: FILE_ALL_ACCESS,
+        },
+        Ace {
+            account: "BU",
+            mask: READ_AND_EXECUTE,
+        },
+    ]
+}
+
+fn aces_of(grants: &[nrr_platform_api::data_tree_access::Grant]) -> Vec<Ace> {
+    use nrr_platform_api::data_tree_access::Principal;
+    grants
+        .iter()
+        .filter(|grant| !grant.deny)
+        .filter_map(|grant| {
+            let account = match grant.principal {
+                Principal::Service => "SY",
+                Principal::Administrators => "BA",
+                Principal::Other => return None,
+            };
+            Some(Ace {
+                account,
+                mask: mask_of(grant.rights),
+            })
+        })
+        .collect()
+}
+
+#[derive(Clone, Copy)]
+enum Rendered {
+    Root,
+    Folder,
+    File,
+}
+
+/// The descriptor as SDDL: the root protected and passing its entries on to
+/// files and folders, an entry below holding them as inherited.
+fn render(aces: &[Ace], shape: Rendered, options: &Lockdown<'_>) -> String {
+    let (control, flags) = match shape {
+        Rendered::Root => ("PAI", "OICI"),
+        Rendered::Folder => ("AI", "OICIID"),
+        Rendered::File => ("AI", "ID"),
+    };
+    let owner = if options.set_owner { "O:BA" } else { "" };
+    let entries: String = aces
+        .iter()
+        .map(|ace| {
+            let account = match ace.account {
+                "BA" => options.administrators,
+                other => other,
+            };
+            format!("(A;{flags};0x{:x};;;{account})", ace.mask)
+        })
+        .collect();
+    format!("{owner}D:{control}{entries}")
+}
+
+const UNPROTECTED_DACL_INFO: u32 = 0x2000_0000;
+
+/// `SetKernelObjectSecurity` on the open handle: it acts on that object alone
+/// and walks nothing by name.
+fn write_descriptor(
+    file: &std::fs::File,
+    sddl: &str,
+    protection: u32,
+    set_owner: bool,
+) -> Result<(), String> {
+    use std::os::windows::io::AsRawHandle;
+    use windows::Win32::Foundation::HANDLE;
+    use windows::Win32::Security::{SetKernelObjectSecurity, OBJECT_SECURITY_INFORMATION};
+    let descriptor = SecurityDescriptor::from_sddl(sddl)?;
+    let owner = if set_owner {
         OWNER_SECURITY_INFORMATION.0
-            | DACL_SECURITY_INFORMATION.0
-            | PROTECTED_DACL_SECURITY_INFORMATION.0,
-    );
+    } else {
+        0
+    };
+    let info = OBJECT_SECURITY_INFORMATION(owner | DACL_SECURITY_INFORMATION.0 | protection);
+    // SAFETY: the handle stays open for the borrow of `file`; the descriptor
+    // is valid and outlives the call.
+    unsafe { SetKernelObjectSecurity(HANDLE(file.as_raw_handle().cast()), info, descriptor.0) }
+        .map_err(|e| e.to_string())
+}
 
-fn failed_reset(root: &Path, status: u32) -> LockdownError {
-    LockdownError::Failed(format!(
-        "reset permissions on {}: Win32 error {status}",
-        root.display()
-    ))
+/// An entry's owner and DACL, read on its handle, in the neutral model.
+fn observe(
+    file: &std::fs::File,
+    options: &Lockdown<'_>,
+) -> Result<nrr_platform_api::data_tree_access::Observed, String> {
+    use nrr_platform_api::data_tree_access::{Grant, Observed, Principal, Rights};
+    use windows::Win32::Security::GetSecurityDescriptorControl;
+    const SE_DACL_PROTECTED: u16 = 0x1000;
+
+    let descriptor = SecurityDescriptor::of_handle(file)?;
+    let (owner, dacl) = descriptor.owner_and_dacl()?;
+    let mut control = 0u16;
+    let mut revision = 0u32;
+    // SAFETY: a valid descriptor and two fresh out-locals.
+    unsafe { GetSecurityDescriptorControl(descriptor.0, &mut control, &mut revision) }
+        .map_err(|e| format!("read control: {e}"))?;
+    let everyone_full = Grant {
+        principal: Principal::Other,
+        rights: Rights::FULL,
+        deny: false,
+        to_children: true,
+    };
+    let grants = if dacl.is_null() {
+        vec![everyone_full]
+    } else {
+        // SAFETY: `dacl` points into `descriptor`, alive for the call.
+        unsafe { grants_of(dacl, options.administrators) }?
+    };
+    Ok(Observed {
+        protected: control & SE_DACL_PROTECTED != 0,
+        owner_trusted: (options.trusted_owner)(&sid_string(owner)?),
+        grants,
+    })
+}
+
+/// Every entry of `dacl` in the neutral model. What the service and the
+/// administrators are allowed counts only when every bit of a class is there;
+/// what anyone else is allowed, and any denial, counts on a single bit. An
+/// entry of a kind not read here counts as full access for someone else.
+///
+/// # Safety
+///
+/// `dacl` must point at a valid ACL that outlives the call.
+unsafe fn grants_of(
+    dacl: *const ACL,
+    administrators: &str,
+) -> Result<Vec<nrr_platform_api::data_tree_access::Grant>, String> {
+    use nrr_platform_api::data_tree_access::{Grant, Principal, Rights};
+    const ACCESS_DENIED_ACE_TYPE: u8 = 1;
+    const OBJECT_INHERIT: u8 = 0x1;
+    const CONTAINER_INHERIT: u8 = 0x2;
+    const NO_PROPAGATE: u8 = 0x4;
+    let mut grants = Vec::new();
+    // SAFETY: each ACE pointer `GetAce` returns stays inside the valid ACL;
+    // allow and deny ACEs share the layout of `ACCESS_ALLOWED_ACE`.
+    unsafe {
+        for index in 0..u32::from((*dacl).AceCount) {
+            let mut ace = std::ptr::null_mut();
+            if GetAce(dacl, index, &mut ace).is_err() || ace.is_null() {
+                return Err("read DACL entry".to_string());
+            }
+            let entry = &*(ace as *const ACCESS_ALLOWED_ACE);
+            let kind = entry.Header.AceType;
+            if kind != ACCESS_ALLOWED_ACE_TYPE && kind != ACCESS_DENIED_ACE_TYPE {
+                grants.push(Grant {
+                    principal: Principal::Other,
+                    rights: Rights::FULL,
+                    deny: false,
+                    to_children: true,
+                });
+                continue;
+            }
+            let deny = kind == ACCESS_DENIED_ACE_TYPE;
+            let flags = entry.Header.AceFlags;
+            let sid = PSID(std::ptr::addr_of!(entry.SidStart) as *mut core::ffi::c_void);
+            let account = sid_string(sid)?;
+            let principal = if account.eq_ignore_ascii_case("S-1-5-18") {
+                Principal::Service
+            } else if account.eq_ignore_ascii_case(administrators) {
+                Principal::Administrators
+            } else {
+                Principal::Other
+            };
+            let inherit_only = u32::from(flags) & INHERIT_ONLY_ACE.0 != 0;
+            // An entry only passed on gives a trusted account nothing here.
+            if inherit_only && !deny && principal != Principal::Other {
+                continue;
+            }
+            let every_bit = !deny && principal != Principal::Other;
+            grants.push(Grant {
+                principal,
+                rights: rights_of(entry.Mask, every_bit),
+                deny,
+                to_children: flags & OBJECT_INHERIT != 0
+                    && flags & CONTAINER_INHERIT != 0
+                    && flags & NO_PROPAGATE == 0,
+            });
+        }
+    }
+    Ok(grants)
+}
+
+const READ_CONTROL_RIGHT: u32 = 0x2_0000;
+const READ_BITS: u32 = 0x1 | 0x8 | 0x80 | READ_CONTROL_RIGHT;
+const EXECUTE_BIT: u32 = 0x20;
+const CHANGE_BITS: u32 =
+    FILE_WRITE_DATA | FILE_APPEND_DATA | 0x10 | FILE_DELETE_CHILD | 0x100 | DELETE;
+const CONTROL_BITS: u32 = WRITE_DAC | WRITE_OWNER;
+const SYNCHRONIZE: u32 = 0x10_0000;
+
+fn rights_of(mask: u32, every_bit: bool) -> nrr_platform_api::data_tree_access::Rights {
+    use nrr_platform_api::data_tree_access::Rights;
+    const GENERIC_READ: u32 = 0x8000_0000;
+    const GENERIC_EXECUTE: u32 = 0x2000_0000;
+    const MAXIMUM_ALLOWED: u32 = 0x0200_0000;
+    const ACCESS_SYSTEM_SECURITY: u32 = 0x0100_0000;
+    let mut bits = mask;
+    if mask & (GENERIC_ALL | MAXIMUM_ALLOWED) != 0 {
+        bits |= FILE_ALL_ACCESS;
+    }
+    if mask & GENERIC_READ != 0 {
+        bits |= READ_BITS | SYNCHRONIZE;
+    }
+    if mask & GENERIC_WRITE != 0 {
+        bits |= FILE_WRITE_DATA | FILE_APPEND_DATA | 0x10 | 0x100 | READ_CONTROL_RIGHT;
+    }
+    if mask & GENERIC_EXECUTE != 0 {
+        bits |= EXECUTE_BIT | 0x80 | READ_CONTROL_RIGHT;
+    }
+    let class = |of: u32| {
+        if every_bit {
+            bits & of == of
+        } else {
+            bits & of != 0
+        }
+    };
+    let mut rights = Rights::NONE;
+    if class(READ_BITS) || (!every_bit && bits & EXECUTE_BIT != 0) {
+        rights = rights.union(Rights::READ);
+    }
+    let unknown = bits
+        & !(READ_BITS | EXECUTE_BIT | CHANGE_BITS | CONTROL_BITS | SYNCHRONIZE)
+        & !(GENERIC_ALL | GENERIC_READ | GENERIC_WRITE | GENERIC_EXECUTE | MAXIMUM_ALLOWED);
+    if class(CHANGE_BITS) || (!every_bit && unknown != 0) {
+        rights = rights.union(Rights::CHANGE);
+    }
+    if class(CONTROL_BITS) || (!every_bit && bits & ACCESS_SYSTEM_SECURITY != 0) {
+        rights = rights.union(Rights::CONTROL);
+    }
+    rights
+}
+
+fn mask_of(rights: nrr_platform_api::data_tree_access::Rights) -> u32 {
+    use nrr_platform_api::data_tree_access::Rights;
+    if rights.contains(Rights::FULL) {
+        return FILE_ALL_ACCESS;
+    }
+    let mut mask = 0;
+    if rights.contains(Rights::READ) {
+        mask |= READ_AND_EXECUTE;
+    }
+    if rights.contains(Rights::CHANGE) {
+        mask |= CHANGE_BITS | SYNCHRONIZE | READ_CONTROL_RIGHT;
+    }
+    if rights.contains(Rights::CONTROL) {
+        mask |= CONTROL_BITS | READ_CONTROL_RIGHT;
+    }
+    mask
 }
 
 /// Whether `path` is owned by SYSTEM, Administrators or TrustedInstaller.
@@ -312,17 +898,24 @@ pub fn first_reparse_point(root: &Path) -> Result<Option<PathBuf>, String> {
 /// The first account outside [`TRUSTED_SIDS`] that owns `path` or is allowed
 /// any of `rights` on it.
 fn untrusted_rights(path: &Path, rights: u32) -> Result<Option<String>, String> {
-    let descriptor = SecurityDescriptor::of_file(path)?;
+    untrusted_rights_in(&SecurityDescriptor::of_file(path)?, rights, &is_trusted)
+}
+
+fn untrusted_rights_in(
+    descriptor: &SecurityDescriptor,
+    rights: u32,
+    trusted: &dyn Fn(&str) -> bool,
+) -> Result<Option<String>, String> {
     let (owner, dacl) = descriptor.owner_and_dacl()?;
     let owner_sid = sid_string(owner)?;
-    if !is_trusted(&owner_sid) {
+    if !trusted(&owner_sid) {
         return Ok(Some(format!("its owner {owner_sid}")));
     }
     if dacl.is_null() {
         return Ok(Some("everyone (no DACL)".to_string()));
     }
     // SAFETY: `dacl` points into `descriptor`, alive for the call.
-    unsafe { first_allowed(dacl, rights, &|sid| !is_trusted(sid)) }
+    unsafe { first_allowed(dacl, rights, &|sid| !trusted(sid)) }
 }
 
 /// Groups every account that signs in belongs to: Everyone, Authenticated
@@ -343,7 +936,10 @@ const ADDS_PROGRAMS: u32 =
 /// Whether a group every account belongs to may add files or folders to
 /// `dir`, as `C:\Users\Public` and most of `C:\ProgramData` let Users do.
 pub fn open_to_everyone(dir: &Path) -> Result<bool, String> {
-    let descriptor = SecurityDescriptor::of_file(dir)?;
+    open_to_everyone_in(&SecurityDescriptor::of_file(dir)?)
+}
+
+fn open_to_everyone_in(descriptor: &SecurityDescriptor) -> Result<bool, String> {
     let (_, dacl) = descriptor.owner_and_dacl()?;
     if dacl.is_null() {
         return Ok(true);
@@ -417,14 +1013,6 @@ const LIST_DIRECTORY: u32 = 0x1;
 /// Whether the account `sid` may list `dir`, judged by the folder's own DACL
 /// for that account and the groups the system resolves for it.
 pub fn sid_may_list(dir: &Path, sid: &str) -> Result<bool, String> {
-    use windows::Win32::Foundation::LUID;
-    use windows::Win32::Security::Authorization::{
-        AuthzAccessCheck, AuthzFreeContext, AuthzFreeResourceManager,
-        AuthzInitializeContextFromSid, AuthzInitializeResourceManager, ConvertStringSidToSidW,
-        AUTHZ_ACCESS_CHECK_FLAGS, AUTHZ_ACCESS_REPLY, AUTHZ_ACCESS_REQUEST,
-        AUTHZ_AUDIT_EVENT_HANDLE, AUTHZ_CLIENT_CONTEXT_HANDLE, AUTHZ_RESOURCE_MANAGER_HANDLE,
-        AUTHZ_RM_FLAG_NO_AUDIT,
-    };
     use windows::Win32::Security::GROUP_SECURITY_INFORMATION;
 
     let wide_path = wide(dir.as_os_str());
@@ -446,7 +1034,28 @@ pub fn sid_may_list(dir: &Path, sid: &str) -> Result<bool, String> {
     if status != ERROR_SUCCESS {
         return Err(format!("read permissions: Win32 error {}", status.0));
     }
-    let descriptor = SecurityDescriptor(raw);
+    sid_granted(&SecurityDescriptor(raw), sid, LIST_DIRECTORY)
+}
+
+/// Whether the account `sid` belongs to Administrators, as the system resolves
+/// its groups — not whether a process of it runs elevated.
+pub fn is_administrator(sid: &str) -> Result<bool, String> {
+    const PROBE: u32 = 0x1;
+    let only_administrators = SecurityDescriptor::from_sddl("O:SYG:SYD:(A;;0x1;;;BA)")?;
+    sid_granted(&only_administrators, sid, PROBE)
+}
+
+/// Whether `descriptor` grants the account `sid` every bit of `desired`.
+fn sid_granted(descriptor: &SecurityDescriptor, sid: &str, desired: u32) -> Result<bool, String> {
+    use windows::Win32::Foundation::LUID;
+    use windows::Win32::Security::Authorization::{
+        AuthzAccessCheck, AuthzFreeContext, AuthzFreeResourceManager,
+        AuthzInitializeContextFromSid, AuthzInitializeResourceManager, ConvertStringSidToSidW,
+        AUTHZ_ACCESS_CHECK_FLAGS, AUTHZ_ACCESS_REPLY, AUTHZ_ACCESS_REQUEST,
+        AUTHZ_AUDIT_EVENT_HANDLE, AUTHZ_CLIENT_CONTEXT_HANDLE, AUTHZ_RESOURCE_MANAGER_HANDLE,
+        AUTHZ_RM_FLAG_NO_AUDIT,
+    };
+
     let wide_sid = wide(OsStr::new(sid));
     let mut account = PSID::default();
     // SAFETY: NUL-terminated input; the SID is LocalAlloc'd and freed below.
@@ -479,7 +1088,7 @@ pub fn sid_may_list(dir: &Path, sid: &str) -> Result<bool, String> {
         })
         .and_then(|()| {
             let request = AUTHZ_ACCESS_REQUEST {
-                DesiredAccess: LIST_DIRECTORY,
+                DesiredAccess: desired,
                 ..AUTHZ_ACCESS_REQUEST::default()
             };
             let mut mask = 0u32;
@@ -500,7 +1109,7 @@ pub fn sid_may_list(dir: &Path, sid: &str) -> Result<bool, String> {
                 &mut reply,
                 None,
             )
-            .map(|()| error == 0 && mask & LIST_DIRECTORY != 0)
+            .map(|()| error == 0 && mask & desired == desired)
         });
         if !context.is_invalid() {
             let _ = AuthzFreeContext(context);
@@ -559,6 +1168,32 @@ impl SecurityDescriptor {
                 path.display(),
                 status.0
             ));
+        }
+        Ok(Self(descriptor))
+    }
+
+    /// The owner and DACL of the object an open handle holds.
+    fn of_handle(file: &std::fs::File) -> Result<Self, String> {
+        use std::os::windows::io::AsRawHandle;
+        use windows::Win32::Foundation::HANDLE;
+        use windows::Win32::Security::Authorization::GetSecurityInfo;
+        let mut descriptor = PSECURITY_DESCRIPTOR::default();
+        // SAFETY: the handle stays open for the borrow of `file`; the
+        // descriptor is LocalAlloc'd and owned by the returned value.
+        let status = unsafe {
+            GetSecurityInfo(
+                HANDLE(file.as_raw_handle().cast()),
+                SE_FILE_OBJECT,
+                OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION,
+                None,
+                None,
+                None,
+                None,
+                Some(&mut descriptor),
+            )
+        };
+        if status != ERROR_SUCCESS {
+            return Err(format!("read permissions: Win32 error {}", status.0));
         }
         Ok(Self(descriptor))
     }
@@ -669,16 +1304,47 @@ mod tests {
     }
 
     #[test]
-    fn a_file_a_user_could_have_placed_has_an_untrusted_author_and_a_system_file_does_not() {
-        assert_eq!(
-            untrusted_author(&crate::system_shell::system32_exe("cmd.exe")),
-            Ok(None)
-        );
+    fn a_file_a_user_could_have_placed_is_refused_and_a_system_file_is_opened() {
+        let system = crate::system_shell::system32_exe("icacls.exe");
+        assert!(matches!(open_admin_authored(&system), Ok(Some(_))));
         let dir = tempfile::tempdir().expect("tempdir");
         let sheet = dir.path().join("first-run.json");
         std::fs::write(&sheet, b"{}").expect("write");
         own_by_this_user(dir.path());
-        assert!(untrusted_author(&sheet).expect("readable").is_some());
+        assert!(open_admin_authored(&sheet).is_err());
+        assert!(matches!(
+            open_admin_authored(&dir.path().join("absent.json")),
+            Ok(None)
+        ));
+    }
+
+    /// The folder reached through a junction is not the folder named: what
+    /// was judged would not be what is read.
+    #[test]
+    fn a_sheet_reached_through_a_junction_is_refused() {
+        let target = tempfile::tempdir().expect("tempdir");
+        std::fs::write(target.path().join("first-run.json"), b"{}").expect("write");
+        let holder = tempfile::tempdir().expect("tempdir");
+        let link = holder.path().join("NetRuleRouter");
+        let made = std::process::Command::new(crate::system_shell::system32_exe("cmd.exe"))
+            .args(["/C", "mklink", "/J"])
+            .arg(&link)
+            .arg(target.path())
+            .output()
+            .expect("run mklink");
+        if !made.status.success() {
+            return; // Junctions need no privilege, but a locked-down host may refuse.
+        }
+        // Only the groups everyone belongs to count as ordinary here, so the
+        // chain through this account's profile passes and only the junction
+        // is left to refuse.
+        let trusted = |sid: &str| !ANYONE_SIDS.iter().any(|a| a.eq_ignore_ascii_case(sid));
+        let through_link = open_trusting(&link.join("first-run.json"), &trusted);
+        let direct = open_trusting(&target.path().join("first-run.json"), &trusted);
+        let _ = std::fs::remove_dir(&link);
+        let why = through_link.expect_err("refused");
+        assert!(why.contains("is a link"), "{why}");
+        assert!(matches!(direct, Ok(Some(_))), "{direct:?}");
     }
 
     #[test]
@@ -761,5 +1427,256 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         std::fs::create_dir_all(dir.path().join("logs").join("inner")).expect("mkdir");
         assert_eq!(first_reparse_point(dir.path()), Ok(None));
+    }
+
+    const USERS: &str = "S-1-5-32-545";
+
+    fn me() -> String {
+        crate::win32_ffi::console_session::current_process_user_sid().expect("own SID")
+    }
+
+    /// Who owns a file this run just made: the account itself, or
+    /// Administrators when the run is elevated.
+    fn owner_of(path: &Path) -> String {
+        let descriptor = SecurityDescriptor::of_file(path).expect("readable");
+        let (owner, _) = descriptor.owner_and_dacl().expect("owner");
+        sid_string(owner).expect("owner SID")
+    }
+
+    fn icacls(path: &Path, args: &[&str]) {
+        let done = std::process::Command::new(crate::system_shell::system32_exe("icacls.exe"))
+            .arg(path)
+            .args(args)
+            .output()
+            .expect("run icacls");
+        assert!(done.status.success(), "icacls {args:?}: {done:?}");
+    }
+
+    /// The lockdown as an unelevated run can carry it out: its own account
+    /// stands in for Administrators, and owners stay as they are.
+    fn lock_down_as_me(
+        root: &Path,
+        aside: Option<&str>,
+        trusted_owner: &dyn Fn(&str) -> bool,
+    ) -> Result<Vec<SetAside>, LockdownError> {
+        let me = me();
+        let options = Lockdown {
+            rule: TreeRule::Service,
+            set_owner: false,
+            aside,
+            trusted_owner,
+            administrators: &me,
+        };
+        lock_down(root, &options)
+    }
+
+    /// Every account an allow entry on `path` names, inherited ones included.
+    fn allowed_accounts(path: &Path) -> Vec<String> {
+        let descriptor = SecurityDescriptor::of_file(path).expect("readable");
+        let (_, dacl) = descriptor.owner_and_dacl().expect("DACL");
+        let found = std::cell::RefCell::new(Vec::new());
+        // SAFETY: `dacl` points into `descriptor`, alive for the call.
+        let _ = unsafe {
+            first_allowed(dacl, u32::MAX, &|sid| {
+                found.borrow_mut().push(sid.to_ascii_uppercase());
+                false
+            })
+        };
+        found.into_inner()
+    }
+
+    fn is_protected(path: &Path) -> bool {
+        use windows::Win32::Security::GetSecurityDescriptorControl;
+        let descriptor = SecurityDescriptor::of_file(path).expect("readable");
+        let (mut control, mut revision) = (0u16, 0u32);
+        // SAFETY: a valid descriptor and two fresh out-locals.
+        unsafe { GetSecurityDescriptorControl(descriptor.0, &mut control, &mut revision) }
+            .expect("control");
+        control & 0x1000 != 0
+    }
+
+    /// A data folder inherits from ProgramData the right of every user to
+    /// create files in it; after the lockdown nobody but the service and the
+    /// administrators has any entry anywhere in it, and it inherits nothing.
+    #[test]
+    fn a_folder_users_could_plant_files_in_is_closed_to_them_and_cut_from_its_parent() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path().join("NetRuleRouter");
+        let state = root.join("nrr_service_state.db");
+        let log = root.join("logs").join("service.log");
+        std::fs::create_dir_all(log.parent().expect("parent")).expect("mkdir");
+        std::fs::write(&state, b"rules").expect("write");
+        std::fs::write(&log, b"line").expect("write");
+        icacls(
+            &root,
+            &["/grant", &format!("*{USERS}:(OI)(CI)(WD,AD)"), "/Q"],
+        );
+        icacls(&state, &["/grant", &format!("*{USERS}:(M)"), "/Q"]);
+        assert_eq!(open_to_everyone(&root), Ok(true), "users may plant files");
+
+        lock_down_as_me(&root, None, &|_| true).expect("locked down");
+
+        assert_eq!(open_to_everyone(&root), Ok(false));
+        assert!(
+            is_protected(&root),
+            "the root still inherits from its parent"
+        );
+        for path in [&root, &state, &root.join("logs"), &log] {
+            let accounts = allowed_accounts(path);
+            assert!(
+                !accounts.contains(&USERS.to_string()),
+                "{path:?}: {accounts:?}"
+            );
+            assert!(
+                accounts.contains(&"S-1-5-18".to_string()),
+                "{path:?}: {accounts:?}"
+            );
+        }
+        assert_eq!(std::fs::read(&state).expect("readable"), b"rules");
+    }
+
+    /// The lockdown runs at every start; a file narrowed to the service alone
+    /// must not be opened back up to administrators by the next one.
+    #[test]
+    fn a_file_sealed_tighter_than_the_tree_keeps_its_seal() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path().join("NetRuleRouter");
+        let sealed = root.join("sealed.bin");
+        std::fs::create_dir_all(&root).expect("mkdir");
+        std::fs::write(&sealed, b"secret").expect("write");
+        // Administrators (this account, here) may read it and change its
+        // permissions, never its contents.
+        let me = me();
+        icacls(
+            &sealed,
+            &[
+                "/inheritance:r",
+                "/grant:r",
+                "*S-1-5-18:F",
+                &format!("*{me}:(RX,WDAC)"),
+                "/Q",
+            ],
+        );
+        let before = dacl_sddl(&sealed);
+
+        lock_down_as_me(&root, None, &|_| true).expect("locked down");
+
+        assert_eq!(dacl_sddl(&sealed), before);
+        assert!(before.starts_with("D:P"), "{before}");
+    }
+
+    fn dacl_sddl(path: &Path) -> String {
+        use windows::Win32::Security::Authorization::ConvertSecurityDescriptorToStringSecurityDescriptorW;
+        let descriptor = SecurityDescriptor::of_file(path).expect("readable");
+        let mut raw = PWSTR::null();
+        // SAFETY: a valid descriptor; the string is LocalAlloc'd and freed after
+        // it is copied.
+        unsafe {
+            ConvertSecurityDescriptorToStringSecurityDescriptorW(
+                descriptor.0,
+                SDDL_REVISION_1,
+                DACL_SECURITY_INFORMATION,
+                &mut raw,
+                None,
+            )
+            .expect("SDDL");
+            let text = raw.to_string().expect("UTF-16");
+            let _ = LocalFree(HLOCAL(raw.0.cast()));
+            text
+        }
+    }
+
+    /// A data root swapped for a junction would carry the reset to wherever it
+    /// points; the target must come out exactly as it was.
+    #[test]
+    fn a_link_in_place_of_the_root_is_refused_and_its_target_left_alone() {
+        let target = tempfile::tempdir().expect("tempdir");
+        let file = target.path().join("other.txt");
+        std::fs::write(&file, b"x").expect("write");
+        icacls(
+            target.path(),
+            &["/grant", &format!("*{USERS}:(OI)(CI)(WD,AD)"), "/Q"],
+        );
+        let before = (allowed_accounts(target.path()), allowed_accounts(&file));
+        let holder = tempfile::tempdir().expect("tempdir");
+        let link = holder.path().join("NetRuleRouter");
+        let made = std::process::Command::new(crate::system_shell::system32_exe("cmd.exe"))
+            .args(["/C", "mklink", "/J"])
+            .arg(&link)
+            .arg(target.path())
+            .output()
+            .expect("run mklink");
+        if !made.status.success() {
+            return; // Junctions need no privilege, but a locked-down host may refuse.
+        }
+
+        let outcome = lock_down_as_me(&link, Some("set-aside"), &|_| true);
+
+        let after = (allowed_accounts(target.path()), allowed_accounts(&file));
+        let _ = std::fs::remove_dir(&link);
+        assert_eq!(outcome, Err(LockdownError::Link(link.clone())));
+        assert_eq!(after, before);
+    }
+
+    /// Before the lockdown any account could put a file or folder into the
+    /// tree; the reset makes Administrators the owner of everything, so a
+    /// planted answer sheet or staged file would then pass for an
+    /// administrator's. It is moved out of use first, and only once.
+    #[test]
+    fn what_another_account_planted_is_set_aside_not_adopted() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path().join("NetRuleRouter");
+        let sheet = root.join("first-run.json");
+        let staged = root.join("provision").join("rules_primary.txt");
+        std::fs::create_dir_all(staged.parent().expect("parent")).expect("mkdir");
+        std::fs::write(&sheet, b"{}").expect("write");
+        std::fs::write(&staged, b"example.com").expect("write");
+        let planter = owner_of(&sheet);
+        let not_planter = |sid: &str| !sid.eq_ignore_ascii_case(&planter);
+
+        let moved = lock_down_as_me(&root, Some("set-aside"), &not_planter).expect("locked down");
+
+        let mut from: Vec<_> = moved.iter().map(|entry| entry.from.clone()).collect();
+        from.sort();
+        assert_eq!(from, vec![sheet.clone(), root.join("provision")]);
+        assert!(!sheet.exists() && !staged.exists());
+        for entry in &moved {
+            assert!(entry.to.starts_with(root.join("set-aside")), "{entry:?}");
+            assert!(entry.to.exists(), "{entry:?}");
+        }
+        assert_eq!(
+            lock_down_as_me(&root, Some("set-aside"), &not_planter),
+            Ok(Vec::new()),
+            "what was set aside is not moved again"
+        );
+    }
+
+    /// A copy of the program in a folder the user owns — a download, a desktop
+    /// folder — must not seed the setup from a sheet left beside it.
+    #[test]
+    fn a_sheet_beside_a_program_in_a_users_own_folder_is_not_believed() {
+        use nrr_platform_api::admin_authored::AdminAuthoredFiles;
+        use nrr_shared::first_run_sheet::{search, PROVISIONING_FILE_NAME};
+        let install = tempfile::tempdir().expect("tempdir");
+        std::fs::write(
+            install.path().join(PROVISIONING_FILE_NAME),
+            r#"{"leak-protection":"off","doh-lockdown":false,"fake-ip":false,"rule-set":"none"}"#,
+        )
+        .expect("write");
+        own_by_this_user(install.path());
+        let candidates = nrr_platform_api::paths::first_run_sheet_candidates(Some(install.path()));
+
+        let outcome = search(&candidates, &|path| {
+            WindowsAdminAuthoredFiles.open_admin_authored(path)
+        });
+
+        assert_eq!(outcome.found, None);
+        assert_eq!(outcome.ignored.len(), 1, "{:?}", outcome.ignored);
+    }
+
+    #[test]
+    fn an_administrator_account_is_told_apart_from_an_ordinary_one() {
+        assert_eq!(is_administrator("S-1-5-18"), Ok(true));
+        assert_eq!(is_administrator(USERS), Ok(false));
     }
 }

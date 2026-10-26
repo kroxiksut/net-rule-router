@@ -28,19 +28,27 @@ pub fn load(app: &mut AppState) {
             call(client, IpcOperationName::BlockNoticeMutesList, &json!({}));
         Reply::new(move |app| {
             if let Some(mutes) = answer.ok().and_then(|a| a.get("mutes").cloned()) {
-                app.notice_mutes.mutes = mutes;
+                set(app, mutes);
             }
         })
     }));
 }
 
+/// The mutes as just read or written. A notice of a kind now silenced leaves
+/// the feed, as the window's card does.
+pub fn set(app: &mut AppState, mutes: Value) {
+    app.notice_mutes.mutes = mutes;
+    let now = app.settings.clock.now();
+    let silenced = &app.notice_mutes.mutes;
+    app.notices.retain(|n| match n.about {
+        crate::feed::About::Kind(kind) => !notice_kind_muted(silenced, kind, now),
+        _ => true,
+    });
+}
+
 /// Whether notices of `kind` are silenced now.
 pub fn muted(app: &AppState, kind: &str) -> bool {
-    notice_kind_muted(
-        &app.notice_mutes.mutes,
-        kind,
-        chrono::Utc::now().timestamp_millis(),
-    )
+    notice_kind_muted(&app.notice_mutes.mutes, kind, app.settings.clock.now())
 }
 
 #[cfg(test)]
@@ -106,6 +114,27 @@ mod tests {
         drain(&mut app, &fake);
         app.apply(tunnel_found(), &texts_en(), Instant::now());
         assert_eq!(app.notice_count, before + 1);
+    }
+
+    /// The user answered "don't show again" on a link that keeps dropping: the
+    /// next report of it stays out of the feed.
+    #[test]
+    fn a_silenced_link_that_keeps_dropping_stays_out_of_the_feed() {
+        let (mut app, _) = connected(json!([
+            { "scope": { "kind": "notice", "notice": "link-keeps-dropping" } }
+        ]));
+        let before = app.notice_count;
+        app.apply(
+            BackendEvent::Push(PushEvent::Status(Box::new(
+                StatusUpdateEvent::LinkKeepsDropping {
+                    sid: "S".into(),
+                    role: "primary".into(),
+                },
+            ))),
+            &texts_en(),
+            Instant::now(),
+        );
+        assert_eq!(app.notice_count, before);
     }
 
     #[test]

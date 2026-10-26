@@ -29,6 +29,7 @@ pub(crate) fn settings_from_preferences(preferences: &UiPreferences) -> UserSett
         service_intent: intent_object(&preferences.service_intent_json),
         accepted_eula: preferences.accepted_eula_version,
         merge_policy: preferences.merge_conflict_policy.clone(),
+        window_parked: intent_object(&preferences.route_pending_offline_json),
         ..UserSettings::default()
     };
     let bound = |path: &Option<String>| path.as_deref().unwrap_or_default().to_owned();
@@ -481,6 +482,12 @@ pub(crate) fn open_session_in(
                         }
                     });
                 }
+                // The window owns what it parked: a copy left from a session
+                // that ended before it published is not shown as waiting.
+                let parked = intent_object(&preferences.route_pending_offline_json);
+                if outcome.settings.window_parked != parked {
+                    let _ = store.update(|settings| settings.window_parked = parked);
+                }
             }
             Some(UserSettingsMirror::new(store, preferences))
         }
@@ -571,6 +578,45 @@ mod tests {
         assert_eq!(prefs.selected_preset_set, "bundled:ru_basic");
         assert_eq!(prefs.merge_conflict_policy, "service-wins");
         assert_eq!(prefs.service_intent_json, "", "an empty intent is none");
+    }
+
+    /// The terminal shows what the window parked for a stopped service, so the
+    /// shared file carries it while parked and drops it once sent; a stale copy
+    /// from an earlier session is replaced by the window's own.
+    #[test]
+    fn work_the_window_parked_reaches_the_shared_file_and_leaves_it_when_sent() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        store_in(&dir)
+            .update(|s| {
+                s.window_parked = serde_json::json!({ "stability": { "stale": 1 } })
+                    .as_object()
+                    .cloned()
+                    .unwrap_or_default();
+            })
+            .expect("seed");
+        let mut prefs = preferences();
+        let mut mirror = open_session_in(store_in(&dir), &mut prefs, true).expect("mirror");
+        let parked = |dir: &tempfile::TempDir| {
+            store_in(dir)
+                .load()
+                .expect("load")
+                .expect("file")
+                .window_parked
+        };
+        assert!(
+            parked(&dir).is_empty(),
+            "a stale copy stayed: {:?}",
+            parked(&dir)
+        );
+
+        prefs.route_pending_offline_json =
+            r#"{"route-policy":{"mode":"prefer-secondary"},"parked-at-ms":5}"#.to_string();
+        mirror.publish(&prefs).expect("publish");
+        assert_eq!(parked(&dir)["route-policy"]["mode"], "prefer-secondary");
+
+        prefs.route_pending_offline_json.clear();
+        mirror.publish(&prefs).expect("publish");
+        assert!(parked(&dir).is_empty(), "sent work still shown as waiting");
     }
 
     #[test]

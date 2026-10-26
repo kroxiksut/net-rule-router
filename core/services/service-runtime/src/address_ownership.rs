@@ -54,6 +54,7 @@ use std::net::{IpAddr, Ipv4Addr};
 use std::sync::OnceLock;
 
 use nrr_domain::canonical::{CanonicalAddressMatch, CanonicalRuleBook, CanonicalRuleSet};
+use nrr_domain::decision_matching::zone_ranks_as_suffix;
 use nrr_domain::rule_shape::{rule_verdict, RuleShapeSupport};
 use nrr_domain::RuleAction;
 use nrr_shared::ip_block::IpBlock;
@@ -674,11 +675,37 @@ impl AddressOwnership {
 /// The order is the engine's evaluation order — exact FQDN, then suffix, then
 /// zone — so the link whose rule is more specific carries the host. Within a
 /// kind, more labels is more specific: `corp.intra` beats `intra`.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum NameClaim {
     Zone(usize),
     Suffix(usize),
+    /// A zone of several labels: a suffix without its apex, so narrower than
+    /// an equally long suffix and wider than a longer one.
+    SiteZone(usize),
     ExactFqdn,
+}
+
+impl NameClaim {
+    fn key(self) -> (u8, usize) {
+        match self {
+            Self::Zone(labels) => (0, labels),
+            Self::Suffix(labels) => (1, 2 * labels),
+            Self::SiteZone(labels) => (1, 2 * labels + 1),
+            Self::ExactFqdn => (2, 0),
+        }
+    }
+}
+
+impl Ord for NameClaim {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.key().cmp(&other.key())
+    }
+}
+
+impl PartialOrd for NameClaim {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
 }
 
 /// Where an exact-IP rule sits against a zone rule.
@@ -747,7 +774,8 @@ fn host_rank(claim: NameClaim, order: ZoneVsIpOrder) -> ClaimRank {
             ZoneVsIpOrder::ExactIpFirst => (0, labels),
             ZoneVsIpOrder::ZoneFirst => (2, labels),
         },
-        NameClaim::Suffix(labels) => (3, labels),
+        NameClaim::Suffix(labels) => (3, 2 * labels),
+        NameClaim::SiteZone(labels) => (3, 2 * labels + 1),
         NameClaim::ExactFqdn => (4, 0),
     }
 }
@@ -776,11 +804,22 @@ fn block_rank(
         }
         CanonicalAddressMatch::ExactFqdn(_) => NameClaim::ExactFqdn,
         CanonicalAddressMatch::SuffixDomain(s) => NameClaim::Suffix(label_count(s)),
-        CanonicalAddressMatch::Zone(z) => NameClaim::Zone(label_count(z)),
+        CanonicalAddressMatch::Zone(z) => zone_claim(z, None),
         // Carried by its `*.site.<zone>` twins (`any_zone_sites`).
         CanonicalAddressMatch::AnyZoneDomain(_) => return None,
     };
     Some(host_rank(own, order))
+}
+
+/// The addresses the takeover setting never hands to a program: those an
+/// enabled literal-IP Block names, as [`AddressOwnership::with_app_takeover`]
+/// skips them. For readers that hold a program's addresses without an arbiter.
+#[must_use]
+pub fn app_takeover_vetoes(
+    rule_book: &CanonicalRuleBook,
+    support: RuleShapeSupport,
+) -> HashSet<IpAddr> {
+    literal_blocks(rule_book, support).into_keys().collect()
 }
 
 /// Enabled literal-IP Blocks on either link, the smallest rule id per address.
@@ -824,6 +863,25 @@ fn literal_rank(order: ZoneVsIpOrder) -> ClaimRank {
 
 fn label_count(name: &str) -> usize {
     name.split('.').filter(|l| !l.is_empty()).count()
+}
+
+/// A zone of several labels claims its subtree as a suffix rule does, less
+/// its apex — unless its own set (when known) holds `*.` of its name, which
+/// claims the same hosts.
+fn zone_claim(
+    zone: &str,
+    own: Option<(
+        &CanonicalRuleSet,
+        &Option<nrr_domain::canonical::CanonicalAppMatch>,
+    )>,
+) -> NameClaim {
+    if !zone_ranks_as_suffix(zone) {
+        return NameClaim::Zone(label_count(zone));
+    }
+    match own {
+        Some((set, app)) if set.holds_suffix(zone, app) => NameClaim::Suffix(label_count(zone)),
+        _ => NameClaim::SiteZone(label_count(zone)),
+    }
 }
 
 /// What one rule set's route rules claim.
@@ -873,7 +931,7 @@ fn name_claims(
                 }
             }
             Some(CanonicalAddressMatch::Zone(zone)) => {
-                let c = NameClaim::Zone(label_count(zone));
+                let c = zone_claim(zone, Some((rules, &rule.app_match)));
                 for sub in cache.hostnames_under_suffix(zone, SUFFIX_FANOUT_BACKSTOP) {
                     claim(&mut names, sub, c);
                 }
@@ -1136,6 +1194,9 @@ pub enum AppDestinationRefusal {
     /// A process none of the rule set's own application rules name is already
     /// using it, and a host route moves every process on the address.
     UsedByOtherProcess,
+    /// Shared with a direct host, and the shared-address policy keeps it off
+    /// the additional link. That policy reports it.
+    DeclinedShared,
 }
 
 /// Destinations one application rule may take, and the ones it may not.
@@ -1147,6 +1208,49 @@ pub enum AppDestinationRefusal {
 pub struct AppDestinations {
     pub admitted: Vec<Ipv4Addr>,
     pub refused: Vec<(Ipv4Addr, AppDestinationRefusal)>,
+}
+
+/// Why an application rule whose program is found carries none of its traffic.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AppTrafficElsewhere {
+    /// The user's address rules name the addresses it uses, and they win.
+    NamedByAddressRules,
+    /// Other programs or sites use the same addresses, so moving them would
+    /// move those too.
+    SharedWithOthers,
+}
+
+impl AppTrafficElsewhere {
+    /// The wire slug of `unrouted-app-rules`.
+    #[must_use]
+    pub const fn slug(self) -> &'static str {
+        match self {
+            Self::NamedByAddressRules => "addresses-named-by-rules",
+            Self::SharedWithOthers => "addresses-shared",
+        }
+    }
+}
+
+impl AppDestinations {
+    /// Why the rule takes none of the program's traffic: it was seen using
+    /// addresses and every one went elsewhere. `None` while the rule takes any
+    /// address, or before the program was seen. The user's own address rules
+    /// are named first: that is the reason they can act on.
+    #[must_use]
+    pub fn none_taken(&self) -> Option<AppTrafficElsewhere> {
+        if !self.admitted.is_empty() || self.refused.is_empty() {
+            return None;
+        }
+        let named = self
+            .refused
+            .iter()
+            .any(|(_, why)| *why == AppDestinationRefusal::ClaimedByAddressRule);
+        Some(if named {
+            AppTrafficElsewhere::NamedByAddressRules
+        } else {
+            AppTrafficElsewhere::SharedWithOthers
+        })
+    }
 }
 
 /// The single gate between an application rule's observed destinations and any
@@ -1165,6 +1269,9 @@ pub struct AppDestinationGate<'a> {
     /// compiled. A destination two routed applications share is not somebody
     /// else's, and one route serves both identically.
     friendly: Vec<String>,
+    /// Shared addresses the policy keeps off the additional link: routes and
+    /// filters must give them the same answer.
+    declined: Option<&'a std::collections::HashSet<Ipv4Addr>>,
 }
 
 impl<'a> AppDestinationGate<'a> {
@@ -1181,13 +1288,32 @@ impl<'a> AppDestinationGate<'a> {
             friendly: crate::app_destination_memory::routed_app_patterns(rules)
                 .into_iter()
                 .collect(),
+            declined: None,
         }
+    }
+
+    /// The shared addresses the policy declined for the additional link.
+    #[must_use]
+    pub fn with_declined(mut self, declined: &'a std::collections::HashSet<Ipv4Addr>) -> Self {
+        self.declined = Some(declined);
+        self
     }
 
     /// Tell the observations where the rule by path spelled `key` really is,
     /// so its programs are recognised there too.
     pub fn note_path_places(&self, key: &str, places: &[nrr_shared::app_path::AppPath]) {
         self.observations.note_path_places(key, places);
+    }
+
+    /// Of `admitted`, the destinations that also get per-destination filters:
+    /// the [`PER_HOSTNAME_IP_CAP`] the program used most recently, so a busy
+    /// program keeps its current servers rather than its lowest addresses.
+    /// One answer for the filter codegen and the neutral planner; routes take
+    /// every admitted address.
+    #[must_use]
+    pub fn mirrored(&self, pattern: &str, admitted: &[Ipv4Addr]) -> Vec<Ipv4Addr> {
+        self.observations
+            .latest_of(pattern, admitted, PER_HOSTNAME_IP_CAP)
     }
 
     /// Whether `pattern`'s rule learnt `ip` from a script its folder holds
@@ -1212,6 +1338,11 @@ impl<'a> AppDestinationGate<'a> {
             if !self.ownership.app_rule_may_claim(IpAddr::V4(ip), for_link) {
                 out.refused
                     .push((ip, AppDestinationRefusal::ClaimedByAddressRule));
+            } else if for_link == Link::Additional
+                && self.declined.is_some_and(|declined| declined.contains(&ip))
+            {
+                out.refused
+                    .push((ip, AppDestinationRefusal::DeclinedShared));
             } else if !self.ownership.app_takeover
                 && self
                     .observations
@@ -1233,6 +1364,44 @@ mod tests {
     use crate::fqdn_cache_lookup::MockFqdnCacheLookup;
     use nrr_domain::canonical::{CanonicalAppMatch, CanonicalAppPattern, CanonicalRule};
     use nrr_domain::RuleId;
+
+    /// "Not routed" is said only when the rule takes nothing, and the reason
+    /// the user can act on (their own address rules) is the one named.
+    #[test]
+    fn a_rule_takes_none_of_a_program_only_when_every_seen_address_went_elsewhere() {
+        let a = Ipv4Addr::new(192, 0, 2, 1);
+        let b = Ipv4Addr::new(192, 0, 2, 2);
+        let refused = |why: &[AppDestinationRefusal]| AppDestinations {
+            admitted: Vec::new(),
+            refused: why.iter().map(|w| (a, *w)).collect(),
+        };
+        assert_eq!(AppDestinations::default().none_taken(), None, "never seen");
+        assert_eq!(
+            AppDestinations {
+                admitted: vec![b],
+                ..refused(&[AppDestinationRefusal::ClaimedByAddressRule])
+            }
+            .none_taken(),
+            None,
+            "one address taken is a working rule"
+        );
+        assert_eq!(
+            refused(&[
+                AppDestinationRefusal::UsedByOtherProcess,
+                AppDestinationRefusal::DeclinedShared
+            ])
+            .none_taken(),
+            Some(AppTrafficElsewhere::SharedWithOthers)
+        );
+        assert_eq!(
+            refused(&[
+                AppDestinationRefusal::UsedByOtherProcess,
+                AppDestinationRefusal::ClaimedByAddressRule
+            ])
+            .none_taken(),
+            Some(AppTrafficElsewhere::NamedByAddressRules)
+        );
+    }
 
     const NAMED: Ipv4Addr = Ipv4Addr::new(203, 0, 113, 68);
     const OTHER: Ipv4Addr = Ipv4Addr::new(203, 0, 113, 9);
@@ -2147,6 +2316,65 @@ mod tests {
             assert_eq!(
                 resolve_in(&zone_additional, &cache, ZoneVsIpOrder::ZoneFirst).owner_of(at),
                 Some(Link::Additional)
+            );
+        }
+
+        /// A zone of several labels is a subdomain rule without its apex: it
+        /// takes its hosts from a wider suffix, an exact address and a network
+        /// on the other link, where a single-label zone yields to all three.
+        #[test]
+        fn a_zone_of_several_labels_wins_its_hosts_like_a_suffix() {
+            let cache = MockFqdnCacheLookup::new();
+            cache.set_ips("db.corp.example.com", vec![Ipv4Addr::new(10, 0, 0, 9)]);
+            let at = ip("10.0.0.9");
+            let zone = || {
+                route(
+                    "s-zone",
+                    CanonicalAddressMatch::Zone("corp.example.com".into()),
+                )
+            };
+            for main in [
+                route(
+                    "p-wide",
+                    CanonicalAddressMatch::SuffixDomain("example.com".into()),
+                ),
+                route("p-ip", literal("10.0.0.9")),
+                route("p-net", subnet("10.0.0.0/8")),
+                route(
+                    "p-same",
+                    CanonicalAddressMatch::SuffixDomain("corp.example.com".into()),
+                ),
+            ] {
+                let label = main.id.as_str().to_string();
+                let rules = book(vec![main], vec![zone()]);
+                let ownership = resolve(&rules, &cache);
+                assert_eq!(ownership.owner_of(at), Some(Link::Additional), "{label}");
+                assert!(
+                    ownership.address_rule_may_steer(at, Link::Additional),
+                    "{label}"
+                );
+            }
+
+            // Bare names covering subdomains: the zone is `*.` of its name,
+            // the same rule on both links, and the main link keeps it.
+            let same = book(
+                vec![route(
+                    "p-same",
+                    CanonicalAddressMatch::SuffixDomain("corp.example.com".into()),
+                )],
+                vec![zone()],
+            )
+            .with_subdomain_coverage();
+            assert_eq!(resolve(&same, &cache).owner_of(at), Some(Link::Main));
+
+            cache.set_ips("db.corp.intra", vec![Ipv4Addr::new(10, 0, 0, 10)]);
+            let top_level = book(
+                vec![route("p-ip", literal("10.0.0.10"))],
+                vec![route("s-zone", CanonicalAddressMatch::Zone("intra".into()))],
+            );
+            assert_eq!(
+                resolve(&top_level, &cache).owner_of(ip("10.0.0.10")),
+                Some(Link::Main)
             );
         }
 

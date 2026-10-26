@@ -192,49 +192,4 @@ impl DnsObservationConsumer {
             .filter(|ip| memo.insert((hostname.to_string(), *ip), now).is_none())
             .collect()
     }
-
-    /// register an FCrDNS-confirmed `(hostname, addresses)`
-    /// fact whose name matches NO active rule as a known-DIRECT destination.
-    /// The inverse gate of [`learn_reverse_confirmed`](Self::learn_reverse_confirmed):
-    /// same active-SID + routable filters, but the host must match NEITHER rule
-    /// set — a rule match here means the rule path should have kept it, so the
-    /// direct claim is refused. Feeds the known-direct registry (NOT the FQDN
-    /// cache — the cache is rule-matching by design); the block-all exemption
-    /// compiles on the next reconcile. Returns `true` iff at least one new
-    /// address was registered.
-    pub fn learn_reverse_confirmed_direct(&self, hostname: &str, addresses: &[Ipv4Addr]) -> bool {
-        let Some(registry) = self.known_direct.as_ref() else {
-            return false;
-        };
-        // Direct only when NO present principal's rules name it: the registry
-        // exempts the address from every block-all on the machine.
-        let books = self.present_rule_books();
-        if books.is_empty() {
-            return false;
-        }
-        if books.iter().any(|book| {
-            rule_set_matches(hostname, &book.primary) || rule_set_matches(hostname, &book.secondary)
-        }) {
-            return false;
-        }
-        let routable: Vec<Ipv4Addr> = addresses
-            .iter()
-            .copied()
-            .filter(|ip| !is_non_routable_v4(ip))
-            .collect();
-        if routable.is_empty() {
-            return false;
-        }
-        let added = registry.register(&routable);
-        if added > 0 {
-            tracing::info!(
-                target: "nrr::dns-observe",
-                msg_key = "dnsobs-reverse-confirmed-direct-host-registered",
-                hostname = %hostname,
-                addresses = added,
-                "registered a reverse-confirmed DIRECT host from an NRR drop — block-all exemption compiles on the next reconcile",
-            );
-        }
-        added > 0
-    }
 }

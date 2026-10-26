@@ -322,7 +322,9 @@ fn forgetting_erases_the_answer_so_the_host_can_be_offered_again() {
     );
     assert!(f.engine.candidates(SID).is_empty(), "and so is the offer");
 
-    // Nothing suppresses it any more, so the next tick offers it afresh.
+    // Nothing suppresses it any more. The refusal already dropped its
+    // evidence, so it is offered afresh once the feed earns it again.
+    two_visits(&f.engine, &["cdn.example"]);
     f.engine.tick(SID, later());
     assert_eq!(f.engine.candidates(SID).len(), 1);
 }
@@ -373,4 +375,78 @@ fn an_offer_in_another_zone_of_the_site_can_be_taken_for_every_zone() {
     let calls = f.author.calls();
     assert_eq!(calls[0].1[0].match_kind, AuthoredMatchKind::AnyZoneSite);
     assert_eq!(calls[0].1[0].value, "site");
+}
+
+// ── The ledger forgets what is settled ───────────────────────────────────────
+
+/// Whether `SID`'s ledger still holds `host` as a candidate, taking a slot.
+fn tracks(engine: &AutoRulesEngine, host: &str) -> bool {
+    engine
+        .ledgers
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .get(SID)
+        .is_some_and(|l| l.ledger.is_tracking_candidate(host))
+}
+
+/// An accepted host is a rule now: its evidence is dead and must not hold a
+/// slot against hosts still earning an offer — at once, not after a tick.
+#[test]
+fn an_accepted_host_stops_taking_a_ledger_slot() {
+    let f = fixture(AutoRulesMode::Suggest);
+    two_visits(&f.engine, &["cdn.example"]);
+    f.engine.tick(SID, later());
+    assert!(tracks(&f.engine, "cdn.example"));
+    let ids: Vec<String> = f.engine.candidates(SID).into_iter().map(|c| c.id).collect();
+
+    f.engine.accept(SID, &ids, false, later()).expect("accept");
+
+    assert!(!tracks(&f.engine, "cdn.example"));
+}
+
+/// A refusal lives in the dismissal record, which also carries the offer for
+/// "restore": the counters have nothing left to do.
+#[test]
+fn a_dismissed_host_stops_taking_a_ledger_slot_and_can_still_be_restored() {
+    let f = fixture(AutoRulesMode::Suggest);
+    two_visits(&f.engine, &["cdn.example"]);
+    f.engine.tick(SID, later());
+    assert!(tracks(&f.engine, "cdn.example"));
+    let ids: Vec<String> = f.engine.candidates(SID).into_iter().map(|c| c.id).collect();
+
+    f.engine.dismiss(SID, &ids, later());
+    assert!(!tracks(&f.engine, "cdn.example"));
+
+    f.engine.restore_dismissed(SID, &ids, later());
+    assert_eq!(
+        f.engine.candidates(SID).len(),
+        1,
+        "restored from the record"
+    );
+}
+
+/// A rule typed by hand, an imported preset, a revision from another session:
+/// whichever way a rule came to cover the host, the next tick lets it go.
+#[test]
+fn a_host_a_rule_covers_another_way_stops_taking_a_ledger_slot() {
+    let f = fixture(AutoRulesMode::Suggest);
+    two_visits(&f.engine, &["cdn.example", "img.media.example"]);
+    f.engine.tick(SID, later());
+    assert!(tracks(&f.engine, "cdn.example"));
+    assert!(tracks(&f.engine, "img.media.example"));
+
+    {
+        let mut book = f.rules.book.lock().unwrap_or_else(|p| p.into_inner());
+        let mut primary = book.primary.rules().to_vec();
+        primary.push(exact_rule("cdn.example"));
+        primary.push(CanonicalRule {
+            address_match: Some(CanonicalAddressMatch::SuffixDomain("media.example".into())),
+            ..exact_rule("media.example")
+        });
+        book.primary = CanonicalRuleSet::from_rules(primary);
+    }
+    f.engine.tick(SID, later());
+
+    assert!(!tracks(&f.engine, "cdn.example"));
+    assert!(!tracks(&f.engine, "img.media.example"));
 }

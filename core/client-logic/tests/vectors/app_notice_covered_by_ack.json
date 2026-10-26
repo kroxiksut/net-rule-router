@@ -1,0 +1,17 @@
+{
+  "description": "pure.js appNoticeCoveredByAck / nrr_client_logic::app_notice_ack::app_notice_covered_by_ack: \"Don't show\" holds per program and problem",
+  "cases": [
+    { "name": "nothing acknowledged", "input": { "ack": "", "notFound": ["citymap.exe"], "unrouted": [] }, "expected": false },
+    { "name": "not found, acknowledged", "input": { "ack": "not-found:citymap.exe", "notFound": ["citymap.exe"], "unrouted": [] }, "expected": true },
+    { "name": "acknowledged as not found, now found but routes nothing", "input": { "ack": "not-found:citymap.exe", "notFound": [], "unrouted": ["citymap.exe"] }, "expected": false },
+    { "name": "acknowledged as routing nothing, still so", "input": { "ack": "unrouted:citymap.exe", "notFound": [], "unrouted": ["citymap.exe"] }, "expected": true },
+    { "name": "acknowledged as routing nothing, now not found", "input": { "ack": "unrouted:citymap.exe", "notFound": ["citymap.exe"], "unrouted": [] }, "expected": false },
+    { "name": "an old name-only entry hides the not-found state", "input": { "ack": "citymap.exe", "notFound": ["citymap.exe"], "unrouted": [] }, "expected": true },
+    { "name": "an old name-only entry does not hide routing nothing", "input": { "ack": "citymap.exe", "notFound": [], "unrouted": ["citymap.exe"] }, "expected": false },
+    { "name": "an old entry that is a path with a drive letter", "input": { "ack": "C:\\Apps\\tool.exe", "notFound": ["C:\\Apps\\tool.exe"], "unrouted": [] }, "expected": true },
+    { "name": "a new program not found", "input": { "ack": "not-found:citymap.exe", "notFound": ["citymap.exe", "ab.exe"], "unrouted": [] }, "expected": false },
+    { "name": "the set shrank", "input": { "ack": "not-found:ab.exe|not-found:citymap.exe", "notFound": ["ab.exe"], "unrouted": [] }, "expected": true },
+    { "name": "both problems acknowledged", "input": { "ack": "not-found:ab.exe|unrouted:citymap.exe", "notFound": ["ab.exe"], "unrouted": ["citymap.exe"] }, "expected": true },
+    { "name": "an empty entry between separators is skipped", "input": { "ack": "|not-found:ab.exe||", "notFound": ["ab.exe"], "unrouted": [] }, "expected": true }
+  ]
+}

@@ -829,6 +829,7 @@ impl Device for PipeClientDevice {
     }
 }
 
+mod binding_release;
 mod echo_relay;
 mod end_to_end;
 mod hostile_peer;

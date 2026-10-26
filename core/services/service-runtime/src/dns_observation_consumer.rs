@@ -22,7 +22,9 @@ use std::sync::{Arc, Mutex};
 use std::time::SystemTime;
 
 use nrr_domain::canonical::{CanonicalAddressMatch, CanonicalRuleSet};
-use nrr_domain::decision_matching::{match_any_zone_domain, match_suffix_domain, match_zone};
+use nrr_domain::decision_matching::{
+    match_any_zone_domain, match_suffix_domain, match_zone, zone_ranks_as_suffix,
+};
 use nrr_domain::rule_specificity::match_specificity;
 use nrr_platform_api::dns::{DnsCacheReadPort, NoopDnsCacheRead};
 use nrr_platform_api::dns_observe::DnsObservation;
@@ -115,12 +117,6 @@ pub struct DnsObservationConsumer {
     /// [`seed_from_os_cache`]: DnsObservationConsumer::seed_from_os_cache
     /// [`with_dns_cache_read`]: DnsObservationConsumer::with_dns_cache_read
     dns_cache_read: Arc<dyn DnsCacheReadPort>,
-    /// known-direct registry
-    /// [`learn_reverse_confirmed_direct`] feeds. `None` (default) disables
-    /// direct-learning (the strict block-all posture).
-    ///
-    /// [`learn_reverse_confirmed_direct`]: DnsObservationConsumer::learn_reverse_confirmed_direct
-    known_direct: Option<Arc<crate::known_direct::KnownDirectRegistry>>,
     /// True while the fake-IP relay stack is live. When it is, a collateral
     /// direct host is actively steered/rescued onto the primary by name, so the
     /// "shares its IP with a secondary rule" WARN is no longer describing a
@@ -238,12 +234,13 @@ pub(crate) fn secondary_ip_claims(
                     Some(&mut closer),
                 );
             }
+            // A zone of several labels names its hosts as closely as a suffix.
             Some(CanonicalAddressMatch::Zone(zone)) => {
                 claim_hosts(
                     &fqdn.hostnames_under_suffix(zone, SUFFIX_FANOUT_LIMIT),
                     fqdn,
                     &mut owners,
-                    None,
+                    zone_ranks_as_suffix(zone).then_some(&mut closer),
                 );
             }
             // Carried by its `*.site.<zone>` twins (`any_zone_sites`).
@@ -339,7 +336,7 @@ pub(crate) fn rule_covers(rule: &nrr_domain::canonical::CanonicalRule, hostname:
 
 /// The KIND of the strongest enabled address rule covering `(hostname, ip)`,
 /// in the engine's default order (exact-fqdn > subdomain > exact-ip > subnet >
-/// zone): the narrower rule wins. A range reports as `subnet`: it is carried as
+/// zone, a zone of several labels ranking as a subdomain): the narrower rule wins. A range reports as `subnet`: it is carried as
 /// the networks it decomposes into. `None` when no address rule matches
 /// (app-only rules carry no address match by definition).
 pub(crate) fn rule_set_match_kind(
@@ -367,7 +364,7 @@ pub(crate) fn rule_set_match_kind(
                 consider(1, "subdomain");
             }
             Some(CanonicalAddressMatch::Zone(z)) if match_zone(hostname, z) => {
-                consider(4, "zone");
+                consider(if zone_ranks_as_suffix(z) { 1 } else { 4 }, "zone");
             }
             Some(CanonicalAddressMatch::ExactIp(rule_ip))
                 if ip.map(std::net::IpAddr::V4) == Some(*rule_ip) =>

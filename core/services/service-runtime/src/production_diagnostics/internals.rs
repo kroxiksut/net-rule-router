@@ -171,6 +171,17 @@ impl ProductionDiagnosticsFacade {
                 network_ip = Some(ip);
             }
         }
+        if self.reads_app_takeover(caller_sid) {
+            if let Some(taken) = app_takeover_decision(
+                &rule_book,
+                &decision,
+                sample.process_name.as_deref(),
+                zone_policy,
+                behavior_mode,
+            ) {
+                decision = taken;
+            }
+        }
         let matched_network = match &decision {
             nrr_domain::decision_matching::RequestedRouteDecision::MatchedRoute { candidate }
                 if candidate.match_class == nrr_domain::decision_matching::MatchClass::Subnet =>
@@ -445,6 +456,25 @@ impl ProductionDiagnosticsFacade {
             .unwrap_or(false)
     }
 
+    /// The caller's `app_rules_take_all_addresses`, as the arbiter reads it.
+    /// `false` on any read failure: the address rules then answer, as they do
+    /// with the setting off.
+    fn reads_app_takeover(&self, sid: &str) -> bool {
+        if sid.is_empty() {
+            return false;
+        }
+        let Some(conn_arc) = self.state_conn.as_ref() else {
+            return false;
+        };
+        let Ok(conn) = conn_arc.lock() else {
+            return false;
+        };
+        nrr_storage::route_bindings::RouteBindingsRepository::new(&conn)
+            .load_for_sid(sid)
+            .map(|p| p.app_rules_take_all_addresses)
+            .unwrap_or(false)
+    }
+
     /// The addresses the FQDN cache holds for `host`, newest first. Empty
     /// without a cache or on any read error: the probe then answers from the
     /// name rules alone, as it did before it looked.
@@ -688,6 +718,47 @@ pub(super) fn literal_block_veto(
         );
         literal_block_ip(&decision, Some(*ip)).map(|ip| (ip, decision))
     })
+}
+
+/// The program's own route under "application rules take all their
+/// addresses", when it overrides an address rule of the other link: the
+/// arbiter hands the address to the program (`AddressOwnership::with_app_takeover`).
+/// A Block decision stands, which keeps a literal-IP Block's veto.
+pub(super) fn app_takeover_decision(
+    rule_book: &nrr_domain::canonical::CanonicalRuleBook,
+    decision: &nrr_domain::decision_matching::RequestedRouteDecision,
+    process_name: Option<&str>,
+    zone_policy: nrr_domain::decision_matching::ZonePriorityPolicy,
+    behavior_mode: nrr_domain::RouteBehaviorMode,
+) -> Option<nrr_domain::decision_matching::RequestedRouteDecision> {
+    use nrr_domain::decision_matching::{MatchClass, RequestedRouteDecision};
+    let RequestedRouteDecision::MatchedRoute { candidate } = decision else {
+        return None;
+    };
+    if candidate.action != nrr_domain::RuleAction::Route
+        || candidate.match_class == MatchClass::Application
+    {
+        return None;
+    }
+    // The program alone: only an address-free application rule matches.
+    let program = nrr_domain::decision_engine_input::match_sample(
+        rule_book,
+        None,
+        None,
+        Some(process_name?),
+        zone_policy,
+        behavior_mode,
+    );
+    match &program {
+        RequestedRouteDecision::MatchedRoute { candidate: app }
+            if app.match_class == MatchClass::Application
+                && app.action == nrr_domain::RuleAction::Route
+                && app.route_role != candidate.route_role =>
+        {
+            Some(program)
+        }
+        _ => None,
+    }
 }
 
 /// `ip` when `decision` is a literal-IP Block on it.

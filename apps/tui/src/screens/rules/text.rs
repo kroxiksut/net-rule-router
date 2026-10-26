@@ -108,6 +108,34 @@ pub const PATH_SUBFOLDERS_KEY: Key = key(
     "tui.rules.form-subfolders",
     "Ctrl+F, or !f in line mode: with subfolders or without",
 );
+pub const COVERAGE_ANY_ZONE: Key = key(
+    "dialog.rule.coverage-any-zone",
+    "Covers {host} in every zone ({host}.com, {host}.net and so on) with all subdomains. A rule naming the zone wins over it.",
+);
+pub const COVERAGE_WITH_SUBDOMAINS: Key = key(
+    "dialog.rule.coverage-with-subdomains",
+    "Covers {host} and every subdomain of it.",
+);
+pub const COVERAGE_EXACT_ONLY: Key = key(
+    "dialog.rule.coverage-exact-only",
+    "Covers {host} only. Type *.{host} to include its subdomains.",
+);
+pub const INCLUDE_SUBDOMAINS: Key = key("dialog.rule.include-subdomains", "Include subdomains");
+pub const SUBDOMAINS_KEY: Key = key(
+    "tui.rules.form-subdomains",
+    "Ctrl+F, or !f in line mode: with subdomains or without",
+);
+pub const PUBLIC_SUFFIX_WARNING: Key = key(
+    "rules.value.public-suffix-warning",
+    "{value} is a public registry, not one service: the rule would route unrelated owners. Use a zone rule if that is what you want.",
+);
+pub const SUFFIX_REACH: Key = key(
+    "rules.value.suffix-reach",
+    "Matches every name under {value}, including ones you did not list.",
+);
+pub const PUNYCODE_HINT: Key = key("rules.value.punycode-hint", "Punycode: {ace}");
+pub const COMMENT_COUNTER: Key = key("rules.comment.char-counter", "{used}/{max}");
+pub const COMMENT_MAX_LENGTH: Key = key("rules.comment.max-length", "Up to {max} characters");
 pub const APP_FOLDER_SCRIPTS_DENY: Key = key(
     "rules.application-folder-scripts-deny",
     "A deny by folder stops the programs in it, but not for certain a script from it that an interpreter installed elsewhere runs.",
@@ -345,6 +373,11 @@ pub const FILES_CONVERGED: Key = key(
     "notifications.rules-file-converged.title",
     "Your rules file was brought up to date",
 );
+pub const FILES_CONVERGED_ADDED: Key = key(
+    "notifications.rules-file-converged.added-body",
+    "Rules already in force were missing from your rules file and are now written to it: {rules}. Nothing about what is applied changed.",
+);
+pub const LIST_MORE: Key = key("status.app-unresolved-more", "+{n} more");
 pub const FILES_DRIFT: Key = key(
     "status.merge-banner",
     "The rules in your files are not the ones being applied \u{2014} you can compare and merge them.",
@@ -528,6 +561,186 @@ pub const OLD_FILES_KEPT: Key = key(
     "The files they were linked to before stay where they were: {dir}",
 );
 pub const MY_RULES: Key = key("rules.sets.my-rules", "My rules");
+
+// The window's administrator lock, in its own words.
+pub const LOCKED_TITLE: Key = key(
+    "rules.locked.banner-title",
+    "Rules are managed by your administrator",
+);
+pub const LOCKED_BODY: Key = key(
+    "rules.locked.banner-body",
+    "Changing rules is turned off on this computer. You can still view, search, filter and export them.",
+);
+pub const FOLDER_OFFER_TITLE: Key = key("tui.rules.folder-offer.title", "Your rule-set folder");
+pub const FOLDER_OFFER: Key = key(
+    "status.rules-folder-suggestion",
+    "Keep your rule sets in this folder? It then becomes the place the app loads and saves rule sets from.",
+);
+pub const FOLDER_OFFER_HOW: Key = key(
+    "tui.rules.folder-offer.how",
+    "To keep them in {dir}, press o on the Rules screen and enter that folder.",
+);
+pub const HELP_MORE_FILES: Key = key(
+    "tui.rules.help.more-files",
+    "X: save one route's rules to a file. L: add the demo rules. W: clear all rules (asks first)",
+);
+pub const ROUTE_QUESTION: Key = key("tui.rules.export-route-question", "Which rules to save?");
+pub const EXPORT_PRIMARY: Key = key(
+    "rules.action.export-source-primary",
+    "Export only the main route's rules to a file...",
+);
+pub const EXPORT_SECONDARY: Key = key(
+    "rules.action.export-source-secondary",
+    "Export only the additional route's rules to a file...",
+);
+pub const EXPORT_ROUTE_QUESTION: Key = key(
+    "tui.rules.export-route-file",
+    "File to write these rules to:",
+);
+pub const OVERWRITE_FILE_QUESTION: Key = key(
+    "tui.rules.overwrite-file-question",
+    "The file already exists. Replace it?",
+);
+pub const OVERWRITE_FILE: Key = key("tui.rules.overwrite-file", "Replace the file");
+pub const SHIPPED_TITLE: Key = key(
+    "settings.presets.bundled-write-warning.title",
+    "This folder belongs to the app",
+);
+pub const SHIPPED_BODY: Key = key(
+    "settings.presets.bundled-write-warning.body",
+    "You are saving into the folder the app keeps its own rule sets in. Updating the app replaces that folder, and your set is lost with it. Pick a folder of your own above to keep sets safely.",
+);
+pub const SHIPPED_CONFIRM: Key = key(
+    "settings.presets.bundled-write-warning.confirm",
+    "Save here anyway",
+);
+pub const CLEAR_ALL_TITLE: Key = key("rules.action.clear-all-title", "Clear all rules?");
+pub const CLEAR_ALL_BODY: Key = key(
+    "rules.action.clear-all-body",
+    "All rules will be removed from this app and (when the service is running) from the service as well. The OS will route traffic without any NetRuleRouter overrides. This cannot be undone.",
+);
+pub const CLEAR_ALL_CONFIRM: Key = key("rules.action.clear-all-confirm", "Clear all rules");
+pub const CLEARED: Key = key("status.rules-cleared", "All rules cleared from the app.");
+pub const CLEARED_FILES_KEPT: Key = key(
+    "tui.rules.cleared-files-kept",
+    "Your rules files stay on disk and are no longer written to.",
+);
+pub const DEMO_ADDED: Key = key(
+    "tui.rules.demo-added",
+    "Demo rules added: {count}. They are not applied yet.",
+);
+pub const DEMO_MISSING: Key = key(
+    "tui.rules.demo-missing",
+    "The demo rules are not part of this copy of the program.",
+);
+pub const HELP_RESET: Key = key(
+    "tui.rules.help.reset-baseline",
+    "Z: go back to the baseline rules; your own rules and the changes on screen are dropped, and what changes is shown first",
+);
+pub const RESET_NOOP: Key = key(
+    "dialog.reset-baseline-noop.body",
+    "You have no custom rules — the baseline rules are already in effect.",
+);
+pub const RESET_DONE: Key = key(
+    "status.reset-baseline-completed",
+    "Reset to baseline rules. Reloading the active rules...",
+);
+pub const RESET_FAILED: Key = key(
+    "status.reset-baseline-failed",
+    "Could not reset to baseline: ",
+);
+pub const PRESET_INTRO: Key = key(
+    "dialog.preset-review.intro",
+    "The file contains sections that need a decision before import.",
+);
+pub const PRESET_DUPLICATE_ROW: Key = key(
+    "dialog.preset-review.duplicate-row",
+    "Section \"{name}\" appears {n} times",
+);
+pub const PRESET_DUPLICATE_HINT: Key = key(
+    "dialog.preset-review.duplicates-hint",
+    "These sections appear more than once in the file. Pick how to combine them.",
+);
+pub const PRESET_DUPLICATE_KNOWN: Key = key(
+    "tui.rules.preset-duplicate-known",
+    "Section \"{name}\" appears {n} times: all of its rules were taken.",
+);
+pub const PRESET_MERGE: Key = key(
+    "dialog.preset-review.duplicate-merge",
+    "Merge (concatenate contents)",
+);
+pub const PRESET_LAST_WINS: Key = key(
+    "dialog.preset-review.duplicate-last-wins",
+    "Use only the last occurrence",
+);
+pub const PRESET_IGNORE: Key = key(
+    "dialog.preset-review.duplicate-ignore",
+    "Skip this section entirely",
+);
+pub const PRESET_UNKNOWN_ROW: Key =
+    key("dialog.preset-review.unknown-row", "--- {name} ({n} lines)");
+pub const PRESET_UNKNOWN_HINT: Key = key(
+    "dialog.preset-review.unknowns-hint",
+    "We didn't recognise these sections. Tell us what they are, or keep them as-is for export.",
+);
+pub const PRESET_WHAT: Key = key("dialog.preset-review.what-is-this", "What is this?");
+/// The answers to an unknown section, in [`files::REFILE_HEADERS`] order
+/// between "keep" and "skip".
+pub const PRESET_CLASSIFY: [Key; 8] = [
+    key(
+        "dialog.preset-review.classify-passthrough",
+        "Preserve for other OS / tools (default)",
+    ),
+    key("dialog.preset-review.classify-zones", "Zones"),
+    key("dialog.preset-review.classify-domains", "Domains"),
+    key("dialog.preset-review.classify-ip", "IP addresses"),
+    key("dialog.preset-review.classify-ranges", "IP ranges"),
+    key("dialog.preset-review.classify-cidr", "Subnets (CIDR)"),
+    key(
+        "dialog.preset-review.classify-windows",
+        "Windows applications",
+    ),
+    key("dialog.preset-review.classify-skip", "Skip (discard)"),
+];
+pub const HELP_MARK: Key = key(
+    "tui.rules.help.mark",
+    "*: select or unselect the chosen rule (in line mode * and numbers, for example * 2 5). B: act on the selected rules",
+);
+pub const MARKED_COUNT: Key = key("rules.bulk.selected-count", "{n} rule(s) selected");
+pub const ROW_MARKED: Key = key("tui.rules.row-marked", "selected");
+pub const NONE_MARKED: Key = key(
+    "tui.rules.none-marked",
+    "No rules are selected: select them with * first.",
+);
+pub const MARKED_QUESTION: Key = key(
+    "tui.rules.marked-question",
+    "What to do with the selected rules?",
+);
+pub const BULK_ENABLE: Key = key("rules.bulk.enable", "Enable");
+pub const BULK_DISABLE: Key = key("rules.bulk.disable", "Disable");
+pub const BULK_MOVE: Key = key("rules.bulk.move-to-route", "Move to route");
+pub const BULK_DENY: Key = key("rules.route.deny", "Deny");
+pub const BULK_DELETE: Key = key("rules.bulk.delete", "Delete...");
+pub const BULK_UNMARK: Key = key("tui.rules.unmark-all", "Unselect all");
+pub const BULK_DELETE_TITLE: Key = key("rules.bulk.delete-title", "Delete selected rules?");
+pub const BULK_DELETE_BODY: Key = key(
+    "rules.bulk.delete-body",
+    "{n} selected rule(s) will be removed. You can apply the change to the service later via 'Save and review...'.",
+);
+pub const BULK_DELETE_CONFIRM: Key = key("rules.bulk.delete-confirm", "Delete");
+pub const BULK_ENABLED: Key = key("status.rules-bulk-enabled", "{n} rule(s) enabled.");
+pub const BULK_DISABLED: Key = key("status.rules-bulk-disabled", "{n} rule(s) disabled.");
+pub const BULK_MOVED: Key = key("status.rules-bulk-moved", "{n} rule(s) moved to {route}.");
+pub const BULK_DENIED: Key = key(
+    "status.rules-bulk-denied",
+    "{n} rule(s) now deny their traffic.",
+);
+pub const BULK_DELETED: Key = key("status.rules-bulk-deleted", "{n} rule(s) deleted.");
+pub const SAVES_TO: Key = key("status.bound-file-save-destination", "Saves to:");
+pub const LOCKED: Key = key(
+    "errors.rules-locked",
+    "Your administrator manages the routing rules on this computer, so they cannot be changed here.",
+);
 
 /// The syntax hint a written rules file opens with, a key per line; the keys
 /// and their English live with the writer.
@@ -780,6 +993,18 @@ pub const TYPE_FILTER_SUBNET: Key = key("rules.type.subnet", "Subnet (CIDR)");
 pub const TYPE_FILTER_APPLICATION: Key = key("rules.filter.type.application", "Application");
 pub const TYPE_QUESTION: Key = key("tui.rules.type-question", "Show the rules of which type?");
 pub const AUTO_ONLY: Key = key("rules.filter.auto-added", "Auto-added only");
+pub const NOT_WORKING_HIDDEN: Key = key(
+    "rules.filter.not-working-hidden",
+    "rules that do not work are hidden",
+);
+pub const OTHER_OS_TITLE: Key = key(
+    "rules.other-os.title",
+    "Rules for other systems: kept in the files, applied only there",
+);
+pub const OTHER_OS_NOT_APPLIED: Key = key(
+    "rules.other-os.not-applied",
+    "Rule for {os}: kept in the file, not applied on this system.",
+);
 pub const INVALID_COUNT: Key = key(
     "rules.invalid-count",
     "{n} rule(s) will not be applied: the value is not valid.",
@@ -787,11 +1012,11 @@ pub const INVALID_COUNT: Key = key(
 pub const INVALID_SHOW: Key = key("tui.rules.invalid-show", "E: show them");
 pub const HELP_FILTERS: Key = key(
     "tui.rules.help.filters",
-    "S: rules by state (enabled, disabled, with errors). y: by type. u: only the ones added automatically. E: the rules that will not be applied",
+    "S: rules by state (enabled, disabled, with errors). y: by type. u: only the ones added automatically. E: the rules that will not be applied. H: hide or show the rules that do not work",
 );
 pub const PLAIN_FILTERS: Key = key(
     "tui.rules.plain.filters",
-    "S: by state, y: by type, u: only added automatically, E: the rules that will not be applied",
+    "S: by state, y: by type, u: only added automatically, E: the rules that will not be applied, H: hide or show the rules that do not work",
 );
 pub const HELP_MAIN_ROUTE: Key = key(
     "tui.rules.help.main-route",
@@ -1207,6 +1432,73 @@ pub const PLAIN_OVERRIDE: Key = key(
 #[cfg(test)]
 pub const ALL: &[Key] = &[
     FILTER_OVERRIDDEN,
+    LOCKED_TITLE,
+    LOCKED_BODY,
+    LOCKED,
+    SAVES_TO,
+    HELP_MORE_FILES,
+    ROUTE_QUESTION,
+    EXPORT_PRIMARY,
+    EXPORT_SECONDARY,
+    EXPORT_ROUTE_QUESTION,
+    OVERWRITE_FILE_QUESTION,
+    OVERWRITE_FILE,
+    SHIPPED_TITLE,
+    SHIPPED_BODY,
+    SHIPPED_CONFIRM,
+    CLEAR_ALL_TITLE,
+    CLEAR_ALL_BODY,
+    CLEAR_ALL_CONFIRM,
+    CLEARED,
+    CLEARED_FILES_KEPT,
+    DEMO_ADDED,
+    DEMO_MISSING,
+    HELP_RESET,
+    HELP_MARK,
+    PRESET_INTRO,
+    PRESET_DUPLICATE_ROW,
+    PRESET_DUPLICATE_HINT,
+    PRESET_DUPLICATE_KNOWN,
+    PRESET_MERGE,
+    PRESET_LAST_WINS,
+    PRESET_IGNORE,
+    PRESET_UNKNOWN_ROW,
+    PRESET_UNKNOWN_HINT,
+    PRESET_WHAT,
+    PRESET_CLASSIFY[0],
+    PRESET_CLASSIFY[1],
+    PRESET_CLASSIFY[2],
+    PRESET_CLASSIFY[3],
+    PRESET_CLASSIFY[4],
+    PRESET_CLASSIFY[5],
+    PRESET_CLASSIFY[6],
+    PRESET_CLASSIFY[7],
+    FILES_CONVERGED_ADDED,
+    LIST_MORE,
+    MARKED_COUNT,
+    ROW_MARKED,
+    NONE_MARKED,
+    MARKED_QUESTION,
+    BULK_ENABLE,
+    BULK_DISABLE,
+    BULK_MOVE,
+    BULK_DENY,
+    BULK_DELETE,
+    BULK_UNMARK,
+    BULK_DELETE_TITLE,
+    BULK_DELETE_BODY,
+    BULK_DELETE_CONFIRM,
+    BULK_ENABLED,
+    BULK_DISABLED,
+    BULK_MOVED,
+    BULK_DENIED,
+    BULK_DELETED,
+    RESET_NOOP,
+    RESET_DONE,
+    RESET_FAILED,
+    FOLDER_OFFER_TITLE,
+    FOLDER_OFFER,
+    FOLDER_OFFER_HOW,
     OVERRIDE_GRANTED_MARK,
     OVERRIDE_PENDING_MARK,
     OVERRIDE_TITLE,
@@ -1291,6 +1583,16 @@ pub const ALL: &[Key] = &[
     PATH_ANYONE_CAN_WRITE,
     PATH_INCLUDE_SUBFOLDERS,
     PATH_SUBFOLDERS_KEY,
+    COVERAGE_ANY_ZONE,
+    COVERAGE_WITH_SUBDOMAINS,
+    COVERAGE_EXACT_ONLY,
+    INCLUDE_SUBDOMAINS,
+    SUBDOMAINS_KEY,
+    PUBLIC_SUFFIX_WARNING,
+    SUFFIX_REACH,
+    PUNYCODE_HINT,
+    COMMENT_COUNTER,
+    COMMENT_MAX_LENGTH,
     APP_ROUTING_NOTE,
     APP_ROUTING_NOTE_LINUX,
     VERDICTS_TITLE,
@@ -1525,6 +1827,9 @@ pub const ALL: &[Key] = &[
     TYPE_FILTER_APPLICATION,
     TYPE_QUESTION,
     AUTO_ONLY,
+    NOT_WORKING_HIDDEN,
+    OTHER_OS_TITLE,
+    OTHER_OS_NOT_APPLIED,
     INVALID_COUNT,
     INVALID_SHOW,
     HELP_FILTERS,

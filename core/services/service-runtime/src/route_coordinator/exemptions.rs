@@ -438,9 +438,6 @@ impl SecondaryRouteCoordinator {
             // overrides this from the per-SID policy at the block-all call site.
             allow_dns_over_primary: false,
             dns_servers: Vec::new(),
-            // the orchestrator fills known-direct IPs at the block-all
-            // call site (it owns the registry and the secondary-dest subtraction).
-            known_direct_ips: Vec::new(),
             // the orchestrator resolves the tunnel and fills this at the
             // block-all call site; the resolver has no LUID context.
             secondary_luid: 0,

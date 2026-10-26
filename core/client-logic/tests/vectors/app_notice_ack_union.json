@@ -1,0 +1,14 @@
+{
+  "description": "pure.js appNoticeAckUnion / nrr_client_logic::app_notice_ack::app_notice_ack_union: what \"Don't show\" stores",
+  "cases": [
+    { "name": "first dismissal", "input": { "ack": "", "notFound": ["ab.exe"], "unrouted": ["citymap.exe"] }, "expected": "not-found:ab.exe|unrouted:citymap.exe" },
+    { "name": "old name-only entries are rewritten as not found", "input": { "ack": "citymap.exe|ab.exe", "notFound": ["tool.exe"], "unrouted": [] }, "expected": "not-found:ab.exe|not-found:citymap.exe|not-found:tool.exe" },
+    { "name": "a program keeps both of its problems", "input": { "ack": "not-found:citymap.exe", "notFound": [], "unrouted": ["citymap.exe"] }, "expected": "not-found:citymap.exe|unrouted:citymap.exe" },
+    { "name": "no repeats", "input": { "ack": "unrouted:citymap.exe", "notFound": [], "unrouted": ["citymap.exe"] }, "expected": "unrouted:citymap.exe" },
+    { "name": "nothing to store", "input": { "ack": "", "notFound": [], "unrouted": [] }, "expected": "" },
+    { "name": "a program gone from the notice stays acknowledged", "input": { "ack": "not-found:ab.exe|unrouted:citymap.exe", "notFound": [], "unrouted": ["citymap.exe"] }, "expected": "not-found:ab.exe|unrouted:citymap.exe" },
+    { "name": "an old path entry keeps its drive letter", "input": { "ack": "C:\\Apps\\tool.exe", "notFound": [], "unrouted": [] }, "expected": "not-found:C:\\Apps\\tool.exe" },
+    { "name": "an old entry next to its new spelling is one entry", "input": { "ack": "ab.exe|not-found:ab.exe", "notFound": ["ab.exe"], "unrouted": [] }, "expected": "not-found:ab.exe" },
+    { "name": "empty entries between separators are dropped", "input": { "ack": "||unrouted:ab.exe|", "notFound": [], "unrouted": [] }, "expected": "unrouted:ab.exe" }
+  ]
+}

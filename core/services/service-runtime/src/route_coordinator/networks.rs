@@ -371,6 +371,35 @@ impl SecondaryRouteCoordinator {
             .clear_machine_wide(self.events.as_deref(), sid);
     }
 
+    /// A bound adapter the user renamed is still found by id, but a later id
+    /// change is recovered by name: store the name it carries now, under the
+    /// same id. Journal only — the user renamed it themselves.
+    fn refresh_renamed_binding(
+        &self,
+        sid: &str,
+        role: &str,
+        binding: &PerSidBinding,
+        info: &AdapterInfo,
+    ) {
+        if adapter_answers_to_saved_name(info, &binding.display_name) {
+            return;
+        }
+        let name = preferred_display_name(info);
+        if name.trim().is_empty() || !self.note_rename_once(sid, role, &binding.stable_id, name) {
+            return;
+        }
+        tracing::info!(
+            target: "nrr::route-coordinator",
+            sid = %sid,
+            role = role,
+            stable_id = %binding.stable_id,
+            "the bound adapter carries a new name; storing it so a later id change is still recovered by name",
+        );
+        if let Some(persist) = self.binding_heal_persist.as_ref() {
+            persist(sid, role, &binding.stable_id, name);
+        }
+    }
+
     /// Resolve one route binding (primary or secondary) to a
     /// [`SecondaryRouteTarget`] against live `infos`. `None` when the bound
     /// adapter is missing, unusable, or has no gateway and no derivable
@@ -394,13 +423,13 @@ impl SecondaryRouteCoordinator {
         // circuit to fail-closed — it falls into the same name-heal below so we can
         // adopt a live same-name SIBLING. If the bound adapter is genuinely down with
         // no live sibling, the heal finds nothing and we still fail closed (correct).
-        let by_id = infos
-            .iter()
-            .find(|i| binding_matches_live(i, &binding.stable_id, &binding.known_stable_ids));
-        let info = match by_id
-            .filter(|i| classify_availability(i) == Some(AdapterAvailability::Available))
-        {
-            Some(i) => i,
+        // The same check the leak-protection banner makes (`bound_adapter_usable`).
+        let by_id = bound_adapter(infos, &binding.stable_id, &binding.known_stable_ids);
+        let info = match by_id.filter(|i| BoundCandidate::usable(*i)) {
+            Some(i) => {
+                self.refresh_renamed_binding(sid, role, binding, i);
+                i
+            }
             None => {
                 // Auto-heal: the stored GUID is gone (VPN reinstall/upgrade — same
                 // adapter name, new GUID) OR the bound instance is present-but-down.
@@ -579,6 +608,15 @@ impl SecondaryRouteCoordinator {
                                         || self.gone_long_enough(sid, role, &binding.stable_id)
                                     {
                                         self.publish_enforcement_status(sid, status, role, choices);
+                                    } else {
+                                        // Not up is what is known yet, shown
+                                        // quietly; "gone" continues its grace.
+                                        self.publish_enforcement_status(
+                                            sid,
+                                            "secondary-down",
+                                            role,
+                                            Vec::new(),
+                                        );
                                     }
                                 }
                                 let live: Vec<String> = infos

@@ -5,6 +5,7 @@ on:
   push:
     branches: [main]
   pull_request:
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -114,8 +115,9 @@ jobs:
 
   # The C++ Qt host and the whole Windows package, installers included, exactly
   # as release.yml builds them: a script or C++ break otherwise shows only on
-  # the day of a release.
+  # the day of a release. Manual runs only until the release work starts.
   package:
+    if: github.event_name == 'workflow_dispatch'
     runs-on: windows-2022
 
     steps:

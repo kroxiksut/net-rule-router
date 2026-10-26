@@ -361,6 +361,62 @@ fn an_offer_neither_link_can_carry_is_withheld_and_said_once() {
     assert_eq!(told, vec!["down.example".to_string()]);
 }
 
+/// A site the user opened that fails on the main link is told when its offer
+/// is parked and again when the additional link answers for it — the two
+/// moments a tray-less user can be told. A site neither link reaches, and an
+/// offer that is not about the main link, are not.
+#[test]
+fn a_site_that_does_not_open_is_told_when_parked_and_when_the_tunnel_answers() {
+    let verdicts = Arc::new(Mutex::new(HashMap::new()));
+    let f = fixture_with_main_link_verdicts(Arc::clone(&verdicts));
+    let parked: Arc<Mutex<Vec<(String, String)>>> = Arc::default();
+    let confirmed: Arc<Mutex<Vec<String>>> = Arc::default();
+    {
+        let parked = Arc::clone(&parked);
+        assert!(f.engine.attach_main_link_blocked_parked(Arc::new(
+            move |sid: &str, _id: &str, host: &str| {
+                parked
+                    .lock()
+                    .unwrap()
+                    .push((sid.to_owned(), host.to_owned()));
+            }
+        )));
+        let confirmed = Arc::clone(&confirmed);
+        assert!(f
+            .engine
+            .attach_site_not_opening(Arc::new(move |_sid: &str, host: &str| {
+                confirmed.lock().unwrap().push(host.to_owned());
+            })));
+    }
+    for host in ["down.example", "up.example"] {
+        set_verdict(&verdicts, host, PrimaryBehavior::Stalls);
+        assert!(f.engine.note_main_link_blocked_host(
+            SID,
+            host,
+            HostCounts::default(),
+            wall_clock()
+        ));
+    }
+    assert!(f
+        .engine
+        .note_placeholder_answer_host(SID, "placeholder.example", wall_clock()));
+    assert_eq!(
+        *parked.lock().unwrap(),
+        [
+            (SID.to_owned(), "down.example".to_owned()),
+            (SID.to_owned(), "up.example".to_owned())
+        ]
+    );
+
+    f.engine
+        .note_secondary_reach(SID, "down.example", false, wall_clock());
+    f.engine
+        .note_secondary_reach(SID, "up.example", true, wall_clock());
+    f.engine
+        .note_secondary_reach(SID, "placeholder.example", true, wall_clock());
+    assert_eq!(*confirmed.lock().unwrap(), ["up.example"]);
+}
+
 /// "Whose name is this" is answerable only where a site pulled the name in.
 /// A self-signed offer IS its own anchor, so the comparison used to return
 /// "the site's own name" for every ad host that failed on the main link — the
@@ -883,4 +939,60 @@ fn a_main_link_answer_does_not_silence_a_companion_of_the_same_brand() {
     self_signed.signal = AUTO_RULE_SIGNAL_MAIN_LINK_BLOCKED.to_string();
     assert!(settled_self_signed(&self_signed));
     assert!(settled_by_the_main_link(&self_signed));
+}
+
+// ── Told when the user's own surface connects ───────────────────────────────
+
+/// The site names of every announcing suggestions push `subscription` holds.
+fn announced_sites(bus: &EventBus, subscription: &str) -> Vec<String> {
+    bus.peek_pending_for(subscription, 64)
+        .into_iter()
+        .filter_map(|e| match e.event {
+            StatusUpdateEvent::AutoRuleCandidatesChanged {
+                top_anchor,
+                announces: true,
+                ..
+            } => Some(top_anchor),
+            _ => None,
+        })
+        .collect()
+}
+
+/// A site that did not open while none of the user's surfaces ran is kept,
+/// and told once one of HIS surfaces connects — named, and never to another
+/// signed-in user, whose own list stays empty.
+#[test]
+fn a_site_that_did_not_open_while_away_is_told_to_its_own_user_on_connect() {
+    const OTHER: &str = "S-B";
+    let verdicts = Arc::new(Mutex::new(HashMap::new()));
+    let bus = Arc::new(EventBus::new());
+    let mut f = fixture_with_main_link_verdicts(Arc::clone(&verdicts));
+    f.engine = f.engine.with_event_bus(Arc::clone(&bus));
+    set_verdict(&verdicts, "forum.talk.example", PrimaryBehavior::Stalls);
+
+    assert!(f.engine.note_main_link_blocked_host(
+        SID,
+        "forum.talk.example",
+        HostCounts::default(),
+        wall_clock()
+    ));
+
+    let own = bus
+        .subscribe_as("own-tray".to_string(), Some(SID.to_string()), None)
+        .subscription_id;
+    let other = bus
+        .subscribe_as("other-tray".to_string(), Some(OTHER.to_string()), None)
+        .subscription_id;
+    f.engine.tick(SID, wall_clock());
+    f.engine.tick(OTHER, wall_clock());
+
+    assert_eq!(announced_sites(&bus, &own), ["forum.talk.example"]);
+    assert!(announced_sites(&bus, &other).is_empty());
+    assert!(f.engine.candidates(OTHER).is_empty());
+    f.engine.tick(SID, wall_clock() + Duration::from_secs(600));
+    assert_eq!(
+        announced_sites(&bus, &own).len(),
+        1,
+        "told once, not on every tick"
+    );
 }

@@ -395,9 +395,9 @@ impl CanonicalRuleSet {
         self.rules.is_empty()
     }
 
-    /// Expand each `ExactFqdn(d)` rule with a sibling
-    /// `SuffixDomain(d)` rule so a bare-domain rule also covers every subdomain,
-    /// WITHOUT losing the apex (the `ExactFqdn` rule stays). The sibling copies
+    /// Expand each `ExactFqdn(d)` rule, and each zone of several labels, with a
+    /// sibling `SuffixDomain(d)` rule so a bare name also covers every subdomain
+    /// and the apex (the original rule stays). The sibling copies
     /// the same `app_match`, `action` and `enabled` state (route role is implied
     /// by the set). Idempotent: a domain that already has a `SuffixDomain(d)`
     /// with the same `app_match` is skipped, so it is safe to apply repeatedly.
@@ -421,24 +421,45 @@ impl CanonicalRuleSet {
             .collect();
         let mut out = self.rules.clone();
         for r in &self.rules {
-            if let Some(CanonicalAddressMatch::ExactFqdn(d)) = &r.address_match {
-                if existing_suffix.contains(&(d.clone(), r.app_match.clone())) {
-                    continue;
+            let d = match &r.address_match {
+                Some(CanonicalAddressMatch::ExactFqdn(d)) => {
+                    if existing_suffix.contains(&(d.clone(), r.app_match.clone())) {
+                        continue;
+                    }
+                    d
                 }
-                out.push(CanonicalRule {
-                    // Synthetic enforcement-only id; distinct from the apex rule
-                    // so the codegen treats them as separate filters/routes.
-                    id: crate::RuleId(format!("{}+sub", r.id.0)),
-                    enabled: r.enabled,
-                    address_match: Some(CanonicalAddressMatch::SuffixDomain(d.clone())),
-                    app_match: r.app_match.clone(),
-                    comment: r.comment.clone(),
-                    action: r.action,
-                    origin: None,
-                });
-            }
+                // A zone of several labels is a bare name too; against `*.` of
+                // its name on the other route the twin ties, as the user meant.
+                Some(CanonicalAddressMatch::Zone(d))
+                    if crate::decision_matching::zone_ranks_as_suffix(d)
+                        && !self.holds_suffix(d, &r.app_match) =>
+                {
+                    d
+                }
+                _ => continue,
+            };
+            out.push(CanonicalRule {
+                // Synthetic enforcement-only id; distinct from the apex rule
+                // so the codegen treats them as separate filters/routes.
+                id: crate::RuleId(format!("{}+sub", r.id.0)),
+                enabled: r.enabled,
+                address_match: Some(CanonicalAddressMatch::SuffixDomain(d.clone())),
+                app_match: r.app_match.clone(),
+                comment: r.comment.clone(),
+                action: r.action,
+                origin: None,
+            });
         }
         CanonicalRuleSet::from_rules(out)
+    }
+
+    /// Whether an enabled rule of this set is `*.{name}` with `app_match`.
+    pub fn holds_suffix(&self, name: &str, app_match: &Option<CanonicalAppMatch>) -> bool {
+        self.rules.iter().any(|r| {
+            r.enabled
+                && &r.app_match == app_match
+                && matches!(&r.address_match, Some(CanonicalAddressMatch::SuffixDomain(s)) if s == name)
+        })
     }
 
     /// The inverse of [`Self::with_subdomain_coverage`]: drops the synthetic
@@ -454,7 +475,9 @@ impl CanonicalRuleSet {
             };
             self.rules.iter().any(|apex| {
                 apex.id.0 == apex_id
-                    && matches!(&apex.address_match, Some(CanonicalAddressMatch::ExactFqdn(a)) if a == d)
+                    && matches!(&apex.address_match,
+                        Some(CanonicalAddressMatch::ExactFqdn(a) | CanonicalAddressMatch::Zone(a))
+                            if a == d)
                     && apex.app_match == r.app_match
                     && apex.enabled == r.enabled
                     && apex.action == r.action
@@ -1250,6 +1273,23 @@ mod tests {
         );
         let widened = book.with_subdomain_coverage();
         assert_eq!(widened.total_rule_count(), 5);
+        assert_eq!(widened.without_subdomain_twins(), Some(book));
+    }
+
+    /// Bare names covering subdomains make a zone of several labels `*.` of
+    /// its name too; a top-level zone is left alone, and the twin never reaches
+    /// the stored book.
+    #[test]
+    fn a_zone_of_several_labels_gets_a_suffix_twin_that_is_taken_back() {
+        let book = CanonicalRuleBook {
+            primary: CanonicalRuleSet::from_rules(vec![zone_rule("z1", "corp.example")]),
+            secondary: CanonicalRuleSet::from_rules(vec![zone_rule("z2", "intra")]),
+        };
+        let widened = book.with_subdomain_coverage();
+        assert!(widened.primary.rules().iter().any(|r| r.id.0 == "z1+sub"
+            && r.address_match
+                == Some(CanonicalAddressMatch::SuffixDomain("corp.example".into()))));
+        assert_eq!(widened.secondary.rules().len(), 1);
         assert_eq!(widened.without_subdomain_twins(), Some(book));
     }
 

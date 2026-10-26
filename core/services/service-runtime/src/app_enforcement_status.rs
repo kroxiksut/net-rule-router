@@ -48,6 +48,9 @@ pub struct AppEnforcementStatus(Arc<Mutex<EnforcementState>>);
 #[derive(Default)]
 struct EnforcementState {
     unresolved: HashMap<String, Vec<String>>,
+    /// Per principal: found programs whose rule carries none of their traffic,
+    /// with why.
+    unrouted: HashMap<String, BTreeMap<String, String>>,
     /// Per principal: a conflict names that user's own rules and addresses.
     conflicts: HashMap<String, Vec<RuleConflictDto>>,
 }
@@ -71,6 +74,38 @@ impl AppEnforcementStatus {
                 guard.unresolved.insert(principal.to_string(), apps);
             }
         }
+    }
+
+    /// Replace `principal`'s found-but-unrouted app rules; an empty list
+    /// forgets them.
+    pub fn set_unrouted(
+        &self,
+        principal: &str,
+        apps: &[(String, crate::address_ownership::AppTrafficElsewhere)],
+    ) {
+        let map: BTreeMap<String, String> = apps
+            .iter()
+            .map(|(app, why)| (app.clone(), why.slug().to_string()))
+            .collect();
+        if let Ok(mut guard) = self.0.lock() {
+            if map.is_empty() {
+                guard.unrouted.remove(principal);
+            } else {
+                guard.unrouted.insert(principal.to_string(), map);
+            }
+        }
+    }
+
+    /// `principal`'s found programs whose rule carries none of their traffic,
+    /// each with the reason slug.
+    pub fn unrouted(&self, principal: &str) -> BTreeMap<String, String> {
+        self.0
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .unrouted
+            .get(principal)
+            .cloned()
+            .unwrap_or_default()
     }
 
     /// `principal`'s set from its last applying compute.
@@ -340,6 +375,80 @@ pub struct RouteEnforcementStatus {
     held: Arc<Mutex<HashMap<String, RoutesHeldDto>>>,
     /// Per principal, the other user's tunnel their unrouted traffic rides.
     carried: Arc<Mutex<HashMap<String, TrafficCarriedDto>>>,
+    /// Per (principal, role), when the link stopped carrying the rules for a
+    /// reason [`NOTICE_GRACE`] holds back.
+    held_since: Arc<Mutex<HashMap<(String, String), i64>>>,
+    /// Per (principal, role), the short drops that may add up to a link that
+    /// keeps dropping.
+    flaps: Arc<Mutex<HashMap<(String, String), FlapState>>>,
+}
+
+/// Short drops this close together are one connection that keeps failing,
+/// and a link up this long has stopped doing so.
+pub const FLAP_WINDOW_MS: i64 = 120_000;
+/// Short drops inside [`FLAP_WINDOW_MS`] that make a link one that keeps
+/// dropping.
+const FLAP_DROPS: usize = 3;
+/// The roles whose link can drop; the machine-wide report is not a link.
+const LINK_ROLES: [&str; 2] = ["primary", "secondary"];
+/// Bound on the (principal, role) pairs watched; past it the watch restarts.
+const MAX_FLAP_KEYS: usize = 128;
+
+/// One link's recent short drops.
+///
+/// Told once at the [`FLAP_DROPS`]th drop inside [`FLAP_WINDOW_MS`]. Re-armed
+/// only by the link staying up for a whole window between two drops: drops
+/// that keep coming, however spread, are the same news. An outage long enough
+/// to be announced on its own resets the count, since it is not a short drop.
+#[derive(Debug, Default)]
+pub struct FlapState {
+    starts: std::collections::VecDeque<i64>,
+    last_end_ms: Option<i64>,
+    told: bool,
+}
+
+impl FlapState {
+    /// A drop that began at `began_ms` ended at `ended_ms`; `true` when it is
+    /// the one to tell.
+    pub fn note_drop(&mut self, began_ms: i64, ended_ms: i64) -> bool {
+        if self
+            .last_end_ms
+            .is_some_and(|end| began_ms.saturating_sub(end) >= FLAP_WINDOW_MS)
+        {
+            self.told = false;
+            self.starts.clear();
+        }
+        self.last_end_ms = Some(ended_ms);
+        if ended_ms.saturating_sub(began_ms) >= NOTICE_GRACE_MS {
+            self.starts.clear();
+            return false;
+        }
+        self.starts
+            .retain(|start| began_ms.saturating_sub(*start) < FLAP_WINDOW_MS);
+        self.starts.push_back(began_ms);
+        while self.starts.len() > FLAP_DROPS {
+            self.starts.pop_front();
+        }
+        if self.told || self.starts.len() < FLAP_DROPS {
+            return false;
+        }
+        self.told = true;
+        true
+    }
+}
+
+/// How long a link may be off, gone or unreadable before it is announced: a
+/// VPN reconnecting or a machine waking from sleep is over by then. The
+/// protection itself does not wait; the report is pushed at once, quiet.
+pub const NOTICE_GRACE_MS: i64 = 15_000;
+
+/// The statuses that share one grace: the link coming back ends all of them.
+const GRACE_STATUSES: [&str; 3] = ["secondary-down", "adapter-gone", "adapters-unreadable"];
+
+/// Whether a report of `status` held since `held_since_ms` is still quiet.
+#[must_use]
+pub fn within_notice_grace(status: &str, held_since_ms: i64, now_ms: i64) -> bool {
+    GRACE_STATUSES.contains(&status) && now_ms.saturating_sub(held_since_ms) < NOTICE_GRACE_MS
 }
 
 /// Principal → role → report.
@@ -380,6 +489,49 @@ impl RouteEnforcementStatus {
         report: &EnforcementStatusDto,
         now_ms: i64,
     ) -> Option<EnforcementStatusDto> {
+        self.record_with_flap_at(principal, report, now_ms).0
+    }
+
+    /// [`Self::record_at`], and whether this report ends the third short drop
+    /// of a link that keeps dropping (see [`FlapState`]).
+    pub fn record_with_flap_at(
+        &self,
+        principal: &str,
+        report: &EnforcementStatusDto,
+        now_ms: i64,
+    ) -> (Option<EnforcementStatusDto>, bool) {
+        let key = (principal.to_string(), report.role.clone());
+        let (held, ended_hold) = {
+            let mut held = self.held_since.lock().unwrap_or_else(|p| p.into_inner());
+            if GRACE_STATUSES.contains(&report.status.as_str()) {
+                let since = held.entry(key.clone()).or_insert(now_ms);
+                // A clock stepped back would stretch the grace by the step.
+                *since = (*since).min(now_ms);
+                (within_notice_grace(&report.status, *since, now_ms), None)
+            } else {
+                (false, held.remove(&key))
+            }
+        };
+        let flapping = match ended_hold {
+            Some(began) if report.status == "ok" && LINK_ROLES.contains(&report.role.as_str()) => {
+                let mut flaps = self.flaps.lock().unwrap_or_else(|p| p.into_inner());
+                if flaps.len() >= MAX_FLAP_KEYS && !flaps.contains_key(&key) {
+                    flaps.clear();
+                }
+                flaps.entry(key).or_default().note_drop(began, now_ms)
+            }
+            _ => false,
+        };
+        (self.store_report(principal, report, now_ms, held), flapping)
+    }
+
+    fn store_report(
+        &self,
+        principal: &str,
+        report: &EnforcementStatusDto,
+        now_ms: i64,
+        held: bool,
+    ) -> Option<EnforcementStatusDto> {
         let stored = {
             let mut guard = self.reports.lock().unwrap_or_else(|p| p.into_inner());
             let roles = guard.entry(principal.to_string()).or_default();
@@ -390,7 +542,8 @@ impl RouteEnforcementStatus {
             };
             let stored = EnforcementStatusDto {
                 since_unix_ms,
-                quiet: crate::startup_quiet::quiet(principal, &report.role, &report.status, now_ms),
+                quiet: held
+                    || crate::startup_quiet::quiet(principal, &report.role, &report.status, now_ms),
                 ..report.clone()
             };
             if previous == Some(&stored) {
@@ -435,7 +588,31 @@ impl RouteEnforcementStatus {
             since_unix_ms: None,
             quiet: false,
         };
-        let Some(report) = self.record(principal, &report) else {
+        let now_ms = crate::conn_observation_consumer::now_unix_ms();
+        let (stored, flapping) = self.record_with_flap_at(
+            principal,
+            &report,
+            i64::try_from(now_ms).unwrap_or(i64::MAX),
+        );
+        if flapping {
+            tracing::info!(
+                target: "nrr::enforcement",
+                msg_key = "enforcement-link-keeps-dropping",
+                sid = %principal,
+                role = %role,
+                "the link keeps dropping for a few seconds and coming back",
+            );
+            if let Some(bus) = events {
+                bus.publish_for(
+                    principal,
+                    nrr_shared::ipc_payloads::StatusUpdateEvent::LinkKeepsDropping {
+                        sid: principal.to_string(),
+                        role: role.to_string(),
+                    },
+                );
+            }
+        }
+        let Some(report) = stored else {
             return;
         };
         let Some(bus) = events else {
@@ -710,7 +887,10 @@ mod tests {
             reader.for_principal("S-1"),
             vec![
                 stamped("ok", "primary", 30),
-                stamped("secondary-down", "secondary", 10)
+                EnforcementStatusDto {
+                    quiet: true,
+                    ..stamped("secondary-down", "secondary", 10)
+                }
             ]
         );
         assert!(writer
@@ -719,7 +899,10 @@ mod tests {
         assert_eq!(reader.status_of("S-1", "secondary").as_deref(), Some("ok"));
         assert_eq!(
             reader.for_principal("S-2"),
-            vec![stamped("adapter-gone", "secondary", 40)]
+            vec![EnforcementStatusDto {
+                quiet: true,
+                ..stamped("adapter-gone", "secondary", 40)
+            }]
         );
         assert!(reader.for_principal("S-3").is_empty());
     }
@@ -755,6 +938,206 @@ mod tests {
                 .and_then(|r| r.since_unix_ms),
             Some(400)
         );
+    }
+
+    /// `(status, quiet)` of every report a pass sequence pushed: what a client
+    /// turns into cards. A quiet report shows the state and pops nothing.
+    fn pushed(board: &RouteEnforcementStatus, passes: &[(&str, &str, i64)]) -> Vec<(String, bool)> {
+        passes
+            .iter()
+            .filter_map(|(status, role, at)| {
+                board.record_at("S-1", &status_report(status, role), *at)
+            })
+            .map(|r| (r.status, r.quiet))
+            .collect()
+    }
+
+    fn loud(pushes: &[(String, bool)]) -> Vec<&str> {
+        pushes
+            .iter()
+            .filter(|(status, quiet)| !quiet && status != "ok")
+            .map(|(status, _)| status.as_str())
+            .collect()
+    }
+
+    /// A VPN reconnecting in five seconds: switched off, gone, back. The state
+    /// is reported at once, but nothing is loud, so no card and, with nothing
+    /// shown, no "works again".
+    #[test]
+    fn a_link_back_within_the_grace_is_never_announced() {
+        let board = RouteEnforcementStatus::new();
+        let pushes = pushed(
+            &board,
+            &[
+                ("secondary-down", "secondary", 1_000),
+                ("adapter-gone", "secondary", 3_000),
+                ("adapter-gone", "secondary", 5_000),
+                ("ok", "secondary", 6_000),
+            ],
+        );
+        assert_eq!(
+            pushes.first().map(|p| p.0.as_str()),
+            Some("secondary-down"),
+            "shown at once"
+        );
+        assert!(loud(&pushes).is_empty(), "{pushes:?}");
+    }
+
+    /// Off then gone is ONE window: the card comes 15 s after the link went,
+    /// once, however the status changed inside it.
+    #[test]
+    fn a_link_away_past_the_grace_is_announced_once() {
+        let board = RouteEnforcementStatus::new();
+        let pushes = pushed(
+            &board,
+            &[
+                ("secondary-down", "secondary", 1_000),
+                ("adapter-gone", "secondary", 10_000),
+                ("adapter-gone", "secondary", 15_000),
+                ("adapter-gone", "secondary", 17_000),
+                ("adapter-gone", "secondary", 18_000),
+                ("ok", "secondary", 20_000),
+            ],
+        );
+        assert_eq!(loud(&pushes), ["adapter-gone"], "{pushes:?}");
+        assert_eq!(pushes.last().map(|p| p.0.as_str()), Some("ok"));
+    }
+
+    /// Two short flaps in a row are two short flaps, not one long outage.
+    #[test]
+    fn flaps_inside_the_grace_do_not_add_up() {
+        let board = RouteEnforcementStatus::new();
+        let pushes = pushed(
+            &board,
+            &[
+                ("secondary-down", "primary", 0),
+                ("ok", "primary", 9_000),
+                ("secondary-down", "primary", 10_000),
+                ("secondary-down", "primary", 20_000),
+                ("ok", "primary", 21_000),
+            ],
+        );
+        assert!(loud(&pushes).is_empty(), "{pushes:?}");
+    }
+
+    /// Waking from sleep the adapter list fails to read for a moment: that is
+    /// told only when it lasts.
+    #[test]
+    fn unreadable_adapters_are_told_only_when_it_lasts() {
+        let board = RouteEnforcementStatus::new();
+        let short = pushed(
+            &board,
+            &[
+                ("adapters-unreadable", MACHINE_WIDE_ROLE, 0),
+                ("adapters-unreadable", MACHINE_WIDE_ROLE, 3_000),
+                ("ok", MACHINE_WIDE_ROLE, 3_500),
+            ],
+        );
+        assert!(loud(&short).is_empty(), "{short:?}");
+        let long = pushed(
+            &board,
+            &[
+                ("adapters-unreadable", MACHINE_WIDE_ROLE, 10_000),
+                ("adapters-unreadable", MACHINE_WIDE_ROLE, 26_000),
+            ],
+        );
+        assert_eq!(loud(&long), ["adapters-unreadable"], "{long:?}");
+    }
+
+    /// Short drops of `principal`'s additional link, each `(began, ended)` in
+    /// seconds; the times a "keeps dropping" notice was due.
+    fn flap_told(
+        board: &RouteEnforcementStatus,
+        principal: &str,
+        drops: &[(i64, i64)],
+    ) -> Vec<i64> {
+        let mut told = Vec::new();
+        for (began, ended) in drops {
+            for (status, at) in [("secondary-down", began * 1000), ("ok", ended * 1000)] {
+                let (_, due) =
+                    board.record_with_flap_at(principal, &status_report(status, "secondary"), at);
+                if due {
+                    told.push(at / 1000);
+                }
+            }
+        }
+        told
+    }
+
+    /// Each drop is too short to announce, yet three in two minutes are a
+    /// connection that keeps failing: told once, at the third.
+    #[test]
+    fn three_short_drops_in_two_minutes_are_told_once() {
+        let board = RouteEnforcementStatus::new();
+        let told = flap_told(&board, "S-1", &[(0, 5), (30, 35), (60, 65), (70, 75)]);
+        assert_eq!(told, [65], "a fourth drop right after says nothing new");
+    }
+
+    #[test]
+    fn two_short_drops_are_not_a_connection_that_keeps_dropping() {
+        let board = RouteEnforcementStatus::new();
+        assert!(flap_told(&board, "S-1", &[(0, 5), (30, 35)]).is_empty());
+    }
+
+    /// Up for a full two minutes ends the flapping; three more drops after
+    /// that are news again.
+    #[test]
+    fn after_two_stable_minutes_three_more_drops_are_told_again() {
+        let board = RouteEnforcementStatus::new();
+        let told = flap_told(
+            &board,
+            "S-1",
+            &[
+                (0, 5),
+                (30, 35),
+                (60, 65),
+                (190, 195),
+                (200, 205),
+                (210, 215),
+            ],
+        );
+        assert_eq!(told, [65, 215]);
+        let still = RouteEnforcementStatus::new();
+        let told = flap_told(
+            &still,
+            "S-1",
+            &[
+                (0, 5),
+                (30, 35),
+                (60, 65),
+                (150, 155),
+                (160, 165),
+                (170, 175),
+            ],
+        );
+        assert_eq!(told, [65], "up for less than two minutes in between");
+    }
+
+    /// Spread over more than two minutes, short drops are not flapping; and an
+    /// outage long enough to be announced on its own is not a short drop.
+    #[test]
+    fn drops_far_apart_or_an_announced_outage_do_not_count() {
+        let board = RouteEnforcementStatus::new();
+        assert!(flap_told(&board, "S-1", &[(0, 5), (70, 75), (140, 145)]).is_empty());
+        let other = RouteEnforcementStatus::new();
+        assert!(flap_told(&other, "S-1", &[(0, 5), (10, 40), (50, 55)]).is_empty());
+    }
+
+    /// Two users' drops are their own: neither reaches three.
+    #[test]
+    fn drops_are_counted_per_user() {
+        let board = RouteEnforcementStatus::new();
+        let mut told = flap_told(&board, "S-1", &[(0, 5), (30, 35)]);
+        told.extend(flap_told(&board, "S-2", &[(10, 15), (40, 45)]));
+        assert!(told.is_empty());
+    }
+
+    /// A fault the user must fix is not held back.
+    #[test]
+    fn a_status_outside_the_grace_is_told_at_once() {
+        let board = RouteEnforcementStatus::new();
+        let pushes = pushed(&board, &[("adapter-choice-needed", "secondary", 0)]);
+        assert_eq!(loud(&pushes), ["adapter-choice-needed"]);
     }
 
     #[test]

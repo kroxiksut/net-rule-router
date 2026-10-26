@@ -20,8 +20,9 @@
           scripts\              recovery and uninstall scripts
 
     Two QML trees under one name would collide, which is why the app's own tree
-    keeps the `apps\desktop\qml` path it has in the checkout. That depth is
-    load bearing anyway: the QML addresses its icons relative to itself.
+    keeps the `apps\desktop\qml` path it has in the checkout, where the launcher
+    looks for it. Icons and images are found through `assets\` beside the
+    binaries, whatever the QML's depth.
 
     Every package carries build-info.json - version, commit, whether the tree
     had uncommitted changes, build time, Qt version - so a report about a
@@ -101,7 +102,7 @@ $packageRoot = Join-Path $OutputRoot $(if ($Headless) { 'NetRuleRouter-headless'
 # Binaries live in the package root: the user starts NetRuleRouter.exe
 # directly, with no wrapper script in between. Nothing collides there -
 # windeployqt owns `qml\` for its modules while the app's own QML sits
-# under `apps\desktop\qml\`, which is also the depth its icon paths expect.
+# under `apps\desktop\qml\`, and `assets\` must sit beside the binaries.
 $binDir = $packageRoot
 $Arch = $Arch.ToLowerInvariant()
 # Kit, CRT, wintun and archive name all follow -Arch. An ARM64 package builds
@@ -641,10 +642,9 @@ if (-not $Headless) {
 
 # ── Payload ──────────────────────────────────────────────────────────────────
 
-# Not `<package>\qml`, despite that being the tidier name: the QML addresses
-# icons as `../../../assets/icons/...`, three levels up from Main.qml. Keeping
-# the same depth as the checkout is what makes those icons resolve, and the
-# launcher looks for exactly this path beside the binary.
+# Not `<package>\qml`: windeployqt owns that, and the launcher looks for the
+# app's QML at exactly `apps\desktop\qml` beside the binary. `assets\` stays
+# beside the binary too: the launcher hands that folder to the QML as its root.
 Copy-Payload 'locales' (Join-Path $packageRoot 'locales')
 Copy-Payload 'presets' (Join-Path $packageRoot 'presets')
 Copy-Payload 'configs' (Join-Path $packageRoot 'configs')

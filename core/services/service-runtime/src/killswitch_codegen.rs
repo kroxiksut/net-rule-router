@@ -860,21 +860,18 @@ pub fn catch_all_kill_switch_filters(
     exemptions: &FailClosedExemptions,
     protocols: KillSwitchProtocols,
 ) -> Vec<WfpFilterSpec> {
-    catch_all_kill_switch_filters_for(sid, resolution, exemptions, protocols, false, false)
+    catch_all_kill_switch_filters_for(sid, resolution, exemptions, protocols, false)
 }
 
 /// [`catch_all_kill_switch_filters`] for a caller that also permits the
 /// tunnel's own client by app id: that permit carries the reconnect, so a
 /// tunnel that installs no host route to its server can still be armed.
-/// `machine_has_other_principals` drops the machine-wide IPv6 packet block
-/// (see [`catch_all_v6_filters`]).
 pub fn catch_all_kill_switch_filters_for(
     sid: &str,
     resolution: &KillSwitchResolution,
     exemptions: &FailClosedExemptions,
     protocols: KillSwitchProtocols,
     client_carries_reconnect: bool,
-    machine_has_other_principals: bool,
 ) -> Vec<WfpFilterSpec> {
     if resolution.secondary_luid == 0
         || (resolution.bootstrap_server_ips.is_empty() && !client_carries_reconnect)
@@ -899,21 +896,6 @@ pub fn catch_all_kill_switch_filters_for(
     // local router/DNS).
     for (net, prefix) in &resolution.local_subnets {
         filters.push(exempt_subnet(sid, *net, *prefix, weight));
-        weight += 1;
-    }
-    // Hosts known to be reached directly — in these modes, the main-link
-    // carve-outs. Without this exemption the catch-all would kill a
-    // destination the user positively routed over the main link the moment
-    // the tunnel came up, even though the fail-closed twin spares the same
-    // hosts.
-    for ip in exemptions
-        .known_direct_ips
-        .iter()
-        .copied()
-        .filter(|ip| !is_exempt_from_blocking(*ip))
-        .take(KILLSWITCH_MAX_DESTINATIONS)
-    {
-        filters.push(exempt_direct_host(sid, ip, weight));
         weight += 1;
     }
     // The catch-all block — everything else this user sends off-tunnel.
@@ -970,16 +952,6 @@ pub fn catch_all_kill_switch_filters_for(
             filters.push(packet_permit_primary_host(sid, TR, ip, pw));
             pw += 1;
         }
-        for ip in exemptions
-            .known_direct_ips
-            .iter()
-            .copied()
-            .filter(|ip| !is_exempt_from_blocking(*ip))
-            .take(KILLSWITCH_MAX_DESTINATIONS)
-        {
-            filters.push(packet_permit_direct_host(sid, TR, ip, pw));
-            pw += 1;
-        }
         filters.extend(packet_protocol_blocks(sid, DestScope::All, protocols, 0));
     }
 
@@ -994,7 +966,6 @@ pub fn catch_all_kill_switch_filters_for(
         &exemptions.bootstrap_server_ips_v6,
         &exemptions.local_subnets_v6,
         protocols,
-        machine_has_other_principals,
     ));
 
     filters
@@ -1160,8 +1131,8 @@ const V4_LOCAL_NETWORK_CONTROL: Ipv4Addr = Ipv4Addr::new(224, 0, 0, 0);
 mod exemptions;
 
 use exemptions::{
-    base_ale_exemptions, base_packet_exemptions, exempt_direct_host, exempt_dns_over_primary,
-    exempt_egress, exempt_probe_target, exempt_subnet,
+    base_ale_exemptions, base_packet_exemptions, exempt_dns_over_primary, exempt_egress,
+    exempt_probe_target, exempt_subnet,
 };
 pub use exemptions::{
     destination_less_floor, doh_foreign_vetoes, foreign_luids_of, foreign_tunnel_permits,

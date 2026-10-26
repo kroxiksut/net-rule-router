@@ -25,13 +25,17 @@ Commands on this screen:
   a: allow the first listed VPN to reach its server, so leak protection lets it connect
   p: confirm the suggested main connection; another one is chosen under Interfaces and routes
   v: send the blocked site named under the state over the additional route; you are asked first
+  x N: dismiss notification N   X: dismiss all
+  m N: stop showing notifications like N   H: hide or show addresses in block notifications
+  For a blocked connection N: v N: send it over the additional route   s N: snooze   w N: why it was blocked
+  For a site that does not open in notification N: c N: check whether the network or the site is at fault
 Type a screen number, h for help or q to quit, then press Enter.
 Service: OK
 Routing state: Routing active
 Routing state: Rules apply on this user session.
 Connections: Main connection: Ethernet — Example Network Adapter — Available — Rules applied
 Connections: Additional connection: Example Tunnel — Example Network Adapter — Available — Rules applied
-Warning: The additional connection is not up — Sites your rules send there go over the main connection until it comes back: leak protection is off. Start the connection, or turn leak protection on to hold them instead.
+1. Warning: The additional connection is not up — Sites your rules send there go over the main connection until it comes back: leak protection is off. Start the connection, or turn leak protection on to hold them instead.
 Routing state: Routing limited
 Routing state: Some rules are not being applied right now. The notices say why.
 Connections: Additional connection: Example Tunnel — Example Network Adapter — Available — Rules not applied
@@ -49,11 +53,14 @@ Commands on this screen:
   d and a number: delete that rule
   t and a number: switch that rule on or off
   f: choose which route's rules to show
-  S: by state, y: by type, u: only added automatically, E: the rules that will not be applied
+  S: by state, y: by type, u: only added automatically, E: the rules that will not be applied, H: hide or show the rules that do not work
   / and text: search, for example / example.com; / alone shows all
   > and <: next and previous page
   s: apply the changes; they are shown first
   i: import files. x: export files. p: load a country rule set
+  X: save one route's rules to a file. L: add the demo rules. W: clear all rules (asks first)
+  Z: go back to the baseline rules; your own rules and the changes on screen are dropped, and what changes is shown first
+  *: select or unselect the chosen rule (in line mode * and numbers, for example * 2 5). B: act on the selected rules
   o: choose the folder with your rule sets
   r: show the rules the service applies
   b: switch between your own rules and the baseline
@@ -79,11 +86,14 @@ Commands on this screen:
   d and a number: delete that rule
   t and a number: switch that rule on or off
   f: choose which route's rules to show
-  S: by state, y: by type, u: only added automatically, E: the rules that will not be applied
+  S: by state, y: by type, u: only added automatically, E: the rules that will not be applied, H: hide or show the rules that do not work
   / and text: search, for example / example.com; / alone shows all
   > and <: next and previous page
   s: apply the changes; they are shown first
   i: import files. x: export files. p: load a country rule set
+  X: save one route's rules to a file. L: add the demo rules. W: clear all rules (asks first)
+  Z: go back to the baseline rules; your own rules and the changes on screen are dropped, and what changes is shown first
+  *: select or unselect the chosen rule (in line mode * and numbers, for example * 2 5). B: act on the selected rules
   o: choose the folder with your rule sets
   r: show the rules the service applies
   b: switch between your own rules and the baseline
@@ -124,11 +134,14 @@ Commands on this screen:
   d and a number: delete that rule
   t and a number: switch that rule on or off
   f: choose which route's rules to show
-  S: by state, y: by type, u: only added automatically, E: the rules that will not be applied
+  S: by state, y: by type, u: only added automatically, E: the rules that will not be applied, H: hide or show the rules that do not work
   / and text: search, for example / example.com; / alone shows all
   > and <: next and previous page
   s: apply the changes; they are shown first
   i: import files. x: export files. p: load a country rule set
+  X: save one route's rules to a file. L: add the demo rules. W: clear all rules (asks first)
+  Z: go back to the baseline rules; your own rules and the changes on screen are dropped, and what changes is shown first
+  *: select or unselect the chosen rule (in line mode * and numbers, for example * 2 5). B: act on the selected rules
   o: choose the folder with your rule sets
   r: show the rules the service applies
   b: switch between your own rules and the baseline

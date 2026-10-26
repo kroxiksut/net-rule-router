@@ -1,0 +1,302 @@
+{
+  "description": "pure.js adapterPassesFilter and adapterSortRank over one interface row: `base-row` with `patch` laid over it, the filter's switches and the sort key.",
+  "base-row": {
+    "persistent-id": "{00000000-0000-0000-0000-000000000001}",
+    "adapter-name": "{00000000-0000-0000-0000-000000000001}",
+    "name": "Ethernet",
+    "interface-description": "Example Gigabit Network Connection",
+    "interface-type": "ethernet",
+    "kind": "ethernet",
+    "is-bluetooth-like": false,
+    "local-ip": "192.0.2.10",
+    "gateway": "192.0.2.1",
+    "dns-servers": "192.0.2.53",
+    "has-default-route": true,
+    "has-forwarding-path": true,
+    "availability": "available",
+    "route-state": "not-selected",
+    "observed-facts": {
+      "connectivity-state": "internet",
+      "external-ip-status": "unknown",
+      "external-ip": null,
+      "external-probe-attempted": false,
+      "external-probe-note": ""
+    },
+    "derived-assessment": {
+      "vpn-tunnel-likelihood": "unlikely",
+      "virtual-interface-likelihood": "unlikely",
+      "service-interface-likelihood": "unlikely",
+      "classification": "regular-interface",
+      "confidence-percent": 90,
+      "heuristic-only": true,
+      "signals": []
+    },
+    "recommendation": {
+      "class": "preferred-primary",
+      "confidence": "high",
+      "advisory-only": true,
+      "key-signals": [],
+      "excluded-alternatives": []
+    }
+  },
+  "cases": [
+    {
+      "name": "an available row passes and ranks by its recommendation",
+      "input": {
+        "patch": {},
+        "showUnavailable": true,
+        "search": "",
+        "sortBy": "default"
+      },
+      "expected": {
+        "passes": true,
+        "rank": 120
+      }
+    },
+    {
+      "name": "an unavailable row is hidden unless asked for",
+      "input": {
+        "patch": {
+          "availability": "unavailable"
+        },
+        "showUnavailable": false,
+        "search": "",
+        "sortBy": "default"
+      },
+      "expected": {
+        "passes": false,
+        "rank": 70
+      }
+    },
+    {
+      "name": "an unavailable row shows when asked for",
+      "input": {
+        "patch": {
+          "availability": "unavailable"
+        },
+        "showUnavailable": true,
+        "search": "",
+        "sortBy": "default"
+      },
+      "expected": {
+        "passes": true,
+        "rank": 70
+      }
+    },
+    {
+      "name": "search finds the description in any case",
+      "input": {
+        "patch": {},
+        "showUnavailable": true,
+        "search": "GIGABIT",
+        "sortBy": "default"
+      },
+      "expected": {
+        "passes": true,
+        "rank": 120
+      }
+    },
+    {
+      "name": "search finds the address",
+      "input": {
+        "patch": {},
+        "showUnavailable": true,
+        "search": "192.0.2.10",
+        "sortBy": "default"
+      },
+      "expected": {
+        "passes": true,
+        "rank": 120
+      }
+    },
+    {
+      "name": "search that matches nothing hides the row",
+      "input": {
+        "patch": {},
+        "showUnavailable": true,
+        "search": "wireless",
+        "sortBy": "default"
+      },
+      "expected": {
+        "passes": false,
+        "rank": 120
+      }
+    },
+    {
+      "name": "an empty address is searched as a dash",
+      "input": {
+        "patch": {
+          "local-ip": ""
+        },
+        "showUnavailable": true,
+        "search": "-",
+        "sortBy": "default"
+      },
+      "expected": {
+        "passes": true,
+        "rank": 120
+      }
+    },
+    {
+      "name": "no resolver costs the dns points",
+      "input": {
+        "patch": {
+          "dns-servers": ""
+        },
+        "showUnavailable": true,
+        "search": "",
+        "sortBy": "default"
+      },
+      "expected": {
+        "passes": true,
+        "rank": 90
+      }
+    },
+    {
+      "name": "a placeholder resolver is no resolver",
+      "input": {
+        "patch": {
+          "dns-servers": "none"
+        },
+        "showUnavailable": true,
+        "search": "",
+        "sortBy": "default"
+      },
+      "expected": {
+        "passes": true,
+        "rank": 90
+      }
+    },
+    {
+      "name": "a loopback sinks whatever the order",
+      "input": {
+        "patch": {
+          "name": "Loopback Pseudo-Interface 1"
+        },
+        "showUnavailable": true,
+        "search": "",
+        "sortBy": "vpn-like"
+      },
+      "expected": {
+        "passes": true,
+        "rank": -10000
+      }
+    },
+    {
+      "name": "a bound primary leads",
+      "input": {
+        "patch": {
+          "selected-role": "primary"
+        },
+        "showUnavailable": true,
+        "search": "",
+        "sortBy": "default"
+      },
+      "expected": {
+        "passes": true,
+        "rank": 1000000
+      }
+    },
+    {
+      "name": "a bound secondary is next",
+      "input": {
+        "patch": {
+          "selected-role": "secondary"
+        },
+        "showUnavailable": true,
+        "search": "",
+        "sortBy": "primary-candidate"
+      },
+      "expected": {
+        "passes": true,
+        "rank": 900000
+      }
+    },
+    {
+      "name": "a likely tunnel leads the vpn order",
+      "input": {
+        "patch": {
+          "derived-assessment": {
+            "vpn-tunnel-likelihood": "likely"
+          }
+        },
+        "showUnavailable": true,
+        "search": "",
+        "sortBy": "vpn-like"
+      },
+      "expected": {
+        "passes": true,
+        "rank": 101
+      }
+    },
+    {
+      "name": "a likely virtual adapter is third in the vpn order",
+      "input": {
+        "patch": {
+          "derived-assessment": {
+            "virtual-interface-likelihood": "likely"
+          }
+        },
+        "showUnavailable": true,
+        "search": "",
+        "sortBy": "vpn-like"
+      },
+      "expected": {
+        "passes": true,
+        "rank": 41
+      }
+    },
+    {
+      "name": "the primary-candidate order reads the recommendation",
+      "input": {
+        "patch": {
+          "recommendation": {
+            "class": "preferred-secondary"
+          }
+        },
+        "showUnavailable": true,
+        "search": "",
+        "sortBy": "primary-candidate"
+      },
+      "expected": {
+        "passes": true,
+        "rank": 31
+      }
+    },
+    {
+      "name": "an unknown recommendation is middling",
+      "input": {
+        "patch": {
+          "recommendation": {
+            "class": ""
+          }
+        },
+        "showUnavailable": true,
+        "search": "",
+        "sortBy": "primary-candidate"
+      },
+      "expected": {
+        "passes": true,
+        "rank": 11
+      }
+    },
+    {
+      "name": "requires-check counts less than available",
+      "input": {
+        "patch": {
+          "availability": "requires-check",
+          "recommendation": {
+            "class": "allowed-but-not-recommended"
+          }
+        },
+        "showUnavailable": true,
+        "search": "",
+        "sortBy": "default"
+      },
+      "expected": {
+        "passes": true,
+        "rank": 60
+      }
+    }
+  ]
+}

@@ -534,3 +534,24 @@ fn every_cause_written_is_one_the_clients_word() {
         );
     }
 }
+
+/// A confirmation whose term ran out stops counting at once: the relay reads
+/// this stamp, and a timer late after a sleep must not keep the rule open.
+#[test]
+fn a_term_running_out_moves_the_pass_stamp_without_its_timer() {
+    let conn = state_conn();
+    let (grants, _audit) = opened(&conn, Some(KEY.to_vec()));
+    let owner = "S-1-5-21-override-stamp";
+    let grant = grants
+        .grant(
+            &preview_for(owner, false),
+            OverrideTerm::OneHour,
+            owner,
+            now_ms(),
+        )
+        .expect("granted");
+    let end = grant.expires_at_ms.expect("a timed term");
+    let before = pass_generation_at(7, Some(&*grants), end - 1);
+    let after = pass_generation_at(7, Some(&*grants), end + 1);
+    assert_ne!(before, after, "the stamp ignored a term that ran out");
+}

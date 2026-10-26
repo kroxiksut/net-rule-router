@@ -26,6 +26,10 @@ Commands on this screen:
   a: allow the first listed VPN to reach its server, so leak protection lets it connect
   p: confirm the suggested main connection; another one is chosen under Interfaces and routes
   v: send the blocked site named under the state over the additional route; you are asked first
+  x N: dismiss notification N   X: dismiss all
+  m N: stop showing notifications like N   H: hide or show addresses in block notifications
+  For a blocked connection N: v N: send it over the additional route   s N: snooze   w N: why it was blocked
+  For a site that does not open in notification N: c N: check whether the network or the site is at fault
 Type a screen number, h for help or q to quit, then press Enter.
 
 Screen: Connection trace
@@ -240,13 +244,16 @@ Diagnostic archive export:
   The archive is saved in the service archives directory (per-user).
   Ready
   x: Diagnostic archive export
+  Detail level: Standard (recommended) · Only logs from the current session: Yes · Log size limit in the archive: Unlimited
 Commands on this screen:
   l: switch between diagnostics, the log and the audit trail
   a and an alert number: acknowledge it, for example a 1
   e and a host or address: which rule decides it, for example e example.com
   c and a site name: check it, for example c example.com; m: move the sign-in names the check found to the site's route
   x: export a diagnostic archive
+  d: change the detail level, o: only this session's logs or all of them, b: change the log size limit
   In the log: v next level, / and text filter by event type (/ on its own clears), s this session or all history
+  In the log: c and text filter by category (c on its own clears). In the log and the audit trail: o next sort column, d reverse order
   n: next page (more)   p: previous page (back)
   r: read again from the service. Lists do not refresh by themselves, so nothing moves while you read.
 Type a screen number, h for help or q to quit, then press Enter.

@@ -351,6 +351,16 @@ pub struct FakeIpBinding {
     pub v6: Option<Ipv6Addr>,
 }
 
+/// A binding nothing has used for a while, as [`FakeIpAllocator::idle_bindings`]
+/// reports it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct IdleBinding {
+    /// Its place in the recycling order when it was reported.
+    pub order: u64,
+    pub domain: String,
+    pub binding: FakeIpBinding,
+}
+
 /// Why an allocation could not be made.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum FakeIpError {
@@ -632,6 +642,59 @@ impl FakeIpAllocator {
         }
     }
 
+    /// Bindings unused for at least `idle`, oldest first, from past `after` in
+    /// the recycling order; at most `limit`. Walks only the idle ones.
+    #[must_use]
+    pub fn idle_bindings(&self, after: u64, idle: Duration, limit: usize) -> Vec<IdleBinding> {
+        use std::ops::Bound;
+        let mut found = Vec::new();
+        for &(order, index) in self
+            .by_age
+            .range((Bound::Excluded((after, u32::MAX)), Bound::Unbounded))
+        {
+            if found.len() >= limit {
+                break;
+            }
+            let Some(slot) = self.by_index.get(&index) else {
+                continue;
+            };
+            // The order follows the use, so every later binding is younger.
+            if slot.touched.elapsed() < idle {
+                break;
+            }
+            found.push(IdleBinding {
+                order,
+                domain: slot.domain.clone(),
+                binding: self.binding_at(index),
+            });
+        }
+        found
+    }
+
+    /// [`Self::release`] `domain`, unless it was used again since
+    /// [`Self::idle_bindings`] reported it at `order`.
+    pub fn release_if_untouched(&mut self, domain: &str, order: u64) -> bool {
+        let key = normalize_hostname(domain);
+        let untouched = self
+            .by_domain
+            .get(&key)
+            .and_then(|index| self.by_index.get(index))
+            .is_some_and(|slot| slot.last_used == order);
+        untouched && self.release(&key)
+    }
+
+    /// Mark the binding behind `addr` used now: a flow is still on it.
+    pub fn touch_address(&mut self, addr: IpAddr) -> bool {
+        let Some(index) = self.config.index_of(addr) else {
+            return false;
+        };
+        if !self.by_index.contains_key(&index) {
+            return false;
+        }
+        self.touch(index);
+        true
+    }
+
     /// Drop every binding (policy reload, feature turned off, service stop).
     pub fn clear(&mut self) {
         self.by_domain.clear();
@@ -720,6 +783,42 @@ mod tests {
             v6_prefix_len: 0,
         })
         .with_min_recycle_idle(Duration::ZERO)
+    }
+
+    /// Only bindings nobody used within the window are offered for release,
+    /// and the walk resumes past what was already looked at.
+    #[test]
+    fn idle_bindings_are_offered_oldest_first_and_resume_past_the_last_one() {
+        let mut alloc = tiny_pool(24);
+        for host in ["a.example", "b.example", "c.example"] {
+            alloc.allocate(host).expect("allocate");
+        }
+        assert!(
+            alloc.idle_bindings(0, RECYCLE_MIN_IDLE, 10).is_empty(),
+            "all just used"
+        );
+        let idle = alloc.idle_bindings(0, Duration::ZERO, 2);
+        let hosts: Vec<&str> = idle.iter().map(|b| b.domain.as_str()).collect();
+        assert_eq!(hosts, ["a.example", "b.example"]);
+        let rest = alloc.idle_bindings(idle[1].order, Duration::ZERO, 10);
+        assert_eq!(rest.len(), 1);
+        assert_eq!(rest[0].domain, "c.example");
+    }
+
+    /// Between being found idle and being released a binding may be used
+    /// again (a new connection to it); it then stays its hostname's.
+    #[test]
+    fn a_binding_used_again_after_it_was_found_idle_is_not_released() {
+        let mut alloc = tiny_pool(24);
+        let kept = alloc.allocate("kept.example").expect("allocate");
+        alloc.allocate("gone.example").expect("allocate");
+        let idle = alloc.idle_bindings(0, Duration::ZERO, 10);
+        assert!(alloc.touch_address(IpAddr::V4(kept.v4)));
+        for found in &idle {
+            alloc.release_if_untouched(&found.domain, found.order);
+        }
+        assert_eq!(alloc.binding_for_domain("kept.example"), Some(kept));
+        assert_eq!(alloc.binding_for_domain("gone.example"), None);
     }
 
     /// A flood of new names cannot take an address an application may still

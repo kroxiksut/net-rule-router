@@ -906,3 +906,24 @@ fn the_automatic_pass_stays_off_while_protection_holds_everything_off_the_main_c
         assert_eq!(cadence(&sid).enabled, runs, "{protection:?} under {mode:?}");
     }
 }
+
+/// A link that dropped is forgotten before the recompute runs; one that came
+/// up, or went from one broken state to another, is not a link that was lost.
+#[test]
+fn only_a_working_adapter_that_stopped_is_a_link_gone() {
+    use nrr_platform_api::{AdapterAvailability as A, AdapterAvailabilityChange};
+    let change = |index: u32, old: A, new: A| AdapterAvailabilityChange {
+        index,
+        stable_id: format!("id-{index}"),
+        old,
+        new,
+    };
+    let changes = [
+        change(7, A::Available, A::Absent),
+        change(8, A::Available, A::PresentNoIp),
+        change(9, A::PresentDown, A::Available),
+        change(10, A::PresentNoIp, A::Absent),
+        change(11, A::Available, A::PresentDown),
+    ];
+    assert_eq!(super::routing::links_gone(&changes), vec![7, 8, 11]);
+}

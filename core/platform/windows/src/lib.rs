@@ -38,6 +38,8 @@
 //! | `interface_manager` | Adapter enumeration |
 
 pub mod adapters;
+/// The block a reboot leaves for a signed-in person until the first pass.
+pub mod boot_guard;
 // Rules by program path: real places, folder listings, ReadDirectoryChangesW.
 pub mod app_folders;
 // IfType / medium / hardware flag -> the neutral facts the kind is decided from.
@@ -161,6 +163,9 @@ pub mod system_theme;
 // accounts, and making the service data tree so.
 #[cfg(windows)]
 pub mod trusted_location;
+// The tray started in a user's session as one notice about a site.
+#[cfg(windows)]
+pub mod site_notice;
 pub mod types;
 // VirtualBox machines of this user and whether the host carries its network.
 pub mod vm_inventory;

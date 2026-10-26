@@ -215,6 +215,8 @@ pub struct UpstreamDnsPool {
     dark: AtomicBool,
     /// With `dark`: the foreign tunnel's resolver answers while nothing else does.
     dark_foreign_only: AtomicBool,
+    /// The idle sockets queries reuse; a network change closes them.
+    sockets: &'static crate::dns_upstream_sockets::UpstreamSockets,
 }
 
 impl UpstreamDnsPool {
@@ -241,6 +243,7 @@ impl UpstreamDnsPool {
             background_refresh: AtomicBool::new(false),
             dark: AtomicBool::new(false),
             dark_foreign_only: AtomicBool::new(false),
+            sockets: crate::dns_upstream_sockets::shared(),
         }
     }
 
@@ -359,6 +362,7 @@ impl UpstreamDnsPool {
             background_refresh: AtomicBool::new(false),
             dark: AtomicBool::new(false),
             dark_foreign_only: AtomicBool::new(false),
+            sockets: crate::dns_upstream_sockets::shared(),
         }
     }
 
@@ -527,6 +531,9 @@ impl UpstreamDnsPool {
     /// [`MIN_REFRESH_GAP`] — this is called from the adapter hook, which fires
     /// on every interface flap, and re-selection shells out to the OS.
     pub fn note_network_change(&self) -> Option<SocketAddr> {
+        // Before the gap check: a reused socket would keep asking from the
+        // old network's address until it ages out.
+        self.sockets.drain();
         *self
             .preferred_cache
             .lock()
@@ -1532,5 +1539,32 @@ mod tests {
 
         assert!(UdpUpstreamProbe::default().responds(addr));
         answered.join().expect("fake server finished");
+    }
+
+    /// After a network change no query goes out on a socket connected from the
+    /// old network: it would wait out its timeout on an address that is gone.
+    #[test]
+    fn a_network_change_closes_the_idle_upstream_sockets() {
+        let sockets: &'static crate::dns_upstream_sockets::UpstreamSockets =
+            Box::leak(Box::new(crate::dns_upstream_sockets::UpstreamSockets::new()));
+        let server: SocketAddr = "127.0.0.1:53".parse().expect("addr");
+        let lease = sockets
+            .checkout(
+                crate::dns_upstream_sockets::UpstreamKey { bind: None, server },
+                || std::net::UdpSocket::bind("127.0.0.1:0"),
+            )
+            .expect("open");
+        lease.release();
+        assert_eq!(sockets.idle_count(), 1);
+        let pool = UpstreamDnsPool {
+            sockets,
+            ..UpstreamDnsPool::fixed(server)
+        };
+        let _ = pool.note_network_change();
+        assert_eq!(
+            sockets.idle_count(),
+            0,
+            "a socket from the old network was kept"
+        );
     }
 }

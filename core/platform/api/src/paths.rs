@@ -8,7 +8,7 @@
 //! standard by coincidence, and it survives a rename in only one of the two
 //! places.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 /// The spelling this OS uses for a directory named after the product:
 /// canonical (`NetRuleRouter`) on Windows, unix (`netrulerouter`) elsewhere —
@@ -84,14 +84,44 @@ pub fn production_logs_dir() -> Option<PathBuf> {
     }
 }
 
-/// Where the clients look for an administrator's first-run answer sheet: the
-/// data root on Windows, `/etc/<product>` elsewhere. Not the Linux state root:
-/// it is `0700` and a user's GUI cannot read it. Both are closed to ordinary
-/// accounts; the reader still refuses a sheet anyone else could have written.
-pub fn machine_first_run_dir() -> Option<PathBuf> {
+/// The service-log folder a client points the user at: the folder itself, or
+/// its parent while the service has written no log yet. Never created here:
+/// the service owns it and its permissions.
+pub fn logs_folder_to_show() -> Option<PathBuf> {
+    let dir = production_logs_dir()?;
+    if dir.is_dir() {
+        return Some(dir);
+    }
+    dir.parent().filter(|p| p.is_dir()).map(Path::to_path_buf)
+}
+
+/// Every place the clients look for a first-run answer sheet, in order, given
+/// the folder of the running program. One definition, so the window and the
+/// terminal client cannot disagree about where an administrator put it.
+///
+/// On Windows that place is the install folder, wherever it was installed,
+/// and a sheet there counts only when no ordinary account could have placed
+/// or changed it: a copy of the program in a folder anyone can write must not
+/// seed the setup of whoever runs it.
+pub fn first_run_sheet_candidates(
+    executable_dir: Option<&Path>,
+) -> Vec<nrr_shared::first_run_sheet::Candidate> {
+    use nrr_shared::first_run_sheet::{candidate_paths, BesideBinary};
+    candidate_paths(
+        executable_dir,
+        BesideBinary::NeedsProof,
+        machine_first_run_dir().as_deref(),
+    )
+}
+
+/// The folder an administrator fills apart from the program's own: none on
+/// Windows, where the data root is closed to the user's session; `/etc/<product>`
+/// elsewhere, not the `0700` state root. The reader still refuses a sheet
+/// anyone else could have written.
+fn machine_first_run_dir() -> Option<PathBuf> {
     #[cfg(windows)]
     {
-        production_data_root()
+        None
     }
     #[cfg(all(unix, not(windows)))]
     {
@@ -292,15 +322,44 @@ mod tests {
         );
     }
 
+    /// The data root is closed to ordinary accounts, so a sheet there was
+    /// invisible to the window and the terminal client. On Windows the
+    /// administrator's place is the install folder, believed only with proof;
+    /// on Linux it is `/etc/<product>`, never the `0700` state root.
     #[test]
-    fn the_first_run_sheet_is_read_where_a_user_session_can_read_it() {
-        let dir = machine_first_run_dir().expect("first-run dir");
-        if cfg!(all(unix, not(windows))) {
-            assert_eq!(dir, PathBuf::from("/etc").join(PRODUCT_NAME_UNIX));
-            let state = production_data_root().expect("production root");
-            assert!(!dir.starts_with(&state), "the state root is 0700");
-        } else {
-            assert_eq!(Some(dir), production_data_root());
+    fn the_first_run_sheet_is_looked_for_only_where_a_user_session_can_read_it() {
+        use nrr_shared::first_run_sheet::{Candidate, PROVISIONING_FILE_NAME};
+        let install = Path::new("install");
+        let candidates = first_run_sheet_candidates(Some(install));
+        let state = production_data_root().expect("production root");
+        assert!(
+            candidates.iter().all(|c| !c.path.starts_with(&state)),
+            "{candidates:?}"
+        );
+        if cfg!(windows) {
+            assert_eq!(
+                candidates,
+                vec![Candidate {
+                    path: install.join(PROVISIONING_FILE_NAME),
+                    admin_only: true,
+                }]
+            );
+        } else if cfg!(unix) {
+            assert_eq!(
+                candidates,
+                vec![
+                    Candidate {
+                        path: install.join(PROVISIONING_FILE_NAME),
+                        admin_only: true,
+                    },
+                    Candidate {
+                        path: PathBuf::from("/etc")
+                            .join(PRODUCT_NAME_UNIX)
+                            .join(PROVISIONING_FILE_NAME),
+                        admin_only: true,
+                    },
+                ]
+            );
         }
     }
 

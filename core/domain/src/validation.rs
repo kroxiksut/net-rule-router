@@ -409,6 +409,15 @@ pub enum ValidationWarning {
         class: AddressClass,
     },
 
+    /// A network or a range of one address (`192.0.2.7/32`) is that address:
+    /// the rule is kept as an IP rule, so a deny of it vetoes every route and
+    /// the same address on both routes is the error it is for an IP.
+    SingleAddressNetwork {
+        rule_id: RuleId,
+        original: String,
+        address: IpAddr,
+    },
+
     /// A subnet written with host bits set (`10.0.2.7/24`) names its network
     /// (`10.0.2.0/24`); the rule keeps the network.
     SubnetHostBitsCleared {
@@ -534,6 +543,16 @@ impl fmt::Display for ValidationWarning {
                 class,
             } => {
                 write!(f, "rule {rule_id}: {address} is a {class:?} address")
+            }
+            Self::SingleAddressNetwork {
+                rule_id,
+                original,
+                address,
+            } => {
+                write!(
+                    f,
+                    "rule {rule_id}: '{original}' is the one address {address}"
+                )
             }
             Self::SubnetHostBitsCleared {
                 rule_id,
@@ -871,8 +890,28 @@ fn normalize_rule(
         return None;
     }
 
+    // One address written as a network or a range is that address.
+    let as_address;
+    let written = match &rule.address_match {
+        Some(AddressMatch::Subnet(text) | AddressMatch::IpRange(text)) => {
+            match single_address_written(text) {
+                Some(address) => {
+                    warnings.push(ValidationWarning::SingleAddressNetwork {
+                        rule_id: rule.id.clone(),
+                        original: text.trim().to_string(),
+                        address,
+                    });
+                    as_address = Some(AddressMatch::ExactIp(address.to_string()));
+                    &as_address
+                }
+                None => &rule.address_match,
+            }
+        }
+        other => other,
+    };
+
     // Normalize address_match.
-    let address_match = match &rule.address_match {
+    let address_match = match written {
         None => None,
         Some(AddressMatch::Zone(name)) => {
             match canonical_host_name(HostNameKind::Zone, name, &rule.id, warnings) {
@@ -1160,6 +1199,20 @@ fn reject_if_not_a_hostname(value: &str, rule_id: &RuleId) -> Result<(), Validat
 /// of a revision all read it. An IPv4-mapped IPv6 address becomes the IPv4
 /// one; its class decides the rest: "this host" and the limited broadcast are
 /// refused, loopback, multicast and link-local kept with a warning.
+/// The one address a network or a range written for one address names
+/// (`192.0.2.7/32`, `192.0.2.7-192.0.2.7`); `None` for anything else.
+pub(crate) fn single_address_written(value: &str) -> Option<IpAddr> {
+    let value = value.trim();
+    if value.contains('/') {
+        let block = IpBlock::parse(value)?;
+        return block
+            .is_single_address()
+            .then(|| crate::address_class::canonical_ip(block.network()));
+    }
+    let range = IpRange::parse(value)?;
+    (range.first() == range.last()).then(|| crate::address_class::canonical_ip(range.first()))
+}
+
 pub(crate) fn canonical_ip_address(
     value: &str,
     rule_id: &RuleId,

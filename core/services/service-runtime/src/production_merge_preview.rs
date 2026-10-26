@@ -34,13 +34,14 @@ use nrr_domain::preset_canonicalize::{canonicalize_preset_rules, PresetRulesCano
 use nrr_domain::review::SubdomainCoverage;
 use nrr_domain::rules_file::{parse_rules_file, HostPlatform};
 use nrr_domain::rules_json_codec;
-use nrr_domain::rules_revision::RulesRevisionContent;
+use nrr_domain::rules_revision::{RulesRevisionContent, UnrecognizedRules};
 use nrr_shared::ipc_payloads::CrossSetDuplicateDto;
 use nrr_shared::merge_dto::{
     ConflictResolutionDto, ConflictRuleDto, ConflictSideDto, MergeConflictDto, MergeOriginDto,
     MergePolicyDto, MergeResultDto, MergedRuleEntryDto,
 };
 use nrr_shared::rules_json;
+use nrr_shared::rules_json::RuleDto;
 use nrr_shared::RouteRole;
 use rusqlite::Connection;
 
@@ -139,7 +140,10 @@ impl ProductionMergePreviewSource {
     /// The caller's book in force, as the rules provider resolves it (a
     /// revision mid-activation, their own, then the baseline). None anywhere
     /// is an empty book.
-    fn service_book(&self, principal: &str) -> Result<CanonicalRuleBook, MergePreviewError> {
+    fn service_book(
+        &self,
+        principal: &str,
+    ) -> Result<(CanonicalRuleBook, UnrecognizedRules), MergePreviewError> {
         let guard = self
             .conn
             .lock()
@@ -157,9 +161,9 @@ impl ProductionMergePreviewSource {
                     rules_json_codec::decode(dto, HostPlatform::compiled()).map_err(|e| {
                         MergePreviewError::ServiceDecodeError(format!("codec decode: {e}"))
                     })?;
-                Ok(content.rule_book)
+                Ok((content.rule_book, content.inactive))
             }
-            None => Ok(CanonicalRuleBook::default()),
+            None => Ok((CanonicalRuleBook::default(), UnrecognizedRules::default())),
         }
     }
 }
@@ -170,18 +174,25 @@ impl MergePreviewSource for ProductionMergePreviewSource {
         principal: &str,
         request: MergePreviewInput<'_>,
     ) -> Result<MergeResultDto, MergePreviewError> {
-        let service_book = self.service_book(principal)?;
+        let (service_book, service_kept) = self.service_book(principal)?;
+        let (file_primary, file_kept_primary) = canonicalize_side(
+            request.primary_text,
+            RouteRole::Primary,
+            request.include_child_processes,
+        )?;
+        let (file_secondary, file_kept_secondary) = canonicalize_side(
+            request.secondary_text,
+            RouteRole::Secondary,
+            request.include_child_processes,
+        )?;
         let file_book = CanonicalRuleBook {
-            primary: canonicalize_side(
-                request.primary_text,
-                RouteRole::Primary,
-                request.include_child_processes,
-            )?,
-            secondary: canonicalize_side(
-                request.secondary_text,
-                RouteRole::Secondary,
-                request.include_child_processes,
-            )?,
+            primary: file_primary,
+            secondary: file_secondary,
+        };
+        // Neither side's rules that do not work may be lost by the merge.
+        let kept = UnrecognizedRules {
+            primary: kept_union(service_kept.primary, file_kept_primary),
+            secondary: kept_union(service_kept.secondary, file_kept_secondary),
         };
 
         let mut resolution_map: BTreeMap<String, ConflictSide> = BTreeMap::new();
@@ -200,8 +211,27 @@ impl MergePreviewSource for ProductionMergePreviewSource {
             self.coverage(principal),
         );
 
-        to_result_dto(result, request.policy)
+        to_result_dto(result, kept, request.policy)
     }
+}
+
+/// The service's rules kept aside, then the file's not already among them by
+/// value; a file rule whose id the service side already uses gets a fresh one.
+fn kept_union(service: Vec<RuleDto>, file: Vec<RuleDto>) -> Vec<RuleDto> {
+    let values = |rule: &RuleDto| -> Vec<(&'static str, String)> {
+        nrr_domain::rule_value_validation::wire_rule_values(rule).collect()
+    };
+    let mut out = service;
+    for mut rule in file {
+        if out.iter().any(|held| values(held) == values(&rule)) {
+            continue;
+        }
+        while out.iter().any(|held| held.id == rule.id) {
+            rule.id.push_str("-kept");
+        }
+        out.push(rule);
+    }
+    out
 }
 
 /// Parse + canonicalise one bound file's text into a [`CanonicalRuleSet`].
@@ -215,7 +245,7 @@ fn canonicalize_side(
     text: &str,
     route: RouteRole,
     include_child_processes: bool,
-) -> Result<CanonicalRuleSet, MergePreviewError> {
+) -> Result<(CanonicalRuleSet, Vec<RuleDto>), MergePreviewError> {
     let parsed = parse_rules_file(text);
     let outcome = canonicalize_preset_rules(
         &parsed,
@@ -224,7 +254,15 @@ fn canonicalize_side(
         include_child_processes,
     );
     match outcome.rule_set() {
-        Some(set) => Ok(set.clone()),
+        Some(set) => Ok((
+            set.clone(),
+            nrr_domain::preset_canonicalize::preset_rules_kept_aside(
+                &parsed,
+                HostPlatform::compiled(),
+                include_child_processes,
+                outcome.warnings(),
+            ),
+        )),
         None => {
             // Named, so a file past the rule cap does not read as a bad value.
             let reasons: Vec<String> = match &outcome {
@@ -341,6 +379,7 @@ fn conflict_dto(conflict: &MergeConflict) -> MergeConflictDto {
 /// the merged book re-encoded as canonical rules-json.
 fn to_result_dto(
     result: MergeResult,
+    kept: UnrecognizedRules,
     policy: MergePolicyDto,
 ) -> Result<MergeResultDto, MergePreviewError> {
     let noop = result.is_noop();
@@ -372,7 +411,22 @@ fn to_result_dto(
         })
         .collect();
 
-    let content = RulesRevisionContent::new(result.merged);
+    let mut content = RulesRevisionContent::new(result.merged);
+    content.inactive = kept;
+    // A rule kept aside never shares an id with a rule of its route.
+    for (set, kept) in [
+        (&content.rule_book.primary, &mut content.inactive.primary),
+        (
+            &content.rule_book.secondary,
+            &mut content.inactive.secondary,
+        ),
+    ] {
+        for rule in kept.iter_mut() {
+            while set.rules().iter().any(|held| held.id.as_str() == rule.id) {
+                rule.id.push_str("-kept");
+            }
+        }
+    }
     let merged_rules_json = rules_json::to_canonical_string(&rules_json_codec::encode(&content))
         .map_err(|e| MergePreviewError::EncodeError(e.to_string()))?;
 
@@ -427,7 +481,14 @@ mod tests {
         principal: &str,
         book: CanonicalRuleBook,
     ) {
-        let content = RulesRevisionContent::new(book);
+        seed_active_content_for(conn, principal, RulesRevisionContent::new(book));
+    }
+
+    fn seed_active_content_for(
+        conn: &Arc<Mutex<Connection>>,
+        principal: &str,
+        content: RulesRevisionContent,
+    ) {
         let json =
             to_canonical_string(&rules_json_codec::encode(&content)).expect("serialise canonical");
         let guard = conn.lock().unwrap();
@@ -452,6 +513,64 @@ mod tests {
             .expect("insert candidate");
         repo.mark_apply_succeeded_for(principal, revision_id, None, 1)
             .expect("activate");
+    }
+
+    fn broadcast(id: &str) -> RuleDto {
+        RuleDto {
+            id: id.into(),
+            enabled: true,
+            address_match: Some(nrr_shared::rules_json::AddressMatchDto::ExactIpv4 {
+                address: "255.255.255.255".into(),
+            }),
+            app_match: None,
+            comment: String::new(),
+            action: nrr_shared::rules_json::RuleAction::Route,
+            origin: None,
+        }
+    }
+
+    /// The merged book the client applies holds the rules that do not work
+    /// from both sides, once: a merge must not delete them.
+    #[test]
+    fn a_merge_keeps_the_rules_that_do_not_work_from_both_sides() {
+        let conn = open_state_db_in_memory();
+        let mut content = RulesRevisionContent::new(CanonicalRuleBook::default());
+        content.inactive.primary = vec![broadcast("r-0000")];
+        seed_active_content_for(&conn, nrr_storage::BASELINE_PRINCIPAL, content);
+        let out = ProductionMergePreviewSource::new(Arc::clone(&conn))
+            .merge_preview(
+                nrr_storage::BASELINE_PRINCIPAL,
+                MergePreviewInput {
+                    primary_text: "--- IP
+192.0.2.4
+255.255.255.255
+0.0.0.0
+",
+                    secondary_text: "",
+                    policy: MergePolicyDto::Union,
+                    resolutions: &[],
+                    keep_secondary: &[],
+                    include_child_processes: false,
+                },
+            )
+            .expect("merge preview");
+        let merged = nrr_shared::rules_json::from_canonical_string(&out.merged_rules_json)
+            .expect("merged book");
+        let values: Vec<String> = merged
+            .primary
+            .iter()
+            .flat_map(|r| nrr_domain::rule_value_validation::wire_rule_values(r).map(|(_, v)| v))
+            .collect();
+        assert_eq!(
+            values.iter().filter(|v| *v == "255.255.255.255").count(),
+            1,
+            "{values:?}"
+        );
+        assert!(values.contains(&"0.0.0.0".to_string()), "{values:?}");
+        let mut ids: Vec<&str> = merged.primary.iter().map(|r| r.id.as_str()).collect();
+        ids.sort_unstable();
+        ids.dedup();
+        assert_eq!(ids.len(), merged.primary.len(), "ids stay unique");
     }
 
     fn domain_rule(id: &str, m: CanonicalAddressMatch) -> CanonicalRule {

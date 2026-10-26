@@ -27,6 +27,12 @@ fn resolve_icon_path() -> Option<PathBuf> {
 /// checkout it was built from. Never a parent or the working directory, where
 /// another local user can plant files.
 fn bundled_resource(relative: &str) -> Option<PathBuf> {
+    let (executable_dir, checkout) = payload_roots();
+    find_bundled(executable_dir.as_deref(), checkout, relative)
+}
+
+/// The executable's directory and, in a debug build only, the checkout.
+fn payload_roots() -> (Option<PathBuf>, Option<&'static Path>) {
     let executable_dir = env::current_exe()
         .ok()
         .and_then(|executable| executable.parent().map(Path::to_path_buf));
@@ -35,7 +41,25 @@ fn bundled_resource(relative: &str) -> Option<PathBuf> {
     let checkout = Path::new(env!("CARGO_MANIFEST_DIR")).ancestors().nth(3);
     #[cfg(not(debug_assertions))]
     let checkout = None;
-    find_bundled(executable_dir.as_deref(), checkout, relative)
+    (executable_dir, checkout)
+}
+
+/// The icons-and-images folder as a `file://` URL, for both surfaces' contexts.
+/// The QML builds every image path from it, so where the package keeps its QML
+/// says nothing about where it keeps its assets.
+pub fn assets_root_url() -> Option<String> {
+    let (executable_dir, checkout) = payload_roots();
+    assets_root_in(executable_dir.as_deref(), checkout).map(|dir| path_to_file_url(&dir))
+}
+
+/// The first of the two payload roots holding an `assets` folder; a file of
+/// that name does not shadow the next root.
+fn assets_root_in(executable_dir: Option<&Path>, checkout: Option<&Path>) -> Option<PathBuf> {
+    executable_dir
+        .into_iter()
+        .chain(checkout)
+        .map(|root| root.join("assets"))
+        .find(|dir| dir.is_dir())
 }
 
 /// The service executable beside this one: the only place the window's
@@ -98,13 +122,7 @@ fn reset_script_command_line(path: &str) -> String {
 /// the access itself. Never created here: the service owns it and its ACL. The
 /// C++ host reads this same value from the launch context.
 pub fn logs_folder_url() -> Option<String> {
-    let dir = nrr_platform_api::paths::production_logs_dir()?;
-    let existing = if dir.is_dir() {
-        dir
-    } else {
-        dir.parent().filter(|p| p.is_dir())?.to_path_buf()
-    };
-    Some(path_to_file_url(&existing))
+    nrr_platform_api::paths::logs_folder_to_show().map(|dir| path_to_file_url(&dir))
 }
 
 /// Embedded: the package does not ship `LICENSE` as a file.
@@ -505,6 +523,8 @@ pub fn write_qt_context_file_at(
         // Parts of the package this copy lacks (`delivery.rs` slugs).
         "deliveryGaps": delivery_gaps,
         "iconFileUrl": icon_file_url,
+        // Root of every icon and image the QML draws (`assetUrl` in Main.qml).
+        "assetsRootUrl": assets_root_url(),
         "platformProfile": platform_profile,
         // How long `RpcTransport.qml` waits for each answer; the launcher owns the budgets.
         "rpcAnswerDeadlines": answer_deadlines,
@@ -1196,6 +1216,9 @@ mod reset_script_tests;
 
 #[cfg(test)]
 mod file_url_tests;
+
+#[cfg(test)]
+mod assets_root_tests;
 
 #[cfg(test)]
 mod backend_provider_tests;

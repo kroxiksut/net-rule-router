@@ -280,6 +280,7 @@ fn deps(
         revision_watch: None,
         dns_refresh_orchestrator: None,
         route_recompute_hook: None,
+        link_gone_hook: None,
         observation_recompute_hook: None,
         route_teardown_hook: Some(teardown),
         rule_hostname_seeder: None,

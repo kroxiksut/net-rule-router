@@ -428,6 +428,87 @@ fn the_neutral_planner_reads_the_same_arbiter() {
     );
 }
 
+/// A busy program has more addresses than per-destination filters; the filter
+/// codegen and the neutral planner must give the same, most recent, ones
+/// filters, and the routes must carry every one of them.
+#[test]
+fn both_mechanisms_filter_the_programs_latest_addresses_and_route_them_all() {
+    use nrr_service_runtime::app_observation_lookup::AppObservationStore;
+
+    let store = AppObservationStore::new();
+    let nth = |d: u8| Ipv4Addr::new(20, 3, 0, d);
+    for d in 1..=100 {
+        store.record(APP, nth(d));
+    }
+    let latest: Vec<Ipv4Addr> = (37..=100).map(nth).collect();
+    let cache = MockFqdnCacheLookup::new();
+    let resolver = resolver();
+    let rule_book = CanonicalRuleBook {
+        primary: CanonicalRuleSet::from_rules(vec![]),
+        secondary: CanonicalRuleSet::from_rules(vec![app_rule("r-app", APP)]),
+    };
+
+    let filters = generate_filters(CodegenInput {
+        sid: "S-1-5-21-TEST",
+        rule_book: &rule_book,
+        fqdn_cache: &cache,
+        app_observations: &store,
+        app_resolver: &resolver,
+        secondary_ip_denylist: &HashSet::new(),
+        zone_priority_over_ip: false,
+        app_rules_take_all_addresses: false,
+        families: nrr_service_runtime::enforcement_planner::FamilyScope::V4Only,
+        packet_blocks: true,
+    });
+    let mut filtered = filters.app_observed_secondary_ips.clone();
+    filtered.sort();
+    assert_eq!(filtered, latest, "the filters carry the latest addresses");
+
+    let flows = plan_route_rules(
+        &rule_book,
+        "S-1-5-21-TEST",
+        &PlannerInput {
+            ipv6: nrr_service_runtime::enforcement_planner::Ipv6Guard::Off,
+            fqdn_cache: &cache,
+            app_resolver: &resolver,
+            app_observations: &store,
+            zone_priority_over_ip: false,
+            app_rules_take_all_addresses: false,
+            secondary_ip_denylist: &HashSet::new(),
+            packet_blocks: true,
+        },
+    )
+    .0;
+    let mut planned: Vec<Ipv4Addr> = flows
+        .iter()
+        .filter(|f| f.observed_by_program)
+        .filter_map(|f| match f.flow.dst {
+            nrr_platform_api::enforcement::DstMatch::HostV4(ip) => Some(ip),
+            _ => None,
+        })
+        .collect();
+    planned.sort();
+    planned.dedup();
+    assert_eq!(planned, latest, "the planner picks the same ones");
+
+    let routes = generate_routes(
+        RouteBehaviorMode::PreferPrimary,
+        &rule_book,
+        None,
+        &target(),
+        &cache,
+        &store,
+        &HashSet::new(),
+        nrr_service_runtime::address_ownership::ZoneVsIpOrder::default(),
+        &[],
+    );
+    let routed: HashSet<IpAddr> = routes.routes.iter().map(|r| r.destination).collect();
+    assert!(
+        (1..=100).all(|d| routed.contains(&IpAddr::V4(nth(d)))),
+        "every admitted address keeps its route"
+    );
+}
+
 /// The gate that keeps the others honest: production code reaches the
 /// observation store through the arbiter, never directly. A new mechanism that
 /// queries `ips_for_app` itself is a new place to forget one of the two checks
@@ -483,7 +564,10 @@ fn only_the_arbiter_reads_the_observation_store() {
                     stripped += 1;
                     break;
                 }
-                if line.contains(".ips_for_app(") || line.contains(".destination_used_outside(") {
+                if line.contains(".ips_for_app(")
+                    || line.contains(".destination_used_outside(")
+                    || line.contains(".latest_of(")
+                {
                     offenders.push(format!("{}:{}", file, n + 1));
                 }
             }

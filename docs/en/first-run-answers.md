@@ -4,23 +4,31 @@
 
 The first time NetRuleRouter starts it asks a short set of questions: which
 connections to use, how strongly to protect against leaks, and which rule set
-to begin with. If those answers are already known — an installer collected them, or a
-portable copy is being prepared for several machines — they can be supplied in a
-file, and the setup window does not appear.
+to begin with. If those answers are already known — an installer collected
+them, or an administrator is preparing several machines alike — they can be
+supplied in a file, and the setup window does not appear.
 
 ## Where the file goes
 
-Name it `first-run.json` and put it in either place:
+Name it `first-run.json`.
 
-- next to the program (`NetRuleRouter.exe` on Windows, `netrulerouter` on
-  Linux): a portable copy, or an installer's program folder;
-- in the machine folder: `%ProgramData%\NetRuleRouter\` on Windows,
-  `/etc/netrulerouter/` on Linux. Only an administrator can write there, so
-  this placement is for an administrator preparing a machine — put the file
-  beside the program otherwise. On Linux the file, its folder and every folder
-  above it must belong to root and be writable by nobody else, which
+**On Windows**, put it next to `NetRuleRouter.exe`, in the folder the program
+was installed to — `C:\Program Files\NetRuleRouter` unless another folder was
+chosen during installation. The file is used only when that folder can be
+changed by administrators alone, as an installed program's folder can; a copy
+of the program in a folder any user can write to — a download, a desktop
+folder, a USB stick — ignores the file, and the setup window asks as usual.
+
+**On Linux**, put it in either place:
+
+- next to the program (`netrulerouter`), in an installed program's folder;
+- in `/etc/netrulerouter/`, for an administrator preparing a machine, which
   `sudo install -D -m 644 first-run.json /etc/netrulerouter/first-run.json`
-  gives you; a file anyone else could have changed is ignored.
+  sets up.
+
+In both places the file, its folder and every folder above it must belong to
+root and be writable by nobody else; a file anyone else could have changed —
+next to a copy in a home folder, say — is ignored.
 
 The folder next to the program wins when both exist.
 

@@ -141,6 +141,7 @@ mod tests {
             interface_description: "".into(),
             interface_type: "ieee80211".into(),
             oper_status: "up".into(),
+            usable: true,
         }));
         let h = InterfacesRefreshHandler::new(provider.clone());
         let resp = h.handle(&req(serde_json::json!({})), &ctx()).unwrap();

@@ -806,7 +806,7 @@ var RULES_ROUTE_FILTERS = ["all", "primary", "secondary", "block", "unsure"]
 var RULES_TYPE_FILTERS = ["all", "zone", "domain", "exact-ip", "ip-range", "subnet", "application"]
 var RULES_SORT_COLUMNS = ["by-display-order", "by-match-value", "by-type", "by-route", "by-main-route"]
 
-// Whether a table row passes `filters` ({status, type, route, autoOnly,
+// Whether a table row passes `filters` ({status, type, route, autoOnly, hideNotWorking,
 // recentOnly, search}). The table, not the row, knows which rules were applied
 // over the protection and which changed lately: `isOverridden()` and
 // `isRecent()` answer those on demand.
@@ -819,6 +819,9 @@ function rulePassesFilters(item, filters, isOverridden, isRecent) {
     if (status === "overridden" && !isOverridden()) return false
     // A warning does not disable the rule, so it is not an error here.
     if (status === "with-errors" && String(item.validationStatus || "valid") !== "error") return false
+    // «Show rules that do not work» off; asking for the errors still shows them.
+    if (f.hideNotWorking && status !== "with-errors"
+            && String(item.validationStatus || "valid") === "error") return false
     var type = String(f.type || "all")
     if (type !== "all" && canonicalRuleTypeSlug(item.ruleType) !== type) return false
     var route = String(f.route || "all")

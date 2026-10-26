@@ -124,6 +124,10 @@ pub const DAEMON_CLEANUP_VERB: &str = "cleanup";
 /// The argument the failure unit passes once the restarts are spent.
 pub const DAEMON_AFTER_CRASH_VERB: &str = "after-crash";
 
+/// The argument the early unit passes: put the saved table up before the
+/// network comes up.
+pub const DAEMON_EARLY_TABLE_VERB: &str = "early-table";
+
 /// How long systemd waits for an orderly stop. The filter removal alone may
 /// take up to a minute on a filtering backend that stopped answering; the
 /// other steps are bounded by a few seconds each.
@@ -150,6 +154,34 @@ pub fn render_after_crash_unit(cfg: &SystemdServiceConfig) -> String {
          [Service]\nType=oneshot\nTimeoutStartSec={STOP_TIMEOUT_SEC}\n\
          ExecStart={executable} {DAEMON_AFTER_CRASH_VERB}\n",
         cfg.description
+    )
+}
+
+/// The oneshot that applies the saved table at boot: `<product>-early.service`.
+pub fn early_unit_name() -> String {
+    format!(
+        "{}-early.service",
+        nrr_shared::product_identity::PRODUCT_NAME_UNIX
+    )
+}
+
+/// Render the early unit. It runs before `network-pre.target`, as the
+/// `nftables` unit does, so no session reaches the network before the table
+/// the last pass saved; the daemon's first pass replaces it. With nothing
+/// saved, or the copy removed with the table, it does nothing. Enabled and
+/// disabled with the service through the service's `Also=`.
+pub fn render_early_unit(cfg: &SystemdServiceConfig) -> String {
+    let executable = exec_word(&cfg.binary_path);
+    format!(
+        "[Unit]\nDescription={} — protection until the service starts\n\
+         DefaultDependencies=no\nAfter=local-fs.target\nWants=network-pre.target\n\
+         Before=network-pre.target shutdown.target\nConflicts=shutdown.target\n\
+         ConditionPathExists={}\n\n\
+         [Service]\nType=oneshot\nTimeoutStartSec=30\n\
+         ExecStart={executable} {DAEMON_EARLY_TABLE_VERB}\n\n\
+         [Install]\nWantedBy=sysinit.target\n",
+        cfg.description,
+        crate::early_table::path().display()
     )
 }
 
@@ -261,6 +293,8 @@ pub fn render_service_unit(cfg: &SystemdServiceConfig) -> String {
 
     s.push_str("[Install]\n");
     s.push_str("WantedBy=multi-user.target\n");
+    // `systemctl enable`/`disable` of the service carry the early unit along.
+    s.push_str(&format!("Also={}\n", early_unit_name()));
     s
 }
 
@@ -508,6 +542,12 @@ pub fn plan_install(cfg: &SystemdServiceConfig, activation: UnitActivation) -> S
                 contents: render_after_crash_unit(cfg),
                 mode: 0o644,
             },
+            // The unit the service's `Also=` names; without it `enable` fails.
+            InstallFile {
+                path: Path::new(SYSTEMD_UNIT_DIR).join(early_unit_name()),
+                contents: render_early_unit(cfg),
+                mode: 0o644,
+            },
         ],
         symlinks: alias_link(&cfg.binary_path).into_iter().collect(),
         post_write_commands,
@@ -592,6 +632,7 @@ pub fn plan_uninstall(binary_path: Option<&Path>) -> SystemdUninstallPlan {
         crate::logrotate::config_file(),
         crate::polkit_policy::actions_file(),
         Path::new(SYSTEMD_UNIT_DIR).join(after_crash_unit_name()),
+        Path::new(SYSTEMD_UNIT_DIR).join(early_unit_name()),
     ];
     if let Some(alias) = binary_path.and_then(alias_link) {
         files_to_remove.push(alias.link_path);
@@ -913,6 +954,41 @@ mod tests {
         assert!(unit.contains("TimeoutStopSec=120\n"), "{unit}");
     }
 
+    /// With "everything through the tunnel" on, a session that reaches the
+    /// network before the daemon's first pass leaves by the main link. The
+    /// saved table has to be up before `network-pre.target`, and enabling the
+    /// service has to enable it.
+    #[test]
+    fn the_saved_table_is_up_before_the_network_and_rides_on_the_service() {
+        let unit = render_early_unit(&sample_config());
+        for line in [
+            "DefaultDependencies=no\n",
+            "Before=network-pre.target shutdown.target\n",
+            "Wants=network-pre.target\n",
+            "ConditionPathExists=/var/lib/netrulerouter/early-table.json\n",
+            "Type=oneshot\n",
+            "WantedBy=sysinit.target\n",
+        ] {
+            assert!(unit.contains(line), "{line:?} missing from:\n{unit}");
+        }
+        assert!(
+            unit.contains(r#"ExecStart="/usr/libexec/netrulerouter/nrr-serviced" early-table"#),
+            "{unit}"
+        );
+        let service = render_service_unit(&sample_config());
+        assert!(
+            service.contains("Also=netrulerouter-early.service\n"),
+            "{service}"
+        );
+        let plan = plan_install(&sample_config(), UnitActivation::EnableNow);
+        let staged = plan
+            .additional_files
+            .iter()
+            .find(|f| f.path.ends_with("netrulerouter-early.service"))
+            .expect("install writes the early unit the service's Also= names");
+        assert_eq!(staged.contents, unit);
+    }
+
     #[test]
     fn the_failure_unit_runs_the_after_crash_verb_once() {
         let unit = render_after_crash_unit(&sample_config());
@@ -1092,8 +1168,8 @@ mod tests {
     #[test]
     fn install_plan_writes_the_logrotate_backstop_dropin() {
         let plan = plan_install(&sample_config(), UnitActivation::EnableNow);
-        // The logrotate drop-in, the polkit actions and the failure unit.
-        assert_eq!(plan.additional_files.len(), 3);
+        // The logrotate drop-in, the polkit actions, the failure and early units.
+        assert_eq!(plan.additional_files.len(), 4);
         let dropin = &plan.additional_files[0];
         assert_eq!(dropin.path, PathBuf::from("/etc/logrotate.d/netrulerouter"));
         // World-readable /etc config.
@@ -1155,6 +1231,7 @@ mod tests {
                 crate::logrotate::config_file(),
                 crate::polkit_policy::actions_file(),
                 PathBuf::from("/etc/systemd/system/netrulerouter-after-crash.service"),
+                PathBuf::from("/etc/systemd/system/netrulerouter-early.service"),
             ]
         );
         assert_eq!(

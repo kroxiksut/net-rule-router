@@ -25,9 +25,6 @@ pub(super) struct PerSidApplyInputs<'a> {
     /// Raised when a route failure needs the next tick to retry in full.
     pub full_pass: nrr_service_runtime::pass_inputs::FullPassRequest,
     pub id_generator: Arc<ProductionIdGenerator>,
-    /// A full pass, forced and on a thread of its own: a block-all edge of one
-    /// user changes the plan of every other user holding one.
-    pub peer_replan: Arc<dyn Fn() + Send + Sync>,
     pub liveness_tracker: Arc<nrr_service_runtime::secondary_liveness::SecondaryLivenessTracker>,
     pub reachability_probe: Arc<dyn nrr_platform_windows::reachability::ReachabilityProbe>,
     pub rebind_requests: Arc<nrr_service_runtime::power_resume::RebindRequests>,
@@ -149,7 +146,6 @@ pub(super) fn build(inputs: PerSidApplyInputs<'_>) -> PerSidApplyStack {
         health_agg,
         full_pass,
         id_generator,
-        peer_replan,
         liveness_tracker,
         reachability_probe,
         rebind_requests,
@@ -279,7 +275,6 @@ pub(super) fn build(inputs: PerSidApplyInputs<'_>) -> PerSidApplyStack {
         route_coordinator,
         rule_hostname_seeder,
         dns_observation_consumer,
-        known_direct_registry,
         auto_rules_engine,
         app_destination_memory,
     ): RoutePathBundle = match (settings_conn.as_ref(), cache_store.as_ref()) {
@@ -594,7 +589,18 @@ pub(super) fn build(inputs: PerSidApplyInputs<'_>) -> PerSidApplyStack {
                             repo.load_confirmed_since(cutoff).unwrap_or_default()
                         })
                     },
-                ),
+                )
+                .with_app_takeover({
+                    // An address a program takes under the setting is its own,
+                    // so it starts warm too.
+                    let conn = Arc::clone(state_conn);
+                    Arc::new(move |sid: &str| {
+                        let guard = conn.lock().unwrap_or_else(|p| p.into_inner());
+                        nrr_storage::route_bindings::RouteBindingsRepository::new(&guard)
+                            .load_for_sid(sid)
+                            .is_ok_and(|p| p.app_rules_take_all_addresses)
+                    })
+                }),
             );
             // Before the first apply: the routes must exist ahead of the
             // applications' first connections, which is the whole point.
@@ -620,11 +626,6 @@ pub(super) fn build(inputs: PerSidApplyInputs<'_>) -> PerSidApplyStack {
                     Arc::new(nrr_platform_windows::NoopDnsCacheRead)
                 }
             };
-            // Session registry of positively-direct destinations,
-            // shared by the orchestrator (block-all exemptions), the FCrDNS
-            // direct-learning sink, and the Mode-B direct-answer gate.
-            let known_direct =
-                Arc::new(nrr_service_runtime::known_direct::KnownDirectRegistry::default());
             // Companion-domain discovery. Built here because
             // the DNS-observation consumer below is its feed; the rule
             // AUTHOR is attached later, once the activation coordinator
@@ -747,8 +748,6 @@ pub(super) fn build(inputs: PerSidApplyInputs<'_>) -> PerSidApplyStack {
                     Arc::new(move || coord.served_sids(&reg.active_sids()))
                 })
                 .with_dns_cache_read(dns_cache_read)
-                // FCrDNS direct-learning target.
-                .with_known_direct_registry(Arc::clone(&known_direct))
                 // Silence the collateral WARN while fake-IP is live: the
                 // relay steers those hosts onto the primary by name, so the
                 // shared IP is no longer forcing them out the secondary.
@@ -1003,9 +1002,6 @@ pub(super) fn build(inputs: PerSidApplyInputs<'_>) -> PerSidApplyStack {
                         .with_dns_cache_control(Arc::new(
                             nrr_platform_windows::WindowsDnsCacheControl::new(),
                         ))
-                        // Known-direct block-all exemptions (Mode-B
-                        // steered answers + FCrDNS non-rule confirmations).
-                        .with_known_direct_registry(Arc::clone(&known_direct))
                         // Reactive VPN-endpoint learning — publish this SID's
                         // kill-switch/fail-closed Block ids so the conn-trace
                         // consumer's learner can role-verify a drop.
@@ -1089,7 +1085,6 @@ pub(super) fn build(inputs: PerSidApplyInputs<'_>) -> PerSidApplyStack {
                         // IKEv2 and L2TP/IPsec key exchange comes from the IKEEXT
                         // service in svchost: its handshake passes the service
                         // accounts' share of a guard, and nothing else of theirs.
-                        .with_peer_replan(Arc::clone(&peer_replan))
                         .with_ike_service_images(vec![std::path::Path::new(
                             &std::env::var("SystemRoot")
                                 .unwrap_or_else(|_| r"C:\Windows".to_string()),
@@ -1227,7 +1222,6 @@ pub(super) fn build(inputs: PerSidApplyInputs<'_>) -> PerSidApplyStack {
                 Some(route_coord),
                 Some(route_seeder),
                 Some(observe_consumer),
-                Some(known_direct),
                 Some(auto_rules_engine),
                 Some(app_destination_memory),
             )
@@ -1236,7 +1230,7 @@ pub(super) fn build(inputs: PerSidApplyInputs<'_>) -> PerSidApplyStack {
         // blocks are lifted here or by nobody (leak protection still keeps them).
         _ => {
             strip_orphaned_block_filters_standalone();
-            (None, None, None, None, None, None, None)
+            (None, None, None, None, None, None)
         }
     };
 
@@ -1344,7 +1338,6 @@ pub(super) fn build(inputs: PerSidApplyInputs<'_>) -> PerSidApplyStack {
             route_coordinator,
             rule_hostname_seeder,
             dns_observation_consumer,
-            known_direct_registry,
             auto_rules_engine,
             app_destination_memory,
         ),

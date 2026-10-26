@@ -1,0 +1,23 @@
+{
+  "description": "pure.js isPublicSuffixValue: the rule form warns that a domain rule on a public registry routes unrelated owners.",
+  "cases": [
+    { "name": "two-label registry", "input": { "value": "co.uk" }, "expected": true },
+    { "name": "registry behind a wildcard", "input": { "value": "*.com.br" }, "expected": true },
+    { "name": "case and one trailing dot", "input": { "value": "CO.UK." }, "expected": true },
+    { "name": "regional registry of the shipped presets", "input": { "value": "msk.ru" }, "expected": true },
+    { "name": "bare top-level name", "input": { "value": "com" }, "expected": true },
+    { "name": "bare top-level name behind a wildcard", "input": { "value": "*.ru" }, "expected": true },
+    { "name": "internationalised top-level name", "input": { "value": "РФ" }, "expected": true },
+    { "name": "one label is a name of its own", "input": { "value": "localhost" }, "expected": true },
+    { "name": "a site under a registry", "input": { "value": "example.co.uk" }, "expected": false },
+    { "name": "a site under a top-level name", "input": { "value": "example.com" }, "expected": false },
+    { "name": "a subdomain wildcard over a site", "input": { "value": "*.example.com" }, "expected": false },
+    { "name": "an unknown two-label ending is a site", "input": { "value": "example.ru" }, "expected": false },
+    { "name": "a site in every zone", "input": { "value": "example.*" }, "expected": false },
+    { "name": "only one trailing dot is dropped", "input": { "value": "com.." }, "expected": false },
+    { "name": "IPv4 address", "input": { "value": "192.0.2.10" }, "expected": false },
+    { "name": "address-like name with a fifth label", "input": { "value": "1.192.0.2.10" }, "expected": false },
+    { "name": "a wildcard alone", "input": { "value": "*." }, "expected": false },
+    { "name": "empty", "input": { "value": "" }, "expected": false }
+  ]
+}

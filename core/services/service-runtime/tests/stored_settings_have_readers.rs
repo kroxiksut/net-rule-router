@@ -1240,6 +1240,20 @@ fn capabilities() -> Vec<Capability> {
             linux: NotOffered,
         },
         Capability {
+            key: "siteNoticeWithoutTray",
+            windows: Backed(vec![
+                (
+                    "core/services/windows-service/src/runtime_deps/ipc_surface.rs",
+                    "WindowsSiteNotice::beside_this_binary()",
+                ),
+                (
+                    "core/platform/windows/src/site_notice.rs",
+                    "CreateProcessAsUserW(",
+                ),
+            ]),
+            linux: NotOffered,
+        },
+        Capability {
             key: "perUserRouting",
             windows: NotOffered,
             linux: Backed(vec![(

@@ -71,6 +71,7 @@ fn adapter(id: &str, oper_status: &str) -> AdapterEntry {
         interface_description: String::new(),
         interface_type: "Ethernet".into(),
         oper_status: oper_status.into(),
+        usable: oper_status == "Up",
     }
 }
 
@@ -218,6 +219,7 @@ fn guid_adapter_entry(oper_status: &str) -> AdapterEntry {
         interface_description: String::new(),
         interface_type: "Ppp".into(),
         oper_status: oper_status.into(),
+        usable: oper_status == "Up",
     }
 }
 
@@ -299,6 +301,7 @@ fn win_ifindex_mac_scheme_binding_matches_live_mac_adapter() {
         interface_description: String::new(),
         interface_type: "Ppp".into(),
         oper_status: "Up".into(),
+        usable: true,
     };
     let adapters = vec![adapter("primary-id", "Up"), mac_adapter];
     let state = probe.probe(TEST_SID, &adapters).expect("Some");
@@ -306,4 +309,74 @@ fn win_ifindex_mac_scheme_binding_matches_live_mac_adapter() {
         !state.fail_closed_active,
         "a live win-ifindex-mac:-scheme secondary must not trip the Fail-Closed banner"
     );
+}
+
+/// The banner says traffic is held exactly when the service holds it: the
+/// bound adapter is judged by the same check, prior ids and IPv4 included.
+/// A tunnel recognised by the id it had before a reinstall carries traffic,
+/// so no banner; an adapter that is up with no IPv4 carries none, so a banner.
+#[test]
+fn the_banner_judges_the_bound_adapter_as_the_service_does() {
+    use nrr_platform_api::adapters::{AdapterInfo, IfOperStatus, InterfaceType};
+    const NOW: &str = "{11111111-0000-0000-0000-000000000002}";
+    let live = |ipv4: bool| AdapterInfo {
+        index: 7,
+        adapter_name: NOW.into(),
+        description: "Example Tunnel".into(),
+        friendly_name: "Work".into(),
+        mac: None,
+        interface_type: InterfaceType::Ethernet,
+        oper_status: IfOperStatus::Up,
+        ipv4_addresses: if ipv4 {
+            vec![std::net::Ipv4Addr::new(10, 8, 0, 2)]
+        } else {
+            Vec::new()
+        },
+        ipv6_addresses: Vec::new(),
+        gateways: Vec::new(),
+    };
+    let now_id = format!("win-adapter:{}", NOW.to_ascii_lowercase());
+    let before = "win-adapter:{11111111-0000-0000-0000-000000000001}".to_string();
+
+    for (stable_id, known, ipv4, held) in [
+        (before.clone(), vec![now_id.clone()], true, false),
+        (before.clone(), vec![now_id.clone()], false, true),
+        (now_id.clone(), vec![], true, false),
+        (now_id.clone(), vec![], false, true),
+    ] {
+        let (_d, conn) = open_state_db();
+        {
+            let guard = conn.lock().unwrap();
+            let mut record = RoutePolicyRecord::empty(BindingSource::UserAssigned);
+            record.secondary = Some(RouteBindingRecord {
+                stable_id: stable_id.clone(),
+                display_name: "Work".into(),
+                user_confirmed: true,
+                known_stable_ids: known.clone(),
+            });
+            record.leak_protection = LeakProtection::Sites;
+            let repo = RouteBindingsRepository::new(&guard);
+            repo.update_for_sid(TEST_SID, &record, 100)
+                .expect("update_for_sid");
+            for id in &known {
+                repo.remember_stable_id(TEST_SID, "secondary", id, 100)
+                    .expect("remember the prior id");
+            }
+        }
+        let infos = vec![live(ipv4)];
+        let service_carries =
+            crate::route_coordinator::bound_adapter_usable(&infos, &stable_id, &known);
+        let entries: Vec<AdapterEntry> = infos.into_iter().map(adapter_to_entry).collect();
+        let state = ProductionFailClosedProbe::new(conn)
+            .probe(TEST_SID, &entries)
+            .expect("Some");
+        assert_eq!(
+            state.fail_closed_active, held,
+            "{stable_id} known={known:?} ipv4={ipv4}"
+        );
+        assert_eq!(
+            state.fail_closed_active, !service_carries,
+            "banner and service disagree"
+        );
+    }
 }

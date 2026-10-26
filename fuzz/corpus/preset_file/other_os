@@ -1,0 +1,10 @@
+--- Domains
+example.com
+--- Linux
+firefox +children  # browser
+# thunderbird
+"/opt/My App/app"
+--- MacOS
+Safari
+--- Windows
+chrome.exe

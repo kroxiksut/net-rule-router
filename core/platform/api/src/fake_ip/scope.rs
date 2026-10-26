@@ -40,6 +40,37 @@ const NON_ROUTABLE_SUFFIXES: &[&str] = &[
     "ip6.arpa",
 ];
 
+/// First labels of a peer-to-peer announce service (`tracker.site.example`,
+/// `bt2.site.example`), trailing digits allowed. Read only on a name of three
+/// labels or more, so a site whose own name is one of them keeps fake-IP.
+const P2P_FIRST_LABELS: &[&str] = &["tracker", "retracker", "announce", "bt"];
+
+/// Public trackers and mining pools whose names follow no pattern, matched as
+/// a suffix. A name missed here only takes the relay; one caught by mistake
+/// is routed by its addresses, as with fake-IP off.
+const P2P_SUFFIXES: &[&str] = &[
+    "opentrackr.org",
+    "openbittorrent.com",
+    "stealth.si",
+    "demonii.com",
+    "desync.com",
+    "torrent.eu.org",
+    "explodie.org",
+    "nanopool.org",
+    "2miners.com",
+    "f2pool.com",
+    "ethermine.org",
+    "nicehash.com",
+    "minergate.com",
+    "supportxmr.com",
+    "hashvault.pro",
+    "herominers.com",
+    "moneroocean.stream",
+    "unmineable.com",
+    "viabtc.com",
+    "antpool.com",
+];
+
 /// Why a hostname keeps its real address.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "kebab-case")]
@@ -47,7 +78,7 @@ pub enum RealIpReason {
     /// The user has not enabled fake-IP (the default).
     FeatureDisabled,
     /// The traffic belongs to an application group excluded by design
-    /// (peer-to-peer / crypto).
+    /// (peer-to-peer / crypto), known by its program or by the name asked.
     ExcludedAppGroup,
     /// The user listed this host as an exclusion.
     ExcludedHost,
@@ -150,6 +181,11 @@ impl FakeIpScope {
         if is_non_routable_name(&key) {
             return FakeIpVerdict::RealIp(RealIpReason::NonRoutableName);
         }
+        // A DNS query names no program (on Windows every one comes from the
+        // DNS Client service), so the group shows in the name or nowhere.
+        if is_p2p_name(&key) {
+            return FakeIpVerdict::RealIp(RealIpReason::ExcludedAppGroup);
+        }
         if self
             .excluded_hosts
             .iter()
@@ -159,6 +195,19 @@ impl FakeIpScope {
         }
         FakeIpVerdict::FakeIp
     }
+}
+
+/// Whether a normalized name is a tracker or a mining pool by its shape or
+/// its suffix.
+fn is_p2p_name(key: &str) -> bool {
+    let labels: Vec<&str> = key.split('.').collect();
+    if labels.len() >= 3 {
+        let first = labels[0].trim_end_matches(|c: char| c.is_ascii_digit());
+        if P2P_FIRST_LABELS.contains(&first) {
+            return true;
+        }
+    }
+    P2P_SUFFIXES.iter().any(|suffix| host_matches(suffix, key))
 }
 
 /// True when `host` is `pattern` or a subdomain of it. Both sides are expected
@@ -218,6 +267,35 @@ mod tests {
         assert!(scope
             .decide("example.com", Some(AppGroupKind::Hypervisor))
             .is_fake_ip());
+    }
+
+    /// A tracker or a pool under a wide rule keeps its real address: the DNS
+    /// query names no program, and a fake one would carry the swarm's announces
+    /// through the relay. An ordinary host beside it still gets a fake one.
+    #[test]
+    fn a_tracker_or_a_pool_asked_by_name_keeps_its_real_address() {
+        let scope = FakeIpScope::enabled(Vec::<String>::new());
+        for host in [
+            "tracker.site.example",
+            "tracker2.site.example",
+            "bt1.site.example",
+            "announce.cdn.example",
+            "eu1.nanopool.org",
+        ] {
+            assert_eq!(
+                scope.decide(host, None),
+                FakeIpVerdict::RealIp(RealIpReason::ExcludedAppGroup),
+                "{host}"
+            );
+        }
+        for host in [
+            "site.example",
+            "bt.example",
+            "mytracker.site.example",
+            "docs.site.example",
+        ] {
+            assert!(scope.decide(host, None).is_fake_ip(), "{host}");
+        }
     }
 
     #[test]

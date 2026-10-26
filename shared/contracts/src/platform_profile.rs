@@ -127,6 +127,10 @@ pub struct PlatformSupports {
     /// nothing would start it then, a unit that does not start at boot never
     /// runs, so the GUI offers start-with-the-system alone.
     pub service_start_on_app_launch: bool,
+    /// The service can start the user's own tray to tell of a site that does
+    /// not open while no surface of theirs is running. Where it cannot, the
+    /// notice waits for the next surface and the setting is not offered.
+    pub site_notice_without_tray: bool,
 
     // ── Capability INVERSIONS ────────────────────────────────────────────────
     // Unlike the flags above (a Windows superset that other OSes may lack),
@@ -203,6 +207,7 @@ impl PlatformProfile {
                 audit_chain_restart: true,
                 conn_trace_log: true,
                 service_start_on_app_launch: true,
+                site_notice_without_tray: true,
                 // Inversions: Windows blocks apps leak-proof (ALE_APP_ID) but
                 // cannot route per-user or scope a per-user block to all
                 // protocols (packet layer forces user_sid = None).
@@ -260,6 +265,8 @@ impl PlatformProfile {
                 conn_trace_log: true,
                 // No launcher starts the systemd unit with the app.
                 service_start_on_app_launch: false,
+                // A system daemon has no agent in the user's session to start.
+                site_notice_without_tray: false,
                 // Inversions: Linux routes per-user (ip rule uidrange) and
                 // scopes per-user blocks to all protocols (meta skuid), which
                 // Windows cannot — but its per-app block is NOT leak-proof
@@ -300,6 +307,7 @@ impl PlatformProfile {
                 audit_chain_restart: false,
                 conn_trace_log: false,
                 service_start_on_app_launch: false,
+                site_notice_without_tray: false,
                 // Conservative until the macOS Network Extension backend is
                 // verified: claim none of the inversions (an unverified
                 // capability flag defaults to `false`, never a false promise).

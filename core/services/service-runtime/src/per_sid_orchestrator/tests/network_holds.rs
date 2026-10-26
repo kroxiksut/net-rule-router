@@ -90,10 +90,7 @@ fn fail_closed_set(holds: &NetworkHolds) -> Vec<WfpFilterSpec> {
         holds,
         &exemptions(),
         KillSwitchProtocols::ALL,
-        FailClosedPosture {
-            block_all: false,
-            machine_has_other_principals: false,
-        },
+        FailClosedPosture { block_all: false },
     )
 }
 
@@ -191,10 +188,7 @@ fn a_main_link_program_cannot_reach_a_held_network_under_a_block_all() {
         &holds,
         &exemptions(),
         KillSwitchProtocols::ALL,
-        FailClosedPosture {
-            block_all: true,
-            machine_has_other_principals: false,
-        },
+        FailClosedPosture { block_all: true },
     );
     let top_of_primary_band = crate::wfp_bands::BASE_PRIMARY + crate::wfp_bands::BAND_WIDTH;
     let hold = filters

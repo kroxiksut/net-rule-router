@@ -401,26 +401,18 @@ fn handle_service_info(client: &dyn IpcClient) -> LocalHandlerResult {
         Some(i) => (i.server_protocol, i.service_version, i.session_id),
         None => (0u32, String::new(), String::new()),
     };
-    let registration = service_registration();
-    let registered = registration
-        .as_ref()
-        .and_then(|r| r.binary_path.clone())
-        .filter(|p| !p.as_os_str().is_empty());
     let expected = sibling_service_binary();
+    let check = nrr_platform_api::service_placement::RegistrationCheck::of(
+        service_registration().as_ref(),
+        expected.as_deref(),
+    );
     // "Another copy is registered" and "the registered copy is older" are two
     // different faults with one fix, so answer both and let QML offer it once.
-    let elsewhere = match (registered.as_ref(), expected.as_ref()) {
-        (Some(registered), Some(expected)) => registered_elsewhere(registered, expected),
-        _ => false,
-    };
+    let elsewhere = check.registered_elsewhere;
     let older = version_is_older(&service_version, GUI_SEMVER);
-    // An update written over the SAME folder leaves the registration untouched
-    // and the version string unchanged, so neither check above sees it — but
-    // the process still runs the code it loaded before the file was replaced.
-    let stale_process = registration
-        .as_ref()
-        .and_then(binary_is_newer_than_process)
-        .unwrap_or(false);
+    let stale_process = check.binary_replaced;
+    let restart_needed = check.restart_needed();
+    let registered = check.registered_path;
     Ok(json!({
         "gui-protocol":     GUI_PROTOCOL_VERSION,
         "gui-version":      GUI_SEMVER,
@@ -443,7 +435,7 @@ fn handle_service_info(client: &dyn IpcClient) -> LocalHandlerResult {
         "service-older-than-app": older,
         "service-binary-replaced": stale_process,
         "service-update-available": elsewhere || older,
-        "service-restart-needed": stale_process && !elsewhere,
+        "service-restart-needed": restart_needed,
     }))
 }
 
@@ -465,54 +457,11 @@ fn service_registration() -> Option<nrr_platform_api::service_control::ServiceSt
     }
 }
 
-/// Whether the registered binary on disk is newer than the process running from
-/// it — i.e. an update was written in place and the old code is still live.
-///
-/// `None` whenever the answer cannot be established (service stopped, no start
-/// time from the OS, unreadable file): the caller must not turn "unknown" into
-/// a prompt telling the user their service is stale.
-fn binary_is_newer_than_process(
-    report: &nrr_platform_api::service_control::ServiceStatusReport,
-) -> Option<bool> {
-    let started = report.running_since?;
-    let path = report.binary_path.as_ref()?;
-    let modified = std::fs::metadata(path).ok()?.modified().ok()?;
-    // A second of slack: the file timestamp and the process clock come from
-    // different sources, and a start that races its own binary's write would
-    // otherwise report itself stale.
-    Some(modified > started + std::time::Duration::from_secs(1))
-}
-
-/// Whether the service manager starts another binary than the one shipped with
-/// this application. A byte-identical copy is this binary: an install from a
-/// folder ordinary accounts can change registers exactly such a copy, kept
-/// where only administrators can change it, and offering to "update" it would
-/// only write the same copy again.
-fn registered_elsewhere(registered: &std::path::Path, expected: &std::path::Path) -> bool {
-    !same_path(registered, expected)
-        && !nrr_platform_api::service_placement::same_contents(registered, expected)
-}
-
-/// Case- and spelling-insensitive path comparison. Canonicalisation resolves
-/// `\\?\` prefixes, 8.3 names and links; a path that cannot be canonicalised
-/// (removed since, permission) falls back to a plain case-insensitive compare.
-fn same_path(left: &std::path::Path, right: &std::path::Path) -> bool {
-    match (
-        std::fs::canonicalize(left).ok(),
-        std::fs::canonicalize(right).ok(),
-    ) {
-        (Some(a), Some(b)) => a == b,
-        _ => left
-            .to_string_lossy()
-            .eq_ignore_ascii_case(&right.to_string_lossy()),
-    }
-}
-
 /// `true` only when `service` is provably behind `app`, in the order the update
 /// offer uses. Unknown, unparseable or equal versions answer `false`: an update
 /// prompt on a guess is worse than no prompt.
 fn version_is_older(service: &str, app: &str) -> bool {
-    nrr_desktop_gui::update_check::version_is_newer(app, service)
+    nrr_shared::version_order::version_is_newer(app, service)
 }
 
 fn handle_canonical_rules_hash(payload: &Value) -> LocalHandlerResult {
@@ -1075,25 +1024,6 @@ mod tests {
         // A shape or a stage that cannot be ordered is not guessed at.
         assert!(!version_is_older("1.2", "1.2.1"));
         assert!(!version_is_older("0.2.0-dev", "0.2.0-alpha"));
-    }
-
-    #[test]
-    fn a_protected_copy_of_our_own_service_is_not_registered_elsewhere() {
-        let shipped_dir = tempfile::tempdir().expect("shipped dir");
-        let copy_dir = tempfile::tempdir().expect("copy dir");
-        let shipped = shipped_dir.path().join("service.bin");
-        let copy = copy_dir.path().join("service.bin");
-        std::fs::write(&shipped, b"this build").expect("shipped");
-        std::fs::write(&copy, b"this build").expect("copy");
-        assert!(!registered_elsewhere(&copy, &shipped));
-        assert!(!registered_elsewhere(&shipped, &shipped));
-
-        std::fs::write(&copy, b"an older build").expect("older copy");
-        assert!(registered_elsewhere(&copy, &shipped));
-        assert!(
-            registered_elsewhere(&copy_dir.path().join("gone.bin"), &shipped),
-            "a registered binary that cannot be read is not taken for ours"
-        );
     }
 
     #[test]

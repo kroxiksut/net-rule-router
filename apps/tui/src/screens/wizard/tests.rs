@@ -292,6 +292,33 @@ fn everything_with_the_additional_connection_down_is_noted_under_the_choice() {
     }
 }
 
+/// The first run says the site notice holds with the tray closed, where the
+/// service can start the tray; elsewhere it promises nothing.
+#[test]
+fn the_protection_step_tells_of_the_site_notice_only_where_it_exists() {
+    let texts = texts_en();
+    let note = texts.get(k::SITE_NOTICE_NOTE);
+    for (supported, told) in [(true, true), (false, false)] {
+        let mut app = AppState::new(ScreenId::Status, false);
+        app.apply(BackendEvent::Link(Link::Connected), &texts, Instant::now());
+        let parsed =
+            serde_json::from_value(snapshot_json(&Fixture::healthy())).expect("snapshot parses");
+        app.apply(
+            BackendEvent::Snapshot(Box::new(parsed)),
+            &texts,
+            Instant::now(),
+        );
+        app.settings.supports.site_notice_without_tray = supported;
+        app.open(ScreenId::Wizard);
+        app.wizard.go(Step::Protection);
+        let lines: Vec<String> = step_lines(&app, &texts)
+            .iter()
+            .map(ViewLine::plain_text)
+            .collect();
+        assert_eq!(lines.contains(&note), told, "{supported}: {lines:?}");
+    }
+}
+
 /// A user with no policy yet is offered the start the administrator chose at
 /// install time: its default route, and no level below its floor.
 #[test]

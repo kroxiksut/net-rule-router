@@ -72,9 +72,11 @@ pub mod product_identity;
 pub mod rule_value_class;
 pub mod rules_json;
 pub mod rules_overlap;
+pub mod site_notice;
 pub mod system_info;
 pub mod user_paths;
 pub mod user_settings;
+pub mod version_order;
 pub mod wire_fields;
 // Descriptors + integrity status of the binaries we ship from third parties
 // (today: WireGuard LLC's Wintun, Windows only). The GUI renders these, so

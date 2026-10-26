@@ -77,10 +77,15 @@ const EVENT_ID_TCP_DISCONNECT_V4: u16 = 13;
 const EVENT_ID_TCP_DISCONNECT_V6: u16 = 29;
 const EVENT_ID_TCP_RETRANSMIT_V4: u16 = 14;
 const EVENT_ID_TCP_RETRANSMIT_V6: u16 = 30;
+/// "Reconnect attempted": the handshake sent again, before the connect event
+/// that marks it established. Same payload layout and caveat as above; one per
+/// resent handshake, at most a few per connection.
+const EVENT_ID_TCP_RECONNECT_V4: u16 = 16;
+const EVENT_ID_TCP_RECONNECT_V6: u16 = 32;
 
 /// Every event the observer consumes, as `(id, is_v6, progress)`. Both the
 /// session's event-id filter and [`classify_event`] read this one table.
-const SUBSCRIBED_EVENTS: [(u16, bool, ConnectionProgress); 6] = [
+const SUBSCRIBED_EVENTS: [(u16, bool, ConnectionProgress); 8] = [
     (EVENT_ID_TCP_CONNECT_V4, false, ConnectionProgress::Attempt),
     (EVENT_ID_TCP_CONNECT_V6, true, ConnectionProgress::Attempt),
     (
@@ -102,6 +107,16 @@ const SUBSCRIBED_EVENTS: [(u16, bool, ConnectionProgress); 6] = [
         EVENT_ID_TCP_RETRANSMIT_V6,
         true,
         ConnectionProgress::Retransmit,
+    ),
+    (
+        EVENT_ID_TCP_RECONNECT_V4,
+        false,
+        ConnectionProgress::HandshakeRetransmit,
+    ),
+    (
+        EVENT_ID_TCP_RECONNECT_V6,
+        true,
+        ConnectionProgress::HandshakeRetransmit,
     ),
 ];
 
@@ -144,10 +159,63 @@ const KNOWN_CAP: usize = 1024;
 const KNOWN_RETAIN_MS: u64 = 60_000;
 const KNOWN_PRUNE_EVERY_MS: u64 = 1_000;
 
+/// Longest a record plausibly waits in a session buffer (the flush period and
+/// a consumer that fell behind); a larger lag means the system clock jumped.
+const MAX_DELIVERY_LAG_MS: i64 = 5_000;
+/// How long a measured clock offset is kept before it is measured afresh, so a
+/// slow drift between the two clocks never builds up.
+const OFFSET_WINDOW_MS: u64 = 60_000;
+
 /// What the ETW callback reaches.
 struct CallbackContext {
     buffer: Mutex<Vec<ConnectionObservation>>,
     lookups: Arc<ResolverShared>,
+    clock: Mutex<EventClock>,
+}
+
+/// Places a record's header stamp (when the event happened, on the clock the
+/// session converts the performance counter to) on the system clock. Stamping
+/// at delivery would put every record of one buffer flush at the same moment,
+/// and the spacing of a connection's resends is what tells a peer that stopped
+/// answering from a lossy link.
+#[derive(Debug, Default)]
+struct EventClock {
+    /// Smallest `delivery - event` of the current and the previous window: the
+    /// offset between the clocks plus the shortest wait in a buffer.
+    current: Option<i64>,
+    previous: Option<i64>,
+    window_start_ms: u64,
+}
+
+impl EventClock {
+    /// When the event stamped `event_ms` happened, on the system clock that
+    /// read `now_ms` at delivery. Never later than `now_ms`.
+    fn stamp(&mut self, now_ms: u64, event_ms: Option<u64>) -> u64 {
+        let (Some(now), Some(event)) = (
+            i64::try_from(now_ms).ok(),
+            event_ms.and_then(|e| i64::try_from(e).ok()),
+        ) else {
+            return now_ms;
+        };
+        let offset = now - event;
+        if now_ms.saturating_sub(self.window_start_ms) >= OFFSET_WINDOW_MS
+            || now_ms < self.window_start_ms
+        {
+            self.previous = self.current.take();
+            self.window_start_ms = now_ms;
+        }
+        let current = self.current.map_or(offset, |c| c.min(offset));
+        let mut best = self.previous.map_or(current, |p| p.min(current));
+        self.current = Some(current);
+        if offset.saturating_sub(best) > MAX_DELIVERY_LAG_MS {
+            // The system clock jumped forward: the old offset no longer holds.
+            self.current = Some(offset);
+            self.previous = None;
+            best = offset;
+        }
+        // `best <= offset`, so the stamp is never past the delivery.
+        u64::try_from(event.saturating_add(best)).unwrap_or(now_ms)
+    }
 }
 
 /// A running real-time ETW consumer for kernel TCP/IP connect events.
@@ -200,6 +268,7 @@ impl EtwKernelNetworkObserver {
         let context = Arc::new(CallbackContext {
             buffer: Mutex::new(Vec::new()),
             lookups: Arc::clone(&resolver.shared),
+            clock: Mutex::new(EventClock::default()),
         });
         let session = RealtimeSession::start(
             &SessionConfig {
@@ -295,11 +364,19 @@ unsafe extern "system" fn event_record_callback(record: *mut EVENT_RECORD) {
         return;
     };
     // Stamped here: the buffer is drained on a timer, and an unstamped record
-    // would carry the drain time. The system clock rather than the header
-    // stamp, because the pid check compares it with process creation times,
-    // and a performance-counter stamp converted from the session start drifts
-    // from the system clock over a long session. User-mode read, no syscall.
-    let observed_unix_ms = unix_now_ms();
+    // would carry the drain time. A connect keeps the system clock, because
+    // the pid check compares it with process creation times, and a
+    // performance-counter stamp converted from the session start drifts from
+    // the system clock over a long session. A resend or a close takes its
+    // header stamp, re-anchored on the system clock. User-mode reads.
+    let observed_unix_ms = match progress {
+        ConnectionProgress::Attempt => unix_now_ms(),
+        ConnectionProgress::Retransmit
+        | ConnectionProgress::ClosedInOrder
+        | ConnectionProgress::HandshakeRetransmit => unix_now_ms().map(|now| {
+            lock(&context.clock).stamp(now, ticks_to_unix_ms(rec.EventHeader.TimeStamp))
+        }),
+    };
     if progress == ConnectionProgress::Attempt && pid != 0 {
         if let Some(at) = observed_unix_ms {
             context.lookups.offer(pid, at);
@@ -635,9 +712,18 @@ impl LiveProcessImages for SystemProcesses {
 
 /// `FILETIME` (100 ns ticks since 1601) as Unix ms; `None` before 1970.
 fn filetime_to_unix_ms(ft: &FILETIME) -> Option<u64> {
-    const UNIX_EPOCH_TICKS: u64 = 116_444_736_000_000_000;
     let ticks = (u64::from(ft.dwHighDateTime) << 32) | u64::from(ft.dwLowDateTime);
-    ticks.checked_sub(UNIX_EPOCH_TICKS).map(|t| t / 10_000)
+    ticks_to_unix_ms(i64::try_from(ticks).ok()?)
+}
+
+/// A record header's `TimeStamp`, a FILETIME unless the session asked for raw
+/// stamps; a raw counter value lands before 1970 and reads as `None`.
+fn ticks_to_unix_ms(ticks: i64) -> Option<u64> {
+    const UNIX_EPOCH_TICKS: u64 = 116_444_736_000_000_000;
+    u64::try_from(ticks)
+        .ok()?
+        .checked_sub(UNIX_EPOCH_TICKS)
+        .map(|t| t / 10_000)
 }
 
 /// Parse the payload of `Microsoft-Windows-Kernel-Network` event 12 (TCP IPv4
@@ -1061,6 +1147,51 @@ mod tests {
         );
     }
 
+    /// A quiet session hands its buffer over once a second: resends 300 and
+    /// 600 ms apart arrive together, and stamped at delivery they read as one
+    /// burst, so a connection whose peer went silent is never reported.
+    #[test]
+    fn resends_delivered_in_one_flush_keep_their_own_spacing() {
+        let mut clock = EventClock::default();
+        let drift = 7_000;
+        // An earlier flush whose last record waited for nothing.
+        clock.stamp(500 + drift, Some(500));
+        let stamps: Vec<u64> = [1_000, 1_300, 1_900]
+            .iter()
+            .map(|&at| clock.stamp(2_050 + drift, Some(at)))
+            .collect();
+        assert_eq!(
+            stamps[1] - stamps[0],
+            300,
+            "{stamps:?}: spacing of the events, not of the delivery"
+        );
+        assert_eq!(stamps[2] - stamps[1], 600, "{stamps:?}");
+        assert!(stamps.iter().all(|&s| s <= 2_050 + drift));
+    }
+
+    /// The system clock is set forward an hour mid-session: the offset learnt
+    /// before must not keep stamping events an hour in the past, and nothing is
+    /// ever stamped after its delivery.
+    #[test]
+    fn a_jump_of_the_system_clock_re_anchors_and_never_stamps_the_future() {
+        let mut clock = EventClock::default();
+        assert_eq!(clock.stamp(10_000, Some(9_900)), 10_000);
+        let hour = 3_600_000;
+        let late = clock.stamp(10_500 + hour, Some(10_400));
+        assert!(late <= 10_500 + hour);
+        assert!(late + MAX_DELIVERY_LAG_MS as u64 >= 10_500 + hour, "{late}");
+        assert_eq!(
+            clock.stamp(10_900 + hour, Some(10_700)),
+            10_700 + hour + 100
+        );
+        // A garbage stamp from the future is bounded by the delivery.
+        assert_eq!(
+            clock.stamp(20_000 + hour, Some(u64::MAX / 4)),
+            20_000 + hour
+        );
+        assert_eq!(clock.stamp(20_100 + hour, None), 20_100 + hour);
+    }
+
     #[test]
     fn our_own_process_is_named_with_its_start_time() {
         let image = SystemProcesses
@@ -1091,6 +1222,15 @@ mod tests {
         assert_eq!(
             classify_event(EVENT_ID_TCP_RETRANSMIT_V6),
             Some((true, ConnectionProgress::Retransmit))
+        );
+        // A provider swallowing the handshake shows only its resends.
+        assert_eq!(
+            classify_event(EVENT_ID_TCP_RECONNECT_V4),
+            Some((false, ConnectionProgress::HandshakeRetransmit))
+        );
+        assert_eq!(
+            classify_event(EVENT_ID_TCP_RECONNECT_V6),
+            Some((true, ConnectionProgress::HandshakeRetransmit))
         );
         // `datasent`/`datarecv` (v4 10/11, v6 26/27) stay out.
         for segment_event in [10, 11, 26, 27] {

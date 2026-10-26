@@ -98,6 +98,10 @@ pub const LEAK_HOLDS_NOW: Key = key(
     "dialog.leak-holds-now.body",
     "With leak protection set to Everything, traffic is held right away: the internet stops until the additional connection returns.",
 );
+pub const SITE_NOTICE_NOTE: Key = key(
+    "dialog.first-run-wizard.site-notice-note",
+    "Even with the tray closed, NetRuleRouter tells you when a site you open does not open over the main connection. You can turn this off in Settings, Notifications.",
+);
 pub const DOH_LOCKDOWN: Key = key(
     "dialog.first-run-wizard.protection-doh-lockdown",
     "Keep browsers from resolving routed sites past NetRuleRouter",
@@ -289,6 +293,7 @@ pub const ALL: &[Key] = &[
     LEAK_SITES_NOTE,
     LEAK_EVERYTHING_NOTE,
     LEAK_HOLDS_NOW,
+    SITE_NOTICE_NOTE,
     DOH_LOCKDOWN,
     FAKE_IP,
     DIAGNOSTIC_LOGS,

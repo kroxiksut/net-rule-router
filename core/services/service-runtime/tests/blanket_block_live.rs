@@ -189,9 +189,13 @@ fn the_blanket_block_lands_below_the_escapes_it_must_not_cut() {
         .unwrap_or_else(|| panic!("the tunnel server is not exempt:\n{installed}"));
     let lan_at = line_offset(&installed, |l| l.contains("192.168.1.0/24"))
         .unwrap_or_else(|| panic!("the LAN is not exempt:\n{installed}"));
-    // The blanket drop is the one that names no destination at all.
-    let block_at = line_offset(&installed, |l| l.contains("drop") && !l.contains("daddr"))
-        .unwrap_or_else(|| panic!("nothing blocks the off-tunnel traffic:\n{installed}"));
+    // The blanket drop is the user's rule that names no destination: a plain
+    // `drop`, or a jump to the logged drop chain, whose set is listed first.
+    let user = format!("meta skuid {TEST_UID} ");
+    let block_at = line_offset(&installed, |l| {
+        l.contains(&user) && l.contains("drop") && !l.contains("daddr")
+    })
+    .unwrap_or_else(|| panic!("nothing blocks the off-tunnel traffic:\n{installed}"));
 
     assert!(
         server_at < block_at,

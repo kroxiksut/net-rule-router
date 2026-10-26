@@ -12,8 +12,9 @@
 //! The listener constructs these and hands them to
 //! [`crate::dns_resolver::handle_a_query`].
 
+use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant, SystemTime};
 
 use nrr_platform_api::dns::{DnsResolverError, DnsResolverPort, ResolvedRecord};
@@ -41,6 +42,59 @@ const DEFAULT_TTL_SECS: u32 = 300;
 /// The users whose books the local resolver answers by, routing user first.
 pub type ResolverPrincipalsFn = Arc<dyn Fn() -> Vec<String> + Send + Sync>;
 
+/// Run one client query. Inside it every principals source is asked once on
+/// this thread: a query consults the served users several times, and each ask
+/// locks the session registry and copies the list.
+pub fn one_query<R>(f: impl FnOnce() -> R) -> R {
+    /// Restores the enclosing scope however `f` ends, a panic included.
+    struct Restore(Option<QueryPrincipals>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            QUERY_PRINCIPALS.with(|scope| *scope.borrow_mut() = self.0.take());
+        }
+    }
+    let _restore = Restore(QUERY_PRINCIPALS.with(|scope| scope.replace(Some(Vec::new()))));
+    f()
+}
+
+/// Each source's answer in the query this thread is handling, keyed by the
+/// source's address (it outlives the query: its owner does).
+type QueryPrincipals = Vec<(usize, std::rc::Rc<Vec<String>>)>;
+
+thread_local! {
+    static QUERY_PRINCIPALS: std::cell::RefCell<Option<QueryPrincipals>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// `principals`' answer, asked once per [`one_query`] (every time outside one).
+fn with_principals<R>(principals: &ResolverPrincipalsFn, f: impl FnOnce(&[String]) -> R) -> R {
+    let key = Arc::as_ptr(principals).cast::<()>() as usize;
+    let remembered = QUERY_PRINCIPALS.with(|scope| {
+        let scope = scope.borrow();
+        let answers = scope.as_ref()?;
+        Some(
+            answers
+                .iter()
+                .find(|(k, _)| *k == key)
+                .map(|(_, list)| std::rc::Rc::clone(list)),
+        )
+    });
+    match remembered {
+        None => f(&principals()),
+        Some(Some(list)) => f(&list),
+        Some(None) => {
+            let list = std::rc::Rc::new(principals());
+            QUERY_PRINCIPALS.with(|scope| {
+                if let Some(answers) = scope.borrow_mut().as_mut() {
+                    answers.push((key, std::rc::Rc::clone(&list)));
+                }
+            });
+            // The borrow is released: `f` may ask again, of this source or another.
+            f(&list)
+        }
+    }
+}
+
 /// The routing user alone, for a wiring that names no served set.
 pub fn principals_of_routing_user(
     active_sid: Arc<dyn Fn() -> Option<String> + Send + Sync>,
@@ -58,7 +112,22 @@ pub struct ActiveRuleHostOracle {
     rules_provider: Arc<dyn RulesProvider>,
     principals: ResolverPrincipalsFn,
     paused: Option<Arc<crate::routing_pause::PausedPrincipals>>,
+    /// Moves whenever an input the books are made of moves.
+    books_stamp: Arc<dyn Fn() -> u64 + Send + Sync>,
+    /// Each served user's secondary rules as last read: a query must not wait
+    /// on the store's lock, which every writer holds.
+    books: Mutex<HashMap<String, SecondaryMemo>>,
 }
+
+struct SecondaryMemo {
+    stamp: u64,
+    read_at: Instant,
+    secondary: Option<Arc<nrr_domain::canonical::CanonicalRuleSet>>,
+}
+
+/// How long a remembered book is trusted with no event: a change that moves
+/// no counter (a setting written beside the books) shows within this.
+const BOOK_MEMO_TTL: Duration = Duration::from_secs(2);
 
 impl ActiveRuleHostOracle {
     pub fn new(
@@ -69,7 +138,49 @@ impl ActiveRuleHostOracle {
             rules_provider,
             principals: principals_of_routing_user(active_sid),
             paused: None,
+            books_stamp: Arc::new(crate::production_rules_provider::books_stamp),
+            books: Mutex::new(HashMap::new()),
         }
+    }
+
+    /// The stamp the remembered books are checked against.
+    #[must_use]
+    pub fn with_books_stamp(mut self, stamp: Arc<dyn Fn() -> u64 + Send + Sync>) -> Self {
+        self.books_stamp = stamp;
+        self
+    }
+
+    /// `principal`'s secondary rules: remembered while the stamp holds and the
+    /// memo is young, else read once and remembered.
+    fn secondary_of(
+        &self,
+        principal: &str,
+    ) -> Option<Arc<nrr_domain::canonical::CanonicalRuleSet>> {
+        let stamp = (self.books_stamp)();
+        let now = Instant::now();
+        let mut books = self.books.lock().unwrap_or_else(PoisonError::into_inner);
+        if let Some(memo) = books.get(principal) {
+            if memo.stamp == stamp && now.duration_since(memo.read_at) < BOOK_MEMO_TTL {
+                return memo.secondary.clone();
+            }
+        }
+        let secondary = self
+            .rules_provider
+            .active_rules_for(principal)
+            .map(|s| Arc::new(s.rule_book.secondary));
+        // Users who left take their memos with them.
+        if books.len() > 64 {
+            books.clear();
+        }
+        books.insert(
+            principal.to_owned(),
+            SecondaryMemo {
+                stamp,
+                read_at: now,
+                secondary: secondary.clone(),
+            },
+        );
+        secondary
     }
 
     /// Leave paused users out: their rule hosts resolve like any other name.
@@ -79,12 +190,15 @@ impl ActiveRuleHostOracle {
         self
     }
 
-    fn routing_principals(&self) -> Vec<String> {
-        let mut principals = (self.principals)();
-        if let Some(paused) = self.paused.as_ref() {
-            principals.retain(|sid| !paused.contains(sid));
-        }
-        principals
+    /// The served users who are not paused, handed to `f` without a copy.
+    fn any_routing<R>(&self, f: impl FnOnce(&mut dyn Iterator<Item = &String>) -> R) -> R {
+        with_principals(&self.principals, |principals| {
+            let paused = self.paused.as_deref();
+            let mut routing = principals
+                .iter()
+                .filter(|sid| paused.is_none_or(|p| !p.contains(sid)));
+            f(&mut routing)
+        })
     }
 
     /// Answer for every user in `served`, not only the routing one.
@@ -96,23 +210,32 @@ impl ActiveRuleHostOracle {
 
     /// The served users whose secondary rules name `hostname`.
     pub fn owners_of(&self, hostname: &str) -> Vec<String> {
-        self.routing_principals()
-            .into_iter()
-            .filter(|sid| {
-                self.rules_provider
-                    .active_rules_for(sid)
-                    .is_some_and(|s| rule_set_matches(hostname, &s.rule_book.secondary))
-            })
-            .collect()
+        self.any_routing(|routing| {
+            let mut owners = Vec::new();
+            for sid in routing {
+                if self.names(sid, hostname) {
+                    owners.push(sid.clone());
+                }
+            }
+            owners
+        })
+    }
+
+    fn names(&self, sid: &str, hostname: &str) -> bool {
+        self.secondary_of(sid)
+            .is_some_and(|set| rule_set_matches(hostname, &set))
     }
 }
 
 impl RuleHostOracle for ActiveRuleHostOracle {
     fn is_rule_host(&self, hostname: &str) -> bool {
-        self.routing_principals().iter().any(|sid| {
-            self.rules_provider
-                .active_rules_for(sid)
-                .is_some_and(|s| rule_set_matches(hostname, &s.rule_book.secondary))
+        self.any_routing(|routing| {
+            for sid in routing {
+                if self.names(sid, hostname) {
+                    return true;
+                }
+            }
+            false
         })
     }
 }
@@ -142,7 +265,9 @@ impl HostOwnersLeakGuard {
 
 impl crate::dns_resolver::LeakGuardPosture for HostOwnersLeakGuard {
     fn blocking(&self) -> bool {
-        (self.principals)().iter().any(|sid| (self.armed_for)(sid))
+        with_principals(&self.principals, |principals| {
+            principals.iter().any(|sid| (self.armed_for)(sid))
+        })
     }
 
     fn blocking_for_host(&self, hostname: &str) -> bool {
@@ -1601,9 +1726,9 @@ impl crate::dns_resolver::SecondaryOwnedIps for ActiveSecondaryOwnedIps {
 /// beats a stalled browser.
 ///
 /// Coalescing: without it, thread-per-call reconciles convoy on the
-/// orchestrator lock under an armed block-all — each new direct host spawns
+/// orchestrator lock under an armed block-all — each new host spawns
 /// another full reconcile, each one slower than the last, and the
-/// direct-answer gates blow their budget. A caller instead registers its
+/// answer-path budgets are blown. A caller instead registers its
 /// generation (its facts are already recorded/registered by then) and is
 /// satisfied by the first hook run that STARTS after its registration;
 /// concurrent callers share that run. The worker lives for the reconciler's
@@ -2110,8 +2235,7 @@ impl ConsumerConfirmedHostSink {
         }
     }
 
-    /// Report forward-confirmed non-rule names to companion discovery as well
-    /// as to the known-direct registry. Unwired keeps the historic behaviour.
+    /// Report forward-confirmed non-rule names to companion discovery.
     #[must_use]
     pub fn with_companion_sink(mut self, sink: CompanionNameSink) -> Self {
         self.companion_sink = Some(sink);
@@ -2125,78 +2249,14 @@ impl ConfirmedHostSink for ConsumerConfirmedHostSink {
             .learn_reverse_confirmed(hostname, addresses, SystemTime::now())
     }
 
-    /// a forward-confirmed non-rule name registers as a
-    /// known-DIRECT destination (block-all exemption; see
-    /// [`DnsObservationConsumer::learn_reverse_confirmed_direct`]). Inert until
-    /// the consumer is built with a known-direct registry.
-    fn record_confirmed_direct(&self, hostname: &str, addresses: &[Ipv4Addr]) -> bool {
-        // Reported regardless of what the known-direct registry decides: the
-        // two answer different questions. "Stop blocking this" is about the
-        // address; "should this go over the tunnel with the site that needed
-        // it" is about the name, and only the user can settle it.
+    /// A forward-confirmed name no rule covers is only reported: whether it
+    /// goes with the site that needed it is the user's call. It never lifts a
+    /// block.
+    fn record_confirmed_direct(&self, hostname: &str, _addresses: &[Ipv4Addr]) -> bool {
         if let Some(sink) = self.companion_sink.as_ref() {
             sink(hostname);
         }
-        self.consumer
-            .learn_reverse_confirmed_direct(hostname, addresses)
-    }
-}
-
-// ── Direct-answer gate (block-all direct-host exemptions) ────────────────────
-
-/// Production [`crate::dns_resolver::DirectAnswerGate`]: while the kill-switch
-/// block-all is armed, register a steered direct answer's addresses as
-/// known-direct and drive the SAME bounded synchronous reconcile the rule-host
-/// path uses, so the exemption is installed BEFORE the client receives the
-/// answer (its first connect would otherwise race the catch-all and be dropped
-/// with no retry — the observed first-contact drop).
-///
-/// Hot-path discipline: `armed()` is a latch read; when the block-all is not
-/// armed (the overwhelming majority of Mode-B traffic) the gate is two loads
-/// and out. The reconcile fires only when a NEW address was registered, so a
-/// re-queried host answers at full speed.
-pub struct ReconcilingDirectAnswerGate {
-    registry: Arc<crate::known_direct::KnownDirectRegistry>,
-    reconciler: Arc<dyn SyncReconciler>,
-    /// Whether any SID's fail-closed catch-all block-all is currently armed.
-    armed: Arc<dyn Fn() -> bool + Send + Sync>,
-    deadline: Duration,
-}
-
-impl ReconcilingDirectAnswerGate {
-    pub fn new(
-        registry: Arc<crate::known_direct::KnownDirectRegistry>,
-        reconciler: Arc<dyn SyncReconciler>,
-        armed: Arc<dyn Fn() -> bool + Send + Sync>,
-        deadline: Duration,
-    ) -> Self {
-        Self {
-            registry,
-            reconciler,
-            armed,
-            deadline,
-        }
-    }
-}
-
-impl crate::dns_resolver::DirectAnswerGate for ReconcilingDirectAnswerGate {
-    fn gate(&self, hostname: &str, addresses: &[Ipv4Addr]) {
-        if addresses.is_empty() || !(self.armed)() {
-            return;
-        }
-        let added = self.registry.register(addresses);
-        if added == 0 {
-            return; // already exempt (or capped) — nothing new to install
-        }
-        let outcome = self.reconciler.reconcile_forced(self.deadline);
-        tracing::info!(
-            target: "nrr::dns-resolver",
-            msg_key = "dns-resolver-block-all-exemption-installed",
-            host = %hostname,
-            added,
-            outcome = ?outcome,
-            "Mode B: direct host under block-all — known-direct exemption installed before answering",
-        );
+        false
     }
 }
 

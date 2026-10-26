@@ -464,6 +464,9 @@ impl ProductionMutationExecutor {
         // dedupes against exactly what would be applied.
         Self::canonicalize_rules_payload(&mut parsed, self.host_platform);
         self.carry_unrecognized(&mut parsed, principal);
+        if keeps_inactive(payload) {
+            self.carry_inactive(&mut parsed, principal);
+        }
         if let Err(e) = self.enforce_free_rule_cap(&parsed.rules_json, principal) {
             return refused_summary(&e);
         }
@@ -474,9 +477,11 @@ impl ProductionMutationExecutor {
         if let Some(e) = self.foreign_profile_refusal(&parsed.rules_json, principal) {
             return refused_summary(&e);
         }
-        if let Some(e) =
-            self.moved_rules_refusal(&parsed.rules_json, base_revision_in(payload), principal)
-        {
+        if let Some(e) = self.moved_rules_refusal(
+            &parsed.rules_json,
+            rules_update_base(payload, principal),
+            principal,
+        ) {
             return refused_summary(&e);
         }
         // The score is reflected back into the wire `ReviewSummaryResponse`.
@@ -1124,7 +1129,7 @@ fn canonicalize_route_bytes(
     include_child_processes: bool,
     import_only_active: bool,
     platform: HostPlatform,
-) -> Result<CanonicalRuleSet, OperationError> {
+) -> Result<(CanonicalRuleSet, Vec<nrr_shared::rules_json::RuleDto>), OperationError> {
     let bytes = BASE64_STANDARD
         .decode(b64.as_bytes())
         .map_err(|e| OperationError {
@@ -1132,7 +1137,7 @@ fn canonicalize_route_bytes(
             code: "malformed-payload".into(),
             message: format!("PresetImport: base64 decode failed for {route:?}: {e}"),
         })?;
-    canonicalize_route_file_bytes(
+    canonicalize_route_file_bytes_keeping(
         &bytes,
         route,
         include_child_processes,
@@ -1150,6 +1155,25 @@ pub(crate) fn canonicalize_route_file_bytes(
     import_only_active: bool,
     platform: HostPlatform,
 ) -> Result<CanonicalRuleSet, OperationError> {
+    canonicalize_route_file_bytes_keeping(
+        bytes,
+        route,
+        include_child_processes,
+        import_only_active,
+        platform,
+    )
+    .map(|(set, _)| set)
+}
+
+/// [`canonicalize_route_file_bytes`], plus the file's rules no book may apply,
+/// as written: an import keeps them aside instead of losing them.
+fn canonicalize_route_file_bytes_keeping(
+    bytes: &[u8],
+    route: RouteRole,
+    include_child_processes: bool,
+    import_only_active: bool,
+    platform: HostPlatform,
+) -> Result<(CanonicalRuleSet, Vec<nrr_shared::rules_json::RuleDto>), OperationError> {
     let outcome = validate_preset_bytes(bytes);
     let parse_outcome = match outcome {
         PresetFileValidationOutcome::Accepted { parse_outcome } => parse_outcome,
@@ -1199,18 +1223,15 @@ pub(crate) fn canonicalize_route_file_bytes(
     }
     let canonicalized =
         canonicalize_preset_rules(&parse_outcome, route, platform, include_child_processes);
-    let dropped = canonicalized
-        .warnings()
-        .iter()
-        .filter(|w| {
-            matches!(
-                w,
-                nrr_domain::validation::ValidationWarning::RuleOnNoDestinationDropped { .. }
-                    | nrr_domain::validation::ValidationWarning::AppPatternRefusedDropped { .. }
-            )
-        })
-        .count();
-    crate::production_rules_provider::report_dropped_rules(dropped, "preset-import");
+    let kept_aside: Vec<_> = nrr_domain::preset_canonicalize::preset_rules_kept_aside(
+        &parse_outcome,
+        platform,
+        include_child_processes,
+        canonicalized.warnings(),
+    )
+    .into_iter()
+    .filter(|rule| rule.enabled || !import_only_active)
+    .collect();
     // "Import only active": drop rules disabled in the source preset
     // (commented recognizable lines — e.g. application rules left off pending
     // per-process routing) so they don't enter the revision at all. Filtering
@@ -1231,9 +1252,11 @@ pub(crate) fn canonicalize_route_file_bytes(
         )
     };
     match canonicalized {
-        PresetRulesCanonicalizeOutcome::Accepted { rule_set } => Ok(finalize(rule_set)),
+        PresetRulesCanonicalizeOutcome::Accepted { rule_set } => {
+            Ok((finalize(rule_set), kept_aside))
+        }
         PresetRulesCanonicalizeOutcome::AcceptedWithWarnings { rule_set, .. } => {
-            Ok(finalize(rule_set))
+            Ok((finalize(rule_set), kept_aside))
         }
         PresetRulesCanonicalizeOutcome::Rejected { errors } => Err(OperationError {
             args: Default::default(),
@@ -1849,11 +1872,12 @@ pub use profile_paths::PATH_IN_OTHER_USERS_PROFILE_CODE;
 mod tests;
 mod unrecognized;
 
-use activation_drive::base_revision_in;
-use unrecognized::carry_forward;
+use activation_drive::{base_revision_in, rules_update_base};
 #[cfg(test)]
 pub(crate) use unrecognized::first_report_of_book;
 pub(crate) use unrecognized::report_unrecognized_rules;
+pub(crate) use unrecognized::KEEP_INACTIVE_KEY;
+use unrecognized::{carry_forward, keeps_inactive};
 pub use unrecognized::{
     NetworkRuleConflict, NetworkRuleScreen, NETWORK_COVERS_FAKE_IP_POOL_CODE,
     NETWORK_COVERS_LINK_CODE,

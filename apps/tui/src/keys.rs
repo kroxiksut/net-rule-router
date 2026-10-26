@@ -273,6 +273,18 @@ pub const ENF_UNKNOWN_BODY: Key = key(
     "notifications.enforcement.unknown.body",
     "The service reported a state this version does not recognise. Open interfaces and routes to check the setup.",
 );
+pub const LINK_DROPPING_TITLE_PRIMARY: Key = key(
+    "notifications.link-keeps-dropping.title-primary",
+    "The main connection keeps dropping",
+);
+pub const LINK_DROPPING_TITLE_SECONDARY: Key = key(
+    "notifications.link-keeps-dropping.title-secondary",
+    "The additional connection keeps dropping",
+);
+pub const LINK_DROPPING_BODY: Key = key(
+    "notifications.link-keeps-dropping.body",
+    "It went down and came back several times in the last two minutes. Your rules stayed in force, but pages may have failed to load in between. Check the cable, the Wi-Fi or the VPN.",
+);
 pub const ENF_RESTORED_TITLE: Key = key(
     "notifications.enforcement.restored.title",
     "Routing is working again",
@@ -295,6 +307,22 @@ pub const APP_UNRESOLVED_BODY: Key = key(
     "NetRuleRouter couldn't find these programs (they may not be installed in a standard location, or aren't running), so their traffic isn't routed by your rules: {apps}. Launch the app, or check the program name in Rules.",
 );
 pub const APP_UNRESOLVED_MORE: Key = key("status.app-unresolved-more", "+{n} more");
+pub const APP_UNROUTED_TITLE: Key = key(
+    "notifications.app-unresolved.title-unrouted",
+    "App rules applied, but some don't route their program",
+);
+pub const APP_UNROUTED_NAMED: Key = key(
+    "notifications.app-unresolved.unrouted.addresses-named-by-rules",
+    "The program {app} is on this computer, but its rule routes none of its traffic: the addresses it connects to are already covered by your rules for sites and addresses, and the more specific rule wins.",
+);
+pub const APP_UNROUTED_SHARED: Key = key(
+    "notifications.app-unresolved.unrouted.addresses-shared",
+    "The program {app} is on this computer, but its rule routes none of its traffic: other programs or sites use the same addresses, and moving them would move those too.",
+);
+pub const APP_UNROUTED_OTHER: Key = key(
+    "notifications.app-unresolved.unrouted.other",
+    "The program {app} is on this computer, but its rule routes none of its traffic.",
+);
 pub const VPN_TRUST_TITLE: Key = key("notifications.vpn-client-trust.title", "Is this your VPN?");
 pub const VPN_TRUST_BODY: Key = key(
     "notifications.vpn-client-trust.tui-body",
@@ -391,6 +419,10 @@ pub const BLOCK_NOTICE_BODY: Key = key(
 pub const BLOCK_NOTICE_APP_UNKNOWN: Key = key(
     "notifications.block-notice.app-unknown",
     "unknown application",
+);
+pub const BLOCK_NOTICE_DESTINATION_HIDDEN: Key = key(
+    "notifications.block-notice.destination-hidden",
+    "a hidden destination",
 );
 pub const BLOCK_NOTICE_REASON_UNKNOWN: Key = key(
     "notifications.block-notice.reason.unknown",
@@ -580,7 +612,7 @@ pub const HELP_BACK: Key = key("tui.help.back", "Esc: back, or close this help")
 pub const HELP_QUIT: Key = key("tui.help.quit", "q: quit");
 pub const HELP_STATUS_FEED: Key = key(
     "tui.help.status-feed",
-    "On this screen, Up and Down scroll the notifications when that panel has the focus.",
+    "On this screen, Up and Down choose a notification when that panel has the focus; the keys it answers to are listed under it.",
 );
 pub const FOOTER: Key = key("tui.footer", "F1: help   q: quit");
 /// Tail of a panel title when the panel is taller than the room it has.
@@ -700,12 +732,19 @@ pub const ALL: &[Key] = &[
     ENF_UNREADABLE_BODY,
     ENF_UNKNOWN_TITLE,
     ENF_UNKNOWN_BODY,
+    LINK_DROPPING_TITLE_PRIMARY,
+    LINK_DROPPING_TITLE_SECONDARY,
+    LINK_DROPPING_BODY,
     ENF_RESTORED_TITLE,
     ENF_RESTORED_BODY,
     ENF_RESTORED_WHERE,
     APP_UNRESOLVED_TITLE,
     APP_UNRESOLVED_BODY,
     APP_UNRESOLVED_MORE,
+    APP_UNROUTED_TITLE,
+    APP_UNROUTED_NAMED,
+    APP_UNROUTED_SHARED,
+    APP_UNROUTED_OTHER,
     VPN_TRUST_TITLE,
     VPN_TRUST_BODY,
     VPN_TRUST_HINT,
@@ -744,6 +783,7 @@ pub const ALL: &[Key] = &[
     BLOCK_NOTICE_TITLE,
     BLOCK_NOTICE_BODY,
     BLOCK_NOTICE_APP_UNKNOWN,
+    BLOCK_NOTICE_DESTINATION_HIDDEN,
     BLOCK_NOTICE_REASON_UNKNOWN,
     BLOCK_NOTICE_BACKLOG_TITLE,
     LOCAL_NETWORK_TITLE,

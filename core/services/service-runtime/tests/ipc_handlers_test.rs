@@ -409,6 +409,7 @@ fn deps_full(
                     interface_description: "".into(),
                     interface_type: "ieee80211".into(),
                     oper_status: "up".into(),
+                    usable: true,
                 }],
                 secondary: None,
                 rows: Vec::new(),

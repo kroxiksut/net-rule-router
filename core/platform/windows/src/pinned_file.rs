@@ -172,7 +172,7 @@ fn pin_directory(trusted_root: &Path, path: &Path) -> io::Result<File> {
 /// Whether a resolved path sits under `root`, compared the way the filesystem
 /// compares: component by component, case-insensitively, and without the
 /// `\\?\` prefix `GetFinalPathNameByHandleW` returns.
-fn resolves_under(resolved: &Path, root: &Path) -> bool {
+pub(crate) fn resolves_under(resolved: &Path, root: &Path) -> bool {
     fn parts(p: &Path) -> Vec<String> {
         let text = p.to_string_lossy();
         let text = match text.strip_prefix(r"\\?\UNC\") {

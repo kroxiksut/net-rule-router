@@ -27,7 +27,7 @@ ApplicationWindow {
     // emitted into the QML context by the launcher. Windows-all-supported
     // default so mock/preview (which emits no context) still renders every
     // section; the real profile loads from `context.platformProfile` below.
-    property var platformProfile: ({ os: "windows", enforcementBackend: "wfp", serviceModel: "scm", elevationModel: "uac", supports: { killSwitch: true, appRouting: true, dnsObserve: true, dnsResolver: true, fakeIp: true, hostsPin: true, backgroundService: true, autostart: true, serviceStabilityConfig: true, verboseLogging: true, localNetworkExceptions: true, forwardedTrafficGuard: true, blockNotices: true, auditChainRestart: true, connTraceLog: true, serviceStartOnAppLaunch: true, perUserRouting: false, perAppBlockLeakproof: true, perUserAllProtocolScoping: false, appPathRules: false, appPathScripts: false } })
+    property var platformProfile: ({ os: "windows", enforcementBackend: "wfp", serviceModel: "scm", elevationModel: "uac", supports: { killSwitch: true, appRouting: true, dnsObserve: true, dnsResolver: true, fakeIp: true, hostsPin: true, backgroundService: true, autostart: true, serviceStabilityConfig: true, verboseLogging: true, localNetworkExceptions: true, forwardedTrafficGuard: true, blockNotices: true, auditChainRestart: true, connTraceLog: true, serviceStartOnAppLaunch: true, siteNoticeWithoutTray: true, perUserRouting: false, perAppBlockLeakproof: true, perUserAllProtocolScoping: false, appPathRules: false, appPathScripts: false } })
     // Capability query for declarative, OS-agnostic section gating: a
     // feature-keyed section renders only when the running OS supports it.
     // Unknown feature or missing profile → true (show it), which is why the
@@ -109,6 +109,8 @@ ApplicationWindow {
     property int uiRevision: 0
     // Bumped when the service says this user's notice mutes changed.
     property int noticeMutesRevision: 0
+    // Bumped when an import stored new sections this build carries unapplied.
+    property int passthroughRevision: 0
     // Dedicated revision token for the theme tokens (`uiTheme`). Bumped ONLY
     // when a theme-affecting pref changes (themeMode / effectiveThemeMode /
     // high-contrast / font scale / system font) — kept separate from
@@ -425,6 +427,12 @@ ApplicationWindow {
     // `refreshUnenforcedAppRules`, refreshed on reconnect + every rules pull.
     readonly property var unenforcedAppRules:
         (routingState && routingState.unenforcedAppRules) || []
+    // Found programs whose rule routes none of their traffic: app -> reason.
+    // An older service sends none, which leaves the notice as it was.
+    readonly property var unroutedAppRules:
+        (routingState && routingState.unroutedAppRules) || ({})
+    readonly property var _appNoticeApps:
+        unenforcedAppRules.concat(Object.keys(unroutedAppRules).sort())
     // The app-enforcement gap is surfaced through the
     // notifications centre (footer bell chip + NotificationCenterPopup), NOT a
     // top banner (the user found the amber banner too heavy for a low-priority
@@ -438,38 +446,23 @@ ApplicationWindow {
     // startup; the dismiss handler writes both the local value and the pref.
     property string _unenforcedAppRulesAckSig:
         (prefs && prefs.unenforcedAppsAckSig) ? String(prefs.unenforcedAppsAckSig) : ""
-    // SUBSET semantics, not string equality. The unresolved
-    // set oscillates in both directions (an exe resolvable only while its
-    // process runs — e.g. a VPN client installed outside App Paths — leaves
-    // the set on launch and returns on exit), and an exact-signature compare
-    // re-fired the dismissed notice on every SHRINK. Only a genuinely NEW
-    // unresolved app (absent from the acknowledged set) re-surfaces it; the
+    // SUBSET semantics, per program AND problem: a set that only shrank stays
+    // hidden, while a new program, or a known one with a different problem
+    // (not found -> found but routing nothing, or back), is told anew. The
     // dismiss handler stores the UNION so returning apps stay acknowledged.
     function _unenforcedCoveredByAck() {
-        if (_unenforcedAppRulesAckSig === "") return false
-        var ackSet = {}
-        var acked = _unenforcedAppRulesAckSig.split("|")
-        for (var i = 0; i < acked.length; i += 1) ackSet[acked[i]] = true
-        var apps = unenforcedAppRules || []
-        for (var j = 0; j < apps.length; j += 1)
-            if (!ackSet[String(apps[j])]) return false
-        return true
+        return Pure.appNoticeCoveredByAck(_unenforcedAppRulesAckSig,
+            unenforcedAppRules, Object.keys(unroutedAppRules).sort())
     }
     function _unenforcedAckUnionSig() {
-        var union = {}
-        if (_unenforcedAppRulesAckSig !== "") {
-            var acked = _unenforcedAppRulesAckSig.split("|")
-            for (var i = 0; i < acked.length; i += 1) union[acked[i]] = true
-        }
-        var apps = unenforcedAppRules || []
-        for (var j = 0; j < apps.length; j += 1) union[String(apps[j])] = true
-        return Object.keys(union).sort().join("|")
+        return Pure.appNoticeAckUnion(_unenforcedAppRulesAckSig,
+            unenforcedAppRules, Object.keys(unroutedAppRules).sort())
     }
     // Active when connected, at least one app rule is unenforced, and the
     // current set contains an app the user has not yet acknowledged.
     readonly property bool appUnresolvedNoticeActive:
         !!backendStatus && backendStatus.kind === "connected"
-        && unenforcedAppRules.length > 0
+        && _appNoticeApps.length > 0
         && !_unenforcedCoveredByAck()
 
     // Notifications centre SSOT. Low-priority, non-blocking
@@ -486,8 +479,11 @@ ApplicationWindow {
                 "id": "app-unresolved",
                 "severity": "warning",
                 "dismissible": true,
-                "title": tr("notifications.app-unresolved.title",
-                    "App rules aren't active yet"),
+                "title": unenforcedAppRules.length > 0
+                    ? tr("notifications.app-unresolved.title",
+                        "App rules aren't active yet")
+                    : tr("notifications.app-unresolved.title-unrouted",
+                        "App rules applied, but some don't route their program"),
                 "body": _unenforcedAppNoticeBody(),
                 "actionKey": "open-rules",
                 "actionText": tr("action.open-rules", "Open rules")
@@ -859,14 +855,16 @@ ApplicationWindow {
     readonly property color mutedTextColor: uiTheme.colorTextMuted
     readonly property color borderColor: uiTheme.colorBorder
     readonly property color accentColor: uiTheme.colorAccent
-    // Relative paths resolved at parse time so Image consumers in
-    // sub-section QML files (which live at a different URL) don't
-    // re-resolve `../../../assets/...` against their own location.
-    readonly property url appIconSource: Qt.resolvedUrl("../../../assets/icons/app/icon-64.png")
+    // The launcher resolves the assets folder beside the binary: where the
+    // package keeps its QML says nothing about where it keeps its images. Set
+    // once in `loadContext`, so no icon binding follows the volatile `context`.
+    property string assetsRootUrl: ""
+    function assetUrl(relative) { return assetsRootUrl === "" ? "" : assetsRootUrl + "/" + relative }
+    readonly property url appIconSource: assetUrl("icons/app/icon-64.png")
     // The same lockup the startup splash paints, so "About" shows the face
     // the user already met rather than a second, smaller identity.
-    readonly property url appLogoLockupSource: Qt.resolvedUrl("../../../assets/images/logo/logo-lockup-stacked.png")
-    readonly property url appIconSmallSource: Qt.resolvedUrl("../../../assets/icons/app/icon-32.png")
+    readonly property url appLogoLockupSource: assetUrl("images/logo/logo-lockup-stacked.png")
+    readonly property url appIconSmallSource: assetUrl("icons/app/icon-32.png")
     readonly property bool highContrastIcons: uiTheme.useHighContrastIcons
 
     // Left navigation rail collapse. When
@@ -2426,6 +2424,8 @@ ApplicationWindow {
         // Why some of those are not applied (app -> reason slug); an app
         // without one found no program.
         unenforcedAppReasons: {},
+        // Found programs whose rule routes none of their traffic, with why.
+        unroutedAppRules: {},
         // What the service may do with the companion domains it finds
         // ("off" / "suggest" / "auto"). Mirrored from the connect snapshot so
         // the start screen can show and change it without opening Settings.
@@ -2505,6 +2505,7 @@ ApplicationWindow {
             var patch = {
                 unenforcedAppRules: list,
                 unenforcedAppReasons: p["unenforced-app-reasons"] || {},
+                unroutedAppRules: p["unrouted-app-rules"] || {},
                 // Keep the auto-seed checkbox in sync with the
                 // service-side per-SID value on every reconnect/rules refresh.
                 browserHistoryAutoSeed: rp["browser-history-auto-seed"] === true,
@@ -2630,7 +2631,21 @@ ApplicationWindow {
         return tr("rules.overlaps.conflicts.protected", "The rule {rule} is not applied. {reason}")
             .split("{rule}").join(Pure.displayText(app)).split("{reason}").join(why)
     }
-    /// The notice's text: the programs not found, then each refused rule's reason.
+    /// A found program its rule routes nothing of, with why; a reason this
+    /// build does not know still says the program is there.
+    function _unroutedAppText(app, reason) {
+        var text = reason === "addresses-named-by-rules"
+            ? tr("notifications.app-unresolved.unrouted.addresses-named-by-rules",
+                "The program {app} is on this computer, but its rule routes none of its traffic: the addresses it connects to are already covered by your rules for sites and addresses, and the more specific rule wins.")
+            : reason === "addresses-shared"
+            ? tr("notifications.app-unresolved.unrouted.addresses-shared",
+                "The program {app} is on this computer, but its rule routes none of its traffic: other programs or sites use the same addresses, and moving them would move those too.")
+            : tr("notifications.app-unresolved.unrouted.other",
+                "The program {app} is on this computer, but its rule routes none of its traffic.")
+        return text.split("{app}").join(Pure.displayText(app))
+    }
+    /// The notice's text: the programs not found, then each refused rule's
+    /// reason, then the found programs their rule routes nothing of.
     function _unenforcedAppNoticeBody() {
         var parts = []
         var missing = _unenforcedAppRulesSummary()
@@ -2643,6 +2658,9 @@ ApplicationWindow {
             if (reason !== "")
                 parts.push(_unenforcedAppRefusal(unenforcedAppRules[i], reason))
         }
+        var unrouted = Object.keys(unroutedAppRules).sort()
+        for (var j = 0; j < unrouted.length; j += 1)
+            parts.push(_unroutedAppText(unrouted[j], String(unroutedAppRules[unrouted[j]])))
         return parts.join(" ")
     }
     // Correlation-id RPC transport over the C++ bridge: the pending-callback
@@ -4076,32 +4094,8 @@ ApplicationWindow {
                 // is for news, never for an empty inbox.
                 if (autoRuleSuggestionsController.autoRuleCandidatesPending <= 0)
                     notificationsController._dropPushNotice(autoRuleSuggestionsController._autoRuleNoticeId)
-                if (Pure.autoRuleNoticeDue(event)) {
-                    // Keyed on the push, not on a constant: dismissing writes
-                    // to the ledger, and one fixed id would retire the banner
-                    // for the life of the install. Only one is on screen at a
-                    // time — the newer count supersedes the older.
-                    notificationsController._dropPushNotice(autoRuleSuggestionsController._autoRuleNoticeId)
-                    autoRuleSuggestionsController._autoRuleNoticeId = "auto-rule-candidates:" + String(eventId || "")
-                    notificationsController._addPushNotice({
-                        "id": autoRuleSuggestionsController._autoRuleNoticeId,
-                        "severity": "info",
-                        "dismissible": true,
-                        // The inbox keeps everything, so this is a "something
-                        // arrived" stripe, not a question: it retires itself
-                        // and the list stays reachable from the Rules submenu.
-                        "kind": "suggestions-changed",
-                        "autoDismissMs": 5000,
-                        "muteKind": "suggestions-changed",
-                        "title": tr("notifications.auto-rule-candidates.title",
-                            "Addresses waiting to be added"),
-                        "body": tr("notifications.auto-rule-candidates.body",
-                            "The service found {count} addresses the sites you routed need.")
-                            .replace("{count}", String(autoRuleSuggestionsController.autoRuleCandidatesPending)),
-                        "actionKey": "open-auto-rule-suggestions",
-                        "actionText": tr("rules.suggestions.open", "Review")
-                    })
-                }
+                if (Pure.autoRuleNoticeDue(event))
+                    autoRuleSuggestionsController.announce(event, eventId)
                 break
             case "app-rule-learning-destinations":
                 // The route for an application is built from addresses the
@@ -4172,7 +4166,31 @@ ApplicationWindow {
                         "A site does not answer on either link"),
                     "body": tr("notifications.host-unreachable.body",
                         "{host} did not answer through the main link or through the additional one, so moving it would not help and nothing was offered. The problem is most likely on the site's side.")
-                        .replace("{host}", Pure.displayText(event["host"]))
+                        .replace("{host}", Pure.displayText(event["host"])),
+                    // "Most likely" is a guess; the site check settles it.
+                    "actionKey": "check-site",
+                    "actionArg": String(event["host"] || ""),
+                    "actionText": tr("diag.conn-trace.check-site", "Check site…")
+                })
+                break
+            case "link-keeps-dropping":
+                // Each drop was too short to tell; the service says once that
+                // they keep coming, and again only after the link held.
+                notificationsController._addPushNoticeUnlessMuted("link-keeps-dropping", {
+                    "id": "link-keeps-dropping:" + String(event.role || "") + ":" + String(eventId || ""),
+                    "severity": "warning",
+                    "dismissible": true,
+                    "kind": "link-keeps-dropping",
+                    "noticeMuteKind": "link-keeps-dropping",
+                    "title": String(event.role || "") === "primary"
+                        ? tr("notifications.link-keeps-dropping.title-primary",
+                            "The main connection keeps dropping")
+                        : tr("notifications.link-keeps-dropping.title-secondary",
+                            "The additional connection keeps dropping"),
+                    "body": tr("notifications.link-keeps-dropping.body",
+                        "It went down and came back several times in the last two minutes. Your rules stayed in force, but pages may have failed to load in between. Check the cable, the Wi-Fi or the VPN."),
+                    "actionKey": "open-interfaces",
+                    "actionText": tr("notifications.enforcement.action", "Open interfaces")
                 })
                 break
             case "secondary-external-address-observed":
@@ -5032,14 +5050,14 @@ ApplicationWindow {
             nrrNativeBridge.openFolder(path)
         }
     }
-    function uiIconSource(name) { return Qt.resolvedUrl("../../../assets/icons/" + (highContrastIcons ? "ui-hc/" : "ui/") + name + ".svg") }
+    function uiIconSource(name) { return assetUrl("icons/" + (highContrastIcons ? "ui-hc/" : "ui/") + name + ".svg") }
     // The same icon for a control painted with the accent fill. The normal
     // set is a blue/indigo gradient, which on that fill is invisible; the
     // high-contrast set is the same icons painted white, which is what
     // `palette.highlightedText` puts next to them.
-    function uiIconSourceOnAccent(name) { return Qt.resolvedUrl("../../../assets/icons/ui-hc/" + name + ".svg") }
+    function uiIconSourceOnAccent(name) { return assetUrl("icons/ui-hc/" + name + ".svg") }
     function sectionIconSource(sectionId) {
-        if (sectionId === "interfaces-routes") return Qt.resolvedUrl("../../../assets/icons/" + (highContrastIcons ? "status-hc/" : "status/") + "interface-ok.svg")
+        if (sectionId === "interfaces-routes") return assetUrl("icons/" + (highContrastIcons ? "status-hc/" : "status/") + "interface-ok.svg")
         if (sectionId === "rules") return uiIconSource("search")
         if (sectionId === "diagnostics") return uiIconSource("diagnostics")
         if (sectionId === "logs") return uiIconSource("logs")
@@ -5049,9 +5067,9 @@ ApplicationWindow {
     function routeIconSource(routeId) {
         // "block" ships only as an SVG (a drop has no adapter PNG set); render
         // it as SVG in both normal and high-contrast modes.
-        if (routeId === "block") return Qt.resolvedUrl("../../../assets/icons/status" + (highContrastIcons ? "-hc" : "") + "/route-block.svg")
-        if (highContrastIcons) return Qt.resolvedUrl("../../../assets/icons/status-hc/" + (routeId === "secondary" ? "route-secondary" : "route-primary") + ".svg")
-        return Qt.resolvedUrl("../../../assets/icons/status/" + (routeId === "secondary" ? "route-secondary-20.png" : "route-primary-20.png"))
+        if (routeId === "block") return assetUrl("icons/status" + (highContrastIcons ? "-hc" : "") + "/route-block.svg")
+        if (highContrastIcons) return assetUrl("icons/status-hc/" + (routeId === "secondary" ? "route-secondary" : "route-primary") + ".svg")
+        return assetUrl("icons/status/" + (routeId === "secondary" ? "route-secondary-20.png" : "route-primary-20.png"))
     }
     // Leading icon for a rule row, keyed on the rule-type slug. Uses the
     // gradient `rule-type-*` set (auto-swaps to `ui-hc/` under high contrast
@@ -5159,6 +5177,7 @@ ApplicationWindow {
         // The host parses the context file; when it could not, nothing here can.
         if (typeof nrrLaunchContext === "undefined" || !nrrLaunchContext) return
         context = nrrLaunchContext
+        assetsRootUrl = String(context.assetsRootUrl || "")
         localeCatalog = context.localeCatalog || {}
         availableLanguages = context.availableLanguages || []
         platformProfile = context.platformProfile || platformProfile
@@ -8734,15 +8753,10 @@ ApplicationWindow {
     /// the two payloads are byte-identical for identical rules; it lives here
     /// so non-section call sites can reuse it without crossing the section
     /// boundary.
-    /// `candidate` ({index, row}) puts a row that is not in the table yet in
-    /// place of row `index`, or after the last one when `index` is negative.
-    function _buildRulesJsonFromModel(candidate) {
+    function _buildRulesJsonFromModel() {
         try {
             var rows = []
-            for (var i = 0; i < rulesModel.count; i += 1) {
-                rows.push(candidate && candidate.index === i ? candidate.row : rulesModel.get(i))
-            }
-            if (candidate && candidate.index < 0) rows.push(candidate.row)
+            for (var i = 0; i < rulesModel.count; i += 1) rows.push(rulesModel.get(i))
             return Rules.buildRulesJson(rows, _aceEncodeHost)
         } catch (err) {
             // A throw here would otherwise silently kill every save/review/

@@ -65,22 +65,39 @@ mod stderr_capture;
 ///
 /// Install applies it too, but `acl_applied: Some(false)` is a non-fatal install
 /// outcome, and under `%ProgramData%` any account may create the tree first and
-/// stay its owner. A reset that fails is worth a line; a link in the tree is an
-/// `Err`, and the caller does not start — the databases and logs would be
-/// opened through it.
+/// stay its owner. A reset that fails, or entries another account planted and
+/// that were moved aside, are worth a record; a link in the tree is an `Err`,
+/// and the caller does not start — the databases and logs would be opened
+/// through it. The operator's log hears of each: nothing else is open yet.
 #[cfg(windows)]
 pub(crate) fn lock_down_data_tree() -> Result<(), String> {
     use nrr_platform_api::service_control::ServiceControlError;
+    use nrr_platform_api::system_event_log::SystemEventLogPort;
+    use nrr_service_runtime::lifecycle_journal::{data_tree_record, DataTreeOutcome};
 
     let Some(root) = nrr_platform_api::paths::production_data_root() else {
         return Ok(());
     };
     let _ = std::fs::create_dir_all(&root);
-    match nrr_platform_windows::service_control::apply_data_dir_acl(&root) {
-        Ok(()) => Ok(()),
-        Err(refused @ ServiceControlError::InvalidState { .. }) => Err(refused.to_string()),
+    let report = |outcome| {
+        nrr_platform_windows::event_log::WindowsEventLog::new().write(&data_tree_record(outcome));
+    };
+    match nrr_platform_windows::service_control::secure_data_dir(&root) {
+        Ok(moved) => {
+            if !moved.is_empty() {
+                eprintln!("[nrr] data directory: set aside {}", moved.join(", "));
+                report(DataTreeOutcome::SetAside(&moved));
+            }
+            Ok(())
+        }
+        Err(refused @ ServiceControlError::InvalidState { .. }) => {
+            let reason = refused.to_string();
+            report(DataTreeOutcome::Refused(&reason));
+            Err(reason)
+        }
         Err(e) => {
             eprintln!("[nrr] data-directory lockdown could not be applied: {e}");
+            report(DataTreeOutcome::NotSecured(&e.to_string()));
             Ok(())
         }
     }

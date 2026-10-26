@@ -65,6 +65,8 @@ fn every_reported_winner_is_the_engines_winner() {
             suffix("P4", "longer.zone.test"),
             exact("P5", "tie.block.example"),
             blocking(suffix("P6", "blocked.example")),
+            suffix("P7", "site.test"),
+            zone("P8", "same.test"),
         ],
         secondary: vec![
             exact("S1", "www.site.example"),
@@ -75,6 +77,8 @@ fn every_reported_winner_is_the_engines_winner() {
             blocking(exact("S6", "tie.block.example")),
             suffix("S7", "blocked.example"),
             exact("S8", "open.blocked.example"),
+            zone("S9", "corp.site.test"),
+            suffix("S10", "same.test"),
         ],
     };
     let found = find_route_overlaps(&dto, false);

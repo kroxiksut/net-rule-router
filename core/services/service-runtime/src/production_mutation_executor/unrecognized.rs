@@ -22,6 +22,18 @@ use super::*;
 pub const NETWORK_COVERS_LINK_CODE: &str = "network-covers-link";
 /// Refusal code for a network over the service's virtual address pool.
 pub const NETWORK_COVERS_FAKE_IP_POOL_CODE: &str = "network-covers-fake-ip-pool";
+/// The `rules-update` payload member a writer that does not list the rules
+/// kept aside as not working sets, so they are carried rather than deleted.
+pub(crate) const KEEP_INACTIVE_KEY: &str = "keep-inactive";
+
+/// Whether `payload` asks for the rules kept aside to be carried.
+pub(super) fn keeps_inactive(payload: &serde_json::Value) -> bool {
+    payload
+        .get(KEEP_INACTIVE_KEY)
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false)
+}
+
 /// Refusal code for a submitted rule of a kind or action this build cannot read.
 pub const RULE_KIND_UNKNOWN_CODE: &str = "rule-kind-unknown";
 
@@ -135,11 +147,79 @@ impl ProductionMutationExecutor {
     /// The unrecognized rules of the book in force for `principal`; `None`
     /// when it holds none, which is every book this build wrote itself.
     pub(super) fn unrecognized_in_force(&self, principal: &str) -> Option<UnrecognizedRules> {
+        let content = self.content_in_force(principal)?;
+        (!content.unrecognized.is_empty()).then_some(content.unrecognized)
+    }
+
+    /// The rules of the book in force for `principal` that no book may apply,
+    /// kept aside; `None` when it holds none.
+    pub(super) fn inactive_in_force(&self, principal: &str) -> Option<UnrecognizedRules> {
+        let content = self.content_in_force(principal)?;
+        (!content.inactive.is_empty()).then_some(content.inactive)
+    }
+
+    fn content_in_force(
+        &self,
+        principal: &str,
+    ) -> Option<nrr_domain::rules_revision::RulesRevisionContent> {
         let json = self.coordinator.rules_json_in_force_for(principal)?;
         let dto =
             crate::production_rules_provider::read_stored_rules(&json, "rules-in-force").ok()?;
-        let content = rules_json_codec::decode(dto, self.host_platform).ok()?;
-        (!content.unrecognized.is_empty()).then_some(content.unrecognized)
+        rules_json_codec::decode(dto, self.host_platform).ok()
+    }
+
+    /// For a writer that builds on the rules in force without listing them
+    /// (the service's own suggestions): carry the rules kept aside as not
+    /// working into `payload` where it lacks them. A client that lists them
+    /// sends them back, and leaving one out is how the user deletes it.
+    pub(super) fn carry_inactive(&self, payload: &mut RulesUpdatePayload, principal: &str) {
+        let Some(carried) = self.inactive_in_force(principal) else {
+            return;
+        };
+        let Some(mut content) = nrr_shared::rules_json::from_canonical_string(&payload.rules_json)
+            .ok()
+            .and_then(|dto| rules_json_codec::decode(dto, self.host_platform).ok())
+        else {
+            return;
+        };
+        let held: HashSet<String> = content
+            .rule_book
+            .primary
+            .rules()
+            .iter()
+            .chain(content.rule_book.secondary.rules())
+            .map(|rule| rule.id.as_str().to_owned())
+            .chain(
+                content
+                    .inactive
+                    .primary
+                    .iter()
+                    .chain(&content.inactive.secondary)
+                    .map(|rule| rule.id.clone()),
+            )
+            .collect();
+        let mut added = 0;
+        for (into, from) in [
+            (&mut content.inactive.primary, &carried.primary),
+            (&mut content.inactive.secondary, &carried.secondary),
+        ] {
+            for rule in from.iter().filter(|rule| !held.contains(&rule.id)) {
+                into.push(rule.clone());
+                added += 1;
+            }
+            into.sort_by(|a, b| a.id.cmp(&b.id));
+        }
+        if added == 0 {
+            return;
+        }
+        let Ok(canonical) = rules_json::to_canonical_string(&rules_json_codec::encode(&content))
+        else {
+            return;
+        };
+        let mut hasher = Sha256::new();
+        hasher.update(canonical.as_bytes());
+        payload.content_hash = format!("{:x}", hasher.finalize());
+        payload.rules_json = canonical;
     }
 }
 

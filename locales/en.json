@@ -375,7 +375,6 @@
       "block-secondary-traffic": "Block connections when the additional route is unavailable",
       "rules-file-change-mode": "When rules file changes on disk",
       "include-child-processes": "Apply rules to child processes",
-      "show-other-os-rules": "Show rules for other operating systems",
       "import-both-files-together": "Import both route files together",
       "tray-notice-opacity": "Tray notification opacity, %",
       "tray-notice-opacity-note": "Applies to notifications shown from the tray. Restart the tray for it to take effect.",
@@ -1039,7 +1038,8 @@
         "show": "Show",
         "until": "Hidden until {timestamp}",
         "forever": "Hidden for good"
-      }
+      },
+      "site-not-opening": "A site does not open (told even while the tray is closed)"
     }
   },
   "vpn-onboarding": {
@@ -1737,6 +1737,7 @@
       "protection-fake-ip": "Route sites by name, so an address shared with another site is not dragged along",
       "protection-diagnostic-logs": "Write detailed diagnostic logs (only needed to report a problem)",
       "protection-mute-block-notices": "Do not show notifications about blocked traffic (rule suggestions still arrive)",
+      "site-notice-note": "Even with the tray closed, NetRuleRouter tells you when a site you open does not open over the main connection. You can turn this off in Settings, Notifications.",
       "close": "Continue",
       "primary-adapter-description": "The connection everything travels by default. Until you name it, your rules are not applied.",
       "primary-adapter-assigned": "Main connection: {name}. You can change it later in Interfaces and routes.",
@@ -2560,6 +2561,10 @@
     "preview": {
       "invalid-ip-comment": "preview: invalid IP — surfaces the strict validator"
     },
+    "other-os": {
+      "title": "Rules for other systems: kept in the files, applied only there",
+      "not-applied": "Rule for {os}: kept in the file, not applied on this system."
+    },
     "filter": {
       "enabled": {
         "label": "Status",
@@ -2584,6 +2589,9 @@
         "denied": "Denied"
       },
       "auto-added": "Auto-added only",
+      "show-not-working": "Show rules that do not work",
+      "show-not-working-tooltip": "Rules whose value cannot be applied are kept in your set and shown with the reason. Delete one to remove it. Rules for other systems stay in the rules file and are applied only there.",
+      "not-working-hidden": "rules that do not work are hidden",
       "recent": {
         "label": "Recent",
         "tooltip": "Show only the rules you added or changed lately, newest first, and the ones you deleted.",
@@ -2679,6 +2687,7 @@
         "network-wide": "Routed, but not blocked when the additional connection drops: leak protection holds networks up to /{prefix}.",
         "network-wide-public": "Routed, but not blocked when the additional connection drops: leak protection holds networks up to /{prefix}. This is a large public network — make sure you meant it.",
         "subnet-host-bits": "Saved as the network {network}.",
+        "single-address": "One address: saved as the IP rule {address}.",
         "protected-file-in-system-folder": "A program from a system folder: other parts of the system may rely on it reaching the network.",
         "override-requested": "Not applied: the protection of system programs holds this rule until you confirm it (+override).",
         "children-not-in-effect": "The +children flag is kept but not in effect yet: the rule covers only this program, not the ones it starts"
@@ -3175,6 +3184,11 @@
         "app-own-resolver": "it looks up site names on its own, so rules by site name do not reach it",
         "main-link-blocked": "connections to it kept failing on the main route and none went through"
       },
+      "reach": {
+        "confirmed": "it opens over the additional route",
+        "unconfirmed": "the additional route may help",
+        "unreachable": "it does not open over the additional route either"
+      },
       "action": {
         "accept": "Add checked",
         "always": "Add automatically from now on",
@@ -3288,6 +3302,13 @@
     "notice-mute": {
       "title": "Stop showing this notification?",
       "body": "\"{name}\" will not appear for as long as you choose."
+    },
+    "site-not-opening": {
+      "title": "A site does not open",
+      "body-unconfirmed": "{host} does not open over the main connection; the additional route may help.",
+      "body-confirmed": "{host} does not open over the main connection, but opens over the additional route.",
+      "add": "Add rule",
+      "mute": "Don't report again"
     },
     "settings-lost": {
       "body": "This happens after the service was reinstalled or its data was reset. Settings missing: {count}."
@@ -3548,6 +3569,7 @@
       "entries-no-match": "No connections match the current filters",
       "entries-from": "from",
       "relay-for": "relay for %1",
+      "learned-route": "First connection held at %1 while the address was being learned, then sent over the additional route",
       "remote-host-others": "%1 (+%2)",
       "remote-hosts-tip": "Names this address was answered for (%1):",
       "fake-ip": "fake-IP",
@@ -3762,6 +3784,8 @@
     "event": {
       "auto-rules-verify-accepted": "Rules with ? moved to the route that works for them: {count}.",
       "site-check-done": "Site check of {host} finished: {verdict}.",
+      "site-notice-started": "Started the tray to say that {host} does not open.",
+      "site-notice-refused": "Did not start the tray to say that {host} does not open: {reason}.",
       "auto-rules-verify-verdict": "{host} does not open on the route its ? rule is written for but opens on the other one; until restart this host uses the other route (a rule for one site moves whole), and moving the rule is offered.",
       "conn-observation-tick": "Connections observed: {total} (Main {primary}, Additional {secondary}, blocked {blocked_nrr})",
       "dns-refresh-tick": "DNS refresh: {succeeded} of {attempted} names resolved",
@@ -3870,12 +3894,11 @@
       "connobs-app-pin-first-contact-drop": "An application-pinned process was blocked {count} time(s) on destinations not yet routed through the additional link; this is expected on first contact and resolves on the next policy update.",
       "connobs-blocked-connection-first-seen": "Blocked connection observed: process {process}, destination {remote_ip}:{remote_port} ({protocol}), blocked by {blocked_by}{purpose}.",
       "conn-unanswered": "The far side stopped answering a connection of {program} (pid {pid}) over the {link} link (interface {ifindex}, {adapter}) to {remote} from local port {local_port}: no answer for {silent_s} s, {resends} resends. NetRuleRouter did not block this connection.",
-      "conn-unanswered-closed": "The system closed a connection of {program} (pid {pid}) over the {link} link (interface {ifindex}, {adapter}) to {remote} from local port {local_port}: the far side had not answered for {silent_s} s.",
+      "conn-unanswered-closed": "The system closed a connection of {program} (pid {pid}) over the {link} link (interface {ifindex}, {adapter}) to {remote} from local port {local_port}: the far side had not answered for {silent_s} s. NetRuleRouter did not close this connection.",
       "conn-unanswered-omitted": "{omitted} more unanswered connection(s) in the last minute were not listed.",
       "dnsobs-collateral-pin-skipped-secondary-unusable": "Skipped pinning shared address {shared_ip} (also used by {secondary_rule_host}) to the additional link because it is currently unusable; {direct_host} stays on the primary link and will be re-evaluated once the link recovers.",
       "dnsobs-os-cache-seeded": "Seeded the address cache from the OS DNS cache: {matched} matched, {refreshed} refreshed, {ignored} ignored.",
       "dnsobs-reverse-confirmed-rule-host-cached": "Cached rule host {hostname} ({addresses} address(es)) confirmed by reverse lookup from a blocked connection.",
-      "dnsobs-reverse-confirmed-direct-host-registered": "Registered direct host {hostname} ({addresses} address(es)) confirmed by reverse lookup; it is now exempt from the next full-block update.",
       "dnsobs-direct-tenant-forgotten-pending-companion": "Host {host} is a pending suggestion for the additional route; removed {rows} row(s) from the shared-address tracking so its addresses stay pinned there.",
       "dnsobs-upsert-failed": "Could not save an observed hostname to the address cache ({error}).",
       "svctask-retention-delete-failed": "Retention could not delete some {kind} files ({deleted} removed so far).",
@@ -4021,6 +4044,8 @@
       "supervised-start-blocked": "Start blocked, recovery required: {reason}. Reads are answered; nothing is applied or removed.",
       "svc-boot-state-db-restored-from-backup": "The state database could not be used ({failure}) and was restored from backup {backup}; changes after that backup are gone, the damaged file is kept at {damaged}.",
       "svc-boot-teardown-kept-for-shutdown": "Filters and routes stay in force through this stop ({reason}): the machine is going down, or a new version takes over.",
+      "svc-boot-guard-installed": "Leak protection is on: after the restart, signed-in users stay blocked until the service's first pass.",
+      "svc-boot-guard-failed": "The block for the restart could not be set ({error}); after it, sign-in may reach the network before the service's first pass.",
       "svc-boot-wfp-strip-deadline": "Filter removal did not finish within {deadline_secs} s; the stop goes on and the next start adopts or removes what is left.",
       "svc-offline-orphan-strip-deferred": "Leak protection is on: a previous instance's blocks stay until the first pass adopts them.",
       "svc-offline-standalone-strip-failed": "Standalone cleanup of leftover blocking rules failed ({error}).",
@@ -4224,7 +4249,6 @@
       "dns-resolver-unconfirmed-answer": "No second source could confirm the addresses for {host} ({reason}; second source: {second_source}) — using the upstream answer as-is, unpinned",
       "dns-resolver-reuse-unconfirmed": "No second source could confirm the addresses for {host}, shared with {also_answered_for} — answering with the upstream set as-is",
       "dns-resolver-cache-upsert-failed": "Failed to save a resolved DNS entry to the address cache ({error})",
-      "dns-resolver-block-all-exemption-installed": "Direct host {host} exempted from block-all before answering ({added} address(es) added, result: {outcome})",
       "dns-resolver-answer-sanitized": "The DNS answer for {host} contained addresses that cannot be a real destination — those were dropped before enforcement",
       "dns-resolver-answer-unusable": "The DNS answer for {host} contains no address that could be a real destination — answering the client without pinning it for enforcement",
       "dns-resolver-stub-suspected": "The upstream server answered both {host} and {also_answered_for} with the identical address set — this looks like a provider stub rather than a real resolution",
@@ -4306,6 +4330,7 @@
       "persid-plan-route-table-unreadable": "Could not read the system route table; the full block-all protection cannot be armed this round: {error}.",
       "persid-plan-links-unreadable": "Could not read the list of network adapters; the full block-all protection cannot be armed this round: {error}.",
       "persid-plan-blanket-block-refused": "Full block-all was requested, but the tunnel server's address could not be determined; arming it would prevent the tunnel from reconnecting, so it was not enabled.",
+      "persid-plan-blanket-block-no-main-link": "Full block-all was requested, but the main link is not resolved; without its local networks the block would cut the local network, so it was not enabled.",
       "persid-plan-state-db-unreadable": "The policy database could not be opened ({error}); no policy can be enforced until this is resolved.",
       "persid-plan-fqdn-cache-unreadable": "The domain-name cache could not be opened ({error}); domain-based rules will not resolve until this is fixed.",
       "persid-plan-fqdn-cache-migration-failed": "The domain-name cache could not be upgraded ({error}); domain-based rules will not resolve until this is fixed.",
@@ -4416,7 +4441,7 @@
       "prod-activation-reactivate-historical": "Submitted content matched a historical revision; re-activating it (revision: {revision_id}, previous status: {status}).",
       "prod-rules-json-parse-failed": "Canonical rules-JSON parse failed; treating as no active rules (origin: {origin}, error: {error}).",
       "prod-rules-codec-decode-failed": "Rules-JSON codec decode failed; treating as no active rules (origin: {origin}, error: {error}).",
-      "stored-rules-dropped": "Dropped {dropped} stored rule(s) no rule set may hold: an address that is never a destination (this host or broadcast), or an application name that is too long, contains a control character or matches every process; the other rules are in force (origin: {origin}).",
+      "stored-rules-not-applied": "{kept} stored rule(s) are kept but not applied: an address that is never a destination (this host or broadcast), or an application name that is too long, contains a control character or matches every process. The rules list shows them as not working; the other rules are in force (origin: {origin}).",
       "protected-rules-not-applied": "{count} rule(s) not applied: they deny a system program or folder, send one over the additional route, or name a program by a path this system cannot apply yet ({rules}).",
       "protection-override-read-failed": "Confirmed rules could not be read; none of them applies (error: {error}).",
       "protection-override-no-key": "{count} confirmed rule(s) are not honoured this start: the signing key is unavailable, so the protection holds them.",
@@ -4480,6 +4505,7 @@
       "autorules-inbox-accepted": "Accepted {accepted} suggested address(es) (e.g. {anchor}) — added to the user's own rules.",
       "autorules-inbox-accept-failed": "Could not add the accepted addresses to the rules (code: {code}): {error}.",
       "autorules-inbox-dismissed": "Declined {dismissed} suggested address(es) (e.g. {anchor}) — they will not be offered again.",
+      "enforcement-link-keeps-dropping": "A connection keeps dropping for a few seconds and coming back.",
       "autorules-inbox-restored": "Restored {restored} previously declined address(es); {re_offered} are back on the suggestion list.",
       "autorules-inbox-erased": "Erased {forgotten} suggestion(s) — they may be offered again from scratch.",
       "autorules-intake-evidence-restored": "Restored companion evidence from before the last restart: {candidates} candidate(s), {anchors} anchor(s).",
@@ -4797,9 +4823,21 @@
     "dismiss-all": "Dismiss all",
     "dismiss-all-tooltip": "Removes every notice that can be dismissed. Ones that mirror a live state stay until the state itself changes.",
     "mute-kind": "Stop showing these",
+    "link-keeps-dropping": {
+      "title": "A connection keeps dropping",
+      "title-primary": "The main connection keeps dropping",
+      "title-secondary": "The additional connection keeps dropping",
+      "body": "It went down and came back several times in the last two minutes. Your rules stayed in force, but pages may have failed to load in between. Check the cable, the Wi-Fi or the VPN."
+    },
     "app-unresolved": {
       "title": "App rules applied, but some apps weren't found",
-      "body": "NetRuleRouter couldn't find these programs (they may not be installed in a standard location, or aren't running), so their traffic isn't routed by your rules: {apps}. Launch the app, or check the program name in Rules."
+      "body": "NetRuleRouter couldn't find these programs (they may not be installed in a standard location, or aren't running), so their traffic isn't routed by your rules: {apps}. Launch the app, or check the program name in Rules.",
+      "title-unrouted": "App rules applied, but some don't route their program",
+      "unrouted": {
+        "addresses-named-by-rules": "The program {app} is on this computer, but its rule routes none of its traffic: the addresses it connects to are already covered by your rules for sites and addresses, and the more specific rule wins.",
+        "addresses-shared": "The program {app} is on this computer, but its rule routes none of its traffic: other programs or sites use the same addresses, and moving them would move those too.",
+        "other": "The program {app} is on this computer, but its rule routes none of its traffic."
+      }
     },
     "first-run-needs-admin": {
       "title": "A setup answer needs an administrator",
@@ -4912,7 +4950,12 @@
     },
     "rules-file-converged": {
       "title": "Your rules file was brought up to date",
-      "body": "The linked rules file was written differently from the rules in the app, but both described the same routing. The file has been rewritten to match; nothing about what is applied changed."
+      "body": "The linked rules file was written differently from the rules in the app, but both described the same routing. The file has been rewritten to match; nothing about what is applied changed.",
+      "added-body": "Rules already in force were missing from your rules file and are now written to it: {rules}. Nothing about what is applied changed."
+    },
+    "rules-file-not-written": {
+      "title": "Rules applied, but your rules file was not updated",
+      "body": "The rules are in force, but writing them to your rules file failed, so the file still holds the previous rules. Use \"Save to file\" on the Rules screen to try again."
     },
     "service-refused": {
       "title": "The service will not accept this app",
@@ -5245,8 +5288,15 @@
       "help-site-check": "c: type a site name and check whether the network or the site is at fault",
       "plain-site-check": "c and a site name: check it, for example c example.com; m: move the sign-in names the check found to the site's route",
       "site-move": "m: move the sign-in names to the site's route (Rules opens with them, and you confirm)",
+      "site-trace": "t: open the connection trace to see what the site's connections did",
       "plain-export": "x: export a diagnostic archive",
-      "plain-log-filters": "In the log: v next level, / and text filter by event type (/ on its own clears), s this session or all history"
+      "plain-log-filters": "In the log: v next level, / and text filter by event type (/ on its own clears), s this session or all history",
+      "sort": "Sorted by {column}, {direction}",
+      "sort-ascending": "ascending",
+      "sort-descending": "descending",
+      "help-log-sort": "In the log: c filters by category. In the log and the audit trail: o sorts by the next column, d reverses the order",
+      "plain-log-sort": "In the log: c and text filter by category (c on its own clears). In the log and the audit trail: o next sort column, d reverse order",
+      "archive-options": "d: change the detail level, o: only this session's logs or all of them, b: change the log size limit"
     },
     "elevation": {
       "password-prompt": "This change needs an administrator's password. Type it below; the screen comes back once it is answered."
@@ -5282,7 +5332,11 @@
       "block-route-more": "Blocked sites waiting after it: {count}.",
       "block-route-done": "{name} now goes over the additional route. You can undo it in Rules.",
       "block-route-already": "{name} already goes over the additional route; nothing was added.",
-      "block-route-failed": "Could not send {name} over the additional route: {error}"
+      "block-route-failed": "Could not send {name} over the additional route: {error}",
+      "window-parked": "The window holds changes made while the service was not running: {what}. It sends them when it next connects to the service.",
+      "window-parked-routing": "routing settings: {count}",
+      "window-parked-service": "service settings: {count}",
+      "window-parked-roles": "adapter roles"
     },
     "help": {
       "screens": "1 to 9 and 0: open a screen",
@@ -5292,7 +5346,9 @@
       "help": "F1 or ?: help for this screen",
       "back": "Esc: back, or close this help",
       "quit": "q: quit",
-      "status-feed": "On this screen, Up and Down scroll the notifications when that panel has the focus.",
+      "status-feed": "On this screen, Up and Down choose a notification when that panel has the focus; the keys it answers to are listed under it.",
+      "feed-keys": "In the notifications: x: dismiss the chosen one   X: dismiss all   m: stop showing ones like it   H: hide addresses in block notifications. A blocked connection also offers v: the additional route, s: snooze, w: why it was blocked.",
+      "feed-site": "A notification about a site that does not open offers c: check whether the network or the site is at fault (opens Diagnostics).",
       "status-vpn-trust": "t: confirm the first listed program as your VPN (T: with the programs it ships with), so leak protection keeps it working",
       "status-vpn-gateway": "a: allow the first listed VPN to reach its server, so leak protection lets it connect",
       "status-block-route": "v: send the blocked site named under the state over the additional route; you are asked first",
@@ -5313,7 +5369,18 @@
       "unknown": "Not understood: {input}",
       "input-ended-unapplied": "Input ended while rule changes were not applied. They were dropped; nothing was sent to the service.",
       "commands": "Commands on this screen",
-      "status-restore": "r: restore your settings to a service that lost them"
+      "status-restore": "r: restore your settings to a service that lost them",
+      "feed-dismiss": "x N: dismiss notification N   X: dismiss all",
+      "feed-mute": "m N: stop showing notifications like N   H: hide or show addresses in block notifications",
+      "feed-block": "For a blocked connection N: v N: send it over the additional route   s N: snooze   w N: why it was blocked",
+      "feed-site": "For a site that does not open in notification N: c N: check whether the network or the site is at fault"
+    },
+    "feed": {
+      "newer-above": "Newer notifications above: {count}.",
+      "no-such": "No notification has the number {number}.",
+      "choose": "Type the number of an answer. n or Esc: cancel.",
+      "addresses-hidden": "Block notifications no longer show addresses.",
+      "addresses-shown": "Block notifications show addresses again."
     },
     "interfaces": {
       "adapters-title": "Adapters",
@@ -5333,7 +5400,14 @@
       "help-check": "x: check each adapter's external address (sends one small packet per adapter)",
       "help-refresh": "r: read the adapter list again",
       "help-bluetooth": "b: show or hide Bluetooth adapters",
-      "plain-assign": "a: give an adapter a role or take it away (asks for the adapter's number)"
+      "plain-assign": "a: give an adapter a role or take it away (asks for the adapter's number)",
+      "help-search": "/: find an adapter by name, description, address or type (empty clears)",
+      "help-sort": "o: change the order of the list",
+      "help-unavailable": "u: show or hide unavailable adapters",
+      "help-resend": "e: send the remembered adapter to the service again",
+      "unavailable-hidden": "unavailable adapters are hidden",
+      "search-prompt": "Find adapters (empty clears):",
+      "resent": "The binding was sent to the service again."
     },
     "choice": {
       "hint": "Answer with the number, or with Up, Down and Enter. Esc or an empty answer cancels.",
@@ -5469,7 +5543,10 @@
         "bulk": "Shift+A: add several rules at once, typed or pasted as lines of a rules file. F2 in the add form does the same",
         "recent": "Shift+R: recent changes — the rules added or changed in the last hour, today or 7 days, newest first, and the deleted ones. Shift+U: put a deleted rule back",
         "override": "Shift+P: apply a protected rule despite the protection (it needs +override after its value), or take the confirmation back",
-        "filters": "S: rules by state (enabled, disabled, with errors). y: by type. u: only the ones added automatically. E: the rules that will not be applied"
+        "filters": "S: rules by state (enabled, disabled, with errors). y: by type. u: only the ones added automatically. E: the rules that will not be applied. H: hide or show the rules that do not work",
+        "more-files": "X: save one route's rules to a file. L: add the demo rules. W: clear all rules (asks first)",
+        "reset-baseline": "Z: go back to the baseline rules; your own rules and the changes on screen are dropped, and what changes is shown first",
+        "mark": "*: select or unselect the chosen rule (in line mode * and numbers, for example * 2 5). B: act on the selected rules"
       },
       "plain": {
         "add": "a: add a rule",
@@ -5494,7 +5571,7 @@
         "move-to-type": "T and a number: give that rule the type its value is, for example T 3. M: do it for every such rule",
         "recent": "R: recent changes. U: put a deleted rule back",
         "override": "P and a rule number: confirm a protected rule, or take the confirmation back",
-        "filters": "S: by state, y: by type, u: only added automatically, E: the rules that will not be applied"
+        "filters": "S: by state, y: by type, u: only added automatically, E: the rules that will not be applied, H: hide or show the rules that do not work"
       },
       "title-baseline": "Rules — baseline for every user",
       "baseline-note": "These rules are the baseline every user without rules of their own follows, as Set as baseline does in the window. b switches to your own rules.",
@@ -5509,6 +5586,7 @@
       "several-option": "Several rules at once (F2)",
       "form-switch-type": "Ctrl+T, or !t in line mode: move it to “{type}”",
       "form-subfolders": "Ctrl+F, or !f in line mode: with subfolders or without",
+      "form-subdomains": "Ctrl+F, or !f in line mode: with subdomains or without",
       "bulk": {
         "text": "Rules, one per line ({count} lines):",
         "more-above": "{count} more lines above",
@@ -5530,7 +5608,23 @@
       "restore-question": "Which rule to put back?",
       "status-question": "Show which rules by their state?",
       "type-question": "Show the rules of which type?",
-      "invalid-show": "E: show them"
+      "invalid-show": "E: show them",
+      "folder-offer": {
+        "title": "Your rule-set folder",
+        "how": "To keep them in {dir}, press o on the Rules screen and enter that folder."
+      },
+      "export-route-question": "Which rules to save?",
+      "export-route-file": "File to write these rules to:",
+      "overwrite-file-question": "The file already exists. Replace it?",
+      "overwrite-file": "Replace the file",
+      "cleared-files-kept": "Your rules files stay on disk and are no longer written to.",
+      "preset-duplicate-known": "Section \"{name}\" appears {n} times: all of its rules were taken.",
+      "demo-added": "Demo rules added: {count}. They are not applied yet.",
+      "demo-missing": "The demo rules are not part of this copy of the program.",
+      "row-marked": "selected",
+      "none-marked": "No rules are selected: select them with * first.",
+      "marked-question": "What to do with the selected rules?",
+      "unmark-all": "Unselect all"
     },
     "settings": {
       "sections": "Settings sections",
@@ -5590,7 +5684,10 @@
         "fix-reinstall": "To re-register it from this folder and start it, run: {command}",
         "fix-mode": "To change when it starts, remove it with {uninstall}, then install it again with {install}",
         "query-failed": "Could not ask the system about the service: {error}",
-        "no-manager": "This system has no service manager this program can ask."
+        "no-manager": "This system has no service manager this program can ask.",
+        "start-elsewhere": "The system would start the service from another folder, so it was not started. To re-register it from this folder and start it, run: {command}",
+        "logs-folder": "Service logs folder: {path}",
+        "console-check-failed": "Could not check the console's place on PATH: {error}"
       },
       "presets": {
         "export-path": "File to write",
@@ -5660,6 +5757,9 @@
       "failed": "Your settings could not be restored: {error}"
     },
     "answer-in-routing-settings": "Answer in Settings, Routing section (c2).",
-    "see-diagnostics": "Details are on the Diagnostics and logs screen (9)."
+    "see-diagnostics": "Details are on the Diagnostics and logs screen (9).",
+    "app-groups-offer": {
+      "how": "To give them a route, press g on the Rules screen."
+    }
   }
 }

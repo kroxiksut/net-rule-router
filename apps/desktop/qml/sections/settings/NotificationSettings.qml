@@ -183,7 +183,10 @@ GroupBox {
     /// The rows of the table: block notices as a class where this platform
     /// raises them, then every kind `nrr-domain` lets a user hide.
     readonly property var _hideableKinds: (group._blockNoticesSupported ? ["block-notices"] : [])
-        .concat(Object.keys(Pure.MUTABLE_NOTICE_KINDS))
+        .concat(Object.keys(Pure.MUTABLE_NOTICE_KINDS).filter(function (kind) {
+            // Only told where the service can start the tray to tell it.
+            return kind !== "site-not-opening" || root.supports("siteNoticeWithoutTray")
+        }))
     readonly property var _hideChoices: ["show"].concat(Object.keys(Pure.NOTICE_MUTE_CHOICES_MS))
 
     function _kindScope(kind) {

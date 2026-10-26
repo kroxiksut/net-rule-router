@@ -354,7 +354,7 @@ impl IpcHandler for CacheEntriesListHandler {
                     .map(|ip| ip.to_string())
                     .unwrap_or_default(),
                 hostname: redact_hostname(&row.canonical_hostname, mode).display_or_marker(),
-                ip: redact_ipv4_str(&row.canonical_ip, mode).display_or_marker(),
+                ip: viewer_ip_str(&row.canonical_ip, mode),
                 freshness: row.freshness_state,
                 source: row.source,
                 resolved_at_ms: system_time_to_ms(row.resolved_at),
@@ -382,6 +382,14 @@ impl IpcHandler for CacheEntriesListHandler {
         };
         serialise(OP, &response)
     }
+}
+
+/// A stored address as the viewer shows it; one that does not parse stays masked.
+fn viewer_ip_str(ip: &str, mode: RedactionMode) -> String {
+    ip.parse().map_or_else(
+        |_| redact_ipv4_str(ip, mode).display_or_marker(),
+        |ip| viewer_ip(ip, mode),
+    )
 }
 
 /// Rows read per storage query while looking for a caller's own names.

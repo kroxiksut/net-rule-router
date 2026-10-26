@@ -332,6 +332,10 @@ pub struct AdapterEntry {
     pub interface_description: String,
     pub interface_type: String,
     pub oper_status: String,
+    /// Up with an IPv4 address and a kind a route can be bound to: what the
+    /// service requires of a bound adapter, decided where the adapter was read.
+    #[serde(default)]
+    pub usable: bool,
 }
 
 // ── SnapshotDiagnostics ──────────────────────────────────────────────────────
@@ -798,6 +802,10 @@ pub enum StatusUpdateEvent {
     /// nothing. Said quietly, in the notice list only — it is somebody else's
     /// outage — so that "why was nothing offered" has an answer.
     HostUnreachableOnBothRoutes { sid: String, host: String },
+    /// This SID's link for `role` keeps dropping for a few seconds and coming
+    /// back — too briefly for each drop to be announced. Said once, and again
+    /// only after the link has stayed up for a while.
+    LinkKeepsDropping { sid: String, role: String },
     /// An application rule reached this SID for the first time.
     ///
     /// The route for an application is built from the addresses the service has
@@ -1019,6 +1027,7 @@ impl StatusUpdateEvent {
             | Self::AutoRuleCandidatesChanged { sid, .. }
             | Self::RuleDuplicatesDetected { sid, .. }
             | Self::HostUnreachableOnBothRoutes { sid, .. }
+            | Self::LinkKeepsDropping { sid, .. }
             | Self::AppRuleLearningDestinations { sid, .. }
             | Self::VpnClientAwaitingConfirmation { sid, .. }
             | Self::VpnGatewayAwaitingConfirmation { sid, .. }
@@ -1200,6 +1209,13 @@ pub struct SnapshotInitialResponse {
     /// `unenforced-app-reasons`.
     #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
     pub unenforced_app_reasons: std::collections::BTreeMap<String, String>,
+    /// Application rules whose program IS found but whose traffic the rule
+    /// carries none of: the entry, then why (`AppTrafficElsewhere` slug). Kept
+    /// apart from `unenforced_app_rules` so a client that does not know this
+    /// field never reads such a rule as a missing program. Wire key:
+    /// `unrouted-app-rules`.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub unrouted_app_rules: std::collections::BTreeMap<String, String>,
     /// How many secondary-destined IPs the "smart"
     /// kill-switch excluded from its per-IP pin/block set this compute because
     /// the shared-IP census saw them on direct (non-rule) hosts too. `0` under

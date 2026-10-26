@@ -10,6 +10,7 @@ use nrr_shared::ipc_payloads::{
 };
 
 use crate::backend::{BackendEvent, Outbox, PushEvent};
+use crate::feed::About;
 use crate::i18n::{Key, Texts};
 use crate::keys;
 use crate::link::Link;
@@ -57,9 +58,46 @@ pub enum NoticeLevel {
 /// does not change while the program runs.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Notice {
+    /// Its place in the order of arrival, from 1: the number the feed shows
+    /// and line mode's commands name, unchanged while newer ones arrive.
+    pub id: usize,
     pub level: NoticeLevel,
     pub title: String,
     pub body: String,
+    /// The body with the addresses it names left out, for "hide addresses".
+    pub private_body: Option<String>,
+    pub about: crate::feed::About,
+}
+
+impl Notice {
+    pub fn new(level: NoticeLevel, title: String, body: String) -> Self {
+        Self {
+            id: 0,
+            level,
+            title,
+            body,
+            private_body: None,
+            about: crate::feed::About::Nothing,
+        }
+    }
+
+    pub fn about(mut self, about: crate::feed::About) -> Self {
+        self.about = about;
+        self
+    }
+
+    pub fn private(mut self, body: String) -> Self {
+        self.private_body = Some(body);
+        self
+    }
+
+    /// The body as it may be shown now.
+    pub fn shown_body(&self, hide_addresses: bool) -> &str {
+        match &self.private_body {
+            Some(private) if hide_addresses => private,
+            _ => &self.body,
+        }
+    }
 }
 
 /// The service's report that a role's rules are not in force.
@@ -183,9 +221,16 @@ pub struct AppState {
     /// Blocked sites offered "To additional route", and the question asked.
     pub block_route: crate::block_route::BlockRouteState,
     pub local_network_offer: crate::local_network_offer::LocalNetworkOfferState,
+    pub app_groups_offer: crate::app_groups_offer::AppGroupsOfferState,
+    /// When the feed last told that a site does not open, and of which.
+    pub site_notices: crate::site_notices::SiteNoticeLog,
+    /// What the window holds for a service that was not running.
+    pub window_parked: Option<crate::window_parked::WindowParked>,
     pub forwarded_traffic: crate::forwarded_traffic::ForwardedTrafficState,
     /// The notice kinds the user silenced on any surface.
     pub notice_mutes: crate::notice_mutes::NoticeMutesState,
+    /// The notice chosen in the feed and the question asked about it.
+    pub feed: crate::feed::FeedState,
 }
 
 impl AppState {
@@ -236,8 +281,12 @@ impl AppState {
             block_backlog: Default::default(),
             block_route: Default::default(),
             local_network_offer: Default::default(),
+            app_groups_offer: Default::default(),
+            site_notices: Default::default(),
+            window_parked: None,
             forwarded_traffic: Default::default(),
             notice_mutes: Default::default(),
+            feed: Default::default(),
         }
     }
 
@@ -294,6 +343,8 @@ impl AppState {
                     self.policy_idle_since = None;
                 }
                 self.link = link;
+                // The window sends what it parked once it reaches the service.
+                crate::window_parked::refresh(self);
                 let loss = self.service_loss_reading(texts, now);
                 if reconnected {
                     // Read before the backlog, so its summary meets the mutes.
@@ -302,6 +353,7 @@ impl AppState {
                     crate::screens::rules::verdicts::load(self);
                     crate::block_backlog::drain(self);
                     crate::local_network_offer::check(self);
+                    crate::app_groups_offer::check(self);
                     crate::screens::screen(self.screen).on_show(self);
                 }
                 loss
@@ -315,8 +367,11 @@ impl AppState {
                     .chain(crate::vpn_gateway_trust::announce(self, texts, now))
                     .chain(crate::primary_suggestion::announce(self, texts, now))
                     .chain(crate::block_backlog::announce(self, texts, now))
+                    .chain(crate::screens::suggestions::announce(self, texts))
                     .chain(crate::block_route::announce(self, texts, now))
+                    .chain(crate::feed::announce(self, texts, now))
                     .chain(crate::local_network_offer::announce(self, texts, now))
+                    .chain(crate::app_groups_offer::announce(self, texts, now))
                     .chain(crate::screens::wizard::announce(self, texts, now));
                 if std::mem::take(&mut self.snapshot_refresh_due) {
                     effects.push(Effect::Refresh);
@@ -423,12 +478,14 @@ impl AppState {
             }
             StatusUpdateEvent::RoutingPauseStateChanged {
                 paused,
+                paused_at,
                 resumes_at_ms,
                 until_restart,
                 ..
             } => {
                 if let Some(snapshot) = self.snapshot.as_mut() {
                     snapshot.routing_paused = paused;
+                    snapshot.routing_paused_at = paused_at.filter(|_| paused);
                     snapshot.routing_pause_resumes_at_ms = resumes_at_ms;
                     snapshot.routing_pause_until_restart = until_restart;
                 }
@@ -458,13 +515,31 @@ impl AppState {
                 self.rules_book_reading(unreadable, texts, now)
             }
             StatusUpdateEvent::HostUnreachableOnBothRoutes { host, .. } => {
-                let host = display_text(&host).into_owned();
-                self.notify(
+                let shown = display_text(&host).into_owned();
+                let notice = Notice::new(
                     NoticeLevel::Info,
                     texts.get(keys::HOST_UNREACHABLE_TITLE),
-                    texts.fill(keys::HOST_UNREACHABLE_BODY, &[("host", &host)]),
-                    now,
+                    texts.fill(keys::HOST_UNREACHABLE_BODY, &[("host", &shown)]),
                 )
+                .about(About::Site(host));
+                self.post(notice, Some(now))
+            }
+            StatusUpdateEvent::LinkKeepsDropping { role, .. } => {
+                if crate::notice_mutes::muted(self, "link-keeps-dropping") {
+                    return Vec::new();
+                }
+                let title = if role == "primary" {
+                    keys::LINK_DROPPING_TITLE_PRIMARY
+                } else {
+                    keys::LINK_DROPPING_TITLE_SECONDARY
+                };
+                let notice = Notice::new(
+                    NoticeLevel::Warning,
+                    texts.get(title),
+                    texts.get(keys::LINK_DROPPING_BODY),
+                )
+                .about(About::Kind("link-keeps-dropping"));
+                self.post(notice, Some(now))
             }
             // A reconnect inside the service's quiet period is not announced.
             StatusUpdateEvent::SecondaryExternalAddressObserved { quiet: true, .. } => Vec::new(),
@@ -489,11 +564,13 @@ impl AppState {
                 if crate::notice_mutes::muted(self, "external-address") {
                     return Vec::new();
                 }
-                self.note_in_feed(
+                let notice = Notice::new(
                     NoticeLevel::Info,
                     texts.get(keys::EXTERNAL_ADDRESS_TITLE),
                     body,
                 )
+                .about(About::Kind("external-address"));
+                self.post(notice, None)
             }
             StatusUpdateEvent::AdaptersChanged { .. } => vec![Effect::Refresh],
             StatusUpdateEvent::AutoRuleCandidatesChanged {
@@ -541,27 +618,38 @@ impl AppState {
                 ..
             } => {
                 crate::block_route::offer(self, &destination, &reason);
-                let app = if app.is_empty() {
+                let app_name = if app.is_empty() {
                     texts.get(keys::BLOCK_NOTICE_APP_UNKNOWN)
                 } else {
                     display_text(&app).into_owned()
                 };
-                let destination = display_text(&destination).into_owned();
-                let body = texts.fill(
-                    keys::BLOCK_NOTICE_BODY,
-                    &[
-                        ("reason", block_reason_text(&reason, texts).as_str()),
-                        ("destination", destination.as_str()),
-                        ("app", app.as_str()),
-                        ("attempts", attempts.to_string().as_str()),
-                    ],
-                );
-                self.notify(
+                let reason_text = block_reason_text(&reason, texts);
+                let attempts = attempts.to_string();
+                let body = |shown: &str| {
+                    texts.fill(
+                        keys::BLOCK_NOTICE_BODY,
+                        &[
+                            ("reason", reason_text.as_str()),
+                            ("destination", shown),
+                            ("app", app_name.as_str()),
+                            ("attempts", attempts.as_str()),
+                        ],
+                    )
+                };
+                let shown = body(&display_text(&destination));
+                let private = body(&texts.get(keys::BLOCK_NOTICE_DESTINATION_HIDDEN));
+                let notice = Notice::new(
                     NoticeLevel::Warning,
                     texts.get(keys::BLOCK_NOTICE_TITLE),
-                    body,
-                    now,
+                    shown,
                 )
+                .private(private)
+                .about(About::Block(crate::feed::BlockSubject {
+                    destination,
+                    app,
+                    reason,
+                }));
+                self.post(notice, Some(now))
             }
             StatusUpdateEvent::UnassignedTunnelDetected { adapter_name, .. } => {
                 if adapter_name.is_empty() || crate::notice_mutes::muted(self, "unassigned-tunnel")
@@ -572,12 +660,13 @@ impl AppState {
                     keys::UNASSIGNED_TUNNEL_BODY,
                     &[("adapter", display_text(&adapter_name))],
                 );
-                self.notify(
+                let notice = Notice::new(
                     NoticeLevel::Warning,
                     texts.get(keys::UNASSIGNED_TUNNEL_TITLE),
                     body,
-                    now,
                 )
+                .about(About::Kind("unassigned-tunnel"));
+                self.post(notice, Some(now))
             }
             StatusUpdateEvent::LocalNetworkTooWide {
                 adapter_name,
@@ -902,19 +991,19 @@ impl AppState {
         if crate::notice_mutes::muted(self, "routes-held") {
             return Vec::new();
         }
-        match held {
+        let notice = match held {
             Some(held) => {
                 let (title, body) = routes_held_text(&held, texts);
-                self.notify(NoticeLevel::Warning, title, body, now)
+                Notice::new(NoticeLevel::Warning, title, body)
             }
-            None if was_held => self.notify(
+            None if was_held => Notice::new(
                 NoticeLevel::Info,
                 texts.get(keys::ROUTES_HELD_TITLE),
                 texts.get(keys::ROUTES_HELD_CLEARED),
-                now,
             ),
-            None => Vec::new(),
-        }
+            None => return Vec::new(),
+        };
+        self.post(notice.about(About::Kind("routes-held")), Some(now))
     }
 
     /// Another user's tunnel carries this user's unrouted traffic, or stopped
@@ -933,19 +1022,19 @@ impl AppState {
         if crate::notice_mutes::muted(self, "traffic-carried") {
             return Vec::new();
         }
-        match link {
+        let notice = match link {
             Some(link) => {
                 let (title, body) = traffic_carried_text(&link, texts);
-                self.notify(NoticeLevel::Warning, title, body, now)
+                Notice::new(NoticeLevel::Warning, title, body)
             }
-            None if was_carried => self.notify(
+            None if was_carried => Notice::new(
                 NoticeLevel::Info,
                 texts.get(keys::TRAFFIC_CARRIED_TITLE),
                 texts.get(keys::TRAFFIC_CARRIED_CLEARED),
-                now,
             ),
-            None => Vec::new(),
-        }
+            None => return Vec::new(),
+        };
+        self.post(notice.about(About::Kind("traffic-carried")), Some(now))
     }
 
     /// A standing state per role: a later report replaces it, `ok` ends it.
@@ -971,12 +1060,10 @@ impl AppState {
                     body.push(' ');
                     body.push_str(&pointer);
                 }
-                return self.notify(
-                    NoticeLevel::Info,
-                    texts.get(keys::ENF_RESTORED_TITLE),
-                    body,
-                    now,
-                );
+                let notice =
+                    Notice::new(NoticeLevel::Info, texts.get(keys::ENF_RESTORED_TITLE), body)
+                        .about(About::Kind("enforcement-restored"));
+                return self.post(notice, Some(now));
             }
             return Vec::new();
         }
@@ -1000,19 +1087,24 @@ impl AppState {
         if quiet || (routine && crate::notice_mutes::muted(self, "secondary-down")) {
             return Vec::new();
         }
-        self.notify(NoticeLevel::Warning, title, body, now)
+        let notice = Notice::new(NoticeLevel::Warning, title, body);
+        let notice = if routine {
+            notice.about(About::Kind("secondary-down"))
+        } else {
+            notice
+        };
+        self.post(notice, Some(now))
     }
 
     /// Into the feed only: no footer line, no bell. For news that matters
     /// when looked for, not when it happens.
-    fn note_in_feed(&mut self, level: NoticeLevel, title: String, body: String) -> Vec<Effect> {
-        self.notices.push(Notice { level, title, body });
-        self.notice_count += 1;
-        if self.notices.len() > FEED_CAPACITY {
-            let excess = self.notices.len() - FEED_CAPACITY;
-            self.notices.drain(..excess);
-        }
-        Vec::new()
+    pub(crate) fn note_in_feed(
+        &mut self,
+        level: NoticeLevel,
+        title: String,
+        body: String,
+    ) -> Vec<Effect> {
+        self.post(Notice::new(level, title, body), None)
     }
 
     pub(crate) fn notify(
@@ -1022,7 +1114,21 @@ impl AppState {
         body: String,
         now: Instant,
     ) -> Vec<Effect> {
-        self.note_in_feed(level, title, body);
+        self.post(Notice::new(level, title, body), Some(now))
+    }
+
+    /// Into the feed; with `now` also on the bottom line and with the bell.
+    pub(crate) fn post(&mut self, mut notice: Notice, now: Option<Instant>) -> Vec<Effect> {
+        self.notice_count += 1;
+        notice.id = self.notice_count;
+        self.notices.push(notice);
+        if self.notices.len() > FEED_CAPACITY {
+            let excess = self.notices.len() - FEED_CAPACITY;
+            self.notices.drain(..excess);
+        }
+        let Some(now) = now else {
+            return Vec::new();
+        };
         self.last_notice_at = Some(now);
         if self.bell {
             vec![Effect::Bell]
@@ -1191,6 +1297,30 @@ mod tests {
                 quiet: true,
             },
         )))
+    }
+
+    /// Drops each too short to announce, told once by the service as one
+    /// fact about the link, named by its role.
+    #[test]
+    fn a_link_that_keeps_dropping_is_told_with_its_role() {
+        let fixture = Fixture::healthy();
+        let mut app = connected(&fixture);
+        let t = texts();
+        let before = app.notices.len();
+        app.apply(
+            BackendEvent::Push(PushEvent::Status(Box::new(
+                StatusUpdateEvent::LinkKeepsDropping {
+                    sid: "S".into(),
+                    role: "secondary".into(),
+                },
+            ))),
+            &t,
+            Instant::now(),
+        );
+        assert_eq!(app.notices.len(), before + 1);
+        let notice = app.notices.last().expect("told");
+        assert_eq!(notice.title, "The additional connection keeps dropping");
+        assert!(notice.body.contains("several times"), "{}", notice.body);
     }
 
     #[test]

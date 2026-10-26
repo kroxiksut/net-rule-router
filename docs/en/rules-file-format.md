@@ -306,6 +306,12 @@ both files are evaluated together:
    same network on both routes is an error.
 6. **Zones** — `ru` matches every hostname ending in `.ru`. A longer zone beats
    a shorter one. A network or an exact address inside a zone beats the zone.
+   A zone of several labels, such as `corp.example.com`, is ranked at tier 2
+   instead: a domain with subdomains that leaves out the bare name, so it beats
+   `*.example.com`, an exact address and a network. Against
+   `*.corp.example.com` it is the narrower rule and keeps the subdomains; with
+   "Also cover subdomains for domain rules" on, it counts as
+   `*.corp.example.com` itself and the primary route wins the tie.
 7. **Application** — `chrome.exe`, `C:\Apps\Tool\tool.exe`, `C:\Apps\*`
    (`Windows` / `Linux` / `MacOS`). Within the tier the narrower rule wins: a
    full path first, then an exact name, then a folder (a deeper folder first;

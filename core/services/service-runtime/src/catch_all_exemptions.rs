@@ -55,18 +55,6 @@ pub struct CatchAllExemptions {
     pub too_wide: Vec<IpBlock>,
 }
 
-impl CatchAllExemptions {
-    /// Whether a blanket block may be armed at all.
-    ///
-    /// Without a server address the block would hold the tunnel's own reconnect
-    /// shut, and nothing inside the machine could lift it. Refusing to arm is
-    /// the lesser failure: traffic leaks, and the user is told.
-    #[must_use]
-    pub fn can_arm(&self) -> bool {
-        !self.server_ips.is_empty()
-    }
-}
-
 /// Derive the exemptions from a pass's facts and one principal's bindings.
 ///
 /// `primary_name` / `secondary_name` are the display names the user bound, the
@@ -312,7 +300,6 @@ mod tests {
 
         assert_eq!(ex.server_ips, vec![Ipv4Addr::new(203, 0, 113, 7)]);
         assert_eq!(ex.local_subnets, vec![(Ipv4Addr::new(192, 168, 1, 0), 24)]);
-        assert!(ex.can_arm());
     }
 
     /// The failure that matters: with no server address the guard would seal the
@@ -361,14 +348,20 @@ mod tests {
         let ex = collect_exemptions(&routes, &adapters, Some("eth0"), Some("tun0"));
 
         assert!(ex.server_ips.is_empty());
-        assert!(!ex.can_arm());
     }
 
     #[test]
     fn an_unbound_link_yields_nothing() {
         let (routes, adapters) = machine();
-        assert!(!collect_exemptions(&routes, &adapters, Some("eth0"), None).can_arm());
-        assert!(!collect_exemptions(&routes, &adapters, None, Some("tun0")).can_arm());
+        let none = CatchAllExemptions::default();
+        assert_eq!(
+            collect_exemptions(&routes, &adapters, Some("eth0"), None),
+            none
+        );
+        assert_eq!(
+            collect_exemptions(&routes, &adapters, None, Some("tun0")),
+            none
+        );
     }
 
     /// WireGuard and AmneziaWG remove their link on disconnect. The LAN comes
@@ -410,7 +403,6 @@ mod tests {
                 IpBlock::parse("128.0.0.0/1").expect("block"),
             ]
         );
-        assert!(ex.can_arm());
     }
 
     fn bound(name: &str) -> crate::per_sid_orchestrator::PerSidBinding {
@@ -532,6 +524,10 @@ mod tests {
         let (routes, mut adapters) = machine();
         adapters[0].gateways.clear();
 
-        assert!(!collect_exemptions(&routes, &adapters, Some("eth0"), Some("tun0")).can_arm());
+        assert!(
+            collect_exemptions(&routes, &adapters, Some("eth0"), Some("tun0"))
+                .server_ips
+                .is_empty()
+        );
     }
 }

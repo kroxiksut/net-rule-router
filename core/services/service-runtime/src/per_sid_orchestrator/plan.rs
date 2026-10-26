@@ -283,6 +283,7 @@ impl PerSidApplyOrchestrator {
         // Destinations an app rule left alone because other programs use them
         // too: they go direct, or nowhere for the app while its guard is on.
         let mut shared_with_others: Vec<(String, std::net::Ipv4Addr)> = Vec::new();
+        let mut unrouted_apps = Vec::new();
         let mut unsupported_shapes: Vec<String> = Vec::new();
         let mut networks_over_cap: Vec<crate::rule_conflicts::RuleConflict> = Vec::new();
         for diag in &codegen_out.diagnostics {
@@ -325,6 +326,13 @@ impl PerSidApplyOrchestrator {
                     ..
                 } => {
                     shared_with_others.push((app.clone(), *ip));
+                }
+                crate::wfp_codegen::CodegenDiagnostic::AppTrafficTakenElsewhere {
+                    app,
+                    reason,
+                    ..
+                } => {
+                    unrouted_apps.push((app.clone(), *reason));
                 }
                 crate::wfp_codegen::CodegenDiagnostic::SuffixTruncated {
                     rule_id,
@@ -449,6 +457,7 @@ impl PerSidApplyOrchestrator {
             .filter(|_| intent.publishes())
         {
             status.set_unresolved(sid, unresolved_apps.clone());
+            status.set_unrouted(sid, &unrouted_apps);
             let mut conflicts = crate::app_enforcement_status::rule_conflicts_from(
                 &codegen_out.diagnostics,
                 &rules.rule_book,
@@ -743,7 +752,7 @@ impl PerSidApplyOrchestrator {
                 .as_ref()
                 .is_some_and(|ctx| ctx.scope.is_enabled());
             // The subtraction base for every exemption set below (known-primary
-            // transport permits, known-direct rescues): an IP in this set must
+            // transport permits): an IP in this set must
             // NEVER be rescued by an exemption while the secondary is down.
             // Two modes:
             //
@@ -785,7 +794,7 @@ impl PerSidApplyOrchestrator {
             // this gate is re-evaluated promptly, never left waiting for an
             // unrelated recompute.
             // Every exemption this set is subtracted from is IPv4 (the
-            // packet-layer primary permits, the known-direct rescues), so the
+            // packet-layer primary permits), so the
             // set is too: there is no v6 exemption for a v6 address to have to
             // stay out of.
             let never_exempt_secondary_ips: std::collections::HashSet<std::net::Ipv4Addr> =
@@ -851,17 +860,6 @@ impl PerSidApplyOrchestrator {
                         local_subnets: resolution.local_subnets.clone(),
                         local_subnets_v6: resolution.local_subnets_v6.clone(),
                         primary_dest_ips: known_primary_dest_ips.clone(),
-                        known_direct_ips: self
-                            .known_direct
-                            .as_ref()
-                            .map(|registry| {
-                                registry
-                                    .snapshot()
-                                    .into_iter()
-                                    .filter(|ip| !never_exempt_secondary_ips.contains(ip))
-                                    .collect()
-                            })
-                            .unwrap_or_default(),
                         // A block-all-only relaxation: while the tunnel is up, name
                         // resolution belongs in it.
                         allow_dns_over_primary: false,
@@ -870,8 +868,8 @@ impl PerSidApplyOrchestrator {
                         // liveness probe needs no hole through it.
                         probe_target_ips: Vec::new(),
                         secondary_luid: resolution.secondary_luid,
-                        // Only the forwarded blanket reads it, and it is armed
-                        // only with the tunnel gone.
+                        // Only the forwarded blanket reads it; filled where
+                        // that is armed.
                         guest_network_luids: Vec::new(),
                     }
                 };
@@ -903,7 +901,6 @@ impl PerSidApplyOrchestrator {
                             &shared_exemptions(&resolution),
                             protocols,
                             !tunnel_clients.is_empty(),
-                            self.other_principals_hold_block_all(sid),
                         );
                         // The catch-all IS a block-all: the DNS gate and the
                         // banner must see it as one.
@@ -937,6 +934,18 @@ impl PerSidApplyOrchestrator {
                         ks.extend(app_pair);
                         ks
                     };
+                    // Under the blanket through the tunnel, what the machine
+                    // forwards is held to it too, over the floor the owner's
+                    // blanket spares; otherwise it would take the main link
+                    // from the packet the tunnel drops on until the next pass.
+                    let forwarded_floor =
+                        (block_all_armed && policy.guard_forwarded_traffic).then(|| {
+                            let mut floor = shared_exemptions(&resolution);
+                            floor
+                                .guest_network_luids
+                                .clone_from(&fail_closed_base().guest_network_luids);
+                            floor
+                        });
                     // The service accounts get the pins whenever the owner's
                     // guard is on — the address pairs, never the blanket.
                     let shares = self.owner_shares(
@@ -958,8 +967,8 @@ impl PerSidApplyOrchestrator {
                             protocols,
                             guard_forwarded: policy.guard_forwarded_traffic,
                             foreign_networks: &resolution.foreign_tunnel_networks,
-                            block_all: None,
-                            main_networks: &[],
+                            block_all: forwarded_floor.as_ref(),
+                            main_networks: &codegen_out.primary_dest_networks,
                         },
                         &tunnel_clients,
                     );
@@ -1064,17 +1073,6 @@ impl PerSidApplyOrchestrator {
                     // to them survives the block-all (TCP/UDP already escapes at
                     // the ALE rule permit).
                     exemptions.primary_dest_ips = known_primary_dest_ips.clone();
-                    // known-direct destinations get an ALE exempt + packet permit
-                    // so plain primary-path sites survive the block-all, minus
-                    // the never-exempt secondary set (see
-                    // `never_exempt_secondary_ips` for its two modes).
-                    if let Some(registry) = self.known_direct.as_ref() {
-                        exemptions.known_direct_ips = registry
-                            .snapshot()
-                            .into_iter()
-                            .filter(|ip| !never_exempt_secondary_ips.contains(ip))
-                            .collect();
-                    }
                     block_all_armed = effective_block_all;
                     outage_hold = effective_block_all;
                     // The networks the tunnel's rules name are pinned whatever
@@ -1108,7 +1106,6 @@ impl PerSidApplyOrchestrator {
                         protocols,
                         FailClosedPosture {
                             block_all: effective_block_all,
-                            machine_has_other_principals: self.other_principals_hold_block_all(sid),
                         },
                     );
                     // A secondary-routed app is cut whole while its link is

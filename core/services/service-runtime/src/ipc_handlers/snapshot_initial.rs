@@ -188,6 +188,7 @@ impl IpcHandler for SnapshotInitialHandler {
         // The caller's own app rules whose exe resolved to no path.
         let (unenforced_app_rules, unenforced_app_reasons) =
             self.app_enforcement.unenforced_apps(ctx.caller_stored());
+        let unrouted_app_rules = self.app_enforcement.unrouted(ctx.caller_stored());
         // Smart-kill-switch shared-IP exclusion count for the GUI
         // "strictness reduced for N shared IPs" warning.
         let kill_switch_shared_ip_exemptions = self.shared_ip_exemptions.count();
@@ -272,6 +273,7 @@ impl IpcHandler for SnapshotInitialHandler {
             retention_settings,
             unenforced_app_rules,
             unenforced_app_reasons,
+            unrouted_app_rules,
             kill_switch_shared_ip_exemptions,
             kill_switch_shared_ip_exemption_addresses,
             kill_switch_block_all_armed,
@@ -339,6 +341,7 @@ mod tests {
             interface_description: "".into(),
             interface_type: "ieee80211".into(),
             oper_status: "up".into(),
+            usable: true,
         };
         let h = SnapshotInitialHandler::new(
             Arc::new(FakeHealth {
@@ -399,10 +402,25 @@ mod tests {
             interface_description: "".into(),
             interface_type: "ieee80211".into(),
             oper_status: "up".into(),
+            usable: true,
         };
         let app_enforcement = AppEnforcementStatus::new();
         app_enforcement.set_unresolved("unix:uid:1000", vec!["ab.exe".into(), "disko*.exe".into()]);
         app_enforcement.set_unresolved("unix:uid:1001", vec!["other.exe".into()]);
+        app_enforcement.set_unrouted(
+            "unix:uid:1000",
+            &[(
+                "helper.exe".into(),
+                crate::address_ownership::AppTrafficElsewhere::NamedByAddressRules,
+            )],
+        );
+        app_enforcement.set_unrouted(
+            "unix:uid:1001",
+            &[(
+                "theirs.exe".into(),
+                crate::address_ownership::AppTrafficElsewhere::SharedWithOthers,
+            )],
+        );
         let shared_exemptions = crate::app_enforcement_status::SharedIpExemptionStatus::new();
         shared_exemptions.set(&[
             std::net::Ipv4Addr::new(192, 0, 2, 1),
@@ -446,6 +464,16 @@ mod tests {
         assert_eq!(parsed.active_secondary_rule_count, Some(0));
         // The caller's own, sorted + deduped by the status; another user's stay out.
         assert_eq!(parsed.unenforced_app_rules, vec!["ab.exe", "disko*.exe"]);
+        // A found program the rule carries nothing of is told apart from a
+        // missing one, with why; another user's stays out.
+        assert_eq!(
+            parsed.unrouted_app_rules,
+            [(
+                "helper.exe".to_string(),
+                "addresses-named-by-rules".to_string()
+            )]
+            .into()
+        );
         // The smart-kill-switch exclusion count rides the same snapshot.
         assert_eq!(parsed.kill_switch_shared_ip_exemptions, 3);
         // The excluded addresses ride the same snapshot for the GUI's
@@ -554,6 +582,12 @@ mod tests {
             caller.as_stored(),
             &report("secondary-down", "secondary", &[]),
             1_000,
+        );
+        // Past the notice grace, so the standing report is the loud one.
+        board.record_at(
+            caller.as_stored(),
+            &report("secondary-down", "secondary", &[]),
+            1_000 + crate::app_enforcement_status::NOTICE_GRACE_MS,
         );
         board.record_at(caller.as_stored(), &report("ok", "primary", &[]), 1_000);
         board.record_at(

@@ -29,8 +29,8 @@ Service: OK
                            The archive is saved in the service archives directory (per-user).
                            Ready
                            x: Diagnostic archive export
-
-
+                           Detail level: Standard (recommended) · Only logs from the current
+                           session: Yes · Log size limit in the archive: Unlimited
 
 
 

@@ -568,7 +568,21 @@ pub struct AutoRulesEngine {
     verify_wiring: OnceLock<VerifyPrimaryWiring>,
     /// Runs the `?` checks off the tick.
     verify_runner: verify_primary::VerifyRunner,
+    /// Told of a site the user opened that the main link will not carry and
+    /// the additional one does (see [`SiteNotOpeningFn`]).
+    site_not_opening: OnceLock<SiteNotOpeningFn>,
+    /// Told when an offer for a site the main link will not carry is parked
+    /// (see [`MainLinkBlockedParkedFn`]).
+    main_link_blocked_parked: OnceLock<MainLinkBlockedParkedFn>,
 }
+
+/// `(sid, host)`: a site `sid` opened fails on the main link and answered the
+/// probe over the additional one.
+pub type SiteNotOpeningFn = Arc<dyn Fn(&str, &str) + Send + Sync>;
+
+/// `(sid, candidate id, host)`: an offer for a site `sid` opened that the main
+/// link will not carry was just parked for review.
+pub type MainLinkBlockedParkedFn = Arc<dyn Fn(&str, &str, &str) + Send + Sync>;
 
 mod inbox;
 mod intake;

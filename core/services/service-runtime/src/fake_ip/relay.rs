@@ -453,7 +453,6 @@ impl RelayCore {
     pub fn policy_stamp(&self) -> u64 {
         self.routes.policy_stamp()
     }
-
     /// The route the books give hostnames now — the routing user's (`owner`
     /// `None`) or that owner's, `None` when blocked — over one read of the
     /// book. Compared with a live flow's [`UpstreamTarget::book_route`]:

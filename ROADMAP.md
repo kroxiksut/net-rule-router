@@ -72,8 +72,16 @@ priority.
 | Warnings for sites sharing one server program | When several sites are served by one web server program, the app tells you that a rule on one site's folder cannot tell them apart, and warns when two folder rules on different connections lead to the same server | low |
 | Installing with winget and Scoop | Install and update NetRuleRouter on Windows with the package managers many people already use, without downloading a file by hand | low |
 | Instant rule changes with very large rule sets | Even with thousands of rules, a change to one of them takes effect at once, without the whole set being worked out again | low |
+| Every promise checked before each release | Each promise in the README and the guide — nothing leaks while protection is on, rules route traffic as written, users of one computer stay apart, name lookups are given back — has automatic checks that try to break it before every release | medium |
+| A site's new address protected the moment it appears | When a site your rules protect moves to a new address, the protection covers it at once rather than a few seconds later, even if the VPN drops in that very moment | low |
+| First connection after a VPN reconnect | Right after the VPN reconnects, the first connection to a site your rules send over it goes through the new connection instead of failing once | low |
+| Open connections follow the person who signed in | When another person signs in and the computer starts following their rules, connections that were already open move to that person's routes at once instead of staying on the old ones until they close | low |
+| A new account starts clean | On Linux, an account created with the number of a deleted one starts with no rules, history or confirmations of the person who had it before | low |
 | Rules that follow the programs a program starts | A rule for a program also covers what it starts, such as a launcher and the game it opens | low |
 | Adding suggestions on its own for one site | For a site you trust, the app adds the addresses it suggests by itself, while other sites keep asking first | low |
+| Dropped connections explained on Linux | The diagnostic archive tells a connection the network dropped from one the app closed, on Linux as it already does on Windows, so "was it the app?" has an answer | low |
+| Partly routed programs explained | A program rule's details say how many of the program's addresses go by your address rules instead, so a rule that seems to work only half the time is explained | low |
+| A renamed connection keeps its role on Linux | When a network connection is renamed or recreated on Linux, the app still knows which role you gave it, as it already does on Windows | low |
 | Running on OpenWrt routers | Not researched yet. If you know how NetRuleRouter would fit on a router — memory, storage, the firewall — we will be glad to hear it | — |
 
 macOS comes after Linux; its own plan will appear here once the port starts.

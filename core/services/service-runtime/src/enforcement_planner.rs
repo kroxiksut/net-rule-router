@@ -223,7 +223,8 @@ pub fn plan_route_rules_with_shapes(
             &ownership,
             input.app_observations,
             set,
-        );
+        )
+        .with_declined(input.secondary_ip_denylist);
         let link = match role {
             RouteRole::Primary => crate::address_ownership::Link::Main,
             RouteRole::Secondary => crate::address_ownership::Link::Additional,
@@ -386,6 +387,7 @@ pub fn plan_route_rules_with_shapes(
                     }
                 };
                 let pattern = pattern.as_str();
+                let found = !resolved.is_empty();
                 if resolved.is_empty() {
                     report.unresolved_apps.push(pattern.to_string());
                 } else if !by_path && resolved.len() > APP_PATH_FANOUT_CAP as usize {
@@ -434,6 +436,9 @@ pub fn plan_route_rules_with_shapes(
                 // Observed-destination /32s (slots APP_PATH_FANOUT_CAP+1+i),
                 // ordinary host flows.
                 let destinations = gate.admit(pattern, link);
+                if let Some(reason) = destinations.none_taken().filter(|_| found) {
+                    report.unrouted_apps.push((pattern.to_string(), reason));
+                }
                 for (ip, refusal) in &destinations.refused {
                     // Only the address-rule claim is the user's own two rules
                     // pointing one address both ways — the one they can act on.
@@ -443,10 +448,9 @@ pub fn plan_route_rules_with_shapes(
                         report.claimed_by_main.push((pattern.to_string(), *ip));
                     }
                 }
-                for (i, ip) in destinations
-                    .admitted
+                for (i, ip) in gate
+                    .mirrored(pattern, &destinations.admitted)
                     .into_iter()
-                    .take(PER_HOSTNAME_IP_CAP)
                     .enumerate()
                 {
                     flows.push(FlowRule {

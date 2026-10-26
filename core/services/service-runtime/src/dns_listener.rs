@@ -29,10 +29,10 @@ use std::time::{Duration, Instant};
 
 use crate::dns_resolver::{
     handle_a_query, AaaaOutcome, CompanionCandidateLookup, CompanionRescueObserver,
-    DirectAnswerGate, DirectFakeIpAnswerer, FactSink, FakeIpAnswerer, NoopCompanionCandidates,
-    NoopCompanionRescue, NoopDirectAnswerGate, NoopDirectFakeIp, NoopFakeIpAnswerer,
-    NoopSecondaryOwnedIps, NoopUnresolvedRuleHosts, QueryOutcome, ResolveError, RuleHostOracle,
-    SecondaryOwnedIps, SyncReconciler, UnresolvedRuleHostObserver, UpstreamResolver,
+    DirectFakeIpAnswerer, FactSink, FakeIpAnswerer, NoopCompanionCandidates, NoopCompanionRescue,
+    NoopDirectFakeIp, NoopFakeIpAnswerer, NoopSecondaryOwnedIps, NoopUnresolvedRuleHosts,
+    QueryOutcome, ResolveError, RuleHostOracle, SecondaryOwnedIps, SyncReconciler,
+    UnresolvedRuleHostObserver, UpstreamResolver,
 };
 use crate::dns_wire::{
     build_a_response, build_error_response, build_negative_response, only_v4,
@@ -129,6 +129,39 @@ impl SourceLimiter {
 enum ShedReason {
     QueueFull,
     SourceShare,
+}
+
+/// Buffers the workers hand back, so the receive loop copies each datagram
+/// into one it already owns instead of allocating a fresh one per query.
+#[derive(Default)]
+struct QueryBuffers {
+    spare: Mutex<Vec<Vec<u8>>>,
+}
+
+/// Spare buffers kept: a page-load burst, not the whole queue.
+const SPARE_QUERY_BUFFERS: usize = 64;
+/// A buffer a rare oversized datagram grew is let go rather than kept.
+const SPARE_QUERY_BUFFER_BYTES: usize = 4096;
+
+impl QueryBuffers {
+    /// `datagram` in a buffer of its own.
+    fn filled(&self, datagram: &[u8]) -> Vec<u8> {
+        let spare = self.spare.lock().unwrap_or_else(|p| p.into_inner()).pop();
+        let mut buffer = spare.unwrap_or_default();
+        buffer.clear();
+        buffer.extend_from_slice(datagram);
+        buffer
+    }
+
+    fn give_back(&self, buffer: Vec<u8>) {
+        if buffer.capacity() > SPARE_QUERY_BUFFER_BYTES {
+            return;
+        }
+        let mut spare = self.spare.lock().unwrap_or_else(|p| p.into_inner());
+        if spare.len() < SPARE_QUERY_BUFFERS {
+            spare.push(buffer);
+        }
+    }
 }
 
 /// Counts shed datagrams and says so once per interval: the shedding itself
@@ -341,24 +374,13 @@ pub struct DnsInterceptListener {
     /// Fake-IP — answers scope hosts with virtual addresses.
     /// The default no-op returns the real per-IP path for every host.
     fake_ip: Arc<dyn FakeIpAnswerer>,
-    /// gates a steered direct answer on the block-all: the
-    /// production impl installs a known-direct exemption before the answer is
-    /// sent. The default no-op keeps the strict posture.
-    direct_gate: Arc<dyn DirectAnswerGate>,
-    /// while the block-all is armed and fake-IP is
-    /// active, DIRECT hosts are answered with a virtual address too: the relay
-    /// carries them out the primary, so nothing is compiled on the answer path
-    /// and the first connect cannot race the catch-all. The default no-op keeps
-    /// the gate-based path.
-    direct_fake: Arc<dyn DirectFakeIpAnswerer>,
     /// Collateral rescue — a DIRECT host whose steered answer is STILL fully
     /// secondary-pinned (shared-CDN address the census committed to the
     /// secondary link) is answered with a virtual address while the fake-IP
     /// stack is live, instead of the old fail-open "relay the pinned answer"
     /// (which sent the host out the VPN link — geo captchas when it is up,
-    /// a kill-switch block when it is down). Armed on "stack running" alone —
-    /// unlike [`Self::direct_fake`], it does NOT wait for the block-all. The
-    /// default no-op keeps the fail-open path.
+    /// a kill-switch block when it is down). Armed on "stack running" alone.
+    /// The default no-op keeps the fail-open path.
     collateral_fake: Arc<dyn DirectFakeIpAnswerer>,
     /// Vetoes the collateral rescue for a host the companion detector already
     /// parked as a suggestion for the additional link. See
@@ -479,8 +501,6 @@ impl DnsInterceptListener {
             short_name_suffix: None,
             resolver_port: 53,
             fake_ip: Arc::new(NoopFakeIpAnswerer),
-            direct_gate: Arc::new(NoopDirectAnswerGate),
-            direct_fake: Arc::new(NoopDirectFakeIp),
             collateral_fake: Arc::new(NoopDirectFakeIp),
             companion_candidates: Arc::new(NoopCompanionCandidates),
             companion_rescue: Arc::new(NoopCompanionRescue),
@@ -561,24 +581,6 @@ impl DnsInterceptListener {
     /// addresses so the flow is caught by the TUN and steered by the relay.
     pub fn with_fake_ip(mut self, fake_ip: Arc<dyn FakeIpAnswerer>) -> Self {
         self.fake_ip = fake_ip;
-        self
-    }
-
-    /// gate steered direct answers: while the block-all is
-    /// armed, install a known-direct exemption BEFORE the answer is sent so the
-    /// client's first connect is not cut by the catch-all.
-    pub fn with_direct_answer_gate(mut self, gate: Arc<dyn DirectAnswerGate>) -> Self {
-        self.direct_gate = gate;
-        self
-    }
-
-    /// answer DIRECT hosts with a virtual address
-    /// while the block-all is armed and fake-IP is active. Takes precedence
-    /// over [`Self::with_direct_answer_gate`] for the answers it claims; the
-    /// gate remains the fallback for hosts the fake path declines (feature
-    /// off, disarmed, exclusions, pool exhausted).
-    pub fn with_direct_fake_ip(mut self, fake: Arc<dyn DirectFakeIpAnswerer>) -> Self {
-        self.direct_fake = fake;
         self
     }
 
@@ -1132,6 +1134,7 @@ impl DnsInterceptListener {
         socket.set_read_timeout(Some(Duration::from_millis(500)))?;
         let (tx, rx) = std::sync::mpsc::sync_channel::<(Vec<u8>, SocketAddr)>(SERVE_QUEUE_DEPTH);
         let rx = Mutex::new(rx);
+        let buffers = QueryBuffers::default();
         let ended = AtomicBool::new(false);
         let signal = StopSignal {
             stop,
@@ -1151,7 +1154,10 @@ impl DnsInterceptListener {
                         // Stopping: the system's DNS is restored already and
                         // nobody is waiting on us; the queue is thrown away.
                         Ok(_) if signal.is_set() => continue,
-                        Ok((query, src)) => self.handle_datagram_contained(socket, &query, src),
+                        Ok((query, src)) => {
+                            self.handle_datagram_contained(socket, &query, src);
+                            buffers.give_back(query);
+                        }
                         // Sender dropped — the serve loop exited; drain is done.
                         Err(_) => return,
                     }
@@ -1219,11 +1225,12 @@ impl DnsInterceptListener {
                     self.answer_servfail(socket, &buf[..n], src);
                     continue;
                 }
-                match tx.try_send((buf[..n].to_vec(), src)) {
+                match tx.try_send((buffers.filled(&buf[..n]), src)) {
                     Ok(()) => {}
                     Err(TrySendError::Full((query, src))) => {
                         shed.note(ShedReason::QueueFull, src);
                         self.answer_servfail(socket, &query, src);
+                        buffers.give_back(query);
                     }
                     // Unreachable while workers live inside this scope; treat
                     // as shutdown just in case.
@@ -1363,6 +1370,15 @@ impl DnsInterceptListener {
         transport: Transport,
         lane_wait: Duration,
     ) -> Option<Vec<u8>> {
+        crate::dns_resolver_ports::one_query(|| self.answer_one_query(query, transport, lane_wait))
+    }
+
+    fn answer_one_query(
+        &self,
+        query: &[u8],
+        transport: Transport,
+        lane_wait: Duration,
+    ) -> Option<Vec<u8>> {
         let started = Instant::now();
         let left = || QUERY_BUDGET.saturating_sub(started.elapsed());
         // Parsed once: the direct path below reads the question at every step.
@@ -1407,18 +1423,6 @@ impl DnsInterceptListener {
         let (steered, answers, still_pinned) =
             self.steer_parsed(query, q, upstream_reply, answers, budget);
         let answers = answers.as_deref();
-        // under the armed block-all with
-        // fake-IP active, hand the client a virtual address instead:
-        // the relay carries the flow out the primary, nothing is
-        // compiled on the answer path, no race to lose.
-        if let Some(fake) = self.fake_direct_from(query, q, answers) {
-            // Gate before answering: the app may already hold these
-            // real addresses (own cache / in-app DoH) and will not
-            // re-resolve, so the virtual answer never reaches it and
-            // its first connect meets the armed block-all.
-            self.gate_direct_from(q, answers);
-            return fake;
-        }
         // Collateral rescue — steering could not produce a clean
         // answer (every address is committed to the secondary
         // link). With the fake-IP stack live, a virtual address
@@ -1431,18 +1435,10 @@ impl DnsInterceptListener {
             self.note_collateral_host(q);
             if !self.companion_is_pending(q) {
                 if let Some(fake) = self.fake_collateral_from(query, q, answers) {
-                    // Same reason as above: a cached real address
-                    // bypasses the virtual answer entirely.
-                    self.gate_direct_from(q, answers);
                     return fake;
                 }
             }
         }
-        // while the block-all is armed, install the
-        // known-direct exemption BEFORE the client learns these
-        // addresses (its first connect would otherwise race
-        // the catch-all and be dropped with no retry).
-        self.gate_direct_from(q, answers);
         steered
     }
 
@@ -1547,60 +1543,6 @@ impl DnsInterceptListener {
             "Mode B: direct-host answer fully secondary-pinned even after re-query — relaying unchanged (fail-open; smart kill-switch covers)",
         );
         (reply, Some(addresses), true)
-    }
-
-    /// hand the FINAL direct-host answer's addresses to the
-    /// [`DirectAnswerGate`] so a known-direct exemption can be installed before
-    /// the client receives them. Steering has already removed secondary-pinned
-    /// addresses from `reply` on every non-degraded path, so the gate only ever
-    /// sees addresses that are safe to permit on the primary; the orchestrator
-    /// additionally subtracts secondary-destined IPs (defense in depth for the
-    /// fully-pinned fail-open path). Parse failures are a silent no-op — the
-    /// reply is relayed regardless.
-    fn gate_direct_from(&self, q: &ParsedQuestion, answers: Option<&[IpAddr]>) {
-        if let Some(addresses) = answers.filter(|a| !a.is_empty()) {
-            self.direct_gate.gate(&q.qname, &only_v4(addresses));
-        }
-    }
-
-    /// try to answer a DIRECT host with a virtual
-    /// address. Parses the final (already steered) upstream reply, offers its
-    /// addresses to the [`DirectFakeIpAnswerer`] (which registers the real
-    /// addresses for the relay and allocates the fake), and rebuilds the
-    /// response around the fake address. `None` on any parse failure or when
-    /// the answerer declines (feature off / disarmed / exclusion / pool full)
-    /// — the caller then falls back to the gate + steered-reply path.
-    #[cfg(test)]
-    fn fake_direct_response(
-        &self,
-        query: &[u8],
-        q: &ParsedQuestion,
-        reply: &[u8],
-    ) -> Option<Vec<u8>> {
-        let answers = direct_answers(query, q, reply);
-        self.fake_direct_from(query, q, answers.as_deref())
-    }
-
-    fn fake_direct_from(
-        &self,
-        query: &[u8],
-        q: &ParsedQuestion,
-        answers: Option<&[IpAddr]>,
-    ) -> Option<Vec<u8>> {
-        // NXDOMAIN / error / truncated → not ours to rewrite
-        let addresses = answers.filter(|a| !a.is_empty())?;
-        let fake = self
-            .direct_fake
-            .fake_direct_answer(&q.qname, &only_v4(addresses))?;
-        let resp = build_a_response(query, &fake, self.response_ttl)?;
-        tracing::debug!(
-            target: "nrr::dns-resolver",
-            host = %q.qname,
-            fake = ?fake,
-            real = ?addresses,
-            "Mode B: direct host under block-all — answered with a virtual address (relay carries the flow; no reconcile on the answer path)",
-        );
-        Some(resp)
     }
 
     /// Collateral rescue — answer a DIRECT host whose reply is still fully

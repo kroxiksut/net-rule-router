@@ -667,6 +667,54 @@ fn adapter_eligibility_matches_js() {
 }
 
 #[test]
+fn adapter_filter_and_sort_rank_match_js() {
+    let (document, cases) = load_vectors("adapter_view");
+    let base = &document["base-row"];
+    let cases: Vec<Case> = cases
+        .into_iter()
+        .map(|case| Case {
+            input: json!({
+                "row": merged(base, &case.input["patch"]),
+                "showUnavailable": case.input["showUnavailable"],
+                "search": case.input["search"],
+                "sortBy": case.input["sortBy"],
+            }),
+            ..case
+        })
+        .collect();
+    check_cases(
+        "adapter_view",
+        &cases,
+        &mut JsLib::pure(),
+        |input| {
+            format!(
+                "(function (i) {{
+                    var row = mapWireInterfaceRow(i.row);
+                    row.selectedRole = i.row[\"selected-role\"] || \"\";
+                    return {{
+                        passes: adapterPassesFilter(row, i.showUnavailable, i.search),
+                        rank: adapterSortRank(row, i.sortBy)
+                    }}
+                }})({})",
+                lit(input)
+            )
+        },
+        |input| {
+            let row: InterfaceRowDto =
+                serde_json::from_value(input["row"].clone()).expect("vector is an InterfaceRowDto");
+            json!({
+                "passes": adapters::adapter_passes_filter(
+                    &row,
+                    input["showUnavailable"].as_bool().unwrap_or(false),
+                    input["search"].as_str().unwrap_or_default(),
+                ),
+                "rank": adapters::adapter_sort_rank(&row, input["sortBy"].as_str().unwrap_or_default()),
+            })
+        },
+    );
+}
+
+#[test]
 fn bound_wire_row_index_matches_js() {
     let (base_document, _) = load_vectors("adapters");
     let base = &base_document["base-row"];

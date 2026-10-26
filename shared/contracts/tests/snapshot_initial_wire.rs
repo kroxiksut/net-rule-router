@@ -286,3 +286,26 @@ fn rules_book_unreadable_is_optional_and_omitted_while_false() {
     v["rules-book-unreadable"] = json!(true);
     assert!(parse(v).rules_book_unreadable);
 }
+
+/// A found program whose rule carries none of its traffic rides its own key,
+/// so an older service (key absent) leaves only today's "not found" list and
+/// a client that does not know the key never reads it as a missing program.
+#[test]
+fn unrouted_app_rules_are_optional_and_kept_apart_from_missing_programs() {
+    let older = parse(snapshot_without_enforcement());
+    assert!(older.unrouted_app_rules.is_empty());
+    let wire = serde_json::to_value(&older).unwrap_or_else(|e| panic!("{e}"));
+    assert!(wire.get("unrouted-app-rules").is_none(), "{wire}");
+
+    let mut v = snapshot_without_enforcement();
+    v["unrouted-app-rules"] = json!({ "helper.exe": "addresses-named-by-rules" });
+    let parsed = parse(v);
+    assert_eq!(
+        parsed
+            .unrouted_app_rules
+            .get("helper.exe")
+            .map(String::as_str),
+        Some("addresses-named-by-rules")
+    );
+    assert!(parsed.unenforced_app_rules.is_empty());
+}

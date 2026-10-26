@@ -154,6 +154,69 @@ fn service() -> FakeService {
     fake
 }
 
+/// A site that does not open over the main route is offered the additional
+/// one, and the offer says only what was found there: it opens, it may help,
+/// or it does not open there either.
+#[test]
+fn a_site_that_does_not_open_is_worded_by_what_the_additional_route_did() {
+    let blocked = |id: &str, host: &str, reach: Value| {
+        let mut extra = json!({
+            "anchor": host, "signal": "main-link-blocked", "primary-behavior": "stalls",
+            "observations": 0, "affinity": 0.0, "consumers": []
+        });
+        if !reach.is_null() {
+            extra["secondary-reach"] = reach;
+        }
+        candidate(id, host, extra)
+    };
+    let fake = FakeService::new(ConnectionStatus::Connected);
+    fake.answer(
+        IpcOperationName::AutoRuleCandidatesList,
+        json!({
+            "candidates": [
+                blocked("b1", "opens.example", json!(true)),
+                blocked("b2", "unasked.example", Value::Null),
+                blocked("b3", "nowhere.example", json!(false)),
+            ],
+            "pending-count": 3, "inert-dropped": 0, "inert-sample": []
+        }),
+    );
+    fake.answer(
+        IpcOperationName::AutoRuleDismissedList,
+        json!({ "dismissed": [] }),
+    );
+    let mut app = on_screen(&fake);
+    app.suggestions.show_served = true;
+    let texts = texts_en();
+    let text_of = |host: &str| -> String {
+        app.suggestions
+            .shown()
+            .iter()
+            .enumerate()
+            .filter(|(_, g)| g.hosts.iter().any(|h| h.match_value == host))
+            .flat_map(|(i, g)| group_lines(g, i, false, false, &app.suggestions.candidates, &texts))
+            .map(|l| l.plain_text())
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    assert!(
+        text_of("opens.example").contains("it opens over the additional route"),
+        "{}",
+        text_of("opens.example")
+    );
+    let unasked = text_of("unasked.example");
+    assert!(
+        unasked.contains("the additional route may help"),
+        "{unasked}"
+    );
+    assert!(!unasked.contains("it opens over"), "{unasked}");
+    let nowhere = text_of("nowhere.example");
+    assert!(
+        nowhere.is_empty() || nowhere.contains("does not open over the additional route either"),
+        "{nowhere}"
+    );
+}
+
 fn on_screen(fake: &FakeService) -> AppState {
     let mut app = app_at(Link::Connected, Some(&Fixture::healthy()));
     app.open(ScreenId::Suggestions);
@@ -215,7 +278,7 @@ fn the_rows_counted_for_scrolling_are_the_rows_drawn() {
     for (i, group) in app.suggestions.shown().iter().enumerate() {
         assert_eq!(
             group_line_count(group),
-            group_lines(group, i, false, false, &texts).len(),
+            group_lines(group, i, false, false, &app.suggestions.candidates, &texts).len(),
             "{}",
             group.domain
         );
@@ -470,7 +533,7 @@ fn a_less_certain_offer_shows_its_mark_and_basis() {
     for (i, group) in app.suggestions.shown().iter().enumerate() {
         assert_eq!(
             group_line_count(group),
-            group_lines(group, i, false, false, &texts).len(),
+            group_lines(group, i, false, false, &app.suggestions.candidates, &texts).len(),
             "{}",
             group.domain
         );
@@ -703,4 +766,65 @@ fn without_the_service_nothing_is_sent() {
     let picture = render(&app, 160, 60);
     assert!(picture.contains("Status data may be outdated"), "{picture}");
     assert!(picture.contains("Service not connected"), "{picture}");
+}
+
+/// Connected after a site failed to open while no surface ran: the list was
+/// never read, so the announcement waits for it rather than calling the site
+/// "a site missing addresses" — and then names it as a site that does not open.
+#[test]
+fn a_site_that_did_not_open_while_away_is_named_as_one_when_the_list_was_unread() {
+    let fake = FakeService::new(ConnectionStatus::Connected);
+    fake.answer(
+        IpcOperationName::AutoRuleCandidatesList,
+        json!({
+            "candidates": [{
+                "id": "blocked-1",
+                "anchor": "forum.talk.example",
+                "proposed-match": "forum.talk.example",
+                "match-kind": "suffix",
+                "route": "secondary",
+                "affinity": 0.0,
+                "first-seen-unix-ms": 1000,
+                "last-seen-unix-ms": 1000,
+                "signal": "main-link-blocked",
+                "primary-behavior": "stalls"
+            }],
+            "pending-count": 1,
+            "inert-dropped": 0,
+            "inert-sample": []
+        }),
+    );
+    fake.answer(
+        IpcOperationName::AutoRuleDismissedList,
+        json!({ "dismissed": [] }),
+    );
+    let mut app = app_at(Link::Connected, Some(&Fixture::healthy()));
+    assert!(!app.suggestions.loaded);
+    let texts = texts_en();
+    app.apply(
+        BackendEvent::Push(PushEvent::Status(Box::new(
+            nrr_shared::ipc_payloads::StatusUpdateEvent::AutoRuleCandidatesChanged {
+                sid: "S".into(),
+                pending_count: 1,
+                top_anchor: "forum.talk.example".into(),
+                announces: true,
+            },
+        ))),
+        &texts,
+        Instant::now(),
+    );
+    drain(&mut app, &fake);
+
+    let told: Vec<_> = app
+        .notices
+        .iter()
+        .filter(|n| n.body.contains("forum.talk.example"))
+        .collect();
+    assert_eq!(told.len(), 1, "told once");
+    assert_eq!(told[0].title, "Sites the main route will not carry");
+    assert!(
+        !told[0].body.contains("will not work fully"),
+        "{}",
+        told[0].body
+    );
 }

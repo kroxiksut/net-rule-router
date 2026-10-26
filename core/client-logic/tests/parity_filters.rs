@@ -104,6 +104,7 @@ fn rule_passes_filters_matches_js() {
                 route: RouteFilter::from_slug(text(given, "route")).unwrap_or_default(),
                 auto_only: given["autoOnly"].as_bool().unwrap_or(false),
                 recent_only: given["recentOnly"].as_bool().unwrap_or(false),
+                hide_not_working: given["hideNotWorking"].as_bool().unwrap_or(false),
                 search: text(given, "search"),
             };
             Value::from(rule_passes_filters(

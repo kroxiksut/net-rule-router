@@ -69,14 +69,104 @@ fn open_to_others(
     None
 }
 
-/// [`untrusted_writer`] behind the neutral port.
+/// [`open_root_authored`] behind the neutral port.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct LinuxAdminAuthoredFiles;
 
 impl nrr_platform_api::admin_authored::AdminAuthoredFiles for LinuxAdminAuthoredFiles {
-    fn untrusted_because(&self, path: &Path) -> Option<String> {
-        untrusted_writer(path).unwrap_or_else(Some)
+    fn open_admin_authored(&self, path: &Path) -> nrr_platform_api::admin_authored::AdminAuthored {
+        use nrr_platform_api::admin_authored::AdminAuthored;
+        match open_root_authored(path) {
+            Ok(Some(file)) => AdminAuthored::Opened(file),
+            Ok(None) => AdminAuthored::Missing,
+            Err(why) => AdminAuthored::Refused(why),
+        }
     }
+}
+
+/// `file` opened for reading when it and every folder on its path belong to
+/// root and nobody else may write them, as [`untrusted_writer`] judges, and no
+/// component is a link. Each folder is opened below the handle of the one
+/// above it with `O_NOFOLLOW` and judged on that handle, and the file returned
+/// is the one judged, so nothing can be swapped between the check and the
+/// read. `Ok(None)` when the file or a folder on the way is absent.
+pub fn open_root_authored(file: &Path) -> Result<Option<fs::File>, String> {
+    open_trusting(file, &[ROOT_UID])
+}
+
+fn open_trusting(file: &Path, trusted: &[u32]) -> Result<Option<fs::File>, String> {
+    use std::os::unix::fs::OpenOptionsExt;
+    use std::os::unix::io::AsRawFd;
+    use std::path::{Component, PathBuf};
+
+    let (Some(parent), Some(name)) = (file.parent(), file.file_name()) else {
+        return Err(format!("{} names no file in a folder", file.display()));
+    };
+    if !file.is_absolute() {
+        return Err(format!("{} is not an absolute path", file.display()));
+    }
+    let mut folders = Vec::new();
+    for component in parent.components() {
+        match component {
+            Component::RootDir => {}
+            Component::Normal(name) => folders.push(name),
+            _ => return Err(format!("{} is not a plain path", file.display())),
+        }
+    }
+    // Below a handle by its `/proc` name, so a rename above cannot redirect it.
+    let below = |dir: &fs::File, name: &std::ffi::OsStr| {
+        PathBuf::from(format!("/proc/self/fd/{}", dir.as_raw_fd())).join(name)
+    };
+    let refused_open = |shown: &Path, e: std::io::Error| match e.raw_os_error() {
+        Some(libc::ELOOP) | Some(libc::ENOTDIR) => format!("{} is a link", shown.display()),
+        _ => format!("open {}: {e}", shown.display()),
+    };
+    let open_dir = |path: &Path| {
+        fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW)
+            .open(path)
+    };
+    let mut shown = PathBuf::from("/");
+    let mut dir = open_dir(&shown).map_err(|e| refused_open(&shown, e))?;
+    let judge_dir = |dir: &fs::File, shown: &Path, is_folder: bool| {
+        let meta = dir
+            .metadata()
+            .map_err(|e| format!("inspect {}: {e}", shown.display()))?;
+        match open_to_others(shown, &meta, trusted, !is_folder) {
+            Some(why) => Err(why),
+            None => Ok(()),
+        }
+    };
+    judge_dir(&dir, &shown, folders.is_empty())?;
+    for (index, folder) in folders.iter().enumerate() {
+        shown.push(folder);
+        dir = match open_dir(&below(&dir, folder)) {
+            Ok(next) => next,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => return Err(refused_open(&shown, e)),
+        };
+        judge_dir(&dir, &shown, index + 1 == folders.len())?;
+    }
+    let opened = match fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_NOCTTY)
+        .open(below(&dir, name))
+    {
+        Ok(opened) => opened,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(refused_open(file, e)),
+    };
+    let meta = opened
+        .metadata()
+        .map_err(|e| format!("inspect {}: {e}", file.display()))?;
+    if !meta.is_file() {
+        return Err(format!("{} is not a regular file", file.display()));
+    }
+    if let Some(why) = open_to_others(file, &meta, trusted, false) {
+        return Err(why);
+    }
+    Ok(Some(opened))
 }
 
 #[cfg(test)]
@@ -165,6 +255,60 @@ mod tests {
         fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o1777)).expect("chmod");
         let why = untrusted_writer_trusting(&file, &[ROOT_UID, my_uid()]).expect("readable");
         assert!(why.is_some(), "the binary's own folder must be closed");
+    }
+
+    /// A copy of the program in a user's own folder must not seed the setup
+    /// from a sheet left beside it.
+    #[test]
+    fn a_sheet_in_a_folder_an_ordinary_account_owns_is_not_opened() {
+        if my_uid() == ROOT_UID {
+            return;
+        }
+        let (_dir, file) = private_dir_with_file();
+        let why = open_root_authored(&file).expect_err("refused");
+        assert!(why.contains("belongs to uid"), "{why}");
+    }
+
+    #[test]
+    fn a_sheet_in_a_closed_chain_is_opened_and_is_the_file_judged() {
+        let (_dir, file) = private_dir_with_file();
+        let mut opened = open_trusting(&file, &[ROOT_UID, my_uid()])
+            .expect("trusted")
+            .expect("present");
+        let mut read = String::new();
+        std::io::Read::read_to_string(&mut opened, &mut read).expect("read");
+        assert_eq!(read, "{}");
+    }
+
+    /// Whoever controls a link on the way decides which folder the read
+    /// lands in, between the check and the read; a link anywhere is refused,
+    /// even to a folder that would pass.
+    #[test]
+    fn a_link_to_a_closed_folder_on_the_way_is_refused() {
+        let (dir, _file) = private_dir_with_file();
+        let holder = tempfile::tempdir().expect("tempdir");
+        fs::set_permissions(holder.path(), fs::Permissions::from_mode(0o700)).expect("chmod");
+        let link = holder.path().join("install");
+        std::os::unix::fs::symlink(dir.path(), &link).expect("symlink");
+        let why = open_trusting(&link.join("first-run.json"), &[ROOT_UID, my_uid()])
+            .expect_err("refused");
+        assert!(why.contains("is a link"), "{why}");
+    }
+
+    #[test]
+    fn a_sheet_others_may_write_or_a_link_in_its_place_is_not_opened() {
+        let (dir, file) = private_dir_with_file();
+        fs::set_permissions(&file, fs::Permissions::from_mode(0o664)).expect("chmod");
+        let why = open_trusting(&file, &[ROOT_UID, my_uid()]).expect_err("refused");
+        assert!(why.contains("writable by group or others"), "{why}");
+        let link = dir.path().join("link.json");
+        std::os::unix::fs::symlink(&file, &link).expect("symlink");
+        let why = open_trusting(&link, &[ROOT_UID, my_uid()]).expect_err("refused");
+        assert!(why.contains("is a link"), "{why}");
+        assert!(matches!(
+            open_trusting(&dir.path().join("absent.json"), &[ROOT_UID, my_uid()]),
+            Ok(None)
+        ));
     }
 
     #[test]

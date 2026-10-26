@@ -31,6 +31,51 @@ pub enum Words {
     /// `{error}` in the key filled with the failure's words.
     Failed(Key, Failure),
     Join(Vec<Words>),
+    /// A key whose text carries the window's link markup, shown without it.
+    Untagged(Key),
+    /// A key with the window's Qt-style `%1`, `%2`; its line breaks join into
+    /// one row.
+    Numbered(Key, Vec<Words>),
+}
+
+/// `%1`..`%9` filled in one pass, so a value that itself reads `%2` stays as
+/// written; line breaks become a separator on one row.
+fn fill_numbered(template: &str, values: &[String]) -> String {
+    let mut out = String::with_capacity(template.len());
+    let mut chars = template.chars().peekable();
+    while let Some(c) = chars.next() {
+        let slot = match (c, chars.peek()) {
+            ('%', Some(d)) => d.to_digit(10).filter(|d| *d > 0),
+            _ => None,
+        };
+        let value = slot
+            .and_then(|d| usize::try_from(d).ok())
+            .and_then(|d| values.get(d - 1));
+        match value {
+            Some(value) => {
+                chars.next();
+                out.push_str(value);
+            }
+            None if c == '\n' => out.push_str(" · "),
+            None => out.push(c),
+        }
+    }
+    out
+}
+
+/// The text between the tags: the link's words stay, the markup goes.
+fn without_tags(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut in_tag = false;
+    for c in text.chars() {
+        match c {
+            '<' => in_tag = true,
+            '>' if in_tag => in_tag = false,
+            c if !in_tag => out.push(c),
+            _ => {}
+        }
+    }
+    out
 }
 
 impl Words {
@@ -54,6 +99,11 @@ impl Words {
                 texts.fill(*key, &[("error", failure_text(failure, texts))])
             }
             Self::Join(parts) => parts.iter().map(|p| p.resolve(texts)).collect(),
+            Self::Untagged(key) => without_tags(&texts.get(*key)),
+            Self::Numbered(key, values) => {
+                let values: Vec<String> = values.iter().map(|v| v.resolve(texts)).collect();
+                fill_numbered(&texts.get(*key), &values)
+            }
         }
     }
 }
@@ -135,6 +185,8 @@ pub enum PrefField {
     Plain,
     NoColor,
     Ascii,
+    /// Block notices name no destination (a shared or recorded screen).
+    HideBlockAddresses,
 }
 
 /// Which change a row stands for.
@@ -196,6 +248,8 @@ pub enum ItemId {
     ServiceStart,
     ServiceStop,
     ServiceRestart,
+    /// Puts the console on the user's PATH, or takes our entry off.
+    ConsolePath,
     ExportPath,
     ExportRun,
     /// Who wins when the bound files and the service differ on a rule.
@@ -251,6 +305,11 @@ impl Item {
 
     fn note(mut self, note: Key) -> Self {
         self.note = Some(Words::Key(note));
+        self
+    }
+
+    fn note_words(mut self, note: Words) -> Self {
+        self.note = Some(note);
         self
     }
 
@@ -425,17 +484,23 @@ fn notifications(app: &AppState) -> Vec<Item> {
             .supports
             .block_notices
             .then_some((BLOCK_NOTICES, Words::Key(t::MUTE_ALL)));
-        let kinds = block_row
-            .into_iter()
-            .chain(MUTABLE_NOTICE_KINDS.iter().map(|k| {
-                (
-                    k.slug,
-                    Words::Key(Key {
-                        id: k.title_key,
-                        en: k.title_en,
-                    }),
-                )
-            }));
+        let site_notice = s.supports.site_notice_without_tray;
+        let kinds = block_row.into_iter().chain(
+            MUTABLE_NOTICE_KINDS
+                .iter()
+                .filter(move |k| {
+                    k.slug != nrr_client_logic::notice_mutes::SITE_NOT_OPENING_KIND || site_notice
+                })
+                .map(|k| {
+                    (
+                        k.slug,
+                        Words::Key(Key {
+                            id: k.title_key,
+                            en: k.title_en,
+                        }),
+                    )
+                }),
+        );
         for (kind, title) in kinds {
             let state = match kind_mute(mutes, kind) {
                 None => Words::Key(t::HIDDEN_SHOWN),
@@ -465,6 +530,12 @@ fn notifications(app: &AppState) -> Vec<Item> {
         v.push(info(Words::Key(t::UNSUPPORTED)));
         return v;
     }
+    v.push(toggle(
+        ItemId::Pref(PrefField::HideBlockAddresses),
+        t::HIDE_ADDRESSES,
+        s.prefs.hide_block_addresses,
+    ));
+    v.push(info(Words::Key(t::HIDE_ADDRESSES_NOTE)));
     v.push(heading(t::MUTES_HEADING));
     if let Some(mutes) = mutes {
         let fine = fine_mutes(mutes);
@@ -833,6 +904,62 @@ fn rollback_rows(app: &AppState) -> Vec<Item> {
     rows
 }
 
+/// While the rules are off: how long for, and since when, as the window says.
+fn pause_rows(app: &AppState) -> Vec<Item> {
+    let Some(snapshot) = app.snapshot.as_ref() else {
+        return Vec::new();
+    };
+    let clock = app.settings.clock;
+    let left = if snapshot.routing_pause_until_restart {
+        Some(Words::Key(t::PAUSE_UNTIL_RESTART))
+    } else {
+        snapshot.routing_pause_resumes_at_ms.map(|at| {
+            let (kind, count) =
+                nrr_client_logic::rules_table::override_remaining(Some(at), clock.now());
+            let key = match kind {
+                "minutes" => t::LEFT_MINUTES,
+                "hours" => t::LEFT_HOURS,
+                "days" => t::LEFT_DAYS,
+                _ => t::LEFT_ENDED,
+            };
+            Words::Fill(key, vec![("count", count.to_string())])
+        })
+    };
+    let mut status = vec![Words::Key(t::PAUSE_STATUS_PAUSED)];
+    if let Some(left) = left {
+        status.extend([raw(" · "), left]);
+    }
+    let mut v = vec![info(Words::Join(status))];
+    let since = snapshot
+        .routing_paused_at
+        .and_then(|secs| i64::try_from(secs).ok())
+        .filter(|secs| *secs > 0);
+    if let Some(secs) = since {
+        v.push(info(Words::Fill(
+            t::PAUSED_SINCE,
+            vec![("timestamp", clock.format(secs.saturating_mul(1000)))],
+        )));
+    }
+    v
+}
+
+/// What the default route does, for the one chosen, and what routing by
+/// address cannot promise.
+fn default_route_note(mode: &str) -> Words {
+    let chosen = if mode == "prefer-secondary-when-available" {
+        t::MODE_PREFER_SECONDARY_NOTE
+    } else {
+        t::MODE_PREFER_PRIMARY_NOTE
+    };
+    Words::Join(vec![
+        Words::Key(t::DEFAULT_ROUTE_NOTE),
+        raw(" "),
+        Words::Key(chosen),
+        raw(" "),
+        Words::Untagged(t::IP_ROUTING_NOTE),
+    ])
+}
+
 fn routing(app: &AppState) -> Vec<Item> {
     let s = &app.settings;
     let policy = match &s.data.policy {
@@ -847,8 +974,11 @@ fn routing(app: &AppState) -> Vec<Item> {
     let mut v = vec![
         heading(t::RULES_PAUSE_TITLE),
         toggle(ItemId::RulesPause, t::RULES_PAUSE_TITLE, !paused),
-        info(Words::Key(t::RULES_PAUSE_HINT)),
     ];
+    if paused {
+        v.extend(pause_rows(app));
+    }
+    v.push(info(Words::Key(t::RULES_PAUSE_HINT)));
     if !paused {
         v.push(choice(
             ItemId::RulesPauseTerm,
@@ -870,7 +1000,7 @@ fn routing(app: &AppState) -> Vec<Item> {
             ],
             &mode,
         )
-        .note(t::DEFAULT_ROUTE_NOTE),
+        .note_words(default_route_note(&mode)),
         policy_toggle(policy, "include-subdomains", t::SUBDOMAINS).note(t::SUBDOMAINS_NOTE),
         policy_toggle(policy, "app-rules-take-all-addresses", t::APP_TAKEOVER)
             .note(t::APP_TAKEOVER_NOTE),
@@ -1140,8 +1270,31 @@ fn routing_refinements(
             }
         };
         v.push(item);
+        if row == routing_settings::FAKE_IP_ENABLED {
+            v.extend(fake_ip_driver(app));
+        }
     }
     v
+}
+
+/// The verdict on the virtual-adapter driver fake-IP loads, from the same
+/// check that gates it. Nothing where no driver is shipped or not yet read.
+fn fake_ip_driver(app: &AppState) -> Option<Item> {
+    use nrr_shared::third_party::IntegrityVerdict;
+    let list = app.settings.data.third_party.ready()?;
+    let driver = list.components.iter().find(|c| c.key == "wintun")?;
+    let (verdict, tone) = match driver.verdict {
+        IntegrityVerdict::Genuine => (t::VERDICT_GENUINE, StateTone::Good),
+        IntegrityVerdict::Untrusted => (t::VERDICT_UNTRUSTED, StateTone::Bad),
+        IntegrityVerdict::Missing | IntegrityVerdict::NotApplicable => {
+            (t::VERDICT_MISSING, StateTone::Caution)
+        }
+    };
+    Some(Item::new(
+        ItemId::None,
+        Words::Key(verdict),
+        Kind::State(tone, t::FAKE_IP_DRIVER),
+    ))
 }
 
 /// The shared addresses leak protection left open in its smart mode, as
@@ -1280,7 +1433,9 @@ fn stability_item(config: &Map<String, Value>, row: &'static str) -> Option<Item
         routing_settings::DNS_FAST_ANSWERS => {
             stability_toggle(config, row, t::DNS_FAST).note(t::DNS_FAST_NOTE)
         }
-        routing_settings::FAKE_IP_ENABLED => stability_toggle(config, row, t::FAKE_IP),
+        routing_settings::FAKE_IP_ENABLED => {
+            stability_toggle(config, row, t::FAKE_IP).note(t::FAKE_IP_NOTE)
+        }
         // Named and explained, as the GUI does, rather than offered.
         routing_settings::FAKE_IP_UNAVAILABLE => info(Words::Join(vec![
             Words::Key(t::FAKE_IP),
@@ -1410,6 +1565,9 @@ fn service(app: &AppState) -> Vec<Item> {
                     vec![("mode", Words::Key(mode))],
                 )));
             }
+            if let Some(check) = &app.settings.data.service_check {
+                v.extend(registration_rows(check));
+            }
             match report.run_state {
                 ServiceRunState::Stopped => {
                     v.push(action(ItemId::ServiceStart, t::SERVICE_START, false))
@@ -1476,6 +1634,102 @@ fn service(app: &AppState) -> Vec<Item> {
             failure.clone(),
         ))),
         Loadable::NotLoaded | Loadable::Loading => v.push(info(Words::Key(t::LOADING))),
+    }
+    v.push(info(Words::Key(t::SERVICE_CRASH_RECOVERY)));
+    match &app.settings.data.logs_folder {
+        Loadable::Ready(Some(folder)) => v.push(info(Words::Fill(
+            t::SERVICE_LOGS_FOLDER,
+            vec![("path", display_text(&folder.to_string_lossy()).into_owned())],
+        ))),
+        Loadable::Ready(None) => v.push(info(Words::Key(t::SERVICE_LOGS_UNAVAILABLE))),
+        _ => {}
+    }
+    v.extend(console_rows(app));
+    v
+}
+
+/// The window's "the registered service is not this one" and "the old
+/// process still runs" facts; nothing while the registration is this build's.
+fn registration_rows(check: &super::ServiceCheck) -> Vec<Item> {
+    let registration = &check.registration;
+    let mut v = Vec::new();
+    if registration.registered_elsewhere || check.older {
+        v.push(info(Words::Key(if registration.registered_elsewhere {
+            t::SERVICE_UPDATE_ELSEWHERE
+        } else {
+            t::SERVICE_UPDATE_OLDER
+        })));
+        let path = |path: &Option<std::path::PathBuf>| match path {
+            Some(path) => raw(display_text(&path.to_string_lossy()).into_owned()),
+            None => Words::Key(t::SERVICE_PATH_UNKNOWN),
+        };
+        v.push(info(Words::Numbered(
+            t::SERVICE_UPDATE_DETAIL,
+            vec![
+                path(&registration.registered_path),
+                path(&registration.expected_path),
+            ],
+        )));
+    }
+    if registration.restart_needed() {
+        v.push(info(Words::Key(t::SERVICE_STALE)));
+    }
+    v
+}
+
+/// The console on the user's PATH: whether it runs by name, its folder, and
+/// the one action that applies, as the window's console panel offers it.
+fn console_rows(app: &AppState) -> Vec<Item> {
+    let s = &app.settings;
+    let mut v = vec![
+        heading(t::CONSOLE_TITLE),
+        info(Words::Key(t::CONSOLE_DESCRIPTION)),
+    ];
+    let state = match &s.data.console {
+        Loadable::Ready(state) => state,
+        Loadable::Failed(failure) => {
+            v.push(info(Words::Failed(
+                t::CONSOLE_CHECK_FAILED,
+                failure.clone(),
+            )));
+            return v;
+        }
+        _ => {
+            v.push(info(Words::Key(t::LOADING)));
+            return v;
+        }
+    };
+    v.push(info(Words::Key(if state.reachable {
+        t::CONSOLE_REACHABLE
+    } else {
+        t::CONSOLE_NOT_REACHABLE
+    })));
+    v.push(info(Words::Join(vec![
+        Words::Key(t::CONSOLE_FOLDER),
+        raw(format!(
+            ": {}",
+            display_text(&state.directory.to_string_lossy())
+        )),
+    ])));
+    if state.reachable_but_not_ours() {
+        v.push(info(Words::Key(t::CONSOLE_NOT_OURS)));
+    } else if state.owned_entry_present {
+        v.push(action(ItemId::ConsolePath, t::CONSOLE_REMOVE, false).note(t::CONSOLE_REMOVE_NOTE));
+    } else {
+        v.push(action(ItemId::ConsolePath, t::CONSOLE_ADD, false).note(t::CONSOLE_ADD_NOTE));
+    }
+    if s.console_hint {
+        v.push(info(Words::Key(t::CONSOLE_NEW_TERMINAL)));
+        v.push(info(raw(format!(
+            "  {}",
+            display_text(&state.current_session_command)
+        ))));
+        if let Some(file) = &state.target_file {
+            v.push(info(Words::Numbered(
+                t::CONSOLE_PROFILE_FILE,
+                vec![raw(display_text(&file.to_string_lossy()).into_owned())],
+            )));
+        }
     }
     v
 }

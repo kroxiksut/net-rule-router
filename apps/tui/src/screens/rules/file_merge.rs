@@ -11,10 +11,12 @@
 
 use std::path::{Path, PathBuf};
 
+use nrr_client_logic::placeholders::list_summary;
 use nrr_client_logic::rebase::{Conflict, ConflictKind, MergeView};
 use nrr_client_logic::rules_table::{RuleRow, RuleType, TargetRoute};
 use nrr_client_logic::Route;
 use nrr_ipc_client::IpcClient;
+use nrr_shared::display_text::display_text;
 use nrr_shared::ipc::IpcOperationName;
 use nrr_shared::ipc_payloads::{MergePreviewRequest, MergePreviewResponse};
 use nrr_shared::merge_dto::{
@@ -148,7 +150,14 @@ fn previewed(app: &mut AppState, texts: [String; 2], result: &MergeResultDto) {
     // to show, or the merged rules are the ones on screen. The files may still
     // spell them differently, and then they are rewritten, as the window does.
     if result.noop || view.is_noop() || merges_to_screen(app, result) {
-        converge(app);
+        // Rules only the service holds are the ones the file lacked.
+        let added: Vec<String> = result
+            .service_only
+            .iter()
+            .map(|entry| display_text(&entry.value).into_owned())
+            .filter(|value| !value.is_empty())
+            .collect();
+        converge(app, &added);
         return;
     }
     app.rules.mode = Mode::Merge(Box::new(Merge::files(texts, view)));
@@ -164,7 +173,7 @@ fn merges_to_screen(app: &AppState, result: &MergeResultDto) -> bool {
 /// The files say what the rules in force say: any bound file whose body is
 /// spelled otherwise is rewritten from them. A file already in line is left
 /// alone and the note says the two match.
-fn converge(app: &mut AppState) {
+fn converge(app: &mut AppState, added: &[String]) {
     let Some(settings_file) = app.rules.settings_file.clone() else {
         return;
     };
@@ -200,7 +209,15 @@ fn converge(app: &mut AppState) {
     }
     let _ = own_settings::note_written(&settings_file, &written);
     if app.rules.note.is_none() {
-        app.rules.note = Some(Note::new(text::FILES_CONVERGED));
+        app.rules.note = Some(if added.is_empty() {
+            Note::new(text::FILES_CONVERGED)
+        } else {
+            let more = app.rules.list_more.clone();
+            Note::with(
+                text::FILES_CONVERGED_ADDED,
+                vec![("rules", list_summary(added, &more))],
+            )
+        });
     }
 }
 
@@ -260,6 +277,7 @@ fn merged(app: &mut AppState, result: &MergeResultDto) {
         correlation_id: apply::correlation_id("tui-merge"),
         admin_baseline: false,
         base_revision: app.rules.base_revision.clone(),
+        reset_to_baseline: false,
     };
     app.rules.note = None;
     // The rows on screen are not what this holds: they are read back once it

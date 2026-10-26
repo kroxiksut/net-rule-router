@@ -49,6 +49,251 @@ const EXPORT_TIMEOUT: Duration = Duration::from_secs(120);
 const LOG_PAGE_SIZE: u32 = 50;
 /// The GUI's level choices; empty is every level.
 const LEVELS: [&str; 4] = ["", "info", "warn", "error"];
+/// The window's caps on the raw service log in an archive; 0 is no cap.
+const ARCHIVE_LOG_BUDGETS_MIB: [u64; 4] = [0, 24, 64, 128];
+const MIB: u64 = 1024 * 1024;
+
+/// The columns the window's log table sorts by.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum LogColumn {
+    #[default]
+    Time,
+    Level,
+    Category,
+    Kind,
+}
+
+impl LogColumn {
+    fn next(self) -> Self {
+        match self {
+            Self::Time => Self::Level,
+            Self::Level => Self::Category,
+            Self::Category => Self::Kind,
+            Self::Kind => Self::Time,
+        }
+    }
+
+    fn label(self) -> Key {
+        match self {
+            Self::Time => keys::COLUMN_TIME,
+            Self::Level => keys::COLUMN_LEVEL,
+            Self::Category => keys::COLUMN_CATEGORY,
+            Self::Kind => keys::COLUMN_KIND,
+        }
+    }
+}
+
+/// The columns the window's audit table sorts by.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum AuditColumn {
+    #[default]
+    Seq,
+    Time,
+    Kind,
+    Result,
+    Reason,
+    Revision,
+}
+
+impl AuditColumn {
+    fn next(self) -> Self {
+        match self {
+            Self::Seq => Self::Time,
+            Self::Time => Self::Kind,
+            Self::Kind => Self::Result,
+            Self::Result => Self::Reason,
+            Self::Reason => Self::Revision,
+            Self::Revision => Self::Seq,
+        }
+    }
+
+    fn label(self) -> Key {
+        match self {
+            Self::Seq => keys::COLUMN_SEQ,
+            Self::Time => keys::COLUMN_TIME,
+            Self::Kind => keys::COLUMN_AUDIT_KIND,
+            Self::Result => keys::COLUMN_RESULT,
+            Self::Reason => keys::COLUMN_REASON,
+            Self::Revision => keys::COLUMN_REVISION,
+        }
+    }
+}
+
+/// A table's order, newest first until the user picks another; a new column
+/// starts in its natural direction, as a header click in the window does.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Sort<C> {
+    column: C,
+    descending: bool,
+}
+
+impl Sort<LogColumn> {
+    fn next_column(self) -> Self {
+        let column = self.column.next();
+        Self {
+            column,
+            descending: column == LogColumn::Time,
+        }
+    }
+}
+
+impl Sort<AuditColumn> {
+    fn next_column(self) -> Self {
+        let column = self.column.next();
+        Self {
+            column,
+            descending: matches!(column, AuditColumn::Seq | AuditColumn::Time),
+        }
+    }
+}
+
+impl<C: Default> Default for Sort<C> {
+    fn default() -> Self {
+        Self {
+            column: C::default(),
+            descending: true,
+        }
+    }
+}
+
+impl<C> Sort<C> {
+    fn reversed(self) -> Self {
+        Self {
+            descending: !self.descending,
+            ..self
+        }
+    }
+
+    fn apply(self, order: std::cmp::Ordering) -> std::cmp::Ordering {
+        if self.descending {
+            order.reverse()
+        } else {
+            order
+        }
+    }
+}
+
+/// Text columns compare without regard to case, as the window's
+/// `localeCompare` does for these ASCII slugs.
+fn text_order(a: &str, b: &str) -> std::cmp::Ordering {
+    a.to_lowercase()
+        .cmp(&b.to_lowercase())
+        .then_with(|| a.cmp(b))
+}
+
+/// The loaded rows in display order; equal rows keep the order they came in.
+fn log_order(entries: &[LogEntryDto], sort: Sort<LogColumn>) -> Vec<usize> {
+    let mut order: Vec<usize> = (0..entries.len()).collect();
+    order.sort_by(|&a, &b| {
+        let (a, b) = (&entries[a], &entries[b]);
+        sort.apply(match sort.column {
+            LogColumn::Time => a.created_at.cmp(&b.created_at),
+            LogColumn::Level => text_order(&a.level, &b.level),
+            LogColumn::Category => text_order(&a.category, &b.category),
+            LogColumn::Kind => text_order(&a.kind, &b.kind),
+        })
+    });
+    order
+}
+
+fn audit_order(entries: &[AuditEntryDto], sort: Sort<AuditColumn>) -> Vec<usize> {
+    let mut order: Vec<usize> = (0..entries.len()).collect();
+    order.sort_by(|&a, &b| {
+        let (a, b) = (&entries[a], &entries[b]);
+        sort.apply(match sort.column {
+            AuditColumn::Seq => a.seq.cmp(&b.seq),
+            AuditColumn::Time => a.created_at.cmp(&b.created_at),
+            AuditColumn::Kind => text_order(&a.kind, &b.kind),
+            AuditColumn::Result => text_order(&a.result, &b.result),
+            AuditColumn::Reason => text_order(&a.reason_code, &b.reason_code),
+            AuditColumn::Revision => text_order(
+                a.revision_id.as_deref().unwrap_or(""),
+                b.revision_id.as_deref().unwrap_or(""),
+            ),
+        })
+    });
+    order
+}
+
+fn sort_words<C: Copy>(texts: &Texts, sort: Sort<C>, label: fn(C) -> Key) -> String {
+    texts.fill(
+        keys::SORT,
+        &[
+            ("column", texts.get(label(sort.column))),
+            (
+                "direction",
+                texts.get(if sort.descending {
+                    keys::SORT_DESCENDING
+                } else {
+                    keys::SORT_ASCENDING
+                }),
+            ),
+        ],
+    )
+}
+
+/// What the next archive carries, as the window's export options choose it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ArchiveOptions {
+    full_detail: bool,
+    session_only: bool,
+    /// Index into [`ARCHIVE_LOG_BUDGETS_MIB`].
+    budget: usize,
+}
+
+impl Default for ArchiveOptions {
+    fn default() -> Self {
+        Self {
+            full_detail: false,
+            session_only: true,
+            budget: 0,
+        }
+    }
+}
+
+impl ArchiveOptions {
+    fn budget_mib(self) -> u64 {
+        ARCHIVE_LOG_BUDGETS_MIB
+            .get(self.budget)
+            .copied()
+            .unwrap_or_default()
+    }
+
+    /// "This session" reaches back to the local midnight the session began
+    /// on, so a restart during the day does not cut the day's history.
+    fn request(self, session_start_ms: i64) -> DiagnosticsExportArchiveRequest {
+        let budget = self.budget_mib().saturating_mul(MIB);
+        DiagnosticsExportArchiveRequest {
+            include_logs: true,
+            include_audit_summary: true,
+            include_troubleshooting_playbooks: true,
+            redaction_level: Some(
+                if self.full_detail {
+                    "diagnostics"
+                } else {
+                    "standard"
+                }
+                .to_owned(),
+            ),
+            logs_from_ms: self
+                .session_only
+                .then(|| local_midnight(session_start_ms))
+                .flatten(),
+            raw_log_budget_bytes: (budget > 0).then_some(budget),
+        }
+    }
+}
+
+fn local_midnight(ms: i64) -> Option<i64> {
+    use chrono::TimeZone;
+    let at = chrono::DateTime::from_timestamp_millis(ms).filter(|_| ms > 0)?;
+    let day = at.with_timezone(&chrono::Local).date_naive();
+    let midnight = day.and_hms_opt(0, 0, 0)?;
+    chrono::Local
+        .from_local_datetime(&midnight)
+        .earliest()
+        .map(|local| local.timestamp_millis())
+}
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 enum Part {
@@ -62,6 +307,7 @@ enum Part {
 enum Field {
     Explain,
     LogKind,
+    LogCategory,
     Site,
 }
 
@@ -120,7 +366,9 @@ struct Log {
     error: Option<String>,
     level: usize,
     kind: String,
+    category: String,
     all_history: bool,
+    sort: Sort<LogColumn>,
     pager: Pager,
     generation: u64,
     advance: bool,
@@ -133,6 +381,7 @@ struct AuditTrail {
     entries: Vec<AuditEntryDto>,
     cursor: Option<PageCursor>,
     error: Option<String>,
+    sort: Sort<AuditColumn>,
     pager: Pager,
     generation: u64,
     advance: bool,
@@ -154,11 +403,12 @@ pub struct DiagState {
     explain: Explain,
     typing: Option<(Field, String)>,
     archive: Archive,
+    archive_options: ArchiveOptions,
     log: Log,
     audit: AuditTrail,
     pub(super) restart: super::audit_restart::Restart,
     /// "Current session" in the log starts when this program did.
-    session_start_ms: i64,
+    pub(super) session_start_ms: i64,
 }
 
 impl Default for DiagState {
@@ -181,6 +431,7 @@ impl Default for DiagState {
             explain: Explain::default(),
             typing: None,
             archive: Archive::default(),
+            archive_options: ArchiveOptions::default(),
             log: Log::default(),
             audit: AuditTrail::default(),
             restart: Default::default(),
@@ -545,13 +796,9 @@ fn export(app: &mut AppState) {
         return;
     }
     app.inspect.diag.archive = Archive::Busy;
-    queue(app, |client| {
-        let request = DiagnosticsExportArchiveRequest {
-            include_logs: true,
-            include_audit_summary: true,
-            include_troubleshooting_playbooks: true,
-            ..DiagnosticsExportArchiveRequest::default()
-        };
+    let state = &app.inspect.diag;
+    let request = state.archive_options.request(state.session_start_ms);
+    queue(app, move |client| {
         let outcome = serde_json::to_value(&request)
             .map_err(unencodable)
             .and_then(|payload| {
@@ -592,6 +839,7 @@ fn log_filter(state: &DiagState) -> LogEntryFilter {
     LogEntryFilter {
         from_ms: (!log.all_history && state.session_start_ms > 0).then_some(state.session_start_ms),
         level_min: Some(LEVELS[log.level].to_owned()).filter(|l| !l.is_empty()),
+        category: Some(log.category.trim().to_owned()).filter(|c| !c.is_empty()),
         kind: Some(log.kind.trim().to_owned()).filter(|k| !k.is_empty()),
         ..LogEntryFilter::default()
     }
@@ -863,7 +1111,9 @@ impl Screen for DiagnosticsScreen {
             keys::DIAG_HELP_EXPLAIN,
             keys::DIAG_HELP_SITE,
             keys::DIAG_HELP_EXPORT,
+            keys::ARCHIVE_OPTIONS_HELP,
             keys::DIAG_HELP_LOG_FILTERS,
+            keys::DIAG_HELP_LOG_SORT,
             keys::HELP_PAGES,
             keys::HELP_REFRESH,
             keys::EXPLAIN_SUBTITLE,
@@ -877,7 +1127,9 @@ impl Screen for DiagnosticsScreen {
             keys::DIAG_PLAIN_EXPLAIN,
             keys::DIAG_PLAIN_SITE,
             keys::DIAG_PLAIN_EXPORT,
+            keys::ARCHIVE_OPTIONS_HELP,
             keys::DIAG_PLAIN_LOG_FILTERS,
+            keys::DIAG_PLAIN_LOG_SORT,
             keys::PLAIN_PAGES,
             keys::HELP_REFRESH,
         ]
@@ -953,6 +1205,10 @@ impl Screen for DiagnosticsScreen {
                             app.inspect.diag.log.kind = text.trim().to_owned();
                             load_log(app, true);
                         }
+                        Field::LogCategory => {
+                            app.inspect.diag.log.category = text.trim().to_owned();
+                            load_log(app, true);
+                        }
                     }
                 }
                 Edit::Cancelled => app.inspect.diag.typing = None,
@@ -1010,7 +1266,11 @@ fn overview_key(app: &mut AppState, key: KeyEvent) -> bool {
             app.inspect.diag.typing = Some((Field::Site, host));
         }
         KeyCode::Char('m') => return super::site_check::move_sign_in(app),
+        KeyCode::Char('t') => return super::site_check::open_trace(app),
         KeyCode::Char('x') => export(app),
+        KeyCode::Char('d') => archive_option(app, ArchiveChange::Detail),
+        KeyCode::Char('o') => archive_option(app, ArchiveChange::SessionOnly),
+        KeyCode::Char('b') => archive_option(app, ArchiveChange::Budget),
         KeyCode::Char('k') if offered => super::audit_restart::start(app),
         KeyCode::Char('r') => load_status(app),
         code => {
@@ -1035,12 +1295,59 @@ fn overview_line(app: &mut AppState, line: &str) -> bool {
         ("e", host) => probe(app, host, "", ""),
         ("c", host) => super::site_check::start(app, host),
         ("m", "") => return super::site_check::move_sign_in(app),
+        ("t", "") => return super::site_check::open_trace(app),
         ("k", "") if offered => super::audit_restart::start(app),
         ("x", "") => export(app),
+        ("d", "") => archive_option(app, ArchiveChange::Detail),
+        ("o", "") => archive_option(app, ArchiveChange::SessionOnly),
+        ("b", "") => archive_option(app, ArchiveChange::Budget),
         ("r", "") => load_status(app),
         _ => return false,
     }
     true
+}
+
+#[derive(Clone, Copy)]
+enum ArchiveChange {
+    Detail,
+    SessionOnly,
+    Budget,
+}
+
+/// The next archive's options; one being written keeps what it was asked with.
+/// Which logs and how much are kept for the next run; the detail level is not.
+fn archive_option(app: &mut AppState, change: ArchiveChange) {
+    let options = &mut app.inspect.diag.archive_options;
+    match change {
+        ArchiveChange::Detail => {
+            options.full_detail = !options.full_detail;
+            return;
+        }
+        ArchiveChange::SessionOnly => options.session_only = !options.session_only,
+        ArchiveChange::Budget => {
+            options.budget = (options.budget + 1) % ARCHIVE_LOG_BUDGETS_MIB.len();
+        }
+    }
+    let (all_logs, budget) = (!options.session_only, options.budget_mib());
+    let prefs = &mut app.settings.prefs;
+    prefs.archive_all_logs = all_logs;
+    prefs.archive_log_budget_mib = budget;
+    if let Some(path) = app.settings.prefs_path.as_deref() {
+        // Unsaved, the choice still holds for this run.
+        let _ = crate::screens::settings::prefs::save(path, app.settings.prefs);
+    }
+}
+
+/// The archive options the user kept from an earlier run. A size the list
+/// does not offer (an edited file) reads as no cap.
+pub fn restore_archive_options(app: &mut AppState) {
+    let prefs = app.settings.prefs;
+    let options = &mut app.inspect.diag.archive_options;
+    options.session_only = !prefs.archive_all_logs;
+    options.budget = ARCHIVE_LOG_BUDGETS_MIB
+        .iter()
+        .position(|mib| *mib == prefs.archive_log_budget_mib)
+        .unwrap_or(0);
 }
 
 fn log_key(app: &mut AppState, key: KeyEvent) -> bool {
@@ -1052,6 +1359,11 @@ fn log_key(app: &mut AppState, key: KeyEvent) -> bool {
             load_log(app, true);
         }
         KeyCode::Char('/') => state.typing = Some((Field::LogKind, state.log.kind.clone())),
+        KeyCode::Char('c') => {
+            state.typing = Some((Field::LogCategory, state.log.category.clone()));
+        }
+        KeyCode::Char('o') => state.log.sort = state.log.sort.next_column(),
+        KeyCode::Char('d') => state.log.sort = state.log.sort.reversed(),
         KeyCode::Char('s') => {
             state.log.all_history = !state.log.all_history;
             load_log(app, true);
@@ -1079,6 +1391,12 @@ fn log_line(app: &mut AppState, line: &str) -> bool {
             state.log.kind = kind.to_owned();
             load_log(app, true);
         }
+        ("c", category) => {
+            state.log.category = category.to_owned();
+            load_log(app, true);
+        }
+        ("o", "") => state.log.sort = state.log.sort.next_column(),
+        ("d", "") => state.log.sort = state.log.sort.reversed(),
         ("s", "") => {
             state.log.all_history = !state.log.all_history;
             load_log(app, true);
@@ -1094,6 +1412,8 @@ fn audit_key(app: &mut AppState, key: KeyEvent) -> bool {
     let len = audit.entries.len();
     match key.code {
         KeyCode::Char('r') => load_audit(app, true),
+        KeyCode::Char('o') => audit.sort = audit.sort.next_column(),
+        KeyCode::Char('d') => audit.sort = audit.sort.reversed(),
         KeyCode::PageDown if audit.pager.page_start() + super::PAGE_ROWS >= len => {
             more_audit(app);
         }
@@ -1108,6 +1428,14 @@ fn audit_line(app: &mut AppState, line: &str) -> bool {
         ("n", "") => more_audit(app),
         ("p", "") => app.inspect.diag.audit.pager.previous_page(),
         ("r", "") => load_audit(app, true),
+        ("o", "") => {
+            let audit = &mut app.inspect.diag.audit;
+            audit.sort = audit.sort.next_column();
+        }
+        ("d", "") => {
+            let audit = &mut app.inspect.diag.audit;
+            audit.sort = audit.sort.reversed();
+        }
         _ => return false,
     }
     true
@@ -1497,6 +1825,11 @@ fn explain_lines(state: &DiagState, texts: &Texts) -> Vec<ViewLine> {
 }
 
 fn archive_lines(state: &DiagState, texts: &Texts) -> Vec<ViewLine> {
+    let options = state.archive_options;
+    let budget = match options.budget_mib() {
+        0 => texts.get(keys::ARCHIVE_BUDGET_UNLIMITED),
+        mib => format!("{mib} MiB"),
+    };
     let mut lines = vec![ViewLine::text(texts.get(keys::ARCHIVE_NOTE))];
     match &state.archive {
         Archive::Ready => lines.push(ViewLine::text(texts.get(keys::ARCHIVE_READY))),
@@ -1524,6 +1857,26 @@ fn archive_lines(state: &DiagState, texts: &Texts) -> Vec<ViewLine> {
         ))),
     }
     lines.push(ViewLine::text(format!("x: {}", texts.get(keys::ARCHIVE))));
+    lines.push(ViewLine::text(format!(
+        "{}: {} · {}: {} · {}: {budget}",
+        texts.get(keys::ARCHIVE_LEVEL),
+        texts.get(if options.full_detail {
+            keys::ARCHIVE_LEVEL_FULL
+        } else {
+            keys::ARCHIVE_LEVEL_STANDARD
+        }),
+        texts.get(keys::ARCHIVE_SESSION_ONLY),
+        texts.get(if options.session_only {
+            keys::YES
+        } else {
+            keys::NO
+        }),
+        texts.get(keys::ARCHIVE_BUDGET),
+    )));
+    // The warning only where it applies: the panel shares a screen.
+    if options.full_detail {
+        lines.push(ViewLine::text(texts.get(keys::ARCHIVE_LEVEL_CAPTION)));
+    }
     lines
 }
 
@@ -1540,15 +1893,31 @@ fn log_lines(app: &AppState, texts: &Texts) -> Vec<ViewLine> {
     } else {
         keys::LOGS_SESSION
     });
-    let mut lines = vec![ViewLine::text(format!(
-        "{}: {} · {}: {kind} · {}: {range}",
-        texts.get(keys::LOGS_LEVEL),
-        level_label(texts, LEVELS[log.level]),
-        texts.get(keys::LOGS_KIND),
-        texts.get(keys::LOGS_RANGE),
-    ))];
-    if let Some((Field::LogKind, buffer)) = &state.typing {
-        lines.extend(typing_lines(texts, &texts.get(keys::LOGS_KIND), buffer));
+    let category = if log.category.is_empty() {
+        texts.get(keys::LOGS_KIND_ANY)
+    } else {
+        display_text(&log.category).into_owned()
+    };
+    let kind = display_text(&kind).into_owned();
+    let mut lines = vec![
+        ViewLine::text(format!(
+            "{}: {} · {}: {category} · {}: {kind} · {}: {range}",
+            texts.get(keys::LOGS_LEVEL),
+            level_label(texts, LEVELS[log.level]),
+            texts.get(keys::LOGS_CATEGORY),
+            texts.get(keys::LOGS_KIND),
+            texts.get(keys::LOGS_RANGE),
+        )),
+        ViewLine::text(sort_words(texts, log.sort, LogColumn::label)),
+    ];
+    match &state.typing {
+        Some((Field::LogKind, buffer)) => {
+            lines.extend(typing_lines(texts, &texts.get(keys::LOGS_KIND), buffer));
+        }
+        Some((Field::LogCategory, buffer)) => {
+            lines.extend(typing_lines(texts, &texts.get(keys::LOGS_CATEGORY), buffer));
+        }
+        _ => {}
     }
     if !app.link.is_connected() && log.asked {
         lines.push(ViewLine::text(texts.get(keys::STALE)));
@@ -1567,12 +1936,13 @@ fn log_lines(app: &AppState, texts: &Texts) -> Vec<ViewLine> {
     }
     let mut pager = log.pager;
     pager.clamp(log.entries.len());
+    let order = log_order(&log.entries, log.sort);
     lines.extend(page_lines(
         texts,
         pager,
         log.entries.len(),
         log.cursor.is_some(),
-        |i| log_row(texts, &log.entries[i]),
+        |i| log_row(texts, &log.entries[order[i]]),
     ));
     lines.push(ViewLine::text(texts.get(keys::DIAG_HELP_SWITCH)));
     lines
@@ -1580,7 +1950,11 @@ fn log_lines(app: &AppState, texts: &Texts) -> Vec<ViewLine> {
 
 fn audit_lines(app: &AppState, texts: &Texts) -> Vec<ViewLine> {
     let audit = &app.inspect.diag.audit;
-    let mut lines = Vec::new();
+    let mut lines = vec![ViewLine::text(sort_words(
+        texts,
+        audit.sort,
+        AuditColumn::label,
+    ))];
     if !app.link.is_connected() && audit.asked {
         lines.push(ViewLine::text(texts.get(keys::STALE)));
     }
@@ -1598,12 +1972,13 @@ fn audit_lines(app: &AppState, texts: &Texts) -> Vec<ViewLine> {
     }
     let mut pager = audit.pager;
     pager.clamp(audit.entries.len());
+    let order = audit_order(&audit.entries, audit.sort);
     lines.extend(page_lines(
         texts,
         pager,
         audit.entries.len(),
         audit.cursor.is_some(),
-        |i| audit_row(texts, &audit.entries[i]),
+        |i| audit_row(texts, &audit.entries[order[i]]),
     ));
     lines.push(ViewLine::text(texts.get(keys::DIAG_HELP_SWITCH)));
     lines

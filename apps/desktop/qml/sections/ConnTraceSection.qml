@@ -304,9 +304,34 @@ ScrollView {
     // Single cached filtered view (see _cacheFiltered). The view filters run
     // BEFORE the text search so the search counts match what is on screen; both
     // toggles are read as binding arguments, which registers the dependency.
+    // A connection held while its address was being learned, then sent over the
+    // additional route, is listed as the one that went through and says it was
+    // held first (`Pure.connTraceLearnedRoutes`, the terminal's fold too). A
+    // hold nothing followed stays a block. Kept history is per hour: not folded.
+    function _foldConnLearned(entries) {
+        var pairs = Pure.connTraceLearnedRoutes(entries)
+        var held = {}
+        var heldAt = {}
+        for (var p = 0; p < pairs.length; p++) {
+            held[pairs[p].held] = true
+            var t = Number(entries[pairs[p].held].observed_at_ms)
+            var at = heldAt[pairs[p].routed]
+            if (at === undefined || t < at) heldAt[pairs[p].routed] = t
+        }
+        var out = []
+        for (var i = 0; i < entries.length; i++) {
+            if (held[i] === true) continue
+            var e = entries[i]
+            if (e) e._held_at_ms = heldAt[i] !== undefined ? heldAt[i] : 0
+            out.push(e)
+        }
+        return out
+    }
+    property var _connFolded: _connIsHistory ? _connTraceEntries
+        : _foldConnLearned(_connTraceEntries)
     property var _connFiltered: _sortRows(
         _filterConnTraceEntries(
-            _applyConnViewFilters(_connTraceEntries, _connShowBlocked, _connShowLocal,
+            _applyConnViewFilters(_connFolded, _connShowBlocked, _connShowLocal,
                                   _connOnlyIpv6),
             _connTraceFilter),
         "conn", _connSortCol, _connSortDir)
@@ -510,7 +535,7 @@ ScrollView {
     }
     // Address and name share one line, so every data row is two lines.
     function _connRowHeight(e, lineH) {
-        return 2 * lineH
+        return (e && e._held_at_ms > 0) ? 3 * lineH : 2 * lineH
     }
     // The Remote column grows with the window: it now carries the name too.
     readonly property int _connRemoteColWidth:
@@ -1678,6 +1703,20 @@ ScrollView {
                                     ? "  ·  " + root.tr("diag.conn-trace.relay-for", "relay for %1")
                                         .arg(String(modelData.relay_for))
                                     : "")
+                            color: root.mutedTextColor
+                            font.pixelSize: Math.max(11, root.uiTheme.baseFontSizePx - 1)
+                            wrapMode: Text.WordWrap
+                        }
+                        Label {
+                            Layout.fillWidth: true
+                            readonly property double heldAtMs:
+                                Number((modelData && modelData._held_at_ms) || 0)
+                            visible: heldAtMs > 0
+                            text: heldAtMs > 0
+                                ? root.tr("diag.conn-trace.learned-route",
+                                    "First connection held at %1 while the address was being learned, then sent over the additional route")
+                                    .arg(Pure.formatTimestamp(heldAtMs))
+                                : ""
                             color: root.mutedTextColor
                             font.pixelSize: Math.max(11, root.uiTheme.baseFontSizePx - 1)
                             wrapMode: Text.WordWrap

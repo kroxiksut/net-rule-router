@@ -295,8 +295,6 @@ pub(crate) fn build_runtime_deps(
                 served_sids: served_principals.clone(),
                 recompute_hook: recompute_hook.clone().unwrap_or_else(|| hook.clone()),
                 forced_recompute_hook: Some(hook.clone()),
-                known_direct: None,
-                block_all_armed: None,
                 // While the guard holds, a rule host's name is asked only
                 // through the tunnel and its address is withheld otherwise.
                 // The resolver answers for the route-table owner, so the
@@ -442,6 +440,7 @@ pub(crate) fn build_runtime_deps(
             })
         }),
         route_recompute_hook: recompute_hook.clone(),
+        link_gone_hook: None,
         observation_recompute_hook,
         route_teardown_hook: teardown_hook,
         // Both need the per-principal orchestrator's seeding path, which is not
@@ -781,7 +780,18 @@ fn app_destination_memory(
                     repo.load_confirmed_since(cutoff).unwrap_or_default()
                 })
             },
-        ),
+        )
+        .with_app_takeover({
+            // An address a program takes under the setting is its own, so it
+            // starts warm too.
+            let conn = Arc::clone(state_conn);
+            Arc::new(move |principal: &str| {
+                let guard = conn.lock().unwrap_or_else(|p| p.into_inner());
+                nrr_storage::route_bindings::RouteBindingsRepository::new(&guard)
+                    .load_for_sid(principal)
+                    .is_ok_and(|p| p.app_rules_take_all_addresses)
+            })
+        }),
     );
     let admitted = memory.warm_load(std::time::SystemTime::now());
     if admitted > 0 {
@@ -1265,6 +1275,7 @@ pub(crate) fn build_policy_stack(
     let liveness = Arc::new(SecondaryLivenessTracker::new(0));
     let nft_enforcer = Arc::new(
         NftPolicyEnforcer::new(Arc::clone(&bindings), Arc::clone(&adapter_port))
+            .keeping_boot_table()
             .with_liveness({
                 let liveness = Arc::clone(&liveness);
                 Arc::new(move |ifindex| {
@@ -1664,8 +1675,10 @@ pub(crate) fn build_policy_stack(
     );
     let trace_ring =
         Arc::new(nrr_service_runtime::conn_observation_consumer::ConnectionTraceRing::new(1000));
+    // The resolver cannot tell whose lookup a name came from: the machine's
+    // names would show in every user's history.
     trace_ring.attach_namer(Arc::new(
-        nrr_service_runtime::conn_trace_names::ConnTraceNamer::production(Arc::clone(&cache_store)),
+        nrr_service_runtime::conn_trace_names::ConnTraceNamer::without_shared_names(),
     ));
     // Each user's connection history, folded from the rows the trace sees.
     trace_ring.attach_history(nrr_service_runtime::conn_history::open_for_service(

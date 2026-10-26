@@ -16,7 +16,7 @@ pub struct MutableNoticeKind {
 }
 
 /// Mirrors `NoticeKind` in `nrr-domain`, which refuses any other slug.
-pub const MUTABLE_NOTICE_KINDS: [MutableNoticeKind; 9] = [
+pub const MUTABLE_NOTICE_KINDS: [MutableNoticeKind; 11] = [
     MutableNoticeKind {
         slug: "block-notice-backlog",
         title_key: "notifications.block-notice.backlog.title",
@@ -62,7 +62,21 @@ pub const MUTABLE_NOTICE_KINDS: [MutableNoticeKind; 9] = [
         title_key: "notifications.traffic-carried.title",
         title_en: "Your traffic goes through another user's tunnel",
     },
+    MutableNoticeKind {
+        slug: "site-not-opening",
+        title_key: "settings.notifications.site-not-opening",
+        title_en: "A site does not open (told even while the tray is closed)",
+    },
+    MutableNoticeKind {
+        slug: "link-keeps-dropping",
+        title_key: "notifications.link-keeps-dropping.title",
+        title_en: "A connection keeps dropping",
+    },
 ];
+
+/// The kind told even while the tray is closed; listed only where the
+/// platform can start the tray to tell it (`siteNoticeWithoutTray`).
+pub const SITE_NOT_OPENING_KIND: &str = "site-not-opening";
 
 /// How long each answer of the chooser holds, in milliseconds; 0 is "until
 /// lifted".

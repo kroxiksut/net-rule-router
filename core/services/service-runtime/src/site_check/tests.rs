@@ -338,6 +338,46 @@ fn where_the_site_sends_a_visitor_counts_as_its_sign_in() {
     assert_eq!(report.move_names, ["passport.site.example"]);
 }
 
+/// The site and its sign-in send a visitor to each other for ever.
+struct Looping;
+
+impl HttpsHead for Looping {
+    fn fetch(
+        &self,
+        target: Ipv4Addr,
+        _server_name: &str,
+        _source: Ipv4Addr,
+        _request: &[u8],
+        _timeout: Duration,
+    ) -> Result<Vec<u8>, HeadFailure> {
+        Ok(if target == ip(1) {
+            b"HTTP/1.1 302 Found\r\nLocation: https://login.site.example/\r\n\r\n".to_vec()
+        } else {
+            b"HTTP/1.1 302 Found\r\nLocation: https://site.example/\r\n\r\n".to_vec()
+        })
+    }
+}
+
+/// A redirect loop while both names answer on one route is the site's own
+/// doing: the network is fine, and the loop is shown once, not followed on.
+#[test]
+fn a_redirect_loop_on_one_working_route_is_the_site_not_the_network() {
+    let mut f = Fixture::new();
+    f.cache.set_ips("site.example", vec![ip(1)]);
+    f.cache.set_ips("login.site.example", vec![ip(2)]);
+    f.https = Some(Arc::new(Looping));
+    let report = f.checker(routes(&[])).check(ALICE, "site.example");
+    assert_eq!(report.verdict, SITE_CHECK_VERDICT_FINE);
+    assert!(report.move_names.is_empty());
+    assert_eq!(report.names[0].status, Some(302));
+    assert_eq!(
+        report.names[0].redirects,
+        ["login.site.example", "site.example"],
+        "the loop ends where it closes"
+    );
+    assert!(names(&report).contains(&("login.site.example", "primary", "answered")));
+}
+
 /// Something on the route answers with a certificate the roots do not know.
 struct Intercepted;
 

@@ -123,6 +123,12 @@ pub enum PrecedenceClass {
     CatchAllExempt,
     /// Per-destination / per-app fail-closed blocks (kill-switch armed).
     KillSwitchBlock,
+    /// An application's tunnel pin, or its fail-closed block, while application
+    /// rules take every address their program uses: the block outranks the
+    /// main-link rule permits, so the program reaches a main-named address only
+    /// through the tunnel. The rank is the block's; a `Permit` flow here is the
+    /// pin, whose permit half lowers with [`Self::KillSwitchPermit`].
+    AppTakeover,
     /// Per-protocol / reconnection permits that outrank the kill-switch block.
     KillSwitchPermit,
     /// The fake-IP relay's virtual pool: the permit that lets an application
@@ -153,6 +159,9 @@ impl PrecedenceClass {
             // tunnel or a primary-routed app).
             Self::DohBlock => 35,
             Self::KillSwitchBlock => 40,
+            // Above the main-link rules it takes addresses from, below the
+            // app's own egress permit.
+            Self::AppTakeover => 45,
             Self::KillSwitchPermit => 50,
             // Above the per-destination kill-switch permits, below the
             // exemption floor — the pool must survive a block-all, and must
@@ -1181,6 +1190,7 @@ mod tests {
             PrecedenceClass::RouteRule(RouteRole::Secondary),
             PrecedenceClass::RouteRule(RouteRole::Primary),
             PrecedenceClass::KillSwitchBlock,
+            PrecedenceClass::AppTakeover,
             PrecedenceClass::KillSwitchPermit,
             PrecedenceClass::CatchAllExempt,
             PrecedenceClass::HardBlock,

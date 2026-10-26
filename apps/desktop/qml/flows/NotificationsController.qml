@@ -384,8 +384,8 @@ QtObject {
             // app that temporarily left the set (resolved while running) stays
             // acknowledged when it returns after its process exits.
             root._unenforcedAppRulesAckSig = root._unenforcedAckUnionSig()
-            // Persist the ack so the notice stays dismissed
-            // across GUI restarts until a NEW unresolved app appears.
+            // Persist the ack so the notice stays dismissed across GUI
+            // restarts until a new program, or a new problem of one, appears.
             root.updatePrefs({ unenforcedAppsAckSig: root._unenforcedAppRulesAckSig })
             root.emitPrefs()
         } else if (notificationId === "update-available") {

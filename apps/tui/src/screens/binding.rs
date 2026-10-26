@@ -265,8 +265,24 @@ pub fn policy_write(
     edit: impl FnOnce(&mut Map<String, Value>) + Send + 'static,
     done: impl FnOnce(&mut AppState, Result<(), WriteFailure>) + Send + 'static,
 ) -> Job {
+    policy_job(edit, false, done)
+}
+
+/// The bindings the service holds, written back unchanged, so it looks for
+/// the adapters again ("send the binding again").
+pub fn bindings_resend(
+    done: impl FnOnce(&mut AppState, Result<(), WriteFailure>) + Send + 'static,
+) -> Job {
+    policy_job(|_| {}, true, done)
+}
+
+fn policy_job(
+    edit: impl FnOnce(&mut Map<String, Value>) + Send + 'static,
+    resend: bool,
+    done: impl FnOnce(&mut AppState, Result<(), WriteFailure>) + Send + 'static,
+) -> Job {
     Box::new(move |client: &dyn IpcClient| {
-        let result = write_policy(client, edit);
+        let result = write_policy(client, edit, resend);
         Reply::new(move |app| {
             let result = result.map(|(stored, sent)| {
                 if let Some(sent) = &sent {
@@ -290,6 +306,7 @@ type Written = (Option<RoutePolicyDto>, Option<Map<String, Value>>);
 fn write_policy(
     client: &dyn IpcClient,
     edit: impl FnOnce(&mut Map<String, Value>),
+    resend: bool,
 ) -> Result<Written, WriteFailure> {
     let read = IpcOperationName::SnapshotInitialGet;
     let snapshot = client
@@ -307,7 +324,9 @@ fn write_policy(
     edit(&mut request);
     settle_leak_protection(&mut request);
     // Only what changed: a whole row would revert what the tray wrote since.
-    let Some(request) = name_changes(&base, request) else {
+    let Some(request) = name_changes(&base, request.clone())
+        .or_else(|| resend.then(|| bindings_named(request)).flatten())
+    else {
         return Ok((serde_json::from_value(Value::Object(stored)).ok(), None));
     };
     let write = IpcOperationName::RoutePolicyUpdate;
@@ -319,6 +338,21 @@ fn write_policy(
         )
         .map_err(|e| WriteFailure::new(Stage::Write, &e))?;
     Ok((serde_json::from_value(answer).ok(), Some(request)))
+}
+
+/// `request` naming the bindings it holds as its changes; `None` with none.
+fn bindings_named(mut request: Map<String, Value>) -> Option<Map<String, Value>> {
+    let bound: Vec<Value> = [Route::Primary, Route::Secondary]
+        .iter()
+        .map(|route| route.as_str())
+        .filter(|key| request.get(*key).is_some_and(|v| !v.is_null()))
+        .map(Value::from)
+        .collect();
+    if bound.is_empty() {
+        return None;
+    }
+    request.insert("apply-only".to_owned(), Value::from(bound));
+    Some(request)
 }
 
 /// A role change as a policy write.

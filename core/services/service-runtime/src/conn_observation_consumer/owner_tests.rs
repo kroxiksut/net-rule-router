@@ -112,9 +112,11 @@ fn notices(f: &Fixture) -> Vec<(String, &'static str)> {
 #[test]
 fn a_pin_drop_during_its_owners_outage_lands_in_that_owners_list_only() {
     let f = fixture();
+    // Past the notice grace, so the drop is news.
+    f.ring.outage_blocks().outage_began(ALICE, 0);
     f.consumer.consume(
-        &[drop_by(ALICE, PIN, 1, 1_000), drop_by(BOB, PIN, 2, 1_000)],
-        at(1_500),
+        &[drop_by(ALICE, PIN, 1, 16_000), drop_by(BOB, PIN, 2, 16_000)],
+        at(16_500),
     );
 
     let alice = f.ring.outage_blocks().snapshot(ALICE);
@@ -140,13 +142,16 @@ fn a_pin_drop_during_its_owners_outage_lands_in_that_owners_list_only() {
 fn an_outage_is_announced_once_per_episode_and_per_owner() {
     let f = fixture();
     let charlie = "u-charlie";
+    // Both outages are past the notice grace.
+    f.ring.outage_blocks().outage_began(ALICE, 0);
+    f.ring.outage_blocks().outage_began(charlie, 0);
     f.consumer.consume(
         &[
-            drop_by(ALICE, PIN, 1, 1_000),
-            drop_by(ALICE, PIN, 2, 1_100),
-            drop_by(charlie, PIN, 3, 1_200),
+            drop_by(ALICE, PIN, 1, 16_000),
+            drop_by(ALICE, PIN, 2, 16_100),
+            drop_by(charlie, PIN, 3, 16_200),
         ],
-        at(1_500),
+        at(16_500),
     );
     assert_eq!(
         notices(&f),
@@ -157,11 +162,12 @@ fn an_outage_is_announced_once_per_episode_and_per_owner() {
         "a second destination is the same news; another user's outage is not"
     );
 
-    f.ring.outage_blocks().outage_ended(ALICE, 2_000);
+    f.ring.outage_blocks().outage_ended(ALICE, 17_000);
     f.consumer
-        .consume(&[drop_by(ALICE, PIN, 4, 2_100)], at(2_200));
+        .consume(&[drop_by(ALICE, PIN, 4, 17_100)], at(17_200));
     assert_eq!(notices(&f).len(), 2, "a straggler of the ended outage");
 
+    f.ring.outage_blocks().outage_began(ALICE, 580_000);
     f.consumer
         .consume(&[drop_by(ALICE, PIN, 5, 600_000)], at(600_100));
     assert_eq!(
@@ -301,4 +307,38 @@ fn two_users_are_each_labelled_by_their_own_links() {
         Some(EgressRole::Secondary),
         "an unowned connection is judged by Alice's links, where that tunnel is no link of hers"
     );
+}
+
+/// A VPN reconnecting in a few seconds: the block lands in the user's list of
+/// what was blocked, but no card pops up — the link was back before the grace
+/// a status notice waits out.
+#[test]
+fn a_block_in_the_first_seconds_of_an_outage_is_listed_but_not_announced() {
+    let f = fixture();
+    f.ring.outage_blocks().outage_began(ALICE, 10_000);
+    f.consumer
+        .consume(&[drop_by(ALICE, PIN, 1, 13_000)], at(13_500));
+    f.ring.outage_blocks().outage_ended(ALICE, 15_000);
+
+    assert!(notices(&f).is_empty(), "{:?}", notices(&f));
+    assert_eq!(f.ring.outage_blocks().snapshot(ALICE).entries.len(), 1);
+}
+
+/// Gone past the grace, the outage is told once, as before.
+#[test]
+fn a_block_once_the_link_stays_gone_past_the_grace_is_announced_once() {
+    let f = fixture();
+    f.ring.outage_blocks().outage_began(ALICE, 10_000);
+    f.consumer
+        .consume(&[drop_by(ALICE, PIN, 1, 12_000)], at(12_500));
+    assert!(notices(&f).is_empty(), "still inside the grace");
+    f.consumer.consume(
+        &[
+            drop_by(ALICE, PIN, 2, 26_000),
+            drop_by(ALICE, PIN, 3, 27_000),
+        ],
+        at(27_500),
+    );
+
+    assert_eq!(notices(&f), vec![(ALICE.to_owned(), "route-unavailable")]);
 }

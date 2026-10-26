@@ -45,15 +45,6 @@ pub struct FailClosedExemptions {
     /// every program that runs its own DNS. Empty when the OS has not listed
     /// them yet, which permits nothing.
     pub dns_servers: Vec<IpAddr>,
-    /// destinations POSITIVELY established as DIRECT
-    /// (non-rule) hosts (see [`crate::known_direct::KnownDirectRegistry`]): a
-    /// Mode-B steered direct answer, or an FCrDNS forward-confirmed name that
-    /// matches no rule. Unlike [`Self::primary_dest_ips`] these have NO rule
-    /// permit at the ALE layer, so under the block-all each earns BOTH an ALE
-    /// exempt and a packet-layer permit — otherwise a plain primary-path site
-    /// (an unruled direct destination) dies with the tunnel it never used. The caller has
-    /// already subtracted anything secondary-destined.
-    pub known_direct_ips: Vec<Ipv4Addr>,
     /// LUID of the tunnel, so traffic leaving THROUGH it survives a cut. `0`
     /// when the tunnel is unresolved and there is no egress to permit. Carried
     /// here rather than passed alongside because it answers the same question
@@ -238,18 +229,6 @@ pub fn fail_closed_block_all_filters(
     exemptions: &FailClosedExemptions,
     protocols: KillSwitchProtocols,
 ) -> Vec<WfpFilterSpec> {
-    fail_closed_block_all_filters_for(sid, exemptions, protocols, false)
-}
-
-/// [`fail_closed_block_all_filters`] on a machine where other principals also
-/// hold a block: the IPv6 packet block, which no user condition can scope, is
-/// left out so it does not cut them (see [`catch_all_v6_filters`]).
-pub fn fail_closed_block_all_filters_for(
-    sid: &str,
-    exemptions: &FailClosedExemptions,
-    protocols: KillSwitchProtocols,
-    machine_has_other_principals: bool,
-) -> Vec<WfpFilterSpec> {
     if !protocols.any() {
         return Vec::new();
     }
@@ -272,20 +251,6 @@ pub fn fail_closed_block_all_filters_for(
     // Primary interface's connected subnets (LAN, DHCP unicast, local DNS).
     for (net, prefix) in &exemptions.local_subnets {
         filters.push(exempt_subnet(sid, *net, *prefix, weight));
-        weight += 1;
-    }
-    // known-direct destinations. A direct host has no rule
-    // permit at all, so without this the catch-all cuts plain primary-path
-    // sites along with the leak it guards against. Distinct id kind from
-    // `exempt_host`, so an IP that is also a VPN server keeps both filter ids.
-    for ip in exemptions
-        .known_direct_ips
-        .iter()
-        .copied()
-        .filter(|ip| !is_exempt_from_blocking(*ip))
-        .take(KILLSWITCH_MAX_DESTINATIONS)
-    {
-        filters.push(exempt_direct_host(sid, ip, weight));
         weight += 1;
     }
     // opt-in: keep name resolution working over the primary
@@ -351,18 +316,6 @@ pub fn fail_closed_block_all_filters_for(
             filters.push(packet_permit_primary_host(sid, TR, ip, pw));
             pw += 1;
         }
-        // packet-layer twin of the known-direct ALE exempt
-        // above, so ICMP/ping to a learned direct host survives too.
-        for ip in exemptions
-            .known_direct_ips
-            .iter()
-            .copied()
-            .filter(|ip| !is_exempt_from_blocking(*ip))
-            .take(KILLSWITCH_MAX_DESTINATIONS)
-        {
-            filters.push(packet_permit_direct_host(sid, TR, ip, pw));
-            pw += 1;
-        }
         filters.extend(packet_protocol_blocks(sid, DestScope::All, protocols, 0));
     }
 
@@ -375,7 +328,6 @@ pub fn fail_closed_block_all_filters_for(
         &exemptions.bootstrap_server_ips_v6,
         &exemptions.local_subnets_v6,
         protocols,
-        machine_has_other_principals,
     ));
 
     filters

@@ -378,6 +378,7 @@ impl AutoRulesEngine {
         }
         let now_ms = unix_ms(now);
         let mut withheld = false;
+        let mut not_opening = false;
         let updated = {
             let mut guard = self.pending.lock().unwrap_or_else(|p| p.into_inner());
             let Some(entry) = guard.get_mut(sid) else {
@@ -389,6 +390,10 @@ impl AutoRulesEngine {
                     candidate.dto.secondary_reach = Some(answered);
                     touched = true;
                     withheld |= !answered && is_self_signed_signal(&candidate.dto.signal);
+                    // Measured on both links: the site the user opened fails
+                    // where it goes and works where it could go.
+                    not_opening |=
+                        answered && candidate.dto.signal == AUTO_RULE_SIGNAL_MAIN_LINK_BLOCKED;
                 }
             }
             touched.then(|| entry.clone())
@@ -398,6 +403,11 @@ impl AutoRulesEngine {
         }
         if withheld {
             self.announce_unreachable(sid, &host, now_ms);
+        }
+        if not_opening {
+            if let Some(told) = self.site_not_opening.get() {
+                told(sid, &host);
+            }
         }
     }
 
@@ -637,9 +647,18 @@ impl AutoRulesEngine {
             match_kind: AuthoredMatchKind::SuffixDomain,
         };
         self.absorb_names_under(sid, &candidate.dto.proposed_match, now_ms);
+        let parked = (signal == AUTO_RULE_SIGNAL_MAIN_LINK_BLOCKED).then(|| {
+            (
+                candidate.dto.id.clone(),
+                candidate.dto.proposed_match.clone(),
+            )
+        });
         self.park(sid, vec![candidate], now_ms);
         if matches!(self.mode(sid), AutoRulesMode::Suggest) {
             self.announce_pending(sid, now);
+            if let (Some((id, host)), Some(told)) = (parked, self.main_link_blocked_parked.get()) {
+                told(sid, &id, &host);
+            }
         }
         true
     }

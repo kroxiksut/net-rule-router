@@ -64,7 +64,6 @@ fn probe_exemptions() -> FailClosedExemptions {
         primary_dest_ips: Vec::new(),
         allow_dns_over_primary: false,
         dns_servers: Vec::new(),
-        known_direct_ips: Vec::new(),
         // Liveness-probe target (tunnel next-hop) — private-range like the
         // real derived next-hop it stands in for.
         probe_target_ips: vec![Ipv4Addr::new(10, 91, 192, 1)],

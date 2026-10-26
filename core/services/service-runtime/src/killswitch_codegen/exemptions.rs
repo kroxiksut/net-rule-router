@@ -685,41 +685,9 @@ pub(super) fn exempt_host(sid: &str, ip: Ipv4Addr, weight: u64) -> WfpFilterSpec
     }
 }
 
-/// ALE exempt for a KNOWN-DIRECT destination under the
-/// catch-all block-all (see [`FailClosedExemptions::known_direct_ips`]).
-/// Distinct id kind from [`exempt_host`] so an IP that is also a bootstrap
-/// VPN server does not collide filter ids in one desired set.
-/// `pub(super)` because the emitters moved out of `killswitch_codegen` and it
-/// is now the caller.
-pub(super) fn exempt_direct_host(sid: &str, ip: Ipv4Addr, weight: u64) -> WfpFilterSpec {
-    WfpFilterSpec {
-        layer: WfpLayerKey::AleAuthConnectV4,
-        action: WfpAction::Permit,
-        remote_ip: Some(ip),
-        remote_ip_set: Vec::new(),
-        remote_ip_set_v6: Vec::new(),
-        remote_port: None,
-        weight,
-        id: filter_id_for(
-            sid,
-            KILLSWITCH_ROLE,
-            "",
-            "ks-ca-direct-host",
-            &ip.to_string(),
-        ),
-        user_sid: Some(sid.to_string()),
-        app_pattern: None,
-        local_interface_luid: None,
-        remote_subnet: None,
-        remote_subnet_v6: None,
-        ip_protocol: None,
-        remote_subnet_set: Vec::new(),
-    }
-}
-
 /// ALE exempt for a liveness-probe target (the secondary tunnel's next-hop) —
 /// see [`FailClosedExemptions::probe_target_ips`]. Distinct id kind from
-/// [`exempt_host`] / [`exempt_direct_host`] so overlapping IPs keep distinct
+/// [`exempt_host`] so overlapping IPs keep distinct
 /// filter ids in one desired set.
 /// `pub(super)` because the emitters moved out of `killswitch_codegen` and it
 /// is now the caller.

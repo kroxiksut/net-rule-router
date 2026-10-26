@@ -25,6 +25,11 @@ const EVENT_ID_DEGRADED: u32 = 3;
 const EVENT_ID_RECOVERY_REQUIRED: u32 = 4;
 const EVENT_ID_DISABLED: u32 = 5;
 const EVENT_ID_GAVE_UP: u32 = 6;
+const EVENT_ID_DATA_TREE: u32 = 7;
+
+/// Entries named in one record; the rest are counted. Another account chose
+/// how many there are, and a record past the log's size limit is dropped whole.
+const SET_ASIDE_NAMED: usize = 20;
 
 /// The record a state deserves, or `None` when the state is an intention rather
 /// than an outcome.
@@ -105,6 +110,52 @@ pub fn after_crash_record(result: AfterCrashResult) -> SystemEventRecord {
     }
 }
 
+/// What securing the data folder before a start came to, when the operator
+/// should hear of it. It runs before the service has a log of its own.
+#[derive(Clone, Copy, Debug)]
+pub enum DataTreeOutcome<'a> {
+    /// A link in the folder: the service does not start.
+    Refused(&'a str),
+    /// The permissions could not be tightened; the service starts anyway.
+    NotSecured(&'a str),
+    /// Entries another account had placed there, moved out of use.
+    SetAside(&'a [String]),
+}
+
+pub fn data_tree_record(outcome: DataTreeOutcome<'_>) -> SystemEventRecord {
+    let (severity, message) = match outcome {
+        DataTreeOutcome::Refused(reason) => (
+            SystemEventSeverity::Error,
+            format!(
+                "NetRuleRouter service did not start: its data folder cannot be trusted ({reason}). \
+                 Remove the link as an administrator and start the service again."
+            ),
+        ),
+        DataTreeOutcome::NotSecured(detail) => (
+            SystemEventSeverity::Warning,
+            format!("NetRuleRouter service could not tighten the permissions of its data folder: {detail}"),
+        ),
+        DataTreeOutcome::SetAside(moved) => {
+            let mut message = String::from(
+                "NetRuleRouter service found entries another account had placed in its data folder and moved them out of use:",
+            );
+            for entry in moved.iter().take(SET_ASIDE_NAMED) {
+                message.push_str("\n  ");
+                message.extend(entry.chars().take(512));
+            }
+            if moved.len() > SET_ASIDE_NAMED {
+                message.push_str(&format!("\n  and {} more", moved.len() - SET_ASIDE_NAMED));
+            }
+            (SystemEventSeverity::Warning, message)
+        }
+    };
+    SystemEventRecord {
+        severity,
+        event_id: EVENT_ID_DATA_TREE,
+        message,
+    }
+}
+
 /// Change-suppressing writer around a [`SystemEventLogPort`].
 ///
 /// Give it every state report; it writes the ones that are both worth a record
@@ -175,6 +226,33 @@ mod tests {
         let incomplete = after_crash_record(Incomplete);
         assert_eq!(incomplete.severity, SystemEventSeverity::Error);
         assert!(incomplete.message.contains("reset-network"));
+    }
+
+    /// A refused start leaves the service stopped with no log of its own: the
+    /// operator's log is the only place that says why.
+    #[test]
+    fn a_data_folder_refusal_is_an_error_that_names_the_reason() {
+        let record = data_tree_record(DataTreeOutcome::Refused("logs is a link"));
+        assert_eq!(record.severity, SystemEventSeverity::Error);
+        assert!(record.message.contains("logs is a link"));
+    }
+
+    /// Another account picks how many entries it plants; a record past the
+    /// event log's limit would be dropped, saying nothing at all.
+    #[test]
+    fn a_flood_of_planted_entries_still_fits_one_record() {
+        let moved: Vec<String> = (0..10_000)
+            .map(|i| format!("C:\\ProgramData\\NetRuleRouter\\{}{i}", "x".repeat(2_000)))
+            .collect();
+        let record = data_tree_record(DataTreeOutcome::SetAside(&moved));
+        assert!(
+            record.message.chars().count() < 16_000,
+            "{}",
+            record.message.len()
+        );
+        assert!(record
+            .message
+            .ends_with(&format!("and {} more", 10_000 - SET_ASIDE_NAMED)));
     }
 
     #[test]

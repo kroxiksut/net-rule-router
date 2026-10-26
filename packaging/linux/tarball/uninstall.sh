@@ -60,7 +60,7 @@ if [ -x "$NRR_STAGED_SERVICE_BINARY" ]; then
     if nrr_pkg_have_systemd; then
       systemctl disable --now "$NRR_UNIT_NAME" >/dev/null 2>&1 || true
     fi
-    rm -f -- "$NRR_UNIT_FILE" "$NRR_AFTER_CRASH_UNIT_FILE" "$NRR_LOGROTATE_CONFIG" "$NRR_POLKIT_POLICY"
+    rm -f -- "$NRR_UNIT_FILE" "$NRR_AFTER_CRASH_UNIT_FILE" "$NRR_EARLY_UNIT_FILE" "$NRR_EARLY_TABLE_FILE" "$NRR_LOGROTATE_CONFIG" "$NRR_POLKIT_POLICY"
   fi
 fi
 

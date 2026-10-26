@@ -1,0 +1,13 @@
+{
+  "description": "pure.js siteOfferReach",
+  "cases": [
+    { "name": "the additional route answered", "input": { "signal": "main-link-blocked", "reach": true }, "expected": "confirmed" },
+    { "name": "it did not answer there either", "input": { "signal": "main-link-blocked", "reach": false }, "expected": "unreachable" },
+    { "name": "never asked", "input": { "signal": "main-link-blocked", "reach": null }, "expected": "unconfirmed" },
+    { "name": "a companion of a routed site", "input": { "signal": "co-activity", "reach": true }, "expected": "" },
+    { "name": "a placeholder answer", "input": { "signal": "placeholder-answer", "reach": null }, "expected": "" },
+    { "name": "a program", "input": { "signal": "app-main-link-blocked", "reach": true }, "expected": "" },
+    { "name": "a reach that is not a yes or no is not a confirmation", "input": { "signal": "main-link-blocked", "reach": "yes" }, "expected": "unconfirmed" },
+    { "name": "a signal spelled otherwise is another offer", "input": { "signal": "Main-Link-Blocked", "reach": true }, "expected": "" }
+  ]
+}

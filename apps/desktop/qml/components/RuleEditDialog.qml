@@ -187,6 +187,13 @@ Dialog {
             ruleTypeCombo.currentIndex = idx
         }
     }
+    // A new rule for `value` already pointed at `route` (the tray's card about
+    // a site that does not open over the main route).
+    function resetForNewOnRoute(ruleType, value, route) {
+        resetForNew(ruleType, value)
+        localRoute = String(route || "primary")
+        _syncRouteCombo()
+    }
     // "Several rules" holding `names` on `route`, each line set to move a rule
     // that stands on another route (the site check's offer). The user still
     // reviews the plan and confirms it.

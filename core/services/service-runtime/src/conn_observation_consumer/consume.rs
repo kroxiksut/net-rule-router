@@ -304,8 +304,8 @@ impl ConnectionObservationConsumer {
             // FCrDNS reverse-learning: our block of a routable V4 no rule
             // permitted (the browser-cache/DoH blind spot under block-all) is
             // named by the learner; a match caches it for the rule, a confirmed
-            // name no rule matches becomes known-direct for its confirmed
-            // addresses only. A user's own Block rule still blocks. De-duped per batch.
+            // name no rule matches is only reported. A user's own Block rule
+            // still blocks. De-duped per batch.
             if let Some(learner) = self.reverse_dns_learner.as_ref() {
                 if rec.verdict == ConnectionVerdict::Block
                     && rec.blocked_by_nrr == Some(true)
@@ -549,7 +549,7 @@ impl ConnectionObservationConsumer {
                     )
                 },
             );
-            let torn_down = reset.reset_established(&flows);
+            let torn_down = self.own_flow_resets.reset(reset.as_ref(), &flows);
             for ip in flows
                 .iter()
                 .map(|flow| flow.remote.ip())

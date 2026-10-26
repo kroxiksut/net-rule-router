@@ -505,24 +505,22 @@ pub fn decode_rules_snapshot(rules_json: &str, origin: &str) -> Option<ActiveRul
         content.unrecognized.len(),
         "",
     );
+    if !content.inactive.is_empty() && first_report_of(rules_json) {
+        report_inactive_rules(content.inactive.len(), origin);
+    }
     Some(ActiveRulesSnapshot {
         rule_book: content.rule_book,
     })
 }
 
-/// A stored rule book as every service reader reads it: a rule no book may hold
-/// (an address never a destination, an application value the pipeline refuses)
-/// is dropped and the rest loads, so saving what was read leaves it out for good.
+/// A stored rule book as every service reader reads it. A rule no book may
+/// apply stays in it: the decoder keeps it aside, unapplied, and the rules
+/// list shows it as not working until the user deletes it.
 pub(crate) fn read_stored_rules(
     rules_json: &str,
-    origin: &str,
+    _origin: &str,
 ) -> Result<rules_json::CanonicalRulesJsonV1, rules_json::RulesJsonCodecError> {
-    let mut dto = rules_json::from_canonical_string(rules_json)?;
-    let dropped = nrr_domain::rule_value_validation::drop_rules_refused_outright(&mut dto);
-    if !dropped.is_empty() && first_report_of(rules_json) {
-        report_dropped_rules(dropped.len(), origin);
-    }
-    Ok(dto)
+    rules_json::from_canonical_string(rules_json)
 }
 
 /// The stored rules `principal` is under right now, as they were stored.
@@ -570,6 +568,25 @@ pub(crate) fn book_in_force_for(
     }
 }
 
+/// Moves whenever an input the enforcement books are read with moves, from
+/// in-memory counters alone: every activation publishes and withdraws the
+/// applying overlay, and check verdicts, confirmations and `site.*` twins
+/// change a book with no activation. A reader on a hot path checks a
+/// remembered book against it instead of taking the store's lock.
+#[must_use]
+pub fn books_stamp() -> u64 {
+    [
+        crate::applying_revision_overlay::changes(),
+        crate::verify_overlay::changes(),
+        crate::override_grants::pass_generation(),
+        crate::any_zone_sites::generation(),
+    ]
+    .into_iter()
+    .fold(0u64, |stamp, part| {
+        stamp.wrapping_mul(0x0000_0100_0000_01B3).wrapping_add(part)
+    })
+}
+
 /// How a writer names the rules it built from (`base-revision`): the digest
 /// of the stored bytes in force, `""` for none. Taken from the bytes, not a
 /// stored hash, so a revision mid-activation is named like a committed one.
@@ -595,17 +612,14 @@ pub(crate) fn stored_book_in_force_for(
     read_stored_rules(&book.rules_json, book.origin()).ok()
 }
 
-/// The one line saying stored rules no book may hold were dropped on read.
-pub(crate) fn report_dropped_rules(dropped: usize, origin: &str) {
-    if dropped == 0 {
-        return;
-    }
+/// The one line saying stored rules no book may apply are kept but not applied.
+fn report_inactive_rules(kept: usize, origin: &str) {
     tracing::warn!(
         target: "nrr::rules-provider",
-        msg_key = "stored-rules-dropped",
-        dropped,
+        msg_key = "stored-rules-not-applied",
+        kept,
         origin = %origin,
-        "dropped stored rules no rule set may hold",
+        "stored rules no rule set may apply are kept and not applied",
     );
 }
 
@@ -1031,11 +1045,10 @@ mod tests {
         assert!(held.contains(&CanonicalAddressMatch::Zone("123".into())));
     }
 
-    /// A stored rule on an address that is never a destination is gone once
-    /// read: enforcement and the rules table both get the rest of the book, and
-    /// what they would save no longer holds it.
+    /// A stored rule on an address that is never a destination is not
+    /// applied, and the rules table lists it as not working.
     #[test]
-    fn a_stored_rule_on_no_destination_is_dropped_on_read() {
+    fn a_stored_rule_on_no_destination_is_listed_but_not_applied() {
         use crate::ipc_handlers::providers::RulesSnapshotProvider as _;
         use nrr_shared::ipc_payloads::RulesRouteFilter;
         use nrr_shared::rules_json::{
@@ -1075,23 +1088,27 @@ mod tests {
         let rows = crate::production_handlers_misc::ProductionRulesSnapshotProvider::new(conn)
             .rules_snapshot(RulesRouteFilter::All)
             .rows;
-        let row_ids: Vec<&str> = rows.iter().map(|r| r.id.as_str()).collect();
-        assert_eq!(row_ids, ["r-1", "r-4"]);
-
-        let saved = rules_json_codec::encode(&nrr_domain::rules_revision::RulesRevisionContent {
-            unrecognized: Default::default(),
-            rule_book: snap.rule_book,
-            format_version: nrr_domain::rules_revision::RULES_REVISION_FORMAT_VERSION,
-        });
-        let saved = rules_json::to_canonical_string(&saved).expect("json");
-        assert!(!saved.contains("255.255.255.255") && !saved.contains("0.0.0.0"));
+        // Kept and listed as not working, so the user sees them and decides.
+        let listed: Vec<(&str, &str)> = rows
+            .iter()
+            .map(|r| (r.id.as_str(), r.validation_status.as_str()))
+            .collect();
+        assert_eq!(
+            listed,
+            [
+                ("r-1", "valid"),
+                ("r-2", "error"),
+                ("r-3", "error"),
+                ("r-4", "valid")
+            ]
+        );
     }
 
     /// An application row the pipeline refuses — too long, a control
-    /// character, the bare `*` — stored before the check is dropped on read the
-    /// same way; the rest of the book is in force and saving it leaves them out.
+    /// character, the bare `*` — is left out of what is applied the same way;
+    /// the rest of the book is in force.
     #[test]
-    fn a_stored_application_the_pipeline_refuses_is_dropped_on_read() {
+    fn a_stored_application_the_pipeline_refuses_is_not_applied() {
         use nrr_shared::rules_json::{
             AppMatchDto, AppPatternDto, CanonicalRulesJsonV1, RuleDto, RULES_JSON_SCHEMA_VERSION,
         };
@@ -1134,18 +1151,6 @@ mod tests {
         };
         assert_eq!(ids(&snap.rule_book.primary), ["r-1"]);
         assert_eq!(ids(&snap.rule_book.secondary), ["r-5"]);
-
-        let saved = rules_json_codec::encode(&nrr_domain::rules_revision::RulesRevisionContent {
-            unrecognized: Default::default(),
-            rule_book: snap.rule_book,
-            format_version: nrr_domain::rules_revision::RULES_REVISION_FORMAT_VERSION,
-        });
-        let saved = rules_json::to_canonical_string(&saved).expect("json");
-        let mut reread = read_stored_rules(&saved, "test").expect("read");
-        assert!(
-            nrr_domain::rule_value_validation::drop_rules_refused_outright(&mut reread).is_empty()
-        );
-        assert_eq!(reread.primary.len() + reread.secondary.len(), 2);
     }
 
     #[test]

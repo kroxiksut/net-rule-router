@@ -84,6 +84,10 @@ pub const TRACE_BLOCK_BY_OTHER: Key = key(
 );
 pub const TRACE_FROM: Key = key("diag.conn-trace.entries-from", "from");
 pub const TRACE_RELAY_FOR: Key = key("diag.conn-trace.relay-for", "relay for %1");
+pub const TRACE_LEARNED_ROUTE: Key = key(
+    "diag.conn-trace.learned-route",
+    "First connection held at %1 while the address was being learned, then sent over the additional route",
+);
 pub const TRACE_HOST_OTHERS: Key = key("diag.conn-trace.remote-host-others", "%1 (+%2)");
 pub const TRACE_FAKE_IP: Key = key("diag.conn-trace.fake-ip", "fake-IP");
 pub const TRACE_VIA_FAKE_IP: Key = key(
@@ -503,6 +507,10 @@ pub const SITE_MOVE: Key = key(
     "tui.diagnostics.site-move",
     "m: move the sign-in names to the site's route (Rules opens with them, and you confirm)",
 );
+pub const SITE_TRACE: Key = key(
+    "tui.diagnostics.site-trace",
+    "t: open the connection trace to see what the site's connections did",
+);
 pub const ROUTE_DENIED: Key = key("label.block", "Denied");
 pub const DIAG_HELP_SITE: Key = key(
     "tui.diagnostics.help-site-check",
@@ -624,11 +632,76 @@ pub const DIAG_PLAIN_LOG_FILTERS: Key = key(
     "tui.diagnostics.plain-log-filters",
     "In the log: v next level, / and text filter by event type (/ on its own clears), s this session or all history",
 );
+pub const LOGS_CATEGORY: Key = key("diag.logs.filter-category", "Category");
+pub const COLUMN_TIME: Key = key("logs.column.time", "Time");
+pub const COLUMN_LEVEL: Key = key("logs.column.level", "Level");
+pub const COLUMN_CATEGORY: Key = key("logs.column.category", "Category");
+pub const COLUMN_KIND: Key = key("logs.column.kind", "Event type");
+pub const COLUMN_SEQ: Key = key("audit.column.seq", "Seq");
+pub const COLUMN_AUDIT_KIND: Key = key("audit.column.kind", "Kind");
+pub const COLUMN_RESULT: Key = key("audit.column.result", "Result");
+pub const COLUMN_REASON: Key = key("audit.column.reason", "Reason");
+pub const COLUMN_REVISION: Key = key("audit.column.revision", "Revision");
+pub const SORT: Key = key("tui.diagnostics.sort", "Sorted by {column}, {direction}");
+pub const SORT_ASCENDING: Key = key("tui.diagnostics.sort-ascending", "ascending");
+pub const SORT_DESCENDING: Key = key("tui.diagnostics.sort-descending", "descending");
+pub const DIAG_HELP_LOG_SORT: Key = key(
+    "tui.diagnostics.help-log-sort",
+    "In the log: c filters by category. In the log and the audit trail: o sorts by the next column, d reverses the order",
+);
+pub const DIAG_PLAIN_LOG_SORT: Key = key(
+    "tui.diagnostics.plain-log-sort",
+    "In the log: c and text filter by category (c on its own clears). In the log and the audit trail: o next sort column, d reverse order",
+);
+pub const ARCHIVE_LEVEL: Key = key("diag.archive.level.label", "Detail level");
+pub const ARCHIVE_LEVEL_STANDARD: Key =
+    key("diag.archive.level.standard", "Standard (recommended)");
+pub const ARCHIVE_LEVEL_FULL: Key = key("diag.archive.level.diagnostics", "Full diagnostics");
+pub const ARCHIVE_LEVEL_CAPTION: Key = key(
+    "diag.archive.level.caption",
+    "Full diagnostics adds extra cache, storage and decision detail and is less redacted. Only share it with support.",
+);
+pub const ARCHIVE_SESSION_ONLY: Key = key(
+    "diag.archive.session-only",
+    "Only logs from the current session",
+);
+pub const ARCHIVE_BUDGET: Key = key(
+    "diag.archive.log-budget.label",
+    "Log size limit in the archive",
+);
+pub const ARCHIVE_BUDGET_UNLIMITED: Key = key("diag.archive.log-budget.unlimited", "Unlimited");
+pub const ARCHIVE_OPTIONS_HELP: Key = key(
+    "tui.diagnostics.archive-options",
+    "d: change the detail level, o: only this session's logs or all of them, b: change the log size limit",
+);
 
 /// Every `tui.*` and fixed GUI key above, for the test that holds both locale
 /// files to them.
 #[cfg(test)]
 pub const ALL: &[Key] = &[
+    LOGS_CATEGORY,
+    COLUMN_TIME,
+    COLUMN_LEVEL,
+    COLUMN_CATEGORY,
+    COLUMN_KIND,
+    COLUMN_SEQ,
+    COLUMN_AUDIT_KIND,
+    COLUMN_RESULT,
+    COLUMN_REASON,
+    COLUMN_REVISION,
+    SORT,
+    SORT_ASCENDING,
+    SORT_DESCENDING,
+    DIAG_HELP_LOG_SORT,
+    DIAG_PLAIN_LOG_SORT,
+    ARCHIVE_LEVEL,
+    ARCHIVE_LEVEL_STANDARD,
+    ARCHIVE_LEVEL_FULL,
+    ARCHIVE_LEVEL_CAPTION,
+    ARCHIVE_SESSION_ONLY,
+    ARCHIVE_BUDGET,
+    ARCHIVE_BUDGET_UNLIMITED,
+    ARCHIVE_OPTIONS_HELP,
     PAGE,
     PAGE_MORE,
     HELP_PAGES,
@@ -671,6 +744,7 @@ pub const ALL: &[Key] = &[
     TRACE_BLOCK_BY_OTHER,
     TRACE_FROM,
     TRACE_RELAY_FOR,
+    TRACE_LEARNED_ROUTE,
     TRACE_HOST_OTHERS,
     TRACE_FAKE_IP,
     TRACE_VIA_FAKE_IP,
@@ -870,6 +944,7 @@ pub const ALL: &[Key] = &[
     SITE_COOKIES_FIREFOX,
     SITE_COOKIES_NOTE,
     SITE_MOVE,
+    SITE_TRACE,
     ROUTE_DENIED,
     DIAG_HELP_SITE,
     DIAG_PLAIN_SITE,

@@ -20,6 +20,7 @@ base     @libexec@/scripts/reset-network.sh
 base     @libexec@/scripts/lib/service-paths.sh
 
 service  @unitdir@/netrulerouter-after-crash.service
+service  @unitdir@/netrulerouter-early.service
 
 gui      @libexec@/nrr_qt_native_host
 gui      @libexec@/apps/desktop/qml/Main.qml

@@ -149,6 +149,9 @@ Notes:
   beats any network containing it, a network beats the zone it sits in.
   Between two names the longer one wins, between two networks the more
   specific one.
+- A zone of several labels (`corp.example.com`) names one site's subdomains:
+  it ranks with the subdomain rules, without the bare name itself, so it beats
+  `*.example.com`, an exact IP and a network.
 - A **site in every zone** (`bank.*`) covers `bank.com`, `bank.net`,
   `bank.co.uk` and their subdomains with one rule. A rule that names the zone
   (`bank.by`, `*.bank.by`) beats it, whichever route either sends the site to.

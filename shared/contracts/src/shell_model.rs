@@ -317,7 +317,7 @@ const SETTINGS_LOGS_DIAGNOSTICS_FIELDS: [SettingField; 4] = [
     },
 ];
 
-const SETTINGS_ROUTING_BEHAVIOR_FIELDS: [SettingField; 7] = [
+const SETTINGS_ROUTING_BEHAVIOR_FIELDS: [SettingField; 6] = [
     SettingField {
         id: SettingFieldId::DefaultRoutingMode,
         availability: SettingAvailability::Preview,
@@ -342,11 +342,6 @@ const SETTINGS_ROUTING_BEHAVIOR_FIELDS: [SettingField; 7] = [
         id: SettingFieldId::RuleIncludeChildProcesses,
         availability: SettingAvailability::Preview,
         ownership: SettingOwnership::PolicyAffectingPreview,
-    },
-    SettingField {
-        id: SettingFieldId::ShowOtherOsRules,
-        availability: SettingAvailability::Preview,
-        ownership: SettingOwnership::UiPreference,
     },
     SettingField {
         id: SettingFieldId::ZonePriorityOverIp,

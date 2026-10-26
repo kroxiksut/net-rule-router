@@ -17,7 +17,6 @@ impl DnsObservationConsumer {
             present_sids: None,
             collateral_warned: Mutex::new(BoundedRecentSet::new(WARNED_HOSTS_CAP)),
             dns_cache_read: Arc::new(NoopDnsCacheRead),
-            known_direct: None,
             fake_ip_running: Arc::new(|| false),
             secondary_usable: Arc::new(|| true),
             reverse_confirm_memo: Mutex::new(HashMap::new()),
@@ -81,19 +80,6 @@ impl DnsObservationConsumer {
     /// call sites and tests keep the warn-always default.
     pub fn with_fake_ip_gate(mut self, gate: Arc<dyn Fn() -> bool + Send + Sync>) -> Self {
         self.fake_ip_running = gate;
-        self
-    }
-
-    /// inject the known-direct registry so
-    /// [`learn_reverse_confirmed_direct`] can register positively-direct
-    /// destinations for block-all exemptions. Builder-style.
-    ///
-    /// [`learn_reverse_confirmed_direct`]: DnsObservationConsumer::learn_reverse_confirmed_direct
-    pub fn with_known_direct_registry(
-        mut self,
-        registry: Arc<crate::known_direct::KnownDirectRegistry>,
-    ) -> Self {
-        self.known_direct = Some(registry);
         self
     }
 

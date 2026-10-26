@@ -102,9 +102,8 @@ impl RulesFileSection {
 
     /// Returns `true` if this section is platform-specific (not cross-platform).
     ///
-    /// Platform-specific sections are hidden in the GUI by default when the
-    /// running platform does not match. The "Show rules for other operating
-    /// systems" GUI setting makes them visible.
+    /// Another platform's section is shown read only, under «Show rules that
+    /// do not work».
     pub const fn is_platform_specific(self) -> bool {
         matches!(self, Self::Windows | Self::Linux | Self::MacOS)
     }

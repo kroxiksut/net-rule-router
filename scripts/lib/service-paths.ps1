@@ -356,6 +356,10 @@ function Remove-NrrDnsRedirect {
 # platform-api types.rs); a test holds both to the code.
 $NrrWfpFilterKeyPrefix = '4e525246-0001-4e52-'
 $NrrWfpSubLayer = 'c1d2e3f4-5a6b-7c8d-9e0f-1a2b3c4d5e6f'
+# The block a machine shutdown leaves for signed-in people (BOOT_GUARD_IDS in
+# wfp_filter.rs): persistent and in the universal sub-layer, so neither the
+# sub-layer match nor a BFE restart takes it. Removed by key.
+$NrrWfpBootGuardKeys = @('4e525246-0001-4e52-4e52-52424f4f5434', '4e525246-0001-4e52-4e52-52424f4f5436')
 
 $NrrWfpSweepSource = @'
 using System;
@@ -373,7 +377,7 @@ public static class NrrWfpSweep {
     const uint FilterNotFound = 0x80320003;
 
     // { ours found, removed, first error (0 = none) }.
-    public static uint[] Remove(string keyPrefix, Guid subLayer) {
+    public static uint[] Remove(string keyPrefix, Guid subLayer, Guid[] byKey) {
         IntPtr engine;
         uint code = FwpmEngineOpen0(null, RpcAuthnWinNt, IntPtr.Zero, IntPtr.Zero, out engine);
         if (code != 0) return new uint[] { 0, 0, code };
@@ -400,7 +404,7 @@ public static class NrrWfpSweep {
                             Guid key = (Guid)Marshal.PtrToStructure(row, typeof(Guid));
                             if (!key.ToString().StartsWith(keyPrefix, StringComparison.OrdinalIgnoreCase)) continue;
                             Guid layer = (Guid)Marshal.PtrToStructure(new IntPtr(row.ToInt64() + subLayerOffset), typeof(Guid));
-                            if (layer == subLayer) ours.Add(key);
+                            if (layer == subLayer || Array.IndexOf(byKey, key) >= 0) ours.Add(key);
                         }
                     }
                     finally { FwpmFreeMemory0(ref entries); }
@@ -429,7 +433,8 @@ function Remove-NrrWfpFilters {
     Write-Host "--> removing our WFP filters"
     try {
         if (-not ('NrrWfpSweep' -as [type])) { Add-Type -TypeDefinition $NrrWfpSweepSource -ErrorAction Stop }
-        $result = [NrrWfpSweep]::Remove($NrrWfpFilterKeyPrefix, [Guid]$NrrWfpSubLayer)
+        $bootGuard = [Guid[]]($NrrWfpBootGuardKeys | ForEach-Object { [Guid]$_ })
+        $result = [NrrWfpSweep]::Remove($NrrWfpFilterKeyPrefix, [Guid]$NrrWfpSubLayer, $bootGuard)
     }
     catch {
         Write-Warning "WFP filter sweep could not run: $($_.Exception.Message)"

@@ -1126,33 +1126,6 @@ fn only_a_forced_request_runs_the_forced_hook() {
     assert_eq!(forced.load(Ordering::SeqCst), 1);
 }
 
-/// A new exemption must be installed before its answer: the gate forces.
-#[test]
-fn a_new_known_direct_exemption_forces_the_pass_and_a_known_one_does_not() {
-    let forced = Arc::new(AtomicUsize::new(0));
-    let f = Arc::clone(&forced);
-    let reconciler = Arc::new(
-        HookSyncReconciler::new(Arc::new(|| {})).with_forced_hook(Arc::new(move || {
-            f.fetch_add(1, Ordering::SeqCst);
-        })),
-    );
-    let gate = ReconcilingDirectAnswerGate::new(
-        Arc::new(crate::known_direct::KnownDirectRegistry::default()),
-        reconciler,
-        Arc::new(|| true),
-        Duration::from_secs(5),
-    );
-    let addr = [std::net::Ipv4Addr::new(203, 0, 113, 40)];
-    crate::dns_resolver::DirectAnswerGate::gate(&gate, "direct.example", &addr);
-    assert_eq!(forced.load(Ordering::SeqCst), 1);
-    crate::dns_resolver::DirectAnswerGate::gate(&gate, "direct.example", &addr);
-    assert_eq!(
-        forced.load(Ordering::SeqCst),
-        1,
-        "a re-queried exempt host forced another pass"
-    );
-}
-
 /// Each family's first contact reaches its own hook, and a family without
 /// one routes nothing: an AAAA answer never lands in the v4 hook, whose
 /// planner would route nothing for it anyway, and vice versa.
@@ -1795,4 +1768,110 @@ fn the_censored_host_memory_expires_and_is_bounded() {
         );
     }
     assert!(memory.entries.len() <= HostVerdicts::CAPACITY);
+}
+
+/// Counts the reads a DNS path makes of the rule store.
+struct CountingRules {
+    inner: PerUserRules,
+    reads: std::sync::atomic::AtomicUsize,
+}
+
+impl RulesProvider for CountingRules {
+    fn active_rules(&self) -> Option<ActiveRulesSnapshot> {
+        None
+    }
+    fn active_rules_for(&self, principal: &str) -> Option<ActiveRulesSnapshot> {
+        self.reads.fetch_add(1, Ordering::SeqCst);
+        self.inner.active_rules_for(principal)
+    }
+}
+
+/// A DNS query costs no read of the rule store while nothing the books are
+/// made of has moved: the store sits behind the lock every writer takes, and
+/// a query waiting on it is a stalled page load. When something moves, the
+/// next query reads the book again.
+#[test]
+fn a_rule_host_answer_reads_the_store_only_when_the_books_moved() {
+    let rules = Arc::new(CountingRules {
+        inner: PerUserRules(vec![(
+            ALICE,
+            secondary_book(vec![exact_rule("r-s", "tunnel.example")]),
+        )]),
+        reads: std::sync::atomic::AtomicUsize::new(0),
+    });
+    let stamp = Arc::new(std::sync::atomic::AtomicU64::new(1));
+    let seen = Arc::clone(&stamp);
+    let oracle = ActiveRuleHostOracle::new(
+        Arc::clone(&rules) as Arc<dyn RulesProvider>,
+        Arc::new(|| Some(ALICE.to_owned())),
+    )
+    .with_books_stamp(Arc::new(move || seen.load(Ordering::SeqCst)));
+
+    for _ in 0..50 {
+        assert!(oracle.is_rule_host("tunnel.example"));
+        assert!(!oracle.is_rule_host("elsewhere.example"));
+    }
+    assert_eq!(
+        rules.reads.load(Ordering::SeqCst),
+        1,
+        "one read for 100 queries"
+    );
+
+    stamp.store(2, Ordering::SeqCst);
+    assert!(oracle.is_rule_host("tunnel.example"));
+    assert_eq!(
+        rules.reads.load(Ordering::SeqCst),
+        2,
+        "a moved book is read again"
+    );
+}
+
+/// Every question a query asks about its users used to lock the session
+/// registry and copy the list again: is it a rule host, does a guard hold,
+/// whose guard. One query asks the source once; the next query asks afresh,
+/// so a user signing in is seen by the very next query.
+#[test]
+fn one_query_asks_who_is_served_once_and_the_next_query_asks_again() {
+    use crate::dns_resolver::LeakGuardPosture;
+    let (rules, _) = two_users();
+    let asked = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let served: ResolverPrincipalsFn = {
+        let asked = Arc::clone(&asked);
+        Arc::new(move || {
+            asked.fetch_add(1, Ordering::SeqCst);
+            vec![ALICE.to_owned(), BOB.to_owned()]
+        })
+    };
+    let oracle = Arc::new(
+        ActiveRuleHostOracle::new(rules, Arc::new(|| Some(ALICE.to_owned())))
+            .with_served(Arc::clone(&served)),
+    );
+    let guard = HostOwnersLeakGuard::new(
+        Arc::clone(&oracle),
+        Arc::clone(&served),
+        Arc::new(|sid: &str| sid == BOB),
+    );
+    let answer = || {
+        (
+            oracle.is_rule_host("bob-site.example"),
+            guard.blocking_for_host("bob-site.example"),
+            oracle.is_rule_host("nobody.example"),
+            guard.blocking_for_host("alice-site.example"),
+        )
+    };
+    assert_eq!(one_query(answer), (true, true, false, false));
+    assert_eq!(
+        asked.load(Ordering::SeqCst),
+        1,
+        "one ask for the whole query"
+    );
+    assert_eq!(one_query(answer), (true, true, false, false));
+    assert_eq!(
+        asked.load(Ordering::SeqCst),
+        2,
+        "the next query asks afresh"
+    );
+    // Outside a query nothing is remembered.
+    assert_eq!(answer(), (true, true, false, false));
+    assert!(asked.load(Ordering::SeqCst) > 3);
 }

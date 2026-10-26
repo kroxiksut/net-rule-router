@@ -245,6 +245,15 @@ const THREADS: &[(&str, &str, usize, Verdict)] = &[
         ),
     ),
     (
+        "service-runtime/src/site_notice.rs",
+        "nrr-site-notice",
+        1,
+        Verdict::Invisible(
+            "idles on a bounded queue; a stuck tray start only drops later site \
+             notices, and no enforcement pass waits for it",
+        ),
+    ),
+    (
         "service-runtime/src/dns_resolver_service.rs",
         "nrr-dns-resolver",
         1,
@@ -407,14 +416,6 @@ const THREADS: &[(&str, &str, usize, Verdict)] = &[
         "nrr-fakeip-watchdog",
         1,
         Verdict::Leased(ServiceTaskKind::FakeIpWatchdog),
-    ),
-    (
-        "windows-service/src/runtime_deps/build.rs",
-        "nrr-peer-replan",
-        1,
-        Verdict::Bounded(
-            "one pass request per block-all change of another user; the coalescer serialises them",
-        ),
     ),
     (
         "windows-service/src/runtime_deps/build.rs",

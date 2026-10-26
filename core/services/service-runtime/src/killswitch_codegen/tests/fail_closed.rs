@@ -242,20 +242,16 @@ fn a_dual_stack_network_permits_both_families_and_never_a_link_local_resolver() 
     assert_eq!(ids.len(), out.len(), "every filter has its own id");
 }
 
-/// With another principal on the machine nothing v6 is emitted below ALE, and
-/// the resolver keeps its ALE permits.
+/// The v6 resolver keeps its ALE permits under the block of everything.
 #[test]
-fn with_other_principals_the_v6_resolver_keeps_its_ale_permits() {
+fn the_v6_resolver_keeps_its_ale_permits() {
     let resolver: Ipv6Addr = "2001:db8:53::1".parse().unwrap();
     let ex = FailClosedExemptions {
         allow_dns_over_primary: true,
         dns_servers: vec![IpAddr::V6(resolver)],
         ..FailClosedExemptions::default()
     };
-    let out = fail_closed_block_all_filters_for("S", &ex, KillSwitchProtocols::ALL, true);
-    assert!(out
-        .iter()
-        .all(|f| f.layer != WfpLayerKey::OutboundTransportV6));
+    let out = fail_closed_block_all_filters("S", &ex, KillSwitchProtocols::ALL);
     assert_eq!(
         out.iter()
             .filter(|f| f.layer == WfpLayerKey::AleAuthConnectV6 && f.remote_port == Some(53))
@@ -303,72 +299,6 @@ fn fail_closed_block_all_permits_known_primary_at_packet_layer_above_block() {
             blk.weight
         );
     }
-}
-
-#[test]
-fn fail_closed_block_all_exempts_known_direct_at_both_layers() {
-    // a known-DIRECT destination has no
-    // rule permit at all, so it needs BOTH an ALE exempt (TCP/UDP connects)
-    // and a packet-layer permit (ICMP), each above its layer's block.
-    let direct = ip(203, 0, 113, 68);
-    let ex = FailClosedExemptions {
-        known_direct_ips: vec![direct, ip(127, 0, 0, 1)], // loopback filtered
-        ..FailClosedExemptions::default()
-    };
-    let out = fail_closed_block_all_filters("S", &ex, KillSwitchProtocols::ALL);
-    let ale = out
-        .iter()
-        .find(|f| {
-            f.layer == WfpLayerKey::AleAuthConnectV4
-                && f.action == WfpAction::Permit
-                && f.remote_ip == Some(direct)
-        })
-        .expect("known-direct ALE exempt present");
-    let pkt = out
-        .iter()
-        .find(|f| {
-            f.layer == WfpLayerKey::OutboundTransportV4
-                && f.action == WfpAction::Permit
-                && f.remote_ip == Some(direct)
-                && f.ip_protocol.is_none()
-        })
-        .expect("known-direct packet permit present");
-    // Distinct id kinds — an IP that is also a VPN server / known-primary
-    // must not collide filter ids in one desired set.
-    let overlap = FailClosedExemptions {
-        bootstrap_server_ips: vec![direct],
-        bootstrap_server_ips_v6: Vec::new(),
-        primary_dest_ips: vec![direct],
-        known_direct_ips: vec![direct],
-        ..FailClosedExemptions::default()
-    };
-    let dup = fail_closed_block_all_filters("S", &overlap, KillSwitchProtocols::ALL);
-    let ids: std::collections::HashSet<String> =
-        dup.iter().map(|f| format!("{:?}", f.id)).collect();
-    assert_eq!(
-        ids.len(),
-        dup.len(),
-        "server/primary/direct twins keep distinct filter ids"
-    );
-    // Each permit outranks its own layer's block.
-    let ale_block = out
-        .iter()
-        .find(|f| f.action == WfpAction::Block && f.layer == WfpLayerKey::AleAuthConnectV4)
-        .expect("ALE block present");
-    assert!(ale.weight > ale_block.weight);
-    for blk in out
-        .iter()
-        .filter(|f| f.layer == WfpLayerKey::OutboundTransportV4 && f.action == WfpAction::Block)
-    {
-        assert!(pkt.weight > blk.weight);
-    }
-    // The loopback entry is filtered — no per-host permit keyed on it.
-    assert!(
-        !out.iter().any(|f| f.remote_ip == Some(ip(127, 0, 0, 1))),
-        "loopback never earns a known-direct permit"
-    );
-    // ALE half carries the user-SID scope like every kill-switch ALE filter.
-    assert_eq!(ale.user_sid.as_deref(), Some("S"));
 }
 
 #[test]

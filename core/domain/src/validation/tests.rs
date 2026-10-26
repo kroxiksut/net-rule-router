@@ -1508,3 +1508,34 @@ fn a_program_in_an_address_section_names_the_same_section_on_any_host() {
         }
     }
 }
+
+/// One address written as a network or a range is kept as that address: a
+/// deny of it then vetoes every route on the address, and the same address on
+/// both routes is the conflict it is for two IP rules.
+#[test]
+fn one_address_written_as_a_network_or_a_range_is_an_ip_rule() {
+    for written in ["192.0.2.7/32", "192.0.2.7-192.0.2.7"] {
+        let mut rule = domain_rule("r-1", "x");
+        rule.address_match = Some(if written.contains('/') {
+            AddressMatch::Subnet(written.to_string())
+        } else {
+            AddressMatch::IpRange(written.to_string())
+        });
+        let config = config_with_rules(
+            Some(primary()),
+            Some(secondary()),
+            RouteBehaviorMode::PreferPrimary,
+            vec![rule],
+            vec![],
+        );
+        let outcome = validate_and_canonicalize(&config, HostPlatform::Windows);
+        let profile = outcome.profile().expect("profile must be present");
+        assert_eq!(
+            profile.rule_book.primary.rules()[0].address_match,
+            Some(CanonicalAddressMatch::ExactIp(IpAddr::V4(Ipv4Addr::new(
+                192, 0, 2, 7
+            )))),
+            "{written}"
+        );
+    }
+}

@@ -935,6 +935,7 @@ fn a_default_export_does_not_ship_addresses_or_adapter_names() {
             interface_description: "Example Provider TUN driver".into(),
             interface_type: "ethernet".into(),
             oper_status: "up".into(),
+            usable: true,
         }],
         secondary: None,
         rows: vec![row],

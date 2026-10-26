@@ -313,6 +313,10 @@ fn every_status_update_event() -> Vec<StatusUpdateEvent> {
             sid: "S-1-5-21-1".into(),
             host: "unreachable.example".into(),
         },
+        StatusUpdateEvent::LinkKeepsDropping {
+            sid: "S-1-5-21-1".into(),
+            role: "secondary".into(),
+        },
         StatusUpdateEvent::AutoRuleCandidatesChanged {
             sid: "S-1-5-21".into(),
             pending_count: 59,

@@ -59,6 +59,15 @@ fn on_screen(fake: &FakeService) -> AppState {
     app
 }
 
+/// The service calls made, without the administrator's lock the Rules screen
+/// reads beside its list.
+fn rule_calls(fake: &FakeService) -> Vec<IpcOperationName> {
+    fake.operations()
+        .into_iter()
+        .filter(|op| *op != IpcOperationName::ServiceStabilityConfigGet)
+        .collect()
+}
+
 fn winners(app: &AppState) -> Vec<String> {
     app.overlaps
         .shown()
@@ -77,7 +86,7 @@ fn every_key_is_in_both_locale_files() {
 fn pairs_say_which_route_the_sites_take() {
     let fake = service();
     let app = on_screen(&fake);
-    assert_eq!(fake.operations(), vec![IpcOperationName::RulesList]);
+    assert_eq!(rule_calls(&fake), vec![IpcOperationName::RulesList]);
     assert_eq!(
         winners(&app),
         [
@@ -150,7 +159,7 @@ fn a_confirmed_pair_leaves_the_list_until_asked_for() {
     assert_eq!(app.overlaps.pending_count(), 4);
     press(&mut app, KeyCode::Char('C'));
     assert_eq!(app.overlaps.pending_count(), 0);
-    assert_eq!(fake.operations().len(), 1, "confirming is local");
+    assert_eq!(rule_calls(&fake).len(), 1, "confirming is local");
 }
 
 #[test]
@@ -210,7 +219,7 @@ fn sending_over_edits_the_rules_and_waits_for_apply() {
     app.open(ScreenId::Status);
     app.open(ScreenId::Overlaps);
     assert!(app.outbox.take().is_empty());
-    assert_eq!(fake.operations(), vec![IpcOperationName::RulesList]);
+    assert_eq!(rule_calls(&fake), vec![IpcOperationName::RulesList]);
 }
 
 #[test]
@@ -232,7 +241,7 @@ fn the_pairs_follow_an_edit_on_the_rules_screen() {
         wide.contains("Rule changes take effect only after you review and apply them."),
         "{wide}"
     );
-    assert_eq!(fake.operations(), vec![IpcOperationName::RulesList]);
+    assert_eq!(rule_calls(&fake), vec![IpcOperationName::RulesList]);
 }
 
 #[test]

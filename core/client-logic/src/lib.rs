@@ -23,6 +23,8 @@
 //! - [`restore`] — the user's recorded settings brought back to a service
 //!   that lost them.
 //! - [`adapters`] — which adapter may take which route.
+//! - [`app_notice_ack`] — "Don't show" for the application-rule notice, per
+//!   program and problem.
 //! - [`app_routes`] — application groups and virtual machines put on a route.
 //! - [`auto_rules`] — suggested addresses grouped, filtered and sorted.
 //! - [`bulk_rules`] — many rules pasted into the Add form at once, line by
@@ -40,6 +42,8 @@
 //! - [`forwarded`] — whether WSL runs, and asking what it gets when the
 //!   tunnel is down.
 //! - [`notice_mutes`] — hiding whole notice kinds for a while.
+//! - [`public_suffix`] — whether a domain value is a registry of strangers'
+//!   names rather than one service.
 //! - [`service_loss`] — telling the user the service stopped on its own, and the
 //!   recoveries offered.
 //! - [`routing_settings`] — which routing settings a window offers.
@@ -56,6 +60,7 @@
 //!   another VPN, and the gateway list an answer writes.
 
 pub mod adapters;
+pub mod app_notice_ack;
 pub mod app_routes;
 pub mod auto_rules;
 pub mod block_notices;
@@ -70,7 +75,9 @@ pub mod forwarded;
 pub mod full_reset;
 mod js;
 pub mod notice_mutes;
+pub mod passthrough;
 pub mod placeholders;
+pub mod public_suffix;
 pub mod rebase;
 pub mod recent_changes;
 pub mod restore;
@@ -84,6 +91,7 @@ pub mod rule_value_class;
 pub mod rules_overlaps;
 pub mod rules_table;
 pub mod service_loss;
+pub mod site_notice;
 pub mod stability;
 pub mod system_dns;
 pub mod units;

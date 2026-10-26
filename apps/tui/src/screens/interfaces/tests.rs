@@ -448,3 +448,112 @@ fn line_mode_assigns_by_numbered_questions() {
     assert_eq!(request["secondary"]["stable-id"], json!(WIFI));
     assert_snapshot("interfaces-plain", &text);
 }
+
+fn names(app: &AppState) -> Vec<String> {
+    rows(app).iter().map(|row| row.name.clone()).collect()
+}
+
+fn view_text(app: &AppState) -> String {
+    let view = InterfacesScreen.view(app, &texts_en());
+    let mut out = String::new();
+    for panel in &view.panels {
+        out.push_str(&panel.title);
+        out.push('\n');
+        for line in &panel.lines {
+            out.push_str(&line.plain_text());
+            out.push('\n');
+        }
+    }
+    out
+}
+
+fn enter(app: &mut AppState) {
+    handle_key(
+        app,
+        KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+        &texts_en(),
+    );
+}
+
+/// The window's search, unavailable switch and sort, from the keyboard: a
+/// long list on a docked laptop is found by typing, not by scrolling.
+#[test]
+fn the_list_is_searched_narrowed_and_reordered_as_in_the_window() {
+    let mut snapshot = machine();
+    snapshot["adapters"]["rows"][2]["availability"] = json!("unavailable");
+    let unavailable = snapshot["adapters"]["rows"][2]["name"]
+        .as_str()
+        .expect("name")
+        .to_owned();
+    let mut app = app_with(snapshot);
+    let all = names(&app);
+
+    press(&mut app, '/');
+    for c in "host".chars() {
+        press(&mut app, c);
+    }
+    enter(&mut app);
+    assert_eq!(names(&app), vec!["Host-only Network".to_string()]);
+    assert!(
+        view_text(&app).contains("Find: host"),
+        "{}",
+        view_text(&app)
+    );
+
+    press(&mut app, '/');
+    for _ in 0..4 {
+        handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE),
+            &texts_en(),
+        );
+    }
+    enter(&mut app);
+    assert_eq!(names(&app), all, "an empty search shows everything again");
+
+    press(&mut app, 'u');
+    assert!(!names(&app).contains(&unavailable), "{:?}", names(&app));
+    press(&mut app, 'u');
+
+    press(&mut app, 'o');
+    let vpn_first = names(&app);
+    let host_only = vpn_first
+        .iter()
+        .position(|n| n == "Host-only Network")
+        .expect("listed");
+    let wifi = vpn_first.iter().position(|n| n == "Wi-Fi").expect("listed");
+    assert!(
+        host_only < wifi,
+        "a likely virtual adapter leads the VPN order: {vpn_first:?}"
+    );
+}
+
+/// A bound additional adapter the OS reports switched off says so, and says
+/// to turn it back on rather than to send the binding again.
+#[test]
+fn a_switched_off_remembered_adapter_says_to_turn_it_back_on() {
+    let mut snapshot = machine();
+    snapshot["route-policy"]["secondary"]["stable-id"] = json!("{gone}");
+    snapshot["route-policy"]["secondary"]["display-name"] = json!("Corp VPN");
+    snapshot["enforcement-status"] = json!([{ "status": "secondary-down", "role": "secondary" }]);
+    let app = app_with(snapshot);
+    let text = view_text(&app);
+    assert!(text.contains("remembered · switched off"), "{text}");
+    assert!(text.contains("Turn it back on"), "{text}");
+}
+
+/// `e` sends the bindings the service holds back to it, so it finds the
+/// adapter again.
+#[test]
+fn resend_writes_the_route_policy_again() {
+    let fake = service();
+    let mut app = app_with(machine());
+    press(&mut app, 'e');
+    run_jobs(&mut app, &fake);
+    assert_eq!(fake.sent(IpcOperationName::RoutePolicyUpdate).len(), 1);
+    assert!(
+        view_text(&app).contains("sent to the service again"),
+        "{}",
+        view_text(&app)
+    );
+}

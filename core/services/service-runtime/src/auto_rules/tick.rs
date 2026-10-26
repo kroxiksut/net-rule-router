@@ -189,6 +189,20 @@ impl AutoRulesEngine {
                             "hosts that are no longer rules stopped counting as sites to learn around",
                         );
                     }
+                    // A host a rule now covers can never be offered, however
+                    // it got covered; its evidence only holds a slot.
+                    let covered = l.ledger.forget_candidates(|host| {
+                        exclusions.is_rule_host(host)
+                            || exclusions.is_matched_by_existing_rule(host)
+                    });
+                    if covered > 0 {
+                        tracing::debug!(
+                            target: "nrr::auto-rules",
+                            sid = %sid,
+                            covered,
+                            "hosts a rule now covers stopped being tracked as suggestions",
+                        );
+                    }
                     l.ledger
                         .proposals_for(now_ms.max(0) as u64, &exclusions, proposal_use(mode))
                 }
@@ -197,6 +211,11 @@ impl AutoRulesEngine {
         };
         if proposals.is_empty() {
             summary.pending = self.pending_count_under(sid, &snapshot);
+            // A site that signed its own offer while nobody listened has no
+            // companion to bring it up again: told here once someone does.
+            if matches!(mode, AutoRulesMode::Suggest) {
+                summary.published = self.announce_pending(sid, now);
+            }
             return (summary, true);
         }
 

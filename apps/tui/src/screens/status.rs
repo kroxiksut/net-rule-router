@@ -17,12 +17,13 @@ use crossterm::event::{KeyCode, KeyEvent};
 
 use super::{overlaps, Screen};
 use crate::block_route;
+use crate::feed;
 use crate::i18n::{Key, Texts};
 use crate::keys;
 use crate::link::{admin_command, Link};
 use crate::primary_suggestion;
 use crate::restore;
-use crate::state::{enforcement_text, traffic_carried_text, AppState, NoticeLevel, RoutingState};
+use crate::state::{enforcement_text, traffic_carried_text, AppState, RoutingState};
 use crate::view::{Panel, ScreenView, Segment, StateTone, ViewLine};
 use crate::vpn_gateway_trust;
 use crate::vpn_trust;
@@ -46,7 +47,7 @@ impl Screen for StatusScreen {
                 },
                 Panel {
                     title: texts.get(keys::NOTICES_TITLE),
-                    lines: notice_lines(app, texts),
+                    lines: feed::lines(app, texts),
                     feed: true,
                 },
             ],
@@ -56,6 +57,8 @@ impl Screen for StatusScreen {
     fn help(&self) -> &'static [Key] {
         &[
             keys::HELP_STATUS_FEED,
+            feed::HELP,
+            feed::HELP_SITE,
             restore::HELP,
             vpn_trust::HELP,
             vpn_gateway_trust::HELP,
@@ -71,12 +74,17 @@ impl Screen for StatusScreen {
             vpn_gateway_trust::HELP,
             primary_suggestion::HELP,
             block_route::HELP,
+            feed::PLAIN_DISMISS,
+            feed::PLAIN_MUTE,
+            feed::PLAIN_BLOCK,
+            feed::PLAIN_SITE,
         ]
     }
 
-    /// The "To additional route" question takes y, n and Esc first.
+    /// The "To additional route" question and the feed's take their answers
+    /// first.
     fn captures_keys(&self, app: &AppState) -> bool {
-        block_route::asking(app)
+        block_route::asking(app) || feed::question_open(app)
     }
 
     fn on_key(&self, app: &mut AppState, key: KeyEvent) -> bool {
@@ -86,6 +94,9 @@ impl Screen for StatusScreen {
                 KeyCode::Char('n') | KeyCode::Esc => block_route::answer(app, false),
                 _ => false,
             };
+        }
+        if feed::on_key(app, key) {
+            return true;
         }
         match key.code {
             KeyCode::Char('r') => restore::restore(app),
@@ -105,6 +116,9 @@ impl Screen for StatusScreen {
                 "n" => block_route::answer(app, false),
                 _ => false,
             };
+        }
+        if feed::on_line(app, line) {
+            return true;
         }
         match line {
             "r" => restore::restore(app),
@@ -316,6 +330,7 @@ fn routing_lines(app: &AppState, texts: &Texts) -> Vec<ViewLine> {
     if app.restore.offer.is_some() {
         lines.push(ViewLine::text(texts.get(restore::OFFER_LINE)));
     }
+    lines.extend(crate::window_parked::lines(app, texts));
     // Not dismissible here: the terminal keeps no acknowledgement to hide it by.
     if app.link.is_connected()
         && app
@@ -562,8 +577,9 @@ fn pending_vpn_gateway_lines(app: &AppState, texts: &Texts) -> Vec<ViewLine> {
     lines
 }
 
-/// The caller's app rules that found no program: standing while it lasts, so
-/// it sits with the state rather than in the feed.
+/// The caller's app rules that found no program, and found programs their rule
+/// routes nothing of: standing while it lasts, so it sits with the state
+/// rather than in the feed.
 fn unresolved_app_lines(app: &AppState, texts: &Texts) -> Vec<ViewLine> {
     let snapshot = match &app.snapshot {
         Some(snapshot) if app.link.is_connected() => snapshot,
@@ -597,6 +613,23 @@ fn unresolved_app_lines(app: &AppState, texts: &Texts) -> Vec<ViewLine> {
         lines.push(ViewLine::text(
             texts.fill(keys::APP_UNRESOLVED_BODY, &[("apps", summary)]),
         ));
+    }
+    let unrouted = &snapshot.unrouted_app_rules;
+    if !unrouted.is_empty() {
+        if missing.is_empty() {
+            lines.push(ViewLine::new(vec![Segment::state(
+                texts.get(keys::APP_UNROUTED_TITLE),
+                StateTone::Caution,
+            )]));
+        }
+        lines.extend(unrouted.iter().map(|(app, reason)| {
+            let template = match reason.as_str() {
+                "addresses-named-by-rules" => keys::APP_UNROUTED_NAMED,
+                "addresses-shared" => keys::APP_UNROUTED_SHARED,
+                _ => keys::APP_UNROUTED_OTHER,
+            };
+            ViewLine::text(texts.fill(template, &[("app", display_text(app).to_string())]))
+        }));
     }
     lines
 }
@@ -686,32 +719,6 @@ fn rules_state(app: &AppState, reported_down: bool, texts: &Texts) -> Segment {
     } else {
         Segment::state(texts.get(keys::RULES_APPLIED), StateTone::Good)
     }
-}
-
-/// Newest first, so the latest is on screen without scrolling. Notices stay
-/// until the program ends: nothing here disappears on a timer.
-fn notice_lines(app: &AppState, texts: &Texts) -> Vec<ViewLine> {
-    if app.notices.is_empty() {
-        return vec![ViewLine::new(vec![Segment::muted(
-            texts.get(keys::NOTICES_EMPTY),
-        )])];
-    }
-    let mut lines = Vec::new();
-    for notice in app.notices.iter().rev() {
-        let level = match notice.level {
-            NoticeLevel::Warning => {
-                Segment::state(texts.get(keys::LEVEL_WARNING), StateTone::Caution)
-            }
-            NoticeLevel::Info => Segment::strong(texts.get(keys::LEVEL_INFO)),
-        };
-        lines.push(ViewLine::new(vec![
-            level,
-            Segment::plain(": "),
-            Segment::strong(notice.title.clone()),
-        ]));
-        lines.push(ViewLine::text(notice.body.clone()));
-    }
-    lines
 }
 
 #[cfg(test)]
@@ -968,6 +975,45 @@ mod tests {
         let lines = shown(&app);
         assert!(
             lines.iter().any(|l| l.contains("another user's profile")),
+            "{lines:?}"
+        );
+        assert!(
+            !lines.iter().any(|l| l.contains("weren't found")),
+            "{lines:?}"
+        );
+    }
+
+    /// A program that is installed but whose rule routes none of its traffic
+    /// says so with why, and is never told as a program not found; a reason
+    /// this build does not know still says the program is there.
+    #[test]
+    fn a_found_program_its_rule_does_not_route_is_not_told_as_missing() {
+        let mut app = app_at(Link::Connected, Some(&Fixture::healthy()));
+        if let Some(snapshot) = app.snapshot.as_mut() {
+            snapshot.unrouted_app_rules = [
+                ("helper.exe", "addresses-named-by-rules"),
+                ("later.exe", "a-reason-from-a-newer-service"),
+            ]
+            .map(|(a, r)| (a.to_string(), r.to_string()))
+            .into();
+        }
+        let lines = shown(&app);
+        assert!(
+            lines
+                .iter()
+                .any(|l| l == "App rules applied, but some don't route their program"),
+            "{lines:?}"
+        );
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.contains("helper.exe is on this computer")
+                    && l.contains("covered by your rules for sites and addresses")),
+            "{lines:?}"
+        );
+        assert!(
+            lines.iter().any(|l| l
+                == "The program later.exe is on this computer, but its rule routes none of its traffic."),
             "{lines:?}"
         );
         assert!(

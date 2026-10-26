@@ -19,6 +19,43 @@ fn exceeding_the_candidate_cap_evicts_the_least_recently_seen() {
     assert!(ledger.is_tracking_candidate("new.cdn"));
 }
 
+/// A candidate whose fate is decided must not sit on a slot: with the cap
+/// full, the next new host takes the forgotten one's place, not the slot of a
+/// host still earning its offer.
+#[test]
+fn a_forgotten_candidate_frees_its_slot_without_evicting_a_live_one() {
+    let mut ledger = CompanionAffinityLedger::new(CompanionAffinityConfig {
+        max_candidates: 2,
+        ..CompanionAffinityConfig::default()
+    });
+    page_load(&mut ledger, 0, "site.example", SECONDARY, &[]);
+    ledger.observe(1_000, "live.cdn", CoActivityKind::Candidate);
+    ledger.observe(2_000, "settled.cdn", CoActivityKind::Candidate);
+
+    assert_eq!(ledger.forget_candidates(|h| h == "settled.cdn"), 1);
+    ledger.observe(3_000, "new.cdn", CoActivityKind::Candidate);
+
+    assert!(!ledger.is_tracking_candidate("settled.cdn"));
+    assert!(ledger.is_tracking_candidate("live.cdn"), "kept its slot");
+    assert!(ledger.is_tracking_candidate("new.cdn"));
+}
+
+/// A sighting waiting for a window is the same evidence: forgetting the host
+/// must not let the next page load track it straight back.
+#[test]
+fn a_forgotten_candidate_does_not_return_from_sightings_awaiting_a_window() {
+    let mut ledger = CompanionAffinityLedger::with_defaults();
+    ledger.observe(500, "settled.cdn", CoActivityKind::CandidateInUse);
+    ledger.forget_candidates(|h| h == "settled.cdn");
+    ledger.observe(
+        1_000,
+        "site.example",
+        CoActivityKind::Anchor { route: SECONDARY },
+    );
+
+    assert!(!ledger.is_tracking_candidate("settled.cdn"));
+}
+
 #[test]
 fn exceeding_the_anchor_cap_evicts_and_sweeps_pair_statistics() {
     let mut ledger = CompanionAffinityLedger::new(CompanionAffinityConfig {

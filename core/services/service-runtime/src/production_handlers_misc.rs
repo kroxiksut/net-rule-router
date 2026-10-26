@@ -1742,15 +1742,6 @@ impl ProductionFailClosedProbe {
         }
     }
 
-    /// Match the wire-formatted oper_status against the documented
-    /// "up" marker. `adapter_to_entry` formats via `{:?}` on
-    /// `IfOperStatus::Up` → "Up". Any other value (Down, Testing,
-    /// Dormant, Unknown, NotPresent, …) is treated as offline for the
-    /// purposes of fail-closed evaluation.
-    fn adapter_is_up(entry: &crate::ipc_handlers::payloads::AdapterEntry) -> bool {
-        entry.oper_status == "Up"
-    }
-
     fn emit_transition_if_changed(&self, new_state: bool) {
         let mut guard = match self.last_emitted.lock() {
             Ok(g) => g,
@@ -1812,13 +1803,13 @@ impl crate::ipc_handlers::providers::FailClosedStateProbe for ProductionFailClos
         // always misses, which makes `secondary_offline` permanently
         // `true` — reuse the same matching rules the route coordinator
         // uses for the live adapter list.
-        let adapter = adapters.iter().find(|a| {
-            crate::route_coordinator::adapter_entry_binding_matches(a, &secondary.stable_id)
-        });
-        let secondary_offline = match adapter {
-            None => true,
-            Some(a) => !Self::adapter_is_up(a),
-        };
+        // The coordinator's own check, prior ids and IPv4 included: the banner
+        // must say what the service does.
+        let secondary_offline = !crate::route_coordinator::bound_adapter_usable(
+            adapters,
+            &secondary.stable_id,
+            &secondary.known_stable_ids,
+        );
         // The banner mirrors the actual blocking: with protection off nothing
         // blocks, and the ordinary secondary-down notice is the warning.
         let fail_closed_active = policy.leak_protection.is_on() && secondary_offline;
@@ -1837,6 +1828,7 @@ fn adapter_to_entry(
         )
     });
     let stable_id = info.stable_id();
+    let usable = crate::route_coordinator::BoundCandidate::usable(&info);
     nrr_shared::ipc_payloads::AdapterEntry {
         persistent_id: stable_id,
         adapter_name: info.adapter_name.clone(),
@@ -1846,6 +1838,7 @@ fn adapter_to_entry(
         interface_description: info.description,
         interface_type: format!("{:?}", info.interface_type),
         oper_status: format!("{:?}", info.oper_status),
+        usable,
     }
 }
 

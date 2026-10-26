@@ -165,6 +165,10 @@ pub struct RulesFilters<'a> {
     pub auto_only: bool,
     /// Only the rules changed lately («Recent»).
     pub recent_only: bool,
+    /// Leave out the rules that do not work (a refused value): the table's
+    /// «Show rules that do not work» switched off. Asking for the errors
+    /// shows them anyway.
+    pub hide_not_working: bool,
     pub search: &'a str,
 }
 
@@ -188,6 +192,12 @@ pub fn rule_passes_filters(
         StatusFilter::Overridden => is_overridden(),
     };
     if !status_ok {
+        return false;
+    }
+    if filters.hide_not_working
+        && filters.status != StatusFilter::WithErrors
+        && row.validation_status == "error"
+    {
         return false;
     }
     if !matches!(filters.rule_type, "" | "all")

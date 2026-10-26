@@ -128,6 +128,18 @@ pub fn plan_app_kill_switch(
     app_patterns: &[String],
     protocols: KillSwitchProtocols,
 ) -> Vec<FlowRule> {
+    plan_app_kill_switch_for(sid, app_patterns, protocols, false)
+}
+
+/// [`plan_app_kill_switch`] under the principal's
+/// `app_rules_take_all_addresses`: with it on, the pin's block outranks the
+/// main-link rule permits ([`PrecedenceClass::AppTakeover`]).
+pub fn plan_app_kill_switch_for(
+    sid: &str,
+    app_patterns: &[String],
+    protocols: KillSwitchProtocols,
+    app_takeover: bool,
+) -> Vec<FlowRule> {
     if !(protocols.tcp || protocols.udp) {
         return Vec::new();
     }
@@ -142,7 +154,7 @@ pub fn plan_app_kill_switch(
             flows.push(ks_flow(
                 &principal,
                 Verdict::Permit,
-                PrecedenceClass::KillSwitchPermit,
+                app_class(idx, app_takeover, PrecedenceClass::KillSwitchPermit),
                 dst,
                 app_scope(pattern),
                 EgressConstraint::OnlyVia(EgressRef::Secondary),
@@ -153,6 +165,17 @@ pub fn plan_app_kill_switch(
         }
     }
     flows
+}
+
+/// The class of the `idx`-th app's pin or block: raised over the main-link
+/// rules under the takeover setting while it fits that band, as
+/// `killswitch_codegen::app_block_band` decides for the live filters.
+fn app_class(idx: usize, app_takeover: bool, otherwise: PrecedenceClass) -> PrecedenceClass {
+    if app_takeover && idx < crate::wfp_bands::APP_TAKEOVER_MAX_APPS {
+        PrecedenceClass::AppTakeover
+    } else {
+        otherwise
+    }
 }
 
 /// Every destination of either family: `Any` lowers to the v4 layer, the
@@ -344,6 +367,17 @@ pub fn plan_fail_closed_apps(
     app_patterns: &[String],
     protocols: KillSwitchProtocols,
 ) -> Vec<FlowRule> {
+    plan_fail_closed_apps_for(sid, app_patterns, protocols, false)
+}
+
+/// [`plan_fail_closed_apps`] under the principal's
+/// `app_rules_take_all_addresses`, as [`plan_app_kill_switch_for`].
+pub fn plan_fail_closed_apps_for(
+    sid: &str,
+    app_patterns: &[String],
+    protocols: KillSwitchProtocols,
+    app_takeover: bool,
+) -> Vec<FlowRule> {
     if !(protocols.tcp || protocols.udp) {
         return Vec::new();
     }
@@ -354,11 +388,12 @@ pub fn plan_fail_closed_apps(
         .enumerate()
         .flat_map(|(idx, pattern)| {
             let principal = &principal;
+            let class = app_class(idx, app_takeover, PrecedenceClass::KillSwitchBlock);
             BOTH_FAMILIES.into_iter().map(move |dst| {
                 ks_flow(
                     principal,
                     Verdict::Block,
-                    PrecedenceClass::KillSwitchBlock,
+                    class,
                     dst,
                     app_scope(pattern),
                     EgressConstraint::Any,
@@ -440,7 +475,9 @@ pub fn plan_doh_dot_block(sid: &str, resolver_ips: &[IpAddr], block_dot: bool) -
 /// selected.
 // Mirrors `FailClosedExemptions` field-by-field as plain slices — the
 // equivalence tests drive both sides from the same locals, and a struct here
-// would just duplicate the codegen's.
+// would just duplicate the codegen's. `open_hosts` has no codegen field: they
+// are hosts no rule permit lets out, open at both layers — what the forwarded
+// blanket states as its floor.
 #[allow(clippy::too_many_arguments)]
 pub fn plan_fail_closed_block_all(
     sid: &str,
@@ -448,7 +485,7 @@ pub fn plan_fail_closed_block_all(
     probe_target_ips: &[Ipv4Addr],
     local_subnets: &[(Ipv4Addr, u8)],
     primary_dest_ips: &[Ipv4Addr],
-    known_direct_ips: &[Ipv4Addr],
+    open_hosts: &[Ipv4Addr],
     v6: Ipv6Exemptions<'_>,
     allow_dns_over_primary: bool,
     dns_servers: &[Ipv4Addr],
@@ -461,7 +498,7 @@ pub fn plan_fail_closed_block_all(
         probe_target_ips,
         local_subnets,
         primary_dest_ips,
-        known_direct_ips,
+        open_hosts,
         v6,
         allow_dns_over_primary,
         &dns,
@@ -478,7 +515,7 @@ pub fn plan_fail_closed_block_all_with_dns(
     probe_target_ips: &[Ipv4Addr],
     local_subnets: &[(Ipv4Addr, u8)],
     primary_dest_ips: &[Ipv4Addr],
-    known_direct_ips: &[Ipv4Addr],
+    open_hosts: &[Ipv4Addr],
     v6: Ipv6Exemptions<'_>,
     allow_dns_over_primary: bool,
     dns_servers: &[IpAddr],
@@ -570,13 +607,10 @@ pub fn plan_fail_closed_block_all_with_dns(
         }
         e += 1;
     }
-    // Known-DIRECT destinations: an ALE exempt now (matching
-    // the codegen's within-layer order: …, subnets, direct, dns-53, block); the
-    // packet twin is emitted after the known-primary permits below. Unlike
-    // known-primary these have NO rule permit at all, so the ALE half is what
-    // keeps a plain primary-path site reachable under the block-all.
-    // Mirrors `killswitch_codegen::exempt_direct_host`.
-    for ip in known_direct_ips
+    // Open hosts: a connect-layer exempt now, the packet twin after the
+    // known-primary permits below. No rule permit lets them out, so the
+    // connect half is what keeps them reachable.
+    for ip in open_hosts
         .iter()
         .copied()
         .filter(|ip| !nrr_platform_api::is_exempt_from_blocking(*ip))
@@ -618,10 +652,8 @@ pub fn plan_fail_closed_block_all_with_dns(
             ));
             e += 1;
         }
-        // Packet twin of the known-direct ALE exempt above, after the
-        // known-primary permits (the codegen's packet-layer emission order).
-        // Mirrors `killswitch_codegen::packet_permit_direct_host`.
-        for ip in known_direct_ips
+        // Packet twin of the open-host exempt above.
+        for ip in open_hosts
             .iter()
             .copied()
             .filter(|ip| !nrr_platform_api::is_exempt_from_blocking(*ip))

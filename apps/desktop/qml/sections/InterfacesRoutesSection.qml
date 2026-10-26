@@ -98,29 +98,7 @@ ColumnLayout {
     }
 
     function adapterPassesFilter(item) {
-        if (!item) return false
-        if (!showUnavailable && String(item.availability) === "unavailable") return false
-        var q = adapterSearchFilter.toLowerCase().trim()
-        if (q !== "") {
-            var hay = (String(item.name || "") + " "
-                + String(item.description || "") + " "
-                + String(item.ip || "") + " "
-                + String(item.dns || "") + " "
-                + String(item.type || "")).toLowerCase()
-            if (hay.indexOf(q) < 0) return false
-        }
-        return true
-    }
-    function isLoopbackAdapter(item) {
-        if (!item) return false
-        var n = String(item.name || "").toLowerCase()
-        var t = String(item.type || "").toLowerCase()
-        var d = String(item.description || "").toLowerCase()
-        var c = String((item.derivedAssessment || {}).classification || "").toLowerCase()
-        return n.indexOf("loopback") >= 0
-            || t.indexOf("loopback") >= 0
-            || d.indexOf("loopback") >= 0
-            || c.indexOf("loopback") >= 0
+        return Pure.adapterPassesFilter(item, showUnavailable, adapterSearchFilter)
     }
     // Raw OS-reported order — NRR's own DNS redirect (Mode B) uses NRPT, never
     // a per-adapter rewrite, so a loopback entry here is third-party software.
@@ -143,18 +121,6 @@ ColumnLayout {
         var loopback = parts.filter(function(p) { return p === "127.0.0.1" })
         return rest.concat(loopback).join(", ")
     }
-    function hasConfiguredDns(item) {
-        if (!item) return false
-        var raw = String(item.dns || "").trim()
-        if (raw === "") return false
-        var lc = raw.toLowerCase()
-        // Backend uses the literal "—" / "none" / "(none)" / "—" placeholders
-        // when an adapter has no DNS resolvers configured. Treat them as
-        // "no DNS" so the default sort matches the user expectation.
-        if (lc === "—" || lc === "-" || lc === "none" || lc === "(none)" || lc === "n/a")
-            return false
-        return true
-    }
     function applyAdapterSort() {
         if (root.interfacesModel.count <= 1) return
         var snap = []
@@ -169,55 +135,7 @@ ColumnLayout {
         }
     }
     function classificationRank(item) {
-        // Higher score = should appear earlier. Loopback always sinks to the
-        // bottom regardless of the active sort key — it's a local-only
-        // address space, never a routing target.
-        if (!item) return -100000
-        if (isLoopbackAdapter(item)) return -10000
-
-        // Adapters with assigned roles always pin to the top in the order
-        // primary → secondary, regardless of the active sort key. Once the
-        // user has bound a role, that adapter is operationally important
-        // and shouldn't get buried under heuristic scores. The +1_000_000
-        // / +900_000 bumps comfortably exceed every other contribution
-        // below so they win the sort. The two roles are kept adjacent so
-        // the user sees them side-by-side.
-        var role = String(item.selectedRole || "")
-        if (role === "primary") return 1000000
-        if (role === "secondary") return 900000
-
-        var rec = (item.recommendation && item.recommendation.class) || ""
-        var da = item.derivedAssessment || {}
-        var vpn = String(da.vpnTunnelLikelihood || "")
-        var virt = String(da.virtualInterfaceLikelihood || "")
-        var avail = String(item.availability || "")
-        var dns = hasConfiguredDns(item) ? 1 : 0
-
-        if (adapterSortBy === "vpn-like") {
-            if (vpn === "likely") return 100 + dns
-            if (vpn === "possible") return 60 + dns
-            if (virt === "likely") return 40 + dns
-            if (virt === "possible") return 25 + dns
-            return dns
-        }
-        if (adapterSortBy === "primary-candidate") {
-            if (rec === "preferred-primary") return 100 + dns
-            if (rec === "allowed-but-not-recommended") return 40 + dns
-            if (rec === "preferred-secondary") return 30 + dns
-            if (rec === "not-recommended") return dns
-            return 10 + dns
-        }
-        // Default sort: adapters that match the backend's recommendation
-        // AND have DNS configured land at the top, then other available
-        // adapters, then unavailable, then loopback (handled above).
-        var score = 0
-        if (avail === "available") score += 50
-        else if (avail === "requires-check") score += 20
-        if (dns === 1) score += 30
-        if (rec === "preferred-primary") score += 40
-        else if (rec === "preferred-secondary") score += 25
-        else if (rec === "allowed-but-not-recommended") score += 10
-        return score
+        return Pure.adapterSortRank(item, adapterSortBy)
     }
 
     // The rows are not this machine's. Stated before anything else on the

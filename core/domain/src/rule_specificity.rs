@@ -10,7 +10,9 @@
 //! Pure and total: no I/O, no clock, ordering fully determined by the inputs.
 
 use crate::canonical::{CanonicalAddressMatch, CanonicalRule, CanonicalRuleBook, CanonicalRuleSet};
-use crate::decision_matching::{match_any_zone_domain, match_suffix_domain, match_zone};
+use crate::decision_matching::{
+    match_any_zone_domain, match_suffix_domain, match_zone, zone_ranks_as_suffix,
+};
 
 /// Strength of a rule set's claim on one hostname. Ordered least to most
 /// specific, so `Ord` answers "whose claim wins" directly.
@@ -27,6 +29,9 @@ pub enum MatchSpecificity {
         /// Longer suffix = narrower claim (`*.cdn.example.com` beats
         /// `*.example.com`).
         label_len: usize,
+        /// A zone of several labels leaves out its own name, so it is the
+        /// narrower of two equally long claims.
+        without_apex: bool,
     },
     /// The rule names the host outright. Nothing is more specific.
     ExactFqdn,
@@ -46,7 +51,7 @@ pub fn match_specificity(
     set.rules()
         .iter()
         .filter(|rule| rule.enabled)
-        .filter_map(|rule| rule_match_specificity(hostname, rule, book))
+        .filter_map(|rule| claim_in_set(hostname, rule, set, book))
         .max()
 }
 
@@ -58,6 +63,22 @@ pub fn rule_match_specificity(
     rule: &CanonicalRule,
     book: &CanonicalRuleBook,
 ) -> Option<MatchSpecificity> {
+    let set = if book.primary.rules().iter().any(|r| std::ptr::eq(r, rule)) {
+        &book.primary
+    } else {
+        &book.secondary
+    };
+    claim_in_set(hostname, rule, set, book)
+}
+
+/// One rule's claim, `set` being the set that holds it: a zone beside `*.` of
+/// its name in that set claims no more than that suffix does.
+fn claim_in_set(
+    hostname: &str,
+    rule: &CanonicalRule,
+    set: &CanonicalRuleSet,
+    book: &CanonicalRuleBook,
+) -> Option<MatchSpecificity> {
     match &rule.address_match {
         Some(CanonicalAddressMatch::ExactFqdn(name)) if name == hostname => {
             Some(MatchSpecificity::ExactFqdn)
@@ -67,16 +88,24 @@ pub fn rule_match_specificity(
         {
             Some(MatchSpecificity::SuffixDomain {
                 label_len: label.len(),
+                without_apex: false,
             })
         }
         Some(CanonicalAddressMatch::AnyZoneDomain(base)) => match_any_zone_domain(hostname, base)
             .filter(|named| !book.names_suffix_outright(named))
             .map(|named| MatchSpecificity::SuffixDomain {
                 label_len: named.len(),
+                without_apex: false,
             }),
         Some(CanonicalAddressMatch::Zone(label)) if match_zone(hostname, label) => {
-            Some(MatchSpecificity::Zone {
-                label_len: label.len(),
+            let label_len = label.len();
+            Some(if zone_ranks_as_suffix(label) {
+                MatchSpecificity::SuffixDomain {
+                    label_len,
+                    without_apex: !set.holds_suffix(label, &rule.app_match),
+                }
+            } else {
+                MatchSpecificity::Zone { label_len }
             })
         }
         _ => None,
@@ -124,10 +153,18 @@ mod tests {
 
     #[test]
     fn a_name_beats_a_suffix_beats_a_zone() {
-        assert!(MatchSpecificity::ExactFqdn > MatchSpecificity::SuffixDomain { label_len: 99 });
         assert!(
-            MatchSpecificity::SuffixDomain { label_len: 1 }
-                > MatchSpecificity::Zone { label_len: 99 }
+            MatchSpecificity::ExactFqdn
+                > MatchSpecificity::SuffixDomain {
+                    label_len: 99,
+                    without_apex: false,
+                }
+        );
+        assert!(
+            MatchSpecificity::SuffixDomain {
+                label_len: 1,
+                without_apex: false,
+            } > MatchSpecificity::Zone { label_len: 99 }
         );
     }
 
@@ -202,6 +239,31 @@ mod tests {
     }
 
     #[test]
+    fn a_zone_of_several_labels_outranks_the_wider_suffix_it_sits_under() {
+        let zone = set(vec![rule(
+            "z",
+            CanonicalAddressMatch::Zone("corp.example.com".into()),
+        )]);
+        let wide = set(vec![suffix("s", "example.com")]);
+        let host = "db.corp.example.com";
+        assert!(claim_in_own_book(host, &zone) > claim_in_own_book(host, &wide));
+        assert_eq!(claim_in_own_book("corp.example.com", &zone), None);
+
+        // Against `*.` of its own name the zone, leaving out the apex, is the
+        // narrower claim; beside that suffix in its own set it adds nothing.
+        let same = set(vec![suffix("s", "corp.example.com")]);
+        assert!(claim_in_own_book(host, &zone) > claim_in_own_book(host, &same));
+        let both = set(vec![
+            rule("z", CanonicalAddressMatch::Zone("corp.example.com".into())),
+            suffix("s", "corp.example.com"),
+        ]);
+        assert_eq!(
+            claim_in_own_book(host, &both),
+            claim_in_own_book(host, &same)
+        );
+    }
+
+    #[test]
     fn a_suffix_covers_the_apex_it_names() {
         let s = set(vec![rule(
             "r",
@@ -222,12 +284,18 @@ mod tests {
         assert_eq!(match_specificity(host, &book.secondary, &book), None);
         assert_eq!(
             match_specificity(host, &book.primary, &book),
-            Some(MatchSpecificity::SuffixDomain { label_len: 10 })
+            Some(MatchSpecificity::SuffixDomain {
+                label_len: 10,
+                without_apex: false,
+            })
         );
         // Elsewhere the any-zone rule still claims its site.
         assert_eq!(
             match_specificity("www.example.com", &book.secondary, &book),
-            Some(MatchSpecificity::SuffixDomain { label_len: 11 })
+            Some(MatchSpecificity::SuffixDomain {
+                label_len: 11,
+                without_apex: false,
+            })
         );
     }
 
@@ -236,7 +304,10 @@ mod tests {
         let s = set(vec![any_zone("s", "google")]);
         assert_eq!(
             claim_in_own_book("www.google.com.vn", &s),
-            Some(MatchSpecificity::SuffixDomain { label_len: 13 })
+            Some(MatchSpecificity::SuffixDomain {
+                label_len: 13,
+                without_apex: false,
+            })
         );
     }
 }

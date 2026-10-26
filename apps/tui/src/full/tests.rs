@@ -195,11 +195,11 @@ fn a_new_notice_shows_in_the_bottom_line_then_only_in_the_feed() {
 fn a_foreign_name_leaves_no_dangerous_character_in_the_frame() {
     let mut app = limited();
     let at = Instant::now();
-    app.notices.push(crate::state::Notice {
-        level: NoticeLevel::Warning,
-        title: "gnp\u{202E}.exe \u{1b}]0;x\u{7}".into(),
-        body: String::new(),
-    });
+    app.notices.push(crate::state::Notice::new(
+        NoticeLevel::Warning,
+        "gnp\u{202E}.exe \u{1b}]0;x\u{7}".into(),
+        String::new(),
+    ));
     app.last_notice_at = Some(at);
     let buffer = draw_buffer(&app, COLOUR, 80, 40, at);
     let mut shown = String::new();

@@ -20,7 +20,6 @@ use nrr_platform_api::dns::DnsResolverPort;
 use nrr_shared::RouteRole;
 use nrr_storage::repository::CacheRepository;
 
-use crate::dns_observation_consumer::rule_covers;
 use crate::fqdn_cache_lookup::FqdnCacheLookup;
 use crate::per_sid_orchestrator::RulesProvider;
 use crate::service_tasks::ServiceTaskKind;
@@ -305,11 +304,9 @@ impl super::stack::FlowObserver for CompositeFlowObserver {
 
 /// [`RouteSelector`] over the active rule book.
 ///
-/// A hostname that matches an enabled **secondary** rule for the routing-active
-/// principal leaves over the secondary link; everything else takes the primary.
-/// Hosts are matched by the same `rule_covers` the DNS oracle and the observer
-/// use, so fake-IP steers a host to the link the filters do — which is also why
-/// a rule enforcement skips for its shape is left out.
+/// A hostname leaves over the link the rule engine picks for it in the
+/// routing-active principal's book; one no rule names takes the primary. A
+/// rule enforcement skips for its shape is left out, as the filters leave it.
 pub struct RuleBookRouteSelector {
     rules_provider: Arc<dyn RulesProvider>,
     active_sid: Arc<dyn Fn() -> Option<String> + Send + Sync>,
@@ -395,71 +392,62 @@ fn steers(rule: &nrr_domain::canonical::CanonicalRule) -> bool {
     rule.enabled && crate::wfp_codegen::rule_shape_enforced(rule)
 }
 
-fn secondary_covers(book: &nrr_domain::canonical::CanonicalRuleBook, hostname: &str) -> bool {
-    book.secondary
-        .rules()
-        .iter()
-        .any(|r| steers(r) && covers_in_book(book, r, hostname))
-}
-
-/// `base.*` yields to a rule naming its zone outright, as in the engine.
-fn covers_in_book(
-    book: &nrr_domain::canonical::CanonicalRuleBook,
-    rule: &nrr_domain::canonical::CanonicalRule,
-    hostname: &str,
-) -> bool {
-    match &rule.address_match {
-        Some(nrr_domain::canonical::CanonicalAddressMatch::AnyZoneDomain(base)) => {
-            nrr_domain::decision_matching::match_any_zone_domain(hostname, base)
-                .is_some_and(|named| !book.names_suffix_outright(named))
-        }
-        _ => rule_covers(rule, hostname),
-    }
-}
-
-/// Whether the narrowest name rule claiming `hostname` in `book` is a block.
-/// A block and a route equally narrow leave it blocked.
-fn book_blocks(book: &nrr_domain::canonical::CanonicalRuleBook, hostname: &str) -> bool {
-    use nrr_domain::rule_specificity::rule_match_specificity;
-    let mut block = None;
-    let mut route = None;
-    for rule in book
-        .primary
-        .rules()
-        .iter()
-        .chain(book.secondary.rules())
-        .filter(|r| steers(r) && r.app_match.is_none())
-    {
-        let claim = rule_match_specificity(hostname, rule, book);
-        match rule.action {
-            nrr_domain::RuleAction::Block => block = block.max(claim),
-            nrr_domain::RuleAction::Route | nrr_domain::RuleAction::Verify => {
-                route = route.max(claim)
-            }
-        }
-    }
-    block.is_some() && block >= route
-}
-
-/// The route `book` gives `hostname`, `None` when it blocks it. One function
-/// for the routing user and every other served user: the relay's dial is the
+/// The route `book` gives `hostname`, `None` when it blocks it: the engine's
+/// answer, so the narrower rule wins here as everywhere. One function for the
+/// routing user and every other served user: the relay's dial is the
 /// service's own and passes the filters of the user it carries for, so that
 /// user's block is honoured here or nowhere.
 fn route_in_book(
     book: Option<&nrr_domain::canonical::CanonicalRuleBook>,
     hostname: &str,
 ) -> Option<RouteRole> {
+    use nrr_domain::canonical::{CanonicalRuleBook, CanonicalRuleSet};
+    use nrr_domain::decision_matching::{RequestedRouteDecision, ZonePriorityPolicy};
     let Some(book) = book else {
         return Some(RouteRole::Primary);
     };
-    if book_blocks(book, hostname) {
-        return None;
-    }
-    Some(if secondary_covers(book, hostname) {
-        RouteRole::Secondary
+    // A rule enforcement skips steers nothing here either.
+    let steering;
+    let book = if book
+        .primary
+        .rules()
+        .iter()
+        .chain(book.secondary.rules())
+        .all(steers)
+    {
+        book
     } else {
-        RouteRole::Primary
-    })
+        let only = |set: &CanonicalRuleSet| {
+            CanonicalRuleSet::from_rules(
+                set.rules().iter().filter(|r| steers(r)).cloned().collect(),
+            )
+        };
+        steering = CanonicalRuleBook {
+            primary: only(&book.primary),
+            secondary: only(&book.secondary),
+        };
+        &steering
+    };
+    // No process and no address: an application rule and a literal-IP veto
+    // have nothing to match, as for a name the relay carries.
+    match nrr_domain::decision_engine_input::match_sample(
+        book,
+        Some(hostname),
+        None,
+        None,
+        ZonePriorityPolicy::default(),
+        nrr_shared::RouteBehaviorMode::PreferPrimary,
+    ) {
+        RequestedRouteDecision::MatchedRoute { candidate }
+            if candidate.action == nrr_domain::RuleAction::Block =>
+        {
+            None
+        }
+        RequestedRouteDecision::MatchedRoute { candidate } => Some(candidate.route_role),
+        // A fake address is handed only to rule hosts; one no rule names now
+        // takes the main link.
+        _ => Some(RouteRole::Primary),
+    }
 }
 
 impl RouteSelector for RuleBookRouteSelector {
@@ -483,7 +471,8 @@ impl RouteSelector for RuleBookRouteSelector {
         [
             crate::applying_revision_overlay::changes(),
             crate::verify_overlay::changes(),
-            crate::override_grants::generation(),
+            // A term that ran out counts before its timer fires.
+            crate::override_grants::pass_generation(),
             crate::any_zone_sites::generation(),
             self.routing_user.current(|| (self.active_sid)()),
             self.paused.as_ref().map_or(0, |p| p.generation()),
@@ -872,6 +861,29 @@ mod tests {
         assert_eq!(route("deep.wide.example"), None);
         assert_eq!(route("open.wide.example"), Some(RouteRole::Primary));
         assert_eq!(route("elsewhere.example"), Some(RouteRole::Primary));
+    }
+
+    /// The narrower rule wins in the relay as in the engine: a main-route rule
+    /// for one host under a wider additional-route one keeps that host on the
+    /// main link, and the wider rule still takes its other hosts.
+    #[test]
+    fn a_narrower_main_route_rule_beats_a_wider_additional_one() {
+        let book = CanonicalRuleBook {
+            primary: CanonicalRuleSet::from_rules(vec![exact_rule("r-p", "mail.example.com")]),
+            secondary: CanonicalRuleSet::from_rules(vec![suffix_rule(
+                "r-s",
+                "example.com",
+                nrr_domain::RuleAction::Route,
+            )]),
+        };
+        assert_eq!(
+            route_in_book(Some(&book), "mail.example.com"),
+            Some(RouteRole::Primary)
+        );
+        assert_eq!(
+            route_in_book(Some(&book), "www.example.com"),
+            Some(RouteRole::Secondary)
+        );
     }
 
     fn owners(

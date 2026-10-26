@@ -46,7 +46,19 @@ impl AutoRulesEngine {
             verify_watches_ips: std::sync::atomic::AtomicBool::new(false),
             verify_wiring: OnceLock::new(),
             verify_runner: verify_primary::VerifyRunner::default(),
+            site_not_opening: OnceLock::new(),
+            main_link_blocked_parked: OnceLock::new(),
         }
+    }
+
+    /// Attach who is told of a site that does not open; the first wins.
+    pub fn attach_site_not_opening(&self, told: SiteNotOpeningFn) -> bool {
+        self.site_not_opening.set(told).is_ok()
+    }
+
+    /// Attach who is told when such an offer is parked; the first wins.
+    pub fn attach_main_link_blocked_parked(&self, told: MainLinkBlockedParkedFn) -> bool {
+        self.main_link_blocked_parked.set(told).is_ok()
     }
 
     /// Is a ledger already live for `sid`? Read on its own so the evidence load

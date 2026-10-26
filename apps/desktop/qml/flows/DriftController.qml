@@ -898,7 +898,7 @@ QtObject {
                     _writeDriftDiagnostics(res, mergedJson, guiJson,
                         mergedHash, guiHash, equivalent)
                     if (equivalent) {
-                        _convergeFilesQuietly()
+                        _convergeFilesQuietly(res)
                         return
                     }
                     _showMergeDialogWith(res)
@@ -1001,24 +1001,45 @@ QtObject {
     /// window (a content-compare per route, so a file that already matches is
     /// not touched), then re-run the comparison so the banner clears on the
     /// facts rather than on a suppression flag.
-    function _convergeFilesQuietly() {
-        root.boundFilesController._writeBoundFiles(false, function() {
+    /// `res` is the merge preview that found nothing to change. Its
+    /// service-only rules are the ones the file lacked: they are named, since
+    /// "spelled differently" would hide a rule the file was missing.
+    function _convergeFilesQuietly(res) {
+        var added = (((res || {})["service-only"]) || []).map(function(entry) {
+            return String((entry || {}).value || "")
+        }).filter(function(value) { return value !== "" })
+        var pairKey = _driftPairKey()
+        root.boundFilesController._writeBoundFiles(false, function(ok, written, held) {
             // Drop the mtime cache only once the write is on disk — a recheck
             // racing it would re-read the old bytes and raise the banner again.
             root._driftFileCachedPathPrimary = ""
             root._driftFileCachedPathSecondary = ""
             _driftRecheckNow(false)
+            if (!ok) {
+                if ((held || []).length === 0)
+                    root.boundFilesController.noticeRulesFileNotWritten()
+                return
+            }
+            var body = added.length > 0
+                ? root.tr("notifications.rules-file-converged.added-body",
+                    "Rules already in force were missing from your rules file and are now written to it: {rules}. Nothing about what is applied changed.")
+                    .replace("{rules}", Pure.listSummary(Pure.displayTextList(added),
+                        root.tr("status.app-unresolved-more", "+{n} more")))
+                : root.tr("notifications.rules-file-converged.body",
+                    "The linked rules file was written differently from the rules in the app, but both described the same routing. The file has been rewritten to match; nothing about what is applied changed.")
+            // Opened from the tray to compare: the answer belongs on screen,
+            // not only in the notice list.
+            root.statusLine = body
+            root.notificationsController._addPushNotice({
+                "id": "rules-file-converged:" + pairKey,
+                "kind": "rules-file-converged",
+                "severity": "info",
+                "dismissible": true,
+                "title": root.tr("notifications.rules-file-converged.title",
+                    "Your rules file was brought up to date"),
+                "body": body
+            })
         }, true)
-        root.notificationsController._addPushNotice({
-            "id": "rules-file-converged:" + _driftPairKey(),
-            "kind": "rules-file-converged",
-            "severity": "info",
-            "dismissible": true,
-            "title": root.tr("notifications.rules-file-converged.title",
-                "Your rules file was brought up to date"),
-            "body": root.tr("notifications.rules-file-converged.body",
-                "The linked rules file was written differently from the rules in the app, but both described the same routing. The file has been rewritten to match; nothing about what is applied changed.")
-        })
     }
 
     /// Periodic poll entry. Re-fetches file legs (mtime-cached) and

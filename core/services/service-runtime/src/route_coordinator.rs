@@ -52,7 +52,10 @@ use binding_resolver::{
     derive_secondary_next_hop, derive_secondary_next_hop_v6, diagnostic_tally, has_own_way_out,
     mac_anchor_id, preferred_display_name, replacement_candidates,
 };
-pub use binding_resolver::{adapter_binding_matches, adapter_entry_binding_matches};
+pub use binding_resolver::{
+    adapter_binding_matches, adapter_entry_binding_matches, bound_adapter, bound_adapter_usable,
+    BoundCandidate,
+};
 // The main-link derivation, for a platform that resolves egress without this
 // coordinator; one definition either way.
 pub(crate) use binding_resolver::derive_primary_target;
@@ -268,6 +271,9 @@ pub struct SecondaryRouteCoordinator {
     /// a cycle behind the write, so without this the same anchor would be
     /// written (and logged) on every reconcile until the reload catches up.
     anchor_persisted: Mutex<std::collections::HashSet<String>>,
+    /// Renames already handed to the heal callback, `"{sid}|{role}|{id}|{name}"`,
+    /// for the same reason as `anchor_persisted`.
+    rename_persisted: Mutex<std::collections::HashSet<String>>,
     ///  — once-per-transition latch for the "UP but no derivable or
     /// cached next-hop" WARN, keyed `"{sid}|{role}"`. The state occurs in a
     /// tight burst while OpenVPN has brought the adapter Up but not yet

@@ -50,9 +50,14 @@ pub struct RulesRevisionContent {
     /// Rules of a kind this build does not know, kept as they came: stored and
     /// written back on every rewrite, never applied.
     pub unrecognized: UnrecognizedRules,
+    /// The user's rules with a value no book may apply (an address that is
+    /// never a destination, a program value the pipeline refuses): kept as
+    /// written and shown as not working, never applied. Gone only when the
+    /// user deletes them.
+    pub inactive: UnrecognizedRules,
 }
 
-/// Rules a newer build wrote that this one cannot read, per route.
+/// Rules kept as they came, per route: unreadable to this build, or refused.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct UnrecognizedRules {
     pub primary: Vec<nrr_shared::rules_json::RuleDto>,
@@ -76,6 +81,7 @@ impl RulesRevisionContent {
             rule_book,
             format_version: RULES_REVISION_FORMAT_VERSION,
             unrecognized: UnrecognizedRules::default(),
+            inactive: UnrecognizedRules::default(),
         }
     }
 }

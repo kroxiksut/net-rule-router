@@ -10,8 +10,8 @@ use std::cell::RefCell;
 
 use crossterm::event::{KeyCode, KeyEvent};
 use nrr_client_logic::conn_trace::{
-    group_trace_rows, is_ipv6_endpoint, is_non_internet_address, TraceGroup, TraceGroupKind,
-    TraceGrouping, TraceRowRef,
+    conn_trace_learned_routes, group_trace_rows, is_ipv6_endpoint, is_non_internet_address,
+    TraceGroup, TraceGroupKind, TraceGrouping, TraceOutcomeRef, TraceRowRef,
 };
 use nrr_client_logic::rule_value_class::path_style_for_os;
 use nrr_client_logic::rules_table::RuleType;
@@ -131,6 +131,9 @@ pub struct TraceState {
     period: Period,
     /// Per kept row, beside `entries`: attempts and the first time.
     kept: Vec<(u64, i64)>,
+    /// Per live row, beside `entries`: when its connection was first held
+    /// while the address was learned, or 0.
+    held_at: Vec<i64>,
     history_enabled: bool,
     history_available: bool,
     removed: u64,
@@ -160,6 +163,7 @@ impl Default for TraceState {
             history: false,
             period: Period::default(),
             kept: Vec::new(),
+            held_at: Vec::new(),
             history_enabled: true,
             history_available: true,
             removed: 0,
@@ -241,6 +245,7 @@ impl TraceState {
         self.period = period;
         self.entries.clear();
         self.kept.clear();
+        self.held_at.clear();
         self.pager = Pager::default();
     }
 
@@ -515,7 +520,7 @@ fn load(app: &mut AppState) {
             state.loading = false;
             match result {
                 Ok(Read::Now(drained)) => {
-                    state.entries = drained.entries;
+                    (state.entries, state.held_at) = fold_learned(drained.entries);
                     state.kept.clear();
                     state.observer_active = drained.observer_active;
                     state.stream_enabled = drained.stream_enabled;
@@ -524,6 +529,7 @@ fn load(app: &mut AppState) {
                 Ok(Read::History(kept)) => {
                     state.entries = kept.entries;
                     state.kept = kept.meta;
+                    state.held_at.clear();
                     state.history_enabled = kept.enabled;
                     state.history_available = kept.available;
                     state.removed = kept.removed;
@@ -534,6 +540,49 @@ fn load(app: &mut AppState) {
             }
         })
     });
+}
+
+/// A connection held while its address was being learned, then sent over the
+/// additional route, is kept as the one that went through, beside when it was
+/// first held (`conn_trace_learned_routes`, the GUI's fold too). A hold nothing
+/// followed stays a block. Kept history is per hour and is not folded.
+fn fold_learned(entries: Vec<ConnTraceEntryDto>) -> (Vec<ConnTraceEntryDto>, Vec<i64>) {
+    let pairs = {
+        let rows: Vec<TraceOutcomeRef<'_>> = entries
+            .iter()
+            .map(|e| TraceOutcomeRef {
+                process: &e.process,
+                process_path: &e.process_path,
+                remote: &e.remote,
+                verdict: &e.verdict,
+                blocked_by: &e.blocked_by,
+                block_reason: &e.block_reason,
+                egress_role: &e.egress_role,
+                observed_at_ms: e.observed_at_ms,
+            })
+            .collect();
+        conn_trace_learned_routes(&rows)
+    };
+    let mut held = vec![false; entries.len()];
+    let mut held_at = vec![0_i64; entries.len()];
+    for pair in pairs {
+        let Some(t) = entries.get(pair.held).map(|e| e.observed_at_ms) else {
+            continue;
+        };
+        if let (Some(flag), Some(at)) = (held.get_mut(pair.held), held_at.get_mut(pair.routed)) {
+            *flag = true;
+            if *at == 0 || t < *at {
+                *at = t;
+            }
+        }
+    }
+    entries
+        .into_iter()
+        .zip(held_at)
+        .zip(held)
+        .filter(|(_, held)| !held)
+        .map(|(row, _)| row)
+        .unzip()
 }
 
 /// Switch between the latest connections and the kept history, then read.
@@ -686,7 +735,12 @@ impl Screen for TraceScreen {
         let mut pager = state.pager;
         pager.clamp(items.len());
         let mut detail = match items.get(pager.selected) {
-            Some(Item::Row(i)) => detail_lines(texts, &state.entries[*i], state.kept.get(*i)),
+            Some(Item::Row(i)) => detail_lines(
+                texts,
+                &state.entries[*i],
+                state.kept.get(*i),
+                state.held_at.get(*i).copied().unwrap_or(0),
+            ),
             Some(Item::Header(group)) => header_detail(texts, group),
             None => Vec::new(),
         };
@@ -1045,7 +1099,12 @@ fn row_text(texts: &Texts, e: &ConnTraceEntryDto, kept: Option<&(u64, i64)>) -> 
     row
 }
 
-fn detail_lines(texts: &Texts, e: &ConnTraceEntryDto, kept: Option<&(u64, i64)>) -> Vec<ViewLine> {
+fn detail_lines(
+    texts: &Texts,
+    e: &ConnTraceEntryDto,
+    kept: Option<&(u64, i64)>,
+    held_at_ms: i64,
+) -> Vec<ViewLine> {
     let or_dash = |s: &str| {
         if s.is_empty() {
             "—".to_owned()
@@ -1136,6 +1195,12 @@ fn detail_lines(texts: &Texts, e: &ConnTraceEntryDto, kept: Option<&(u64, i64)>)
         ));
     }
     lines.push(ViewLine::text(facts));
+    if held_at_ms > 0 {
+        lines.push(ViewLine::text(fill_numbered(
+            &texts.get(keys::TRACE_LEARNED_ROUTE),
+            &[&wall_clock(held_at_ms)],
+        )));
+    }
     lines.push(ViewLine::text(format!(
         "Enter / e: {}",
         texts.get(keys::TRACE_WHY)

@@ -2246,10 +2246,10 @@ fn submit_candidate_spares_a_refused_value_already_in_force() {
     );
 }
 
-/// A stored book drops such an application row on read, but a new submission
-/// carrying one is refused by name rather than silently losing the row.
+/// An application value the pipeline refuses is kept in the book as written
+/// and left out of what is applied, rather than refused or lost.
 #[test]
-fn submit_candidate_refuses_an_application_value_the_pipeline_refuses() {
+fn submit_candidate_keeps_an_application_value_the_pipeline_refuses_unapplied() {
     use nrr_shared::rules_json::{AppMatchDto, AppPatternDto, CanonicalRulesJsonV1, RuleDto};
     let fx = build_fixture(ApplyFailurePolicy::AllOrNothing);
     let long = format!("{}.exe", "a".repeat(300));
@@ -2277,23 +2277,24 @@ fn submit_candidate_refuses_an_application_value_the_pipeline_refuses() {
         ],
         secondary: vec![],
     };
-    let err = fx
-        .coordinator
+    let json = nrr_shared::rules_json::to_canonical_string(&dto).expect("serialise");
+    fx.coordinator
         .submit_candidate(CandidateSubmission {
             principal: nrr_storage::BASELINE_PRINCIPAL.to_string(),
-            rules_json: nrr_shared::rules_json::to_canonical_string(&dto).expect("serialise"),
+            rules_json: json.clone(),
             content_hash: "h-app".to_string(),
             source: RulesRevisionSource::GuiRulesEdit,
             correlation_id: "corr".to_string(),
             risk_level: None,
             review_summary_json: None,
         })
-        .expect_err("refused");
+        .expect("kept as not working rather than refused");
+    let applied = crate::production_rules_provider::decode_rules_snapshot(&json, "test")
+        .expect("the book loads");
     assert_eq!(
-        err,
-        PolicyError::InvalidRuleValue {
-            rules: vec![refused("R-0002", &long), refused("R-0003", "*")],
-        }
+        applied.rule_book.primary.rules().len(),
+        1,
+        "only chrome.exe applies"
     );
 }
 

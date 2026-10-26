@@ -207,7 +207,8 @@ pub trait RulesProvider: Send + Sync {
     /// The `base-revision` a write built from [`Self::stored_rules_for`] names
     /// (see `production_rules_provider::base_revision_of`). Read before the
     /// book, so a change in between makes the write refused, never lost.
-    /// `None` when the provider cannot name it: the write is then unchecked.
+    /// `None` when the provider cannot name it: the write then counts as built
+    /// on no rules and is refused over any.
     fn base_revision_for(&self, _principal: &str) -> Option<String> {
         None
     }

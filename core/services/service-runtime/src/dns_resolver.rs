@@ -438,50 +438,22 @@ impl SecondaryOwnedIps for NoopSecondaryOwnedIps {
     }
 }
 
-/// gate a DIRECT (non-rule) host's steered answer on the
-/// kill-switch block-all. The production impl registers the answered
-/// addresses as known-direct and drives a bounded reconcile so the exemption
-/// is installed BEFORE the client receives the answer — otherwise the app's
-/// first connect races the catch-all and is dropped with no retry (the ALE
-/// deny is instant; the observed first-contact drop). Must be a fast no-op while the
-/// block-all is not armed: this sits on the hot path of every direct `A`
-/// answer in Mode B.
-pub trait DirectAnswerGate: Send + Sync {
-    fn gate(&self, hostname: &str, addresses: &[Ipv4Addr]);
-}
-
-/// No-op [`DirectAnswerGate`]: direct answers are never gated (strict
-/// block-all posture / tests).
-pub struct NoopDirectAnswerGate;
-
-impl DirectAnswerGate for NoopDirectAnswerGate {
-    fn gate(&self, _hostname: &str, _addresses: &[Ipv4Addr]) {}
-}
-
-/// answer a DIRECT (non-rule) host with a virtual
-/// address while the fail-closed block-all is armed and fake-IP is active.
-///
-/// The gate-based exemption path ([`DirectAnswerGate`]) has an unavoidable
-/// race: the exemption is a WFP recompile, and when it misses its budget the
-/// first connect dies against the catch-all. Handing the client a fake
-/// address removes the race by construction —
-/// the static pool permit is already installed, the TUN catches the flow, and
-/// the relay dials the real address out the primary while the client waits
-/// inside its handshake. Slow beats severed.
+/// Answers a DIRECT (non-rule) host with a virtual address, so the relay
+/// carries it by name out the primary: the collateral rescue of a host whose
+/// every address is committed to the additional link.
 ///
 /// The impl MUST register `real` (the final, already steered answer set)
 /// where the relay's upstream resolver can find it BEFORE returning the fake
 /// address — the client's first packet may reach the TUN immediately.
 ///
-/// `None` means "not claimed": feature off, block-all not armed, host
-/// excluded from scope, or pool exhausted. The caller then falls back to the
-/// gate + real-answer path unchanged.
+/// `None` means "not claimed": stack down, host excluded from scope, or pool
+/// exhausted. The caller then relays the real answer.
 pub trait DirectFakeIpAnswerer: Send + Sync {
     fn fake_direct_answer(&self, hostname: &str, real: &[Ipv4Addr]) -> Option<Vec<Ipv4Addr>>;
 }
 
-/// No-op [`DirectFakeIpAnswerer`]: direct hosts always take the real-answer
-/// (steer + gate) path. The default when fake-IP is off or unavailable.
+/// No-op [`DirectFakeIpAnswerer`]: direct hosts always take the real answer.
+/// The default when fake-IP is off or unavailable.
 pub struct NoopDirectFakeIp;
 
 impl DirectFakeIpAnswerer for NoopDirectFakeIp {

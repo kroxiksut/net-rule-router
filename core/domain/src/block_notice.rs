@@ -155,6 +155,11 @@ pub enum NoticeKind {
     /// What this user's rules do not route rides another signed-in user's
     /// tunnel.
     TrafficCarried,
+    /// A site the user opened does not open over the main link but answers
+    /// over the additional one; told even while the tray is closed.
+    SiteNotOpening,
+    /// A connection keeps dropping for moments too short to tell one by one.
+    LinkKeepsDropping,
 }
 
 impl NoticeKind {
@@ -171,6 +176,8 @@ impl NoticeKind {
             Self::SecondaryDown => "secondary-down",
             Self::RoutesHeld => "routes-held",
             Self::TrafficCarried => "traffic-carried",
+            Self::SiteNotOpening => "site-not-opening",
+            Self::LinkKeepsDropping => "link-keeps-dropping",
         }
     }
 
@@ -180,7 +187,7 @@ impl NoticeKind {
         Self::ALL.into_iter().find(|kind| kind.slug() == slug)
     }
 
-    pub const ALL: [Self; 9] = [
+    pub const ALL: [Self; 11] = [
         Self::BlockBacklog,
         Self::ExternalAddress,
         Self::RoutingRestored,
@@ -190,6 +197,8 @@ impl NoticeKind {
         Self::SecondaryDown,
         Self::RoutesHeld,
         Self::TrafficCarried,
+        Self::SiteNotOpening,
+        Self::LinkKeepsDropping,
     ];
 }
 

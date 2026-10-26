@@ -27,11 +27,13 @@ pub mod verdicts;
 pub use bulk::start_moving;
 pub use files::presets_root;
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use nrr_client_logic::rule_value_class::misplaced_target_type;
 use nrr_client_logic::rules_table::{search_box_text, RuleRow, RuleType, TargetRoute};
+use nrr_shared::display_text::display_text;
 use nrr_shared::ipc_payloads::{RulesListResponse, RULES_CHANGED_ELSEWHERE};
 use nrr_shared::rules_json::FREE_MAX_RULES;
 use nrr_shared::rules_overlap::{find_route_overlaps, RouteOverlap};
@@ -74,6 +76,37 @@ pub enum InputPurpose {
     RulesFolder,
     /// The rule-set folder asked for before `?` rules move.
     VerdictFolder,
+    /// The file one route's rules are written to.
+    ExportRoute(nrr_client_logic::Route),
+}
+
+/// Where a write goes: a set's folder, or one route's file.
+#[derive(Debug)]
+pub enum SaveTarget {
+    Set(PathBuf),
+    Route(nrr_client_logic::Route, PathBuf),
+}
+
+impl SaveTarget {
+    fn folder(&self) -> &Path {
+        match self {
+            Self::Set(dir) => dir,
+            Self::Route(_, file) => file.parent().unwrap_or(file),
+        }
+    }
+
+    fn exists(&self) -> bool {
+        match self {
+            Self::Set(dir) => files::set_exists(dir),
+            Self::Route(_, file) => file.exists(),
+        }
+    }
+
+    pub fn shown(&self) -> String {
+        match self {
+            Self::Set(path) | Self::Route(_, path) => path.display().to_string(),
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -95,7 +128,19 @@ pub enum ChoicePurpose {
         path: String,
     },
     Preset(SetList),
-    Overwrite(PathBuf),
+    Overwrite(SaveTarget),
+    /// The write would go into the tree shipped with the program.
+    Shipped(SaveTarget),
+    /// `X`: which route's rules to save.
+    ExportRoute,
+    /// `W`: every rule goes.
+    ClearAll,
+    /// The import's questions about its sections, one at a time.
+    ImportReview(Box<ReviewFlow>),
+    /// `B`: what to do with the selected rules.
+    Marked,
+    /// The selected rules go, asked first.
+    DeleteMarked,
     Recent,
     Restore(usize),
     /// Bound files edited by hand since this program wrote them, which a
@@ -122,6 +167,17 @@ pub struct SetList {
     pub settings_error: Option<String>,
     /// The remembered choice, `<source>:<label>`.
     pub selected: String,
+}
+
+/// An import waiting for the answers about its sections.
+#[derive(Debug)]
+pub struct ReviewFlow {
+    pub set: RuleSet,
+    pub path: String,
+    /// The question asked now.
+    pub at: usize,
+    pub duplicates: BTreeMap<String, files::DuplicateChoice>,
+    pub unknown: BTreeMap<String, files::UnknownChoice>,
 }
 
 #[derive(Debug)]
@@ -231,6 +287,11 @@ pub struct RulesState {
     /// The rules applied are the administrator's baseline (`sudo`), not the
     /// caller's own.
     pub baseline: bool,
+    /// The terminal runs with administrator rights, which pass the lock below.
+    pub elevated: bool,
+    /// An administrator turned rule editing off for this machine: the list
+    /// is read-only here, as the service would refuse any change.
+    pub admin_locked: bool,
     /// The quit question chose "apply, then quit".
     quit_after_apply: bool,
     /// The settings file shared with the GUI; `None` when this session has no
@@ -239,6 +300,22 @@ pub struct RulesState {
     /// The files the rules on screen were last read from or written to, per
     /// route, as the settings file spells them; `""` is none.
     pub loaded_files: [String; 2],
+    /// The rules files the settings file binds, main route first, for the
+    /// line that says where the rules are saved; read when the list is read
+    /// or the binding written, never per frame.
+    pub bound_paths: Vec<String>,
+    /// The rule-set folder was offered this run.
+    pub folder_offered: bool,
+    /// The demo rules are read in Russian.
+    pub demo_russian: bool,
+    /// The two routes' names in the reader's language, main first.
+    pub route_names: [String; 2],
+    /// "+{n} more" after the names a sentence lists, in the reader's language.
+    pub list_more: String,
+    /// The preview or confirm in flight is the reset to the baseline.
+    resetting: bool,
+    /// The folder offer's title, question and how-to, in the reader's language.
+    pub folder_offer_words: [String; 3],
     /// "My rules" in the reader's language: the name of a set with no other.
     pub my_rules: String,
     /// `?` rules that work only on the other route, waiting for an answer.
@@ -293,6 +370,17 @@ pub fn on_texts(app: &mut AppState, texts: &Texts) {
     super::app_groups::on_texts(app, texts);
     app.rules.my_rules = texts.get(text::MY_RULES);
     app.rules.gateway_comment = texts.get(text::GATEWAY_COMMENT);
+    app.rules.demo_russian = texts.language().starts_with("ru");
+    app.rules.route_names = [
+        texts.get(text::ROUTE_PRIMARY),
+        texts.get(text::ROUTE_SECONDARY),
+    ];
+    app.rules.list_more = texts.get(text::LIST_MORE);
+    app.rules.folder_offer_words = [
+        texts.get(text::FOLDER_OFFER_TITLE),
+        texts.get(text::FOLDER_OFFER),
+        texts.get(text::FOLDER_OFFER_HOW),
+    ];
     app.rules.file_hint = text::file_hint_keys()
         .into_iter()
         .map(|k| texts.get(k))
@@ -316,6 +404,9 @@ impl Screen for RulesScreen {
             text::HELP_FILTERS,
             text::HELP_APPLY,
             text::HELP_FILES,
+            text::HELP_MORE_FILES,
+            text::HELP_RESET,
+            text::HELP_MARK,
             text::HELP_FOLDER,
             text::HELP_RELOAD,
             text::HELP_BOOK,
@@ -345,6 +436,9 @@ impl Screen for RulesScreen {
             text::PLAIN_PAGES,
             text::PLAIN_APPLY,
             text::PLAIN_FILES,
+            text::HELP_MORE_FILES,
+            text::HELP_RESET,
+            text::HELP_MARK,
             text::PLAIN_FOLDER,
             text::PLAIN_RELOAD,
             text::PLAIN_BOOK,
@@ -362,6 +456,7 @@ impl Screen for RulesScreen {
     }
 
     fn on_show(&self, app: &mut AppState) {
+        refresh_bound_paths(app);
         load_if_needed(app);
         verdicts::load(app);
     }
@@ -479,7 +574,7 @@ fn line_in_mode(app: &mut AppState, line: &str) -> bool {
                 return true;
             }
             if line == "!f" {
-                form.toggle_subfolders();
+                form.toggle_scope();
                 refresh_form(app, &mut form);
                 app.rules.mode = Mode::Form(form);
                 return true;
@@ -706,10 +801,59 @@ fn settle(app: &mut AppState) {
 
 fn load(app: &mut AppState) {
     app.rules.busy = Some(Busy::Loading);
+    // Ahead of the list, so a form waiting for it opens knowing the lock.
+    if nrr_shared::platform_profile::PlatformProfile::current()
+        .supports
+        .service_stability_config
+    {
+        app.outbox.push(apply::edit_permission_job());
+    }
     app.outbox.push(apply::load_job(app.rules.baseline));
 }
 
+/// Take the administrator's lock out of a service-stability row, whichever
+/// screen read it.
+pub fn adopt_edit_permission(
+    app: &mut AppState,
+    config: &serde_json::Map<String, serde_json::Value>,
+) {
+    app.rules.admin_locked =
+        nrr_client_logic::stability::rule_edits_locked(config, app.rules.elevated);
+}
+
+/// Refuse a change to the rules while the administrator's lock is on, and
+/// say why. Viewing, searching, filtering and exporting stay open.
+fn refuse_when_admin_locked(app: &mut AppState) -> bool {
+    if app.rules.admin_locked {
+        app.rules.note = Some(Note::new(text::LOCKED));
+        return true;
+    }
+    false
+}
+
+/// The list's keys and line commands that change rules.
+fn changes_rules(command: &str) -> bool {
+    const CHANGING: &[&str] = &[
+        "a", "e", "d", "s", "i", "p", "m", "v", "F", "C", "T", "M", "A", "U", "P", "L", "W", "Z",
+        "B",
+    ];
+    CHANGING.contains(&command)
+}
+
+/// The window may bind other files at any time: the settings file is shared.
+fn refresh_bound_paths(app: &mut AppState) {
+    let settings = app.rules.settings_file.as_deref().map(own_settings::read);
+    app.rules.bound_paths = match settings {
+        Some(Ok(settings)) => [settings.rules_files.primary, settings.rules_files.secondary]
+            .into_iter()
+            .filter(|path| !path.is_empty())
+            .collect(),
+        _ => Vec::new(),
+    };
+}
+
 fn loaded(app: &mut AppState, result: Result<RulesListResponse, Failure>) {
+    refresh_bound_paths(app);
     let rules = &mut app.rules;
     rules.busy = None;
     rules.reread_due = false;
@@ -735,6 +879,7 @@ fn loaded(app: &mut AppState, result: Result<RulesListResponse, Failure>) {
                     rules.unrecognized = list.unrecognized;
                     rules.base_revision = list.base_revision.clone();
                     rules.table.load(&list.rows);
+                    files::take_bound_passthrough(&mut rules.table, rules.settings_file.as_deref());
                     if let Some(edits) = edits {
                         rules.table.apply_edits(edits, &[]);
                         rules.note = Some(Note::new(text::REBASED));
@@ -786,6 +931,20 @@ fn rebase_edits(app: &mut AppState) {
 fn previewed(app: &mut AppState, previewed: Previewed) {
     let rules = &mut app.rules;
     rules.busy = None;
+    if rules.resetting {
+        match previewed {
+            Previewed::Review(review) => rules.mode = Mode::Review(review),
+            Previewed::NothingToApply => {
+                rules.resetting = false;
+                rules.note = Some(Note::new(text::RESET_NOOP));
+            }
+            Previewed::Refused(failure) => {
+                rules.resetting = false;
+                rules.note = Some(Note::failed(text::RESET_FAILED, failure));
+            }
+        }
+        return;
+    }
     if !matches!(previewed, Previewed::Review(_)) {
         rules.reload_after_apply = false;
         rules.merged_from.clear();
@@ -812,6 +971,10 @@ fn previewed(app: &mut AppState, previewed: Previewed) {
 }
 
 fn finished(app: &mut AppState, finished: Finished) {
+    if std::mem::take(&mut app.rules.resetting) {
+        reset_finished(app, finished);
+        return;
+    }
     let rules = &mut app.rules;
     rules.busy = None;
     let quit = std::mem::take(&mut rules.quit_after_apply);
@@ -866,7 +1029,45 @@ fn finished(app: &mut AppState, finished: Finished) {
     settle(app);
 }
 
+/// The baseline applies now: the list is read back. The user's rules files
+/// are not rewritten — they are the user's copy of what was dropped.
+fn reset_finished(app: &mut AppState, finished: Finished) {
+    let rules = &mut app.rules;
+    rules.busy = None;
+    rules.quit_after_apply = false;
+    let applied = matches!(finished, Finished::Applied { .. });
+    rules.note = Some(match finished {
+        Finished::Applied { base } => {
+            rules.base_revision = base;
+            app.snapshot_refresh_due = true;
+            Note::new(text::RESET_DONE)
+        }
+        Finished::Expired => Note::new(text::EXPIRED),
+        Finished::UacDeclined => Note::new(text::UAC_DECLINED),
+        Finished::Failed(failure) => Note::failed(text::RESET_FAILED, failure),
+    });
+    if applied {
+        load(app);
+    }
+}
+
 // ── Actions ─────────────────────────────────────────────────────────────────
+
+/// `Z`: back to the administrator's baseline. The service shows what goes
+/// before anything does; the review's confirm is the user's answer.
+fn start_reset(app: &mut AppState) {
+    if locked(app) || !own_rules_on_screen(app) {
+        return;
+    }
+    if !app.link.is_connected() {
+        app.rules.note = Some(Note::new(text::APPLY_OFFLINE));
+        return;
+    }
+    app.rules.resetting = true;
+    app.rules.busy = Some(Busy::Previewing);
+    app.rules.note = None;
+    app.outbox.push(apply::preview_job(apply::reset_pending()));
+}
 
 /// Edits wait while the service is busy with this list.
 fn locked(app: &mut AppState) -> bool {
@@ -878,7 +1079,7 @@ fn locked(app: &mut AppState) -> bool {
 }
 
 fn start_apply(app: &mut AppState) {
-    if locked(app) {
+    if locked(app) || refuse_when_admin_locked(app) {
         return;
     }
     if !app.link.is_connected() {
@@ -916,7 +1117,7 @@ fn confirm(app: &mut AppState, review: Box<Review>) {
 }
 
 fn open_form(app: &mut AppState, mut form: Form) {
-    if !locked(app) {
+    if !locked(app) && !refuse_when_admin_locked(app) {
         refresh_form(app, &mut form);
         app.rules.mode = Mode::Form(Box::new(form));
     }
@@ -936,7 +1137,7 @@ fn edit_selected(app: &mut AppState, master: Option<usize>) {
 }
 
 fn toggle(app: &mut AppState, master: Option<usize>) {
-    if locked(app) {
+    if locked(app) || refuse_when_admin_locked(app) {
         return;
     }
     if let Some(row) = master.and_then(|i| app.rules.table.rows.get_mut(i)) {
@@ -1024,6 +1225,9 @@ fn ask(app: &mut AppState, purpose: ChoicePurpose) {
         ChoicePurpose::Delete(_)
         | ChoicePurpose::Reload
         | ChoicePurpose::Overwrite(_)
+        | ChoicePurpose::Shipped(_)
+        | ChoicePurpose::ClearAll
+        | ChoicePurpose::DeleteMarked
         | ChoicePurpose::RemoveSpare(_) => 1,
         _ => 0,
     };
@@ -1052,6 +1256,7 @@ fn replace_hand_edited(app: &mut AppState, held: &[(nrr_client_logic::Route, Pat
     let exported_at = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
     let mut written = Vec::new();
     for (route, path) in held {
+        files::take_passthrough_from(&mut app.rules.table, *route, path);
         let (table, hint) = (&app.rules.table, &app.rules.file_hint);
         if let Err((path, error)) = files::write_route(path, *route, table, hint, &exported_at) {
             let path = path.display().to_string();
@@ -1092,6 +1297,7 @@ fn start_input(app: &mut AppState, purpose: InputPurpose) {
     let text = match purpose {
         InputPurpose::Search => app.rules.table.search.clone(),
         InputPurpose::Import | InputPurpose::Export => files_input_start(app),
+        InputPurpose::ExportRoute(route) => files_input_start(app) + files::file_name(route),
         InputPurpose::RulesFolder => folder::prompt_text(app),
         InputPurpose::VerdictFolder => String::new(),
     };
@@ -1225,15 +1431,14 @@ fn commit_input(app: &mut AppState, input: Input) {
                 Ok(set) => offer_import(app, set, shown),
             }
         }
-        InputPurpose::Export => {
-            let path = path_of(&input.text);
-            if files::set_exists(&path) {
-                ask(app, ChoicePurpose::Overwrite(path));
-            } else {
-                export(app, &path);
-            }
+        InputPurpose::Export => save_to(app, SaveTarget::Set(path_of(&input.text)), false),
+        InputPurpose::ExportRoute(route) => {
+            save_to(app, SaveTarget::Route(route, path_of(&input.text)), false);
         }
-        InputPurpose::RulesFolder => folder::choose(app, &input.text),
+        InputPurpose::RulesFolder => {
+            folder::choose(app, &input.text);
+            refresh_bound_paths(app);
+        }
         InputPurpose::VerdictFolder => verdicts::folder_answered(app, &input.text),
     }
 }
@@ -1264,7 +1469,65 @@ fn read_failed(file: &std::path::Path, error: files::ReadError) -> Note {
 }
 
 /// An empty list takes the files whole; otherwise the user picks.
+/// A set whose sections need a decision is asked about first, one question
+/// at a time, as the window's import review; Esc drops the import.
 fn offer_import(app: &mut AppState, set: RuleSet, path: String) {
+    if set.questions.is_empty() {
+        offer_reviewed_import(app, set, path);
+        return;
+    }
+    let flow = ReviewFlow {
+        set,
+        path,
+        at: 0,
+        duplicates: BTreeMap::new(),
+        unknown: BTreeMap::new(),
+    };
+    ask(app, ChoicePurpose::ImportReview(Box::new(flow)));
+}
+
+/// One answer of the import review; the last one lets the set land.
+fn review_answered(app: &mut AppState, mut flow: Box<ReviewFlow>, answer: usize) {
+    use files::{DuplicateChoice, ReviewQuestion, UnknownChoice, REFILE_HEADERS};
+    match flow.set.questions.get(flow.at) {
+        Some(ReviewQuestion::Duplicate { name, .. }) => {
+            let choice = match answer {
+                0 => DuplicateChoice::KeepAll,
+                1 => DuplicateChoice::LastOnly,
+                _ => DuplicateChoice::Ignore,
+            };
+            flow.duplicates.insert(name.clone(), choice);
+        }
+        Some(ReviewQuestion::Unknown { name, .. }) => {
+            let choice = match answer {
+                0 => UnknownChoice::Keep,
+                n if n <= REFILE_HEADERS.len() => UnknownChoice::Refile(REFILE_HEADERS[n - 1]),
+                _ => UnknownChoice::Skip,
+            };
+            flow.unknown.insert(name.clone(), choice);
+        }
+        None => {}
+    }
+    flow.at += 1;
+    if flow.at < flow.set.questions.len() {
+        app.rules.mode = Mode::Choice(Choice {
+            purpose: ChoicePurpose::ImportReview(flow),
+            cursor: 0,
+        });
+        return;
+    }
+    let ReviewFlow {
+        mut set,
+        path,
+        duplicates,
+        unknown,
+        ..
+    } = *flow;
+    set.apply_review(&duplicates, &unknown);
+    offer_reviewed_import(app, set, path);
+}
+
+fn offer_reviewed_import(app: &mut AppState, set: RuleSet, path: String) {
     if app.rules.table.rows.is_empty() {
         import(app, set, path, true);
     } else {
@@ -1279,6 +1542,7 @@ fn offer_import(app: &mut AppState, set: RuleSet, path: String) {
 }
 
 fn import(app: &mut AppState, set: RuleSet, path: String, replace: bool) {
+    let dir = PathBuf::from(&path);
     let table = &mut app.rules.table;
     let added = table.import(set.rows, replace);
     table.passthrough = set.passthrough;
@@ -1288,6 +1552,16 @@ fn import(app: &mut AppState, set: RuleSet, path: String, replace: bool) {
         text::IMPORTED,
         vec![("count", added.to_string()), ("path", path)],
     );
+    // A rule section written twice: all of its rules are taken, said once.
+    for (name, times) in &set.known_duplicates {
+        note = note.then(Note::with(
+            text::PRESET_DUPLICATE_KNOWN,
+            vec![
+                ("name", display_text(name).into_owned()),
+                ("n", times.to_string()),
+            ],
+        ));
+    }
     if let Err(error) = bind_imported(app, &set.paths) {
         note = note.then(Note::with(
             text::SETTINGS_NOT_WRITTEN,
@@ -1295,6 +1569,8 @@ fn import(app: &mut AppState, set: RuleSet, path: String, replace: bool) {
         ));
     }
     app.rules.note = Some(note);
+    refresh_bound_paths(app);
+    folder::offer(app, &dir);
 }
 
 /// The files read become where the rules come from and, outside the shipped
@@ -1335,6 +1611,7 @@ fn export(app: &mut AppState, path: &Path) {
             vec![("path", shown), ("error", error.to_string())],
         ),
     });
+    refresh_bound_paths(app);
 }
 
 fn bind_written_set(app: &AppState, dir: &Path) -> Result<(), UserSettingsError> {
@@ -1342,6 +1619,214 @@ fn bind_written_set(app: &AppState, dir: &Path) -> Result<(), UserSettingsError>
         return Ok(());
     };
     own_settings::bind_written_set(file, dir, files::presets_root().as_deref())
+}
+
+/// A write asks first when it would go into the shipped tree, which an update
+/// replaces, and when it would replace files already there.
+fn save_to(app: &mut AppState, target: SaveTarget, shipped_ok: bool) {
+    let shipped = files::presets_root();
+    if !shipped_ok && own_settings::inside_shipped(target.folder(), shipped.as_deref()) {
+        ask(app, ChoicePurpose::Shipped(target));
+    } else if target.exists() {
+        ask(app, ChoicePurpose::Overwrite(target));
+    } else {
+        write_target(app, &target);
+    }
+}
+
+fn write_target(app: &mut AppState, target: &SaveTarget) {
+    match target {
+        SaveTarget::Set(dir) => export(app, dir),
+        SaveTarget::Route(route, file) => export_route(app, *route, file),
+    }
+}
+
+/// One route's rules into `file`, which becomes that route's rules file.
+fn export_route(app: &mut AppState, route: nrr_client_logic::Route, file: &Path) {
+    let failed = |path: &Path, error: String| {
+        Note::with(
+            text::WRITE_FAILED,
+            vec![("path", path.display().to_string()), ("error", error)],
+        )
+    };
+    if let Some(dir) = file.parent().filter(|d| !d.as_os_str().is_empty()) {
+        if let Err(error) = std::fs::create_dir_all(dir) {
+            app.rules.note = Some(failed(dir, error.to_string()));
+            return;
+        }
+    }
+    let exported_at = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+    let written = files::write_route(
+        file,
+        route,
+        &app.rules.table,
+        &app.rules.file_hint,
+        &exported_at,
+    );
+    if let Err((path, error)) = written {
+        app.rules.note = Some(failed(&path, error));
+        return;
+    }
+    let shown = file.display().to_string();
+    let shipped = files::presets_root();
+    let bound = app.rules.settings_file.as_deref().map(|settings| {
+        own_settings::bind_written_route(settings, route, file, shipped.as_deref())
+    });
+    app.rules.note = Some(match bound {
+        Some(Err(error)) => Note::with(
+            text::EXPORTED_UNBOUND,
+            vec![("path", shown), ("error", error.to_string())],
+        ),
+        _ => Note::with(text::EXPORTED, vec![("path", shown)]),
+    });
+    let slot = match route {
+        nrr_client_logic::Route::Primary => 0,
+        nrr_client_logic::Route::Secondary => 1,
+    };
+    app.rules.loaded_files[slot] = own_settings::path_text(&own_settings::absolute(file));
+    refresh_bound_paths(app);
+}
+
+/// `L`: the demo rules join the list, as the window's "Load demo rules"
+/// does; a rule already listed is not added twice.
+fn load_demo(app: &mut AppState) {
+    if locked(app) {
+        return;
+    }
+    let Some(dir) = files::demo_dir(app.rules.demo_russian) else {
+        app.rules.note = Some(Note::new(text::DEMO_MISSING));
+        return;
+    };
+    match files::read_set(&dir) {
+        Err((file, error)) => app.rules.note = Some(read_failed(&file, error)),
+        Ok(set) => {
+            let added = app.rules.table.import(set.rows, false);
+            app.rules.note = Some(Note::with(
+                text::DEMO_ADDED,
+                vec![("count", added.to_string())],
+            ));
+            if added > 0 && app.link.is_connected() {
+                start_apply(app);
+            }
+        }
+    }
+}
+
+fn toggle_mark(app: &mut AppState, i: usize) {
+    if let Some(row) = app.rules.table.rows.get_mut(i) {
+        row.marked = !row.marked;
+    }
+}
+
+fn ask_marked(app: &mut AppState) {
+    if locked(app) {
+        return;
+    }
+    if app.rules.table.marked().is_empty() {
+        app.rules.note = Some(Note::new(text::NONE_MARKED));
+    } else {
+        ask(app, ChoicePurpose::Marked);
+    }
+}
+
+/// The options of [`ChoicePurpose::Marked`], in order.
+pub(crate) const MARKED_ACTIONS: usize = 7;
+
+/// An action on every selected rule, as the window's selection bar: on, off,
+/// to a route, deny, delete (asked first), or unselect.
+fn act_on_marked(app: &mut AppState, at: usize) {
+    let marked = app.rules.table.marked();
+    let n = marked.len().to_string();
+    let rows = &mut app.rules.table.rows;
+    let note = match at {
+        0 | 1 => {
+            for &i in &marked {
+                rows[i].rule.enabled = at == 0;
+            }
+            Note::with(
+                if at == 0 {
+                    text::BULK_ENABLED
+                } else {
+                    text::BULK_DISABLED
+                },
+                vec![("n", n)],
+            )
+        }
+        2 | 3 => {
+            let to = if at == 2 {
+                TargetRoute::Primary
+            } else {
+                TargetRoute::Secondary
+            };
+            for &i in &marked {
+                rows[i].move_to(to.clone());
+            }
+            let route = if at == 2 {
+                app.rules.route_names[0].clone()
+            } else {
+                app.rules.route_names[1].clone()
+            };
+            Note::with(text::BULK_MOVED, vec![("n", n), ("route", route)])
+        }
+        4 => {
+            for &i in &marked {
+                rows[i].move_to(TargetRoute::Block);
+            }
+            Note::with(text::BULK_DENIED, vec![("n", n)])
+        }
+        5 => {
+            ask(app, ChoicePurpose::DeleteMarked);
+            return;
+        }
+        6 => {
+            app.rules.table.clear_marks();
+            return;
+        }
+        _ => return,
+    };
+    app.rules.note = Some(note);
+}
+
+fn delete_marked(app: &mut AppState) {
+    let table = &mut app.rules.table;
+    let before = table.rows.len();
+    table.rows.retain(|row| !row.marked);
+    table.clamp_cursor();
+    let n = (before - table.rows.len()).to_string();
+    app.rules.note = Some(Note::with(text::BULK_DELETED, vec![("n", n)]));
+}
+
+fn ask_clear_all(app: &mut AppState) {
+    if !locked(app) && !app.rules.table.rows.is_empty() {
+        ask(app, ChoicePurpose::ClearAll);
+    }
+}
+
+/// Every rule leaves the list and the rules files stop being written, as the
+/// window's "Clear all rules"; with the service there, the review that
+/// empties it follows. The files themselves stay on disk.
+fn clear_all(app: &mut AppState) {
+    let table = &mut app.rules.table;
+    table.import(Vec::new(), true);
+    table.passthrough = Default::default();
+    table.clear_filters();
+    table.set_cursor(0);
+    app.rules.loaded_files = Default::default();
+    let mut note = Note::new(text::CLEARED);
+    if let Some(file) = app.rules.settings_file.as_deref() {
+        note = match own_settings::unbind_files(file) {
+            Ok(()) => note.then(Note::new(text::CLEARED_FILES_KEPT)),
+            Err(error) => note.then(Note::with(
+                text::SETTINGS_NOT_WRITTEN,
+                vec![("error", error.to_string())],
+            )),
+        };
+    }
+    app.rules.note = Some(note);
+    refresh_bound_paths(app);
+    if app.link.is_connected() {
+        start_apply(app);
+    }
 }
 
 fn cancel_choice(app: &mut AppState, choice: Choice) {
@@ -1399,7 +1884,17 @@ fn pick(app: &mut AppState, choice: Choice) {
                 }
             }
         }
-        ChoicePurpose::Overwrite(path) if at == 0 => export(app, &path),
+        ChoicePurpose::Overwrite(target) if at == 0 => write_target(app, &target),
+        ChoicePurpose::Shipped(target) if at == 0 => save_to(app, target, true),
+        ChoicePurpose::ExportRoute => {
+            if let Some(route) = nrr_client_logic::Route::ALL.get(at) {
+                start_input(app, InputPurpose::ExportRoute(*route));
+            }
+        }
+        ChoicePurpose::ClearAll if at == 0 => clear_all(app),
+        ChoicePurpose::Marked => act_on_marked(app, at),
+        ChoicePurpose::DeleteMarked if at == 0 => delete_marked(app),
+        ChoicePurpose::ImportReview(flow) => review_answered(app, flow, at),
         ChoicePurpose::ChangedElsewhere if at == 0 => rebase_edits(app),
         ChoicePurpose::HandEdited(held) => match at {
             0 => take_hand_edited(app, &held),
@@ -1415,6 +1910,17 @@ fn pick(app: &mut AppState, choice: Choice) {
 // ── Keys ─────────────────────────────────────────────────────────────────────
 
 fn list_key(app: &mut AppState, key: KeyEvent) -> bool {
+    let changing = match key.code {
+        KeyCode::Enter | KeyCode::Delete => true,
+        KeyCode::Char('s') if key.modifiers.contains(KeyModifiers::CONTROL) => true,
+        KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+            changes_rules(c.encode_utf8(&mut [0; 4]))
+        }
+        _ => false,
+    };
+    if changing && refuse_when_admin_locked(app) {
+        return true;
+    }
     let selected = app.rules.table.selected();
     let table = &mut app.rules.table;
     let page = PAGE as isize;
@@ -1443,6 +1949,7 @@ fn list_key(app: &mut AppState, key: KeyEvent) -> bool {
             'y' => ask(app, ChoicePurpose::TypeFilter),
             'u' => toggle_auto_only(app),
             'E' => show_invalid(app),
+            'H' => toggle_not_working(app),
             '/' => start_input(app, InputPurpose::Search),
             's' => start_apply(app),
             'r' => reload(app),
@@ -1465,6 +1972,16 @@ fn list_key(app: &mut AppState, key: KeyEvent) -> bool {
             'U' => return recent::ask_restore(app),
             'P' => return overrides::start(app, selected),
             'b' => switch_book(app),
+            'X' => ask(app, ChoicePurpose::ExportRoute),
+            'L' => load_demo(app),
+            'W' => ask_clear_all(app),
+            'Z' => start_reset(app),
+            '*' => {
+                if let Some(i) = selected {
+                    toggle_mark(app, i);
+                }
+            }
+            'B' => ask_marked(app),
             _ => return false,
         },
         _ => return false,
@@ -1537,6 +2054,14 @@ fn toggle_auto_only(app: &mut AppState) {
     table.set_cursor(0);
 }
 
+/// `H`: leave out the rules that do not work, or show them again (the
+/// window's «Show rules that do not work»).
+fn toggle_not_working(app: &mut AppState) {
+    let table = &mut app.rules.table;
+    table.hide_not_working = !table.hide_not_working;
+    table.set_cursor(0);
+}
+
 /// `E`: the rules that will not be applied (the window's «Show them»).
 fn show_invalid(app: &mut AppState) {
     let table = &mut app.rules.table;
@@ -1600,7 +2125,7 @@ fn form_key(app: &mut AppState, mut form: Box<Form>, key: KeyEvent) -> bool {
             form.switch_type();
         }
         KeyCode::Char('f') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-            form.toggle_subfolders();
+            form.toggle_scope();
         }
         KeyCode::F(2) if form.editing.is_none() => {
             return bulk::start(app, form.route.clone(), form.value.clone(), true);
@@ -1706,6 +2231,9 @@ fn numbered(app: &mut AppState, arg: &str) -> Option<usize> {
 
 fn list_line(app: &mut AppState, line: &str) -> bool {
     let (command, arg) = line.split_once(' ').unwrap_or((line, ""));
+    if changes_rules(command) && refuse_when_admin_locked(app) {
+        return true;
+    }
     let page = PAGE as isize;
     match command {
         "a" => {
@@ -1736,6 +2264,7 @@ fn list_line(app: &mut AppState, line: &str) -> bool {
         "y" => ask(app, ChoicePurpose::TypeFilter),
         "u" => toggle_auto_only(app),
         "E" => show_invalid(app),
+        "H" => toggle_not_working(app),
         "/" => {
             commit_input(
                 app,
@@ -1750,6 +2279,19 @@ fn list_line(app: &mut AppState, line: &str) -> bool {
         "s" => start_apply(app),
         "r" => reload(app),
         "b" => switch_book(app),
+        "X" => ask(app, ChoicePurpose::ExportRoute),
+        "L" => load_demo(app),
+        "W" => ask_clear_all(app),
+        "Z" => start_reset(app),
+        "B" => ask_marked(app),
+        // `* 2 5` selects the rules read as the second and the fifth.
+        "*" => {
+            for n in arg.split_whitespace() {
+                if let Some(i) = numbered(app, n) {
+                    toggle_mark(app, i);
+                }
+            }
+        }
         "i" => start_input(app, InputPurpose::Import),
         "x" => start_input(app, InputPurpose::Export),
         "p" => presets(app),

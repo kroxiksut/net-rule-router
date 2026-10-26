@@ -648,6 +648,128 @@ fn the_narrower_zone_wins_over_the_wider_one_it_sits_inside() {
     assert_eq!(matched_rule_id(&d), Some("a-wide"));
 }
 
+/// A zone of several labels names one site's subtree: the user who wrote
+/// `corp.example.com` among zones meant it over the wider `*.example.com`.
+#[test]
+fn a_zone_of_several_labels_beats_the_wider_suffix_it_sits_under() {
+    let rb = book(
+        vec![rule("a-wide", Some(suffix_domain("example.com")), None)],
+        vec![rule("z-corp", Some(zone("corp.example.com")), None)],
+    );
+    let d = match_rules(
+        &input_hostname("db.corp.example.com"),
+        &empty_lookup(),
+        &rb,
+        default_zone_policy(),
+        prefer_primary(),
+    );
+    assert_eq!(matched_rule_id(&d), Some("z-corp"));
+    assert_eq!(matched_role(&d), Some(RouteRole::Secondary));
+
+    // A zone never covers its apex: the bare name stays with the suffix.
+    let d = match_rules(
+        &input_hostname("corp.example.com"),
+        &empty_lookup(),
+        &rb,
+        default_zone_policy(),
+        prefer_primary(),
+    );
+    assert_eq!(matched_rule_id(&d), Some("a-wide"));
+}
+
+/// A zone leaves out its own name, so against `*.` of the same name it is the
+/// narrower rule and keeps the subdomains whichever route it is on. With bare
+/// names covering their subdomains the zone reads as `*.` of its name: one rule
+/// written twice, and the main route keeps it.
+#[test]
+fn a_zone_beats_the_suffix_of_its_name_unless_bare_names_cover_subdomains() {
+    let rb = book(
+        vec![rule(
+            "s-same",
+            Some(suffix_domain("corp.example.com")),
+            None,
+        )],
+        vec![rule("z-corp", Some(zone("corp.example.com")), None)],
+    );
+    let pick = |rb: &CanonicalRuleBook| {
+        let d = match_rules(
+            &input_hostname("db.corp.example.com"),
+            &empty_lookup(),
+            rb,
+            default_zone_policy(),
+            prefer_primary(),
+        );
+        (
+            matched_rule_id(&d).map(str::to_owned),
+            matched_role(&d),
+            matched_conflict(&d),
+        )
+    };
+    assert_eq!(
+        pick(&rb),
+        (
+            Some("z-corp".into()),
+            Some(RouteRole::Secondary),
+            Some(ConflictMarker::None)
+        )
+    );
+
+    let (_, role, conflict) = pick(&rb.with_subdomain_coverage());
+    assert_eq!(role, Some(RouteRole::Primary));
+    assert_eq!(conflict, Some(ConflictMarker::Detected));
+}
+
+#[test]
+fn a_narrower_suffix_beats_a_zone_of_several_labels() {
+    let rb = book(
+        vec![rule("z-corp", Some(zone("corp.example.com")), None)],
+        vec![rule(
+            "s-db",
+            Some(suffix_domain("db.corp.example.com")),
+            None,
+        )],
+    );
+    let d = match_rules(
+        &input_hostname("x.db.corp.example.com"),
+        &empty_lookup(),
+        &rb,
+        default_zone_policy(),
+        prefer_primary(),
+    );
+    assert_eq!(matched_rule_id(&d), Some("s-db"));
+}
+
+#[test]
+fn a_zone_of_several_labels_beats_an_exact_address_but_a_top_level_zone_does_not() {
+    let host = "db.corp.example.com";
+    let ip = Ipv4Addr::new(192, 0, 2, 9);
+    let composite = book(
+        vec![rule("i-addr", Some(exact_ip(192, 0, 2, 9)), None)],
+        vec![rule("z-corp", Some(zone("corp.example.com")), None)],
+    );
+    let d = match_rules(
+        &input_full(host, ip, "app.exe"),
+        &empty_lookup(),
+        &composite,
+        default_zone_policy(),
+        prefer_primary(),
+    );
+    assert_eq!(matched_rule_id(&d), Some("z-corp"));
+
+    let top_level = book(
+        vec![rule("i-addr", Some(exact_ip(192, 0, 2, 9)), None)],
+        vec![rule("z-com", Some(zone("com")), None)],
+    );
+    let d = match_rules(
+        &input_full(host, ip, "app.exe"),
+        &empty_lookup(),
+        &top_level,
+        default_zone_policy(),
+        prefer_primary(),
+    );
+    assert_eq!(matched_rule_id(&d), Some("i-addr"));
+}
+
 #[test]
 fn suffix_domain_apex_matching_is_case_and_trailing_dot_insensitive() {
     // Normalisation happens before matching; apex coverage must ride on the

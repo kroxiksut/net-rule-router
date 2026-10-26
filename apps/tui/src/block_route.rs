@@ -15,7 +15,7 @@ use nrr_shared::ipc_payloads::{
 use crate::backend::{Job, Reply};
 use crate::i18n::{key, Key, Texts};
 use crate::screens::suggestions::{call, CallError};
-use crate::state::{AppState, Effect, NoticeLevel};
+use crate::state::{AppState, Effect, Notice, NoticeLevel};
 
 /// Destinations kept on offer, as many as the tray's notice lists.
 const OFFERED_CAP: usize = 5;
@@ -73,6 +73,9 @@ pub struct BlockRouteState {
     pub offered: Vec<String>,
     /// What `v` asked about, until it is answered.
     pub asking: Option<String>,
+    /// The feed notice the question was asked from: it closes once the
+    /// destination is routed, as the tray's notice does.
+    pub asked_from: Option<usize>,
     pub busy: bool,
     /// The last write's destination and outcome (`true`: a rule was added),
     /// announced on the next tick with texts in hand.
@@ -100,15 +103,38 @@ pub fn asking(app: &AppState) -> bool {
 /// `v`: ask about the newest destination on offer. `false` when nothing is
 /// offered, the service is away, or a question or a write is open.
 pub fn ask(app: &mut AppState) -> bool {
-    let state = &mut app.block_route;
-    if state.busy || state.asking.is_some() || !app.link.is_connected() {
-        return false;
-    }
-    let Some(first) = state.offered.first().cloned() else {
+    let Some(first) = app.block_route.offered.first().cloned() else {
         return false;
     };
-    state.asking = Some(first);
+    ask_about(app, &first, "")
+}
+
+/// Ask about one block, the one chosen in the feed. `reason` is the block's,
+/// or empty for a destination already on offer.
+pub fn ask_about(app: &mut AppState, destination: &str, reason: &str) -> bool {
+    let destination = destination.trim();
+    let state = &mut app.block_route;
+    if state.busy
+        || state.asking.is_some()
+        || !app.link.is_connected()
+        || destination.is_empty()
+        || destination.len() > DESTINATION_MAX
+        || (!reason.is_empty() && !offers_route(reason))
+    {
+        return false;
+    }
+    state.asking = Some(destination.to_owned());
+    state.asked_from = None;
     true
+}
+
+/// A destination as the user lets it be shown.
+fn shown_name(app: &AppState, destination: &str, texts: &Texts) -> String {
+    if crate::feed::hide_addresses(app) {
+        texts.get(crate::keys::BLOCK_NOTICE_DESTINATION_HIDDEN)
+    } else {
+        display_text(destination).into_owned()
+    }
 }
 
 /// The answer to the question. Either way the offer is answered, as the
@@ -117,18 +143,19 @@ pub fn answer(app: &mut AppState, yes: bool) -> bool {
     let Some(destination) = app.block_route.asking.take() else {
         return false;
     };
+    let from_feed = app.block_route.asked_from.take();
     if yes && !app.link.is_connected() {
         return true;
     }
     app.block_route.offered.retain(|d| *d != destination);
     if yes {
         app.block_route.busy = true;
-        app.outbox.push(route_job(destination));
+        app.outbox.push(route_job(destination, from_feed));
     }
     true
 }
 
-fn route_job(destination: String) -> Job {
+fn route_job(destination: String, from_feed: Option<usize>) -> Job {
     Box::new(move |client: &dyn IpcClient| {
         let answer: Result<BlockNoticeRouteToSecondaryResponse, _> = call(
             client,
@@ -143,6 +170,11 @@ fn route_job(destination: String) -> Job {
             if matches!(authored, Ok(true)) {
                 crate::screens::rules::rules_written_for_an_answer(app);
             }
+            // Answered: the notice has done its job. A failure keeps it for
+            // another try.
+            if let (Ok(_), Some(id)) = (&authored, from_feed) {
+                crate::feed::dismiss_notice(app, id);
+            }
             app.block_route.unannounced = Some((destination, authored));
         })
     })
@@ -155,9 +187,8 @@ pub fn lines(app: &AppState, texts: &Texts) -> Vec<String> {
     }
     let state = &app.block_route;
     if let Some(destination) = &state.asking {
-        let name = display_text(destination).into_owned();
         return vec![
-            texts.fill(ASK, &[("name", name)]),
+            texts.fill(ASK, &[("name", shown_name(app, destination, texts))]),
             texts.get(ASK_BODY),
             texts.get(YES_NO),
         ];
@@ -165,7 +196,7 @@ pub fn lines(app: &AppState, texts: &Texts) -> Vec<String> {
     let Some(first) = state.offered.first() else {
         return Vec::new();
     };
-    let mut lines = vec![texts.fill(OFFER, &[("name", display_text(first).into_owned())])];
+    let mut lines = vec![texts.fill(OFFER, &[("name", shown_name(app, first, texts))])];
     if state.offered.len() > 1 {
         lines.push(texts.fill(MORE, &[("count", (state.offered.len() - 1).to_string())]));
     }
@@ -177,16 +208,21 @@ pub fn announce(app: &mut AppState, texts: &Texts, now: std::time::Instant) -> V
     let Some((destination, outcome)) = app.block_route.unannounced.take() else {
         return Vec::new();
     };
-    let name = display_text(&destination).into_owned();
-    let (level, body) = match outcome {
-        Ok(true) => (NoticeLevel::Info, texts.fill(DONE, &[("name", name)])),
-        Ok(false) => (NoticeLevel::Info, texts.fill(ALREADY, &[("name", name)])),
-        Err(error) => (
-            NoticeLevel::Warning,
-            texts.fill(FAILED, &[("name", name), ("error", error.text(texts))]),
-        ),
+    let (level, key, error) = match outcome {
+        Ok(true) => (NoticeLevel::Info, DONE, String::new()),
+        Ok(false) => (NoticeLevel::Info, ALREADY, String::new()),
+        Err(error) => (NoticeLevel::Warning, FAILED, error.text(texts)),
     };
-    app.notify(level, texts.get(ACTION), body, now)
+    let body = |name: String| texts.fill(key, &[("name", name), ("error", error.clone())]);
+    let notice = Notice::new(
+        level,
+        texts.get(ACTION),
+        body(display_text(&destination).into_owned()),
+    )
+    .private(body(
+        texts.get(crate::keys::BLOCK_NOTICE_DESTINATION_HIDDEN),
+    ));
+    app.post(notice, Some(now))
 }
 
 #[cfg(test)]

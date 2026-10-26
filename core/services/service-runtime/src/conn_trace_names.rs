@@ -177,6 +177,15 @@ impl ConnTraceNamer {
         ])
     }
 
+    /// No machine-wide source: where the resolver cannot tell whose lookup a
+    /// name came from, another user's names would show in this user's
+    /// history. Only a virtual address, bound for the flow itself, is named
+    /// (via [`Self::with_fake_ip_pool`]).
+    #[must_use]
+    pub fn without_shared_names() -> Self {
+        Self::new(Vec::new())
+    }
+
     /// Ask the fake-IP pool first. An address inside it means nothing to the
     /// other sources: whatever they recorded for it is a stale binding.
     #[must_use]
@@ -450,6 +459,34 @@ mod tests {
         assert_eq!(named.names, vec!["app.example"]);
         assert_eq!(named.total, 1);
         assert!(named.fake_ip);
+    }
+
+    /// Another user's lookup is in the machine's memory of names; a namer
+    /// that cannot tell users apart shows it to nobody, and still names the
+    /// virtual address bound for the flow itself.
+    #[test]
+    fn a_namer_without_shared_names_shows_no_machine_wide_name() {
+        let (assembly, fake) = fake_pool();
+        let shared = Ipv4Addr::new(203, 0, 113, 91);
+        crate::observed_host_names::global_observed_host_names()
+            .record("someone-elses.example", &[shared]);
+        assert!(
+            ConnTraceNamer::new(vec![
+                crate::observed_host_names::global_observed_host_names()
+                    as Arc<dyn AddressNameSource>
+            ])
+            .name(IpAddr::V4(shared))
+            .is_some(),
+            "fixture: the machine-wide memory names it"
+        );
+
+        let n = ConnTraceNamer::without_shared_names().with_fake_ip_pool(assembly.binding_view());
+        assert_eq!(
+            n.name(IpAddr::V4(shared)),
+            None,
+            "another user's name leaked"
+        );
+        assert_eq!(n.name(fake).expect("named").names, vec!["app.example"]);
     }
 
     #[test]

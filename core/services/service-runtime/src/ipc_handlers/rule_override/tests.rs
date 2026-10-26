@@ -41,6 +41,7 @@ fn state_with_book(owner: &str, book: CanonicalRuleBook) -> Arc<Mutex<Connection
     let conn = runner.into_connection();
     let content = nrr_domain::rules_revision::RulesRevisionContent {
         unrecognized: Default::default(),
+        inactive: Default::default(),
         rule_book: book,
         format_version: nrr_domain::rules_revision::RULES_REVISION_FORMAT_VERSION,
     };

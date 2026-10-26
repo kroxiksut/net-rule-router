@@ -82,7 +82,7 @@ fn activate(coord: &Arc<ActivationCoordinator>, hash: &str) -> String {
     let outcome = ProductionMutationExecutor::new(Arc::clone(coord)).execute(
         StoredMutation {
             kind: MutationKind::RulesUpdate,
-            payload: serde_json::json!({ "rules-json": rules(hash), "content-hash": hash }),
+            payload: built_on_rules_in_force(coord, hash),
             correlation_id: None,
             issuer_sid: USER.to_string(),
             caller_is_elevated: false,
@@ -295,11 +295,24 @@ fn gated_executor(host: &Host, coord: &Arc<ActivationCoordinator>) -> Production
     ProductionMutationExecutor::new(Arc::clone(coord)).with_alerts_repo(Arc::clone(&host.alerts))
 }
 
-fn rules_update(exec: &ProductionMutationExecutor, hash: &str) -> MutationOutcome {
+/// A rules update as a client that read the rules sends it.
+fn built_on_rules_in_force(coord: &ActivationCoordinator, hash: &str) -> serde_json::Value {
+    serde_json::json!({
+        "rules-json": rules(hash),
+        "content-hash": hash,
+        "base-revision": coord.base_revision_for(USER).expect("base"),
+    })
+}
+
+fn rules_update(
+    exec: &ProductionMutationExecutor,
+    coord: &ActivationCoordinator,
+    hash: &str,
+) -> MutationOutcome {
     exec.execute(
         StoredMutation {
             kind: MutationKind::RulesUpdate,
-            payload: serde_json::json!({ "rules-json": rules(hash), "content-hash": hash }),
+            payload: built_on_rules_in_force(coord, hash),
             correlation_id: None,
             issuer_sid: USER.to_string(),
             caller_is_elevated: false,
@@ -352,7 +365,10 @@ fn assert_one_acknowledgement_settles(host: &Host, coord: &Arc<ActivationCoordin
     let exec = gated_executor(host, coord);
     let alert_id = only_tamper_alert(host);
     assert!(
-        matches!(rules_update(&exec, "h-blocked"), MutationOutcome::Failed(_)),
+        matches!(
+            rules_update(&exec, coord, "h-blocked"),
+            MutationOutcome::Failed(_)
+        ),
         "rule changes wait for the acknowledgement"
     );
 
@@ -365,7 +381,7 @@ fn assert_one_acknowledgement_settles(host: &Host, coord: &Arc<ActivationCoordin
     ));
     assert!(
         matches!(
-            rules_update(&exec, "h-after"),
+            rules_update(&exec, coord, "h-after"),
             MutationOutcome::Completed(_)
         ),
         "edits are unblocked"

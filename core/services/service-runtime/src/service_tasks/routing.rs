@@ -140,10 +140,14 @@ pub fn build_traffic_sample_task(deps: TrafficTickDeps) -> ServiceTask {
 /// dropped here. A future IPC push wiring is expected to carry them
 /// through; the service-side enrichment (per-event audit, GUI notify)
 /// belongs there, not in this task.
+///
+/// `link_gone_hook` hears which working adapters stopped working before the
+/// recompute is asked for, so nothing routes through them in between.
 pub fn build_adapter_monitor_task(
     monitor: Arc<AdapterMonitor>,
     health: Arc<HealthAggregator>,
     route_recompute_hook: Option<crate::supervised_runtime::RouteRecomputeHook>,
+    link_gone_hook: Option<crate::supervised_runtime::LinkGoneHook>,
     event_bus: Option<Arc<EventBus>>,
 ) -> ServiceTask {
     ServiceTask::periodic(
@@ -164,6 +168,10 @@ pub fn build_adapter_monitor_task(
             // a DNS-refresh interval. Recompute only on an actual change, so
             // the steady-state 1 s tick stays cheap.
             if !changes.is_empty() {
+                let gone = links_gone(&changes);
+                if let (Some(hook), false) = (&link_gone_hook, gone.is_empty()) {
+                    hook(&gone);
+                }
                 if let Some(hook) = &route_recompute_hook {
                     tracing::info!(
                         target: "nrr::route-coordinator",
@@ -191,6 +199,15 @@ pub fn build_adapter_monitor_task(
             TaskOutcome::Continue
         },
     )
+}
+
+/// Interfaces that carried traffic before `changes` and no longer do.
+pub(crate) fn links_gone(changes: &[nrr_platform_api::AdapterAvailabilityChange]) -> Vec<u32> {
+    changes
+        .iter()
+        .filter(|c| c.old.is_usable() && !c.new.is_usable())
+        .map(|c| c.index)
+        .collect()
 }
 
 // ── Route-reconcile safety net ───────────────────────────────────────────────

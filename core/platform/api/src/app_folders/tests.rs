@@ -312,3 +312,35 @@ fn a_folder_below_tmp_is_writable_by_anyone_and_a_system_folder_is_not() {
     let folders = StdProgramFolders::new(PathStyle::Linux);
     assert!(!folders.writable_by_anyone(Path::new("/usr/bin")));
 }
+
+/// A subfolder closed to the rule's owner adds nothing to what the form
+/// counts: the walk runs as the service, and the count would tell the owner
+/// what is inside a folder they cannot open.
+#[test]
+fn a_subfolder_closed_to_the_owner_is_left_out_of_the_count() {
+    let root = Path::new("/apps");
+    let listing = FolderListing {
+        programs: vec![
+            root.join("tool"),
+            root.join("open").join("a"),
+            root.join("closed").join("b"),
+            root.join("closed").join("deeper").join("c"),
+        ],
+        truncated: false,
+    };
+    let asked = std::cell::RefCell::new(Vec::new());
+    let shown = visible_to_owner(listing, root, &|dir| {
+        asked.borrow_mut().push(dir.to_path_buf());
+        !dir.ends_with("closed")
+    });
+    assert_eq!(
+        shown.programs,
+        vec![root.join("tool"), root.join("open").join("a")]
+    );
+    let closed = asked
+        .borrow()
+        .iter()
+        .filter(|d| d.ends_with("closed"))
+        .count();
+    assert_eq!(closed, 1, "each folder is asked once");
+}

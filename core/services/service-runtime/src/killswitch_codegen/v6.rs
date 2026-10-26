@@ -53,22 +53,16 @@ const V6_LINK_LOCAL_MULTICAST: Ipv6Addr = Ipv6Addr::new(0xff02, 0, 0, 0, 0, 0, 0
 /// v6 LAN — the printer, the NAS, the router's own management address — dies
 /// with the tunnel it never used.
 ///
-/// The transport layer cannot be scoped to a user either. With
-/// `machine_has_other_principals` its half is left out and the per-SID ALE
-/// filters carry the cut alone, so the other users' networking stays whole.
+/// The transport layer cannot be scoped to a user: each user blocking
+/// everything holds its half, and the others' exemptions there sit beside it.
 pub fn catch_all_v6_filters(
     sid: &str,
     secondary_luid: u64,
     server_ips: &[Ipv6Addr],
     local_subnets: &[(Ipv6Addr, u8)],
     protocols: KillSwitchProtocols,
-    machine_has_other_principals: bool,
 ) -> Vec<WfpFilterSpec> {
-    let below_ale = if machine_has_other_principals {
-        Vec::new()
-    } else {
-        protocols.packet_named_v6()
-    };
+    let below_ale = protocols.packet_named_v6();
     let transport = !below_ale.is_empty();
     let mut out = Vec::new();
     // Anything leaving through the tunnel survives the cut: a tunnel whose

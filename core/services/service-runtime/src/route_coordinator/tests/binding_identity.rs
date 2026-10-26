@@ -376,9 +376,13 @@ fn a_bound_adapter_whose_driver_will_not_start_is_reported_as_broken_not_gone() 
     assert_eq!(statuses(None), vec!["adapter-gone".to_string()]);
 
     // Switching an adapter off reads as "no such device" for a few seconds:
-    // "removed" waits out the grace, "switched off" does not.
+    // "removed" waits out the grace, shown meanwhile as not up; "switched off"
+    // does not wait.
     let fresh = std::time::Duration::from_secs(60);
-    assert!(statuses_after(Some(Arc::new(Fixed(Some(DeviceState::Absent)))), fresh).is_empty());
+    assert_eq!(
+        statuses_after(Some(Arc::new(Fixed(Some(DeviceState::Absent)))), fresh),
+        vec!["secondary-down".to_string()],
+    );
     assert_eq!(
         statuses_after(Some(Arc::new(Fixed(Some(DeviceState::Disabled)))), fresh),
         vec!["secondary-down".to_string()],
@@ -771,4 +775,52 @@ fn a_stock_driver_only_match_asks_the_user_instead_of_failing_closed_silently() 
     assert_eq!(notices.len(), 1);
     assert_eq!(notices[0].0, "adapter-choice-needed");
     assert_eq!(notices[0].1, vec!["OpenVPN Wintun".to_string()]);
+}
+
+/// A connection the user renamed keeps its binding by id, and the stored name
+/// follows the rename: when the id later changes (a driver reinstall), the
+/// adapter is found again by the name it carries now, not the one it had when
+/// it was bound. Persisted once, not every reconcile.
+#[test]
+fn a_renamed_adapter_is_found_by_its_new_name_after_its_id_changes() {
+    let api = Arc::new(MockWindowsApi::new());
+    let renamed = |seed: &str, idx: u32| {
+        let mut info = adapter(seed, idx, true, true, Some([10, 0, 0, 1]));
+        info.friendly_name = "Branch".into();
+        info.description = "Zeta Secure Adapter".into();
+        info
+    };
+    api.set_adapter_infos(vec![renamed("aaa", 3)]);
+
+    let policy = Arc::new(FakePolicy::new());
+    policy.bind_secondary_named("S-REN", "win-adapter:aaa", "Office");
+
+    let persisted: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+    let (cap, store) = (Arc::clone(&persisted), Arc::clone(&policy));
+    let coord = coordinator_with_policy(
+        Arc::clone(&api),
+        Arc::new(FakeRules::new()),
+        Arc::clone(&policy),
+    )
+    .with_binding_heal_persist(Arc::new(move |sid, role, id, name| {
+        cap.lock()
+            .unwrap()
+            .push(format!("{sid}|{role}|{id}|{name}"));
+        store.bind_secondary_named(sid, id, name);
+    }));
+
+    assert!(coord.resolve("S-REN").secondary.is_some(), "bound by id");
+    let _ = coord.resolve("S-REN");
+    assert_eq!(
+        *persisted.lock().unwrap(),
+        vec!["S-REN|secondary|win-adapter:aaa|Branch".to_string()],
+        "the new name is stored once, under the same id"
+    );
+
+    // Reinstalled: a new id, the same connection name.
+    api.set_adapter_infos(vec![renamed("bbb", 4)]);
+    assert!(
+        coord.resolve("S-REN").secondary.is_some(),
+        "found again by the name it carries now"
+    );
 }

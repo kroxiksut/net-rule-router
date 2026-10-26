@@ -134,6 +134,9 @@ pub struct Suggestions {
     loading: bool,
     /// A re-read asked for while one was in flight.
     reload_owed: bool,
+    /// An announcement about a site the list did not hold yet, told once the
+    /// list is read: `(top anchor, pending count)`.
+    announce_owed: Option<(String, u64)>,
     /// Index into the shown groups, as last put; read through
     /// [`Suggestions::chosen`].
     selected: usize,
@@ -682,11 +685,28 @@ fn finish(app: &mut AppState, note: Result<Note, CallError>) {
     load(app);
 }
 
+#[cfg(test)]
+pub(crate) fn accept_job_for_tests(ids: Vec<String>) -> Job {
+    accept_job(ids, false)
+}
+
+#[cfg(test)]
+pub(crate) fn dismiss_job_for_tests(ids: Vec<String>) -> Job {
+    dismiss_job(ids)
+}
+
 fn accept_job(ids: Vec<String>, as_any_zone: bool) -> Job {
     Box::new(move |client: &dyn IpcClient| {
+        let accepted = ids.clone();
         let answer = accept(client, ids, as_any_zone);
         Reply::new(move |app| {
             if let Ok(answer) = &answer {
+                // A rule now carries them: the notices about them were
+                // answered, as the tray records it.
+                if answer.applied > 0 {
+                    let sites = sites_not_opening(&app.suggestions.candidates, &accepted);
+                    crate::site_notices::answered(app, &sites);
+                }
                 took(app, answer);
             }
             finish(app, answer.map(|a| Note::Added(a.applied)));
@@ -737,6 +757,7 @@ fn forget_job(ids: Vec<String>) -> Job {
 
 fn dismiss_job(ids: Vec<String>) -> Job {
     Box::new(move |client: &dyn IpcClient| {
+        let refused = ids.clone();
         let answer: Result<AutoRuleCandidatesActionResponse, _> = call(
             client,
             IpcOperationName::AutoRuleCandidatesDismiss,
@@ -748,6 +769,11 @@ fn dismiss_job(ids: Vec<String>) -> Job {
         Reply::new(move |app| {
             if let Ok(answer) = &answer {
                 app.suggestions.pending_count = answer.pending;
+                // A refusal answers the notice, as the tray counts it.
+                if answer.applied > 0 {
+                    let sites = sites_not_opening(&app.suggestions.candidates, &refused);
+                    crate::site_notices::answered(app, &sites);
+                }
             }
             finish(app, answer.map(|a| Note::Declined(a.applied)));
         })
@@ -856,6 +882,62 @@ pub fn changed(
     if !notice_due(announces, pending_count) {
         return None;
     }
+    // Read before told: until the list holds the offer, what it is about is
+    // unknown, and a site that did not open would read as a site's companions.
+    let unread = !top_anchor.is_empty()
+        && !app
+            .suggestions
+            .candidates
+            .iter()
+            .any(|row| row.anchor == top_anchor);
+    if unread && app.link.is_connected() {
+        app.suggestions.announce_owed = Some((top_anchor.to_owned(), pending_count));
+        if !app.suggestions.loading {
+            load(app);
+        }
+        return None;
+    }
+    if !paced(app, top_anchor) {
+        return None;
+    }
+    Some(notice_text(app, top_anchor, texts))
+}
+
+/// A notice about a site that does not open waits under the rule the tray and
+/// the service keep; any other is told as it comes.
+fn paced(app: &mut AppState, top_anchor: &str) -> bool {
+    if notice_kind_of(&app.suggestions.candidates, top_anchor) != NoticeKind::SitesBlocked {
+        return true;
+    }
+    crate::site_notices::tell(app, top_anchor)
+}
+
+/// The sites among `ids` whose offer was that they do not open.
+fn sites_not_opening(candidates: &[AutoRuleCandidateDto], ids: &[String]) -> Vec<String> {
+    candidates
+        .iter()
+        .filter(|c| ids.contains(&c.id))
+        .filter(|c| c.signal == nrr_shared::ipc_payloads::AUTO_RULE_SIGNAL_MAIN_LINK_BLOCKED)
+        .map(|c| c.proposed_match.clone())
+        .collect()
+}
+
+/// Tell the announcement that waited for the list, once the list is read.
+pub fn announce(app: &mut AppState, texts: &Texts) -> Vec<crate::state::Effect> {
+    if app.suggestions.loading || !app.suggestions.loaded {
+        return Vec::new();
+    }
+    let Some((top_anchor, _)) = app.suggestions.announce_owed.take() else {
+        return Vec::new();
+    };
+    if !paced(app, &top_anchor) {
+        return Vec::new();
+    }
+    let (title, body) = notice_text(app, &top_anchor, texts);
+    app.note_in_feed(crate::state::NoticeLevel::Info, title, body)
+}
+
+fn notice_text(app: &AppState, top_anchor: &str, texts: &Texts) -> (String, String) {
     let site = if top_anchor.is_empty() {
         texts.get(keys::NOTICE_SITE_FALLBACK)
     } else {
@@ -874,7 +956,7 @@ pub fn changed(
             ],
         )
     );
-    Some((texts.get(title), body))
+    (texts.get(title), body)
 }
 
 /// What the offers named after `top_anchor` are about, by the list last read.
@@ -1065,7 +1147,14 @@ fn list_lines(app: &AppState, texts: &Texts) -> Vec<ViewLine> {
         .enumerate()
         .flat_map(|(i, group)| {
             let marked = state.marked.contains(&group_key(group));
-            group_lines(group, i, focused && i == chosen, marked, texts)
+            group_lines(
+                group,
+                i,
+                focused && i == chosen,
+                marked,
+                &state.candidates,
+                texts,
+            )
         })
         .collect()
 }
@@ -1118,11 +1207,14 @@ fn group_line_count(group: &SuggestionGroup) -> usize {
     1 + consumers + hosts
 }
 
+/// `candidates`: the rows as the service sent them, for what the grouped
+/// view does not carry (what the additional route was found to do).
 fn group_lines(
     group: &SuggestionGroup,
     index: usize,
     selected: bool,
     marked: bool,
+    candidates: &[AutoRuleCandidateDto],
     texts: &Texts,
 ) -> Vec<ViewLine> {
     let name = if group.is_app {
@@ -1182,12 +1274,21 @@ fn group_lines(
         )));
     }
     for host in &group.hosts {
-        lines.extend(host_lines(group, host, texts));
+        let reach = (host.status == HostStatus::Pending)
+            .then(|| candidates.iter().find(|c| c.id == host.id))
+            .flatten()
+            .and_then(|c| c.secondary_reach);
+        lines.extend(host_lines(group, host, reach, texts));
     }
     lines
 }
 
-fn host_lines(group: &SuggestionGroup, host: &SuggestionHost, texts: &Texts) -> Vec<ViewLine> {
+fn host_lines(
+    group: &SuggestionGroup,
+    host: &SuggestionHost,
+    reach: Option<bool>,
+    texts: &Texts,
+) -> Vec<ViewLine> {
     let shown_name = if host.match_kind == "suffix" {
         format!("*.{}", display_text(&host.match_value))
     } else {
@@ -1216,7 +1317,7 @@ fn host_lines(group: &SuggestionGroup, host: &SuggestionHost, texts: &Texts) -> 
     if has_evidence(host) {
         lines.push(ViewLine::text(format!(
             "     {}",
-            evidence_text(host, texts)
+            evidence_text(host, reach, texts)
         )));
     }
     lines.push(ViewLine::text(format!(
@@ -1245,7 +1346,7 @@ fn has_evidence(host: &SuggestionHost) -> bool {
 
 /// "How do you know?": the evidence travels with the offer, a less certain
 /// offer's basis first.
-fn evidence_text(host: &SuggestionHost, texts: &Texts) -> String {
+fn evidence_text(host: &SuggestionHost, reach: Option<bool>, texts: &Texts) -> String {
     let mut parts = Vec::new();
     if !host.less_certain.is_empty() {
         let suffix = format!(".{}", host.less_certain);
@@ -1270,6 +1371,19 @@ fn evidence_text(host: &SuggestionHost, texts: &Texts) -> String {
                 .find(|k| k.id.ends_with(&suffix))
                 .map_or_else(|| host.signal.clone(), |k| texts.get(*k)),
         );
+        // Only as sure as the probe of the additional route made it.
+        let reach = (host.status == HostStatus::Pending)
+            .then(|| nrr_client_logic::site_notice::site_offer_reach(&host.signal, reach))
+            .flatten();
+        if let Some(slug) = reach {
+            let suffix = format!(".{slug}");
+            if let Some(words) = keys::ADDITIONAL_REACH
+                .iter()
+                .find(|k| k.id.ends_with(&suffix))
+            {
+                parts.push(texts.get(*words));
+            }
+        }
     }
     if host.observations > 0 {
         parts.push(texts.fill(

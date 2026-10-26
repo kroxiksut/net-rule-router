@@ -80,15 +80,6 @@ const STORED_ROW_READERS: &[StoredRowReader] = &[
         reads_rules: None,
     },
     StoredRowReader {
-        file: "production_mutation_executor/activation_drive.rs",
-        function: "preview_reset_to_baseline",
-        reason: "the reset preview describes the caller's own stored divergence",
-        reads_rules: Some(
-            "counts the rules of the stored row the reset deletes; the book in \
-             force may already be the baseline the reset falls back to",
-        ),
-    },
-    StoredRowReader {
         file: "production_diagnostics/internals.rs",
         function: "read_revision_summary",
         reason: "the diagnostics card reports the committed revision id and the \

@@ -187,6 +187,55 @@ pub const PLAIN_ASSIGN: Key = key(
     "tui.interfaces.plain-assign",
     "a: give an adapter a role or take it away (asks for the adapter's number)",
 );
+pub const HELP_SEARCH: Key = key(
+    "tui.interfaces.help-search",
+    "/: find an adapter by name, description, address or type (empty clears)",
+);
+pub const HELP_SORT: Key = key(
+    "tui.interfaces.help-sort",
+    "o: change the order of the list",
+);
+pub const HELP_UNAVAILABLE: Key = key(
+    "tui.interfaces.help-unavailable",
+    "u: show or hide unavailable adapters",
+);
+pub const HELP_RESEND: Key = key(
+    "tui.interfaces.help-resend",
+    "e: send the remembered adapter to the service again",
+);
+pub const SEARCH_LABEL: Key = key("interfaces.search.label", "Find");
+pub const SORT_LABEL: Key = key("interfaces.sort.label", "Sort");
+pub const UNAVAILABLE_HIDDEN: Key = key(
+    "tui.interfaces.unavailable-hidden",
+    "unavailable adapters are hidden",
+);
+pub const SEARCH_PROMPT: Key = key(
+    "tui.interfaces.search-prompt",
+    "Find adapters (empty clears):",
+);
+pub const REMEMBERED_SWITCHED_OFF: Key = key(
+    "interfaces.remembered.badge-switched-off",
+    "remembered · switched off",
+);
+pub const SWITCHED_OFF_HINT: Key = key(
+    "interfaces.remembered.switched-off-hint",
+    "The adapter is switched off. Turn it back on, or assign another adapter to this role in the list below.",
+);
+pub const RECOVERY_HINT: Key = key(
+    "interfaces.remembered.recovery-hint",
+    "If the connection is back up, send the binding to the service again. Otherwise assign another adapter to this role in the list below.",
+);
+pub const RESENT: Key = key(
+    "tui.interfaces.resent",
+    "The binding was sent to the service again.",
+);
+/// Qt-style placeholders (`%1` the address, `%2` the time), as the window
+/// fills it.
+pub const LAST_KNOWN: Key = key(
+    "interfaces.external-ip.last-known",
+    "Last known external IP: %1 (as of %2)",
+);
+pub const SORT_KEYS: [&str; 3] = ["default", "vpn-like", "primary-candidate"];
 
 /// Every key above, for the test that holds both locale files to them.
 #[cfg(test)]
@@ -249,4 +298,17 @@ pub const ALL: &[Key] = &[
     HELP_REFRESH,
     HELP_BLUETOOTH,
     PLAIN_ASSIGN,
+    HELP_SEARCH,
+    HELP_SORT,
+    HELP_UNAVAILABLE,
+    HELP_RESEND,
+    SEARCH_LABEL,
+    SORT_LABEL,
+    UNAVAILABLE_HIDDEN,
+    SEARCH_PROMPT,
+    REMEMBERED_SWITCHED_OFF,
+    SWITCHED_OFF_HINT,
+    RECOVERY_HINT,
+    RESENT,
+    LAST_KNOWN,
 ];

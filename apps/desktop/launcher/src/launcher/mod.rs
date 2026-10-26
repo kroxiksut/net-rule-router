@@ -19,7 +19,6 @@ use nrr_shared::product_identity::BinaryRole;
 
 use nrr_desktop_gui::app_shell::{parse_launch_request_arguments, LaunchRequest};
 use nrr_desktop_gui::ui_surface::apply_qt_preferences_payload as apply_qt_payload;
-use nrr_ui_support::tray::TrayStatusKind;
 use nrr_ui_support::ui_preferences::{SessionPreferences, UiPreferences, UiPreferencesStore};
 
 use crate::user_settings_bridge::UserSettingsMirror;
@@ -39,7 +38,7 @@ pub(crate) use resolve::sibling_service_binary;
 pub use single_instance::{BuildMismatchNote, SingleInstanceGuard};
 
 use child_process::{apply_no_window, spawn_line_reader, spawn_stderr_reader};
-use context::{cleanup_temp_leftovers, emit_context, take_tray_status_argument};
+use context::{cleanup_temp_leftovers, emit_context, take_tray_arguments, TrayArguments};
 use diag_log::{diag_log_path, rotate_session_log, surface_tag};
 use resolve::{resolve_native_icon_path, resolve_qml_path};
 use single_instance::{
@@ -110,7 +109,7 @@ pub fn run(config: LauncherConfig) -> ExitCode {
         return nrr_broker::run_broker_server(broker_args);
     }
 
-    let (tray_status, cli_args) = take_tray_status_argument(config.surface, cli_args);
+    let (tray_arguments, cli_args) = take_tray_arguments(config.surface, cli_args);
 
     install_system_theme_port();
     install_system_locale_port();
@@ -136,7 +135,7 @@ pub fn run(config: LauncherConfig) -> ExitCode {
             user_settings,
             preferences,
             launch_request,
-            tray_status,
+            tray_arguments,
             guard,
         ),
         Ok(None) => match run_secondary(&config, &launch_request) {
@@ -152,7 +151,7 @@ pub fn run(config: LauncherConfig) -> ExitCode {
                         user_settings,
                         preferences,
                         launch_request,
-                        tray_status,
+                        tray_arguments,
                         guard,
                     ),
                     Err(error) if error.kind() == io::ErrorKind::AddrInUse => {
@@ -194,7 +193,7 @@ fn run_primary(
     user_settings: Option<UserSettingsMirror>,
     preferences: UiPreferences,
     request: LaunchRequest,
-    tray_status: Option<TrayStatusKind>,
+    tray_arguments: TrayArguments,
     guard: SingleInstanceGuard,
 ) -> ExitCode {
     let tag = surface_tag(config.surface);
@@ -262,7 +261,7 @@ fn run_primary(
         &preferences,
         &backend_bundle,
         &request,
-        tray_status,
+        tray_arguments.status,
         preferences_unreadable,
     ) {
         Ok(path) => path,
@@ -337,6 +336,14 @@ fn run_primary(
     ];
     if let Some(icon_path) = resolve_native_icon_path() {
         host_arguments.push(format!("--nrr-app-icon={}", icon_path.display()));
+    }
+    // One card about a site, no icon; the tray reads it off its arguments.
+    if let Some(argument) = tray_arguments
+        .notice_site
+        .as_deref()
+        .and_then(nrr_platform_api::session_notice::notice_site_argument)
+    {
+        host_arguments.push(argument);
     }
     if let Some(argument) = auto_close_argument(cfg!(debug_assertions), || {
         env::var("NRR_QML_AUTOCLOSE_MS").ok()

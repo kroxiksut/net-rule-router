@@ -22,7 +22,10 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use nrr_client_logic::notice_mutes::{notice_mute_request, NOTICE_MUTE_CHOICES_MS};
 use nrr_client_logic::route_policy;
 use nrr_ipc_client::IpcClientError;
+use nrr_platform_api::console_path::ConsolePathState;
+use nrr_platform_api::path_registration::PathRegistrationPort;
 use nrr_platform_api::service_control::ServiceStatusReport;
+use nrr_platform_api::service_placement::RegistrationCheck;
 use nrr_shared::ipc_payloads::{
     BlockNoticeMuteDto, BlockNoticeMuteScopeDto, ConnHistoryListResponse, DohResolverEntryDto,
     DohResolversGetResponse, LocalDnsSuffixesGetResponse, LocalNetworksGetResponse,
@@ -194,6 +197,18 @@ pub enum ServiceInfo {
     Registered(ServiceStatusReport),
 }
 
+/// How the registered service stands against this terminal's own build.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ServiceCheck {
+    pub registration: RegistrationCheck,
+    /// The running service is provably an older build than this terminal.
+    pub older: bool,
+}
+
+/// The host's `PATH` mechanism and the folder holding the console beside
+/// this terminal; an error says why there is none.
+pub type ConsolePort = fn() -> Result<(Box<dyn PathRegistrationPort>, PathBuf), String>;
+
 /// What the service answered, per section.
 #[derive(Clone, Debug, Default)]
 pub struct Data {
@@ -217,6 +232,11 @@ pub struct Data {
     /// The caller's own connection-history choices.
     pub conn_history: Loadable<ConnHistoryListResponse>,
     pub service: Loadable<ServiceInfo>,
+    /// Read with `service`, for a registered one.
+    pub service_check: Option<ServiceCheck>,
+    /// Where the service writes its logs, read with `service`.
+    pub logs_folder: Loadable<Option<PathBuf>>,
+    pub console: Loadable<ConsolePathState>,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -355,11 +375,18 @@ pub struct SettingsState {
     /// How long the next pause from the rules toggle lasts.
     pub pause_term: &'static str,
     pub rollback: RollbackOffer,
+    /// Files and bytes clearing the logs would delete, read when it is asked.
+    pub log_clear_preview: Loadable<(u64, u64)>,
     pub prefs: TuiPrefs,
     /// Where the terminal's settings are saved; `None` cannot save.
     pub prefs_path: Option<PathBuf>,
     pub clock: Clock,
     pub service_probe: RegistrationProbe,
+    /// The service binary shipped beside this terminal, when it is there.
+    pub expected_service: Option<PathBuf>,
+    pub console_port: ConsolePort,
+    /// After a registration: open terminals still need the line shown.
+    pub console_hint: bool,
     pub supports: PlatformSupports,
     /// Where this OS keeps its hosts file, shown beside the bypass toggle.
     pub hosts_file_path: String,
@@ -392,10 +419,14 @@ impl Default for SettingsState {
             safe_disable_term: "until-restart",
             pause_term: "until-resumed",
             rollback: RollbackOffer::default(),
+            log_clear_preview: Loadable::NotLoaded,
             prefs: TuiPrefs::default(),
             prefs_path: None,
             clock: Clock::default(),
             service_probe: crate::platform::service_control,
+            expected_service: sibling_service_binary(),
+            console_port: crate::platform::console_path_port,
+            console_hint: false,
             supports: PlatformProfile::current().supports,
             hosts_file_path: PlatformProfile::current().hosts_file_path,
             merge_policy: MergePolicyDto::Union,
@@ -403,6 +434,16 @@ impl Default for SettingsState {
             providers: providers::ProvidersState::default(),
         }
     }
+}
+
+/// The service binary beside this executable: only the sibling counts, as
+/// for the window.
+fn sibling_service_binary() -> Option<PathBuf> {
+    let exe = std::env::current_exe().ok()?;
+    let path = exe
+        .parent()?
+        .join(nrr_shared::product_identity::BinaryRole::Service.host_file_name());
+    path.is_file().then_some(path)
 }
 
 impl SettingsState {
@@ -625,6 +666,16 @@ fn detail_lines(app: &AppState, item: &Item, focused: bool, texts: &Texts) -> Ve
             }
             lines
         }
+        (Mode::Confirming { item: asked }, _) if asked.id == ItemId::ClearLogs => {
+            let mut lines = vec![
+                indent(texts.get(text::CLEAR_LOGS_BODY)),
+                indent(clear_preview_text(&app.settings.log_clear_preview, texts)),
+            ];
+            if focused {
+                lines.push(indent(texts.get(text::CONFIRM)));
+            }
+            lines
+        }
         (Mode::Confirming { .. }, _) if focused => vec![indent(texts.get(text::CONFIRM))],
         (Mode::ConfirmingPick { why, .. }, _) if focused => {
             let mut lines = leak_confirm_lines(app, *why, texts);
@@ -637,6 +688,28 @@ fn detail_lines(app: &AppState, item: &Item, focused: bool, texts: &Texts) -> Ve
             .map(|note| indent(note.resolve(texts)))
             .collect(),
         _ => Vec::new(),
+    }
+}
+
+/// What the service said a clear would delete, before anything is.
+fn clear_preview_text(preview: &Loadable<(u64, u64)>, texts: &Texts) -> String {
+    match preview {
+        Loadable::Ready((files, bytes)) => texts.fill(
+            text::CLEAR_LOGS_PREVIEW,
+            &[
+                ("count", files.to_string()),
+                (
+                    "size",
+                    nrr_client_logic::units::format_storage_bytes(*bytes),
+                ),
+            ],
+        ),
+        Loadable::Failed(failure) => texts.fill(
+            text::LOAD_FAILED,
+            &[("error", failure_text(failure, texts))],
+        ),
+        Loadable::NotLoaded => texts.get(text::NO_DATA),
+        Loadable::Loading => texts.get(text::LOADING),
     }
 }
 
@@ -750,9 +823,15 @@ fn begin(app: &mut AppState, item: &Item) {
         Kind::Text(text) => Mode::Editing {
             buffer: text.clone(),
         },
-        Kind::Action { confirm: true } => Mode::Confirming {
-            item: Box::new(item.clone()),
-        },
+        Kind::Action { confirm: true } => {
+            if item.id == ItemId::ClearLogs && app.link.is_connected() {
+                app.settings.log_clear_preview = Loadable::Loading;
+                app.outbox.push(jobs::preview_clear_logs());
+            }
+            Mode::Confirming {
+                item: Box::new(item.clone()),
+            }
+        }
         Kind::Action { confirm: false } => {
             activate(app, item, Input::Run);
             return;
@@ -1095,9 +1174,13 @@ fn load(app: &mut AppState) {
             .unwrap_or_default();
     }
     if category == Category::Service {
-        app.settings.data.service.start();
-        app.outbox
-            .push(jobs::load_service(app.settings.service_probe));
+        let s = &mut app.settings;
+        s.data.service.start();
+        s.data.console.start();
+        let service = jobs::load_service(s.service_probe, s.expected_service.clone());
+        let console = jobs::load_console(s.console_port);
+        app.outbox.push(service);
+        app.outbox.push(console);
         return;
     }
     if !app.link.is_connected() {
@@ -1125,6 +1208,9 @@ fn load(app: &mut AppState) {
                 s.data.stability.start();
                 queue.push(jobs::load_stability());
             }
+            // The fake-IP row names its driver's verdict.
+            s.data.third_party.start();
+            queue.push(jobs::load_third_party());
         }
         Category::FailurePolicy => {
             s.data.failure_policy.start();
@@ -1202,6 +1288,7 @@ fn needs_service(id: ItemId) -> bool {
             | ItemId::ServiceStart
             | ItemId::ServiceStop
             | ItemId::ServiceRestart
+            | ItemId::ConsolePath
             | ItemId::None
     )
 }
@@ -1417,10 +1504,36 @@ fn activate(app: &mut AppState, item: &Item, input: Input) {
             stability_change(app, key, Value::from(change))
         }
         (ItemId::FailurePolicy, Input::Pick(slug)) => Some(jobs::set_failure_policy(slug)),
-        (ItemId::ServiceStart, Input::Run) => Some(jobs::control_service(
-            jobs::ServiceOp::Start,
-            app.settings.service_probe,
-        )),
+        (ItemId::ServiceStart, Input::Run) => {
+            // Starting would run the copy registered elsewhere, the one the
+            // user is replacing: the window offers re-registering instead.
+            let elsewhere = app
+                .settings
+                .data
+                .service_check
+                .as_ref()
+                .is_some_and(|check| check.registration.registered_elsewhere);
+            if elsewhere {
+                app.settings.refuse(Words::Fill(
+                    text::SERVICE_START_ELSEWHERE,
+                    vec![("command", crate::link::admin_command("reinstall"))],
+                ));
+                return;
+            }
+            Some(jobs::control_service(
+                jobs::ServiceOp::Start,
+                app.settings.service_probe,
+            ))
+        }
+        (ItemId::ConsolePath, Input::Run) => {
+            let owned = app
+                .settings
+                .data
+                .console
+                .ready()
+                .map(|state| state.owned_entry_present);
+            owned.map(|owned| jobs::console_path_change(app.settings.console_port, !owned, owned))
+        }
         (ItemId::ServiceStop, Input::Run) => Some(jobs::control_service(
             jobs::ServiceOp::Stop,
             app.settings.service_probe,
@@ -1855,6 +1968,7 @@ fn save_pref(app: &mut AppState, field: PrefField, on: bool) {
         PrefField::Plain => prefs.plain = on,
         PrefField::NoColor => prefs.no_color = on,
         PrefField::Ascii => prefs.ascii = on,
+        PrefField::HideBlockAddresses => prefs.hide_block_addresses = on,
     }
     match prefs::save(&path, prefs) {
         Ok(()) => {

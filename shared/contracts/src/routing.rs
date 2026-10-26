@@ -456,7 +456,7 @@ impl FromStr for RulesEnabledFilter {
 /// `Application` is an alias for the current-platform application section
 /// (equivalent to `Windows` on Windows). `Windows`, `Linux`, and `MacOS` are
 /// the explicit cross-platform section names; the latter two are "other OS"
-/// filters hidden in the GUI unless the user enables "Show rules for other OS".
+/// filters.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub enum RulesTypeFilter {
     /// Show all rule types (default).
@@ -528,9 +528,6 @@ impl RulesTypeFilter {
     }
 
     /// `true` for filters that represent another OS's application-rule section.
-    ///
-    /// These are hidden in the GUI by default and only shown when the user
-    /// enables "Show rules for other OS" in settings.
     pub const fn is_other_os_on_windows(self) -> bool {
         matches!(self, Self::Linux | Self::MacOS)
     }

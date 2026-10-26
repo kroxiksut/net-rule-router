@@ -109,6 +109,7 @@ fn fresh_deps() -> SupervisedRuntimeDeps {
         revision_watch: None,
         dns_refresh_orchestrator: None,
         route_recompute_hook: None,
+        link_gone_hook: None,
         observation_recompute_hook: None,
         route_teardown_hook: None,
         rule_hostname_seeder: None,
@@ -1153,4 +1154,62 @@ fn a_wedged_route_teardown_costs_the_stop_its_budget() {
     };
     assert!(run_route_teardown(&prompt, Duration::from_secs(5)));
     assert_eq!(ran.load(Ordering::SeqCst), 1);
+}
+
+/// A wake leaves the adapter monitor holding the state from before the sleep,
+/// and on a machine whose reads are paced by the OS change feed nothing would
+/// re-read it for up to the quiet interval. The resume action asks for one
+/// forced read, which the monitor's own tick then makes and reports.
+#[test]
+fn a_resume_asks_the_adapter_monitor_for_one_forced_read() {
+    struct Counting {
+        reads: AtomicUsize,
+    }
+    impl nrr_platform_api::AdapterEventSource for Counting {
+        fn enumerate_all(
+            &self,
+        ) -> Result<Vec<nrr_platform_api::AdapterInfo>, nrr_platform_api::error::PlatformError>
+        {
+            self.reads.fetch_add(1, Ordering::SeqCst);
+            Ok(Vec::new())
+        }
+    }
+    let source = Arc::new(Counting {
+        reads: AtomicUsize::new(0),
+    });
+    let monitor = Arc::new(
+        AdapterMonitor::new(
+            Arc::clone(&source) as Arc<dyn nrr_platform_api::AdapterEventSource>,
+            500,
+        )
+        .reading_on_change(Duration::from_secs(60)),
+    );
+    monitor.change_feed_live();
+    let _ = monitor.update_if_due(0);
+    assert!(monitor.update_if_due(1_000).is_empty());
+    assert_eq!(source.reads.load(Ordering::SeqCst), 1, "paced: one read");
+
+    let supervisor = ServiceSupervisor::new(
+        StopToken::new(),
+        Arc::new(HealthFailureSink::new(Arc::new(HealthAggregator::new()))),
+    );
+    let rearms = Arc::new(AtomicUsize::new(0));
+    let counted = Arc::clone(&rearms);
+    let on_wake = resume_hook(
+        &supervisor,
+        Arc::new(move || {
+            counted.fetch_add(1, Ordering::SeqCst);
+        }),
+        &monitor,
+    );
+    on_wake();
+    assert_eq!(rearms.load(Ordering::SeqCst), 1, "the re-arm still runs");
+    let _ = monitor.update_if_due(2_000);
+    let _ = monitor.update_if_due(3_000);
+    assert_eq!(
+        source.reads.load(Ordering::SeqCst),
+        2,
+        "one wake, one forced read"
+    );
+    let _ = supervisor.shutdown();
 }

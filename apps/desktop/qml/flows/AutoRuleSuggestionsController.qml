@@ -1,4 +1,5 @@
 import QtQuick 2.15
+import "../lib/pure.js" as Pure
 
 // Non-visual controller for SUGGESTED ADDRESSES: the destinations the service
 // parked because a routed site appears to need them.
@@ -46,6 +47,74 @@ QtObject {
     property int autoRuleInertDropped: 0
     property var autoRuleInertSample: []
 
+    /// An announcing push waiting for the list to hold its offer.
+    property var _announceOwed: null
+
+    /// Raise the stripe for an announcing push. Until the list holds the offer
+    /// what it is about is unknown, so the stripe waits for the re-read rather
+    /// than call a site that does not open a site's companions.
+    function announce(event, eventId) {
+        var anchor = String((event || {})["top-anchor"] || "")
+        var held = (autoRuleCandidates || []).some(function(r) {
+            return String((r || {}).anchor || "") === anchor
+        })
+        if (anchor !== "" && !held && root.bridgeAvailable) {
+            _announceOwed = { "event": event, "eventId": eventId }
+            refreshAutoRuleCandidates()
+            return
+        }
+        _raiseAnnouncement(anchor, eventId)
+    }
+
+    function _raiseAnnouncement(anchor, eventId) {
+        // Keyed on the push, not on a constant: dismissing writes to the
+        // ledger, and one fixed id would retire the banner for the life of the
+        // install. Only one is on screen at a time — the newer supersedes.
+        root.notificationsController._dropPushNotice(_autoRuleNoticeId)
+        _autoRuleNoticeId = "auto-rule-candidates:" + String(eventId || "")
+        var told = announcementText(anchor, autoRuleCandidatesPending)
+        root.notificationsController._addPushNotice({
+            "id": _autoRuleNoticeId,
+            "severity": "info",
+            "dismissible": true,
+            "kind": "suggestions-changed",
+            // News of companions retires itself; a site that does not open is
+            // a question and stays until answered.
+            "autoDismissMs": told.sitesBlocked ? 0 : 5000,
+            "muteKind": "suggestions-changed",
+            "title": told.title,
+            "body": told.body,
+            "actionKey": "open-auto-rule-suggestions",
+            "actionText": root.tr("rules.suggestions.open", "Review")
+        })
+    }
+
+    /// What an announcing push says. A site that did not open over the main
+    /// route is named as one, as the terminal UI and the tray name it; any
+    /// other offer keeps the companions' count.
+    function announcementText(topAnchor, count) {
+        var anchor = String(topAnchor || "")
+        var rows = Pure.autoRuleRowsShownByDefault(autoRuleCandidates || []).filter(function(r) {
+            return anchor !== "" && String((r || {}).anchor || "") === anchor
+        })
+        if (anchor !== "" && Pure.autoRuleNoticeKind(rows) === "sites-blocked") {
+            return {
+                "sitesBlocked": true,
+                "title": root.tr("tray.auto-rules.title-blocked", "Sites the main route will not carry"),
+                "body": root.tr("tray.auto-rules.body-blocked",
+                        "Connections to {name} keep failing on the main route.")
+                    .replace("{name}", Pure.displayText(anchor))
+            }
+        }
+        return {
+            "sitesBlocked": false,
+            "title": root.tr("notifications.auto-rule-candidates.title", "Addresses waiting to be added"),
+            "body": root.tr("notifications.auto-rule-candidates.body",
+                    "The service found {count} addresses the sites you routed need.")
+                .replace("{count}", String(count))
+        }
+    }
+
     function refreshAutoRuleCandidates() {
         if (!root.bridgeAvailable || _autoRuleFetchInFlight) return
         var corr = root.rpc.rpcAutoRuleCandidatesList()
@@ -56,6 +125,7 @@ QtObject {
             if (!ok || !payload) {
                 console.log("auto-rule candidates fetch failed:", code, msg)
                 autoRuleSuggestionsController.autoRuleLoadFailed = true
+                autoRuleSuggestionsController._tellOwedAnnouncement()
                 return
             }
             autoRuleSuggestionsController.autoRuleLoadFailed = false
@@ -69,7 +139,17 @@ QtObject {
             // did not offer because they already travel the same route.
             autoRuleSuggestionsController.autoRuleInertDropped = Number(payload["inert-dropped"] || 0)
             autoRuleSuggestionsController.autoRuleInertSample = payload["inert-sample"] || []
+            autoRuleSuggestionsController._tellOwedAnnouncement()
         })
+    }
+
+    /// The announcement that waited for this read; a failed read tells it with
+    /// what is known rather than lose it.
+    function _tellOwedAnnouncement() {
+        var owed = _announceOwed
+        _announceOwed = null
+        if (owed === null || autoRuleCandidatesPending <= 0) return
+        _raiseAnnouncement(String((owed.event || {})["top-anchor"] || ""), owed.eventId)
     }
 
     /// Navigate to the suggestions section with whatever the service holds

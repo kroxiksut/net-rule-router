@@ -1,6 +1,6 @@
 use nrr_shared::{
-    gui_shell_v1, FreeRuleType, RouteBehaviorMode, RouteRole, RuleScenario, SettingAvailability,
-    SettingFieldId, SettingOwnership, SettingsSectionId, ThemeMode,
+    gui_shell_v1, FreeRuleType, RouteBehaviorMode, RouteRole, RuleScenario, SettingFieldId,
+    SettingOwnership, SettingsSectionId, ThemeMode,
 };
 
 #[test]
@@ -47,7 +47,6 @@ fn routing_behavior_fields_include_expected_ids_in_order() {
             SettingFieldId::WarnWhenSecondaryUnavailable,
             SettingFieldId::RulesFileChangeMode,
             SettingFieldId::RuleIncludeChildProcesses,
-            SettingFieldId::ShowOtherOsRules,
             SettingFieldId::ZonePriorityOverIp,
         ]
     );
@@ -71,24 +70,6 @@ fn routing_behavior_policy_fields_are_policy_affecting_preview() {
     assert!(policy_fields.contains(&SettingFieldId::DefaultRoutingMode));
     assert!(policy_fields.contains(&SettingFieldId::RulesFileChangeMode));
     assert!(policy_fields.contains(&SettingFieldId::RuleIncludeChildProcesses));
-}
-
-#[test]
-fn show_other_os_rules_is_ui_preference() {
-    let shell = gui_shell_v1();
-    let routing = shell
-        .settings
-        .sections
-        .iter()
-        .find(|section| section.id == SettingsSectionId::RoutingBehavior)
-        .unwrap_or_else(|| panic!("routing behavior section must exist"));
-    let field = routing
-        .fields
-        .iter()
-        .find(|f| f.id == SettingFieldId::ShowOtherOsRules)
-        .unwrap_or_else(|| panic!("ShowOtherOsRules field must exist"));
-    assert_eq!(field.ownership, SettingOwnership::UiPreference);
-    assert_eq!(field.availability, SettingAvailability::Preview);
 }
 
 #[test]

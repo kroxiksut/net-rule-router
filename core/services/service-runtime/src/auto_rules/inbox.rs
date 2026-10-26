@@ -235,6 +235,7 @@ impl AutoRulesEngine {
         ) {
             Ok(outcome) => {
                 self.remember_authored(sid, &selected);
+                self.forget_answered(sid, &selected);
                 tracing::info!(
                     target: "nrr::auto-rules",
                     msg_key = "autorules-inbox-accepted",
@@ -290,6 +291,9 @@ impl AutoRulesEngine {
                 entry.insert(c.dto.id.clone());
             }
         }
+        // The refusal record keeps the offer for "restore"; the counters are
+        // not needed for it.
+        self.forget_answered(sid, &selected);
         tracing::info!(
             target: "nrr::auto-rules",
             msg_key = "autorules-inbox-dismissed",
@@ -444,4 +448,26 @@ impl AutoRulesEngine {
     }
 
     // ── Internals ────────────────────────────────────────────────────────────
+
+    /// Drop from `sid`'s ledger the hosts these answered offers named: the
+    /// evidence earned its answer and has nothing left to earn.
+    fn forget_answered(&self, sid: &str, answered: &[PendingCandidate]) {
+        let named: Vec<String> = answered
+            .iter()
+            .filter(|c| !is_app_offer(&c.dto))
+            .map(|c| c.dto.proposed_match.trim_matches('.').to_ascii_lowercase())
+            .filter(|m| !m.is_empty())
+            .collect();
+        if named.is_empty() {
+            return;
+        }
+        let mut ledgers = self.ledgers.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(entry) = ledgers.get_mut(sid) {
+            entry.ledger.forget_candidates(|host| {
+                named
+                    .iter()
+                    .any(|m| nrr_domain::decision_matching::match_suffix_domain(host, m))
+            });
+        }
+    }
 }

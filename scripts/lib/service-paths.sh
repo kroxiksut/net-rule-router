@@ -39,6 +39,10 @@ NRR_STAGED_LOCALES_DIR="$NRR_SERVICE_INSTALL_DIR/locales"
 NRR_UNIT_FILE="/etc/systemd/system/$NRR_UNIT_NAME"
 # The oneshot the unit's OnFailure= starts (systemd.rs after_crash_unit_name).
 NRR_AFTER_CRASH_UNIT_FILE="/etc/systemd/system/$NRR_PRODUCT_NAME_UNIX-after-crash.service"
+# The boot oneshot the unit's Also= names, and the table it applies
+# (systemd.rs early_unit_name, early_table.rs path).
+NRR_EARLY_UNIT_FILE="/etc/systemd/system/$NRR_PRODUCT_NAME_UNIX-early.service"
+NRR_EARLY_TABLE_FILE="/var/lib/$NRR_PRODUCT_NAME_UNIX/early-table.json"
 # Where a distribution package puts the unit (systemd.rs PACKAGE_UNIT_DIRS).
 # One there means the package manager owns the install; these scripts stand down.
 NRR_PACKAGE_UNIT_FILES=("/usr/lib/systemd/system/$NRR_UNIT_NAME" "/lib/systemd/system/$NRR_UNIT_NAME")

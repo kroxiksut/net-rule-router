@@ -642,3 +642,79 @@ fn no_next_hop_warn_latch_dedups_until_cleared() {
         "a successful resolution re-arms the warn"
     );
 }
+
+/// The tunnel drops and comes back under another interface before the pass
+/// that follows has run: a first contact in between must not install a route
+/// through the interface that is gone. Losing one first connection is the
+/// price; a route on the old link would outlive the reconnect.
+#[test]
+fn a_first_contact_after_the_link_is_gone_waits_for_the_next_pass() {
+    let api = Arc::new(MockWindowsApi::new());
+    let rules = Arc::new(FakeRules::new());
+    rules.set_secondary(
+        "S-IVANOV",
+        CanonicalRuleSet::from_rules(vec![ip_rule("a", 203, 0, 113, 1)]),
+    );
+    let coord = coordinator(Arc::clone(&api), Arc::clone(&rules));
+    let fresh = Ipv4Addr::new(203, 0, 113, 2);
+    coord
+        .recompute_for("S-IVANOV", &res(Some(target())))
+        .expect("recompute");
+    rules.set_secondary(
+        "S-IVANOV",
+        CanonicalRuleSet::from_rules(vec![
+            ip_rule("a", 203, 0, 113, 1),
+            ip_rule("b", 203, 0, 113, 2),
+        ]),
+    );
+
+    coord.forget_links(&[target().interface_index]);
+    assert_eq!(
+        coord.route_first_contact("S-IVANOV", &[IpAddr::V4(fresh)]),
+        0
+    );
+    assert!(!table_dests(&api).contains(&fresh));
+
+    let back = SecondaryRouteTarget {
+        interface_index: 9,
+        ..target()
+    };
+    coord
+        .recompute_for("S-IVANOV", &res(Some(back)))
+        .expect("recompute");
+    let links: Vec<u32> = api
+        .get_ip_forward_table()
+        .expect("table")
+        .iter()
+        .filter(|r| r.destination == IpAddr::V4(fresh))
+        .map(|r| r.interface_index)
+        .collect();
+    assert_eq!(links, vec![9], "{links:?}");
+}
+
+/// An unrelated adapter going away must not cost this user a first contact.
+#[test]
+fn another_adapter_going_away_keeps_the_first_contact() {
+    let api = Arc::new(MockWindowsApi::new());
+    let rules = Arc::new(FakeRules::new());
+    rules.set_secondary(
+        "S-IVANOV",
+        CanonicalRuleSet::from_rules(vec![ip_rule("a", 203, 0, 113, 1)]),
+    );
+    let coord = coordinator(Arc::clone(&api), Arc::clone(&rules));
+    coord
+        .recompute_for("S-IVANOV", &res(Some(target())))
+        .expect("recompute");
+    rules.set_secondary(
+        "S-IVANOV",
+        CanonicalRuleSet::from_rules(vec![
+            ip_rule("a", 203, 0, 113, 1),
+            ip_rule("b", 203, 0, 113, 2),
+        ]),
+    );
+    coord.forget_links(&[target().interface_index + 1]);
+    assert_eq!(
+        coord.route_first_contact("S-IVANOV", &[IpAddr::V4(Ipv4Addr::new(203, 0, 113, 2))]),
+        1
+    );
+}

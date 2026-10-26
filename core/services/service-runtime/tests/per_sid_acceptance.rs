@@ -128,12 +128,19 @@ fn hash_of(tag: &str) -> Option<String> {
     ))
 }
 
-fn commit_rules(exec: &ProductionMutationExecutor, principal: &str, tag: &str) {
+/// Commits `tag`'s rules as a client that read the rules first.
+fn commit_rules(
+    exec: &ProductionMutationExecutor,
+    provider: &ProductionRulesProvider,
+    principal: &str,
+    tag: &str,
+) {
     let stored = StoredMutation {
         kind: MutationKind::RulesUpdate,
         payload: serde_json::json!({
             "rules-json": canonical_rules(tag),
             "content-hash": format!("hash-{tag}"),
+            "base-revision": provider.base_revision_for(principal).expect("base"),
         }),
         correlation_id: None,
         issuer_sid: principal.to_string(),
@@ -178,9 +185,9 @@ fn resolved_rule_id(provider: &ProductionRulesProvider, principal: &str) -> Opti
 
 #[test]
 fn two_principals_commit_independently_and_stay_isolated() {
-    let (exec, coord, _provider) = build();
-    commit_rules(&exec, SID_A, "alpha");
-    commit_rules(&exec, SID_B, "beta");
+    let (exec, coord, provider) = build();
+    commit_rules(&exec, &provider, SID_A, "alpha");
+    commit_rules(&exec, &provider, SID_B, "beta");
 
     // Each principal owns exactly its own active revision.
     assert_eq!(active_hash(&coord, SID_A), hash_of("alpha"));
@@ -189,7 +196,7 @@ fn two_principals_commit_independently_and_stay_isolated() {
     assert_eq!(active_hash(&coord, BASELINE_PRINCIPAL), None);
 
     // B re-edits — A is untouched (isolation).
-    commit_rules(&exec, SID_B, "beta2");
+    commit_rules(&exec, &provider, SID_B, "beta2");
     assert_eq!(active_hash(&coord, SID_B), hash_of("beta2"));
     assert_eq!(active_hash(&coord, SID_A), hash_of("alpha"));
 }
@@ -202,7 +209,7 @@ fn fresh_principal_reads_through_to_baseline_then_diverges_on_edit() {
     assert_eq!(resolved_rule_id(&provider, SID_FRESH), None);
 
     // Admin sets the baseline (principal = baseline sentinel).
-    commit_rules(&exec, BASELINE_PRINCIPAL, "base");
+    commit_rules(&exec, &provider, BASELINE_PRINCIPAL, "base");
 
     // The fresh principal now READS THROUGH to baseline (no copied row).
     assert_eq!(active_hash(&coord, SID_FRESH), None, "no own revision");
@@ -213,7 +220,7 @@ fn fresh_principal_reads_through_to_baseline_then_diverges_on_edit() {
     );
 
     // The principal edits → it diverges (own revision overrides baseline).
-    commit_rules(&exec, SID_FRESH, "mine");
+    commit_rules(&exec, &provider, SID_FRESH, "mine");
     assert_eq!(active_hash(&coord, SID_FRESH), hash_of("mine"));
     assert_eq!(
         resolved_rule_id(&provider, SID_FRESH).as_deref(),
@@ -224,8 +231,8 @@ fn fresh_principal_reads_through_to_baseline_then_diverges_on_edit() {
 #[test]
 fn reset_discards_divergence_and_resumes_baseline_read_through() {
     let (exec, coord, provider) = build();
-    commit_rules(&exec, BASELINE_PRINCIPAL, "base");
-    commit_rules(&exec, SID_A, "alpha");
+    commit_rules(&exec, &provider, BASELINE_PRINCIPAL, "base");
+    commit_rules(&exec, &provider, SID_A, "alpha");
     assert_eq!(
         resolved_rule_id(&provider, SID_A).as_deref(),
         Some("r-alpha")
@@ -245,12 +252,12 @@ fn reset_discards_divergence_and_resumes_baseline_read_through() {
 #[test]
 fn admin_baseline_edit_reaches_non_diverged_users_only() {
     let (exec, coord, provider) = build();
-    commit_rules(&exec, BASELINE_PRINCIPAL, "base");
+    commit_rules(&exec, &provider, BASELINE_PRINCIPAL, "base");
     // B diverges; the fresh principal stays on baseline.
-    commit_rules(&exec, SID_B, "beta");
+    commit_rules(&exec, &provider, SID_B, "beta");
 
     // Admin updates the baseline.
-    commit_rules(&exec, BASELINE_PRINCIPAL, "base2");
+    commit_rules(&exec, &provider, BASELINE_PRINCIPAL, "base2");
     assert_eq!(active_hash(&coord, BASELINE_PRINCIPAL), hash_of("base2"));
 
     // Non-diverged fresh principal sees the new baseline...

@@ -662,7 +662,7 @@ fn unparseable_datagram_is_forwarded() {
     assert_eq!(l.answer_query(&[0u8; 3]), ListenerAction::Forward);
 }
 
-// ── S4.8 — direct-host fake-IP under block-all (variant A) ───────────────
+// ── Collateral fake-IP ──────────────────────────────────────────────────
 
 /// Claims every host: returns one fixed fake address and records what the
 /// listener offered (host + the steered real set).
@@ -679,66 +679,6 @@ impl DirectFakeIpAnswerer for ClaimingFake {
         Some(vec![self.fake])
     }
 }
-
-#[test]
-fn direct_fake_rewrites_the_reply_and_sees_the_steered_addresses() {
-    let fake = Ipv4Addr::new(198, 18, 0, 7);
-    let claiming = Arc::new(ClaimingFake {
-        fake,
-        seen: std::sync::Mutex::new(Vec::new()),
-    });
-    let l = listener(
-        &["assistant.example"],
-        Ok(resolved(&[Ipv4Addr::new(100, 64, 1, 4)])),
-    )
-    .with_direct_fake_ip(Arc::clone(&claiming) as Arc<dyn DirectFakeIpAnswerer>);
-    let q = query("blog.example", QTYPE_A);
-    let real = Ipv4Addr::new(203, 0, 113, 68);
-    let reply = reply_for("blog.example", &[real]);
-    let out = l
-        .fake_direct_response(&q, &question(&q), &reply)
-        .expect("claimed");
-    match crate::dns_wire::parse_address_response(0x1234, "blog.example", QTYPE_A, &out) {
-        crate::dns_wire::AddressResponseOutcome::Answers { addresses, .. } => {
-            assert_eq!(
-                addresses,
-                vec![fake],
-                "client is handed the virtual address"
-            );
-        }
-        other => panic!("expected Answers, got {other:?}"),
-    }
-    // The answerer saw the FINAL (steered) real set — what the relay dials.
-    let seen = claiming.seen.lock().unwrap_or_else(|p| p.into_inner());
-    assert_eq!(seen.as_slice(), &[("blog.example".to_string(), vec![real])]);
-}
-
-#[test]
-fn direct_fake_declines_leave_the_gate_path_in_charge() {
-    // Default (Noop) answerer → never claims → caller falls back to the
-    // gate + steered-reply path.
-    let l = listener(
-        &["assistant.example"],
-        Ok(resolved(&[Ipv4Addr::new(100, 64, 1, 4)])),
-    );
-    let q = query("blog.example", QTYPE_A);
-    let reply = reply_for("blog.example", &[Ipv4Addr::new(203, 0, 113, 68)]);
-    assert_eq!(l.fake_direct_response(&q, &question(&q), &reply), None);
-    // Even a claiming answerer must not rewrite an NXDOMAIN / error reply.
-    let claiming = Arc::new(ClaimingFake {
-        fake: Ipv4Addr::new(198, 18, 0, 7),
-        seen: std::sync::Mutex::new(Vec::new()),
-    });
-    let l = listener(
-        &["assistant.example"],
-        Ok(resolved(&[Ipv4Addr::new(100, 64, 1, 4)])),
-    )
-    .with_direct_fake_ip(claiming as Arc<dyn DirectFakeIpAnswerer>);
-    let nx = crate::dns_wire::build_error_response(&q, RCODE_NXDOMAIN).expect("nx");
-    assert_eq!(l.fake_direct_response(&q, &question(&q), &nx), None);
-}
-
-// ── Collateral rescue — fully pinned direct host → virtual address ───────
 
 struct StubCompanions(&'static str);
 impl CompanionCandidateLookup for StubCompanions {
@@ -2296,4 +2236,33 @@ fn a_trickling_peer_is_cut_off_at_the_deadline() {
     );
     drop(stream);
     let _ = trickle.join();
+}
+
+/// Every query used to cost a fresh buffer for the hand-off to a worker. A
+/// buffer a worker is done with carries the next datagram, byte for byte.
+#[test]
+fn a_finished_query_buffer_carries_the_next_datagram() {
+    let buffers = QueryBuffers::default();
+    let first = buffers.filled(b"\x12\x34first query");
+    let at = first.as_ptr();
+    buffers.give_back(first);
+    let second = buffers.filled(b"\xab\xcdsecond");
+    assert_eq!(
+        second, b"\xab\xcdsecond",
+        "no byte of the earlier query left"
+    );
+    assert_eq!(second.as_ptr(), at, "the same buffer, no new allocation");
+}
+
+/// One oversized datagram must not leave the loop holding its buffer, and a
+/// flood of returns must not grow the spare list without bound.
+#[test]
+fn spare_query_buffers_stay_small_and_few() {
+    let buffers = QueryBuffers::default();
+    buffers.give_back(vec![0; SPARE_QUERY_BUFFER_BYTES * 4]);
+    assert!(buffers.filled(b"q").capacity() <= SPARE_QUERY_BUFFER_BYTES);
+    for _ in 0..SPARE_QUERY_BUFFERS * 4 {
+        buffers.give_back(Vec::with_capacity(512));
+    }
+    assert!(buffers.spare.lock().map_or(0, |s| s.len()) <= SPARE_QUERY_BUFFERS);
 }

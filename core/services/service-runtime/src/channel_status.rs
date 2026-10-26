@@ -138,6 +138,11 @@ impl ChannelStatusPublisher {
                             role,
                             replacements.clone(),
                         );
+                    } else {
+                        // Not up is what is known yet; the board keeps it
+                        // quiet, and the grace it starts is the one "gone"
+                        // continues.
+                        board.publish(events, principal, "secondary-down", role, Vec::new());
                     }
                 }
                 ChannelState::Unbound => board.clear_role(events, principal, role),
@@ -185,10 +190,19 @@ mod tests {
         );
         let start = Instant::now();
         publisher.observe(Some(&bus), [("unix:uid:1000", &gone)], start);
+        // Shown at once as not up, and quietly: the grace holds the card.
         assert_eq!(
             statuses(&bus, &me.subscription_id),
-            vec![pair("secondary", "ok")]
+            vec![pair("primary", "secondary-down"), pair("secondary", "ok")]
         );
+        assert!(bus
+            .peek_pending_for(&me.subscription_id, 64)
+            .iter()
+            .any(|e| matches!(
+                &e.event,
+                StatusUpdateEvent::EnforcementStatusChanged { status, quiet: true, .. }
+                    if status == "secondary-down"
+            )));
 
         publisher.observe(Some(&bus), [("unix:uid:1000", &gone)], start + GONE_GRACE);
         assert_eq!(
@@ -222,8 +236,8 @@ mod tests {
         publisher.observe(None, [("p", &gone)], start + GONE_GRACE);
         assert_eq!(
             publisher.board().status_of("p", "primary").as_deref(),
-            Some("ok"),
-            "a link gone twice for half the grace each is not gone",
+            Some("secondary-down"),
+            "a link gone twice for half the grace each is not up, and not gone",
         );
     }
 

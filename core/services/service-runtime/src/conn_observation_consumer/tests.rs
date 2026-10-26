@@ -1379,6 +1379,245 @@ fn over_the_main_link(
     }
 }
 
+/// A main-link connection from `port` that comes up and then resends twice a
+/// timeout apart: one stall.
+fn stalled_main_link_connection(port: u16) -> Vec<ConnectionObservation> {
+    let at = |progress, ms| {
+        let mut o = over_the_main_link(ConnectionVerdict::Unknown, progress);
+        o.local.set_port(port);
+        o.observed_unix_ms = Some(ms);
+        o
+    };
+    vec![
+        at(ConnectionProgress::Attempt, 1_000),
+        at(ConnectionProgress::Retransmit, 2_500),
+        at(ConnectionProgress::Retransmit, 3_600),
+    ]
+}
+
+const STAGE0_USER: &str = "S-1-5-21-TEST";
+const STAGE0_HOST: &str = "click.mail.example";
+
+fn stage0(
+    stalls: &Arc<crate::primary_stall_registry::PrimaryStallRegistry>,
+    engine: Option<MainLinkHealthHook>,
+) -> MainLinkDiagnostics {
+    MainLinkDiagnostics {
+        rule_host_names: Arc::new(|_| None),
+        observed_names: Arc::new(|_| Some(STAGE0_HOST.to_string())),
+        routing: Arc::new(|| Some(STAGE0_USER.to_string())),
+        several_served: Arc::new(|| false),
+        stalls: Arc::clone(stalls),
+        engine,
+    }
+}
+
+/// With the suggestions engine switched off the observer used to name
+/// nothing, so a site that would not open left no trace in the register the
+/// diagnostics read.
+#[test]
+fn with_the_suggestions_engine_off_a_stalled_host_is_still_named_in_the_register() {
+    let stalls = Arc::new(crate::primary_stall_registry::PrimaryStallRegistry::new());
+    let consumer = consumer_on_both_links().with_main_link_diagnostics(stage0(&stalls, None));
+    for port in 0..3 {
+        consumer.consume(
+            &stalled_main_link_connection(50_100 + port),
+            SystemTime::now(),
+        );
+    }
+    assert_eq!(stalls.stalling(STAGE0_USER), vec![STAGE0_HOST.to_string()]);
+}
+
+/// With the engine on it hears every outcome the register files, the verdict
+/// included, exactly as it did when it owned the sink.
+#[test]
+fn with_the_suggestions_engine_on_it_hears_every_outcome_with_the_verdict() {
+    let stalls = Arc::new(crate::primary_stall_registry::PrimaryStallRegistry::new());
+    // `(user, host, stalled, verdict changed)` per outcome.
+    type Heard = Vec<(String, String, bool, bool)>;
+    let heard: Arc<Mutex<Heard>> = Arc::default();
+    let hook: MainLinkHealthHook = {
+        let heard = Arc::clone(&heard);
+        Arc::new(move |h: MainLinkHealth<'_>| {
+            heard.lock().unwrap_or_else(|p| p.into_inner()).push((
+                h.sid.to_string(),
+                h.hostname.to_string(),
+                h.event == nrr_domain::companion_affinity::PrimaryHealthEvent::Stalled,
+                h.report.is_some(),
+            ));
+        })
+    };
+    let consumer = consumer_on_both_links().with_main_link_diagnostics(stage0(&stalls, Some(hook)));
+    for port in 0..3 {
+        consumer.consume(
+            &stalled_main_link_connection(50_200 + port),
+            SystemTime::now(),
+        );
+    }
+    let heard = heard.lock().unwrap_or_else(|p| p.into_inner()).clone();
+    assert_eq!(heard.len(), 3, "{heard:?}");
+    assert!(
+        heard
+            .iter()
+            .all(|(sid, host, stalled, _)| sid == STAGE0_USER && host == STAGE0_HOST && *stalled),
+        "{heard:?}"
+    );
+    assert!(
+        heard[2].3,
+        "the turn to 'stalls' reaches the engine: {heard:?}"
+    );
+    assert_eq!(stalls.stalling(STAGE0_USER), vec![STAGE0_HOST.to_string()]);
+}
+
+/// The main-link health sink's `(hostname, stalled)` reports.
+type HealthReports = Arc<Mutex<Vec<(String, bool)>>>;
+
+fn consumer_reporting_health() -> (ConnectionObservationConsumer, HealthReports) {
+    let seen: HealthReports = Arc::new(Mutex::new(Vec::new()));
+    let sink = Arc::clone(&seen);
+    let consumer = consumer_on_both_links()
+        .with_health_name_fallback(Arc::new(|_| Some("click.mail.example".to_string())))
+        .with_companion_primary_health(Arc::new(move |_owner, host: &str, stalled| {
+            sink.lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .push((host.to_string(), stalled));
+        }));
+    (consumer, seen)
+}
+
+fn handshake_resent(at_ms: u64) -> ConnectionObservation {
+    ConnectionObservation {
+        observed_unix_ms: Some(at_ms),
+        ..over_the_main_link(
+            ConnectionVerdict::Unknown,
+            ConnectionProgress::HandshakeRetransmit,
+        )
+    }
+}
+
+/// A provider swallows the handshake of a host no rule names: the connection
+/// never comes up, the stack only resends it, and the host used to leave no
+/// trace in the main-link register.
+#[test]
+fn a_host_whose_handshake_goes_unanswered_reaches_the_main_link_register_once() {
+    let (consumer, seen) = consumer_reporting_health();
+    consumer.consume(
+        &[
+            handshake_resent(1_000),
+            handshake_resent(3_000),
+            handshake_resent(7_000),
+        ],
+        SystemTime::now(),
+    );
+    let seen = seen.lock().unwrap_or_else(|p| p.into_inner()).clone();
+    assert_eq!(seen, vec![("click.mail.example".to_string(), true)]);
+}
+
+/// Our own filter dropped the handshake; the stack resends it into that
+/// filter, and the host must not be recorded as failing on the main link.
+#[test]
+fn a_handshake_our_own_filter_dropped_never_reaches_the_main_link_register() {
+    let (consumer, seen) = consumer_reporting_health();
+    let dropped = ConnectionObservation {
+        blocked_by_nrr: Some(true),
+        observed_unix_ms: Some(900),
+        ..over_the_main_link(ConnectionVerdict::Block, ConnectionProgress::Attempt)
+    };
+    consumer.consume(
+        &[
+            dropped,
+            handshake_resent(1_000),
+            handshake_resent(3_000),
+            handshake_resent(7_000),
+        ],
+        SystemTime::now(),
+    );
+    assert!(seen.lock().unwrap_or_else(|p| p.into_inner()).is_empty());
+}
+
+/// `(message key, local port)` of every line `run` writes.
+fn logged_lines(run: impl FnOnce()) -> Vec<(String, u64)> {
+    use tracing_subscriber::layer::SubscriberExt;
+
+    let dir = tempfile::TempDir::new().expect("temp dir");
+    let writer = Arc::new(nrr_diagnostics::LogWriter::open(
+        nrr_diagnostics::LogWriterConfig::new(dir.path()),
+    ));
+    let subscriber =
+        tracing_subscriber::registry().with(nrr_diagnostics::NdjsonTracingLayer::new(writer));
+    tracing::subscriber::with_default(subscriber, run);
+    let mut lines = Vec::new();
+    for entry in std::fs::read_dir(dir.path()).expect("logs dir") {
+        let text = std::fs::read_to_string(entry.expect("entry").path()).expect("read");
+        for line in text.lines() {
+            let v: serde_json::Value = serde_json::from_str(line).expect("ndjson line");
+            lines.push((
+                v["message_key"].as_str().unwrap_or_default().to_string(),
+                v["payload"]["local_port"].as_u64().unwrap_or_default(),
+            ));
+        }
+    }
+    lines
+}
+
+/// A main-link connection from `port` whose peer went silent: established,
+/// then resent at a doubling timeout until the stack gives up.
+fn silent_connection(port: u16) -> Vec<ConnectionObservation> {
+    let at = |progress, ms| {
+        let mut o = over_the_main_link(ConnectionVerdict::Unknown, progress);
+        o.local.set_port(port);
+        o.observed_unix_ms = Some(ms);
+        o
+    };
+    let mut batch = vec![at(ConnectionProgress::Attempt, 1_000)];
+    batch.extend(
+        [2_000, 3_000, 5_000, 9_000, 17_000].map(|ms| at(ConnectionProgress::Retransmit, ms)),
+    );
+    batch.push(at(ConnectionProgress::ClosedInOrder, 40_000));
+    batch
+}
+
+/// A silent RDP session the service then tore down (the tunnel came back):
+/// the stack reports that close like one it gave up on, and the log used to
+/// say the system closed it. The connection the network dropped still is.
+#[test]
+fn a_silent_connection_the_service_tore_down_is_not_reported_as_closed_by_the_system() {
+    let resets = Arc::new(crate::own_flow_resets::OwnFlowResets::new());
+    let consumer = consumer_on_both_links().with_own_flow_resets(Arc::clone(&resets));
+    let (ours, dropped) = (silent_connection(50_010), silent_connection(50_011));
+    let lines = logged_lines(|| {
+        consumer.consume(&ours[..ours.len() - 1], SystemTime::now());
+        consumer.consume(&dropped[..dropped.len() - 1], SystemTime::now());
+        let close = &ours[ours.len() - 1];
+        resets.record(&[nrr_platform_api::fake_ip::stale_flows::EstablishedFlow {
+            local: close.local,
+            remote: close.remote,
+            owner: None,
+            pid: None,
+            image: None,
+        }]);
+        consumer.consume(&[ours[ours.len() - 1].clone()], SystemTime::now());
+        consumer.consume(&[dropped[dropped.len() - 1].clone()], SystemTime::now());
+    });
+    let of = |key: &str| -> Vec<u64> {
+        lines
+            .iter()
+            .filter(|(k, _)| k == key)
+            .map(|(_, port)| *port)
+            .collect()
+    };
+    assert_eq!(
+        of("diag.event.conn-unanswered"),
+        vec![50_010, 50_011],
+        "the silence itself was the network's, for both: {lines:?}"
+    );
+    assert_eq!(
+        of("diag.event.conn-unanswered-closed"),
+        vec![50_011],
+        "only the close the service did not cause: {lines:?}"
+    );
+}
+
 /// The stack's connect event is what marks a connection established. Left out
 /// of the stall tracker, no close ever counted, so every program that ever hit
 /// a slow host was offered for the tunnel and never withdrawn — Chrome included.

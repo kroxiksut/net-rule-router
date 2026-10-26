@@ -11,7 +11,9 @@
 use windows::core::PWSTR;
 use windows::Win32::Foundation::{CloseHandle, LocalFree, HANDLE, HLOCAL};
 use windows::Win32::Security::Authorization::ConvertSidToStringSidW;
-use windows::Win32::Security::{GetTokenInformation, TokenUser, TOKEN_QUERY, TOKEN_USER};
+use windows::Win32::Security::{
+    GetTokenInformation, TokenElevation, TokenUser, TOKEN_ELEVATION, TOKEN_QUERY, TOKEN_USER,
+};
 use windows::Win32::System::RemoteDesktop::{
     WTSActive, WTSDisconnected, WTSEnumerateSessionsW, WTSFreeMemory, WTSGetActiveConsoleSessionId,
     WTSQuerySessionInformationW, WTSQueryUserToken, WTSSessionInfo, WTSINFOW,
@@ -240,6 +242,37 @@ fn session_user_sid(session_id: u32) -> Option<String> {
     sid
 }
 
+/// The session in which `sid` sits at a screen: the console when it is theirs,
+/// else an attached remote one. A disconnected session shows nobody anything.
+pub fn attached_session_of(sid: &str) -> Option<u32> {
+    // SAFETY: takes no args; returns the console session id or 0xFFFFFFFF.
+    let console = unsafe { WTSGetActiveConsoleSessionId() };
+    if console != 0xFFFF_FFFF && session_user_sid(console).as_deref() == Some(sid) {
+        return Some(console);
+    }
+    let mut info: *mut WTS_SESSION_INFOW = std::ptr::null_mut();
+    let mut count: u32 = 0;
+    // SAFETY: both out-params are valid; on success `info` points at `count`
+    // entries allocated by WTS, released below with WTSFreeMemory.
+    if unsafe { WTSEnumerateSessionsW(WTS_CURRENT_SERVER_HANDLE, 0, 1, &mut info, &mut count) }
+        .is_err()
+        || info.is_null()
+    {
+        return None;
+    }
+    // SAFETY: WTS returned `count` contiguous entries at `info`, alive until freed.
+    let active: Vec<u32> = unsafe { std::slice::from_raw_parts(info, count as usize) }
+        .iter()
+        .filter(|e| e.SessionId != 0 && e.State == WTSActive)
+        .map(|e| e.SessionId)
+        .collect();
+    // SAFETY: `info` came from WTSEnumerateSessionsW and is freed exactly once.
+    unsafe { WTSFreeMemory(info.cast()) };
+    active
+        .into_iter()
+        .find(|id| session_user_sid(*id).as_deref() == Some(sid))
+}
+
 /// The console user via the SYSTEM-only WTS path. `None` when not running as
 /// LocalSystem (the call is access-denied) or there is no attached console.
 fn active_console_user_sid_via_wts() -> Option<String> {
@@ -280,6 +313,35 @@ pub(crate) fn current_process_user_sid() -> Option<String> {
     sid
 }
 
+/// Whether THIS process runs with an elevated token (UAC "Run as
+/// administrator"). Any failure answers `false`: the caller then shows a
+/// lock the service would also enforce.
+pub fn current_process_elevated() -> bool {
+    let mut token = HANDLE::default();
+    // SAFETY: `GetCurrentProcess` returns a pseudo-handle; `token` is a valid
+    // out-param filled with a query token on success.
+    if unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) }.is_err() {
+        return false;
+    }
+    let mut elevation = TOKEN_ELEVATION::default();
+    let mut written = 0u32;
+    // SAFETY: `token` is the just-opened query token; the buffer is a
+    // TOKEN_ELEVATION of exactly the size passed.
+    let ok = unsafe {
+        GetTokenInformation(
+            token,
+            TokenElevation,
+            Some(std::ptr::from_mut(&mut elevation).cast()),
+            std::mem::size_of::<TOKEN_ELEVATION>() as u32,
+            &mut written,
+        )
+    }
+    .is_ok();
+    // SAFETY: close the token exactly once.
+    let _ = unsafe { CloseHandle(token) };
+    ok && elevation.TokenIsElevated != 0
+}
+
 /// The SID of the user process `pid` runs as. `None` when the process is gone
 /// or its token cannot be opened (a protected process, or no rights).
 pub fn process_user_sid(pid: u32) -> Option<String> {
@@ -313,7 +375,7 @@ pub fn process_handle_user_sid(process: HANDLE) -> Option<String> {
 ///
 /// # Safety
 /// `token` must be a valid, open token handle for the duration of the call.
-unsafe fn token_user_sid_string(token: HANDLE) -> Option<String> {
+pub(crate) unsafe fn token_user_sid_string(token: HANDLE) -> Option<String> {
     // First call sizes the buffer (expected to fail, filling `needed`).
     let mut needed: u32 = 0;
     let _ = GetTokenInformation(token, TokenUser, None, 0, &mut needed);

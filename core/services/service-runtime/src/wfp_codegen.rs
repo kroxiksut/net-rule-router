@@ -418,6 +418,13 @@ pub enum CodegenDiagnostic {
         app: String,
         ip: Ipv4Addr,
     },
+    /// An `Application` rule's program is found and was seen, but every
+    /// address it used went elsewhere, so the rule carries none of its traffic.
+    AppTrafficTakenElsewhere {
+        rule_id: String,
+        app: String,
+        reason: crate::address_ownership::AppTrafficElsewhere,
+    },
     /// an `Application` rule's exe name/glob resolved to NO concrete
     /// exe path on this machine (app not installed / not found). 0 `ALE_APP_ID`
     /// filters emitted this pass — the WFP condition needs a real file path
@@ -711,7 +718,8 @@ pub fn generate_filters_with_shapes(
             &ownership,
             input.app_observations,
             rule_set,
-        );
+        )
+        .with_declined(input.secondary_ip_denylist);
         for (pos, rule) in rule_set.rules().iter().enumerate() {
             generate_for_rule(
                 input.sid,
@@ -1348,6 +1356,14 @@ fn emit_for_app_match(
     // destination dead for every process on the machine.
     let destinations = gate.admit(&pattern_str, link);
     let refused_count = destinations.refused.len();
+    if let Some(reason) = destinations.none_taken().filter(|_| !paths.is_empty()) {
+        out.diagnostics
+            .push(CodegenDiagnostic::AppTrafficTakenElsewhere {
+                rule_id: rule.id.as_str().to_string(),
+                app: pattern_str.clone(),
+                reason,
+            });
+    }
     for (ip, reason) in destinations.refused {
         out.diagnostics.push(match reason {
             AppDestinationRefusal::ClaimedByAddressRule => {
@@ -1364,6 +1380,8 @@ fn emit_for_app_match(
                     ip,
                 }
             }
+            // The shared-address policy reports its own.
+            AppDestinationRefusal::DeclinedShared => continue,
         });
     }
     let ips = destinations.admitted;
@@ -1389,7 +1407,7 @@ fn emit_for_app_match(
         // App observations are IPv4: the destination memory records what the
         // conn observer saw, and it has no v6 half yet.
         let mut observed = Vec::new();
-        for ip in ips.into_iter().take(PER_HOSTNAME_IP_CAP) {
+        for ip in gate.mirrored(&pattern_str, &ips) {
             // A script's interpreter is outside the pair, so the address
             // its script taught keeps its own guard.
             if app_pair_covers

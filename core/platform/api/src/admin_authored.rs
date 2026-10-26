@@ -8,12 +8,15 @@
 
 use std::path::Path;
 
+pub use nrr_shared::first_run_sheet::AdminAuthored;
+
 /// The OS check behind "only an administrator (root) could have put this here".
 pub trait AdminAuthoredFiles: Send + Sync {
-    /// `None` when only SYSTEM/Administrators (root) could have written `path`
-    /// and neither it nor its folder is a link; otherwise why not. A path whose
-    /// owner or rights cannot be read is untrusted, never trusted by default.
-    fn untrusted_because(&self, path: &Path) -> Option<String>;
+    /// `path` opened for reading when only SYSTEM/Administrators (root) could
+    /// have written it and neither it nor a folder on the way is a link;
+    /// otherwise why not. The check runs on the opened file itself, so what
+    /// was judged is what the caller reads. Rights that cannot be read refuse.
+    fn open_admin_authored(&self, path: &Path) -> AdminAuthored;
 }
 
 /// For a platform with no mechanism yet: nothing is believed.
@@ -21,8 +24,11 @@ pub trait AdminAuthoredFiles: Send + Sync {
 pub struct TrustNothing;
 
 impl AdminAuthoredFiles for TrustNothing {
-    fn untrusted_because(&self, _path: &Path) -> Option<String> {
-        Some("this platform cannot tell who wrote the file".to_owned())
+    fn open_admin_authored(&self, path: &Path) -> AdminAuthored {
+        if std::fs::symlink_metadata(path).is_err() {
+            return AdminAuthored::Missing;
+        }
+        AdminAuthored::Refused("this platform cannot tell who wrote the file".to_owned())
     }
 }
 
@@ -32,8 +38,10 @@ mod tests {
 
     #[test]
     fn a_platform_without_a_mechanism_believes_no_file() {
-        assert!(TrustNothing
-            .untrusted_because(Path::new("first-run.json"))
-            .is_some());
+        let dir = std::env::temp_dir();
+        assert!(matches!(
+            TrustNothing.open_admin_authored(&dir),
+            AdminAuthored::Refused(_)
+        ));
     }
 }

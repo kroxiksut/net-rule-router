@@ -102,7 +102,8 @@ pub fn plan_routes_with(
                     &ownership,
                     app_observations,
                     &rule_book.secondary,
-                ),
+                )
+                .with_declined(denied),
                 &ownership,
                 families,
                 &mut seen,
@@ -351,6 +352,39 @@ fn push_host_route(
     true
 }
 
+/// While the tunnel carries the default, its own transport must not: a kernel
+/// tunnel's packets are routed as root, meet the `/1` halves and loop into the
+/// tunnel (WireGuard drops them with `ELOOP` and is dead after the next rekey).
+/// Each known server gets a host route via the main link, in place of one a
+/// rule planned into the tunnel.
+pub fn pin_tunnel_servers_to_primary(
+    servers: &[IpAddr],
+    families: FamilyScope,
+    routes: &mut Vec<RouteIntent>,
+) {
+    let carries_default = routes.iter().any(|r| {
+        r.egress == EgressRef::Secondary && matches!(r.dst, DstMatch::SubnetV4 { prefix: 1, .. })
+    });
+    if !carries_default {
+        return;
+    }
+    for &ip in servers {
+        if !families.admits(ip) || crate::net_filter::is_non_routable(&ip) {
+            continue;
+        }
+        routes.retain(|r| !(r.dst == host_match(ip) && r.egress == EgressRef::Secondary));
+        if routes.iter().any(|r| r.dst == host_match(ip)) {
+            continue;
+        }
+        routes.push(RouteIntent {
+            dst: host_match(ip),
+            egress: EgressRef::Primary,
+            metric: SECONDARY_ROUTE_METRIC,
+            table: RouteTableRef::Main,
+        });
+    }
+}
+
 /// One overlay route intent (a `/1` split-default half or a counter-overlay
 /// block) via `egress`.
 fn overlay_intent(net: Ipv4Addr, prefix: u8, egress: EgressRef) -> RouteIntent {
@@ -510,6 +544,9 @@ pub struct PlanReport {
     /// Destinations an application rule observed but did not take over, because
     /// the main link's own rules name them: `(app, address)`.
     pub claimed_by_main: Vec<(String, Ipv4Addr)>,
+    /// Application rules whose program is found but whose every observed
+    /// address went elsewhere, so they carry none of its traffic.
+    pub unrouted_apps: Vec<(String, crate::address_ownership::AppTrafficElsewhere)>,
     /// Suffix/zone fan-outs stopped at the backstop: `(rule_id, suffix, cap)`.
     pub truncated_suffixes: Vec<(String, String, usize)>,
     /// Where the user's rules contradict each other, unsupported shapes

@@ -51,13 +51,17 @@ fn pure_kinds() -> BTreeSet<String> {
 #[test]
 fn every_notice_kind_is_named_alike_in_the_service_and_the_windows() {
     let domain = domain_kinds();
-    assert_eq!(domain.len(), 9, "{domain:?}");
+    assert_eq!(domain.len(), 11, "{domain:?}");
     assert_eq!(pure_kinds(), domain);
 }
 
 /// Kinds the tray lists in its menu and never raises as a notice: the window's
 /// card carries their "Don't show…".
 const LISTED_IN_TRAY_MENU_ONLY: [&str; 1] = ["external-address"];
+
+/// Kinds whose card answers "don't report again" itself, for good: the user
+/// asked for it in those words, and a duration chooser would ask again.
+const MUTED_FOR_GOOD_FROM_ITS_CARD: [&str; 1] = ["site-not-opening"];
 
 #[test]
 fn the_tray_offers_the_mute_on_every_kind_and_gates_each_one() {
@@ -70,8 +74,13 @@ fn the_tray_offers_the_mute_on_every_kind_and_gates_each_one() {
             );
             continue;
         }
+        let mute_button = if MUTED_FOR_GOOD_FROM_ITS_CARD.contains(&kind.as_str()) {
+            format!("_muteNoticeForGood(\"{kind}\")")
+        } else {
+            format!("_noticeMuteAction(\"{kind}\")")
+        };
         assert!(
-            tray.contains(&format!("_noticeMuteAction(\"{kind}\")")),
+            tray.contains(&mute_button),
             "no \"Don't show…\" button for {kind}"
         );
         let gated = tray.contains(&format!("_offerNotice(\"{kind}\""))

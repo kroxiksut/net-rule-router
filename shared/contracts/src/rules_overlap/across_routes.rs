@@ -1,7 +1,8 @@
 //! Rules of the two routes that claim the same hosts, and which one wins.
 //!
 //! The narrower rule wins without asking anyone — name over suffix over zone,
-//! a longer suffix or zone over a shorter one. On a tie a Block beats a route,
+//! a longer suffix or zone over a shorter one; a zone of several labels ranks
+//! as a suffix. On a tie a Block beats a route,
 //! then the main route beats the additional one. This only names the pairs so
 //! the user can see them and confirm or change the route. `nrr-domain` pins
 //! every reported winner against its matcher.
@@ -119,7 +120,9 @@ enum NameKind {
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 enum Strength {
     Zone(usize),
-    Suffix(usize),
+    /// The name's length, then whether the rule leaves out the apex: a zone of
+    /// several labels is narrower than `*.` of the same name.
+    Suffix(usize, bool),
     Exact,
 }
 
@@ -133,6 +136,8 @@ struct NameRule<'a> {
     kind: NameKind,
     written_type: &'static str,
     written_value: &'a str,
+    /// A zone of several labels with no `*.` of its name on its own route.
+    without_apex: bool,
 }
 
 impl NameRule<'_> {
@@ -147,7 +152,12 @@ impl NameRule<'_> {
     fn strength(&self) -> Strength {
         match self.kind {
             NameKind::Exact => Strength::Exact,
-            NameKind::Suffix => Strength::Suffix(self.name.len()),
+            NameKind::Suffix => Strength::Suffix(self.name.len(), false),
+            // A zone of several labels is a suffix rule without its apex, as
+            // the engine ranks it (`zone_ranks_as_suffix` in `nrr-domain`).
+            NameKind::Zone if self.name.contains('.') => {
+                Strength::Suffix(self.name.len(), self.without_apex)
+            }
             NameKind::Zone => Strength::Zone(self.name.len()),
         }
     }
@@ -198,6 +208,14 @@ fn name_rules<'a>(
     include_subdomains: bool,
     suffixed: &std::collections::HashSet<String>,
 ) -> Vec<NameRule<'a>> {
+    let own_suffixes: std::collections::HashSet<String> = rules
+        .iter()
+        .filter(|rule| rule.enabled && rule.app_match.is_none())
+        .filter_map(|rule| match rule.address_match.as_ref()? {
+            address @ AddressMatchDto::SuffixDomain { .. } => folded_rule_name(address),
+            _ => None,
+        })
+        .collect();
     rules
         .iter()
         .filter(|rule| rule.enabled && rule.app_match.is_none())
@@ -230,6 +248,14 @@ fn name_rules<'a>(
                 _ => return None,
             };
             let name = folded_rule_name(address)?;
+            // Under coverage a zone of several labels is `*.` of its name too.
+            let site_zone = kind == NameKind::Zone && name.contains('.');
+            let kind = if site_zone && include_subdomains {
+                NameKind::Suffix
+            } else {
+                kind
+            };
+            let without_apex = site_zone && !own_suffixes.contains(&name);
             (!name.is_empty()).then_some(NameRule {
                 rule,
                 route,
@@ -237,6 +263,7 @@ fn name_rules<'a>(
                 kind,
                 written_type,
                 written_value: value,
+                without_apex,
             })
         })
         .collect()

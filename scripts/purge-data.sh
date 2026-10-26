@@ -273,6 +273,7 @@ if [ "$user_only" -eq 0 ]; then
   nrr_cyan "==> machine-wide footprint"
   purge_path "$NRR_UNIT_FILE" system
   purge_path "$NRR_AFTER_CRASH_UNIT_FILE" system
+  purge_path "$NRR_EARLY_UNIT_FILE" system
   purge_path "$NRR_LOGROTATE_CONFIG" system
   purge_path "$NRR_POLKIT_POLICY" system
   purge_path "$NRR_PROVISION_DIR" system

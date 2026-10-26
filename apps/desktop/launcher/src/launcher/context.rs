@@ -51,6 +51,46 @@ pub(super) fn take_tray_status_argument(
     (options.status_override(), rest)
 }
 
+/// What a tray launch asks beyond the ordinary start.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(super) struct TrayArguments {
+    pub status: Option<TrayStatusKind>,
+    /// The service started this tray as one card about this site. Anything
+    /// that is not a plain host name is dropped, never forwarded.
+    pub notice_site: Option<String>,
+}
+
+/// Split the tray's own arguments off the launch arguments.
+pub(super) fn take_tray_arguments(
+    surface: LauncherSurface,
+    arguments: Vec<String>,
+) -> (TrayArguments, Vec<String>) {
+    let (status, arguments) = take_tray_status_argument(surface, arguments);
+    if surface != LauncherSurface::Tray {
+        return (
+            TrayArguments {
+                status,
+                ..TrayArguments::default()
+            },
+            arguments,
+        );
+    }
+    let flag = nrr_platform_api::session_notice::NOTICE_SITE_FLAG;
+    let (notice, rest): (Vec<String>, Vec<String>) = arguments
+        .into_iter()
+        .partition(|argument| argument.starts_with(flag));
+    let notice_site = notice.iter().find_map(|argument| {
+        nrr_platform_api::session_notice::notice_site_from_argument(argument).map(str::to_owned)
+    });
+    (
+        TrayArguments {
+            status,
+            notice_site,
+        },
+        rest,
+    )
+}
+
 fn emit_main_gui_context(
     preferences: &UiPreferences,
     backend_bundle: &crate::backend_factory::BackendBundle,
@@ -133,6 +173,7 @@ fn emit_tray_context(
     );
     let urls = TrayContextUrls {
         icon_file_url: resolve_native_icon_path().as_deref().map(path_to_file_url),
+        assets_root_url: nrr_desktop_gui::ui_surface::assets_root_url(),
         logs_folder_url: nrr_desktop_gui::ui_surface::logs_folder_url(),
     };
 
@@ -231,6 +272,33 @@ mod tests {
             take_tray_status_argument(LauncherSurface::MainGui, args(&["--status=preview-mode"]));
         assert_eq!(status, None);
         assert_eq!(rest, args(&["--status=preview-mode"]));
+    }
+
+    /// The site travels to the tray only as a plain host: a value that could
+    /// carry another switch into the host's command line is dropped.
+    #[test]
+    fn the_tray_takes_a_notice_site_only_when_it_is_a_plain_host() {
+        let (tray, rest) = take_tray_arguments(
+            LauncherSurface::Tray,
+            args(&["--nrr-notice-site=site.example", "--source=menu"]),
+        );
+        assert_eq!(tray.notice_site.as_deref(), Some("site.example"));
+        assert_eq!(rest, args(&["--source=menu"]));
+        for hostile in [
+            "--nrr-notice-site=site.example --qml=C:/x.qml",
+            "--nrr-notice-site=",
+            "--nrr-notice-site=SITE.example",
+        ] {
+            let (tray, rest) = take_tray_arguments(LauncherSurface::Tray, args(&[hostile]));
+            assert_eq!(tray.notice_site, None, "{hostile}");
+            assert!(rest.is_empty(), "never handed on: {rest:?}");
+        }
+        let (tray, rest) = take_tray_arguments(
+            LauncherSurface::MainGui,
+            args(&["--nrr-notice-site=site.example"]),
+        );
+        assert_eq!(tray.notice_site, None, "the window is never a notice");
+        assert_eq!(rest, args(&["--nrr-notice-site=site.example"]));
     }
 
     #[test]

@@ -72,13 +72,34 @@ fn the_longer_suffix_wins_whichever_route_holds_it() {
     assert_eq!(found[0].loser.rule_id, "S1");
 }
 
+/// A zone leaves out its own name, so it is narrower than `*.` of the same
+/// name; with bare names covering subdomains it is that suffix, and the two
+/// are one rule written twice, kept by the main route.
 #[test]
-fn a_suffix_beats_the_zone_of_the_same_name() {
+fn a_zone_beats_the_suffix_of_its_name_unless_bare_names_cover_subdomains() {
+    let rules = book(
+        vec![suffix("P1", "corp.example")],
+        vec![zone("S1", "corp.example")],
+    );
+    let found = overlaps(&rules);
+    assert_eq!(found.len(), 1, "{found:?}");
+    assert_eq!(found[0].kind, RouteOverlapKind::Nested);
+    assert_eq!(found[0].winner.rule_id, "S1");
+
+    let covered = find_route_overlaps(&rules, true);
+    assert_eq!(covered.len(), 1, "{covered:?}");
+    assert_eq!(covered[0].kind, RouteOverlapKind::Duplicate);
+    assert_eq!(covered[0].winner.rule_id, "P1");
+}
+
+#[test]
+fn a_zone_of_several_labels_beats_the_wider_suffix() {
     let found = overlaps(&book(
-        vec![zone("P1", "corp.example")],
-        vec![suffix("S1", "corp.example")],
+        vec![suffix("P1", "example.com")],
+        vec![zone("S1", "corp.example.com")],
     ));
     assert_eq!(found.len(), 1, "{found:?}");
+    assert_eq!(found[0].kind, RouteOverlapKind::Nested);
     assert_eq!(found[0].winner.rule_id, "S1");
 }
 

@@ -121,12 +121,12 @@ fn the_owners_blanket_holds_forwarded_traffic_whole() {
 /// Every forwarded packet is judged against the blanket, so the hosts it keeps
 /// open cost a handful of filters, not one each, and every one stays open.
 #[test]
-fn the_forwarded_blanket_keeps_many_direct_hosts_open_in_few_filters() {
+fn the_forwarded_blanket_keeps_many_main_link_hosts_open_in_few_filters() {
     let direct: Vec<Ipv4Addr> = (0..2000u32)
         .map(|n| Ipv4Addr::from(0xC633_6400u32 + n))
         .collect();
     let exemptions = FailClosedExemptions {
-        known_direct_ips: direct.clone(),
+        primary_dest_ips: direct.clone(),
         ..FailClosedExemptions::default()
     };
     let out = forwarded_block_all_filters(OWNER, &exemptions, &[], &[]);
@@ -493,4 +493,56 @@ fn the_guest_permits_skip_tunnels_and_stay_bounded() {
     let added = forwarded_block_all_filters(OWNER, &many, &[], &[]).len()
         - forwarded_block_all_filters(OWNER, &base, &[], &[]).len();
     assert_eq!(added, 2 * GUEST_NETWORK_MAX);
+}
+
+/// Everything protected and the tunnel up: what the machine forwards leaves
+/// only through the tunnel, to any address, from the packet the tunnel drops
+/// on; the floor is exactly the one it keeps with the tunnel gone.
+#[test]
+fn with_the_tunnel_up_the_forwarded_blanket_lets_out_only_what_leaves_through_it() {
+    let gone = FailClosedExemptions {
+        bootstrap_server_ips: vec![Ipv4Addr::new(192, 0, 2, 10)],
+        local_subnets: vec![(Ipv4Addr::new(192, 168, 50, 0), 24)],
+        primary_dest_ips: vec![Ipv4Addr::new(198, 51, 100, 20)],
+        guest_network_luids: vec![GUEST_LUID],
+        ..FailClosedExemptions::default()
+    };
+    let up = FailClosedExemptions {
+        secondary_luid: TUNNEL_LUID,
+        ..gone.clone()
+    };
+    let dns = [IpAddr::V4(Ipv4Addr::new(192, 0, 2, 54))];
+    let held = forwarded_block_all_filters(OWNER, &up, &dns, &[]);
+    let without = forwarded_block_all_filters(OWNER, &gone, &dns, &[]);
+    for layer in [WfpLayerKey::IpForwardV4, WfpLayerKey::IpForwardV6] {
+        let blanket = held
+            .iter()
+            .find(|f| {
+                f.layer == layer
+                    && f.action == WfpAction::Block
+                    && !f.names_a_destination()
+                    && f.local_interface_luid.is_none()
+            })
+            .unwrap_or_else(|| panic!("{layer:?}: a blanket block"));
+        let through = held
+            .iter()
+            .find(|f| {
+                f.layer == layer
+                    && f.action == WfpAction::Permit
+                    && f.local_interface_luid == Some(TUNNEL_LUID)
+                    && !f.names_a_destination()
+            })
+            .unwrap_or_else(|| panic!("{layer:?}: out the tunnel is let through"));
+        assert!(through.weight > blanket.weight, "{layer:?}");
+    }
+    let added: Vec<_> = held.iter().filter(|f| !without.contains(f)).collect();
+    assert_eq!(
+        added.len(),
+        2,
+        "only the two ways out the tunnel: {added:?}"
+    );
+    assert!(
+        without.iter().all(|f| held.contains(f)),
+        "every exemption of the tunnel-gone blanket stays"
+    );
 }

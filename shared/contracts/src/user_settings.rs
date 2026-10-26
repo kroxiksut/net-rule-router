@@ -50,6 +50,7 @@ const KEY_SELECTED_SET: &str = "selected-set";
 const KEY_SERVICE_INTENT: &str = "service-intent";
 const KEY_ACCEPTED_EULA: &str = "accepted-eula";
 const KEY_MERGE_POLICY: &str = "merge-policy";
+const KEY_WINDOW_PARKED: &str = "window-parked";
 const KEY_PRIMARY: &str = "primary";
 const KEY_SECONDARY: &str = "secondary";
 const KEY_WRITTEN: &str = "written";
@@ -94,6 +95,10 @@ pub struct UserSettings {
     /// Who wins a rule the bound files and the service both hold but differ
     /// on: a merge-policy slug, `""` for none chosen (ask per rule).
     pub merge_policy: String,
+    /// What the window holds for a service that was not running, as the
+    /// window parked it (`route-policy`, `stability`, `binding`, the time it
+    /// was parked). Only the window writes it; the terminal client shows it.
+    pub window_parked: Map<String, Value>,
     /// Top-level keys this build does not know, written back unchanged.
     pub other: Map<String, Value>,
 }
@@ -108,6 +113,7 @@ impl Default for UserSettings {
             service_intent: Map::new(),
             accepted_eula: crate::eula::EULA_NOT_ACCEPTED,
             merge_policy: String::new(),
+            window_parked: Map::new(),
             other: Map::new(),
         }
     }
@@ -241,6 +247,12 @@ impl UserSettings {
             &mine.merge_policy,
             &mut changed,
         );
+        adopt(
+            &mut self.window_parked,
+            &base.window_parked,
+            &mine.window_parked,
+            &mut changed,
+        );
         changed |= adopt_map(
             &mut self.service_intent,
             &base.service_intent,
@@ -370,6 +382,11 @@ pub fn parse_user_settings(text: &str) -> Result<UserSettings, String> {
         Some(Value::Object(intent)) => intent,
         Some(_) => return Err(wrong_type(KEY_SERVICE_INTENT, "an object")),
     };
+    let window_parked = match object.remove(KEY_WINDOW_PARKED) {
+        None | Some(Value::Null) => Map::new(),
+        Some(Value::Object(parked)) => parked,
+        Some(_) => return Err(wrong_type(KEY_WINDOW_PARKED, "an object")),
+    };
     let accepted_eula = match object.remove(KEY_ACCEPTED_EULA) {
         None | Some(Value::Null) => crate::eula::EULA_NOT_ACCEPTED,
         Some(value) => value
@@ -385,6 +402,7 @@ pub fn parse_user_settings(text: &str) -> Result<UserSettings, String> {
         service_intent,
         accepted_eula,
         merge_policy,
+        window_parked,
         other: object,
     })
 }
@@ -440,6 +458,12 @@ pub fn format_user_settings(settings: &UserSettings) -> serde_json::Result<Strin
         object.insert(
             KEY_MERGE_POLICY.to_string(),
             Value::String(settings.merge_policy.clone()),
+        );
+    }
+    if !settings.window_parked.is_empty() {
+        object.insert(
+            KEY_WINDOW_PARKED.to_string(),
+            Value::Object(settings.window_parked.clone()),
         );
     }
     // A known key wins over a same-named entry a caller put among the others.
@@ -879,6 +903,10 @@ mod tests {
             },
             selected_set: "user:home".to_string(),
             merge_policy: "file-wins".to_string(),
+            window_parked: json!({"route-policy": {"mode": "prefer-secondary"}, "parked-at-ms": 1})
+                .as_object()
+                .cloned()
+                .unwrap_or_default(),
             service_intent: json!({"stability": {"verbose-logging": true}})
                 .as_object()
                 .cloned()
@@ -894,6 +922,20 @@ mod tests {
     fn rewritten(settings: &UserSettings) -> Value {
         let text = format_user_settings(settings).expect("format");
         serde_json::from_str(&text).expect("json")
+    }
+
+    /// The terminal client writes this file too; its write must not drop the
+    /// work the window parked for a stopped service.
+    #[test]
+    fn a_write_of_another_field_keeps_what_the_window_parked() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let store = store_in(&dir);
+        store.update(|s| *s = sample()).expect("seed");
+        store
+            .update(|s| s.selected_set = "user:trip".to_string())
+            .expect("write");
+        let on_disk = store.load().expect("load").expect("file");
+        assert_eq!(on_disk.window_parked, sample().window_parked);
     }
 
     #[test]

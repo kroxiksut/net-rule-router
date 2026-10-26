@@ -12,7 +12,7 @@
 
 use std::net::{IpAddr, Ipv4Addr};
 
-use nrr_platform_api::adapters::AdapterInfo;
+use nrr_platform_api::adapters::{classify_availability, AdapterAvailability, AdapterInfo};
 use nrr_platform_api::RouteEntry;
 
 use crate::route_codegen::SecondaryRouteTarget;
@@ -111,6 +111,56 @@ pub(super) fn binding_matches_live(
 ) -> bool {
     adapter_binding_matches(info, stable_id)
         || known_ids.iter().any(|id| adapter_binding_matches(info, id))
+}
+
+/// A live adapter as the bound-adapter check sees it, whichever form it was
+/// read in: the service's own list or the snapshot the leak-protection banner
+/// is judged from.
+pub trait BoundCandidate {
+    /// Whether this adapter answers to the binding id `id`.
+    fn answers_to(&self, id: &str) -> bool;
+    /// Up, with an IPv4 address, and of a kind a route can be bound to.
+    fn usable(&self) -> bool;
+}
+
+impl BoundCandidate for AdapterInfo {
+    fn answers_to(&self, id: &str) -> bool {
+        adapter_binding_matches(self, id)
+    }
+    fn usable(&self) -> bool {
+        classify_availability(self) == Some(AdapterAvailability::Available)
+    }
+}
+
+impl BoundCandidate for nrr_shared::ipc_payloads::AdapterEntry {
+    fn answers_to(&self, id: &str) -> bool {
+        adapter_entry_binding_matches(self, id)
+    }
+    fn usable(&self) -> bool {
+        self.usable
+    }
+}
+
+/// The first live adapter answering to a binding's current or a prior id.
+pub fn bound_adapter<'a, T: BoundCandidate>(
+    live: &'a [T],
+    stable_id: &str,
+    known_ids: &[String],
+) -> Option<&'a T> {
+    live.iter().find(|candidate| {
+        candidate.answers_to(stable_id) || known_ids.iter().any(|id| candidate.answers_to(id))
+    })
+}
+
+/// Whether the adapter a binding names carries traffic now — the one answer
+/// the route coordinator and the leak-protection banner both give, so the
+/// banner never says one thing while the service does another.
+pub fn bound_adapter_usable<T: BoundCandidate>(
+    live: &[T],
+    stable_id: &str,
+    known_ids: &[String],
+) -> bool {
+    bound_adapter(live, stable_id, known_ids).is_some_and(BoundCandidate::usable)
 }
 
 /// `true` when a whitespace token of an adapter friendly name is purely a

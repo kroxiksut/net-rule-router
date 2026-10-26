@@ -216,6 +216,35 @@ pub fn plan_forwarded_block_all_with_foreign(
     blanket
 }
 
+/// [`plan_forwarded_block_all_with_foreign`] with the tunnel up, under the
+/// blanket through it: what leaves through the tunnel is let out, both
+/// families, and the same blanket holds the rest. Keyed on the interface a
+/// packet is forwarded out of, so the instant the tunnel goes none of it takes
+/// the main link, before any pass.
+#[must_use]
+pub fn plan_forwarded_catch_all_with_foreign(
+    mut blanket: Vec<FlowRule>,
+    foreign: &[ForeignTunnelLink],
+) -> Vec<FlowRule> {
+    let any_v6 = DstMatch::SubnetV6 {
+        net: std::net::Ipv6Addr::UNSPECIFIED,
+        prefix: 0,
+    };
+    for (dst, ordinal) in [(DstMatch::Any, 0), (any_v6, CATCH_ALL_V6_EGRESS_ORDINAL)] {
+        blanket.push(catch_all_flow(
+            &PrincipalScope::Forwarded,
+            Verdict::Permit,
+            PrecedenceClass::CatchAllExempt,
+            dst,
+            EgressConstraint::OnlyVia(EgressRef::Secondary),
+            None,
+            Coverage::ConnectOnly,
+            ordinal,
+        ));
+    }
+    plan_forwarded_block_all_with_foreign(blanket, foreign)
+}
+
 fn onto_forwarded(flows: &mut Vec<FlowRule>) {
     flows.retain(|flow| flow.coverage == Coverage::ConnectOnly);
     for flow in flows.iter_mut() {

@@ -15,7 +15,7 @@ Service: OK
 │                          ││                                                  │
 │                          │╰──────────────────────────────────────────────────╯
 │                          │╭Notifications─────────────────────────────────────╮
-│                          ││Warning: The additional connection is not up      │
+│                          ││1. Warning: The additional connection is not up   │
 │                          ││Sites your rules send there go over the main      │
 │                          ││connection until it comes back: leak protection is│
 │                          ││off. Start the connection, or turn leak protection│

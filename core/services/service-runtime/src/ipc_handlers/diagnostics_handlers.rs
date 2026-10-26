@@ -121,6 +121,18 @@ fn system_time_to_ms(t: SystemTime) -> i64 {
         .unwrap_or(0)
 }
 
+/// An address as the on-screen viewers show it. Both families: the IPv4
+/// redactor alone turns every IPv6 address into a marker.
+fn viewer_ip(ip: std::net::IpAddr, mode: RedactionMode) -> String {
+    match ip {
+        std::net::IpAddr::V4(v4) => {
+            nrr_diagnostics::privacy::redact::redact_ipv4(v4, mode).display_or_marker()
+        }
+        std::net::IpAddr::V6(v6) if mode.shows_ip() => v6.to_string(),
+        std::net::IpAddr::V6(_) => nrr_diagnostics::privacy::redact::MARKER_REDACTED.into(),
+    }
+}
+
 mod archive;
 mod cache;
 mod conn_history;

@@ -218,6 +218,11 @@ pub mod nft_apply;
 pub mod nft_backend;
 pub mod nft_policy_enforcer;
 
+/// Our table saved for the boot window before the daemon's first pass, and
+/// put back by the early unit.
+#[cfg(target_os = "linux")]
+pub mod early_table;
+
 /// Which of our rules dropped a packet: the tag the lowering puts on a drop and
 /// the drop observer reads back. Pure.
 pub mod drop_tag;

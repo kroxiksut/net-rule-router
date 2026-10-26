@@ -32,7 +32,7 @@
 //! paths a plan has asked about are matched, so a book without path rules pays
 //! nothing for them.
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::time::{Duration, Instant};
 
 use crate::bounded_set::BoundedRecentSet;
@@ -54,15 +54,22 @@ use std::sync::{Arc, Mutex, OnceLock};
 pub const APP_PIN_FRESHNESS_WINDOW: Duration =
     crate::fqdn_cache_lookup::ENFORCEMENT_CONFIRMATION_WINDOW;
 
-/// Max distinct IPs retained per app — bounds the codegen fan-out (mirrors
-/// [`crate::wfp_codegen::PER_HOSTNAME_IP_CAP`] in spirit). A busy browser can
-/// touch thousands of IPs; we keep the most-recently-observed up to this cap.
-pub const APP_IP_CAP: usize = 256;
+/// Max distinct IPs retained per app, the most recently observed ones; it also
+/// bounds an app rule's host routes. Each eviction makes the app's next contact
+/// with that address drop once more, so a CDN-heavy app needs room; the price
+/// is memory and plan size, not anything per packet.
+pub const APP_IP_CAP: usize = 1024;
 
 /// Applications kept, each with up to [`APP_IP_CAP`] destinations. Observation
 /// records every process on the machine, not only those a rule names; this is
 /// far above what a desktop runs, so the one that gives way has gone quiet.
 pub const APP_KEY_CAP: usize = 1024;
+
+/// `(application, destination)` pairs kept across every application, about
+/// 6 MB at the bound. Past it the pair seen least recently anywhere gives way;
+/// one application's share stays capped by [`APP_IP_CAP`], so a burst from one
+/// program displaces at most that many of the oldest pairs of the others.
+pub const APP_PAIR_CAP: usize = 65_536;
 
 /// Destinations the census remembers, with the processes seen using them.
 ///
@@ -117,6 +124,13 @@ pub trait AppObservationLookup: Send + Sync {
     /// observed process image's **file name**. Returns empty when nothing
     /// has been observed yet (cold start / observer off).
     fn ips_for_app(&self, app: &str) -> Vec<Ipv4Addr>;
+
+    /// The `n` of `candidates` (addresses of `app`) seen most recently, in
+    /// address order so a filter keeps its slot while the set holds. A lookup
+    /// that keeps no sighting order answers with the first `n`.
+    fn latest_of(&self, _app: &str, candidates: &[Ipv4Addr], n: usize) -> Vec<Ipv4Addr> {
+        candidates.iter().take(n).copied().collect()
+    }
 
     /// Has a process none of `friendly` names been seen using `ip`?
     ///
@@ -220,10 +234,12 @@ pub struct AppObservationStore {
     /// Last sighting per `(app, ip)` — what [`APP_PIN_FRESHNESS_WINDOW`] is
     /// measured against. Maintained alongside `inner`; a missing stamp is
     /// treated as fresh (unknown age fails toward protection) and restamped.
-    last_seen: Mutex<HashMap<(String, Ipv4Addr), Instant>>,
+    last_seen: Mutex<PairClock>,
     pin_ttl: Duration,
     clock: Arc<dyn Fn() -> Instant + Send + Sync>,
     cap_per_app: usize,
+    /// Pairs kept across every application ([`APP_PAIR_CAP`]).
+    pair_cap: usize,
     /// Last sighting per application, picking who gives way at `app_cap`.
     /// Taken only while `inner` is held.
     app_recency: Mutex<AppRecency>,
@@ -252,6 +268,77 @@ pub struct AppObservationStore {
     /// `(rule path, ip)` pairs a rule's script taught, as opposed to its own
     /// programs.
     script_pairs: Mutex<BoundedRecentSet<(String, Ipv4Addr)>>,
+}
+
+/// Last sighting of every `(app, ip)` pair, and their order across the whole
+/// store: a sighting and the eviction of the oldest pair are O(log n).
+/// Each program's name is held once, shared by its stamps and the order index.
+#[derive(Default)]
+struct PairClock {
+    by_app: HashMap<Arc<str>, HashMap<Ipv4Addr, (Instant, u64)>>,
+    order: BTreeMap<u64, (Arc<str>, Ipv4Addr)>,
+    tick: u64,
+    len: usize,
+}
+
+impl PairClock {
+    fn get(&self, pair: &(String, Ipv4Addr)) -> Option<Instant> {
+        self.by_app
+            .get(pair.0.as_str())?
+            .get(&pair.1)
+            .map(|(at, _)| *at)
+    }
+
+    /// The pair's place in sighting order; higher is more recent.
+    fn rank(&self, pair: &(String, Ipv4Addr)) -> Option<u64> {
+        self.by_app
+            .get(pair.0.as_str())?
+            .get(&pair.1)
+            .map(|(_, tick)| *tick)
+    }
+
+    fn stamp(&mut self, pair: (String, Ipv4Addr), at: Instant) {
+        self.tick += 1;
+        let app: Arc<str> = match self.by_app.get_key_value(pair.0.as_str()) {
+            Some((name, _)) => Arc::clone(name),
+            None => Arc::from(pair.0),
+        };
+        let stamps = self.by_app.entry(Arc::clone(&app)).or_default();
+        match stamps.insert(pair.1, (at, self.tick)) {
+            Some((_, old)) => {
+                self.order.remove(&old);
+            }
+            None => self.len += 1,
+        }
+        self.order.insert(self.tick, (app, pair.1));
+    }
+
+    fn remove(&mut self, pair: &(String, Ipv4Addr)) {
+        if let Some(tick) = self.take(pair.0.as_str(), pair.1) {
+            self.order.remove(&tick);
+        }
+    }
+
+    fn pop_oldest(&mut self) -> Option<(String, Ipv4Addr)> {
+        let (_, (app, ip)) = self.order.pop_first()?;
+        self.take(&app, ip);
+        Some((app.to_string(), ip))
+    }
+
+    /// Drop a pair's stamp, and the program with its last one.
+    fn take(&mut self, app: &str, ip: Ipv4Addr) -> Option<u64> {
+        let stamps = self.by_app.get_mut(app)?;
+        let (_, tick) = stamps.remove(&ip)?;
+        if stamps.is_empty() {
+            self.by_app.remove(app);
+        }
+        self.len -= 1;
+        Some(tick)
+    }
+
+    fn len(&self) -> usize {
+        self.len
+    }
 }
 
 /// Sighting order of applications as a counter, so a sighting costs one map
@@ -301,10 +388,11 @@ impl AppObservationStore {
             census: Mutex::new(CensusIndex::default()),
             retracted: Mutex::new(BoundedRecentSet::new(RETRACTED_CAP)),
             seen_since_flush: Mutex::new(BoundedRecentSet::new(SEEN_SINCE_FLUSH_CAP)),
-            last_seen: Mutex::new(HashMap::new()),
+            last_seen: Mutex::new(PairClock::default()),
             pin_ttl: APP_PIN_FRESHNESS_WINDOW,
             clock: Arc::new(Instant::now),
             cap_per_app,
+            pair_cap: APP_PAIR_CAP,
             app_recency: Mutex::new(AppRecency::default()),
             app_cap: APP_KEY_CAP,
             app_cap_logged: AtomicBool::new(false),
@@ -399,6 +487,20 @@ impl AppObservationStore {
         self
     }
 
+    #[cfg(test)]
+    fn with_pair_cap(mut self, cap: usize) -> Self {
+        self.pair_cap = cap.max(1);
+        self
+    }
+
+    /// Pairs kept across every application (diagnostics / tests).
+    pub fn pair_count(&self) -> usize {
+        self.last_seen
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .len()
+    }
+
     /// Override the freshness window. Builder-style; production keeps the
     /// shared [`APP_PIN_FRESHNESS_WINDOW`] default.
     pub fn with_pin_ttl(mut self, ttl: Duration) -> Self {
@@ -417,7 +519,7 @@ impl AppObservationStore {
     /// IPs (loopback / unspecified / link-local) — they are never routed and
     /// would only pollute the set. At the per-app cap the least recently seen
     /// address gives way, so an app that migrates to new destinations gets them
-    /// routed instead of being frozen on its first 256.
+    /// routed instead of being frozen on its first [`APP_IP_CAP`].
     /// Returns `true` when `ip` was **newly** observed for this app — the
     /// caller uses that to trigger a route recompute so the new destination is
     /// routed promptly.
@@ -472,8 +574,8 @@ impl AppObservationStore {
         {
             return false;
         }
-        let (seen, dropped_app) = {
-            let mut g = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+        let mut g = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+        let dropped_app = {
             let mut recency = self.app_recency.lock().unwrap_or_else(|p| p.into_inner());
             let dropped_app = if !g.contains_key(&key) && g.len() >= self.app_cap {
                 recency
@@ -483,14 +585,17 @@ impl AppObservationStore {
                 None
             };
             recency.touch(&key);
-            let set = g
-                .entry(key.clone())
-                .or_insert_with(|| BoundedRecentSet::new(self.cap_per_app));
-            (set.observe(ip), dropped_app)
+            dropped_app
         };
-        {
+        let seen = g
+            .entry(key.clone())
+            .or_insert_with(|| BoundedRecentSet::new(self.cap_per_app))
+            .observe(ip);
+        // Held under `inner` (the documented order), so the total bound and
+        // the sets never disagree about which pairs exist.
+        let squeezed = {
             let mut stamps = self.last_seen.lock().unwrap_or_else(|p| p.into_inner());
-            stamps.insert((key.clone(), ip), (self.clock)());
+            stamps.stamp((key.clone(), ip), (self.clock)());
             if let Some(old) = seen.evicted {
                 stamps.remove(&(key.clone(), old));
             }
@@ -499,7 +604,19 @@ impl AppObservationStore {
                     stamps.remove(&(app.clone(), *old));
                 }
             }
-        }
+            let mut squeezed = Vec::new();
+            while stamps.len() > self.pair_cap {
+                let Some((app, old)) = stamps.pop_oldest() else {
+                    break;
+                };
+                if let Some(set) = g.get_mut(&app) {
+                    set.remove(&old);
+                }
+                squeezed.push(app);
+            }
+            squeezed
+        };
+        drop(g);
         if dropped_app.is_some() && !self.app_cap_logged.swap(true, Ordering::Relaxed) {
             tracing::info!(
                 target: "nrr::app-observations",
@@ -513,6 +630,7 @@ impl AppObservationStore {
             || dropped_app
                 .as_ref()
                 .is_some_and(|(app, _)| self.planned(app))
+            || squeezed.iter().any(|app| self.planned(app))
         {
             self.generation.fetch_add(1, Ordering::Relaxed);
         }
@@ -602,7 +720,7 @@ impl AppObservationStore {
                     };
                     if covers && set.contains(&connection.remote) {
                         set.observe(connection.remote);
-                        stamps.insert((name.clone(), connection.remote), now);
+                        stamps.stamp((name.clone(), connection.remote), now);
                         refreshed.insert((name.clone(), connection.remote));
                     }
                 }
@@ -1049,10 +1167,10 @@ impl AppObservationStore {
         let mut stale: Vec<Ipv4Addr> = Vec::new();
         for ip in set.iter() {
             match stamps.get(&(name.to_string(), *ip)) {
-                Some(t) if *t < cutoff => stale.push(*ip),
+                Some(t) if t < cutoff => stale.push(*ip),
                 Some(_) => {}
                 None => {
-                    stamps.insert((name.to_string(), *ip), now);
+                    stamps.stamp((name.to_string(), *ip), now);
                 }
             }
         }
@@ -1158,6 +1276,47 @@ impl AppObservationLookup for AppObservationStore {
         // applies for the same observed set.
         v.sort();
         v
+    }
+
+    fn latest_of(&self, app: &str, candidates: &[Ipv4Addr], n: usize) -> Vec<Ipv4Addr> {
+        if candidates.len() <= n {
+            return candidates.to_vec();
+        }
+        // The buckets `ips_for_app` reads for this pattern.
+        let keys: Vec<String> = if is_path_pattern(app) {
+            vec![observation_key(app)]
+        } else {
+            let key = app_key(app);
+            if key.contains('*') {
+                self.inner
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .keys()
+                    .filter(|name| !is_path_pattern(name) && glob_match(&key, name))
+                    .cloned()
+                    .collect()
+            } else {
+                vec![key]
+            }
+        };
+        let mut ranked: Vec<(u64, Ipv4Addr)> = {
+            let clock = self.last_seen.lock().unwrap_or_else(|p| p.into_inner());
+            candidates
+                .iter()
+                .map(|ip| {
+                    let rank = keys
+                        .iter()
+                        .filter_map(|key| clock.rank(&(key.clone(), *ip)))
+                        .max()
+                        .unwrap_or(0);
+                    (rank, *ip)
+                })
+                .collect()
+        };
+        ranked.sort_unstable_by(|a, b| b.cmp(a));
+        let mut latest: Vec<Ipv4Addr> = ranked.into_iter().take(n).map(|(_, ip)| ip).collect();
+        latest.sort_unstable();
+        latest
     }
 
     fn destination_used_outside(&self, friendly: &[String], ip: Ipv4Addr) -> bool {
@@ -1506,7 +1665,7 @@ mod tests {
         assert_eq!(store.ips_for_app("first.exe"), vec![addr(1), addr(3)]);
         assert_eq!(store.ips_for_app("third.exe"), vec![addr(4)]);
         let stamps = store.last_seen.lock().unwrap_or_else(|p| p.into_inner());
-        assert!(!stamps.keys().any(|(app, _)| app == "second.exe"));
+        assert!(!stamps.by_app.keys().any(|app| &**app == "second.exe"));
     }
 
     #[test]
@@ -1669,6 +1828,107 @@ mod tests {
             live.contains(&ip(198, 51, 100, 3)),
             "the newest was admitted"
         );
+    }
+
+    /// Per-destination filters carry 64 of a busy program's addresses; the
+    /// lowest 64 are old servers it no longer uses, so its current ones were
+    /// left without them.
+    #[test]
+    fn the_filtered_slice_is_the_latest_addresses_not_the_lowest() {
+        let store = AppObservationStore::new();
+        let nth = |i: u8| ip(20, 2, 0, i);
+        for i in 1..=100 {
+            store.record("busy.exe", nth(i));
+        }
+        // An old address used again is current.
+        store.record("busy.exe", nth(1));
+        let all = store.ips_for_app("busy.exe");
+        let latest = store.latest_of("busy.exe", &all, 64);
+
+        let mut expected: Vec<Ipv4Addr> = (38..=100).map(nth).collect();
+        expected.insert(0, nth(1));
+        assert_eq!(latest, expected);
+        assert_eq!(store.latest_of("busy.exe", &all[..10], 64), &all[..10]);
+    }
+
+    /// Every program on the machine is observed; past the total bound the pair
+    /// seen least recently anywhere goes, and the bound is never passed.
+    #[test]
+    fn past_the_pair_cap_the_globally_oldest_pair_gives_way() {
+        let store = AppObservationStore::new().with_pair_cap(6);
+        store.record("a.exe", addr(1));
+        store.record("a.exe", addr(2));
+        store.record("b.exe", addr(3));
+        store.record("b.exe", addr(4));
+        store.record("c.exe", addr(5));
+        store.record("a.exe", addr(1));
+        store.record("c.exe", addr(6));
+        store.record("d.exe", addr(7));
+        assert_eq!(store.pair_count(), 6);
+        assert_eq!(
+            store.ips_for_app("a.exe"),
+            vec![addr(1)],
+            "a.exe's 2 was oldest"
+        );
+
+        for n in 0..200u8 {
+            store.record(&format!("p{}.exe", n % 7), addr(n));
+            let kept: usize = ["a", "b", "c", "d", "p0", "p1", "p2", "p3", "p4", "p5", "p6"]
+                .iter()
+                .map(|app| store.ips_for_app(&format!("{app}.exe")).len())
+                .sum();
+            assert!(store.pair_count() <= 6 && kept <= 6, "bound passed at {n}");
+            assert_eq!(kept, store.pair_count(), "sets and the bound agree");
+        }
+    }
+
+    /// One program bursting new addresses takes the globally oldest pairs
+    /// only up to its own share; past that it gives up its own oldest, so
+    /// another program's current addresses stay.
+    #[test]
+    fn a_burst_from_one_program_leaves_another_programs_fresh_addresses() {
+        let store = AppObservationStore::with_cap(4).with_pair_cap(8);
+        for n in 1..=4 {
+            store.record("old.exe", addr(n));
+        }
+        for n in 11..=14 {
+            store.record("fresh.exe", addr(n));
+        }
+        for n in 21..=30 {
+            store.record("burst.exe", addr(n));
+        }
+        assert_eq!(store.pair_count(), 8);
+        assert!(store.ips_for_app("old.exe").is_empty());
+        assert_eq!(
+            store.ips_for_app("fresh.exe"),
+            (11..=14).map(addr).collect::<Vec<_>>()
+        );
+        assert_eq!(
+            store.ips_for_app("burst.exe"),
+            (27..=30).map(addr).collect::<Vec<_>>()
+        );
+    }
+
+    /// A CDN-heavy program touches hundreds of addresses; at too small a cap
+    /// each eviction makes it pay a held first connection again.
+    #[test]
+    fn a_program_keeps_a_thousand_and_twenty_four_addresses() {
+        let store = AppObservationStore::new();
+        let nth = |i: u32| {
+            let [_, _, hi, lo] = i.to_be_bytes();
+            ip(20, 1, hi, lo)
+        };
+        for i in 0..1024 {
+            store.record("cdn.exe", nth(i));
+        }
+        let kept = store.ips_for_app("cdn.exe");
+        assert_eq!(kept.len(), 1024, "every one of 1024 addresses is kept");
+
+        store.record("cdn.exe", nth(1024));
+        let after = store.ips_for_app("cdn.exe");
+        assert_eq!(after.len(), 1024, "the bound still holds");
+        assert!(!after.contains(&nth(0)), "the oldest gave way");
+        assert!(after.contains(&nth(1)) && after.contains(&nth(1024)));
     }
 
     /// Test clock: a base instant plus a shared, advanceable offset — crossing

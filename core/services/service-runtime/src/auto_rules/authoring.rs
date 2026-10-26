@@ -275,6 +275,9 @@ impl ProductionAutoRuleAuthor {
             "rules-json": rules_json,
             "content-hash": content_hash,
             "correlation-id": correlation_id,
+            // Built from the applied book, which leaves out the rules kept
+            // aside as not working: the executor carries them.
+            crate::production_mutation_executor::KEEP_INACTIVE_KEY: true,
         });
         if let (Some(base), Some(fields)) = (base, payload.as_object_mut()) {
             fields.insert(

@@ -53,6 +53,8 @@ The installers and binaries are not signed yet (Windows shows an unknown publish
 
 **Why the system account.** Changing the routing table and installing firewall filters both require administrator-level rights on Windows; the restricted service accounts cannot do either. The consequence is that a compromise of the service is a compromise of the machine, which is why the service's reachable surface is kept to a local, access-controlled channel and every request is validated there.
 
+**When the service starts the tray.** When the service has to tell a signed-in user something while none of their windows is open, it starts the application's own tray in that user's session. The tray runs with that user's ordinary, non-elevated rights and that user's own settings, never with the service's rights and never in another user's session. The service starts only the tray installed beside it, and only if no ordinary account could have changed or replaced it; otherwise it shows nothing. What the notice displays comes from network activity and is treated as untrusted text. Such notices are rate-limited per user, and the user can turn them off.
+
 ## The service channel
 
 The app, the tray and the console talk to the service over a local named pipe. There is no localhost HTTP control plane and the pipe refuses remote clients.

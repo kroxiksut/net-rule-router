@@ -521,7 +521,7 @@ impl ServiceControlPort for WindowsServiceControl {
         // can change is registered as a protected copy instead.
         let binary_path = match self.place_binary(&manager, &spec.binary_path)? {
             Placement::Register(path) => path,
-            Placement::AlreadyRegistered => return Ok(refresh_registration(&manager, spec)),
+            Placement::AlreadyRegistered => return refresh_registration(&manager, spec),
         };
 
         // Step 2 — data directories, locked down before anything is registered.
@@ -1155,7 +1155,19 @@ fn registered_from(
 fn refresh_registration(
     manager: &ServiceManager,
     spec: &ServiceInstallSpec,
-) -> ServiceInstallReport {
+) -> Result<ServiceInstallReport, ServiceControlError> {
+    // The tree a live install has been using: secured as at a start.
+    let mut acl_applied = None;
+    if spec.create_data_dirs {
+        let root = service_data_root()?;
+        if root.is_dir() {
+            acl_applied = Some(match secure_data_dir(&root) {
+                Ok(_) => true,
+                Err(refused @ ServiceControlError::InvalidState { .. }) => return Err(refused),
+                Err(_) => false,
+            });
+        }
+    }
     let recovery_configured = manager
         .open_service(
             WINDOWS_SERVICE_NAME,
@@ -1171,12 +1183,12 @@ fn refresh_registration(
                 configure_recovery(&service, &spec.recovery, &binary).is_ok()
             })
         });
-    ServiceInstallReport {
+    Ok(ServiceInstallReport {
         data_dirs_created: Vec::new(),
         recovery_configured,
-        acl_applied: None,
+        acl_applied,
         event_source_registered: Some(crate::event_log::register_event_source().is_ok()),
-    }
+    })
 }
 
 /// After the registration is gone, remove the protected copy if it was what
@@ -1345,14 +1357,38 @@ pub fn apply_data_dir_acl(root: &Path) -> Result<(), ServiceControlError> {
     // The root comes from an environment string; resetting ownership of a tree
     // someone else pointed it at is not this function's business.
     ensure_under_program_data(root)?;
-    crate::trusted_location::lock_down_service_tree(root).map_err(|e| match e {
+    crate::trusted_location::lock_down_service_tree(root).map_err(lockdown_error)
+}
+
+/// Where [`secure_data_dir`] moves what another account put in the tree.
+/// Nothing reads it; uninstall removes it with the rest of the data.
+pub const SET_ASIDE_SUBDIR: &str = "set-aside";
+
+/// [`apply_data_dir_acl`] for a tree nobody vetted — every service start, an
+/// install over a live registration: an entry an ordinary account owns is
+/// moved into [`SET_ASIDE_SUBDIR`] first, so the reset never passes it off as
+/// an administrator's. Returns what was moved, as `from -> to` lines.
+pub fn secure_data_dir(root: &Path) -> Result<Vec<String>, ServiceControlError> {
+    ensure_under_program_data(root)?;
+    crate::trusted_location::secure_service_tree(root, SET_ASIDE_SUBDIR)
+        .map(|moved| {
+            moved
+                .into_iter()
+                .map(|entry| format!("{} -> {}", entry.from.display(), entry.to.display()))
+                .collect()
+        })
+        .map_err(lockdown_error)
+}
+
+fn lockdown_error(e: crate::trusted_location::LockdownError) -> ServiceControlError {
+    match e {
         crate::trusted_location::LockdownError::Link(_) => ServiceControlError::InvalidState {
             detail: format!("refusing the data directory: {e}"),
         },
         crate::trusted_location::LockdownError::Failed(detail) => {
             ServiceControlError::Mechanism { detail }
         }
-    })
+    }
 }
 
 /// Take over a data tree that may predate this install, then lock it down.

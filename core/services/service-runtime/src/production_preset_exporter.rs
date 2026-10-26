@@ -25,7 +25,7 @@ use std::sync::{Arc, Mutex};
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use base64::Engine as _;
 use nrr_domain::rules_file::{
-    canonical_rule_set_to_rules_file_parsed, write_rules_file_with_passthrough, HostPlatform,
+    rule_set_with_kept_to_rules_file_parsed, write_rules_file_with_passthrough, HostPlatform,
     PassthroughSection, PresetMetadata, RulesFileSection,
 };
 use nrr_domain::rules_json_codec;
@@ -178,7 +178,11 @@ impl PresetExportSource for ProductionPresetExporter {
             .map_err(|e| PresetExportError::DecodeError(format!("codec decode: {e}")))?;
 
         let rule_set = content.rule_book.set_for(route);
-        let parsed = canonical_rule_set_to_rules_file_parsed(rule_set, self.host_app_section);
+        let kept = match route {
+            RouteRole::Primary => &content.inactive.primary,
+            RouteRole::Secondary => &content.inactive.secondary,
+        };
+        let parsed = rule_set_with_kept_to_rules_file_parsed(rule_set, kept, self.host_app_section);
 
         // Active revisions don't carry preset metadata (lost on import
         // canonicalization). When the caller asked for metadata, emit
@@ -364,6 +368,52 @@ mod tests {
         assert!(
             out.file_bytes_utf8.contains("per-sid.example"),
             "expected the caller's own revision content; got:\n{}",
+            out.file_bytes_utf8
+        );
+    }
+
+    /// A file exported from the service holds the user's rules that do not
+    /// work too, so writing it out does not lose them.
+    #[test]
+    fn export_keeps_the_rules_that_do_not_work() {
+        let conn = open_state_db_in_memory();
+        let mut content = RulesRevisionContent::new(CanonicalRuleBook {
+            primary: CanonicalRuleSet::from_rules(vec![rule(
+                "r-1",
+                CanonicalAddressMatch::ExactFqdn("works.example".to_string()),
+                "",
+            )]),
+            secondary: CanonicalRuleSet::default(),
+        });
+        content.inactive.primary = vec![nrr_shared::rules_json::RuleDto {
+            id: "r-2".into(),
+            enabled: true,
+            address_match: Some(nrr_shared::rules_json::AddressMatchDto::ExactIpv4 {
+                address: "255.255.255.255".into(),
+            }),
+            app_match: None,
+            comment: "printer".into(),
+            action: nrr_shared::rules_json::RuleAction::Route,
+            origin: None,
+        }];
+        seed_active_revision_for(&conn, nrr_storage::BASELINE_PRINCIPAL, content);
+        let out = ProductionPresetExporter::new(Arc::clone(&conn))
+            .with_host_app_section(RulesFileSection::Windows)
+            .export_rules_file(
+                nrr_storage::BASELINE_PRINCIPAL,
+                RouteRole::Primary,
+                false,
+                &Default::default(),
+            )
+            .expect("export");
+        assert!(
+            out.file_bytes_utf8.contains("works.example"),
+            "{}",
+            out.file_bytes_utf8
+        );
+        assert!(
+            out.file_bytes_utf8.contains("255.255.255.255  # printer"),
+            "{}",
             out.file_bytes_utf8
         );
     }

@@ -470,8 +470,6 @@ pub enum SettingFieldId {
     RulesFileChangeMode,
     /// Apply routing rules to direct child processes of a matched application.
     RuleIncludeChildProcesses,
-    /// Show rules written for operating systems other than the running platform.
-    ShowOtherOsRules,
     /// When a Zone rule and an Exact IP rule both match the same destination,
     /// determines which takes priority. Default: ExactIp wins.
     ZonePriorityOverIp,
@@ -507,7 +505,6 @@ impl SettingFieldId {
             Self::WarnWhenSecondaryUnavailable => "Warn when secondary route is unavailable",
             Self::RulesFileChangeMode => "When rules file changes on disk",
             Self::RuleIncludeChildProcesses => "Apply rules to child processes",
-            Self::ShowOtherOsRules => "Show rules for other operating systems",
             Self::ZonePriorityOverIp => "Zone vs. IP priority",
             Self::BrowserStubExperimental => "Local browser stub",
             Self::CheckForUpdates => "Check for updates",

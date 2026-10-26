@@ -122,7 +122,18 @@ pub(super) fn exe_name(path: Option<&str>) -> String {
 
 /// An address as the viewers show it.
 fn shown_ip(ip: std::net::IpAddr) -> String {
-    redact_ipv4_str(&ip.to_string(), VIEWER_REDACTION).display_or_marker()
+    viewer_ip(ip, VIEWER_REDACTION)
+}
+
+/// An endpoint as the viewers show it: a shown IPv6 address is bracketed, the
+/// form the clients' family filter and address split read.
+fn shown_endpoint(sa: &std::net::SocketAddr) -> String {
+    let ip = shown_ip(sa.ip());
+    if ip.contains(':') {
+        format!("[{ip}]:{}", sa.port())
+    } else {
+        format!("{ip}:{}", sa.port())
+    }
 }
 
 /// Whether `audience` may see a row owned by `owner`. Rows with no owner
@@ -193,10 +204,6 @@ impl IpcHandler for ConnTraceEntriesListHandler {
             });
         let has_more = rows.len() as u32 > limit;
 
-        let fmt_addr = |sa: &std::net::SocketAddr| -> String {
-            format!("{}:{}", shown_ip(sa.ip()), sa.port())
-        };
-
         // Built ONCE per user per page: each row is judged by the rules of the
         // user who made the connection; a machine row by the viewer's. A row
         // whose remote they own is EXPECTED to egress the additional link; the
@@ -254,8 +261,8 @@ impl IpcHandler for ConnTraceEntriesListHandler {
                     process: exe_name(r.process_path.as_deref()),
                     process_path: r.process_path.clone().unwrap_or_default(),
                     proto: proto_str(r.protocol).to_string(),
-                    local: fmt_addr(&r.local),
-                    remote: fmt_addr(&r.remote),
+                    local: shown_endpoint(&r.local),
+                    remote: shown_endpoint(&r.remote),
                     egress_role: role_str(r.egress.role).to_string(),
                     egress_ifindex: r.egress.ifindex,
                     verdict: verdict_str(r.verdict).to_string(),

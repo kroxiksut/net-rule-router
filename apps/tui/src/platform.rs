@@ -2,6 +2,7 @@
 //! picks implementations of platform ports; every decision codes against them.
 
 use nrr_platform_api::authorization::TerminalPromptAgent;
+use nrr_platform_api::path_registration::PathRegistrationPort;
 use nrr_platform_api::service_control::ServiceControlPort;
 use nrr_platform_api::system_locale::SystemLocalePort;
 
@@ -41,6 +42,34 @@ pub fn service_control() -> Option<Box<dyn ServiceControlPort>> {
     None
 }
 
+/// The host's `PATH` mechanism, and this terminal's own folder once the
+/// console is confirmed to sit in it.
+pub fn console_path_port() -> Result<(Box<dyn PathRegistrationPort>, std::path::PathBuf), String> {
+    let exe = std::env::current_exe()
+        .map_err(|e| format!("cannot locate the running executable: {e}"))?;
+    let directory = nrr_platform_api::console_path::console_directory_beside(&exe)?;
+    Ok((path_registration()?, directory))
+}
+
+#[cfg(windows)]
+fn path_registration() -> Result<Box<dyn PathRegistrationPort>, String> {
+    Ok(Box::new(
+        nrr_platform_windows::path_registration::WindowsUserPathRegistration::production(),
+    ))
+}
+
+#[cfg(target_os = "linux")]
+fn path_registration() -> Result<Box<dyn PathRegistrationPort>, String> {
+    let port = nrr_platform_linux::path_registration::UnixPathRegistration::from_environment()
+        .map_err(|e| e.to_string())?;
+    Ok(Box::new(port))
+}
+
+#[cfg(not(any(windows, target_os = "linux")))]
+fn path_registration() -> Result<Box<dyn PathRegistrationPort>, String> {
+    Err("this platform has no PATH registration mechanism".to_string())
+}
+
 /// Under `sudo` the Rules screen edits the administrator's baseline, as "Set
 /// as baseline" does in the window: rules of root's own would reach no user.
 #[cfg(target_os = "linux")]
@@ -51,6 +80,25 @@ pub fn edits_baseline() -> bool {
 /// Elsewhere the screen edits the caller's own rules.
 #[cfg(not(target_os = "linux"))]
 pub fn edits_baseline() -> bool {
+    false
+}
+
+/// Whether the terminal runs with administrator rights: the service lets
+/// such a caller through the administrator's rule-edit lock.
+#[cfg(target_os = "linux")]
+pub fn runs_elevated() -> bool {
+    nrr_platform_linux::elevation::running_as_root()
+}
+
+/// Whether the terminal runs with administrator rights.
+#[cfg(windows)]
+pub fn runs_elevated() -> bool {
+    nrr_platform_windows::win32_ffi::console_session::current_process_elevated()
+}
+
+/// Whether the terminal runs with administrator rights.
+#[cfg(not(any(windows, target_os = "linux")))]
+pub fn runs_elevated() -> bool {
     false
 }
 

@@ -65,6 +65,7 @@ impl ConnectionObservationConsumer {
             companion_reported: Mutex::new(HashSet::new()),
             primary_stall_evidence: Mutex::new(stall_evidence::ConnectionStallTracker::default()),
             unanswered: Mutex::new(unanswered::UnansweredTracker::default()),
+            own_flow_resets: crate::own_flow_resets::global_own_flow_resets(),
             app_main_link: None,
             app_additional_link: None,
             connection_programs: Mutex::new(std::collections::HashMap::new()),
@@ -101,6 +102,17 @@ impl ConnectionObservationConsumer {
     #[must_use]
     pub fn with_stale_flow_reset(mut self, reset: Arc<dyn StaleFlowReset>) -> Self {
         self.stale_flow_reset = Some(reset);
+        self
+    }
+
+    /// Read the service's own teardowns from `resets` instead of the
+    /// process-wide memory.
+    #[must_use]
+    pub fn with_own_flow_resets(
+        mut self,
+        resets: Arc<crate::own_flow_resets::OwnFlowResets>,
+    ) -> Self {
+        self.own_flow_resets = resets;
         self
     }
 

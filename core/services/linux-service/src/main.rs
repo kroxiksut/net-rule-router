@@ -81,6 +81,8 @@ fn main() -> ExitCode {
         #[cfg(target_os = "linux")]
         Command::AfterCrash => run_after_crash(),
         #[cfg(target_os = "linux")]
+        Command::EarlyTable => run_early_table(),
+        #[cfg(target_os = "linux")]
         Command::PackageFiles => install::write_package_files(args.get(1).map(String::as_str)),
         #[cfg(target_os = "linux")]
         Command::ProvisionCheck => provision_exit(
@@ -96,6 +98,7 @@ fn main() -> ExitCode {
         | Command::Cleanup
         | Command::StopAndCleanup
         | Command::AfterCrash
+        | Command::EarlyTable
         | Command::PackageFiles
         | Command::ProvisionCheck
         | Command::ProvisionStage => {
@@ -163,6 +166,25 @@ fn run_after_crash() -> ExitCode {
         Ok(()) => ExitCode::SUCCESS,
         Err(reason) => {
             eprintln!("after-crash: could not give the machine's DNS back: {reason}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+/// The early unit, before `network-pre.target`: the saved table goes up so no
+/// session reaches the network before the daemon's first pass. Quiet when
+/// nothing was saved.
+#[cfg(target_os = "linux")]
+fn run_early_table() -> ExitCode {
+    let cli = nrr_platform_linux::nft_apply::NftCliEnforcement::new();
+    match nrr_platform_linux::early_table::apply_saved(&cli) {
+        Ok(true) => {
+            println!("NetRuleRouter: the saved protection table is up until the service starts.");
+            ExitCode::SUCCESS
+        }
+        Ok(false) => ExitCode::SUCCESS,
+        Err(reason) => {
+            eprintln!("early-table: the saved protection table could not be applied: {reason}");
             ExitCode::FAILURE
         }
     }

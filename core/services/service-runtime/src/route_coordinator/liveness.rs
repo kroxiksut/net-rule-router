@@ -199,6 +199,21 @@ impl SecondaryRouteCoordinator {
         }
     }
 
+    /// Forget the link of every principal whose last pass routed through one of
+    /// the interfaces in `gone`: until the next pass resolves it again, a first
+    /// contact installs nothing rather than a route through a dead interface.
+    pub fn forget_links(&self, gone: &[u32]) {
+        if gone.is_empty() {
+            return;
+        }
+        let on_gone =
+            |t: &Option<SecondaryRouteTarget>| t.is_some_and(|t| gone.contains(&t.interface_index));
+        self.last_resolution
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .retain(|_, r| !on_gone(&r.secondary) && !on_gone(&r.primary));
+    }
+
     /// Routes `addresses` now, the way the next full recompute for `sid` will,
     /// so a rule host's first connect to a new address leaves through the link
     /// its rule names instead of racing that recompute. Plans from the

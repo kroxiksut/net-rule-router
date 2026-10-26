@@ -47,7 +47,7 @@ const RT_IPSEC_PLACEHOLDER: &str = "nrr-rt-ipsec";
 
 /// The batch as `nft -j -f -` reads it.
 #[cfg(any(target_os = "linux", test))]
-fn batch_json(batch: &Nftables<'_>) -> Result<String, serde_json::Error> {
+pub(crate) fn batch_json(batch: &Nftables<'_>) -> Result<String, serde_json::Error> {
     let mut value = serde_json::to_value(batch)?;
     rewrite_rt_ipsec(&mut value);
     serde_json::to_string(&value)
@@ -126,8 +126,32 @@ pub fn render_batch_with(ruleset: &NftRuleset, reporting: DropReporting) -> Nfta
     );
     add_drop_chains(&mut batch, table.clone(), &ruleset.rules, reporting);
 
+    let generation = (!ruleset.rules.is_empty()).then(|| flow_generation(ruleset));
+    if let Some(generation) = generation {
+        batch.add(bare_rule(
+            &table,
+            &chain,
+            fast_path_statements(generation),
+            "established-fast-path",
+        ));
+    }
     for rule in &ruleset.rules {
-        batch.add(rule_object(&table, &chain, rule, reporting));
+        let mut object = rule_object(&table, &chain, rule, reporting);
+        if let (Some(generation), NfListObject::Rule(r)) = (generation, &mut object) {
+            if marks_its_flow(rule) {
+                let expr = r.expr.to_mut();
+                expr.insert(expr.len() - 1, mark_flow(generation));
+            }
+        }
+        batch.add(object);
+    }
+    if let Some(generation) = generation {
+        batch.add(bare_rule(
+            &table,
+            &chain,
+            vec![mark_flow(generation)],
+            "accepted-flow-mark",
+        ));
     }
     // Recreated, or removed when nothing is forwarded under guard any more.
     let forward: Cow<'_, str> = Cow::Borrowed(NRR_FORWARD_CHAIN);
@@ -137,6 +161,106 @@ pub fn render_batch_with(ruleset: &NftRuleset, reporting: DropReporting) -> Nfta
         batch.add(rule_object(&table, &forward, rule, DropReporting::Silent));
     }
     batch.to_nftables()
+}
+
+/// The high half of the conntrack mark is ours; the low half stays with whoever
+/// uses it (`wg-quick` keeps its own mark there).
+const FLOW_MARK_MASK: u32 = 0xffff_0000;
+
+/// Tags the flows this ruleset accepted. Any change of the ruleset changes it,
+/// so after every apply each live flow walks the chain once more.
+fn flow_generation(ruleset: &NftRuleset) -> u32 {
+    // FNV-1a over the rules as rendered: stable across runs of one build.
+    let text = format!("{:?}{:?}", ruleset.rules, ruleset.forward);
+    let hash = text.bytes().fold(0x811c_9dc5_u32, |h, b| {
+        (h ^ u32::from(b)).wrapping_mul(0x0100_0193)
+    });
+    let high = (hash ^ (hash << 16)) & FLOW_MARK_MASK;
+    if high == 0 {
+        1 << 16
+    } else {
+        high
+    }
+}
+
+/// A flow accepted with no condition on its link keeps that verdict while the
+/// ruleset stands. A pin or a route test does not: the same flow may leave
+/// through another link later, so it is judged on every packet.
+fn marks_its_flow(rule: &NftRule) -> bool {
+    rule.verdict == NftVerdict::Accept
+        && !rule
+            .matches
+            .iter()
+            .any(|m| matches!(m, NftMatch::OutInterface(_) | NftMatch::RouteIpsec))
+}
+
+fn ct_mark() -> Expression<'static> {
+    Expression::Named(NamedExpression::CT(CT {
+        key: Cow::Borrowed("mark"),
+        family: None,
+        dir: None,
+    }))
+}
+
+/// `ct mark set ct mark & 0xffff | generation`.
+fn mark_flow(generation: u32) -> Statement<'static> {
+    use nftables::expr::BinaryOperation;
+    Statement::Mangle(nftables::stmt::Mangle {
+        key: ct_mark(),
+        value: Expression::BinaryOperation(Box::new(BinaryOperation::OR(vec![
+            Expression::BinaryOperation(Box::new(BinaryOperation::AND(
+                ct_mark(),
+                Expression::Number(!FLOW_MARK_MASK),
+            ))),
+            Expression::Number(generation),
+        ]))),
+    })
+}
+
+/// Only a flow's first packets walk the chain; the rest of a flow this ruleset
+/// accepted leaves at the first rule.
+fn fast_path_statements(generation: u32) -> Vec<Statement<'static>> {
+    use nftables::expr::BinaryOperation;
+    vec![
+        Statement::Match(Match {
+            left: Expression::Named(NamedExpression::CT(CT {
+                key: Cow::Borrowed("state"),
+                family: None,
+                dir: None,
+            })),
+            right: Expression::List(vec![
+                Expression::String(Cow::Borrowed("established")),
+                Expression::String(Cow::Borrowed("related")),
+            ]),
+            op: Operator::IN,
+        }),
+        Statement::Match(Match {
+            left: Expression::BinaryOperation(Box::new(BinaryOperation::AND(
+                ct_mark(),
+                Expression::Number(FLOW_MARK_MASK),
+            ))),
+            right: Expression::Number(generation),
+            op: Operator::EQ,
+        }),
+        Statement::Accept(None),
+    ]
+}
+
+fn bare_rule<'a>(
+    table: &Cow<'a, str>,
+    chain: &Cow<'a, str>,
+    expr: Vec<Statement<'static>>,
+    comment: &'static str,
+) -> NfListObject<'a> {
+    NfListObject::Rule(Rule {
+        family: FAMILY,
+        table: table.clone(),
+        chain: chain.clone(),
+        expr: Cow::Owned(expr),
+        handle: None,
+        index: None,
+        comment: Some(Cow::Borrowed(comment)),
+    })
 }
 
 /// A hookless `add` first makes the `delete` valid on a fresh table; with no
@@ -796,13 +920,26 @@ impl NftCliEnforcement {
     /// other programs' rules with it.
     #[cfg(target_os = "linux")]
     pub fn teardown(&self, table: &str) -> Result<(), NftApplyError> {
-        match self.run_batch(&render_teardown(table), &[]) {
+        let outcome = match self.run_batch(&render_teardown(table), &[]) {
             Ok(()) => Ok(()),
             // A table that is already gone is the state teardown wants —
             // Windows classifies `FWP_E_FILTER_NOT_FOUND` the same way.
             Err(failure) if is_absent_table(&failure) => Ok(()),
             Err(failure) => Err(classify(failure)),
+        };
+        // The saved copy would put the table back at the next boot.
+        if outcome.is_ok() && table == crate::lower_linux::NRR_TABLE {
+            crate::early_table::forget();
         }
+        outcome
+    }
+
+    /// Apply a batch saved as `nft -j` reads it: the early table at boot.
+    #[cfg(target_os = "linux")]
+    pub fn apply_json(&self, payload: &str) -> Result<(), NftApplyError> {
+        self.run(&["-j", "-f", "-"], Some(payload))
+            .map(drop)
+            .map_err(classify)
     }
 
     /// Whether `nft` can be reached at all. Called at daemon start so a missing
@@ -1074,6 +1211,12 @@ where
 ///
 /// `offenders` must be sorted and in range; the search that produces them
 /// guarantees both. They index both chains as [`render_probe_batch`] does.
+/// `ruleset` as the kernel holds it after a best-effort apply skipped `skipped`.
+pub fn without_skipped(ruleset: &NftRuleset, skipped: &[SkippedNftRule]) -> NftRuleset {
+    let offenders: Vec<usize> = skipped.iter().map(|s| s.index).collect();
+    without_rules(ruleset, &offenders).0
+}
+
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 fn without_rules(ruleset: &NftRuleset, offenders: &[usize]) -> (NftRuleset, Vec<SkippedNftRule>) {
     let output_len = ruleset.rules.len();
@@ -1344,6 +1487,124 @@ mod tests {
         }
     }
 
+    /// The output chain's rules as `(comment, expr)`, in batch order.
+    fn output_rules(set: &NftRuleset) -> Vec<(String, serde_json::Value)> {
+        let value = serde_json::to_value(render_batch(set)).expect("the batch must serialise");
+        value["nftables"]
+            .as_array()
+            .expect("a command list")
+            .iter()
+            .filter_map(|item| item.get("add")?.get("rule"))
+            .filter(|rule| rule["chain"] == "output")
+            .map(|rule| {
+                (
+                    rule["comment"].as_str().unwrap_or_default().to_owned(),
+                    rule["expr"].clone(),
+                )
+            })
+            .collect()
+    }
+
+    fn marks(expr: &serde_json::Value) -> bool {
+        expr.to_string()
+            .contains(r#""mangle":{"key":{"ct":{"key":"mark"}}"#)
+    }
+
+    fn pinned_set() -> NftRuleset {
+        let dst = |last: u8| NftMatch::DstV4 {
+            net: std::net::Ipv4Addr::new(203, 0, 113, last),
+            prefix: 32,
+        };
+        ruleset(vec![
+            NftRule {
+                matches: vec![dst(1)],
+                verdict: NftVerdict::Accept,
+                comment: "direct".into(),
+            },
+            NftRule {
+                matches: vec![dst(2), NftMatch::OutInterface("tun0".into())],
+                verdict: NftVerdict::Accept,
+                comment: "pin via".into(),
+            },
+            NftRule {
+                matches: vec![dst(2)],
+                verdict: NftVerdict::Drop,
+                comment: "pin leak-guard".into(),
+            },
+        ])
+    }
+
+    /// Per-packet cost is paid by a flow's first packets only, yet a pinned
+    /// flow is still judged on every packet: the link it leaves through can
+    /// change under it, which is the leak the pin stops.
+    #[test]
+    fn an_accepted_flow_skips_the_chain_and_a_pinned_one_never_does() {
+        let set = pinned_set();
+        let generation = flow_generation(&set);
+        let rules = output_rules(&set);
+        let comments: Vec<&str> = rules.iter().map(|(c, _)| c.as_str()).collect();
+        assert_eq!(
+            comments,
+            [
+                "established-fast-path",
+                "direct",
+                "pin via",
+                "pin leak-guard",
+                "accepted-flow-mark"
+            ]
+        );
+        let fast = rules[0].1.to_string();
+        assert!(
+            fast.contains(r#""right":["established","related"]"#),
+            "{fast}"
+        );
+        assert!(
+            fast.contains(&format!(
+                r#"{{"match":{{"left":{{"&":[{{"ct":{{"key":"mark"}}}},{FLOW_MARK_MASK}]}},"op":"==","right":{generation}}}}}"#
+            )),
+            "{fast}"
+        );
+        assert!(marks(&rules[1].1), "an unpinned accept tags its flow");
+        assert!(!marks(&rules[2].1), "a pinned accept must not tag its flow");
+        assert!(!marks(&rules[3].1));
+        assert!(marks(&rules[4].1), "the chain's end tags what fell through");
+        assert!(!rules[4].1.to_string().contains("accept"));
+    }
+
+    /// A flow accepted under the previous ruleset must not ride the fast path
+    /// under the next: a rule added since may block it.
+    #[test]
+    fn any_change_of_the_ruleset_retags_every_flow() {
+        let set = pinned_set();
+        let generation = flow_generation(&set);
+        assert_eq!(generation, flow_generation(&set.clone()));
+        assert_eq!(generation & !FLOW_MARK_MASK, 0);
+        assert_ne!(generation, 0);
+        let mut changed = set.clone();
+        changed.rules[0].verdict = NftVerdict::Drop;
+        assert_ne!(generation, flow_generation(&changed));
+        let mut forwarded = set;
+        forwarded.forward.push(plain("fwd"));
+        assert_ne!(generation, flow_generation(&forwarded));
+    }
+
+    /// `wg-quick` keeps its own conntrack mark in the low half; overwriting it
+    /// would break the tunnel this product routes into.
+    #[test]
+    fn tagging_a_flow_keeps_the_low_half_of_its_conntrack_mark() {
+        let rules = output_rules(&pinned_set());
+        let tag = rules[1].1.to_string();
+        assert!(
+            tag.contains(r#"{"&":[{"ct":{"key":"mark"}},65535]}"#),
+            "{tag}"
+        );
+    }
+
+    #[test]
+    fn an_empty_ruleset_adds_no_fast_path() {
+        assert!(output_rules(&ruleset(Vec::new())).is_empty());
+    }
+
     #[test]
     fn the_probe_table_is_derived_from_ours_and_distinct() {
         assert_eq!(probe_table_name("nrr"), "nrr_probe");
@@ -1365,6 +1626,9 @@ mod tests {
                 "add chain nrr/output",
                 "delete chain nrr/output",
                 "add chain nrr/output hooked",
+                // The fast path, the rule, the flow mark.
+                "add rule nrr/output",
+                "add rule nrr/output",
                 "add rule nrr/output",
                 "add chain nrr/forward",
                 "delete chain nrr/forward",
@@ -1602,7 +1866,8 @@ mod tests {
             .as_array()
             .expect("commands")
             .iter()
-            .find_map(|cmd| cmd.get("add").and_then(|add| add.get("rule")))
+            .filter_map(|cmd| cmd.get("add").and_then(|add| add.get("rule")))
+            .find(|rule| rule["comment"] == "catch-all-exempt#1638400")
             .expect("the rule");
         assert_eq!(
             rule["expr"][1],
@@ -1645,6 +1910,9 @@ mod tests {
                 "add chain nrr/drop_rule",
                 "add rule nrr/drop_rule",
                 "add rule nrr/drop_rule",
+                // The fast path, four rules, the flow mark.
+                "add rule nrr/output",
+                "add rule nrr/output",
                 "add rule nrr/output",
                 "add rule nrr/output",
                 "add rule nrr/output",
@@ -1676,7 +1944,10 @@ mod tests {
             .filter_map(|c| c["add"].get("rule"))
             .find(|r| r["comment"] == "accept")
             .expect("the accept rule");
-        assert_eq!(accept["expr"], serde_json::json!([{ "accept": null }]));
+        let expr = accept["expr"].as_array().expect("statements");
+        assert_eq!(expr.last(), Some(&serde_json::json!({ "accept": null })));
+        let text = accept["expr"].to_string();
+        assert!(!text.contains("log") && !text.contains("jump"), "{text}");
     }
 
     #[test]
@@ -2347,6 +2618,19 @@ mod cli_tests {
             assert!(
                 listed.contains(comment),
                 "{comment} missing from:
+{listed}"
+            );
+        }
+        // The fast path is taken by this kernel as written, not just parsed.
+        for want in [
+            "ct state established,related",
+            "established-fast-path",
+            "ct mark set",
+            "accepted-flow-mark",
+        ] {
+            assert!(
+                listed.contains(want),
+                "{want} missing from:
 {listed}"
             );
         }

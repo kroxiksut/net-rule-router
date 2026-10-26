@@ -236,6 +236,13 @@ ApplicationWindow {
         onActivated: trayRuleWindow._closeSoon()
     }
 
+    /// `present()` with the form already holding a rule for `host` on `route`.
+    function presentFor(host, route) {
+        var fresh = !visible && _state !== "busy"
+        present()
+        if (fresh) ruleDialog.resetForNewOnRoute("domain", host, route)
+    }
+
     /// Open on a fresh form, or bring forward the one already up.
     function present() {
         if (visible) {

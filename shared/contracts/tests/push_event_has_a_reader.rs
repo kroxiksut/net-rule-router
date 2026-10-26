@@ -124,6 +124,12 @@ const TABLE: &[Row] = &[
         tui: Read,
     },
     Row {
+        slug: "link-keeps-dropping",
+        gui: Read,
+        tray: Read,
+        tui: Read,
+    },
+    Row {
         slug: "app-rule-learning-destinations",
         gui: Read,
         tray: Read,

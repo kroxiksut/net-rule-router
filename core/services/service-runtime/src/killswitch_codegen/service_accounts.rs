@@ -108,11 +108,16 @@ pub fn forwarded_guard_filters(
     WfpFilterSpec::onto_forwarding_path(out)
 }
 
-/// The owner's blanket block, for what the machine forwards: the tunnel is gone
-/// and the owner's traffic is held whole, so a guest's is too, save what the
-/// blanket's own floor keeps open plus the main link's resolvers and the
-/// networks its rules route. `main_networks` are the pieces the owner's rule
-/// filters carry, already carved around every narrower claim.
+/// The owner's blanket block, for what the machine forwards: the owner's
+/// traffic is held whole, so a guest's is too, save what the blanket's own
+/// floor keeps open plus the main link's resolvers and the networks its rules
+/// route. `main_networks` are the pieces the owner's rule filters carry,
+/// already carved around every narrower claim.
+///
+/// With the tunnel up (`exemptions.secondary_luid` set) what leaves through it
+/// is let out as well, keyed on the interface the packet is forwarded out of:
+/// the instant the tunnel goes, the same blanket holds the guest's traffic,
+/// before any pass. The floor is the same in both states.
 #[must_use]
 pub fn forwarded_block_all_filters(
     owner: &str,
@@ -127,9 +132,8 @@ pub fn forwarded_block_all_filters(
     // Packed rather than one filter per host: every forwarded packet is judged
     // against this set, and the per-host form would double the standing count
     // the owner's own blanket carries.
-    let open: Vec<Ipv4Addr> = std::mem::take(&mut exemptions.known_direct_ips)
+    let open: Vec<Ipv4Addr> = std::mem::take(&mut exemptions.primary_dest_ips)
         .into_iter()
-        .chain(std::mem::take(&mut exemptions.primary_dest_ips))
         .chain(primary_dns.iter().filter_map(|ip| match ip {
             IpAddr::V4(v4) => Some(*v4),
             IpAddr::V6(_) => None,
@@ -139,9 +143,23 @@ pub fn forwarded_block_all_filters(
         .collect();
     let seed = forwarded_seed(owner);
     let mut out = fail_closed_block_all_filters(&seed, &exemptions, KillSwitchProtocols::ALL);
+    // The IPv6 half already carries its own when the LUID is known.
+    if exemptions.secondary_luid != 0 {
+        out.push(exempt_egress(
+            &seed,
+            exemptions.secondary_luid,
+            CATCHALL_EXEMPT_BASE,
+        ));
+    }
+    // Over the floor alone, so the permits stacked above it keep their weights
+    // whether the tunnel is up or gone.
     let above = out
         .iter()
-        .filter(|spec| spec.action == WfpAction::Permit && spec.layer.supports_ale_scoping())
+        .filter(|spec| {
+            spec.action == WfpAction::Permit
+                && spec.layer.supports_ale_scoping()
+                && spec.local_interface_luid.is_none()
+        })
         .map(|spec| spec.weight)
         .fold(CATCHALL_EXEMPT_BASE, u64::max);
     let chunks = nrr_platform_api::wfp_slotting::pack_v4(open);

@@ -967,6 +967,17 @@ Window {
                     }
                     onToggled: firstRunWindow.wantTrayAutostart = checked
                 }
+                // Told apart from the autostart above: this holds with the
+                // tray closed, whatever is chosen there.
+                Label {
+                    Layout.fillWidth: true
+                    Layout.preferredWidth: 0
+                    visible: root.supports("siteNoticeWithoutTray")
+                    text: root.tr("dialog.first-run-wizard.site-notice-note",
+                        "Even with the tray closed, NetRuleRouter tells you when a site you open does not open over the main connection. You can turn this off in Settings, Notifications.")
+                    color: root.mutedTextColor
+                    wrapMode: Text.WordWrap
+                }
             }
 
             // Option 1: Country preset (if a pack exists for the detected locale).

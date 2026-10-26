@@ -254,7 +254,7 @@ pub fn reset_owner_flows(
     let torn_down = if decision.reset.is_empty() {
         0
     } else {
-        reset.reset_established(&decision.reset)
+        crate::own_flow_resets::reset_as_ours(reset, &decision.reset)
     };
     Some(OwnerFlowReset {
         decision,
@@ -354,7 +354,7 @@ impl RoutedHostFlowRefresh {
         }
         let sweep = StaleFlowSweep {
             found: decision.reset.len(),
-            torn_down: self.reset.reset_established(&decision.reset),
+            torn_down: crate::own_flow_resets::reset_as_ours(self.reset.as_ref(), &decision.reset),
         };
         if sweep.found > 0 {
             log_reset_flows(Some(principal), &decision.reset, |ip| {

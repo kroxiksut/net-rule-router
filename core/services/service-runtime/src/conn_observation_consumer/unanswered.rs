@@ -7,8 +7,9 @@
 //! keeps a lossy but working link out of the log.
 //!
 //! The verdict answers "did the network drop it, or did we": a connection our
-//! own filter dropped is excluded, and every report names the program and the
-//! link, so a user whose corporate tunnel dies can see it was not the router.
+//! own filter dropped is excluded, the close of one the service tore down is
+//! not blamed on the peer, and every report names the program and the link, so
+//! a user whose corporate tunnel dies can see it was not the router.
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
@@ -20,8 +21,9 @@ use nrr_platform_api::conn_observe::{
 
 /// Resends closer than this are one burst (fast retransmit, SACK recovery).
 const BURST_MS: u64 = 200;
-/// The first timeout resend follows the first resend within the initial RTO.
-const FIRST_TIMEOUT_GAP_MAX_MS: u64 = 3_000;
+/// The first timeout resend follows the first one by twice the timeout the
+/// stack started with, which over a slow tunnel is several seconds.
+const FIRST_TIMEOUT_GAP_MAX_MS: u64 = 8_000;
 /// A backed-off gap at least this many tenths of the one before. The stack
 /// doubles; timestamps jitter.
 const BACKOFF_MIN_TENTHS: u64 = 15;
@@ -178,6 +180,8 @@ impl UnansweredTracker {
         let key = (seen.local, seen.remote);
         let at_ms = seen.at_ms;
         match seen.progress {
+            // A connection that never came up did not stop answering.
+            ConnectionProgress::HandshakeRetransmit => None,
             ConnectionProgress::Attempt => {
                 let entry = self.entry(key, seen);
                 entry.program = seen.program.map(str::to_owned);
@@ -285,23 +289,27 @@ impl UnansweredTracker {
 
     /// Dead entries go first, then the quietest; a reported silence and our own
     /// drops outlive the rest so a close is still matched and never blamed on
-    /// the peer.
+    /// the peer. An eighth of the room is freed at once, so a connection flood
+    /// pays one scan per many new connections instead of one each.
     fn make_room(&mut self, now_ms: u64) {
         if self.connections.len() < self.cap {
             return;
         }
         self.connections
             .retain(|_, e| now_ms.saturating_sub(e.last_ms) < IDLE_TTL_MS);
-        while self.connections.len() >= self.cap {
-            let Some(victim) = self
-                .connections
-                .iter()
-                .min_by_key(|(_, e)| (e.reported || e.ours, e.last_ms))
-                .map(|(key, _)| *key)
-            else {
-                return;
-            };
-            self.connections.remove(&victim);
+        let keep = self.cap - (self.cap / 8).max(1);
+        let excess = self.connections.len().saturating_sub(keep);
+        if excess == 0 {
+            return;
+        }
+        let mut ranked: Vec<((bool, u64), ConnectionKey)> = self
+            .connections
+            .iter()
+            .map(|(key, e)| ((e.reported || e.ours, e.last_ms), *key))
+            .collect();
+        ranked.select_nth_unstable(excess - 1);
+        for (_, key) in &ranked[..excess] {
+            self.connections.remove(key);
         }
     }
 }
@@ -345,6 +353,11 @@ impl super::ConnectionObservationConsumer {
             }) else {
                 return;
             };
+            if let Outcome::Closed { silence, .. } = &outcome {
+                if self.own_flow_resets.contains(silence.local, silence.remote) {
+                    return;
+                }
+            }
             let (admitted, omitted) = tracker.admit_line(now_ms);
             (outcome, admitted, omitted)
         };
@@ -402,7 +415,7 @@ impl super::ConnectionObservationConsumer {
                 remote = %silence.remote,
                 local_port = silence.local.port(),
                 silent_s,
-                "the stack closed a connection the far side had stopped answering",
+                "the stack closed a connection the far side had stopped answering; NetRuleRouter did not close it",
             ),
         }
     }
@@ -473,6 +486,21 @@ mod tests {
         assert_eq!(silence.role, EgressRole::Other);
         assert_eq!(silence.ifindex, IFINDEX);
         assert_eq!(silence.since_ms, 1_000);
+    }
+
+    /// RDP over a slow corporate tunnel: a 2 s timeout to start with, then the
+    /// five resends Windows makes by default before it drops the connection.
+    #[test]
+    fn a_slow_tunnel_running_out_of_resends_is_reported_once_and_its_close_too() {
+        let mut t = UnansweredTracker::default();
+        established(&mut t, 50_000, 0);
+        let out = resends(&mut t, 50_000, &[2_000, 6_000, 14_000, 30_000, 62_000]);
+        assert!(
+            matches!(&out[..], [Outcome::Unanswered(s)] if s.since_ms == 2_000),
+            "{out:?}"
+        );
+        let closed = t.note(seen(50_000, ConnectionProgress::ClosedInOrder, 126_000));
+        assert!(matches!(closed, Some(Outcome::Closed { .. })), "{closed:?}");
     }
 
     #[test]
@@ -556,6 +584,22 @@ mod tests {
         established(&mut t, 50_002, 100_001);
         assert!(t.connections.contains_key(&key(50_000)));
         assert!(!t.connections.contains_key(&key(50_001)));
+    }
+
+    /// A port scan or a torrent opens connections faster than any close
+    /// arrives: memory stays at the cap and the silence already reported keeps
+    /// its place, so its close is still told apart.
+    #[test]
+    fn a_connection_flood_stays_within_the_cap_and_keeps_the_reported_silence() {
+        let mut t = UnansweredTracker::with_cap(64);
+        established(&mut t, 50_000, 0);
+        resends(&mut t, 50_000, &backoff_from(1_000, 8));
+        for port in 0..10_000u16 {
+            established(&mut t, 50_001 + port, 40_000 + u64::from(port));
+            assert!(t.connections.len() <= 64);
+        }
+        assert!(t.connections.contains_key(&key(50_000)));
+        assert!(t.connections.contains_key(&key(50_001 + 9_999)));
     }
 
     #[test]

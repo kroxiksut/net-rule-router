@@ -64,6 +64,8 @@ pub mod error;
 // Whether a file under the machine state root was placed by an administrator:
 // an unprivileged reader believes it only then. Ownership is read per-OS.
 pub mod admin_authored;
+// Who may reach the service's data tree: the plan each OS lockdown applies.
+pub mod data_tree_access;
 // Per-adapter external (reflexive) address discovery over STUN. Portable as
 // written — the transport is `std::net` and the codec is pure bytes — so there
 // is no per-OS mechanism to hide behind a trait here.
@@ -105,6 +107,9 @@ pub mod source_link;
 // the list become — is pure and lives here; the mechanism is per-OS (per-user
 // environment store on Windows, a shell start-up file on Unix).
 pub mod path_registration;
+// The console's folder on the user's PATH: the state and the two actions every
+// client offers, over the per-OS registration port.
+pub mod console_path;
 // Where the production service keeps state and operational logs. The leaf comes
 // from the product identity, the OS shape (`%ProgramData%` / FHS split) is this
 // crate's business — declared once so a rename cannot land in one place only.
@@ -142,6 +147,9 @@ pub mod service_control;
 // Whether an install registers its binary in place or a copy kept where only
 // administrators can change it, and what to do about a copy already there.
 pub mod service_placement;
+// Telling a signed-in user of a site that does not open while none of their
+// surfaces runs. The decision is neutral; starting their tray is per-OS.
+pub mod session_notice;
 // Session-scoped single-instance claim for the desktop surfaces. A kernel
 // object on Windows, a socket in the private runtime directory on Linux —
 // anything deleting a file does not end and the OS releases when the owner dies.

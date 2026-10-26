@@ -40,7 +40,7 @@ pub struct FakeIpAssembly {
     scope: FakeIpScope,
     pool: FakeIpPoolConfig,
     /// Session `hostname → real IPs` for DIRECT hosts answered with a
-    /// fake address under the armed block-all. Shared between the direct
+    /// fake address by the collateral rescue. Shared between the direct
     /// answerer (writer) and the relay's upstream resolver (reader).
     direct_map: Arc<super::direct::DirectRealIpMap>,
     /// VPN self-heal — hostnames excluded from fake-IP at runtime because a VPN
@@ -65,6 +65,8 @@ pub struct FakeIpAssembly {
     /// addresses, swept once as each stack comes up. Inert until the boot
     /// wiring supplies an OS mechanism.
     stale_flow_reset: Arc<dyn StaleFlowReset>,
+    /// The addresses the current stack's flows are on, for the releaser.
+    live_addresses: Arc<super::binding_release::LiveFlowAddresses>,
 }
 
 impl FakeIpAssembly {
@@ -82,6 +84,7 @@ impl FakeIpAssembly {
             network_owner: None,
             vpn_bypass: Arc::new(super::vpn_client_bypass::NoVpnClientBypass),
             stale_flow_reset: Arc::new(NoopStaleFlowReset),
+            live_addresses: Arc::default(),
         }
     }
 
@@ -176,10 +179,9 @@ impl FakeIpAssembly {
         self
     }
 
-    /// The DIRECT-host answerer for the armed block-all,
-    /// sharing this assembly's allocator, scope and direct-host map. `armed`
-    /// is the same latch the [`crate::dns_resolver_ports::ReconcilingDirectAnswerGate`]
-    /// reads.
+    /// The DIRECT-host answerer of the collateral rescue, sharing this
+    /// assembly's allocator, scope and direct-host map; it claims nothing
+    /// while `armed` reads false.
     #[must_use]
     pub fn direct_answerer(
         &self,
@@ -243,6 +245,24 @@ impl FakeIpAssembly {
         .with_vpn_client_bypass(Arc::clone(&self.vpn_bypass));
         FakeIpStack::new(device, &self.pool, relay, dialer, waker)
             .with_health(Arc::clone(&self.health))
+            .with_live_flow_addresses(Arc::clone(&self.live_addresses))
+    }
+
+    /// Releases the virtual addresses of hosts `named` (a served user's rule)
+    /// no longer covers, over this assembly's map and the live-flow addresses
+    /// its stacks hand over. A host the direct-host rescue holds is kept: no
+    /// rule names it.
+    #[must_use]
+    pub fn binding_releaser(
+        &self,
+        named: Arc<dyn Fn(&str) -> bool + Send + Sync>,
+    ) -> Arc<super::binding_release::BindingReleaser> {
+        let direct = Arc::clone(&self.direct_map);
+        Arc::new(super::binding_release::BindingReleaser::new(
+            Arc::clone(&self.allocator),
+            Arc::new(move |hostname| direct.contains(hostname) || named(hostname)),
+            Arc::clone(&self.live_addresses),
+        ))
     }
 
     /// Tear down TCP connections a previous run left pointing at now-dead fake
@@ -336,6 +356,9 @@ pub struct FakeIpDatapathStatus {
 #[derive(Default)]
 pub struct FakeIpController {
     inner: Mutex<ControllerInner>,
+    /// Run on every watchdog tick, outside `inner`: its rule checks must not
+    /// hold up a start or a stop.
+    binding_releaser: Mutex<Option<Arc<super::binding_release::BindingReleaser>>>,
 }
 
 #[derive(Default)]
@@ -450,6 +473,14 @@ impl FakeIpController {
     /// answers handed out against packets actually read.
     pub fn set_health(&self, health: Arc<super::health::FakeIpHealth>) {
         self.lock().health = Some(health);
+    }
+
+    /// Release departed hosts' virtual addresses on every watchdog tick.
+    pub fn set_binding_releaser(&self, releaser: Arc<super::binding_release::BindingReleaser>) {
+        *self
+            .binding_releaser
+            .lock()
+            .unwrap_or_else(|p| p.into_inner()) = Some(releaser);
     }
 
     /// Report the stack thread's exit to `liveness`.
@@ -761,7 +792,23 @@ impl FakeIpController {
     /// Returns `true` when the stack was torn down and rebuilt this tick —
     /// the caller then re-runs the enforcement replan + OS DNS cache flush,
     /// exactly like a boot bring-up.
+    ///
+    /// Also gives departed hosts' virtual addresses back, after the wedge
+    /// check and with the controller unlocked.
     pub fn watchdog_tick(&self) -> bool {
+        let rebuilt = self.wedge_tick();
+        let releaser = self
+            .binding_releaser
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone();
+        if let Some(releaser) = releaser {
+            releaser.run_once();
+        }
+        rebuilt
+    }
+
+    fn wedge_tick(&self) -> bool {
         let mut inner = self.lock();
         Self::reap_finished(&mut inner);
         Self::log_relay_activity_delta(&mut inner);

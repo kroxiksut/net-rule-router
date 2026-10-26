@@ -270,6 +270,7 @@ pub fn write_bound_files_now(app: &mut AppState) {
             continue;
         }
         let path = PathBuf::from(path);
+        files::take_passthrough_from(&mut app.rules.table, route, &path);
         let (table, hint) = (&app.rules.table, &app.rules.file_hint);
         // Edited by hand since this program wrote it: asked about, not lost.
         if own_settings::hand_edited(file, &path) && files::route_differs(&path, route, table, hint)

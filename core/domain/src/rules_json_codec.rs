@@ -21,10 +21,10 @@
 //! kept as it came: a stored revision must keep decoding, so refusing a new one
 //! is the service's acceptance gate
 //! ([`crate::rule_value_validation::rules_with_refused_values`]).
-//! Addresses and applications are read by the pipeline's own readers, refusals
-//! included: a stored book is read through
-//! [`crate::rule_value_validation::drop_rules_refused_outright`] first, so only
-//! a new submission can still carry such a value.
+//! Addresses and applications are read by the pipeline's own readers. A rule
+//! whose value no book may apply is not a decode failure: it goes to
+//! [`RulesRevisionContent::inactive`], kept as written and never applied, so a
+//! book holding one still loads and saving it keeps the rule.
 //!
 //! ## Schema-version vs format-version
 //!
@@ -160,19 +160,25 @@ impl std::error::Error for RulesJsonCodecError {}
 /// [`CanonicalRuleSet`] — `primary` and `secondary` rules are emitted
 /// in the same sequence the domain layer iterates them.
 pub fn encode(content: &RulesRevisionContent) -> CanonicalRulesJsonV1 {
-    let route = |set: &CanonicalRuleSet, kept: &[RuleDto]| -> Vec<RuleDto> {
+    let route = |set: &CanonicalRuleSet, kept: &[RuleDto], inactive: &[RuleDto]| -> Vec<RuleDto> {
         set.rules()
             .iter()
             .map(encode_rule)
             .chain(kept.iter().cloned())
+            .chain(inactive.iter().cloned())
             .collect()
     };
     let mut dto = CanonicalRulesJsonV1 {
         schema_version: RULES_JSON_SCHEMA_VERSION,
-        primary: route(&content.rule_book.primary, &content.unrecognized.primary),
+        primary: route(
+            &content.rule_book.primary,
+            &content.unrecognized.primary,
+            &content.inactive.primary,
+        ),
         secondary: route(
             &content.rule_book.secondary,
             &content.unrecognized.secondary,
+            &content.inactive.secondary,
         ),
     };
     // A book of the older kinds keeps schema 1 and its exact bytes, so no
@@ -195,6 +201,61 @@ fn encode_rule(rule: &CanonicalRule) -> RuleDto {
         // canonical bytes and content hashes untouched.
         origin: rule.origin.clone(),
     }
+}
+
+/// A rule of a rules file as it was written, for one the pipeline left out
+/// because no book may apply its value: stored as written, never applied.
+/// `None` for a rule the pipeline reads, which takes the canonical path.
+pub(crate) fn encode_written_rule(rule: &crate::Rule) -> Option<RuleDto> {
+    use crate::AddressMatch;
+    let address_match = match &rule.address_match {
+        None => None,
+        Some(AddressMatch::ExactIp(value)) if value.contains(':') => {
+            Some(AddressMatchDto::ExactIpv6 {
+                address: value.trim().to_owned(),
+            })
+        }
+        Some(AddressMatch::ExactIp(value)) => Some(AddressMatchDto::ExactIpv4 {
+            address: value.trim().to_owned(),
+        }),
+        Some(AddressMatch::Subnet(value)) => Some(AddressMatchDto::Subnet {
+            network: value.trim().to_owned(),
+        }),
+        Some(AddressMatch::IpRange(value)) => {
+            let (first, last) = value.split_once('-')?;
+            Some(AddressMatchDto::IpRange {
+                first: first.trim().to_owned(),
+                last: last.trim().to_owned(),
+            })
+        }
+        Some(_) => return None,
+    };
+    let app_match = rule.app_match.as_ref().map(|app| {
+        let value = app.pattern.as_str().to_owned();
+        // The same reading the rules table gives a typed value.
+        let pattern = if value.contains(['\\', '/']) {
+            AppPatternDto::Path { value }
+        } else if value.contains('*') {
+            AppPatternDto::Glob { value }
+        } else {
+            AppPatternDto::Exact { value }
+        };
+        AppMatchDto {
+            pattern,
+            include_child_processes: app.include_child_processes,
+            override_requested: app.override_requested,
+        }
+    });
+    let dto = RuleDto {
+        id: rule.id.as_str().to_owned(),
+        enabled: rule.enabled,
+        address_match,
+        app_match,
+        comment: rule.comment.trim().to_owned(),
+        action: encode_action(rule.action),
+        origin: rule.origin.clone(),
+    };
+    crate::rule_value_validation::refused_outright(&dto).map(|_| dto)
 }
 
 fn encode_action(action: crate::canonical::RuleAction) -> WireRuleAction {
@@ -282,8 +343,19 @@ pub fn decode(
     }
 
     let mut unrecognized = UnrecognizedRules::default();
-    let primary = decode_route(dto.primary, platform, &mut unrecognized.primary)?;
-    let secondary = decode_route(dto.secondary, platform, &mut unrecognized.secondary)?;
+    let mut inactive = UnrecognizedRules::default();
+    let primary = decode_route(
+        dto.primary,
+        platform,
+        &mut unrecognized.primary,
+        &mut inactive.primary,
+    )?;
+    let secondary = decode_route(
+        dto.secondary,
+        platform,
+        &mut unrecognized.secondary,
+        &mut inactive.secondary,
+    )?;
 
     Ok(RulesRevisionContent {
         rule_book: CanonicalRuleBook {
@@ -292,19 +364,28 @@ pub fn decode(
         },
         format_version: RULES_REVISION_FORMAT_VERSION,
         unrecognized,
+        inactive,
     })
 }
 
-/// The route's rules this build reads; the rest go to `kept`, sorted by id so
-/// the re-encoded bytes do not depend on arrival order. A `?` that means
-/// nothing where it stands is settled as the rules file settles it.
+/// The route's rules this build reads; the rest go to `kept`, and those with a
+/// value no book may apply to `inactive`, each sorted by id so the re-encoded
+/// bytes do not depend on arrival order. A `?` that means nothing where it
+/// stands is settled as the rules file settles it.
 fn decode_route(
     rules: Vec<RuleDto>,
     platform: HostPlatform,
     kept: &mut Vec<RuleDto>,
+    inactive: &mut Vec<RuleDto>,
 ) -> Result<Vec<CanonicalRule>, RulesJsonCodecError> {
     let mut out = Vec::with_capacity(rules.len());
     for rule in rules {
+        if !rule.is_unrecognized()
+            && crate::rule_value_validation::refused_outright_on(&rule, platform).is_some()
+        {
+            inactive.push(rule);
+            continue;
+        }
         if !rule.is_unrecognized() {
             let mut decoded = decode_rule(rule, platform)?;
             settle_verify(&mut decoded);
@@ -324,6 +405,7 @@ fn decode_route(
         kept.push(rule);
     }
     kept.sort_by(|a, b| a.id.cmp(&b.id));
+    inactive.sort_by(|a, b| a.id.cmp(&b.id));
     Ok(out)
 }
 
@@ -636,17 +718,15 @@ mod tests {
             }],
             secondary: vec![],
         };
-        // Both spellings a producer can use for "everything".
+        // Both spellings a producer can use for "everything": kept as written,
+        // never applied.
         for pattern in [
             AppPatternDto::Glob { value: "*".into() },
             AppPatternDto::Exact { value: "*".into() },
         ] {
-            assert_eq!(
-                decode(dto(pattern), HostPlatform::Windows),
-                Err(RulesJsonCodecError::AppGlobTooWide {
-                    rule_id: "r-app".into()
-                })
-            );
+            let content = decode(dto(pattern), HostPlatform::Windows).expect("the book loads");
+            assert!(content.rule_book.primary.is_empty());
+            assert_eq!(content.inactive.primary.len(), 1);
         }
         // A narrower glob is still perfectly legal.
         assert!(decode(
@@ -693,19 +773,17 @@ mod tests {
             long.as_str(),
         ] {
             let verdict = crate::rule_value_validation::validate_rule_value("application", value);
+            let content = decode(dto(value), HostPlatform::Windows).expect("the book loads");
             assert_eq!(
-                decode(dto(value), HostPlatform::Windows).is_ok(),
-                !verdict.is_error(),
+                content.rule_book.primary.is_empty(),
+                verdict.is_error(),
                 "{value:?}"
             );
+            assert_eq!(
+                content.inactive.primary.len(),
+                usize::from(verdict.is_error())
+            );
         }
-        assert_eq!(
-            decode(dto(&long), HostPlatform::Windows),
-            Err(RulesJsonCodecError::AppNameInvalid {
-                rule_id: "r-app".into(),
-                raw: long.clone(),
-            })
-        );
         let source = include_str!("rules_json_codec.rs");
         let (code, _) = source.split_once("#[cfg(test)]").expect("test module");
         for own_reader in [
@@ -816,28 +894,22 @@ mod tests {
         }
     }
 
-    /// A path that names no program is the pipeline's refusal on the wire too;
-    /// an `exact` value stored before paths existed still reads as its name.
+    /// A path that names no program is kept aside on the wire too, never
+    /// applied; an `exact` value stored before paths existed still reads as
+    /// its name.
     #[test]
-    fn a_broken_path_is_refused_and_a_stored_name_keeps_its_reading() {
-        assert!(matches!(
-            decode(
+    fn a_broken_path_is_kept_aside_and_a_stored_name_keeps_its_reading() {
+        for value in [r"C:\Apps\*.exe", "C:\\Apps\\line\nbreak\\"] {
+            let content = decode(
                 app_dto(AppPatternDto::Path {
-                    value: r"C:\Apps\*.exe".into()
+                    value: value.into(),
                 }),
-                HostPlatform::Windows
-            ),
-            Err(RulesJsonCodecError::AppNameInvalid { .. })
-        ));
-        assert!(matches!(
-            decode(
-                app_dto(AppPatternDto::Path {
-                    value: "C:\\Apps\\line\nbreak\\".into()
-                }),
-                HostPlatform::Windows
-            ),
-            Err(RulesJsonCodecError::AppNameInvalid { .. })
-        ));
+                HostPlatform::Windows,
+            )
+            .expect("the book loads");
+            assert!(content.rule_book.primary.is_empty(), "{value:?}");
+            assert_eq!(content.inactive.primary.len(), 1, "{value:?}");
+        }
         let legacy = decode(
             app_dto(AppPatternDto::Exact {
                 value: r"C:\Apps\Tool.exe".into(),

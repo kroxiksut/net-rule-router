@@ -11,7 +11,7 @@
 #[test]
 fn the_v6_cut_still_lets_the_tunnel_itself_out() {
     const LUID: u64 = 0x1234_5678;
-    let out = catch_all_v6_filters("S", LUID, &[], &[], KillSwitchProtocols::ALL, false);
+    let out = catch_all_v6_filters("S", LUID, &[], &[], KillSwitchProtocols::ALL);
     for layer in [
         WfpLayerKey::AleAuthConnectV6,
         WfpLayerKey::OutboundTransportV6,
@@ -25,7 +25,7 @@ fn the_v6_cut_still_lets_the_tunnel_itself_out() {
     }
     // An unresolved tunnel has no egress to permit - and must not turn the
     // cut into a permit-everything by accident.
-    let unresolved = catch_all_v6_filters("S", 0, &[], &[], KillSwitchProtocols::ALL, false);
+    let unresolved = catch_all_v6_filters("S", 0, &[], &[], KillSwitchProtocols::ALL);
     assert!(unresolved.iter().all(|f| f.local_interface_luid.is_none()));
     assert!(unresolved.iter().any(|f| f.action == WfpAction::Block));
 }
@@ -37,7 +37,6 @@ fn the_v6_cut_still_lets_the_tunnel_itself_out() {
 /// was DOWN and stopped answering when it came up.
 #[test]
 fn the_catch_all_spares_what_its_twin_spares() {
-    let direct = Ipv4Addr::new(203, 0, 113, 40);
     let primary = Ipv4Addr::new(198, 51, 100, 50);
     let exemptions = FailClosedExemptions {
         bootstrap_server_ips: vec![Ipv4Addr::new(198, 51, 100, 9)],
@@ -49,7 +48,6 @@ fn the_catch_all_spares_what_its_twin_spares() {
         primary_dest_ips: vec![primary],
         allow_dns_over_primary: false,
         dns_servers: Vec::new(),
-        known_direct_ips: vec![direct],
         probe_target_ips: Vec::new(),
         secondary_luid: 0,
         guest_network_luids: Vec::new(),
@@ -61,12 +59,6 @@ fn the_catch_all_spares_what_its_twin_spares() {
         KillSwitchProtocols::ALL,
     );
 
-    assert!(
-        out.iter().any(|f| f.remote_ip == Some(direct)
-            && f.action == WfpAction::Permit
-            && f.layer == WfpLayerKey::AleAuthConnectV4),
-        "a known-direct host must keep its connect-layer permit",
-    );
     assert!(
         out.iter().any(|f| f.remote_ip == Some(primary)
             && f.action == WfpAction::Permit

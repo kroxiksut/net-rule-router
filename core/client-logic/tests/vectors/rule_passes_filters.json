@@ -1,27 +1,491 @@
 {
-  "description": "rules.js rulePassesFilters: which table rows the status, type, route, auto-added, Recent and search filters let through; overridden and recent are what the table answers for the row",
+  "description": "rules.js rulePassesFilters: which table rows the status, type, route, auto-added, not-working, Recent and search filters let through; overridden and recent are what the table answers for the row",
   "cases": [
-    { "name": "no filters", "input": { "item": { "id": "R-0001", "enabled": true, "ruleType": "domain", "matchValue": "a.example", "targetRoute": "primary" }, "filters": {}, "overridden": false, "recent": false }, "expected": true },
-    { "name": "enabled-only drops a disabled rule", "input": { "item": { "id": "R-0001", "enabled": false, "ruleType": "domain", "matchValue": "a.example", "targetRoute": "primary" }, "filters": { "status": "enabled-only" }, "overridden": false, "recent": false }, "expected": false },
-    { "name": "disabled-only keeps a disabled rule", "input": { "item": { "id": "R-0001", "enabled": false, "ruleType": "domain", "matchValue": "a.example", "targetRoute": "primary" }, "filters": { "status": "disabled-only" }, "overridden": false, "recent": false }, "expected": true },
-    { "name": "a warning is not an error", "input": { "item": { "id": "R-0001", "enabled": true, "ruleType": "domain", "matchValue": "a.example", "targetRoute": "primary", "validationStatus": "warning" }, "filters": { "status": "with-errors" }, "overridden": false, "recent": false }, "expected": false },
-    { "name": "with-errors keeps a refused value", "input": { "item": { "id": "R-0001", "enabled": true, "ruleType": "domain", "matchValue": "bad value", "targetRoute": "primary", "validationStatus": "error" }, "filters": { "status": "with-errors" }, "overridden": false, "recent": false }, "expected": true },
-    { "name": "overridden asks the table", "input": { "item": { "id": "R-0001", "enabled": true, "ruleType": "application", "matchValue": "svchost.exe", "targetRoute": "secondary" }, "filters": { "status": "overridden" }, "overridden": true, "recent": false }, "expected": true },
-    { "name": "overridden drops a plain rule", "input": { "item": { "id": "R-0001", "enabled": true, "ruleType": "application", "matchValue": "svchost.exe", "targetRoute": "secondary" }, "filters": { "status": "overridden" }, "overridden": false, "recent": false }, "expected": false },
-    { "name": "type folds the spelling", "input": { "item": { "id": "R-0001", "enabled": true, "ruleType": "suffix-domain", "matchValue": "*.a.example", "targetRoute": "primary" }, "filters": { "type": "domain" }, "overridden": false, "recent": false }, "expected": true },
-    { "name": "type other", "input": { "item": { "id": "R-0001", "enabled": true, "ruleType": "domain", "matchValue": "a.example", "targetRoute": "primary" }, "filters": { "type": "zone" }, "overridden": false, "recent": false }, "expected": false },
-    { "name": "route block keeps a block", "input": { "item": { "id": "R-0001", "enabled": true, "ruleType": "domain", "matchValue": "a.example", "targetRoute": "block" }, "filters": { "route": "block" }, "overridden": false, "recent": false }, "expected": true },
-    { "name": "route secondary drops a block", "input": { "item": { "id": "R-0001", "enabled": true, "ruleType": "domain", "matchValue": "a.example", "targetRoute": "block" }, "filters": { "route": "secondary" }, "overridden": false, "recent": false }, "expected": false },
-    { "name": "unsure keeps a verify rule", "input": { "item": { "id": "R-0001", "enabled": true, "ruleType": "domain", "matchValue": "a.example", "targetRoute": "primary", "verify": true }, "filters": { "route": "unsure" }, "overridden": false, "recent": false }, "expected": true },
-    { "name": "unsure drops a block that still carries the flag", "input": { "item": { "id": "R-0001", "enabled": true, "ruleType": "domain", "matchValue": "a.example", "targetRoute": "block", "verify": true }, "filters": { "route": "unsure" }, "overridden": false, "recent": false }, "expected": false },
-    { "name": "auto-only drops a typed rule", "input": { "item": { "id": "R-0001", "enabled": true, "ruleType": "domain", "matchValue": "a.example", "targetRoute": "primary", "originReason": "" }, "filters": { "autoOnly": true }, "overridden": false, "recent": false }, "expected": false },
-    { "name": "auto-only keeps an authored rule", "input": { "item": { "id": "R-0001", "enabled": true, "ruleType": "domain", "matchValue": "a.example", "targetRoute": "primary", "originReason": "collateral", "originAnchor": "b.example", "originAdded": "2026-01-02" }, "filters": { "autoOnly": true }, "overridden": false, "recent": false }, "expected": true },
-    { "name": "recent asks the table", "input": { "item": { "id": "R-0001", "enabled": true, "ruleType": "domain", "matchValue": "a.example", "targetRoute": "primary" }, "filters": { "recentOnly": true }, "overridden": false, "recent": false }, "expected": false },
-    { "name": "search finds the ace form", "input": { "item": { "id": "R-0001", "enabled": true, "ruleType": "domain", "matchValue": "пример.рф", "aceMatchValue": "xn--e1afmkfd.xn--p1ai", "targetRoute": "primary" }, "filters": { "search": "XN--P1AI" }, "overridden": false, "recent": false }, "expected": true },
-    { "name": "search cleans a url", "input": { "item": { "id": "R-0001", "enabled": true, "ruleType": "domain", "matchValue": "пример.рф", "targetRoute": "primary" }, "filters": { "search": "https://пример.рф/page" }, "overridden": false, "recent": false }, "expected": true },
-    { "name": "search finds the comment", "input": { "item": { "id": "R-0001", "enabled": true, "ruleType": "domain", "matchValue": "a.example", "targetRoute": "primary", "comment": "Work Site" }, "filters": { "search": "work" }, "overridden": false, "recent": false }, "expected": true },
-    { "name": "search misses", "input": { "item": { "id": "R-0001", "enabled": true, "ruleType": "domain", "matchValue": "a.example", "targetRoute": "primary" }, "filters": { "search": "other" }, "overridden": false, "recent": false }, "expected": false },
-    { "name": "bare punctuation is searched as typed", "input": { "item": { "id": "R-0001", "enabled": true, "ruleType": "subnet", "matchValue": "192.0.2.0/24", "targetRoute": "secondary" }, "filters": { "search": "/24" }, "overridden": false, "recent": false }, "expected": true },
-    { "name": "every filter at once", "input": { "item": { "id": "R-0001", "enabled": true, "ruleType": "exact-ipv4", "matchValue": "203.0.113.7", "targetRoute": "secondary", "originReason": "collateral", "originAnchor": "b.example", "originAdded": "2026-01-02" }, "filters": { "status": "enabled-only", "type": "exact-ip", "route": "secondary", "autoOnly": true, "recentOnly": true, "search": "113" }, "overridden": false, "recent": true }, "expected": true }
+    {
+      "name": "no filters",
+      "input": {
+        "item": {
+          "id": "R-0001",
+          "enabled": true,
+          "ruleType": "domain",
+          "matchValue": "a.example",
+          "targetRoute": "primary"
+        },
+        "filters": {},
+        "overridden": false,
+        "recent": false
+      },
+      "expected": true
+    },
+    {
+      "name": "enabled-only drops a disabled rule",
+      "input": {
+        "item": {
+          "id": "R-0001",
+          "enabled": false,
+          "ruleType": "domain",
+          "matchValue": "a.example",
+          "targetRoute": "primary"
+        },
+        "filters": {
+          "status": "enabled-only"
+        },
+        "overridden": false,
+        "recent": false
+      },
+      "expected": false
+    },
+    {
+      "name": "disabled-only keeps a disabled rule",
+      "input": {
+        "item": {
+          "id": "R-0001",
+          "enabled": false,
+          "ruleType": "domain",
+          "matchValue": "a.example",
+          "targetRoute": "primary"
+        },
+        "filters": {
+          "status": "disabled-only"
+        },
+        "overridden": false,
+        "recent": false
+      },
+      "expected": true
+    },
+    {
+      "name": "a warning is not an error",
+      "input": {
+        "item": {
+          "id": "R-0001",
+          "enabled": true,
+          "ruleType": "domain",
+          "matchValue": "a.example",
+          "targetRoute": "primary",
+          "validationStatus": "warning"
+        },
+        "filters": {
+          "status": "with-errors"
+        },
+        "overridden": false,
+        "recent": false
+      },
+      "expected": false
+    },
+    {
+      "name": "with-errors keeps a refused value",
+      "input": {
+        "item": {
+          "id": "R-0001",
+          "enabled": true,
+          "ruleType": "domain",
+          "matchValue": "bad value",
+          "targetRoute": "primary",
+          "validationStatus": "error"
+        },
+        "filters": {
+          "status": "with-errors"
+        },
+        "overridden": false,
+        "recent": false
+      },
+      "expected": true
+    },
+    {
+      "name": "overridden asks the table",
+      "input": {
+        "item": {
+          "id": "R-0001",
+          "enabled": true,
+          "ruleType": "application",
+          "matchValue": "svchost.exe",
+          "targetRoute": "secondary"
+        },
+        "filters": {
+          "status": "overridden"
+        },
+        "overridden": true,
+        "recent": false
+      },
+      "expected": true
+    },
+    {
+      "name": "overridden drops a plain rule",
+      "input": {
+        "item": {
+          "id": "R-0001",
+          "enabled": true,
+          "ruleType": "application",
+          "matchValue": "svchost.exe",
+          "targetRoute": "secondary"
+        },
+        "filters": {
+          "status": "overridden"
+        },
+        "overridden": false,
+        "recent": false
+      },
+      "expected": false
+    },
+    {
+      "name": "type folds the spelling",
+      "input": {
+        "item": {
+          "id": "R-0001",
+          "enabled": true,
+          "ruleType": "suffix-domain",
+          "matchValue": "*.a.example",
+          "targetRoute": "primary"
+        },
+        "filters": {
+          "type": "domain"
+        },
+        "overridden": false,
+        "recent": false
+      },
+      "expected": true
+    },
+    {
+      "name": "type other",
+      "input": {
+        "item": {
+          "id": "R-0001",
+          "enabled": true,
+          "ruleType": "domain",
+          "matchValue": "a.example",
+          "targetRoute": "primary"
+        },
+        "filters": {
+          "type": "zone"
+        },
+        "overridden": false,
+        "recent": false
+      },
+      "expected": false
+    },
+    {
+      "name": "route block keeps a block",
+      "input": {
+        "item": {
+          "id": "R-0001",
+          "enabled": true,
+          "ruleType": "domain",
+          "matchValue": "a.example",
+          "targetRoute": "block"
+        },
+        "filters": {
+          "route": "block"
+        },
+        "overridden": false,
+        "recent": false
+      },
+      "expected": true
+    },
+    {
+      "name": "route secondary drops a block",
+      "input": {
+        "item": {
+          "id": "R-0001",
+          "enabled": true,
+          "ruleType": "domain",
+          "matchValue": "a.example",
+          "targetRoute": "block"
+        },
+        "filters": {
+          "route": "secondary"
+        },
+        "overridden": false,
+        "recent": false
+      },
+      "expected": false
+    },
+    {
+      "name": "unsure keeps a verify rule",
+      "input": {
+        "item": {
+          "id": "R-0001",
+          "enabled": true,
+          "ruleType": "domain",
+          "matchValue": "a.example",
+          "targetRoute": "primary",
+          "verify": true
+        },
+        "filters": {
+          "route": "unsure"
+        },
+        "overridden": false,
+        "recent": false
+      },
+      "expected": true
+    },
+    {
+      "name": "unsure drops a block that still carries the flag",
+      "input": {
+        "item": {
+          "id": "R-0001",
+          "enabled": true,
+          "ruleType": "domain",
+          "matchValue": "a.example",
+          "targetRoute": "block",
+          "verify": true
+        },
+        "filters": {
+          "route": "unsure"
+        },
+        "overridden": false,
+        "recent": false
+      },
+      "expected": false
+    },
+    {
+      "name": "auto-only drops a typed rule",
+      "input": {
+        "item": {
+          "id": "R-0001",
+          "enabled": true,
+          "ruleType": "domain",
+          "matchValue": "a.example",
+          "targetRoute": "primary",
+          "originReason": ""
+        },
+        "filters": {
+          "autoOnly": true
+        },
+        "overridden": false,
+        "recent": false
+      },
+      "expected": false
+    },
+    {
+      "name": "auto-only keeps an authored rule",
+      "input": {
+        "item": {
+          "id": "R-0001",
+          "enabled": true,
+          "ruleType": "domain",
+          "matchValue": "a.example",
+          "targetRoute": "primary",
+          "originReason": "collateral",
+          "originAnchor": "b.example",
+          "originAdded": "2026-01-02"
+        },
+        "filters": {
+          "autoOnly": true
+        },
+        "overridden": false,
+        "recent": false
+      },
+      "expected": true
+    },
+    {
+      "name": "recent asks the table",
+      "input": {
+        "item": {
+          "id": "R-0001",
+          "enabled": true,
+          "ruleType": "domain",
+          "matchValue": "a.example",
+          "targetRoute": "primary"
+        },
+        "filters": {
+          "recentOnly": true
+        },
+        "overridden": false,
+        "recent": false
+      },
+      "expected": false
+    },
+    {
+      "name": "search finds the ace form",
+      "input": {
+        "item": {
+          "id": "R-0001",
+          "enabled": true,
+          "ruleType": "domain",
+          "matchValue": "пример.рф",
+          "aceMatchValue": "xn--e1afmkfd.xn--p1ai",
+          "targetRoute": "primary"
+        },
+        "filters": {
+          "search": "XN--P1AI"
+        },
+        "overridden": false,
+        "recent": false
+      },
+      "expected": true
+    },
+    {
+      "name": "search cleans a url",
+      "input": {
+        "item": {
+          "id": "R-0001",
+          "enabled": true,
+          "ruleType": "domain",
+          "matchValue": "пример.рф",
+          "targetRoute": "primary"
+        },
+        "filters": {
+          "search": "https://пример.рф/page"
+        },
+        "overridden": false,
+        "recent": false
+      },
+      "expected": true
+    },
+    {
+      "name": "search finds the comment",
+      "input": {
+        "item": {
+          "id": "R-0001",
+          "enabled": true,
+          "ruleType": "domain",
+          "matchValue": "a.example",
+          "targetRoute": "primary",
+          "comment": "Work Site"
+        },
+        "filters": {
+          "search": "work"
+        },
+        "overridden": false,
+        "recent": false
+      },
+      "expected": true
+    },
+    {
+      "name": "search misses",
+      "input": {
+        "item": {
+          "id": "R-0001",
+          "enabled": true,
+          "ruleType": "domain",
+          "matchValue": "a.example",
+          "targetRoute": "primary"
+        },
+        "filters": {
+          "search": "other"
+        },
+        "overridden": false,
+        "recent": false
+      },
+      "expected": false
+    },
+    {
+      "name": "bare punctuation is searched as typed",
+      "input": {
+        "item": {
+          "id": "R-0001",
+          "enabled": true,
+          "ruleType": "subnet",
+          "matchValue": "192.0.2.0/24",
+          "targetRoute": "secondary"
+        },
+        "filters": {
+          "search": "/24"
+        },
+        "overridden": false,
+        "recent": false
+      },
+      "expected": true
+    },
+    {
+      "name": "every filter at once",
+      "input": {
+        "item": {
+          "id": "R-0001",
+          "enabled": true,
+          "ruleType": "exact-ipv4",
+          "matchValue": "203.0.113.7",
+          "targetRoute": "secondary",
+          "originReason": "collateral",
+          "originAnchor": "b.example",
+          "originAdded": "2026-01-02"
+        },
+        "filters": {
+          "status": "enabled-only",
+          "type": "exact-ip",
+          "route": "secondary",
+          "autoOnly": true,
+          "recentOnly": true,
+          "search": "113"
+        },
+        "overridden": false,
+        "recent": true
+      },
+      "expected": true
+    },
+    {
+      "name": "a rule that does not work is shown by default",
+      "input": {
+        "item": {
+          "id": "R-0001",
+          "enabled": true,
+          "ruleType": "exact-ip",
+          "matchValue": "255.255.255.255",
+          "targetRoute": "primary",
+          "validationStatus": "error"
+        },
+        "filters": {},
+        "overridden": false,
+        "recent": false
+      },
+      "expected": true
+    },
+    {
+      "name": "hiding the rules that do not work hides a refused value",
+      "input": {
+        "item": {
+          "id": "R-0001",
+          "enabled": true,
+          "ruleType": "exact-ip",
+          "matchValue": "255.255.255.255",
+          "targetRoute": "primary",
+          "validationStatus": "error"
+        },
+        "filters": {
+          "hideNotWorking": true
+        },
+        "overridden": false,
+        "recent": false
+      },
+      "expected": false
+    },
+    {
+      "name": "hiding the rules that do not work keeps a working one",
+      "input": {
+        "item": {
+          "id": "R-0002",
+          "enabled": true,
+          "ruleType": "domain",
+          "matchValue": "a.example",
+          "targetRoute": "primary"
+        },
+        "filters": {
+          "hideNotWorking": true
+        },
+        "overridden": false,
+        "recent": false
+      },
+      "expected": true
+    },
+    {
+      "name": "asking for the errors shows them even while they are hidden",
+      "input": {
+        "item": {
+          "id": "R-0001",
+          "enabled": true,
+          "ruleType": "exact-ip",
+          "matchValue": "255.255.255.255",
+          "targetRoute": "primary",
+          "validationStatus": "error"
+        },
+        "filters": {
+          "hideNotWorking": true,
+          "status": "with-errors"
+        },
+        "overridden": false,
+        "recent": false
+      },
+      "expected": true
+    }
   ]
 }

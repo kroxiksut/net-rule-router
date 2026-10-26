@@ -989,6 +989,59 @@ fn hostile_trace() -> FakeService {
     fake
 }
 
+/// A program on the additional route has its first connection to a new
+/// address held while the address is learned. Shown as a block beside the
+/// success, the user reads "it works but gets blocked"; a hold nothing
+/// followed is a real block and stays one.
+#[test]
+fn a_held_first_connection_reads_as_the_one_that_went_through() {
+    let held = |process: &str, at: i64| {
+        let mut row = trace_row(process, "160.79.104.10:443", "primary", "block", &[]);
+        row["block_reason"] = json!("route-unavailable");
+        row["observed_at_ms"] = json!(at);
+        row
+    };
+    let mut routed = trace_row(
+        "claude.exe",
+        "160.79.104.10:443",
+        "secondary",
+        "permit",
+        &[],
+    );
+    routed["observed_at_ms"] = json!(NOON + 3_000);
+    let fake = service();
+    fake.answer(
+        IpcOperationName::ConnTraceEntriesList,
+        json!({
+            "page": {
+                "items": [routed, held("claude.exe", NOON), held("other.exe", NOON)],
+                "next_cursor": null,
+                "total_count": 3,
+                "stale": false
+            },
+            "redacted": false,
+            "observer-active": true,
+            "gui-stream-enabled": true
+        }),
+    );
+    let mut app = connected();
+    open(&mut app, &fake, ScreenId::Trace);
+    key(&mut app, KeyCode::Tab);
+    key(&mut app, KeyCode::Char('b'));
+    let picture = render(&app, 140, 40);
+    assert!(picture.contains("Shown: 2 of 2."), "{picture}");
+    assert_eq!(
+        picture.matches("Blocked (NetRuleRouter)").count(),
+        1,
+        "only the hold nothing followed stays a block:\n{picture}"
+    );
+    assert!(picture.contains("other.exe"), "{picture}");
+    assert!(
+        picture.contains("First connection held at"),
+        "the routed row says it was held first:\n{picture}"
+    );
+}
+
 #[test]
 fn a_hostile_process_name_is_shown_with_dots_and_never_reaches_the_terminal() {
     use nrr_shared::display_text::needs_substitute;
@@ -1319,6 +1372,66 @@ fn check_site_from_the_trace_follows_the_check_to_its_verdict() {
     );
 }
 
+/// Diagnostics after a check of `site.example` that ended in `verdict`.
+fn checked_site(verdict: &str) -> (AppState, FakeService) {
+    let fake = service();
+    fake.answer(
+        IpcOperationName::SiteCheckRun,
+        json!({ "state": "running", "host": "site.example" }),
+    );
+    fake.answer(
+        IpcOperationName::SiteCheckResultGet,
+        json!({
+            "state": "done",
+            "host": "site.example",
+            "report": {
+                "site": "site.example",
+                "verdict": verdict,
+                "site-route": "primary",
+                "names": [
+                    { "name": "site.example", "role": "site", "address": "203.0.113.1",
+                      "route": "primary", "answer": "silent" }
+                ]
+            }
+        }),
+    );
+    let mut app = connected();
+    open(&mut app, &fake, ScreenId::Diagnostics);
+    super::diagnostics::check_site(&mut app, "site.example");
+    settle(&mut app, &fake);
+    for (_, job) in app.outbox.take_delayed() {
+        (job(&fake).0)(&mut app);
+    }
+    (app, fake)
+}
+
+/// A site that does not answer over its route leads on to the trace, where
+/// its connections show what happened; a verdict that does not, does not.
+#[test]
+fn a_site_that_does_not_answer_leads_on_to_the_trace() {
+    for verdict in ["not-answering", "route-down"] {
+        let (mut app, _fake) = checked_site(verdict);
+        let text: Vec<String> = super::site_check::lines(&app, &texts_en(), None)
+            .iter()
+            .map(|l| l.plain_text())
+            .collect();
+        assert!(
+            text.iter()
+                .any(|l| l.starts_with("t: open the connection trace")),
+            "{verdict}: {text:?}"
+        );
+        key(&mut app, KeyCode::Char('t'));
+        assert_eq!(app.screen, ScreenId::Trace, "{verdict}");
+    }
+    let (mut app, _fake) = checked_site("fine");
+    key(&mut app, KeyCode::Char('t'));
+    assert_eq!(
+        app.screen,
+        ScreenId::Diagnostics,
+        "a fine site has no trace step"
+    );
+}
+
 fn diagnostics_with_tamper(card: Value) -> String {
     let fake = service();
     let mut status = diagnostics_status();
@@ -1394,4 +1507,161 @@ fn a_health_warning_from_the_service_is_listed_and_a_clean_one_is_not() {
     assert_eq!(warned.len(), 1);
     assert!(warned[0].segments[0].text.contains("protection was off"));
     assert!(super::diagnostics::health_warning_lines(&health(Vec::new())).is_empty());
+}
+
+/// The archive is exported with the options on screen: standard detail and
+/// this session's logs from its local midnight unless the user changes them,
+/// and the log size limit only once one is picked.
+#[test]
+fn the_archive_is_exported_with_the_options_chosen() {
+    let fake = service();
+    let mut app = connected();
+    open(&mut app, &fake, ScreenId::Diagnostics);
+    let text = view_text(&app, ScreenId::Diagnostics);
+    assert!(
+        text.contains("Detail level: Standard (recommended)"),
+        "{text}"
+    );
+    assert!(
+        text.contains("Only logs from the current session: Yes"),
+        "{text}"
+    );
+    assert!(
+        text.contains("Log size limit in the archive: Unlimited"),
+        "{text}"
+    );
+
+    key(&mut app, KeyCode::Char('x'));
+    settle(&mut app, &fake);
+    let sent = fake.sent(IpcOperationName::DiagnosticsExportArchive);
+    assert_eq!(sent[0]["redaction-level"], json!("standard"), "{sent:?}");
+    assert!(sent[0].get("raw-log-budget-bytes").is_none(), "{sent:?}");
+    let session_start = app.inspect.diag.session_start_ms;
+    let from = sent[0]["logs-from-ms"]
+        .as_i64()
+        .expect("this session's logs");
+    assert!(
+        from <= session_start && session_start - from < 86_400_000 + 3_600_000,
+        "{from} for a session that started at {session_start}"
+    );
+
+    key(&mut app, KeyCode::Char('d'));
+    key(&mut app, KeyCode::Char('o'));
+    key(&mut app, KeyCode::Char('b'));
+    let text = view_text(&app, ScreenId::Diagnostics);
+    assert!(text.contains("Detail level: Full diagnostics"), "{text}");
+    assert!(
+        text.contains("Only logs from the current session: No"),
+        "{text}"
+    );
+    assert!(
+        text.contains("Log size limit in the archive: 24 MiB"),
+        "{text}"
+    );
+    key(&mut app, KeyCode::Char('x'));
+    settle(&mut app, &fake);
+    let sent = fake.sent(IpcOperationName::DiagnosticsExportArchive);
+    assert_eq!(sent[1]["redaction-level"], json!("diagnostics"), "{sent:?}");
+    assert!(
+        sent[1]["logs-from-ms"].is_null(),
+        "the whole history: {sent:?}"
+    );
+    assert_eq!(
+        sent[1]["raw-log-budget-bytes"],
+        json!(24 * 1024 * 1024),
+        "{sent:?}"
+    );
+}
+
+/// The category typed is the one the service is asked to keep, and clearing
+/// it asks for every category again.
+#[test]
+fn a_log_category_filter_asks_only_for_that_category() {
+    let fake = service();
+    transcript_with(&fake, &["9", "l", "c service", "c"]);
+    let sent = fake.sent(IpcOperationName::LogsList);
+    let categories: Vec<&serde_json::Value> =
+        sent.iter().map(|s| &s["filter"]["category"]).collect();
+    assert_eq!(
+        categories,
+        [&json!(null), &json!("service"), &json!(null)],
+        "{sent:?}"
+    );
+}
+
+/// The log reads newest first; another column orders the rows by it, and a
+/// reversal turns that order round, as the window's header clicks do.
+#[test]
+fn the_log_and_the_audit_trail_sort_by_the_column_chosen() {
+    let fake = service();
+    let mut app = connected();
+    open(&mut app, &fake, ScreenId::Diagnostics);
+    key(&mut app, KeyCode::Char('l'));
+    settle(&mut app, &fake);
+    let order = |app: &AppState| {
+        let text = view_text(app, ScreenId::Diagnostics);
+        let dns = text.find("DNS refresh").expect("dns row");
+        let slow = text.find("Apply took long").expect("slow row");
+        (dns < slow, text)
+    };
+    let (dns_first, text) = order(&app);
+    assert!(dns_first, "newest first: {text}");
+    assert!(text.contains("Sorted by Time, descending"), "{text}");
+
+    key(&mut app, KeyCode::Char('o'));
+    let (dns_first, text) = order(&app);
+    assert!(text.contains("Sorted by Level, ascending"), "{text}");
+    assert!(dns_first, "info before warn: {text}");
+    key(&mut app, KeyCode::Char('d'));
+    let (dns_first, text) = order(&app);
+    assert!(!dns_first, "warn before info: {text}");
+
+    key(&mut app, KeyCode::Char('l'));
+    settle(&mut app, &fake);
+    let text = view_text(&app, ScreenId::Diagnostics);
+    assert!(text.contains("Sorted by Seq, descending"), "{text}");
+    assert!(
+        text.find("#8").expect("seq 8") < text.find("#7").expect("seq 7"),
+        "{text}"
+    );
+    key(&mut app, KeyCode::Char('d'));
+    let text = view_text(&app, ScreenId::Diagnostics);
+    assert!(
+        text.find("#7").expect("seq 7") < text.find("#8").expect("seq 8"),
+        "{text}"
+    );
+}
+
+/// Which logs and how much the archive takes outlive the run; a raised detail
+/// level does not, so a later archive never carries more than standard detail
+/// unless asked for again.
+#[test]
+fn archive_options_are_kept_but_the_detail_level_starts_standard_again() {
+    let dir = crate::testing::Scratch::new("archive-options-kept");
+    let path = dir.path().join("tui.json");
+    let fake = service();
+    let mut app = connected();
+    app.settings.prefs_path = Some(path.clone());
+    open(&mut app, &fake, ScreenId::Diagnostics);
+    key(&mut app, KeyCode::Char('d'));
+    key(&mut app, KeyCode::Char('o'));
+    key(&mut app, KeyCode::Char('b'));
+
+    let mut next = connected();
+    next.settings.prefs = crate::screens::settings::prefs::load(&path);
+    crate::screens::inspect::diagnostics::restore_archive_options(&mut next);
+    open(&mut next, &fake, ScreenId::Diagnostics);
+    let text = view_text(&next, ScreenId::Diagnostics);
+    assert!(
+        text.contains("Detail level: Standard (recommended)"),
+        "{text}"
+    );
+    assert!(
+        text.contains("Only logs from the current session: No"),
+        "{text}"
+    );
+    assert!(
+        text.contains("Log size limit in the archive: 24 MiB"),
+        "{text}"
+    );
 }

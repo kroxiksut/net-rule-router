@@ -36,6 +36,74 @@ fn compute_records_unresolved_app_rules_into_status() {
     );
 }
 
+/// The program is installed and was seen, but its only address belongs to a
+/// main-link rule: the banner must say "found, not routed" with why, not list
+/// it among programs not on this machine.
+#[test]
+fn compute_tells_a_found_but_unrouted_app_apart_from_a_missing_one() {
+    let api = Arc::new(MockWindowsApi::new());
+    let session = Arc::new(WfpSession::open(Arc::clone(&api) as Arc<dyn WindowsApiPort>).unwrap());
+    let source = Arc::new(ScriptedSource::default());
+    source.set("S-1-5-21-APP", snap_full("Wi-Fi", "TAP"));
+    let named = Ipv4Addr::new(203, 0, 113, 10);
+    let app = |id: &str, exe: &str| CanonicalRule {
+        id: RuleId(id.into()),
+        enabled: true,
+        address_match: None,
+        app_match: Some(nrr_domain::canonical::CanonicalAppMatch {
+            pattern: nrr_domain::canonical::CanonicalAppPattern::Exact(exe.into()),
+            include_child_processes: false,
+            override_requested: false,
+        }),
+        comment: String::new(),
+        action: nrr_domain::RuleAction::Route,
+        origin: None,
+    };
+    let rules = Arc::new(ScriptedRules::default());
+    rules.set(ActiveRulesSnapshot {
+        rule_book: CanonicalRuleBook {
+            primary: CanonicalRuleSet::from_rules(vec![primary_ip_rule("r-main", named)]),
+            secondary: CanonicalRuleSet::from_rules(vec![
+                app("r-app", "helper.exe"),
+                app("r-gone", "ghost.exe"),
+            ]),
+        },
+    });
+    let observations = crate::app_observation_lookup::MockAppObservationLookup::new();
+    observations.set_ips("helper.exe", vec![named]);
+    observations.set_ips("ghost.exe", vec![named]);
+    let resolver = nrr_platform_api::MockAppPathResolver::new().with(
+        "helper.exe",
+        vec![std::path::PathBuf::from(r"C:\Apps\helper.exe")],
+    );
+    let cache: Arc<dyn FqdnCacheLookup> = Arc::new(MockFqdnCacheLookup::new());
+    let audit = Arc::new(CollectAudit::default());
+    let status = crate::app_enforcement_status::AppEnforcementStatus::new();
+    let orch = PerSidApplyOrchestrator::new(
+        session,
+        Arc::clone(&source) as Arc<dyn RoutePolicySource>,
+        Arc::clone(&rules) as Arc<dyn RulesProvider>,
+        cache,
+        Arc::clone(&audit) as Arc<dyn PerSidApplyAudit>,
+    )
+    .with_app_resolver(Arc::new(resolver))
+    .with_app_observations(Arc::new(observations))
+    .with_app_enforcement_status(status.clone());
+
+    orch.compute_filters_for_sid("S-1-5-21-APP", true, None, ComputeIntent::Apply)
+        .unwrap();
+
+    assert_eq!(status.unresolved("S-1-5-21-APP"), vec!["ghost.exe"]);
+    assert_eq!(
+        status.unrouted("S-1-5-21-APP"),
+        [(
+            "helper.exe".to_string(),
+            "addresses-named-by-rules".to_string()
+        )]
+        .into()
+    );
+}
+
 #[test]
 fn doh_lockdown_emits_blocks_when_enabled_and_in_scope() {
     use nrr_storage::doh_lockdown::DohLockdownScope;

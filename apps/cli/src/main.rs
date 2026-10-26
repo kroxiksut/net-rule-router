@@ -165,10 +165,17 @@ fn run(command: Command, ctx: &Ctx<'_>) -> u8 {
                         "  crash recovery:    {}",
                         yes_no(report.recovery_configured)
                     );
+                    // An install over a live registration secures the tree it
+                    // finds and creates nothing.
+                    let found = if report.data_dirs_created.is_empty() {
+                        "found"
+                    } else {
+                        "created"
+                    };
                     match report.acl_applied {
-                        Some(true) => println!("  data directory:    created and locked down"),
+                        Some(true) => println!("  data directory:    {found} and locked down"),
                         Some(false) => println!(
-                            "  data directory:    created, but permissions could not be tightened"
+                            "  data directory:    {found}, but permissions could not be tightened"
                         ),
                         None => println!("  data directory:    left as it was"),
                     }

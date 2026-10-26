@@ -857,9 +857,13 @@ fn slice9_plan_report_matches_current_codegen_diagnostics() {
     let mut codegen_apps: Vec<String> = Vec::new();
     let mut codegen_hosts: Vec<String> = Vec::new();
     let mut codegen_claimed: Vec<(String, Ipv4Addr)> = Vec::new();
+    let mut codegen_unrouted = Vec::new();
     for diag in &current.diagnostics {
         match diag {
             CodegenDiagnostic::AppUnresolved { app, .. } => codegen_apps.push(app.clone()),
+            CodegenDiagnostic::AppTrafficTakenElsewhere { app, reason, .. } => {
+                codegen_unrouted.push((app.clone(), *reason))
+            }
             CodegenDiagnostic::HostnameUnresolved { hostname, .. } => {
                 codegen_hosts.push(hostname.clone())
             }
@@ -899,6 +903,19 @@ fn slice9_plan_report_matches_current_codegen_diagnostics() {
     assert_eq!(
         codegen_claimed,
         vec![("known.exe".to_string(), Ipv4Addr::new(203, 0, 113, 9))]
+    );
+    // Found, but its only address belongs to the main link's rule: both
+    // planners say the rule carries nothing, and the missing app is not that.
+    assert_eq!(
+        report.unrouted_apps, codegen_unrouted,
+        "a found program whose rule carries none of its traffic"
+    );
+    assert_eq!(
+        codegen_unrouted,
+        vec![(
+            "known.exe".to_string(),
+            crate::address_ownership::AppTrafficElsewhere::NamedByAddressRules
+        )]
     );
 }
 
@@ -1538,8 +1555,6 @@ fn slice4d_fail_closed_and_app_kill_switch_match_current_codegen() {
             Ipv4Addr::new(203, 0, 113, 50),
             Ipv4Addr::new(203, 0, 113, 51),
         ];
-        // Known-direct exemptions ride the same parity check.
-        let directs = [Ipv4Addr::new(203, 0, 113, 68)];
         // The liveness-probe target (tunnel next-hop) rides the
         // same parity check as every other exemption.
         let probes = [Ipv4Addr::new(10, 91, 192, 1)];
@@ -1555,7 +1570,6 @@ fn slice4d_fail_closed_and_app_kill_switch_match_current_codegen() {
                 primary_dest_ips: primaries.to_vec(),
                 allow_dns_over_primary: allow_dns,
                 dns_servers: dns.iter().copied().map(IpAddr::V4).collect(),
-                known_direct_ips: directs.to_vec(),
                 probe_target_ips: probes.to_vec(),
                 secondary_luid: 0,
                 guest_network_luids: Vec::new(),
@@ -1568,7 +1582,7 @@ fn slice4d_fail_closed_and_app_kill_switch_match_current_codegen() {
                     &probes,
                     &subnets,
                     &primaries,
-                    &directs,
+                    &[],
                     Ipv6Exemptions::default(),
                     allow_dns,
                     &dns,
@@ -1578,6 +1592,113 @@ fn slice4d_fail_closed_and_app_kill_switch_match_current_codegen() {
             );
             assert_equiv(&cur, &low, "fail-closed-block-all");
         }
+    }
+}
+
+/// With application rules taking all their addresses, a pinned app's block
+/// outranks the main-link rule permits: the app reaches a main-named address
+/// only through the tunnel, and not at all while it is down. The neutral plan
+/// must say so, or the neutral path would hand that address back to the app
+/// directly. Off, both keep the block below those permits, as before. A
+/// main-link permit sits in both sets: only against it does the band show.
+#[cfg(windows)]
+#[test]
+fn the_takeover_setting_raises_the_app_block_over_main_rules_in_the_neutral_plan_too() {
+    use crate::killswitch_codegen::{app_kill_switch_filters_for, fail_closed_block_apps_for};
+    use nrr_platform_api::enforcement::EnforcementPlan;
+    use nrr_platform_api::types::{WfpAction, WfpFilterId, WfpFilterSpec, WfpLayerKey};
+    use nrr_platform_api::wfp_behavioral::{arbitration_order_preserved, behaviorally_equivalent};
+    use nrr_platform_windows::lower_windows::lower_kill_switch;
+
+    let sid = "S-1-5-21-1-2-3-1001";
+    let luid = 0x0001_0000_0000_0007_u64;
+    let apps = vec![r"C:\VMs\VirtualBoxVM.exe".to_string(), "*game*".to_string()];
+    let main_permit = |layer, remote_ip, remote_subnet_v6| WfpFilterSpec {
+        layer,
+        action: WfpAction::Permit,
+        remote_ip,
+        remote_ip_set: Vec::new(),
+        remote_ip_set_v6: Vec::new(),
+        remote_port: None,
+        weight: crate::wfp_bands::BASE_PRIMARY,
+        id: WfpFilterId::from_raw(7),
+        user_sid: Some(sid.to_string()),
+        app_pattern: None,
+        local_interface_luid: None,
+        remote_subnet: None,
+        remote_subnet_v6,
+        ip_protocol: None,
+        remote_subnet_set: Vec::new(),
+    };
+    let main_named = [
+        main_permit(
+            WfpLayerKey::AleAuthConnectV4,
+            Some(Ipv4Addr::new(203, 0, 113, 5)),
+            None,
+        ),
+        main_permit(
+            WfpLayerKey::AleAuthConnectV6,
+            None,
+            Some((Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 5), 128)),
+        ),
+    ];
+    let with_main = |mut filters: Vec<WfpFilterSpec>| {
+        filters.extend(main_named.iter().cloned());
+        filters
+    };
+    let plan = |flows: Vec<FlowRule>| EnforcementPlan {
+        principal: nrr_platform_api::enforcement::UserPrincipal::from_windows_sid(sid)
+            .expect("valid sid"),
+        flows,
+        routes: Vec::new(),
+        policy_rules: Vec::new(),
+    };
+    for takeover in [false, true] {
+        let live = with_main(app_kill_switch_filters_for(
+            sid,
+            &apps,
+            luid,
+            KillSwitchProtocols::ALL,
+            takeover,
+        ));
+        let neutral = with_main(lower_kill_switch(
+            &plan(plan_app_kill_switch_for(
+                sid,
+                &apps,
+                KillSwitchProtocols::ALL,
+                takeover,
+            )),
+            luid,
+        ));
+        assert!(behaviorally_equivalent(&live, &neutral), "pin, {takeover}");
+        assert!(
+            arbitration_order_preserved(&live, &neutral),
+            "pin, takeover {takeover}: the app block must sit where the live one does"
+        );
+
+        let live = with_main(fail_closed_block_apps_for(
+            sid,
+            &apps,
+            KillSwitchProtocols::ALL,
+            takeover,
+        ));
+        let neutral = with_main(lower_kill_switch(
+            &plan(plan_fail_closed_apps_for(
+                sid,
+                &apps,
+                KillSwitchProtocols::ALL,
+                takeover,
+            )),
+            luid,
+        ));
+        assert!(
+            behaviorally_equivalent(&live, &neutral),
+            "fail-closed, {takeover}"
+        );
+        assert!(
+            arbitration_order_preserved(&live, &neutral),
+            "fail-closed, takeover {takeover}: the app block must sit where the live one does"
+        );
     }
 }
 
@@ -2507,4 +2628,52 @@ fn a_tunnel_with_an_ipv6_address_but_no_ipv6_route_does_not_carry_the_family() {
         Ipv6Guard::from_links(&adapters, Some(&tunnel), &with_v6),
         Ipv6Guard::FiltersAndRoutes
     );
+}
+
+/// The tunnel's own transport must not meet the `/1` halves that send
+/// everything into it: a kernel tunnel routed into itself is dead after the
+/// next rekey. Each server leaves by the main link, also when a rule planned it
+/// into the tunnel; with no default carried there is nothing to pin.
+#[test]
+fn the_tunnel_server_leaves_by_the_main_link_while_the_tunnel_carries_everything() {
+    use nrr_platform_api::enforcement::{EgressRef, RouteTableRef};
+    let server = v4(198, 51, 100, 9);
+    let server_v6: IpAddr = "2001:db8::9".parse().expect("v6");
+    let ruled_into_tunnel = RouteIntent {
+        dst: DstMatch::HostV4(Ipv4Addr::new(198, 51, 100, 9)),
+        egress: EgressRef::Secondary,
+        metric: 1,
+        table: RouteTableRef::Main,
+    };
+    let rb = book(Vec::new(), Vec::new());
+    let mut routes = plan_routes(
+        RouteBehaviorMode::PreferSecondaryWhenAvailable,
+        &rb,
+        true,
+        &MapCache::default(),
+        &crate::app_observation_lookup::MockAppObservationLookup::new(),
+        &std::collections::HashSet::new(),
+        FamilyScope::Both,
+        crate::address_ownership::ZoneVsIpOrder::default(),
+        &[],
+    );
+    routes.push(ruled_into_tunnel.clone());
+    pin_tunnel_servers_to_primary(&[server, server_v6], FamilyScope::Both, &mut routes);
+    let to = |ip: IpAddr| -> Vec<EgressRef> {
+        let dst = match ip {
+            IpAddr::V4(v) => DstMatch::HostV4(v),
+            IpAddr::V6(v) => DstMatch::HostV6(v),
+        };
+        routes
+            .iter()
+            .filter(|r| r.dst == dst)
+            .map(|r| r.egress.clone())
+            .collect()
+    };
+    assert_eq!(to(server), vec![EgressRef::Primary]);
+    assert_eq!(to(server_v6), vec![EgressRef::Primary]);
+
+    let mut split = vec![ruled_into_tunnel.clone()];
+    pin_tunnel_servers_to_primary(&[server], FamilyScope::Both, &mut split);
+    assert_eq!(split, vec![ruled_into_tunnel]);
 }

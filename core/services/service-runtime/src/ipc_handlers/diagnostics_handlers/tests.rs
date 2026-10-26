@@ -203,6 +203,41 @@ fn conn_trace_rows_carry_the_names_seen_for_their_remote() {
     assert!(oldest.remote_host_floor.is_empty());
 }
 
+/// An IPv6 connection must show its address, bracketed as the clients' "only
+/// IPv6" filter reads it, not a "masked IPv4" marker that hides it from both.
+#[test]
+fn conn_trace_shows_an_ipv6_rows_address() {
+    let ring = Arc::new(crate::conn_observation_consumer::ConnectionTraceRing::new(
+        8,
+    ));
+    let mut row = trace_row();
+    row.local = "[2001:db8::10]:52000".parse().expect("local");
+    row.remote = "[2001:db8::7]:443".parse().expect("remote");
+    ring.push(row);
+    let resp = conn_trace_list(&ConnTraceEntriesListHandler::new(Arc::clone(&ring)));
+    assert_eq!(resp.page.items[0].remote, "[2001:db8::7]:443");
+    assert!(looks_like_ipv6_endpoint(&resp.page.items[0].remote));
+}
+
+/// The same twin as the clients' `isIpv6Endpoint`, kept local: the service
+/// does not link the client crates.
+fn looks_like_ipv6_endpoint(endpoint: &str) -> bool {
+    endpoint.starts_with('[') || endpoint.split(':').count() > 2
+}
+
+/// Where addresses are hidden, an IPv6 address is hidden too, whichever
+/// viewer asks.
+#[test]
+fn viewer_ip_hides_ipv6_where_addresses_are_hidden() {
+    let v6: IpAddr = "2001:db8::7".parse().expect("v6");
+    assert_eq!(viewer_ip(v6, RedactionMode::Diagnostics), "2001:db8::7");
+    let hidden = viewer_ip(v6, RedactionMode::Default);
+    assert!(
+        !hidden.contains("2001") && !hidden.contains(':'),
+        "{hidden}"
+    );
+}
+
 /// A virtual address is named by the pool and says so; once its binding is
 /// recycled the row still says it is virtual rather than going blank.
 #[test]
@@ -725,6 +760,42 @@ fn cache_entries_local_viewer_shows_real_hostname_and_ip() {
     assert_eq!(items[1]["freshness"], "fresh");
 }
 
+/// A host's IPv6 address is cached beside its IPv4 one; the viewer must show
+/// it, not a "masked IPv4" marker the user cannot search or compare.
+#[test]
+fn cache_entries_viewer_shows_a_hosts_ipv6_address() {
+    use nrr_storage::dto::ResolutionEntry;
+    use nrr_storage::resolution_source::StorageResolutionSource;
+    let cache = seeded_cache();
+    let v6: IpAddr = "2001:db8::5".parse().expect("v6");
+    cache
+        .lock()
+        .expect("lock")
+        .upsert_resolution(ResolutionEntry {
+            canonical_hostname: "sub.example.com".into(),
+            raw_hostname_sample: None,
+            resolved_ips: vec![v6],
+            ttl_seconds: Some(300),
+            source: StorageResolutionSource::Dns,
+            resolved_at: SystemTime::now(),
+            active_revision_id: Some("rev-1".into()),
+        })
+        .expect("seed v6");
+    let h = CacheEntriesListHandler::new(cache);
+    let v = h
+        .handle(&envelope(serde_json::json!({})), &ctx())
+        .expect("ok");
+    let shown: Vec<&str> = v["page"]["items"]
+        .as_array()
+        .expect("items")
+        .iter()
+        .filter(|i| i["hostname"] == "sub.example.com")
+        .filter_map(|i| i["ip"].as_str())
+        .collect();
+    assert!(shown.contains(&"2001:db8::5"), "{shown:?}");
+    assert!(shown.contains(&"203.0.113.5"), "{shown:?}");
+}
+
 #[test]
 fn cache_entries_pagination_reports_next_cursor() {
     let h = CacheEntriesListHandler::new(seeded_cache());
@@ -1188,6 +1259,7 @@ fn health_json_carries_enrichment_from_providers() {
             interface_description: "Test NIC".into(),
             interface_type: "ethernet".into(),
             oper_status: "up".into(),
+            usable: true,
         }));
     let route_policy = Arc::new(FakeRoutePolicy::default());
     *route_policy.stored.lock().unwrap() = Some(RoutePolicyDto {

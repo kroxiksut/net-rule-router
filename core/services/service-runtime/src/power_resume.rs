@@ -225,10 +225,12 @@ impl PowerResumeRearm {
 /// Periodic gap detector plus [`RebindRequests`] drain. Runs on every platform,
 /// including those with no power observer at all, and catches the wakes an OS
 /// notification missed. `Optional`: a failure here costs promptness, never
-/// enforcement.
+/// enforcement. A wake runs `wake_hook` (what the power observer runs too),
+/// a rebind request `rearm_hook`.
 pub fn build_resume_watchdog_task(
     requests: Arc<RebindRequests>,
     rearm_hook: Arc<dyn Fn() + Send + Sync>,
+    wake_hook: Arc<dyn Fn() + Send + Sync>,
 ) -> ServiceTask {
     let mut last_mono = Instant::now();
     let mut last_wall = SystemTime::now();
@@ -247,14 +249,19 @@ pub fn build_resume_watchdog_task(
             );
             last_mono = now_mono;
             last_wall = now_wall;
-            watchdog_tick(gap, &requests, rearm_hook.as_ref());
+            watchdog_tick(gap, &requests, rearm_hook.as_ref(), wake_hook.as_ref());
             TaskOutcome::Continue
         },
     )
 }
 
 /// One watchdog pass, given the sleep gap it measured.
-fn watchdog_tick(gap: Option<Duration>, requests: &RebindRequests, rearm_hook: &dyn Fn()) {
+fn watchdog_tick(
+    gap: Option<Duration>,
+    requests: &RebindRequests,
+    rearm_hook: &dyn Fn(),
+    wake_hook: &dyn Fn(),
+) {
     if let Some(gap) = gap {
         if requests.wake_latch().claim() {
             tracing::warn!(
@@ -264,7 +271,7 @@ fn watchdog_tick(gap: Option<Duration>, requests: &RebindRequests, rearm_hook: &
                 slept_seconds = gap.as_secs(),
                 "machine resumed from sleep — re-resolving the adapter binding and re-driving routes",
             );
-            rearm_hook();
+            wake_hook();
         }
         // The pass for this wake also answers a request the posture heartbeat
         // raised during the sleep.
@@ -415,7 +422,7 @@ mod tests {
         std::thread::sleep(SETTLE);
         assert_eq!(fires.load(Ordering::SeqCst), 1);
 
-        watchdog_tick(SLEPT, &requests, hook.as_ref());
+        watchdog_tick(SLEPT, &requests, hook.as_ref(), hook.as_ref());
         assert_eq!(fires.load(Ordering::SeqCst), 1, "same wake, one re-arm");
 
         // The next sleep is announced, so its wake re-arms however soon it is.
@@ -439,25 +446,45 @@ mod tests {
         )
         .expect("manual observer subscribes");
 
-        watchdog_tick(SLEPT, &requests, hook.as_ref());
+        watchdog_tick(SLEPT, &requests, hook.as_ref(), hook.as_ref());
         assert_eq!(fires.load(Ordering::SeqCst), 1);
         observer.emit(PowerEvent::Resume);
         std::thread::sleep(SETTLE);
         assert_eq!(fires.load(Ordering::SeqCst), 1, "same wake, one re-arm");
     }
 
+    /// A wake is more than a rebind: it also re-reads the adapters, so the
+    /// clock-gap source must run the same wake action the OS source runs.
+    #[test]
+    fn a_wake_runs_the_wake_action_and_a_request_only_the_rearm() {
+        let (rearms, rearm) = counting_hook();
+        let (wakes, wake) = counting_hook();
+        let requests = RebindRequests::new();
+        requests.request("fail-closed-heartbeat");
+        watchdog_tick(None, &requests, rearm.as_ref(), wake.as_ref());
+        assert_eq!(
+            (rearms.load(Ordering::SeqCst), wakes.load(Ordering::SeqCst)),
+            (1, 0)
+        );
+        watchdog_tick(SLEPT, &requests, rearm.as_ref(), wake.as_ref());
+        assert_eq!(
+            (rearms.load(Ordering::SeqCst), wakes.load(Ordering::SeqCst)),
+            (1, 1)
+        );
+    }
+
     #[test]
     fn the_watchdog_alone_rearms_on_a_gap_and_on_a_request() {
         let (fires, hook) = counting_hook();
         let requests = RebindRequests::new();
-        watchdog_tick(None, &requests, hook.as_ref());
+        watchdog_tick(None, &requests, hook.as_ref(), hook.as_ref());
         assert_eq!(fires.load(Ordering::SeqCst), 0);
         requests.request("fail-closed-heartbeat");
-        watchdog_tick(None, &requests, hook.as_ref());
+        watchdog_tick(None, &requests, hook.as_ref(), hook.as_ref());
         assert_eq!(fires.load(Ordering::SeqCst), 1);
         // A request raised during the sleep is answered by the wake's pass.
         requests.request("fail-closed-heartbeat");
-        watchdog_tick(SLEPT, &requests, hook.as_ref());
+        watchdog_tick(SLEPT, &requests, hook.as_ref(), hook.as_ref());
         assert_eq!(fires.load(Ordering::SeqCst), 2);
         assert_eq!(requests.take(), None);
     }

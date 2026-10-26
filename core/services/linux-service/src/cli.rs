@@ -25,6 +25,9 @@ pub enum Command {
     /// The unit's last word once the restarts are spent: DNS is handed back,
     /// and the policy goes too unless someone's leak protection keeps it.
     AfterCrash,
+    /// The early unit's word at boot: put the table the last pass saved up
+    /// before the network comes up.
+    EarlyTable,
     /// `package-files <DIR>` — write the install footprint a distribution
     /// package ships under DIR, for the packaging script.
     PackageFiles,
@@ -58,6 +61,7 @@ pub fn parse_command(args: &[String]) -> Command {
         "cleanup" => Command::Cleanup,
         "stop-and-cleanup" => Command::StopAndCleanup,
         "after-crash" => Command::AfterCrash,
+        "early-table" => Command::EarlyTable,
         "package-files" => Command::PackageFiles,
         "provision-check" => Command::ProvisionCheck,
         "provision-stage" => Command::ProvisionStage,
@@ -93,6 +97,16 @@ mod tests {
         assert_eq!(
             parse(&[nrr_platform_api::service_control::STOP_AND_CLEANUP_VERB]),
             Command::StopAndCleanup
+        );
+    }
+
+    /// The early unit writes this word; a mismatch is a boot with no table up.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_early_unit_verb_is_one_this_daemon_knows() {
+        assert_eq!(
+            parse(&[nrr_platform_linux::systemd::DAEMON_EARLY_TABLE_VERB]),
+            Command::EarlyTable
         );
     }
 

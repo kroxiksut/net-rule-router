@@ -894,18 +894,29 @@ impl ActivationCoordinator {
     /// but without its read-time expansions: the gate compares stored books.
     /// `None` on a storage error, which leaves the gate checking every rule.
     pub(crate) fn rules_json_in_force_for(&self, principal: &str) -> Option<String> {
-        let conn = self.conn.lock().expect("connection mutex poisoned");
-        let repo = self.revisions_repo(&conn);
-        let resolve = |p: &str| match crate::applying_revision_overlay::applying_for(&conn, p) {
-            Some(json) => Ok(Some(json.to_string())),
-            None => repo.get_active_for(p).map(|r| r.map(|r| r.rules_json)),
-        };
-        match resolve(principal) {
-            Ok(None) if principal != nrr_storage::BASELINE_PRINCIPAL => {
-                resolve(nrr_storage::BASELINE_PRINCIPAL).ok().flatten()
-            }
+        match self.own_rules_json_in_force_for(principal) {
+            Ok(None) if principal != nrr_storage::BASELINE_PRINCIPAL => self
+                .own_rules_json_in_force_for(nrr_storage::BASELINE_PRINCIPAL)
+                .ok()
+                .flatten(),
             found => found.ok().flatten(),
         }
+    }
+
+    /// `principal`'s own book in force, mid-activation included, with no
+    /// read-through to the baseline: what a reset to the baseline discards.
+    pub(crate) fn own_rules_json_in_force_for(
+        &self,
+        principal: &str,
+    ) -> Result<Option<String>, String> {
+        let conn = self.conn.lock().expect("connection mutex poisoned");
+        if let Some(json) = crate::applying_revision_overlay::applying_for(&conn, principal) {
+            return Ok(Some(json.to_string()));
+        }
+        self.revisions_repo(&conn)
+            .get_active_for(principal)
+            .map(|r| r.map(|r| r.rules_json))
+            .map_err(|e| e.to_string())
     }
 
     /// The book `principal` is under right now, resolved as the rules provider

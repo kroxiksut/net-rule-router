@@ -194,7 +194,11 @@ fn now_ms() -> u64 {
 #[test]
 fn a_pin_drop_during_an_outage_joins_that_users_list_only() {
     let rig = rig(true);
-    rig.ring.outage_blocks().outage_began(&alice(), now_ms());
+    // Gone past the notice grace: a drop inside it is listed but not told.
+    let grace = nrr_service_runtime::app_enforcement_status::NOTICE_GRACE_MS.unsigned_abs();
+    rig.ring
+        .outage_blocks()
+        .outage_began(&alice(), now_ms() - grace - 1_000);
     rig.reports
         .push(dropped(&alice(), DropTag::user(DropKind::Pin), 1));
     rig.reports

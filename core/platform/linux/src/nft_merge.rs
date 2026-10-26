@@ -1,7 +1,8 @@
 //! Folding per-address rules into anonymous sets.
 //!
-//! The output chain is walked by EVERY packet the machine sends, one rule after
-//! another, and nothing short-cuts an established flow. A plan states one rule
+//! The output chain is walked rule after rule by every new flow's packets, and
+//! by every packet of a pinned one (an accepted unpinned flow skips it, see
+//! `nft_apply::flow_generation`). A plan states one rule
 //! per address — a rule host's addresses, the encrypted-DNS resolvers, the pins
 //! — so a few hundred addresses meant a few hundred comparisons per packet:
 //! measured on a laptop at ~0.24 µs a rule, the chain cost more than the send

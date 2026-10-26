@@ -1275,6 +1275,9 @@ fn step_lines(app: &AppState, texts: &Texts) -> Vec<ViewLine> {
             if leak_protection_holds_now(shown_level(app), secondary_row(app).as_ref()) {
                 lines.push(texts.get(k::LEAK_HOLDS_NOW));
             }
+            if app.settings.supports.site_notice_without_tray {
+                lines.push(texts.get(k::SITE_NOTICE_NOTE));
+            }
         }
         Step::Rules | Step::OtherCountries => {
             lines.push(texts.get(k::RULES_DESCRIPTION));

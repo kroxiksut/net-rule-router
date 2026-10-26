@@ -8,8 +8,8 @@ mod js_harness;
 
 use js_harness::{arg, check, text, JsLib};
 use nrr_client_logic::conn_trace::{
-    group_trace_rows, is_ipv6_endpoint, is_non_internet_address, TraceGroup, TraceGrouping,
-    TraceRowRef,
+    conn_trace_learned_routes, group_trace_rows, is_ipv6_endpoint, is_non_internet_address,
+    TraceGroup, TraceGrouping, TraceOutcomeRef, TraceRowRef,
 };
 use nrr_client_logic::diagnostics::{alert_ack_outcome, security_alert_items, AlertItem};
 use nrr_client_logic::rule_value_class::path_style_for_os;
@@ -91,6 +91,39 @@ fn conn_trace_groups_match_js() {
             let style = path_style_for_os(text(input, "os"));
             let groups = group_trace_rows(&rows, grouping, style);
             Value::from(groups.iter().map(group_json).collect::<Vec<_>>())
+        },
+    );
+}
+
+#[test]
+fn conn_trace_learned_routes_match_js() {
+    check(
+        "conn_trace_learned_routes",
+        &mut JsLib::pure(),
+        |input| format!("connTraceLearnedRoutes({})", arg(input, "rows")),
+        |input| {
+            let rows: Vec<TraceOutcomeRef<'_>> = input["rows"]
+                .as_array()
+                .map(Vec::as_slice)
+                .unwrap_or_default()
+                .iter()
+                .map(|row| TraceOutcomeRef {
+                    process: text(row, "process"),
+                    process_path: text(row, "process_path"),
+                    remote: text(row, "remote"),
+                    verdict: text(row, "verdict"),
+                    blocked_by: text(row, "blocked_by"),
+                    block_reason: text(row, "block_reason"),
+                    egress_role: text(row, "egress_role"),
+                    observed_at_ms: row["observed_at_ms"].as_i64().unwrap_or(0),
+                })
+                .collect();
+            Value::from(
+                conn_trace_learned_routes(&rows)
+                    .iter()
+                    .map(|pair| json!({ "held": pair.held, "routed": pair.routed }))
+                    .collect::<Vec<_>>(),
+            )
         },
     );
 }

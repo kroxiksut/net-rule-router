@@ -243,8 +243,37 @@ pub fn path_programs_once(
             };
             (kind, real)
         },
-        &|folder, subfolders| folders.list(&folder, subfolders),
+        &|folder, subfolders| {
+            let listing = folders.list(&folder, subfolders);
+            visible_to_owner(listing, &folder, &|dir| folders.owner_may_list(dir, owner))
+        },
     )
+}
+
+/// `listing` with the programs of every subfolder `may_list` closes left out:
+/// the walk reads as the service, and a count of what is inside a folder the
+/// owner cannot open tells them what they could not see. `root` was judged
+/// before the walk. Each folder is asked once.
+fn visible_to_owner(
+    mut listing: FolderListing,
+    root: &Path,
+    may_list: &dyn Fn(&Path) -> bool,
+) -> FolderListing {
+    let mut judged: std::collections::HashMap<PathBuf, bool> = std::collections::HashMap::new();
+    listing.programs.retain(|program| {
+        let mut dir = program.parent();
+        while let Some(at) = dir.filter(|at| *at != root && at.starts_with(root)) {
+            let open = *judged
+                .entry(at.to_path_buf())
+                .or_insert_with(|| may_list(at));
+            if !open {
+                return false;
+            }
+            dir = at.parent();
+        }
+        true
+    });
+    listing
 }
 
 /// The programs under `folder`, breadth first, each folder's entries sorted

@@ -14,9 +14,6 @@ use super::*;
 #[derive(Clone, Copy, Debug)]
 pub(super) struct FailClosedPosture {
     pub(super) block_all: bool,
-    /// Another principal also holds a block-all, so the machine-wide IPv6
-    /// packet block is left out rather than cutting that principal too.
-    pub(super) machine_has_other_principals: bool,
 }
 
 /// Filters the orchestrator currently has installed for one SID.

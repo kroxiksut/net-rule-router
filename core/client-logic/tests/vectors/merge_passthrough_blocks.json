@@ -1,0 +1,61 @@
+{
+  "description": "pure.js mergePassthroughBlocks: sections this build does not apply, merged per name for a rules file rewrite; a section written twice keeps both copies.",
+  "cases": [
+    { "name": "no blocks", "input": { "blocks": [] }, "expected": {} },
+    {
+      "name": "one block each",
+      "input": { "blocks": [
+        { "section-name": "Linux", "raw-text": "firefox\n" },
+        { "section-name": "Ports", "raw-text": "443\n" }
+      ] },
+      "expected": { "Linux": "firefox\n", "Ports": "443\n" }
+    },
+    {
+      "name": "a section written twice keeps the first copy first",
+      "input": { "blocks": [
+        { "section-name": "MacOS", "raw-text": "first.app\n" },
+        { "section-name": "Corp", "raw-text": "intra.example\n" },
+        { "section-name": "MacOS", "raw-text": "second.app\n" }
+      ] },
+      "expected": { "MacOS": "first.app\nsecond.app\n", "Corp": "intra.example\n" }
+    },
+    {
+      "name": "a copy without a final line break is not glued to the next",
+      "input": { "blocks": [
+        { "section-name": "Geo", "raw-text": "one" },
+        { "section-name": "Geo", "raw-text": "two\n" }
+      ] },
+      "expected": { "Geo": "one\ntwo\n" }
+    },
+    {
+      "name": "an empty copy adds nothing and loses nothing",
+      "input": { "blocks": [
+        { "section-name": "Linux", "raw-text": "" },
+        { "section-name": "Linux", "raw-text": "vlc\n" }
+      ] },
+      "expected": { "Linux": "vlc\n" }
+    },
+    {
+      "name": "three copies stay in file order",
+      "input": { "blocks": [
+        { "section-name": "Ports", "raw-text": "80\n" },
+        { "section-name": "Ports", "raw-text": "443\n" },
+        { "section-name": "Ports", "raw-text": "8443\n" }
+      ] },
+      "expected": { "Ports": "80\n443\n8443\n" }
+    },
+    {
+      "name": "names that differ in case are two sections",
+      "input": { "blocks": [
+        { "section-name": "Geo", "raw-text": "a\n" },
+        { "section-name": "geo", "raw-text": "b\n" }
+      ] },
+      "expected": { "Geo": "a\n", "geo": "b\n" }
+    },
+    {
+      "name": "a block with no name is not a section",
+      "input": { "blocks": [ { "section-name": "", "raw-text": "stray\n" } ] },
+      "expected": {}
+    }
+  ]
+}

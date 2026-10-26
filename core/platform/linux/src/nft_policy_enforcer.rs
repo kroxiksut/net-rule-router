@@ -81,6 +81,8 @@ pub struct NftPolicyEnforcer {
     /// Who owns the route table and which uids are service accounts, read per
     /// pass. `None` lowers no service-account rule.
     service_accounts: Option<ServiceAccountScopeSource>,
+    /// Saves each applied table for the boot window.
+    keeps_boot_table: bool,
 }
 
 /// The route-table owner and the service uids as they stand this pass, given
@@ -106,7 +108,16 @@ impl NftPolicyEnforcer {
             applied: Mutex::new(None),
             verify_next: AtomicBool::new(false),
             service_accounts: None,
+            keeps_boot_table: false,
         }
+    }
+
+    /// Save each applied table for the boot window ([`crate::early_table`]).
+    /// The daemon's own enforcer only: a test's table must never come up at boot.
+    #[must_use]
+    pub fn keeping_boot_table(mut self) -> Self {
+        self.keeps_boot_table = true;
+        self
     }
 
     /// Lower the route-table owner's service-account rules onto the uids
@@ -179,6 +190,23 @@ fn failure(e: NftApplyError) -> EnforcementFailure {
         NftApplyError::NftUnavailable { .. }
         | NftApplyError::NotPermitted { .. }
         | NftApplyError::Rejected { .. } => EnforcementFailure::persistent(e.to_string()),
+    }
+}
+
+/// Save what was applied for the boot window ([`crate::early_table`]). Said once
+/// per process when it fails: the next boot is then unguarded until the first
+/// pass, which is no reason to fail this one.
+#[cfg(target_os = "linux")]
+fn keep_for_boot(applied: &NftRuleset) {
+    static WARNED: AtomicBool = AtomicBool::new(false);
+    if let Err(e) = crate::early_table::keep(applied) {
+        if !WARNED.swap(true, Ordering::Relaxed) {
+            tracing::warn!(
+                target: "nrr::enforcement",
+                error = %e,
+                "the table could not be saved for the next boot; until the service's first pass there it holds nothing back",
+            );
+        }
     }
 }
 
@@ -369,6 +397,13 @@ impl PolicyEnforcer for NftPolicyEnforcer {
             refused_notes: refused_notes.clone(),
         });
         drop(applied);
+        #[cfg(target_os = "linux")]
+        if self.keeps_boot_table && self.table == crate::lower_linux::NRR_TABLE {
+            keep_for_boot(&crate::nft_apply::without_skipped(
+                &lowered.ruleset,
+                &outcome.skipped,
+            ));
+        }
 
         let mut notes = notes_for_unsupported();
         notes.extend(refused_notes.into_iter().map(ApplyNote::machine));

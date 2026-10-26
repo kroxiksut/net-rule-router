@@ -140,6 +140,14 @@ pub const FOR_7_DAYS: Key = key("label.duration.for-7-days", "For 7 days");
 pub const FOR_30_DAYS: Key = key("label.duration.for-30-days", "For 30 days");
 pub const FOREVER: Key = key("label.duration.forever", "Forever");
 pub const BLOCK_GROUP: Key = key("settings.group.block-notices", "Blocked-connection notices");
+pub const HIDE_ADDRESSES: Key = key(
+    "settings.field.hide-block-notice-addresses",
+    "Hide addresses in these notifications",
+);
+pub const HIDE_ADDRESSES_NOTE: Key = key(
+    "settings.field.hide-block-notice-addresses-tooltip",
+    "Replaces the destination with a generic label instead of the real hostname — useful when your screen is being shared or recorded.",
+);
 pub const MUTE_ALL: Key = key(
     "settings.block-notices.mutes.row-all",
     "All blocked-connection notices",
@@ -1175,6 +1183,201 @@ pub const NEEDS_ELEVATION_UNIX: Key = key(
     "This needs administrator rights, and nrr-tui does not ask for them. Quit and start it again with the command sudo nrr-tui.",
 );
 
+// ── Status lines the window shows beside its settings ────────────────────────
+
+pub const PAUSE_STATUS_PAUSED: Key =
+    key("settings.routing.pause.status-paused", "Rules are disabled");
+pub const PAUSED_SINCE: Key = key(
+    "settings.routing.pause.paused-since",
+    "Paused since {timestamp}",
+);
+pub const PAUSE_UNTIL_RESTART: Key = key("routing.pause.until-restart", "until restart");
+pub const LEFT_MINUTES: Key = key("rules.override.left.minutes", "{count} min left");
+pub const LEFT_HOURS: Key = key("rules.override.left.hours", "{count} h left");
+pub const LEFT_DAYS: Key = key("rules.override.left.days", "{count} d left");
+pub const LEFT_ENDED: Key = key("rules.override.left.ended", "ended");
+pub const MODE_PREFER_PRIMARY_NOTE: Key = key(
+    "settings.routing-behavior.mode.prefer-primary.description",
+    "Only the sites, IPs and apps in your rules use the additional connection; all other traffic stays on your main connection.",
+);
+pub const MODE_PREFER_SECONDARY_NOTE: Key = key(
+    "settings.routing-behavior.mode.prefer-secondary-when-available.description",
+    "All traffic goes through the additional connection; only the exceptions in your rules use the main one.",
+);
+/// Carries links in the window; the terminal shows it without the markup.
+pub const IP_ROUTING_NOTE: Key = key(
+    "settings.routing-behavior.ip-routing-note",
+    "Routing works by IP address. A website that checks and shows your IP can still display your provider's address. This is a known limitation, not a routing failure.",
+);
+pub const FAKE_IP_NOTE: Key = key(
+    "settings.routing.fake-ip.note",
+    "Each routed site is answered with its own virtual address, so routing stays per-site even when several sites share one real server address. Off by default.",
+);
+pub const FAKE_IP_DRIVER: Key = key(
+    "settings.routing.fake-ip.driver-status",
+    "Virtual-adapter driver (Wintun): ",
+);
+
+pub const CLEAR_LOGS_BODY: Key = key(
+    "diag.logs.clear-confirm-body",
+    "This will permanently delete log files. The audit trail will not be affected.",
+);
+pub const CLEAR_LOGS_PREVIEW: Key = key(
+    "diag.logs.clear-dry-run-summary",
+    "Would delete {count} files ({size})",
+);
+
+// ── The service and the console, as the window's service panel shows them ────
+
+pub const SERVICE_UPDATE_ELSEWHERE: Key = key(
+    "settings.service.update.elsewhere",
+    "The system starts the background service from another folder, not the one this application runs from.",
+);
+pub const SERVICE_UPDATE_OLDER: Key = key(
+    "settings.service.update.older",
+    "The running background service is an older build than this application.",
+);
+/// Qt-style `%1`/`%2` and a line break, as the window's text has them.
+pub const SERVICE_UPDATE_DETAIL: Key = key(
+    "settings.service.update.detail",
+    "Registered: %1\nThis application: %2",
+);
+pub const SERVICE_PATH_UNKNOWN: Key = key("settings.service.status.unknown", "Unknown");
+pub const SERVICE_START_ELSEWHERE: Key = key(
+    "tui.settings.service.start-elsewhere",
+    "The system would start the service from another folder, so it was not started. To re-register it from this folder and start it, run: {command}",
+);
+pub const SERVICE_STALE: Key = key(
+    "settings.service.stale-process.description",
+    "The service program file was updated, but the service is still running the previous version. Restart it to run the update.",
+);
+pub const SERVICE_CRASH_RECOVERY: Key = key(
+    "settings.service.crash-recovery",
+    "Service will auto-restart up to 3 times after failures.",
+);
+pub const SERVICE_LOGS_FOLDER: Key = key(
+    "tui.settings.service.logs-folder",
+    "Service logs folder: {path}",
+);
+pub const SERVICE_LOGS_UNAVAILABLE: Key = key(
+    "settings.service.logs-path-unavailable",
+    "Service logs folder path unavailable.",
+);
+pub const CONSOLE_TITLE: Key = key("settings.console.title", "Command-line console");
+pub const CONSOLE_DESCRIPTION: Key = key(
+    "settings.console.description",
+    "NetRuleRouter ships a small console for service tasks. Add its folder to your PATH to run it as \"nrr-cli\" from any terminal.",
+);
+pub const CONSOLE_REACHABLE: Key = key(
+    "settings.console.path-registered",
+    "The console can be run from any terminal.",
+);
+pub const CONSOLE_NOT_REACHABLE: Key = key(
+    "settings.console.path-not-registered",
+    "The console can only be run from its own folder.",
+);
+pub const CONSOLE_NOT_OURS: Key = key(
+    "settings.console.path-reachable-not-ours",
+    "The folder is already on your PATH, but the entry was not added by NetRuleRouter — so there is nothing here to add or take away.",
+);
+pub const CONSOLE_FOLDER: Key = key("settings.console.folder-label", "Console folder");
+pub const CONSOLE_ADD: Key = key("settings.console.add-to-path", "Add console to PATH");
+pub const CONSOLE_ADD_NOTE: Key = key(
+    "settings.console.add-to-path-tooltip",
+    "Adds the console's folder to your personal PATH. It affects your account only, needs no administrator rights, and changes nothing else on the list.",
+);
+pub const CONSOLE_REMOVE: Key = key(
+    "settings.console.remove-from-path",
+    "Remove console from PATH",
+);
+pub const CONSOLE_REMOVE_NOTE: Key = key(
+    "settings.console.remove-from-path-tooltip",
+    "Removes the entry NetRuleRouter added to your personal PATH. Nothing else on the list is touched.",
+);
+pub const CONSOLE_ADDED: Key = key(
+    "settings.console.path-added",
+    "The console was added to your PATH.",
+);
+pub const CONSOLE_ALREADY: Key = key(
+    "settings.console.path-already-present",
+    "The console was already on your PATH.",
+);
+pub const CONSOLE_ADD_FAILED: Key = key(
+    "settings.console.path-failed",
+    "Could not add the console to your PATH.",
+);
+pub const CONSOLE_REMOVED: Key = key(
+    "settings.console.path-removed",
+    "The console was removed from your PATH.",
+);
+pub const CONSOLE_NOT_PRESENT: Key = key(
+    "settings.console.path-was-not-present",
+    "Nothing to remove — this entry was not put there by NetRuleRouter.",
+);
+pub const CONSOLE_REMOVE_FAILED: Key = key(
+    "settings.console.path-remove-failed",
+    "Could not remove the console from your PATH.",
+);
+pub const CONSOLE_NEW_TERMINAL: Key = key(
+    "settings.console.new-terminal-hint",
+    "Terminals that are already open keep the PATH they started with. Open a new one, or run this line in the current one:",
+);
+pub const CONSOLE_PROFILE_FILE: Key = key(
+    "settings.console.profile-file-hint",
+    "The line was added to %1.",
+);
+pub const CONSOLE_CHECK_FAILED: Key = key(
+    "tui.settings.service.console-check-failed",
+    "Could not check the console's place on PATH: {error}",
+);
+
+/// The status-line keys, for the locale test.
+#[cfg(test)]
+const STATUS_LINES: &[Key] = &[
+    SERVICE_UPDATE_ELSEWHERE,
+    SERVICE_UPDATE_OLDER,
+    SERVICE_UPDATE_DETAIL,
+    SERVICE_PATH_UNKNOWN,
+    SERVICE_START_ELSEWHERE,
+    SERVICE_STALE,
+    SERVICE_CRASH_RECOVERY,
+    SERVICE_LOGS_FOLDER,
+    SERVICE_LOGS_UNAVAILABLE,
+    CONSOLE_TITLE,
+    CONSOLE_DESCRIPTION,
+    CONSOLE_REACHABLE,
+    CONSOLE_NOT_REACHABLE,
+    CONSOLE_NOT_OURS,
+    CONSOLE_FOLDER,
+    CONSOLE_ADD,
+    CONSOLE_ADD_NOTE,
+    CONSOLE_REMOVE,
+    CONSOLE_REMOVE_NOTE,
+    CONSOLE_ADDED,
+    CONSOLE_ALREADY,
+    CONSOLE_ADD_FAILED,
+    CONSOLE_REMOVED,
+    CONSOLE_NOT_PRESENT,
+    CONSOLE_REMOVE_FAILED,
+    CONSOLE_NEW_TERMINAL,
+    CONSOLE_PROFILE_FILE,
+    CONSOLE_CHECK_FAILED,
+    CLEAR_LOGS_BODY,
+    CLEAR_LOGS_PREVIEW,
+    PAUSE_STATUS_PAUSED,
+    PAUSED_SINCE,
+    PAUSE_UNTIL_RESTART,
+    LEFT_MINUTES,
+    LEFT_HOURS,
+    LEFT_DAYS,
+    LEFT_ENDED,
+    MODE_PREFER_PRIMARY_NOTE,
+    MODE_PREFER_SECONDARY_NOTE,
+    IP_ROUTING_NOTE,
+    FAKE_IP_NOTE,
+    FAKE_IP_DRIVER,
+];
+
 /// Every key above, for the test that holds both locale files to them.
 #[cfg(test)]
 pub fn all() -> Vec<Key> {
@@ -1241,6 +1444,8 @@ pub fn all() -> Vec<Key> {
         FOR_30_DAYS,
         FOREVER,
         BLOCK_GROUP,
+        HIDE_ADDRESSES,
+        HIDE_ADDRESSES_NOTE,
         MUTE_ALL,
         MUTE_HOST,
         MUTE_APP,
@@ -1567,5 +1772,6 @@ pub fn all() -> Vec<Key> {
         NEEDS_ELEVATION_UNIX,
     ];
     keys.extend(ERRORS.iter().map(|(_, k)| *k));
+    keys.extend_from_slice(STATUS_LINES);
     keys
 }

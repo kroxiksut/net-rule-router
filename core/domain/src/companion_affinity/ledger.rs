@@ -684,6 +684,22 @@ impl CompanionAffinityLedger {
         retired.len()
     }
 
+    /// Drop every candidate whose fate is decided — accepted, dismissed, or
+    /// covered by a rule — so it stops holding a slot that eviction would
+    /// otherwise take from one still earning its offer. Sightings waiting for
+    /// a window go too, or the next page load would track it straight back.
+    ///
+    /// Returns how many candidates were dropped.
+    pub fn forget_candidates<F>(&mut self, is_settled: F) -> usize
+    where
+        F: Fn(&str) -> bool,
+    {
+        let before = self.candidates.len();
+        self.candidates.retain(|name, _| !is_settled(name));
+        self.unattributed.retain(|(name, _, _)| !is_settled(name));
+        before - self.candidates.len()
+    }
+
     /// Pull every timestamp that sits in the future back to `at_ms`.
     ///
     /// Called when an observation is seen to predate a window that is already

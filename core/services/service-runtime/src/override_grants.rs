@@ -69,10 +69,13 @@ pub fn generation() -> u64 {
 /// folded in: what an enforcement pass counts among its inputs.
 #[must_use]
 pub fn pass_generation() -> u64 {
-    let due = installed().map_or(0, |grants| grants.due_count(now_ms()));
-    generation()
-        .wrapping_mul(1_000_003)
-        .wrapping_add(due as u64)
+    pass_generation_at(generation(), installed().map(Arc::as_ref), now_ms())
+}
+
+/// [`pass_generation`] at `now_ms`: a term running out moves it with no timer.
+fn pass_generation_at(generation: u64, grants: Option<&OverrideGrants>, now_ms: i64) -> u64 {
+    let due = grants.map_or(0, |grants| grants.due_count(now_ms));
+    generation.wrapping_mul(1_000_003).wrapping_add(due as u64)
 }
 
 /// Makes `grants` the service's. Only the first call counts.

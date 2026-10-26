@@ -501,3 +501,105 @@ fn the_forwarded_blanket_lets_replies_into_a_guest_whose_network_was_refused() {
         "nothing keyed on the guest reaches the machine's own traffic: {guest:?}"
     );
 }
+
+/// A forwarded packet as the forwarding layer judges it: of the filters whose
+/// every condition matches its destination and the interface it leaves by, the
+/// heaviest decides; none leaves it permitted.
+fn forwarded_verdict(filters: &[WfpFilterRecord], remote: Ipv4Addr, luid: u64) -> WfpAction {
+    let within = |net: Ipv4Addr, len: u8| {
+        let mask = u32::MAX.checked_shl(32 - u32::from(len)).unwrap_or(0);
+        u32::from(net) & mask == u32::from(remote) & mask
+    };
+    let destination_matches = |f: &WfpFilterRecord| {
+        let named = f.remote_ip.is_some()
+            || !f.remote_ip_set.is_empty()
+            || f.remote_subnet.is_some()
+            || !f.remote_subnet_set.is_empty();
+        !named
+            || covers(f, remote)
+            || f.remote_subnet.is_some_and(|(net, len)| within(net, len))
+            || f.remote_subnet_set.iter().any(|(net, len)| match net {
+                IpAddr::V4(net) => within(*net, *len),
+                IpAddr::V6(_) => false,
+            })
+    };
+    filters
+        .iter()
+        .filter(|f| f.layer == WfpLayerKey::IpForwardV4)
+        .filter(|f| f.local_interface_luid.is_none_or(|l| l == luid))
+        .filter(|f| destination_matches(f))
+        .max_by_key(|f| f.weight)
+        .map_or(WfpAction::Permit, |f| f.action)
+}
+
+/// Everything protected, the additional connection as the default route, the
+/// tunnel up: what the machine forwards (WSL, containers, guests) leaves only
+/// through the tunnel, to any address and not only the rules', so the moment
+/// the tunnel goes none of it takes the main link. The LAN and the tunnel's
+/// server stay open; with protection off the forwarding path is untouched.
+#[test]
+fn everything_through_the_tunnel_holds_all_forwarded_traffic_to_it() {
+    const MAIN_LUID: u64 = 0x0001_0000_0000_0042;
+    const ANY_SITE: Ipv4Addr = Ipv4Addr::new(192, 0, 2, 80);
+    let installed = |snapshot: PerSidPolicySnapshot| {
+        let owner = owner_is(Some("S-1-5-21-A"));
+        let (api, orch, src, rules) =
+            fixture_with_service_accounts(Some(full_ks_resolution()), &owner, Vec::new());
+        rules.set(rules_with_secondary_ip(RULE_HOST));
+        src.set("S-1-5-21-A", snapshot);
+        orch.install_for_sid("S-1-5-21-A").unwrap();
+        let filters = api.wfp_filters.lock().unwrap().clone();
+        filters
+    };
+
+    let held = installed(snap_block_mode_b("Wi-Fi", "TAP"));
+    assert_eq!(
+        forwarded_verdict(&held, ANY_SITE, KS_LUID),
+        WfpAction::Permit,
+        "a guest's site through the tunnel"
+    );
+    assert_eq!(
+        forwarded_verdict(&held, ANY_SITE, MAIN_LUID),
+        WfpAction::Block,
+        "a guest's site over the main link, as on the packet the tunnel drops"
+    );
+    assert_eq!(
+        forwarded_verdict(&held, Ipv4Addr::new(192, 168, 1, 20), MAIN_LUID),
+        WfpAction::Permit,
+        "the LAN"
+    );
+    assert_eq!(
+        forwarded_verdict(&held, Ipv4Addr::new(203, 0, 113, 7), MAIN_LUID),
+        WfpAction::Permit,
+        "the tunnel's server"
+    );
+
+    let off = installed(snap_with(
+        "Wi-Fi",
+        "TAP",
+        PerSidBehaviorMode::PreferSecondaryWhenAvailable,
+        nrr_domain::LeakProtection::Off,
+    ));
+    assert!(
+        off.iter().all(|f| !f.layer.is_forwarding()),
+        "protection off touches nothing forwarded"
+    );
+
+    // Under the main default route a guest's unmatched traffic belongs on the
+    // main link, as the user's own does.
+    let main = installed(snap_with(
+        "Wi-Fi",
+        "TAP",
+        PerSidBehaviorMode::PreferPrimary,
+        nrr_domain::LeakProtection::Everything,
+    ));
+    assert_eq!(
+        forwarded_verdict(&main, ANY_SITE, MAIN_LUID),
+        WfpAction::Permit
+    );
+    assert_eq!(
+        forwarded_verdict(&main, RULE_HOST, MAIN_LUID),
+        WfpAction::Block,
+        "the rule host stays pinned"
+    );
+}

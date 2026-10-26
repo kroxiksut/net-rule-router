@@ -162,6 +162,18 @@ pub fn canonical_rule_set_to_rules_file_parsed(
     set: &crate::canonical::CanonicalRuleSet,
     host_app_section: RulesFileSection,
 ) -> RulesFileParsed {
+    rule_set_with_kept_to_rules_file_parsed(set, &[], host_app_section)
+}
+
+/// [`canonical_rule_set_to_rules_file_parsed`] plus the route's rules kept
+/// aside as not working ([`crate::rules_revision::RulesRevisionContent::inactive`]),
+/// each written in its section as the user wrote it, so a file exported from
+/// the service still holds them.
+pub fn rule_set_with_kept_to_rules_file_parsed(
+    set: &crate::canonical::CanonicalRuleSet,
+    kept: &[nrr_shared::rules_json::RuleDto],
+    host_app_section: RulesFileSection,
+) -> RulesFileParsed {
     use crate::canonical::CanonicalAddressMatch;
 
     let mut zones: Vec<RulesFileEntry> = Vec::new();
@@ -252,6 +264,45 @@ pub fn canonical_rule_set_to_rules_file_parsed(
         // occur — the validation pipeline enforces "at least one of the
         // two is Some" before a rule reaches a CanonicalRuleSet. We
         // silently skip such a rule if encountered (defensive).
+    }
+
+    for rule in kept {
+        use nrr_shared::rules_json::{AddressMatchDto, RuleAction as Wire};
+        let comment = (!rule.comment.is_empty()).then(|| rule.comment.clone());
+        let blocked = rule.action == Wire::Block;
+        if let Some(app) = &rule.app_match {
+            apps.push(RulesFileEntry {
+                match_value: app.pattern.value().to_owned(),
+                inline_comment: comment,
+                enabled: rule.enabled,
+                blocked,
+                verify_primary: false,
+                override_requested: app.override_requested,
+                children_requested: app.include_child_processes,
+                origin: rule.origin.clone(),
+            });
+            continue;
+        }
+        let (bucket, value, single) = match &rule.address_match {
+            Some(
+                AddressMatchDto::ExactIpv4 { address } | AddressMatchDto::ExactIpv6 { address },
+            ) => (&mut ips, address.clone(), true),
+            Some(AddressMatchDto::Subnet { network }) => (&mut subnets, network.clone(), false),
+            Some(AddressMatchDto::IpRange { first, last }) => {
+                (&mut ranges, format!("{first}-{last}"), false)
+            }
+            _ => continue,
+        };
+        bucket.push(RulesFileEntry {
+            match_value: value,
+            inline_comment: comment,
+            enabled: rule.enabled,
+            blocked,
+            verify_primary: single && rule.action == Wire::VerifyPrimary,
+            override_requested: false,
+            children_requested: false,
+            origin: None,
+        });
     }
 
     let sections = [

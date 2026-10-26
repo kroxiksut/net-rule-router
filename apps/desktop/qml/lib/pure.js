@@ -1125,6 +1125,70 @@ function connTraceGroups(rows, grouping, os) {
     return groups
 }
 
+// How soon a success over the additional route must follow a held connection
+// for the two to read as one row (`LEARNED_ROUTE_WINDOW_MS`).
+var CONN_TRACE_LEARNED_ROUTE_WINDOW_MS = 10000
+
+function _ctEndpointAddress(remote) {
+    var s = String(remote || "").trim()
+    if (s.charAt(0) === "[") {
+        var close = s.indexOf("]")
+        return close === -1 ? s.slice(1) : s.slice(1, close)
+    }
+    var first = s.indexOf(":"), last = s.lastIndexOf(":")
+    return (first !== -1 && first === last) ? s.slice(0, last) : s
+}
+
+function _ctOutcomeKey(r) {
+    var address = _ctEndpointAddress(r.remote)
+    var path = String(r.process_path || ""), name = String(r.process || "")
+    var program
+    if (path !== "") program = "p" + path
+    else if (name !== "" && name !== "?") program = "n" + name
+    else return null
+    return address === "" ? null : program + "\n" + address
+}
+
+// Each held connection (our block, not a rule's) followed within the window by
+// the same program reaching the same address over the additional route,
+// paired with the earliest such success: [{ held, routed }] by `held`. The
+// list then shows the success alone, saying it was held first.
+function connTraceLearnedRoutes(rows) {
+    var list = rows || []
+    var routed = {}
+    for (var i = 0; i < list.length; i += 1) {
+        var r = list[i] || {}
+        var t = Number(r.observed_at_ms)
+        if (r.verdict !== "permit" || r.egress_role !== "secondary" || !(t > 0)) continue
+        var key = _ctOutcomeKey(r)
+        if (key === null) continue
+        var slot = routed["k" + key]
+        if (slot === undefined) { slot = []; routed["k" + key] = slot }
+        slot.push({ "t": t, "i": i })
+    }
+    for (var k in routed) {
+        routed[k].sort(function (a, b) { return a.t !== b.t ? a.t - b.t : a.i - b.i })
+    }
+    var out = []
+    for (var h = 0; h < list.length; h += 1) {
+        var held = list[h] || {}
+        var at = Number(held.observed_at_ms)
+        var reason = String(held.block_reason || "")
+        if (held.verdict !== "block" || held.blocked_by !== "netrulerouter" || !(at > 0)) continue
+        if (reason !== "route-unavailable" && reason !== "unattributed" && reason !== "") continue
+        var heldKey = _ctOutcomeKey(held)
+        var successes = heldKey === null ? undefined : routed["k" + heldKey]
+        if (successes === undefined) continue
+        for (var s = 0; s < successes.length; s += 1) {
+            if (successes[s].t < at) continue
+            if (successes[s].t - at <= CONN_TRACE_LEARNED_ROUTE_WINDOW_MS)
+                out.push({ "held": h, "routed": successes[s].i })
+            break
+        }
+    }
+    return out
+}
+
 // ---- interface-role secondary-name matching ----
 
 // Mirror of the service's `description_matches_display_name`: tokens split on
@@ -1466,6 +1530,76 @@ function adapterHeldOtherRole(row, role) {
     return held !== "" && held !== String(role || "") ? held : ""
 }
 
+// Whether an adapter row stays in the list: unavailable ones only when asked
+// for, and `search` (any case) in its name, description, address, resolvers
+// or type.
+function adapterPassesFilter(row, showUnavailable, search) {
+    if (!row) return false
+    if (!showUnavailable && String(row.availability) === "unavailable") return false
+    var q = String(search || "").toLowerCase().trim()
+    if (q === "") return true
+    var hay = (String(row.name || "") + " "
+        + String(row.description || "") + " "
+        + String(row.ip || "") + " "
+        + String(row.dns || "") + " "
+        + String(row.type || "")).toLowerCase()
+    return hay.indexOf(q) >= 0
+}
+
+// A loopback adapter is a local address space, never a route.
+function adapterIsLoopback(row) {
+    if (!row) return false
+    return [row.name, row.type, row.description, (row.derivedAssessment || {}).classification]
+        .some(function (text) { return String(text || "").toLowerCase().indexOf("loopback") >= 0 })
+}
+
+// Whether the row names a resolver; the placeholders a row without one
+// carries read as none.
+function adapterHasConfiguredDns(row) {
+    if (!row) return false
+    var raw = String(row.dns || "").trim().toLowerCase()
+    return raw !== "" && ["—", "-", "none", "(none)", "n/a"].indexOf(raw) < 0
+}
+
+// Where `row` stands in the list sorted by `sortBy` ("default", "vpn-like",
+// "primary-candidate"): higher first. Bound adapters lead whatever the order,
+// loopback sinks.
+function adapterSortRank(row, sortBy) {
+    if (!row) return -100000
+    if (adapterIsLoopback(row)) return -10000
+    var role = String(row.selectedRole || "")
+    if (role === "primary") return 1000000
+    if (role === "secondary") return 900000
+    var rec = String((row.recommendation || {})["class"] || "")
+    var da = row.derivedAssessment || {}
+    var vpn = String(da.vpnTunnelLikelihood || "")
+    var virt = String(da.virtualInterfaceLikelihood || "")
+    var avail = String(row.availability || "")
+    var dns = adapterHasConfiguredDns(row) ? 1 : 0
+    if (sortBy === "vpn-like") {
+        if (vpn === "likely") return 100 + dns
+        if (vpn === "possible") return 60 + dns
+        if (virt === "likely") return 40 + dns
+        if (virt === "possible") return 25 + dns
+        return dns
+    }
+    if (sortBy === "primary-candidate") {
+        if (rec === "preferred-primary") return 100 + dns
+        if (rec === "allowed-but-not-recommended") return 40 + dns
+        if (rec === "preferred-secondary") return 30 + dns
+        if (rec === "not-recommended") return dns
+        return 10 + dns
+    }
+    var score = 0
+    if (avail === "available") score += 50
+    else if (avail === "requires-check") score += 20
+    if (dns === 1) score += 30
+    if (rec === "preferred-primary") score += 40
+    else if (rec === "preferred-secondary") score += 25
+    else if (rec === "allowed-but-not-recommended") score += 10
+    return score
+}
+
 // Convenience predicate over `unroutableInterfaceReasonSlug`.
 function interfaceCannotCarryTrafficOut(row) {
     return unroutableInterfaceReasonSlug(row) !== ""
@@ -1709,7 +1843,11 @@ var MUTABLE_NOTICE_KINDS = {
     "routes-held": ["notifications.routes-held.title",
         "Some addresses follow another user's route"],
     "traffic-carried": ["notifications.traffic-carried.title",
-        "Your traffic goes through another user's tunnel"]
+        "Your traffic goes through another user's tunnel"],
+    "site-not-opening": ["settings.notifications.site-not-opening",
+        "A site does not open (told even while the tray is closed)"],
+    "link-keeps-dropping": ["notifications.link-keeps-dropping.title",
+        "A connection keeps dropping"]
 }
 
 // How long each answer of the chooser holds; 0 is "until lifted".
@@ -1819,6 +1957,55 @@ function rulesBookUnreadable(health) {
 // `nrr_client_logic::diagnostics::rules_book_notice_step`.
 function rulesBookNoticeStep(wasRaised, unreadable) {
     return systemDnsNoticeStep(wasRaised, unreadable)
+}
+
+// "Don't show" for the application-rule notice, per program AND problem:
+// entries `<state>:<program>` joined by `|`. An entry without a known state
+// predates states and stands for a program that was not found. Twins of
+// `nrr_client_logic::app_notice_ack`.
+function _appNoticeAckEntry(token) {
+    var states = ["not-found", "unrouted"]
+    for (var i = 0; i < states.length; i += 1)
+        if (token.indexOf(states[i] + ":") === 0) return token
+    return "not-found:" + token
+}
+
+function _appNoticeAcked(ack) {
+    var out = []
+    var tokens = String(ack || "").split("|")
+    for (var i = 0; i < tokens.length; i += 1)
+        if (tokens[i] !== "") out.push(_appNoticeAckEntry(tokens[i]))
+    return out
+}
+
+function _appNoticeCurrent(notFound, unrouted) {
+    var out = []
+    var missing = notFound || []
+    for (var i = 0; i < missing.length; i += 1) out.push("not-found:" + String(missing[i]))
+    var found = unrouted || []
+    for (var j = 0; j < found.length; j += 1) out.push("unrouted:" + String(found[j]))
+    return out
+}
+
+// Whether every current problem was acknowledged before.
+function appNoticeCoveredByAck(ack, notFound, unrouted) {
+    var acked = _appNoticeAcked(ack)
+    if (acked.length === 0) return false
+    var current = _appNoticeCurrent(notFound, unrouted)
+    for (var i = 0; i < current.length; i += 1)
+        if (acked.indexOf(current[i]) < 0) return false
+    return true
+}
+
+// The acknowledgement after "Don't show": the old entries in today's spelling
+// plus every current problem, sorted and without repeats.
+function appNoticeAckUnion(ack, notFound, unrouted) {
+    var all = _appNoticeAcked(ack).concat(_appNoticeCurrent(notFound, unrouted))
+    all.sort()
+    var out = []
+    for (var i = 0; i < all.length; i += 1)
+        if (i === 0 || all[i] !== all[i - 1]) out.push(all[i])
+    return out.join("|")
 }
 
 // Whether the rules applying again after `previous` is worth the "routing works
@@ -3045,6 +3232,23 @@ function registrableDomain(hostname) {
     return lastTwo
 }
 
+// Sections this build does not apply, merged per name for the rewrite of a
+// rules file: a section written twice keeps both copies in file order.
+// `blocks` are `{ "section-name", "raw-text" }`; the answer is name -> text.
+function mergePassthroughBlocks(blocks) {
+    var sections = {}
+    var list = _isList(blocks) ? blocks : []
+    for (var i = 0; i < list.length; i += 1) {
+        var block = list[i] || {}
+        var name = String(block["section-name"] || "")
+        if (name === "") continue
+        var held = sections.hasOwnProperty(name) ? sections[name] : ""
+        if (held !== "" && held.charAt(held.length - 1) !== "\n") held += "\n"
+        sections[name] = held + String(block["raw-text"] || "")
+    }
+    return sections
+}
+
 // Is this domain value itself a public suffix -- a registry under which
 // unrelated organisations hold their own names (`co.uk`, `com.br`, and every
 // bare TLD)? A suffix rule over one of those routes strangers, not a service,
@@ -3126,6 +3330,38 @@ function autoRuleNoticeDue(event) {
     if (event["announces"] === false) return false
     var count = Number(event["pending-count"] || 0)
     return count > 0
+}
+
+// ---- "A site does not open" ----
+
+// The pacing every surface shares, the service's included (`nrr_shared::
+// site_notice`): one card per half hour, the same site once a day unless its
+// card was answered, nothing once muted.
+var SITE_NOTICE_GAP_MS = 30 * 60 * 1000
+var SAME_SITE_GAP_MS = 24 * 60 * 60 * 1000
+
+/// Is `stamp` at least `gap` behind `now`? None (null, undefined) is; a stamp
+/// from the future is a clock that went back and must not silence the card.
+function _siteNoticeLongAgo(stamp, now, gap) {
+    if (stamp === null || stamp === undefined) return true
+    var at = Number(stamp)
+    return at > now || now - at >= gap
+}
+
+function siteNoticeDue(muted, lastAnyMs, siteShownMs, siteAnswered, nowMs) {
+    return muted !== true
+        && _siteNoticeLongAgo(lastAnyMs, nowMs, SITE_NOTICE_GAP_MS)
+        && (siteAnswered === true || _siteNoticeLongAgo(siteShownMs, nowMs, SAME_SITE_GAP_MS))
+}
+
+/// For an offer about a site that does not open over the main route, what the
+/// additional route was found to do: "confirmed", "unreachable" or
+/// "unconfirmed"; "" for any other offer.
+function siteOfferReach(signal, secondaryReach) {
+    if (String(signal || "") !== "main-link-blocked") return ""
+    if (secondaryReach === true) return "confirmed"
+    if (secondaryReach === false) return "unreachable"
+    return "unconfirmed"
 }
 
 /// `AUTO_RULE_SELF_SIGNED_SIGNALS`: offers a host or program made about itself.

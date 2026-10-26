@@ -553,7 +553,7 @@ fn drop_tag(flow: &FlowRule, leak_guard: bool) -> DropTag {
         DropKind::Pin
     } else {
         match flow.precedence.class {
-            P::KillSwitchBlock => DropKind::FailClosed,
+            P::KillSwitchBlock | P::AppTakeover => DropKind::FailClosed,
             P::CatchAllBlock if matches!(flow.flow.dst, DstMatch::SubnetV6 { prefix: 0, .. }) => {
                 DropKind::Ipv6Cut
             }
@@ -605,6 +605,7 @@ fn band_slug(class: nrr_platform_api::enforcement::PrecedenceClass) -> &'static 
         P::CatchAllExempt => "catch-all-exempt",
         P::KillSwitchBlock => "kill-switch-block",
         P::KillSwitchPermit => "kill-switch-permit",
+        P::AppTakeover => "app-takeover",
         P::FakeIpPool => "fake-ip-pool",
         P::HardBlock => "hard-block",
     }
@@ -1953,5 +1954,79 @@ mod tests {
         assert_eq!(rules[0].verdict, NftVerdict::Accept);
         assert_eq!(rules[1].verdict, pin_drop());
         assert!(matches!(rules[1].matches[0], NftMatch::DstSetV4(ref set) if set.len() == 10));
+    }
+
+    /// The forwarded blanket through the tunnel: out the tunnel accepted to any
+    /// address, the LAN accepted, the rest dropped, so a guest's packet sent
+    /// out the main link once the tunnel is gone meets the drop. With the
+    /// tunnel's name gone only the accept out it goes.
+    #[test]
+    fn the_forwarded_blanket_through_the_tunnel_lowers_to_the_tunnel_then_the_drop() {
+        let forwarded = |mut flow: FlowRule| {
+            flow.principal = PrincipalScope::Forwarded;
+            flow
+        };
+        let mut through = forwarded(rule(
+            PrecedenceClass::CatchAllExempt,
+            0,
+            DstMatch::Any,
+            Verdict::Permit,
+        ));
+        through.egress = EgressConstraint::OnlyVia(EgressRef::Secondary);
+        let lan = forwarded(rule(
+            PrecedenceClass::CatchAllExempt,
+            1,
+            DstMatch::SubnetV4 {
+                net: v4(192, 168, 1, 0),
+                prefix: 24,
+            },
+            Verdict::Permit,
+        ));
+        let blanket = forwarded(rule(
+            PrecedenceClass::CatchAllBlock,
+            0,
+            DstMatch::Any,
+            Verdict::Block,
+        ));
+        let plan = plan_of(vec![blanket, lan, through]);
+        let lower = |egress: &EgressNames| {
+            let scoped = [ScopedPlan {
+                plan: &plan,
+                egress,
+            }];
+            lower_scoped_with(&scoped, &owner_scope()).ruleset.forward
+        };
+
+        let up = lower(&names());
+        let judged = &up[1..];
+        assert_eq!(judged.len(), 3, "{judged:?}");
+        assert_eq!(
+            (judged[0].matches.as_slice(), judged[0].verdict),
+            (
+                &[NftMatch::OutInterface("tun0".into())][..],
+                NftVerdict::Accept
+            )
+        );
+        assert_eq!(judged[1].verdict, NftVerdict::Accept);
+        assert_eq!(
+            (judged[2].matches.as_slice(), judged[2].verdict),
+            (&[][..], NftVerdict::Drop)
+        );
+
+        let gone = lower(&EgressNames {
+            primary: Some("eth0".into()),
+            secondary: None,
+        });
+        assert!(
+            gone.iter().all(|r| !r
+                .matches
+                .iter()
+                .any(|m| matches!(m, NftMatch::OutInterface(_)))),
+            "{gone:?}"
+        );
+        assert_eq!(
+            gone.last().map(|r| (r.matches.is_empty(), r.verdict)),
+            Some((true, NftVerdict::Drop))
+        );
     }
 }

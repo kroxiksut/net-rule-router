@@ -389,6 +389,17 @@ ColumnLayout {
         var parts = []
         var signal = String(host.signal || "")
         if (signal !== "") parts.push(root.tr("tray.auto-rules.signal." + signal, signal))
+        // As sure as the probe of the additional route made it; the grouped
+        // row does not carry the probe, the service's own row does.
+        if (signal !== "" && host.status === "pending") {
+            var rows = root.autoRuleSuggestionsController.autoRuleCandidates || []
+            var raw = null
+            for (var r = 0; r < rows.length; r += 1) {
+                if (String((rows[r] || {}).id || "") === String(host.id || "")) { raw = rows[r]; break }
+            }
+            var reach = Pure.siteOfferReach(signal, raw ? raw["secondary-reach"] : null)
+            if (reach !== "") parts.push(root.tr("tray.auto-rules.reach." + reach, reach))
+        }
         var seen = Number(host.observations || 0)
         if (seen > 0) {
             parts.push(root.tr("tray.auto-rules.detail-observations", "seen in {count} visits")

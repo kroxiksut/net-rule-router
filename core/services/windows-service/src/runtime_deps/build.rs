@@ -313,25 +313,6 @@ pub(crate) fn build_supervised_runtime_deps(
         })
     };
 
-    // Asked from inside a compute, so the pass runs on a thread of its own;
-    // edges in one pass share the next one through the coalescer.
-    let peer_replan: Arc<dyn Fn() + Send + Sync> = {
-        let later = Arc::clone(&recompute_later);
-        Arc::new(move || {
-            let later = Arc::clone(&later);
-            if let Err(e) = std::thread::Builder::new()
-                .name("nrr-peer-replan".into())
-                .spawn(move || later())
-            {
-                tracing::warn!(
-                    target: "nrr::per_sid_orchestrator",
-                    error = %e,
-                    "could not start the pass another user's block-all change asked for; the periodic full pass will carry it",
-                );
-            }
-        })
-    };
-
     // ── Per-SID apply orchestrator ──────────────────────────────────
     // Lives in `runtime_deps::per_sid_apply`; see that module for why it moved
     // and what crosses the boundary.
@@ -355,7 +336,6 @@ pub(crate) fn build_supervised_runtime_deps(
                 route_coordinator,
                 rule_hostname_seeder,
                 dns_observation_consumer,
-                known_direct_registry,
                 auto_rules_engine,
                 app_destination_memory,
             ),
@@ -369,7 +349,6 @@ pub(crate) fn build_supervised_runtime_deps(
         health_agg: Arc::clone(&health_agg),
         full_pass: full_pass.clone(),
         id_generator: Arc::clone(&id_generator),
-        peer_replan,
         liveness_tracker: Arc::clone(&liveness_tracker),
         reachability_probe: Arc::clone(&reachability_probe),
         rebind_requests: Arc::clone(&rebind_requests),
@@ -615,18 +594,11 @@ pub(crate) fn build_supervised_runtime_deps(
         let observations = nrr_service_runtime::app_observation_lookup::global_app_observations();
         let walks = Arc::clone(&app_walk_generation);
         let liveness = Arc::clone(&liveness_tracker);
-        let known_direct = known_direct_registry.clone();
         let vpn_clients = Arc::clone(&learned_vpn_client_apps);
         let fake_ip = Arc::clone(&fake_ip_controller);
         Arc::new(
             PassInputs::new()
                 .with_full_pass_request(full_pass.clone())
-                // Learned in memory, and not every learner asks for a pass: the
-                // reverse-DNS one leaves the exemption to the next reconcile.
-                .with_source(
-                    "known-direct",
-                    Arc::new(move || Some(known_direct.as_ref().map_or(0, |r| r.generation()))),
-                )
                 .with_source(
                     "vpn-clients",
                     hashed(move || {
@@ -913,6 +885,13 @@ pub(crate) fn build_supervised_runtime_deps(
         }) as nrr_service_runtime::supervised_runtime::RouteRecomputeHook
     });
 
+    let link_gone_hook: Option<nrr_service_runtime::supervised_runtime::LinkGoneHook> =
+        route_coordinator.as_ref().map(|coord| {
+            let coord = Arc::clone(coord);
+            Arc::new(move |gone: &[u32]| coord.forget_links(gone))
+                as nrr_service_runtime::supervised_runtime::LinkGoneHook
+        });
+
     // External-address notice for the additional link, for the users who opted
     // in. The link comes from the SAME resolution the routing path uses, so the
     // notice can only ever describe a link the product itself considers usable.
@@ -984,10 +963,30 @@ pub(crate) fn build_supervised_runtime_deps(
                         const ROUTE_PASS_WAIT: std::time::Duration =
                             std::time::Duration::from_secs(10);
                         let reason = nrr_service_runtime::lifecycle::teardown_reason();
+                        let leak_guard_armed = super::offline_reset::leak_guard_armed_anywhere();
+                        // Our filters do not outlive the reboot; this block
+                        // holds signed-in people until the first pass after it.
+                        if leak_guard_armed
+                            && reason == nrr_service_runtime::lifecycle_matrix::StopReason::MachineShutdown
+                        {
+                            match nrr_platform_windows::boot_guard::install() {
+                                Ok(()) => tracing::info!(
+                                    target: "nrr::lifecycle",
+                                    msg_key = "svc-boot-guard-installed",
+                                    "leak protection is on: signed-in users stay blocked after the restart until the service's first pass",
+                                ),
+                                Err(e) => tracing::warn!(
+                                    target: "nrr::lifecycle",
+                                    msg_key = "svc-boot-guard-failed",
+                                    error = %e,
+                                    "the block for the restart could not be set; after it, sign-in may reach the network before the first pass",
+                                ),
+                            }
+                        }
                         let plan = stop_plan(
                             reason,
                             LifecycleInputs {
-                                leak_guard_armed: super::offline_reset::leak_guard_armed_anywhere(),
+                                leak_guard_armed,
                                 keep_rule_routes_on_stop: read_routing_stop_persist(
                                     &conn,
                                     STOP_PLAN_READ_WAIT,
@@ -1402,16 +1401,8 @@ pub(crate) fn build_supervised_runtime_deps(
     // change). Missing inputs → no factory installed → the controller stays
     // reactive (fail-safe). Must read the boot mode BEFORE `settings_conn` is
     // moved into the deps below.
-    // The Mode-B direct-answer gate needs "is any block-all armed?"
-    // from the orchestrator plus the shared known-direct registry.
-    let block_all_armed: Option<Arc<dyn Fn() -> bool + Send + Sync>> =
-        per_sid_orchestrator.as_ref().map(|orch| {
-            let orch = Arc::clone(orch);
-            Arc::new(move || orch.any_block_all_armed()) as Arc<dyn Fn() -> bool + Send + Sync>
-        });
-    // The answer gate keys on the WIDER posture: with the default per-IP guard
-    // the block-all latch stays disarmed while the additional link is
-    // unresolved and rule destinations are very much being blocked.
+    // Any guard posture, not only a block of everything: the per-address guard
+    // blocks rule destinations while the additional link is unresolved.
     let fail_closed_armed: Option<Arc<dyn Fn() -> bool + Send + Sync>> =
         per_sid_orchestrator.as_ref().map(|orch| {
             let orch = Arc::clone(orch);
@@ -1575,6 +1566,17 @@ pub(crate) fn build_supervised_runtime_deps(
     // bring-up does, so the pool permit and client caches match the fresh
     // adapter.
     fake_ip_controller.set_health(fake_ip_assembly.health());
+    // A host no served user's rules name any more gives its virtual address
+    // back once idle, on the watchdog tick below rather than the packet loop.
+    if let (Some(conn), Some(active)) = (settings_conn.as_ref(), active_routing_sid.as_ref()) {
+        fake_ip_controller.set_binding_releaser(fake_ip_assembly.binding_releaser(
+            nrr_service_runtime::fake_ip::binding_release::rule_host_keeper(
+                Arc::new(ProductionRulesProvider::new(Arc::clone(conn))),
+                Arc::clone(active),
+                Arc::clone(&served_principals),
+            ),
+        ));
+    }
     // Only when there is a stack to watch. `set_factory` is the single arming
     // path, so without it every tick is a no-op — and a recovery-BLOCKED boot
     // (settings/cache/WFP unopenable) would otherwise leave a thread outside
@@ -1694,8 +1696,6 @@ pub(crate) fn build_supervised_runtime_deps(
         active_routing_sid.as_ref(),
         route_recompute_hook.as_ref(),
         route_recompute_now.as_ref(),
-        known_direct_registry.as_ref(),
-        block_all_armed,
         fail_closed_armed,
         fail_closed_armed_for,
         Some(Arc::clone(&served_principals)),
@@ -1910,6 +1910,7 @@ pub(crate) fn build_supervised_runtime_deps(
         revision_watch,
         dns_refresh_orchestrator,
         route_recompute_hook,
+        link_gone_hook,
         observation_recompute_hook,
         route_teardown_hook,
         rule_hostname_seeder,

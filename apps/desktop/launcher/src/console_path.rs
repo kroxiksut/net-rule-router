@@ -15,168 +15,41 @@
 //! caller is the explicit user action, and both entry points below are safe to
 //! call twice — the second call reports "already there" and writes nothing.
 //!
-//! ## Where the OS work happens
+//! ## Where the work happens
 //!
-//! Nowhere here. The decision (is it already on the list, what does the list
-//! become) is `nrr_platform_api::path_registration`, and the mechanism is the
-//! per-OS backend behind `PathRegistrationPort`. This module only resolves WHICH
-//! directory to register and picks the implementation for the host.
+//! Not here. The state and the two actions are `nrr_platform_api::console_path`,
+//! shared with the terminal UI; the mechanism is the per-OS backend behind
+//! `PathRegistrationPort`. This module only names the directory (the one this
+//! process runs from) and the implementation for the host.
 
-use std::ffi::OsStr;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
-use nrr_platform_api::path_registration::{
-    list_contains_directory, PathListStyle, PathRegistrationPlan, PathRegistrationPort,
-    PathRegistrationRequest, PathRegistrationStep,
-};
-use nrr_shared::product_identity::BinaryRole;
-
-/// What the UI needs to render the action and its result.
-///
-/// Two facts, not one, and they answer different questions. `reachable` is
-/// "would typing the console's name work" — the composed `PATH`, machine
-/// entries included — and it drives the status line. `owned_entry_present` is
-/// "is OUR entry in OUR store", and it drives the button: on Unix a removal
-/// cannot change this process's inherited `PATH`, so a button watching
-/// reachability would snap straight back and read as "it did not work".
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct ConsolePathState {
-    /// The directory holding the console executable.
-    pub directory: PathBuf,
-    /// Whether the directory is reachable from a newly started shell.
-    pub reachable: bool,
-    /// Whether the entry WE would write is in the store we write to.
-    pub owned_entry_present: bool,
-    /// The command to paste into a shell that is ALREADY open — no OS updates a
-    /// running process's environment, so this is what closes the gap between
-    /// clicking the button and the console working in the terminal on screen.
-    pub current_session_command: String,
-    /// The file the registration writes to, where the mechanism is file-based
-    /// (Unix). `None` on hosts with a real per-user environment store.
-    pub target_file: Option<PathBuf>,
-}
-
-impl ConsolePathState {
-    fn from_plan(plan: &PathRegistrationPlan, reachable: bool, owned_entry_present: bool) -> Self {
-        let target_file = plan.steps.iter().find_map(|step| match step {
-            PathRegistrationStep::AppendShellProfileLine { path, .. } => Some(path.clone()),
-            _ => None,
-        });
-        Self {
-            directory: plan.directory.clone(),
-            reachable,
-            owned_entry_present,
-            current_session_command: plan.current_session_command.clone(),
-            target_file,
-        }
-    }
-}
-
-/// Whether typing the console's name works with the `PATH` this process
-/// inherited.
-///
-/// The COMPOSED list, deliberately: a directory reachable only because a
-/// machine-wide entry names it is still reachable, and telling the user
-/// otherwise would be a lie about their own shell. What we must not do is let
-/// this answer drive the button — see [`ConsolePathState`].
-fn reachable_on_process_path(directory: &Path, port: &dyn PathRegistrationPort) -> bool {
-    let list = std::env::var_os("PATH").unwrap_or_default();
-    reachable_on(&list, directory, port.style())
-}
-
-/// `directory` is on `list`, or the first console the name finds there
-/// resolves to the one in `directory`: a package links `/usr/bin/nrr-cli` to
-/// the binary in its private folder. The link is only resolved, never run.
-fn reachable_on(list: &OsStr, directory: &Path, style: PathListStyle) -> bool {
-    if list_contains_directory(&list.to_string_lossy(), directory, style) {
-        return true;
-    }
-    let name = BinaryRole::Console.host_file_name();
-    let Ok(ours) = directory.join(name).canonicalize() else {
-        return false;
-    };
-    // A relative entry depends on the shell's current folder.
-    std::env::split_paths(list)
-        .filter(|entry| entry.is_absolute())
-        .map(|entry| entry.join(name))
-        .find(|candidate| candidate.is_file())
-        .and_then(|found| found.canonicalize().ok())
-        .is_some_and(|found| found == ours)
-}
+use nrr_platform_api::console_path;
+pub use nrr_platform_api::console_path::ConsolePathState;
+use nrr_platform_api::path_registration::PathRegistrationPort;
 
 /// Report the current state, without changing anything.
 pub fn console_path_state() -> Result<ConsolePathState, String> {
-    let port = host_port()?;
-    let request = PathRegistrationRequest::for_current_user(console_directory()?);
-    let plan = port.plan(&request).map_err(|e| e.to_string())?;
-    let owned = port
-        .owned_entry_present(&request)
-        .map_err(|e| e.to_string())?;
-    let reachable = reachable_on_process_path(&request.directory, port.as_ref());
-    Ok(ConsolePathState::from_plan(&plan, reachable, owned))
+    console_path::state(host_port()?.as_ref(), &console_directory()?)
 }
 
-/// Register the console's directory on the current user's `PATH`.
-///
-/// Idempotent: calling it when the directory is already there writes nothing and
-/// still returns a state the UI can render.
+/// Register the console's directory on the current user's `PATH`; idempotent.
 pub fn register_console_on_path() -> Result<ConsolePathState, String> {
-    let port = host_port()?;
-    let request = PathRegistrationRequest::for_current_user(console_directory()?);
-    let plan = port.plan(&request).map_err(|e| e.to_string())?;
-    if plan.changes_anything() {
-        port.apply(&plan).map_err(|e| e.to_string())?;
-    }
-    // Reachability is re-read rather than assumed: the entry is in the store
-    // now, but this process still holds the `PATH` it started with, and saying
-    // "reachable" here would promise something the user's open terminal does
-    // not have.
-    let reachable = reachable_on_process_path(&request.directory, port.as_ref());
-    Ok(ConsolePathState::from_plan(&plan, reachable, true))
+    console_path::register(host_port()?.as_ref(), &console_directory()?)
 }
 
-/// Take our entry back off the current user's `PATH`.
-///
-/// Idempotent in the same way registration is: with nothing of ours on the list
-/// this writes nothing and still returns a renderable state. Only OUR entry
-/// goes — see `decide_path_removal` for what "ours" means.
+/// Take our entry back off the current user's `PATH`; idempotent, and only
+/// OUR entry goes.
 pub fn unregister_console_from_path() -> Result<ConsolePathState, String> {
-    let port = host_port()?;
-    let request = PathRegistrationRequest::for_current_user(console_directory()?);
-    port.unregister(&request).map_err(|e| e.to_string())?;
-    // Re-plan against the store as it stands AFTER the write: the registration
-    // plan is what carries `current_session_command` and the target file, and a
-    // plan computed before the removal would describe the old world.
-    let plan = port.plan(&request).map_err(|e| e.to_string())?;
-    let reachable = reachable_on_process_path(&request.directory, port.as_ref());
-    Ok(ConsolePathState::from_plan(&plan, reachable, false))
+    console_path::unregister(host_port()?.as_ref(), &console_directory()?)
 }
 
-/// The directory to register: the one this process runs from.
-///
-/// It is only accepted once the console executable is confirmed to be sitting in
-/// it. Registering a directory on the strength of "our binaries usually ship
-/// together" would, in a partial install or an unusual layout, put a directory
-/// on the user's `PATH` that never gains the program they asked for — a change
-/// they then have to find and undo by hand.
+/// The directory to register: the one this process runs from, once the
+/// console is confirmed to be in it.
 fn console_directory() -> Result<PathBuf, String> {
     let exe = std::env::current_exe()
         .map_err(|e| format!("cannot locate the running executable: {e}"))?;
-    let dir = exe
-        .parent()
-        .ok_or_else(|| "the running executable has no parent directory".to_string())?;
-    verify_console_present(dir)?;
-    Ok(dir.to_path_buf())
-}
-
-/// Confirm the console executable lives in `dir`.
-fn verify_console_present(dir: &Path) -> Result<(), String> {
-    let name = BinaryRole::Console.host_file_name();
-    if dir.join(name).is_file() {
-        Ok(())
-    } else {
-        Err(format!("{name} is not present in {}", dir.display()))
-    }
+    console_path::console_directory_beside(&exe)
 }
 
 /// The host's `PATH` mechanism, when this build has one.
@@ -199,142 +72,4 @@ fn host_port() -> Result<Box<dyn PathRegistrationPort>, String> {
 #[cfg(not(any(windows, unix)))]
 fn host_port() -> Result<Box<dyn PathRegistrationPort>, String> {
     Err("this platform has no PATH registration mechanism".to_string())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use nrr_platform_api::path_registration::{PathDecision, PathScope};
-
-    fn plan_with(steps: Vec<PathRegistrationStep>, decision: PathDecision) -> PathRegistrationPlan {
-        PathRegistrationPlan {
-            directory: PathBuf::from("/opt/netrulerouter/bin"),
-            scope: PathScope::CurrentUser,
-            decision,
-            steps,
-            current_session_command: "export PATH=\"$PATH:/opt/netrulerouter/bin\"".to_string(),
-        }
-    }
-
-    #[test]
-    fn a_file_based_plan_surfaces_the_file_it_would_write() {
-        let plan = plan_with(
-            vec![PathRegistrationStep::AppendShellProfileLine {
-                path: PathBuf::from("/home/u/.bashrc"),
-                line: "export PATH=…".to_string(),
-            }],
-            PathDecision::Append {
-                updated_list: "/usr/bin:/opt/netrulerouter/bin".to_string(),
-            },
-        );
-        let state = ConsolePathState::from_plan(&plan, false, false);
-        assert_eq!(state.target_file, Some(PathBuf::from("/home/u/.bashrc")));
-        assert!(!state.reachable);
-        assert!(!state.owned_entry_present);
-        assert!(state
-            .current_session_command
-            .contains("/opt/netrulerouter/bin"));
-    }
-
-    #[test]
-    fn an_environment_store_plan_names_no_file() {
-        let plan = plan_with(
-            vec![PathRegistrationStep::SetUserEnvironmentVariable {
-                name: "Path".to_string(),
-                value: "…".to_string(),
-            }],
-            PathDecision::Append {
-                updated_list: "…".to_string(),
-            },
-        );
-        assert_eq!(
-            ConsolePathState::from_plan(&plan, false, false).target_file,
-            None
-        );
-    }
-
-    #[test]
-    fn an_already_registered_state_still_carries_the_command_for_open_shells() {
-        // The user may have registered it in a previous session; the terminal
-        // they have open right now still predates the change.
-        let plan = plan_with(Vec::new(), PathDecision::AlreadyPresent);
-        let state = ConsolePathState::from_plan(&plan, true, true);
-        assert!(state.reachable);
-        assert!(state.owned_entry_present);
-        assert_eq!(state.target_file, None);
-        assert!(!state.current_session_command.is_empty());
-    }
-
-    /// `private/` holds the console; each name in `others` is a folder made
-    /// beside it.
-    fn layout(others: &[&str]) -> (tempfile::TempDir, PathBuf) {
-        let root = tempfile::tempdir().expect("temp dir");
-        let private = root.path().join("private");
-        std::fs::create_dir(&private).expect("private dir");
-        std::fs::write(
-            private.join(BinaryRole::Console.host_file_name()),
-            b"console",
-        )
-        .expect("console");
-        for other in others {
-            std::fs::create_dir(root.path().join(other)).expect("dir");
-        }
-        (root, private)
-    }
-
-    fn list(dirs: &[PathBuf]) -> std::ffi::OsString {
-        std::env::join_paths(dirs).expect("joinable")
-    }
-
-    #[test]
-    fn the_console_folder_on_the_list_is_reachable() {
-        let (root, private) = layout(&["elsewhere"]);
-        let path = list(&[root.path().join("elsewhere"), private.clone()]);
-        assert!(reachable_on(&path, &private, PathListStyle::host()));
-        let path = list(&[root.path().join("elsewhere")]);
-        assert!(!reachable_on(&path, &private, PathListStyle::host()));
-    }
-
-    #[test]
-    fn another_program_of_the_same_name_is_not_the_console() {
-        let (root, private) = layout(&["bin"]);
-        let bin = root.path().join("bin");
-        std::fs::write(bin.join(BinaryRole::Console.host_file_name()), b"other")
-            .expect("look-alike");
-        assert!(!reachable_on(
-            &list(&[bin]),
-            &private,
-            PathListStyle::host()
-        ));
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn a_link_on_the_path_to_the_console_makes_it_reachable() {
-        let name = BinaryRole::Console.host_file_name();
-        let (root, private) = layout(&["bin", "shadow"]);
-        let bin = root.path().join("bin");
-        std::os::unix::fs::symlink(private.join(name), bin.join(name)).expect("link");
-        assert!(reachable_on(
-            &list(std::slice::from_ref(&bin)),
-            &private,
-            PathListStyle::host()
-        ));
-        // The name runs the first match; one shadowing the link is not ours.
-        let shadow = root.path().join("shadow");
-        std::fs::write(shadow.join(name), b"other").expect("shadow");
-        assert!(!reachable_on(
-            &list(&[shadow, bin]),
-            &private,
-            PathListStyle::host()
-        ));
-    }
-
-    #[test]
-    fn a_directory_without_the_console_binary_is_refused() {
-        // The temp directory is real but holds no console executable.
-        let dir = std::env::temp_dir();
-        let err = verify_console_present(&dir).expect_err("must refuse");
-        assert!(err.contains(BinaryRole::Console.host_file_name()), "{err}");
-    }
 }

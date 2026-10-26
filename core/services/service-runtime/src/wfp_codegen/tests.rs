@@ -1378,6 +1378,73 @@ fn an_app_whose_every_address_was_claimed_is_not_reported_as_unobserved() {
     );
 }
 
+fn claimed_app_codegen(resolver: &MockAppPathResolver) -> CodegenOutput {
+    let shared = Ipv4Addr::new(203, 0, 113, 68);
+    let cache = MockFqdnCacheLookup::new();
+    cache.set_ips("blog.example", vec![shared]);
+    let observations = MockAppObservationLookup::new();
+    observations.set_ips("helper.exe", vec![shared]);
+    let rule_book = book(
+        vec![exact_fqdn_rule("r-main", "blog.example")],
+        vec![app_rule("r-app", "helper.exe", false)],
+    );
+    generate_filters(CodegenInput {
+        sid: "S",
+        rule_book: &rule_book,
+        fqdn_cache: &cache,
+        app_observations: &observations,
+        app_resolver: resolver,
+        secondary_ip_denylist: &std::collections::HashSet::new(),
+        zone_priority_over_ip: false,
+        app_rules_take_all_addresses: false,
+        families: crate::enforcement_planner::FamilyScope::V4Only,
+        packet_blocks: true,
+    })
+}
+
+/// The program is installed and was seen, yet the rule moves none of its
+/// traffic: the user must hear "found, not working, and why", never "not found".
+#[test]
+fn a_found_program_whose_every_address_went_to_address_rules_reads_as_not_carried() {
+    let resolver =
+        MockAppPathResolver::new().with("helper.exe", vec![PathBuf::from(r"C:\Apps\helper.exe")]);
+    let out = claimed_app_codegen(&resolver);
+    assert!(
+        out.diagnostics
+            .contains(&CodegenDiagnostic::AppTrafficTakenElsewhere {
+                rule_id: "r-app".into(),
+                app: "helper.exe".into(),
+                reason: crate::address_ownership::AppTrafficElsewhere::NamedByAddressRules,
+            }),
+        "{:?}",
+        out.diagnostics
+    );
+    assert!(
+        !out.diagnostics
+            .iter()
+            .any(|d| matches!(d, CodegenDiagnostic::AppUnresolved { .. })),
+        "the program was found",
+    );
+}
+
+/// A program not on this machine stays "not found", whatever its old
+/// observations say.
+#[test]
+fn a_missing_program_with_claimed_addresses_still_reads_as_not_found() {
+    let out = claimed_app_codegen(&MockAppPathResolver::new());
+    assert!(out
+        .diagnostics
+        .iter()
+        .any(|d| matches!(d, CodegenDiagnostic::AppUnresolved { .. })));
+    assert!(
+        !out.diagnostics
+            .iter()
+            .any(|d| matches!(d, CodegenDiagnostic::AppTrafficTakenElsewhere { .. })),
+        "{:?}",
+        out.diagnostics
+    );
+}
+
 /// The mirror case: an address NO main-route rule names is taken over as
 /// before. The guard must not turn into "app rules never route anything".
 #[test]
@@ -1473,6 +1540,40 @@ fn app_rule_routes_observed_ips_as_secondary_dest() {
             .filter(|f| f.remote_ip.is_some() || !f.remote_ip_set.is_empty())
             .count(),
         2
+    );
+}
+
+/// A shared address the shared-address policy declined for the tunnel is
+/// declined for the program's filters too: the route already leaves it on the
+/// main link, and a `/32` permit beside it would answer the same question the
+/// other way.
+#[test]
+fn a_declined_shared_address_gets_no_program_permit() {
+    let cache = MockFqdnCacheLookup::new();
+    let resolver =
+        MockAppPathResolver::new().with("chrome.exe", vec![PathBuf::from(r"C:\Apps\chrome.exe")]);
+    let app_obs = MockAppObservationLookup::new();
+    let shared = Ipv4Addr::new(203, 0, 113, 7);
+    let own = Ipv4Addr::new(203, 0, 113, 8);
+    app_obs.set_ips("chrome.exe", vec![shared, own]);
+    let rule_book = book(vec![], vec![app_rule("r-app", "chrome.exe", false)]);
+    let declined: std::collections::HashSet<Ipv4Addr> = [shared].into_iter().collect();
+    let out = generate_filters(CodegenInput {
+        sid: "S",
+        rule_book: &rule_book,
+        fqdn_cache: &cache,
+        app_observations: &app_obs,
+        app_resolver: &resolver,
+        secondary_ip_denylist: &declined,
+        zone_priority_over_ip: false,
+        app_rules_take_all_addresses: false,
+        families: crate::enforcement_planner::FamilyScope::V4Only,
+        packet_blocks: true,
+    });
+    assert_eq!(out.secondary_dest_ips, vec![own]);
+    assert!(
+        !out.filters.iter().any(|f| f.covers_v4(shared)),
+        "the declined address kept a permit"
     );
 }
 

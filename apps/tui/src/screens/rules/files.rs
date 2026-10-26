@@ -5,10 +5,11 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
+use nrr_client_logic::passthrough::add_passthrough_block;
 use nrr_client_logic::rules_table::{build_rules_file_text, RuleRow, RulesFileOptions};
 use nrr_client_logic::Route;
 use nrr_shared::platform_profile::PlatformProfile;
-use nrr_shared::preset_parser::parse_canonical_rules;
+use nrr_shared::preset_parser::{app_section_os_label, parse_canonical_rules};
 
 use super::table::{row_from_parsed, Table};
 
@@ -45,6 +46,94 @@ pub struct RuleSet {
     pub files: usize,
     /// The file each route was read from, when the set has one.
     pub paths: [Option<PathBuf>; 2],
+    /// Every such section as read, in file order, per route: the answers to
+    /// [`RuleSet::questions`] are applied to these.
+    pub blocks: [Vec<(String, String)>; 2],
+    /// What the user decides before the set lands (the window's import review).
+    pub questions: Vec<ReviewQuestion>,
+    /// Known sections that appear more than once, with how often: their rules
+    /// are all taken, which is only said.
+    pub known_duplicates: Vec<(String, u32)>,
+}
+
+/// A decision the import asks for, as the window's review does.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ReviewQuestion {
+    /// A section this build does not apply appears more than once.
+    Duplicate { name: String, occurrences: u32 },
+    /// A section that is neither a rule section nor another system's programs.
+    Unknown { name: String, lines: usize },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DuplicateChoice {
+    KeepAll,
+    LastOnly,
+    Ignore,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum UnknownChoice {
+    Keep,
+    /// Its lines become rules of the section with this header.
+    Refile(&'static str),
+    Skip,
+}
+
+/// The application section of the system this runs on.
+#[cfg(windows)]
+pub const OWN_APP_SECTION: &str = "Windows";
+#[cfg(target_os = "macos")]
+pub const OWN_APP_SECTION: &str = "MacOS";
+#[cfg(not(any(windows, target_os = "macos")))]
+pub const OWN_APP_SECTION: &str = "Linux";
+
+/// What an unknown section can be refiled as, in the window's order.
+pub const REFILE_HEADERS: [&str; 6] = ["Zones", "Domains", "IP", "Ranges", "CIDR", OWN_APP_SECTION];
+
+impl RuleSet {
+    /// The answers to [`RuleSet::questions`]: which blocks stay as sections,
+    /// which go, and which become rules. A section with no answer stays whole.
+    pub fn apply_review(
+        &mut self,
+        duplicates: &BTreeMap<String, DuplicateChoice>,
+        unknown: &BTreeMap<String, UnknownChoice>,
+    ) {
+        for route in Route::ALL {
+            let at = route_index(route);
+            let blocks = &self.blocks[at];
+            let mut kept = Vec::new();
+            for (i, (name, raw)) in blocks.iter().enumerate() {
+                let later = blocks[i + 1..].iter().any(|(n, _)| n == name);
+                match duplicates.get(name) {
+                    Some(DuplicateChoice::Ignore) => continue,
+                    Some(DuplicateChoice::LastOnly) if later => continue,
+                    _ => {}
+                }
+                kept.push((name.clone(), raw.clone()));
+            }
+            let mut passthrough = BTreeMap::new();
+            for (name, raw) in kept {
+                match unknown.get(&name).copied().unwrap_or(UnknownChoice::Keep) {
+                    UnknownChoice::Skip => {}
+                    UnknownChoice::Refile(header) => {
+                        let text = format!("--- {header}\n{raw}");
+                        let parsed = parse_canonical_rules(&text);
+                        self.rows
+                            .extend(parsed.rules.iter().map(|rule| row_from_parsed(rule, route)));
+                    }
+                    UnknownChoice::Keep => add_block(&mut passthrough, name, &raw),
+                }
+            }
+            self.passthrough[at] = passthrough;
+        }
+    }
+}
+
+/// Two sections of one name are kept as one, in file order: nothing of the
+/// first is lost to the second.
+fn add_block(passthrough: &mut BTreeMap<String, String>, name: String, raw: &str) {
+    add_passthrough_block(passthrough, &name, raw);
 }
 
 pub fn read_text(path: &Path) -> Result<Option<String>, ReadError> {
@@ -77,11 +166,72 @@ pub fn read_set(dir: &Path) -> Result<RuleSet, (PathBuf, ReadError)> {
         let parsed = parse_canonical_rules(&text);
         set.rows
             .extend(parsed.rules.iter().map(|rule| row_from_parsed(rule, route)));
+        for duplicate in &parsed.duplicate_sections {
+            let name = duplicate.section_name.clone();
+            if duplicate.is_known_section {
+                if !set.known_duplicates.iter().any(|(n, _)| *n == name) {
+                    set.known_duplicates.push((name, duplicate.occurrences));
+                }
+            } else if !set
+                .questions
+                .iter()
+                .any(|q| matches!(q, ReviewQuestion::Duplicate { name: n, .. } if *n == name))
+            {
+                set.questions.push(ReviewQuestion::Duplicate {
+                    name,
+                    occurrences: duplicate.occurrences,
+                });
+            }
+        }
         for block in parsed.passthrough {
-            set.passthrough[route_index(route)].insert(block.section_name, block.raw_text);
+            let name = block.section_name;
+            // Another system's programs are kept for it, never asked about.
+            let asked = app_section_os_label(&name).is_none()
+                && !set
+                    .questions
+                    .iter()
+                    .any(|q| matches!(q, ReviewQuestion::Unknown { name: n, .. } if *n == name));
+            if asked {
+                set.questions.push(ReviewQuestion::Unknown {
+                    name: name.clone(),
+                    lines: block.content_lines,
+                });
+            }
+            add_block(
+                &mut set.passthrough[route_index(route)],
+                name.clone(),
+                &block.raw_text,
+            );
+            set.blocks[route_index(route)].push((name, block.raw_text));
         }
     }
     Ok(set)
+}
+
+/// Takes `route`'s passthrough sections from its bound file at `path`, so the
+/// list shows what the file holds and a rewrite carries it, whoever wrote it.
+/// A missing or unreadable file leaves the ones in memory.
+pub fn take_passthrough_from(table: &mut Table, route: Route, path: &Path) {
+    if let Ok(Some(text)) = read_text(path) {
+        let mut passthrough = BTreeMap::new();
+        for block in parse_canonical_rules(&text).passthrough {
+            add_block(&mut passthrough, block.section_name, &block.raw_text);
+        }
+        table.passthrough[route_index(route)] = passthrough;
+    }
+}
+
+/// [`take_passthrough_from`] for both bound files named in `settings_file`.
+pub fn take_bound_passthrough(table: &mut Table, settings_file: Option<&Path>) {
+    let Some(settings) = settings_file.and_then(|file| super::own_settings::read(file).ok()) else {
+        return;
+    };
+    let bound = [settings.rules_files.primary, settings.rules_files.secondary];
+    for (route, path) in Route::ALL.into_iter().zip(bound) {
+        if !path.is_empty() {
+            take_passthrough_from(table, route, Path::new(&path));
+        }
+    }
 }
 
 /// Whether writing to `dir` would replace a rules file.
@@ -212,6 +362,31 @@ pub fn presets_root() -> Option<PathBuf> {
     #[cfg(not(debug_assertions))]
     let checkout: Option<PathBuf> = None;
     beside.into_iter().chain(checkout).find(|dir| dir.is_dir())
+}
+
+/// The demo rule set the window's "Load demo rules" reads, in the reader's
+/// language when it has one: shipped under `configs/presets`, found the way
+/// [`presets_root`] finds the country sets.
+pub fn demo_dir(russian: bool) -> Option<PathBuf> {
+    let beside = std::env::current_exe().ok().and_then(|exe| {
+        exe.parent()
+            .map(|dir| dir.join("configs/presets/builtin-demo"))
+    });
+    #[cfg(debug_assertions)]
+    let checkout =
+        Some(Path::new(env!("CARGO_MANIFEST_DIR")).join("../../configs/presets/builtin-demo"));
+    #[cfg(not(debug_assertions))]
+    let checkout: Option<PathBuf> = None;
+    let root = beside
+        .into_iter()
+        .chain(checkout)
+        .find(|dir| dir.is_dir())?;
+    let translated = root.join("ru");
+    Some(if russian && translated.is_dir() {
+        translated
+    } else {
+        root
+    })
 }
 
 fn sorted_dirs(dir: &Path) -> Vec<PathBuf> {

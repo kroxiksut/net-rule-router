@@ -34,6 +34,12 @@ ColumnLayout {
     /// Show only rules the service authored (they carry an origin tag; a rule
     /// the user typed carries none).
     property bool filterAutoAddedOnly: false
+    // Rules that do not work (a value no rule set may apply) are kept and
+    // shown; switched off, the table leaves them out.
+    property bool showNotWorking: true
+    /// Another OS's programs in the rules files, per route: read-only rows the
+    /// table shows after its own, never applied, sent or written from.
+    property var otherOsByRoute: ({ "primary": [], "secondary": [] })
     property string searchText: ""
 
     // ── «Recent»: what the user changed lately, told by the service ──
@@ -443,6 +449,25 @@ ColumnLayout {
         } else {
             arr.sort(compareRules)
         }
+        // After the table's own rows, whatever the order: the cursor and every
+        // action stop at them (`masterIndex` -1).
+        var otherRoutes = ["primary", "secondary"]
+        for (var o = 0; o < otherRoutes.length; o += 1) {
+            var others = section.otherOsByRoute[otherRoutes[o]] || []
+            for (var p = 0; p < others.length; p += 1) {
+                if (!section.passesFilter(others[p])) continue
+                var other = Object.assign({}, others[p])
+                other.masterId = ""
+                other.masterIndex = -1
+                other.ruleKey = ""
+                other.recentMark = ""
+                other.recentAt = 0
+                other.recentTip = ""
+                other.overrideMark = ""
+                other.overrideUntil = -1
+                arr.push(other)
+            }
+        }
         section.modelRevision += 1
         displayModel.clear()
         // Single append for the whole snapshot — see `_appendRowsChunked` in
@@ -470,6 +495,45 @@ ColumnLayout {
     function scheduleRebuild() {
         if (root && root.rulesBulkLoading === true) return
         rebuildTimer.restart()
+    }
+
+    /// Re-reads another OS's programs from the sections the launcher keeps
+    /// for each rules file; it parses them, the table only shows them.
+    function refreshOtherOsRows() {
+        if (typeof nrrNativeBridge === "undefined" || !nrrNativeBridge
+                || typeof nrrNativeBridge.rpcSidecarPassthroughRead !== "function"
+                || !root.rpc || typeof root.rpc.registerRpcCallback !== "function") return
+        var routes = ["primary", "secondary"]
+        for (var r = 0; r < routes.length; r += 1) {
+            var corr = nrrNativeBridge.rpcSidecarPassthroughRead(routes[r])
+            if (!corr || String(corr) === "") continue
+            root.rpc.registerRpcCallback(corr, (function(route) {
+                return function(ok, payload) {
+                    var found = (ok && payload && payload["other-os-rules"]) || []
+                    var rows = []
+                    for (var i = 0; i < found.length; i += 1) {
+                        var rule = found[i] || {}
+                        rows.push({
+                            id: "",
+                            enabled: rule.enabled === true,
+                            ruleType: "application",
+                            matchValue: String(rule.value || ""),
+                            targetRoute: rule.blocked === true ? "block" : route,
+                            verify: false,
+                            comment: String(rule.comment || ""),
+                            validationStatus: "error",
+                            validationMessageKey: "rules.other-os.not-applied",
+                            validationMessageArgs: { os: String(rule.os || "") }
+                        })
+                    }
+                    var next = ({ "primary": section.otherOsByRoute.primary,
+                                  "secondary": section.otherOsByRoute.secondary })
+                    next[route] = rows
+                    section.otherOsByRoute = next
+                    section.scheduleRebuild()
+                }
+            })(routes[r]))
+        }
     }
 
     // Per-row edit / toggle key on the MASTER INDEX (unique), not the
@@ -592,11 +656,13 @@ ColumnLayout {
 
     onFilterTypeChanged:    scheduleRebuild()
     onFilterEnabledChanged: scheduleRebuild()
+    onShowNotWorkingChanged: scheduleRebuild()
     onFilterRouteChanged:   scheduleRebuild()
     onFilterAutoAddedOnlyChanged: scheduleRebuild()
     onSearchTextChanged:    scheduleRebuild()
     Component.onCompleted: {
         section._reindexOverrides()
+        section.refreshOtherOsRows()
         rebuildDisplay()
         if (typeof root.refreshRulesOverlaps === "function") root.refreshRulesOverlaps()
     }
@@ -615,6 +681,7 @@ ColumnLayout {
         // (this is what previously only happened on a manual re-search).
         target: root
         function onRulesModelEdited() { section.scheduleRebuild() }
+        function onPassthroughRevisionChanged() { section.refreshOtherOsRows() }
         // Bulk-load settle signal — see `scheduleRebuild()` doc comment above.
         // `rulesBulkLoading` flips true→false exactly once per service
         // refetch/import, AFTER the model is fully populated and overlaid;
@@ -796,7 +863,8 @@ ColumnLayout {
         var sawAnyVisible = false
         for (var i = 0; i < displayModel.count; i += 1) {
             var vis = displayModel.get(i)
-            if (!vis) continue
+            // Another OS's rows take no selection.
+            if (!vis || String(vis.ruleKey || "") === "") continue
             sawAnyVisible = true
             if (section.selectedRowIds[String(vis.ruleKey || "")]) anySelected = true
             else anyUnselected = true
@@ -913,6 +981,7 @@ ColumnLayout {
             type: section.filterType,
             route: section.filterRoute,
             autoOnly: section.filterAutoAddedOnly,
+            hideNotWorking: !section.showNotWorking,
             recentOnly: section.filterRecent,
             search: section.searchText
         }, function () { return section.overrideFor(item) !== null },
@@ -2509,6 +2578,26 @@ ColumnLayout {
                 verticalAlignment: Text.AlignVCenter
             }
         }
+        CheckBox {
+            id: notWorkingFilterCheck
+            text: root.uiRevision >= 0
+                ? root.tr("rules.filter.show-not-working", "Show rules that do not work") : ""
+            checked: section.showNotWorking
+            onToggled: section.showNotWorking = checked
+            Accessible.name: text
+            Accessible.description: root.uiRevision >= 0
+                ? root.tr("rules.filter.show-not-working-tooltip",
+                    "Rules whose value cannot be applied are kept in your set and shown with the reason. Delete one to remove it. Rules for other systems stay in the rules file and are applied only there.")
+                : ""
+            ToolTip.visible: hovered && root.prefs.tooltipsEnabled
+            ToolTip.text: Accessible.description
+            contentItem: Text {
+                text: notWorkingFilterCheck.text
+                color: root.textColor
+                leftPadding: notWorkingFilterCheck.indicator.width + notWorkingFilterCheck.spacing
+                verticalAlignment: Text.AlignVCenter
+            }
+        }
         // «Recent»: what the user added, changed or deleted lately.
         CheckBox {
             id: recentFilterCheck
@@ -3134,6 +3223,7 @@ ColumnLayout {
                     CheckBox {
                         Layout.preferredWidth: 32
                         Layout.alignment: Qt.AlignVCenter
+                        enabled: model.masterIndex >= 0
                         checked: ruleDelegate.isSelectedForBulk
                         onToggled: section._setRowSelected(model.masterIndex, checked)
                         Accessible.name: ToolTip.text + ": " + Pure.displayText(model.matchValue)
@@ -3276,7 +3366,7 @@ ColumnLayout {
                     CheckBox {
                         Layout.preferredWidth: 28
                         Layout.alignment: Qt.AlignVCenter | Qt.AlignHCenter
-                        enabled: !section.rulesLocked
+                        enabled: !section.rulesLocked && model.masterIndex >= 0
                         checked: !!model.enabled
                         onToggled: {
                             section._setRuleEnabledAt(model.masterIndex, checked)

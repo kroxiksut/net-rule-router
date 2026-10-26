@@ -86,7 +86,10 @@ SystemTrayIcon {
         && typeof nrrNativeBridge.rpcRoutingPauseGet === "function"
 
     readonly property string actionMarker: "NRR_TRAY_ACTION:"
-    readonly property string appIconSource: "../../../assets/icons/app/icon-64.png"
+    // Resolved by the launcher beside the binary, as in Main.qml.
+    property string assetsRootUrl: ""
+    function assetUrl(relative) { return assetsRootUrl === "" ? "" : assetsRootUrl + "/" + relative }
+    readonly property string appIconSource: assetUrl("icons/app/icon-64.png")
 
     // Correlation-id RPC transport (pending-callback table + GC timer + bridge
     // forwarders), shared with the main window via flows/RpcTransport. Held in a
@@ -151,6 +154,8 @@ SystemTrayIcon {
     /// answer to the user's own pick in the menu, which goes ahead of
     /// background notices and is never the one the cap drops.
     function _presentOrQueue(kind, show, fromUser) {
+        // Started for one card: nothing else is said before the tray leaves.
+        if (_noticeSite !== "" && kind !== "site-not-opening" && kind !== "tray-add-rule") return
         if (!promptWindow || !promptWindow.visible) {
             show()
             return
@@ -192,6 +197,8 @@ SystemTrayIcon {
         _activeNoticeId = ""
         _addRuleUndo = null
         _autoRuleActiveIds = []
+        // Unanswered: the sites it told of wait their day.
+        _siteHostsOnScreen = []
         _enforcementNoticeKind = ""
         _noticeMuteKind = ""
         _silenceChoiceReplacedOffer = false
@@ -433,6 +440,182 @@ SystemTrayIcon {
         return _addRuleWindow
     }
 
+    // ── One card while the tray is otherwise closed ──────────────────────────
+    //
+    // The service starts the tray with `--nrr-notice-site=<host>` when a site
+    // the user opened does not open over the main route and nothing of theirs
+    // is running to say so. No icon: the card, its answer, and the tray leaves.
+
+    property string _noticeSite: ""
+    property bool _noticeShown: false
+    property bool _noticeWritePending: false
+    property double _noticeModeStartedAt: 0
+    readonly property int _noticeModeLimitMs: 600000
+    /// How long a card the mutes held back is waited for.
+    readonly property int _noticeModeQuietMs: 15000
+
+    function _readNoticeSite() {
+        var flag = "--nrr-notice-site="
+        var args = Qt.application.arguments
+        for (var i = 0; i < args.length; i += 1) {
+            var a = String(args[i])
+            if (a.indexOf(flag) !== 0) continue
+            var host = a.slice(flag.length)
+            // The launcher passes only a plain host; anything else is not ours.
+            if (host.length <= 253 && /^[a-z0-9-]+(\.[a-z0-9-]+)+$/.test(host)) return host
+        }
+        return ""
+    }
+
+    // ── When a card about a site that does not open may show ─────────────────
+    //
+    // One rule for the tray started for one card and a running tray
+    // (`siteNoticeDue`, the service's too), kept in the notice ledger both
+    // tray processes share so each holds the other to it.
+
+    readonly property string _siteShownAnyId: "site-notice-shown"
+    function _siteShownId(host) { return "site-notice-shown:" + host }
+    function _siteAnsweredId(host) { return "site-notice-answered:" + host }
+    /// Sites the prompt on screen is telling of, answered by its buttons.
+    property var _siteHostsOnScreen: []
+
+    /// Whether a card about `host` may show now; the mutes as last read.
+    function _siteNoticeDue(host) {
+        var shown = noticeLedger.decidedAt(_siteShownId(host))
+        var answered = noticeLedger.decidedAt(_siteAnsweredId(host))
+        return Pure.siteNoticeDue(_noticeMutedNow("site-not-opening"),
+            noticeLedger.decidedAt(_siteShownAnyId) || null,
+            shown || null,
+            answered > 0 && answered >= shown,
+            Date.now())
+    }
+
+    function _recordSitesShown(hosts) {
+        var ids = [_siteShownAnyId]
+        for (var i = 0; i < hosts.length; i += 1) ids.push(_siteShownId(hosts[i]))
+        noticeLedger.recordAll(ids)
+        _siteHostsOnScreen = hosts.slice()
+    }
+
+    function _recordSitesAnswered() {
+        if (_siteHostsOnScreen.length > 0)
+            noticeLedger.recordAll(_siteHostsOnScreen.map(_siteAnsweredId))
+        _siteHostsOnScreen = []
+    }
+
+    /// The card's words for `reach` (`siteOfferReach`): only as sure as the
+    /// probe of the additional route made it.
+    function _siteNoticeBody(host, reach) {
+        var shown = Pure.displayText(host)
+        return reach === "confirmed"
+            ? tr("tray.site-not-opening.body-confirmed",
+                "{host} does not open over the main connection, but opens over the additional route.")
+                .replace("{host}", shown)
+            : tr("tray.site-not-opening.body-unconfirmed",
+                "{host} does not open over the main connection; the additional route may help.")
+                .replace("{host}", shown)
+    }
+
+    /// What the additional route was found to do for `host`, from the offers
+    /// the service holds; "unconfirmed" when that cannot be read.
+    function _siteReachThen(host, done) {
+        var corr = (rpc && typeof rpc.rpcAutoRuleCandidatesList === "function")
+            ? rpc.rpcAutoRuleCandidatesList() : ""
+        if (!corr) {
+            done("unconfirmed")
+            return
+        }
+        rpc.registerRpcCallback(corr, function(ok, payload) {
+            var list = (ok && payload && payload.candidates) || []
+            for (var i = 0; i < list.length; i += 1) {
+                var c = list[i] || {}
+                if (String(c["proposed-match"] || "") !== host) continue
+                var reach = Pure.siteOfferReach(c.signal, c["secondary-reach"])
+                if (reach !== "") {
+                    done(reach)
+                    return
+                }
+            }
+            done("unconfirmed")
+        })
+    }
+
+    function _showSiteNotice() {
+        _noticeModeStartedAt = Date.now()
+        _noticeModeWatch.start()
+        _whenNoticeAllowed("site-not-opening", function() {
+            if (!tray._siteNoticeDue(tray._noticeSite)) {
+                console.log("tray notice: site-not-opening held back — told within its window")
+                return
+            }
+            tray._siteReachThen(tray._noticeSite, function(reach) {
+                tray._showSiteNoticeCard(reach)
+            })
+        })
+    }
+
+    function _showSiteNoticeCard(reach) {
+        _presentOrQueue("site-not-opening", function() {
+            tray._noticeShown = true
+            tray._recordSitesShown([tray._noticeSite])
+            promptWindow.present({
+                titleText: tr("tray.site-not-opening.title", "A site does not open"),
+                bodyText: tray._siteNoticeBody(tray._noticeSite, reach),
+                primaryAction: {
+                    label: tr("tray.site-not-opening.add", "Add rule"),
+                    actionId: "site-not-opening-add",
+                    accent: true
+                },
+                secondaryAction: {
+                    label: tr("tray.site-not-opening.mute", "Don't report again"),
+                    actionId: "site-not-opening-mute"
+                },
+                dismissActionId: "site-not-opening-dismiss",
+                autoRetireMs: _promptAutoRetireMs
+            })
+        })
+    }
+
+    /// Mutes `kind` until lifted in Settings, without the duration chooser.
+    function _muteNoticeForGood(kind) {
+        var req = Pure.noticeMuteRequest(kind, "forever", Date.now())
+        if (req === null || !rpc || typeof rpc.rpcBlockNoticeMutesSet !== "function") return
+        var corr = rpc.rpcBlockNoticeMutesSet(req)
+        if (!corr) return
+        _noticeWritePending = true
+        rpc.registerRpcCallback(corr, function(ok, p, code, msg) {
+            tray._noticeWritePending = false
+            if (!ok) console.warn("notice mute set failed:", code, msg)
+        })
+    }
+
+    function _onSiteNoticeAction(action) {
+        // Closing the card is no answer: the site waits its day.
+        if (action === "site-not-opening-dismiss") _siteHostsOnScreen = []
+        else _recordSitesAnswered()
+        if (action === "site-not-opening-add") {
+            var w = _ensureAddRuleWindow()
+            if (w) w.presentFor(_noticeSite, "secondary")
+        } else if (action === "site-not-opening-mute") {
+            _muteNoticeForGood("site-not-opening")
+        }
+    }
+
+    /// Leaves once nothing of the card is left: the card, the rule form, the
+    /// add's own notice and the mute on its way. Bounded either way.
+    property Timer _noticeModeWatch: Timer {
+        interval: 1000
+        repeat: true
+        onTriggered: {
+            var busy = (tray.promptWindow && tray.promptWindow.visible)
+                || tray._addRuleWindow !== null || tray._noticeWritePending
+            var waited = Date.now() - tray._noticeModeStartedAt
+            if ((tray._noticeShown && !busy) || waited > tray._noticeModeLimitMs
+                    || (!tray._noticeShown && waited > tray._noticeModeQuietMs))
+                Qt.quit()
+        }
+    }
+
     /// How long the notice of an add offers to take it back.
     readonly property int _addRuleUndoMs: 15000
     /// What the add on screen can be taken back with, while its notice is up.
@@ -552,6 +735,9 @@ SystemTrayIcon {
                 break
             case "auto-rule-candidates-changed":
                 _onAutoRuleCandidatesChanged(event)
+                break
+            case "link-keeps-dropping":
+                _onLinkKeepsDropping(event)
                 break
             case "secondary-external-address-observed":
                 _onSecondaryExternalAddress(event)
@@ -742,7 +928,18 @@ SystemTrayIcon {
         // Listed, not announced: the menu carries the count and opens the
         // prompt when the user asks for it.
         _autoRulePendingCount = Number(event["pending-count"] || 0)
+        // Except a site the user opened that does not open: that one gets its
+        // card, also for what piled up while no surface of theirs was running.
+        // The tray started for one card says nothing else.
+        if (_noticeSite === "" && Pure.autoRuleNoticeDue(event)) {
+            _autoRuleOnlySitesNotOpening = true
+            // The mute is read afresh: it may have been set in the window.
+            _refreshNoticeMutes(function() { tray._fetchAutoRuleCandidates() })
+        }
     }
+
+    /// The next prompt lists only sites that do not open over the main route.
+    property bool _autoRuleOnlySitesNotOpening: false
 
     function _fetchAutoRuleCandidates() {
         if (_autoRuleFetchInFlight) return
@@ -768,6 +965,7 @@ SystemTrayIcon {
                 // A request left standing would turn a later unasked fetch into
                 // a "nothing is waiting" window.
                 tray._autoRuleShowAll = false
+                tray._autoRuleOnlySitesNotOpening = false
                 // The turn was spent without showing anything — let whatever is
                 // behind it through rather than stalling the queue on a failure.
                 tray._scheduleDrain()
@@ -842,6 +1040,8 @@ SystemTrayIcon {
         var signal = String(c.signal || c["signal"] || "")
         if (signal !== "") {
             parts.push(tr("tray.auto-rules.signal." + signal, signal))
+            var reach = Pure.siteOfferReach(signal, c["secondary-reach"])
+            if (reach !== "") parts.push(tr("tray.auto-rules.reach." + reach, reach))
         }
         var observations = Number(c.observations || c["observations"] || 0)
         if (observations > 0) {
@@ -891,6 +1091,18 @@ SystemTrayIcon {
             if (aa === bb) return 0
             return aa < bb ? -1 : 1
         })
+        // Asked by the user, the whole list; raised by the service, only the
+        // sites that do not open.
+        var onlySitesNotOpening = _autoRuleOnlySitesNotOpening && !_autoRuleShowAll
+        _autoRuleOnlySitesNotOpening = false
+        if (onlySitesNotOpening) {
+            // Under the rule the tray started for one card keeps too: the
+            // mute, one card per half hour, a site once a day unanswered.
+            ordered = ordered.filter(function(r) {
+                return String((r || {}).signal || "") === "main-link-blocked"
+                    && tray._siteNoticeDue(String((r || {})["proposed-match"] || ""))
+            })
+        }
         for (var i = 0; i < ordered.length; i += 1) {
             if (ids.length >= _autoRuleMaxPerNotice) break
             var c = ordered[i] || {}
@@ -963,6 +1175,13 @@ SystemTrayIcon {
         console.log("tray auto-rules: offering", ids.length, "addresses for", anchor)
         _autoRuleActiveIds = ids
         _activeNoticeId = ""
+        if (onlySitesNotOpening) {
+            _recordSitesShown(shownRows.map(function(r) {
+                return String((r || {})["proposed-match"] || "")
+            }))
+        } else {
+            _siteHostsOnScreen = []
+        }
 
         var siteName = anchor !== ""
             ? Pure.displayText(anchor)
@@ -1000,13 +1219,18 @@ SystemTrayIcon {
             bodyText = tr("tray.auto-rules.body-mixed-blocked",
                     "The programs and sites below keep failing on the main route.")
         } else if (noticeKind === "sites-blocked") {
+            var oneReach = Pure.siteOfferReach(shownRows[0].signal, shownRows[0]["secondary-reach"])
             bodyText = ids.length > 1
                 ? tr("tray.auto-rules.body-blocked-multi",
                         "Connections to {count} sites keep failing on the main route.")
                     .replace("{count}", String(ids.length))
-                : tr("tray.auto-rules.body-blocked",
+                // One site: the same words as its card, as sure as the probe
+                // of the additional route made them.
+                : (oneReach === "confirmed" || oneReach === "unconfirmed"
+                    ? _siteNoticeBody(String(shownRows[0]["proposed-match"] || ""), oneReach)
+                    : tr("tray.auto-rules.body-blocked",
                         "Connections to {name} keep failing on the main route.")
-                    .replace("{name}", items[0].primaryText)
+                        .replace("{name}", items[0].primaryText))
         } else {
             // One heading cannot honestly name one site when the rows belong
             // to several; each row still says which site it came from.
@@ -3013,6 +3237,37 @@ SystemTrayIcon {
         })
     }
 
+    /// A link whose drops were each too short to tell, but keep coming. The
+    /// service says it once and again only after the link held.
+    function _onLinkKeepsDropping(event) {
+        if (!showNotifications) {
+            console.log("tray link-keeps-dropping notice: suppressed, notifications are off")
+            return
+        }
+        var presence = guiPresence ? guiPresence.read() : { windowActive: false }
+        if (presence.windowActive) return
+        var role = String(event.role || "")
+        _offerNotice("link-keeps-dropping", "link-keeps-dropping:" + role, function() {
+            promptWindow.present({
+                titleText: role === "primary"
+                    ? tr("notifications.link-keeps-dropping.title-primary",
+                        "The main connection keeps dropping")
+                    : tr("notifications.link-keeps-dropping.title-secondary",
+                        "The additional connection keeps dropping"),
+                bodyText: tr("notifications.link-keeps-dropping.body",
+                    "It went down and came back several times in the last two minutes. Your rules stayed in force, but pages may have failed to load in between. Check the cable, the Wi-Fi or the VPN."),
+                primaryAction: {
+                    label: tr("notifications.enforcement.action", "Open interfaces"),
+                    actionId: "enforcement-open-interfaces",
+                    accent: true
+                },
+                secondaryAction: tray._noticeMuteAction("link-keeps-dropping"),
+                dismissActionId: "enforcement-dismiss",
+                autoRetireMs: tray._enforcementNoticeMs
+            })
+        })
+    }
+
     function _onEnforcementStatusChanged(event) {
         var status = String(event.status || "")
         var role = String(event.role || "")
@@ -3480,6 +3735,11 @@ SystemTrayIcon {
     /// pressing Esc arrives here as the dismiss action id.
     function _onPromptAction(actionId, selectedIndexes) {
         var action = String(actionId)
+        if (action.indexOf("site-not-opening-") === 0) {
+            _onSiteNoticeAction(action)
+            _scheduleDrain()
+            return
+        }
         if (action === "leak-protection-confirm" || action === "leak-protection-cancel") {
             var level = _leakConfirmLevel
             _leakConfirmLevel = ""
@@ -3788,6 +4048,7 @@ SystemTrayIcon {
         // user has not been shown yet are unaffected.
         if (action === "auto-rules-later") {
             _activeNoticeId = ""
+            _siteHostsOnScreen = []
             _snoozeCandidates(ids)
             _scheduleDrain()
             return
@@ -3824,6 +4085,10 @@ SystemTrayIcon {
             answered.push(_autoRuleNoticeId(declined[j]))
             answered.push(_autoRuleRefusedId(declined[j]))
         }
+        if (action === "auto-rules-accept" || action === "auto-rules-dismiss") {
+            answered = answered.concat(_siteHostsOnScreen.map(_siteAnsweredId))
+        }
+        _siteHostsOnScreen = []
         noticeLedger.recordAll(answered)
         switch (action) {
             case "auto-rules-accept":
@@ -4667,6 +4932,7 @@ SystemTrayIcon {
         routePrimaryLabel = context.routePrimaryLabel || routePrimaryLabel
         routeSecondaryLabel = context.routeSecondaryLabel || routeSecondaryLabel
         iconFileUrl = context.iconFileUrl || ""
+        assetsRootUrl = String(context.assetsRootUrl || "")
         theme = context.theme || theme
         platformProfile = context.platformProfile || platformProfile
         primaryActions = context.primaryActions || []
@@ -4818,7 +5084,9 @@ SystemTrayIcon {
         if (statusAccessibilityKey !== "") statusAccessibilityText = tr(statusAccessibilityKey, statusAccessibilityText)
         applyTrayIcon()
         refreshTooltip()
-        visible = true
+        _noticeSite = _readNoticeSite()
+        // Started for one card: no icon to leave behind.
+        visible = _noticeSite === ""
 
         // Wire bridge: connect rpcResponse + pushEvent,
         // fetch current pause state, subscribe to push.
@@ -4841,6 +5109,7 @@ SystemTrayIcon {
             // otherwise have nothing to show.
             _loadExternalAddressCache()
         }
+        if (_noticeSite !== "") _showSiteNotice()
 
         if (autoCloseMs > 0) {
             autoCloseTimer = Qt.createQmlObject("import QtQuick 2.15; Timer { repeat: false }", tray, "autoCloseTimer")

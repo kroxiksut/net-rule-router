@@ -42,8 +42,9 @@ pub mod tun;
 
 pub use allocator::{
     BindingChange, BindingChangeSink, FakeIpAllocator, FakeIpBinding, FakeIpError,
-    FakeIpPoolConfig, LocalSubnet, PoolCollision, FAKE_IP_FIRST_HOST_INDEX, FAKE_IP_GATEWAY_INDEX,
-    FAKE_IP_V4_BASE, FAKE_IP_V4_PREFIX_LEN, FAKE_IP_V6_BASE, FAKE_IP_V6_PREFIX_LEN,
+    FakeIpPoolConfig, IdleBinding, LocalSubnet, PoolCollision, FAKE_IP_FIRST_HOST_INDEX,
+    FAKE_IP_GATEWAY_INDEX, FAKE_IP_V4_BASE, FAKE_IP_V4_PREFIX_LEN, FAKE_IP_V6_BASE,
+    FAKE_IP_V6_PREFIX_LEN,
 };
 pub use flow_owner::{FlowOwnerLookup, FlowTransport, MockFlowOwnerLookup, NoopFlowOwnerLookup};
 pub use scope::{FakeIpScope, FakeIpVerdict, RealIpReason};

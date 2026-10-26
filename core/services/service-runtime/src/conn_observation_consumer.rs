@@ -683,10 +683,9 @@ pub struct ConnectionObservationConsumer {
     /// IP of ANY flow OUR enforcement dropped (`blocked_by_nrr == Some(true)`,
     /// routable V4) is handed to this sink, which forward-confirms the name behind
     /// the IP and, if it matches a rule, caches it (see
-    /// [`crate::fcrdns_learner`]); a confirmed name no rule matches exempts only
-    /// its confirmed addresses from block-all as known-direct. Never an app-wide
-    /// exemption, so it is NOT gated on the process name. `None` keeps the
-    /// observer from reverse-learning.
+    /// [`crate::fcrdns_learner`]); a confirmed name no rule matches is only
+    /// reported. Never an app-wide exemption, so it is NOT gated on the
+    /// process name. `None` keeps the observer from reverse-learning.
     reverse_dns_learner: Option<ReverseDnsLearnFn>,
     /// `(process basename, remote ip, remote port)` triples whose
     /// BLOCK has already been detail-logged this session. The first drop of a
@@ -723,6 +722,8 @@ pub struct ConnectionObservationConsumer {
     primary_stall_evidence: Mutex<stall_evidence::ConnectionStallTracker>,
     /// Connections on any link the far side stopped answering (see `unanswered`).
     unanswered: Mutex<unanswered::UnansweredTracker>,
+    /// Connections the service tore down: their close is not the far side's.
+    own_flow_resets: Arc<crate::own_flow_resets::OwnFlowResets>,
     /// The application measure's sink — see [`AppMainLinkFn`].
     app_main_link: Option<AppMainLinkFn>,
     /// Programs seen leaving over the additional link — see [`AppAdditionalLinkFn`].
@@ -974,10 +975,12 @@ mod connection_facts;
 mod consume;
 mod drop_pairing;
 mod drop_reporter;
+mod main_link_diagnostics;
 mod stall_evidence;
 mod trace_tee;
 mod unanswered;
 
+pub use main_link_diagnostics::{MainLinkDiagnostics, MainLinkHealth, MainLinkHealthHook};
 pub use trace_tee::ConnTraceTee;
 
 pub(crate) use connection_facts::offerable_program;

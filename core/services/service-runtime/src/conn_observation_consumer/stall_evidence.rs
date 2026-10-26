@@ -3,8 +3,10 @@
 //! The stack reports every resent segment, and one loss burst on a busy
 //! download resends several in the same millisecond. Counted per segment, that
 //! made a working image host "not answer" before its first transfer finished.
-//! A connection counts as stalled once, and only when the stack is still
-//! resending a retransmission timeout after it started.
+//! A connection counts as stalled once, and only when the stack resends again
+//! at least a retransmission timeout after its first resend: one timeout loss
+//! on a working download is not a stall. A handshake resent like that counts
+//! the same: a provider that swallows the handshake leaves no other trace.
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
@@ -26,7 +28,8 @@ type ConnectionKey = (SocketAddr, SocketAddr);
 
 #[derive(Debug, Clone, Copy)]
 struct Resends {
-    first_ms: u64,
+    /// The first resend since the connection came up (or of its handshake).
+    first_resend_ms: Option<u64>,
     last_ms: u64,
     stalled: bool,
     /// Our own filter dropped it; its resends go into that filter.
@@ -39,7 +42,7 @@ struct Resends {
 impl Resends {
     fn started(at_ms: u64) -> Self {
         Self {
-            first_ms: at_ms,
+            first_resend_ms: None,
             last_ms: at_ms,
             stalled: false,
             ours: false,
@@ -95,6 +98,11 @@ impl ConnectionStallTracker {
                 if at_ms.saturating_sub(entry.last_ms) >= IDLE_TTL_MS {
                     *entry = Resends::started(at_ms);
                 }
+                if !entry.established {
+                    // A resent handshake the host did answer in the end says
+                    // nothing about how it carries data.
+                    entry.first_resend_ms = None;
+                }
                 entry.established = true;
                 entry.last_ms = entry.last_ms.max(at_ms);
                 None
@@ -105,7 +113,14 @@ impl ConnectionStallTracker {
                 let established = entry.is_some_and(|r| r.established);
                 (!ours && established).then_some(false)
             }
-            ConnectionProgress::Retransmit => {
+            ConnectionProgress::HandshakeRetransmit
+                if self.connections.get(&key).is_some_and(|r| r.established) =>
+            {
+                None
+            }
+            // A handshake nobody answers is timed like a segment nobody
+            // acknowledges: a path that swallows it shows nothing else.
+            ConnectionProgress::Retransmit | ConnectionProgress::HandshakeRetransmit => {
                 if !self.connections.contains_key(&key) {
                     self.make_room(at_ms);
                 }
@@ -117,9 +132,13 @@ impl ConnectionStallTracker {
                     *entry = Resends::started(at_ms);
                 }
                 entry.last_ms = entry.last_ms.max(at_ms);
+                // The first resend only starts the clock: one timeout loss on
+                // a working connection is not a stall, a second one a timeout
+                // later is.
+                let first_resend_ms = *entry.first_resend_ms.get_or_insert(at_ms);
                 if entry.ours
                     || entry.stalled
-                    || at_ms.saturating_sub(entry.first_ms) < TIMEOUT_RESEND_GAP_MS
+                    || at_ms.saturating_sub(first_resend_ms) < TIMEOUT_RESEND_GAP_MS
                 {
                     return None;
                 }
@@ -201,6 +220,85 @@ mod tests {
     fn close(t: &mut ConnectionStallTracker, port: u16, at_ms: u64) -> Option<bool> {
         let (local, remote) = conn(port);
         t.note(local, remote, ConnectionProgress::ClosedInOrder, at_ms)
+    }
+
+    fn handshake(t: &mut ConnectionStallTracker, port: u16, at_ms: u64) -> Option<bool> {
+        let (local, remote) = conn(port);
+        t.note(
+            local,
+            remote,
+            ConnectionProgress::HandshakeRetransmit,
+            at_ms,
+        )
+    }
+
+    /// One timeout loss early in a working download: a single resend a
+    /// second after the connection came up. Counted as a stall, it put a
+    /// working host into the register.
+    #[test]
+    fn a_single_resend_after_establishment_is_not_a_stall() {
+        let mut t = ConnectionStallTracker::default();
+        assert_eq!(attempt(&mut t, 50000, 0), None);
+        assert_eq!(resend(&mut t, 50000, 1_500), None);
+        assert_eq!(close(&mut t, 50000, 9_000), Some(false));
+    }
+
+    /// Two resends at least a second apart: the stack is still resending a
+    /// timeout later, nobody acknowledges.
+    #[test]
+    fn two_resends_a_second_apart_after_establishment_are_a_stall() {
+        let mut t = ConnectionStallTracker::default();
+        assert_eq!(attempt(&mut t, 50000, 0), None);
+        assert_eq!(resend(&mut t, 50000, 1_500), None);
+        assert_eq!(resend(&mut t, 50000, 2_000), None, "half a second apart");
+        assert_eq!(resend(&mut t, 50000, 2_600), Some(true));
+    }
+
+    /// A provider that swallows the handshake: the connection never comes up,
+    /// so the stack only ever resends it until it gives up. That host used to
+    /// leave no trace at all.
+    #[test]
+    fn a_handshake_nobody_answers_stalls_exactly_once() {
+        let mut t = ConnectionStallTracker::default();
+        assert_eq!(handshake(&mut t, 50000, 1_000), None);
+        assert_eq!(handshake(&mut t, 50000, 3_000), Some(true));
+        assert_eq!(handshake(&mut t, 50000, 7_000), None);
+        assert_eq!(close(&mut t, 50000, 7_100), None, "it never came up");
+    }
+
+    /// One lost handshake, then the host answers: its connection is judged by
+    /// how it carries data from then on, not by the second the handshake took.
+    #[test]
+    fn a_host_that_answers_a_resent_handshake_is_not_a_stall() {
+        let mut t = ConnectionStallTracker::default();
+        assert_eq!(handshake(&mut t, 50000, 1_000), None);
+        assert_eq!(attempt(&mut t, 50000, 1_200), None);
+        assert_eq!(resend(&mut t, 50000, 2_100), None);
+        assert_eq!(close(&mut t, 50000, 2_400), Some(false));
+    }
+
+    /// Our own pin drops the handshake on the wrong link; the stack resends it
+    /// into the filter, which says nothing about the host.
+    #[test]
+    fn a_handshake_resent_into_our_own_filter_is_never_a_stall() {
+        let mut t = ConnectionStallTracker::default();
+        let (local, remote) = conn(50000);
+        t.exclude(local, remote, 900);
+        assert_eq!(handshake(&mut t, 50000, 1_000), None);
+        assert_eq!(handshake(&mut t, 50000, 3_000), None);
+        assert_eq!(handshake(&mut t, 50000, 7_000), None);
+    }
+
+    /// A port scan or a SYN-swallowing middlebox under a burst of tabs: every
+    /// tuple resends its handshake, and the memory stays at the cap.
+    #[test]
+    fn a_handshake_flood_stays_within_the_cap() {
+        let mut t = ConnectionStallTracker::with_cap(64);
+        for port in 0..5_000u16 {
+            handshake(&mut t, 1 + port, u64::from(port));
+            handshake(&mut t, 1 + port, 2_000 + u64::from(port));
+            assert!(t.connections.len() <= 64);
+        }
     }
 
     #[test]

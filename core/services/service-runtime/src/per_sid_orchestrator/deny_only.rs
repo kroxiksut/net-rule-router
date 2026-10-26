@@ -79,6 +79,8 @@ impl PerSidApplyOrchestrator {
             .filter(|_| intent.publishes())
         {
             status.set_unresolved(sid, unresolved_apps.clone());
+            // A deny takes no addresses, so no rule here carries traffic.
+            status.set_unrouted(sid, &[]);
             let mut conflicts = crate::app_enforcement_status::rule_conflicts_from(
                 &out.diagnostics,
                 &rules.rule_book,

@@ -104,6 +104,7 @@ mod tests {
             interface_description: "Dual Band Wireless".into(),
             interface_type: "ieee80211".into(),
             oper_status: "up".into(),
+            usable: true,
         }));
         let h = SnapshotInterfacesHandler::new(provider);
         let resp = h.handle(&req(serde_json::json!({})), &ctx()).unwrap();
@@ -124,6 +125,7 @@ mod tests {
             interface_description: "".into(),
             interface_type: "ieee80211".into(),
             oper_status: "up".into(),
+            usable: true,
         }));
         let h = SnapshotInterfacesHandler::new(provider.clone());
         let _ = h

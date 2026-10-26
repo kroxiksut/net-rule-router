@@ -806,7 +806,15 @@ pub struct FakeIpStack {
     /// read nothing at all.
     read_buffer: Vec<u8>,
     echo_answers: Arc<echo::EchoAnswers>,
+    /// Where the addresses live flows are on are handed over for the binding
+    /// releaser, and when next; `None` hands over nothing.
+    live_addresses: Option<Arc<super::binding_release::LiveFlowAddresses>>,
+    next_live_publish_ms: u64,
 }
+
+/// How often the live-flow addresses are handed over: the only binding work
+/// the packet loop does.
+const LIVE_PUBLISH_EVERY_MS: u64 = 15_000;
 
 /// Graveyard size at which lingering workers become worth a warning.
 const LINGERING_WORKER_WARN_THRESHOLD: usize = 16;
@@ -891,7 +899,20 @@ impl FakeIpStack {
             policy_stamp,
             read_buffer: Vec::new(),
             echo_answers: Arc::default(),
+            live_addresses: None,
+            next_live_publish_ms: 0,
         }
+    }
+
+    /// Hand the addresses live flows are on to `live` now and then, so the
+    /// binding releaser never frees one under a flow.
+    #[must_use]
+    pub fn with_live_flow_addresses(
+        mut self,
+        live: Arc<super::binding_release::LiveFlowAddresses>,
+    ) -> Self {
+        self.live_addresses = Some(live);
+        self
     }
 
     /// Share the datapath-health counters (relay watchdog): every inbound
@@ -1114,8 +1135,29 @@ impl FakeIpStack {
         }
         self.flush_echo_answers();
         self.sweep_worker_graveyard();
+        self.publish_live_addresses(now_ms);
 
         Ok(read > 0)
+    }
+
+    /// At most every [`LIVE_PUBLISH_EVERY_MS`]: copy the flows' fake
+    /// addresses into the hand-over. No allocator lock and no rule check here;
+    /// the releaser does the rest on the watchdog tick.
+    fn publish_live_addresses(&mut self, now_ms: u64) {
+        let Some(live) = self.live_addresses.as_ref() else {
+            return;
+        };
+        if now_ms < self.next_live_publish_ms {
+            return;
+        }
+        self.next_live_publish_ms = now_ms.saturating_add(LIVE_PUBLISH_EVERY_MS);
+        let addresses = self
+            .flows
+            .keys()
+            .map(|key| key.destination.ip())
+            .chain(self.udp_binds.keys().map(|(ip, _)| *ip))
+            .collect();
+        live.publish(addresses, self.policy_stamp);
     }
 
     /// Drop handles of workers that have exited; keep the rest for a later

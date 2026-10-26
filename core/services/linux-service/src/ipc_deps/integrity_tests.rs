@@ -201,17 +201,47 @@ fn stored(kind: MutationKind, payload: serde_json::Value) -> StoredMutation {
 }
 
 /// Distinct bytes per change: the service hashes the content itself, so one
-/// body under two labels would dedupe into one revision.
+/// body under two labels would dedupe into one revision. A real book: a list
+/// of rules it cannot read names no base to build the next write on.
 fn rules(label: &str) -> String {
-    format!(r#"{{"rules":[],"label":"{label}"}}"#)
+    use nrr_shared::rules_json::{
+        to_canonical_string, AddressMatchDto, CanonicalRulesJsonV1, RuleAction, RuleDto,
+    };
+    to_canonical_string(&CanonicalRulesJsonV1 {
+        schema_version: 1,
+        primary: vec![RuleDto {
+            id: format!("r-{label}"),
+            enabled: true,
+            address_match: Some(AddressMatchDto::SuffixDomain {
+                suffix: format!("{label}.example"),
+            }),
+            app_match: None,
+            comment: String::new(),
+            action: RuleAction::Route,
+            origin: None,
+        }],
+        secondary: vec![],
+    })
+    .expect("canonical rules")
 }
 
-/// A rule change from the GUI, through the surface's own executor.
+/// A rule change from the GUI, through the surface's own executor, made
+/// against the revision it read, as the GUI names it.
 fn apply(surface: &IpcSurface, label: &str) -> MutationOutcome {
+    let base = surface
+        .deps
+        .rules
+        .rules_snapshot_for(nrr_shared::ipc_payloads::RulesRouteFilter::All, USER)
+        .base_revision
+        .unwrap_or_default();
     surface.deps.mutation_executor.execute(
         stored(
             MutationKind::RulesUpdate,
-            serde_json::json!({ "rules-json": rules(label), "content-hash": label }),
+            serde_json::json!({
+                "rules-json": rules(label),
+                "content-hash": label,
+                (nrr_shared::ipc_payloads::BASE_REVISION_KEY): base,
+            }),
         ),
         USER,
     )

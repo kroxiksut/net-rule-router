@@ -1,12 +1,8 @@
-//! fake-IP for DIRECT hosts under the armed block-all.
-//!
-//! A gate-based exemption path is structurally racy: installing a WFP
-//! exemption is a full reconcile, and a fast first connect can lose that race
-//! against the catch-all block. This module removes the race for the fake-IP
-//! posture: a DIRECT host's answer becomes a virtual address (nothing
-//! compiles on the answer path — the static pool permit already covers it),
-//! and the relay dials the real address out the primary while the client
-//! waits inside its handshake.
+//! fake-IP for DIRECT hosts whose every address is committed to the
+//! additional link (the collateral rescue): the answer becomes a virtual
+//! address (nothing compiles on the answer path — the static pool permit
+//! already covers it), and the relay dials the real address out the primary
+//! while the client waits inside its handshake.
 //!
 //! Two pieces:
 //!
@@ -92,6 +88,16 @@ impl DirectRealIpMap {
                 touched: tick,
             },
         );
+    }
+
+    /// Whether `hostname` is held here, without touching it.
+    #[must_use]
+    pub fn contains(&self, hostname: &str) -> bool {
+        self.inner
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .entries
+            .contains_key(hostname)
     }
 
     /// The real addresses recorded for `hostname` (empty when unknown).

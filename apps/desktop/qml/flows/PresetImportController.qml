@@ -320,19 +320,16 @@ QtObject {
                 || typeof nrrNativeBridge.rpcSidecarPassthroughWrite !== "function") {
             return
         }
-        var sections = {}
-        for (var i = 0; i < blocks.length; i += 1) {
-            var block = blocks[i] || {}
-            var name = String(block["section-name"] || "")
-            if (name === "") continue
-            sections[name] = String(block["raw-text"] || "")
-        }
+        // A section written twice is kept whole ("merge"): the second copy
+        // must not erase the first.
+        var sections = Pure.mergePassthroughBlocks(blocks)
         // Atomic replace via the sidecar handler: even an empty map
         // clears any previously-recorded passthrough for this route,
         // which is the right behaviour when the user re-imports a
         // preset that no longer has foreign-OS sections.
         var corr = nrrNativeBridge.rpcSidecarPassthroughWrite(route, sections)
         root.rpc.registerRpcCallback(corr, function(ok, payload) {
+            if (ok) root.passthroughRevision += 1
             // The import notice already named every section as preserved;
             // the store refuses one too large to keep, and the user must hear it.
             var dropped = (ok && payload && payload.dropped) || []

@@ -14,6 +14,7 @@ use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, Ipv4Addr};
 
 use nrr_domain::canonical::{CanonicalAddressMatch, CanonicalRuleBook, CanonicalRuleSet};
+use nrr_domain::decision_matching::zone_ranks_as_suffix;
 use nrr_domain::rule_shape::{rule_verdict, RuleShapeSupport};
 use nrr_domain::RuleAction;
 use nrr_shared::ip_block::IpBlock;
@@ -124,7 +125,7 @@ impl SecondaryAddressOwners {
     fn own_owner_of(&self, ip: IpAddr) -> Option<Cow<'_, str>> {
         if let IpAddr::V4(v4) = ip {
             if let Some(holder) = self.named.get(&v4) {
-                // A network outranks a zone: a main one takes a zone-only claim.
+                // A network outranks a single-label zone: a main one takes its claim.
                 let main_network_wins = !self.closer_than_zone.contains(&v4)
                     && self.networks.winner(ip) == Some(Link::Main);
                 return (!main_network_wins).then_some(Cow::Borrowed(holder.as_str()));
@@ -192,7 +193,7 @@ fn network_labels(set: &CanonicalRuleSet, support: RuleShapeSupport) -> HashMap<
 }
 
 /// The main link's literal and exact/suffix-named addresses that lie in an
-/// additional network. A zone is left out: a network outranks it.
+/// additional network. A single-label zone is left out: a network outranks it.
 fn main_closer_inside(
     primary: &CanonicalRuleSet,
     fqdn: &dyn FqdnCacheLookup,
@@ -216,6 +217,11 @@ fn main_closer_inside(
             }
             Some(CanonicalAddressMatch::SuffixDomain(suffix)) => {
                 for host in fqdn.hostnames_for_suffix_domain(suffix, SUFFIX_FANOUT_BACKSTOP) {
+                    capped_for_host(fqdn, &host, FamilyScope::Both).for_each(&mut keep);
+                }
+            }
+            Some(CanonicalAddressMatch::Zone(zone)) if zone_ranks_as_suffix(zone) => {
+                for host in fqdn.hostnames_under_suffix(zone, SUFFIX_FANOUT_BACKSTOP) {
                     capped_for_host(fqdn, &host, FamilyScope::Both).for_each(&mut keep);
                 }
             }

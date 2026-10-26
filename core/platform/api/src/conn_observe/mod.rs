@@ -57,7 +57,7 @@ pub enum ConnectionVerdict {
 /// What the stack was seen doing with a connection.
 ///
 /// [`Self::Attempt`] is the connection itself — every backend reports it, and
-/// only these become trace rows. The other two are evidence ABOUT a peer rather
+/// only these become trace rows. The others are evidence ABOUT a peer rather
 /// than connections of their own: a stack resends because the peer is not
 /// acknowledging, and tears down in order because the connection carried
 /// traffic. Backends that cannot distinguish them report [`Self::Attempt`].
@@ -67,6 +67,9 @@ pub enum ConnectionProgress {
     Attempt,
     Retransmit,
     ClosedInOrder,
+    /// The opening handshake was sent again: the peer has not answered the
+    /// connection at all yet. A path that swallows handshakes shows only this.
+    HandshakeRetransmit,
 }
 
 /// One observed outbound connection attempt.

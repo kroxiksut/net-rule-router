@@ -82,6 +82,20 @@ pub fn path_text(path: &Path) -> String {
     portable_path(&path.to_string_lossy())
 }
 
+/// `dir` lies in the tree shipped with the program, which an update replaces.
+pub fn inside_shipped(dir: &Path, shipped_root: Option<&Path>) -> bool {
+    is_factory(&path_text(&absolute(dir)), "", shipped_root)
+}
+
+/// The rule-set folder a set in `dir` belongs to: the folder above it, never
+/// the root or the home directory.
+pub fn sets_folder_of(dir: &Path) -> Option<PathBuf> {
+    absolute(dir)
+        .parent()
+        .filter(|parent| !is_too_wide(parent))
+        .map(Path::to_path_buf)
+}
+
 /// Inside the shipped tree and not inside the user's own folder: the next
 /// update overwrites it, so it is never a save target (the GUI's
 /// `isFactoryPresetPath`).
@@ -129,10 +143,45 @@ pub fn bind_written_set(
             settings.set_primary_file(&path_text(&dir.join(files::file_name(Route::Primary))));
             settings.set_secondary_file(&path_text(&dir.join(files::file_name(Route::Secondary))));
             if settings.rules_folder.is_empty() {
-                if let Some(parent) = dir.parent().filter(|parent| !is_too_wide(parent)) {
-                    settings.set_rules_folder(&path_text(parent));
+                if let Some(parent) = sets_folder_of(&dir) {
+                    settings.set_rules_folder(&path_text(&parent));
                 }
             }
+        })
+        .map(drop)
+}
+
+/// After one route was written to `path`: it becomes that route's rules
+/// file, outside the shipped tree, as the window binds an export.
+pub fn bind_written_route(
+    file: &Path,
+    route: Route,
+    path: &Path,
+    shipped_root: Option<&Path>,
+) -> Result<(), UserSettingsError> {
+    let path = absolute(path);
+    let text = path_text(&path);
+    let _ = note_written(file, std::slice::from_ref(&path));
+    UserSettingsStore::at(file.to_path_buf())
+        .update(|settings| {
+            if is_factory(&text, &settings.rules_folder, shipped_root) {
+                return;
+            }
+            match route {
+                Route::Primary => settings.set_primary_file(&text),
+                Route::Secondary => settings.set_secondary_file(&text),
+            }
+        })
+        .map(drop)
+}
+
+/// No rules file is bound any more: the files stay on disk, the program
+/// stops writing to them.
+pub fn unbind_files(file: &Path) -> Result<(), UserSettingsError> {
+    UserSettingsStore::at(file.to_path_buf())
+        .update(|settings| {
+            settings.set_primary_file("");
+            settings.set_secondary_file("");
         })
         .map(drop)
 }

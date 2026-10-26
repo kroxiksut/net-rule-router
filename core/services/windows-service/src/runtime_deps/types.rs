@@ -27,10 +27,6 @@ pub(super) type RoutePathBundle = (
     Option<Arc<nrr_service_runtime::route_coordinator::SecondaryRouteCoordinator>>,
     Option<Arc<nrr_service_runtime::rule_hostname_seeder::RuleHostnameSeeder>>,
     Option<Arc<nrr_service_runtime::dns_observation_consumer::DnsObservationConsumer>>,
-    // Session known-direct registry shared by the orchestrator (block-all
-    // exemptions), the FCrDNS direct-learning sink, and the Mode-B
-    // direct-answer gate.
-    Option<Arc<nrr_service_runtime::known_direct::KnownDirectRegistry>>,
     // Companion-domain discovery engine, fed by the DNS-observation
     // consumer above and read by the tray through the `autorules.candidates.*`
     // ops. Same `Arc` in both places, so the tick and the tray see one state.

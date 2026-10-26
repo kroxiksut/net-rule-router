@@ -14,6 +14,7 @@ use nrr_domain::rule_value_validation::{
     validate_rule_value, validate_rule_value_for, RuleEffect, RuleValueValidation,
 };
 use nrr_shared::ipc_payloads::RuleRowEntry;
+use nrr_shared::preset_parser::{app_section_os_label, other_os_app_rules};
 use nrr_shared::rules_json::FREE_MAX_RULES;
 
 use super::ace;
@@ -97,6 +98,8 @@ pub struct Row {
     pub pinned_total: usize,
     /// The OS hosts file answers this hostname before the service sees it.
     pub hosts_override: Option<nrr_shared::ipc_payloads::HostsOverrideDto>,
+    /// Picked for an action on several rules at once.
+    pub marked: bool,
 }
 
 impl Row {
@@ -116,7 +119,22 @@ impl Row {
             pinned: Vec::new(),
             pinned_total: 0,
             hosts_override: None,
+            marked: false,
         }
+    }
+
+    /// Move to another route; the route decides whether a program the rule
+    /// names is protected, and a deny takes no `?`.
+    pub fn move_to(&mut self, to: TargetRoute) {
+        if to == TargetRoute::Block {
+            self.rule.verify = false;
+        }
+        self.rule.target_route = to;
+        self.verdict = Verdict::for_route(
+            &self.rule.rule_type,
+            &self.rule.match_value,
+            &self.rule.target_route,
+        );
     }
 
     /// What the shared filters and order read of this row.
@@ -357,6 +375,14 @@ fn content(rule: &RuleRow) -> RuleRow {
     }
 }
 
+/// A program rule of another OS's section in a rules file.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct OtherOsRow {
+    /// The OS, as the user reads it.
+    pub os: &'static str,
+    pub row: Row,
+}
+
 #[derive(Debug, Default)]
 pub struct Table {
     pub rows: Vec<Row>,
@@ -368,6 +394,8 @@ pub struct Table {
     pub type_filter: &'static str,
     /// Only the rules the app added itself.
     pub auto_only: bool,
+    /// The rules that do not work are left out of the list.
+    pub hide_not_working: bool,
     pub search: String,
     pub sort: SortMode,
     /// Position of the chosen row among the visible ones, as last put; read
@@ -392,14 +420,7 @@ impl Table {
     /// Master indices of the rows the filter and the search let through, in
     /// the chosen order.
     pub fn visible(&self) -> Vec<usize> {
-        let filters = RulesFilters {
-            status: self.status.shared(),
-            rule_type: self.type_filter,
-            route: self.filter.shared(),
-            auto_only: self.auto_only,
-            recent_only: self.recent.is_some(),
-            search: &self.search,
-        };
+        let filters = self.filters();
         let is_overridden =
             |rule: &RuleRow| self.overridden.contains(&super::overrides::key_of(rule));
         let mut shown: Vec<usize> = self
@@ -436,6 +457,48 @@ impl Table {
                     SortDir::Asc,
                 )
             });
+        }
+        shown
+    }
+
+    fn filters(&self) -> RulesFilters<'_> {
+        RulesFilters {
+            status: self.status.shared(),
+            rule_type: self.type_filter,
+            route: self.filter.shared(),
+            auto_only: self.auto_only,
+            recent_only: self.recent.is_some(),
+            hide_not_working: self.hide_not_working,
+            search: &self.search,
+        }
+    }
+
+    /// Another OS's programs in the files, as the filters let them through.
+    /// Read only: the file carries them as written, the service never sees
+    /// them, so they are not rows of the list.
+    pub fn other_os_rows(&self) -> Vec<OtherOsRow> {
+        if self.filter == RouteFilter::Overridden {
+            return Vec::new();
+        }
+        let filters = self.filters();
+        let mut shown = Vec::new();
+        for (route, sections) in Route::ALL.into_iter().zip(&self.passthrough) {
+            for (name, raw_text) in sections {
+                let Some(os) = app_section_os_label(name) else {
+                    continue;
+                };
+                for parsed in other_os_app_rules(name, raw_text) {
+                    let mut row = Row::new(row_from_parsed(&parsed, route));
+                    row.verdict = Verdict {
+                        status: VerdictStatus::Error,
+                        message_key: text::OTHER_OS_NOT_APPLIED.id.to_owned(),
+                        args: BTreeMap::from([("os".to_owned(), os.to_owned())]),
+                    };
+                    if rule_passes_filters(&row.view(), &filters, || false, || false) {
+                        shown.push(OtherOsRow { os, row });
+                    }
+                }
+            }
         }
         shown
     }
@@ -729,19 +792,21 @@ impl Table {
         let Some(at) = self.find(bucket, id) else {
             return false;
         };
-        let row = &mut self.rows[at];
-        // A deny takes no `?`; it must not come back on a later move.
-        if to == TargetRoute::Block {
-            row.rule.verify = false;
-        }
-        row.rule.target_route = to;
-        // The route decides whether a program the rule names is protected.
-        row.verdict = Verdict::for_route(
-            &row.rule.rule_type,
-            &row.rule.match_value,
-            &row.rule.target_route,
-        );
+        self.rows[at].move_to(to);
         true
+    }
+
+    /// The rows picked for an action on several, in list order.
+    pub fn marked(&self) -> Vec<usize> {
+        (0..self.rows.len())
+            .filter(|&i| self.rows[i].marked)
+            .collect()
+    }
+
+    pub fn clear_marks(&mut self) {
+        for row in &mut self.rows {
+            row.marked = false;
+        }
     }
 
     /// Switch the rule on or off; `false` when it is not in the list.

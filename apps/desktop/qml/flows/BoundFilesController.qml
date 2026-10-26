@@ -51,6 +51,8 @@ QtObject {
             if (typeof onDone === "function") onDone(!!ok, !!changed, !!held)
         }
         if (!writer.canWrite) {
+            console.log("[bound-file] not written: this window's native part has no rules-file writer:",
+                        route, path)
             root.statusLine = root.tr("status.bridge-unavailable", "Native bridge unavailable")
             done(false, false, false)
             return
@@ -194,8 +196,9 @@ QtObject {
     /// asked about here (`rulesFileEditedDialog`), whichever gesture wrote;
     /// `overwrite` is that dialog's "replace the file".
     function _writeTargets(targets, allowFactory, onDone, overwrite) {
-        var done = function(ok, paths) {
-            if (typeof onDone === "function") onDone(!!ok, paths || [])
+        // `heldPaths`: files kept as edited by hand; the user is asked about them.
+        var done = function(ok, paths, heldPaths) {
+            if (typeof onDone === "function") onDone(!!ok, paths || [], heldPaths || [])
         }
         if (!targets || targets.length === 0) { done(true, []); return }
         if (!allowFactory && _guardFactoryTargets(targets,
@@ -224,7 +227,7 @@ QtObject {
                 Qt.callLater(root.driftController._driftRecheckNow)
             }
             if (held.length > 0) _askAboutHandEdited(held)
-            done(okAll, written)
+            done(okAll, written, held)
         }
         var writeOne = function(t) {
             writeRouteToPath(t.route, t.path, t.includeComments, function(ok, changed, kept) {
@@ -810,7 +813,30 @@ QtObject {
             root._filesSyncDirtyPrimary = false
         if (String(root.prefs.lastSavedPathSecondary || "") === "")
             root._filesSyncDirtySecondary = false
-        _writeBoundFiles(false, null, true)
+        _writeBoundFiles(false, _noticeUnlessWritten, true /* includeClean */)
+    }
+
+    /// After an apply's write: a failure the user is not already asked about
+    /// (a file kept as edited by hand is) gets a notice.
+    function _noticeUnlessWritten(ok, written, held) {
+        if (!ok && (held || []).length === 0) noticeRulesFileNotWritten()
+    }
+
+    /// The rules are in force but their file still holds the previous ones. A
+    /// status line is overwritten by the next one within the second; this
+    /// stays until dismissed. A file kept as edited by hand is not this case:
+    /// the user is asked about it.
+    function noticeRulesFileNotWritten() {
+        root.notificationsController._addPushNotice({
+            "id": "rules-file-not-written:" + Date.now(),
+            "kind": "rules-file-not-written",
+            "severity": "warning",
+            "dismissible": true,
+            "title": root.tr("notifications.rules-file-not-written.title",
+                "Rules applied, but your rules file was not updated"),
+            "body": root.tr("notifications.rules-file-not-written.body",
+                "The rules are in force, but writing them to your rules file failed, so the file still holds the previous rules. Use \"Save to file\" on the Rules screen to try again.")
+        })
     }
 
     /// A merge built from `taken` (`{ primary, secondary }` file texts, or
@@ -910,13 +936,13 @@ QtObject {
         if (pathSecondary !== "" && (includeClean || root._filesSyncDirtySecondary)) {
             targets.push({ route: "secondary", path: pathSecondary })
         }
-        _writeTargets(targets, false, function(ok, written) {
+        _writeTargets(targets, false, function(ok, written, held) {
             if (toast && ok && written.length > 0) {
                 // Surface WHERE it saved so "куда сохраняет?" is answered.
                 root.statusLine = root.tr("status.bound-file-saved", "Bound rules file saved.")
                     + " → " + written.join("\n")
             }
-            if (typeof onDone === "function") onDone(ok, written)
+            if (typeof onDone === "function") onDone(ok, written, held)
         })
     }
 

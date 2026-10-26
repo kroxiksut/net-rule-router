@@ -216,6 +216,57 @@ fn the_planner_carves_what_the_other_link_names_inside_a_network() {
     );
 }
 
+/// A zone of several labels outranks a network as a subdomain rule does, so the
+/// main network must not carry its hosts; a single-label zone still yields.
+#[test]
+fn the_planner_carves_a_zone_of_several_labels_out_of_the_other_links_network() {
+    use crate::fqdn_cache_lookup::MockFqdnCacheLookup;
+
+    let cache = MockFqdnCacheLookup::new();
+    cache.set_ips("db.corp.example.com", vec![Ipv4Addr::new(10, 1, 2, 3)]);
+    cache.set_ips("db.corp.intra", vec![Ipv4Addr::new(10, 1, 2, 4)]);
+    let denylist = HashSet::new();
+    let flows = plan_route_rules_with_shapes(
+        &book(
+            vec![subnet("p-net", "10.0.0.0/8", RuleAction::Route)],
+            vec![
+                rule(
+                    "s-corp",
+                    CanonicalAddressMatch::Zone("corp.example.com".into()),
+                    RuleAction::Route,
+                ),
+                rule(
+                    "s-intra",
+                    CanonicalAddressMatch::Zone("intra".into()),
+                    RuleAction::Route,
+                ),
+            ],
+        ),
+        SID,
+        &PlannerInput {
+            fqdn_cache: &cache,
+            app_resolver: &NoApps,
+            app_observations: &NoApps,
+            zone_priority_over_ip: false,
+            app_rules_take_all_addresses: false,
+            secondary_ip_denylist: &denylist,
+            ipv6: Ipv6Guard::Off,
+            packet_blocks: true,
+        },
+        NETWORKS,
+    )
+    .0;
+    let main = route_networks(&flows, RouteRole::Primary);
+    assert!(!main
+        .iter()
+        .any(|b| b.contains("10.1.2.3".parse().expect("ip"))));
+    assert!(main
+        .iter()
+        .any(|b| b.contains("10.1.2.4".parse().expect("ip"))));
+    assert!(route_destinations(&flows, RouteRole::Secondary)
+        .contains(&"10.1.2.3".parse::<IpAddr>().expect("ip")));
+}
+
 #[test]
 fn an_ipv6_network_is_planned_only_when_a_link_carries_the_family() {
     let rule_book = book(

@@ -127,8 +127,17 @@ impl UpstreamSockets {
         });
     }
 
+    /// Close every idle socket: each was connected from the source address of
+    /// a network that may be gone.
+    pub(crate) fn drain(&self) {
+        self.idle
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clear();
+    }
+
     #[cfg(test)]
-    fn idle_count(&self) -> usize {
+    pub(crate) fn idle_count(&self) -> usize {
         self.idle
             .lock()
             .unwrap_or_else(PoisonError::into_inner)

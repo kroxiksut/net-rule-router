@@ -887,11 +887,15 @@ pub fn package_install_plan() -> SystemdInstallPlan {
     let spec = ServiceInstallSpec::production_defaults(installed_daemon_path());
     let mut plan = plan_install(&unit_config(&spec), UnitActivation::LeaveDisabled);
     plan.unit_path = Path::new(PACKAGE_UNIT_DIRS[0]).join(SYSTEMD_UNIT_NAME);
-    // The failure unit ships beside the main one.
-    let after_crash = crate::systemd::after_crash_unit_name();
-    for file in &mut plan.additional_files {
-        if file.path.ends_with(&after_crash) {
-            file.path = Path::new(PACKAGE_UNIT_DIRS[0]).join(&after_crash);
+    // The failure and early units ship beside the main one.
+    for unit in [
+        crate::systemd::after_crash_unit_name(),
+        crate::systemd::early_unit_name(),
+    ] {
+        for file in &mut plan.additional_files {
+            if file.path.ends_with(&unit) {
+                file.path = Path::new(PACKAGE_UNIT_DIRS[0]).join(&unit);
+            }
         }
     }
     plan.post_write_commands.clear();
@@ -1294,6 +1298,7 @@ mod tests {
                 "write /etc/logrotate.d/netrulerouter 644".to_string(),
                 "write /usr/share/polkit-1/actions/netrulerouter.policy 644".to_string(),
                 "write /etc/systemd/system/netrulerouter-after-crash.service 644".to_string(),
+                "write /etc/systemd/system/netrulerouter-early.service 644".to_string(),
                 "link /usr/libexec/netrulerouter/nrr-service -> /usr/libexec/netrulerouter/nrr-serviced"
                     .to_string(),
                 "run systemctl daemon-reload".to_string(),
@@ -1410,6 +1415,7 @@ mod tests {
                 PathBuf::from("/etc/logrotate.d/netrulerouter"),
                 PathBuf::from("/usr/share/polkit-1/actions/netrulerouter.policy"),
                 PathBuf::from("/usr/lib/systemd/system/netrulerouter-after-crash.service"),
+                PathBuf::from("/usr/lib/systemd/system/netrulerouter-early.service"),
             ]
         );
         assert_eq!(
@@ -1493,6 +1499,7 @@ mod tests {
                 "remove /etc/logrotate.d/netrulerouter".to_string(),
                 "remove /usr/share/polkit-1/actions/netrulerouter.policy".to_string(),
                 "remove /etc/systemd/system/netrulerouter-after-crash.service".to_string(),
+                "remove /etc/systemd/system/netrulerouter-early.service".to_string(),
                 "remove /usr/libexec/netrulerouter/nrr-service".to_string(),
                 "run systemctl daemon-reload".to_string(),
             ]

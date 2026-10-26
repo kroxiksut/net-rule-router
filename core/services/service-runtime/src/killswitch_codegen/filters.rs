@@ -210,23 +210,6 @@ pub(super) fn packet_permit_primary_host(
     packet_permit_host_with_kind(sid, layer, ip, weight, kind)
 }
 
-/// packet-layer permit for a KNOWN-DIRECT destination.
-/// Same shape as [`packet_permit_primary_host`] with its own id kind so a
-/// destination that is both known-primary and known-direct keeps distinct ids.
-pub(super) fn packet_permit_direct_host(
-    sid: &str,
-    layer: WfpLayerKey,
-    ip: Ipv4Addr,
-    weight: u64,
-) -> WfpFilterSpec {
-    let kind = if layer == WfpLayerKey::OutboundTransportV4 {
-        "ks-tr-direct-host"
-    } else {
-        "ks-pkt-direct-host"
-    };
-    packet_permit_host_with_kind(sid, layer, ip, weight, kind)
-}
-
 /// Packet-layer proto-agnostic permit for a liveness-probe target — the twin
 /// of [`exempt_probe_target`] at the layer where the ICMP echo is actually
 /// classified (the ALE block is TCP/UDP-narrowed; the named packet blocks are

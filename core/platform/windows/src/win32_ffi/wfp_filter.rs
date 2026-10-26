@@ -484,6 +484,96 @@ pub fn add_filter(
     Ok(spec.id)
 }
 
+/// Ids of the boot guard, in our namespace: the first pass over somebody
+/// present removes it as a filter nobody claims, and so does every teardown.
+pub const BOOT_GUARD_IDS: [WfpFilterId; 2] = [
+    WfpFilterId {
+        raw: 0x4E52_5242_4F4F_5434,
+    },
+    WfpFilterId {
+        raw: 0x4E52_5242_4F4F_5436,
+    },
+];
+
+/// Add the boot guard inside the current transaction: one persistent block per
+/// family at the connect layer for processes of a signed-in person (the
+/// INTERACTIVE group), loopback spared. Services are not in that group, so
+/// DHCP, DNS and a VPN service reach the network before the first pass.
+/// Persistent filters need a persistent sub-layer; ours is not, so the
+/// built-in universal one holds them.
+pub fn add_boot_guard(token: &WfpEngineToken) -> Result<(), PlatformError> {
+    use windows::Win32::NetworkManagement::WindowsFilteringPlatform::{
+        FWPM_CONDITION_FLAGS, FWPM_FILTER_FLAG_PERSISTENT, FWPM_SUBLAYER_UNIVERSAL,
+        FWP_CONDITION_FLAG_IS_LOOPBACK, FWP_MATCH_FLAGS_NONE_SET,
+    };
+    let (sd, sd_size) = descriptor_from_sddl("D:(A;;CC;;;IU)", "INTERACTIVE")?;
+    let handle = token_to_handle(token);
+    let mut outcome = Ok(());
+    for (id, layer) in [
+        (BOOT_GUARD_IDS[0], FWPM_LAYER_ALE_AUTH_CONNECT_V4),
+        (BOOT_GUARD_IDS[1], FWPM_LAYER_ALE_AUTH_CONNECT_V6),
+    ] {
+        let mut blob = FWP_BYTE_BLOB {
+            size: sd_size,
+            data: sd.0 as *mut u8,
+        };
+        let mut conditions = [
+            condition_user_id(&mut blob),
+            FWPM_FILTER_CONDITION0 {
+                fieldKey: FWPM_CONDITION_FLAGS,
+                matchType: FWP_MATCH_FLAGS_NONE_SET,
+                conditionValue: FWP_CONDITION_VALUE0 {
+                    r#type: FWP_UINT32,
+                    Anonymous: FWP_CONDITION_VALUE0_0 {
+                        uint32: FWP_CONDITION_FLAG_IS_LOOPBACK,
+                    },
+                },
+            },
+        ];
+        let mut name_w: Vec<u16> = "NetRuleRouter:boot-guard"
+            .encode_utf16()
+            .chain([0])
+            .collect();
+        let mut desc_w: Vec<u16> = "NetRuleRouter: holds signed-in users until the first pass"
+            .encode_utf16()
+            .chain([0])
+            .collect();
+        // SAFETY: zero-init is the documented pattern for `FWPM_FILTER0`; a
+        // zeroed weight is `FWP_EMPTY`, which lets the engine pick one.
+        let mut filter: FWPM_FILTER0 = unsafe { MaybeUninit::zeroed().assume_init() };
+        filter.filterKey = filter_id_to_guid(id);
+        filter.displayData = FWPM_DISPLAY_DATA0 {
+            name: PWSTR(name_w.as_mut_ptr()),
+            description: PWSTR(desc_w.as_mut_ptr()),
+        };
+        filter.flags = FWPM_FILTER_FLAGS(
+            FWPM_FILTER_FLAG_PERSISTENT.0 | FWPM_FILTER_FLAG_CLEAR_ACTION_RIGHT.0,
+        );
+        filter.layerKey = layer;
+        filter.subLayerKey = FWPM_SUBLAYER_UNIVERSAL;
+        filter.numFilterConditions = conditions.len() as u32;
+        filter.filterCondition = conditions.as_mut_ptr();
+        filter.action = FWPM_ACTION0 {
+            r#type: FWP_ACTION_BLOCK,
+            ..FWPM_ACTION0::default()
+        };
+        // SAFETY: `handle` is an open engine handle; every pointer in
+        // `filter` references this frame's buffers, alive for the call.
+        let code =
+            unsafe { FwpmFilterAdd0(handle, &filter, PSECURITY_DESCRIPTOR::default(), None) };
+        if code != 0 && code != nrr_platform_api::error::win32_codes::FWP_E_ALREADY_EXISTS {
+            outcome = Err(PlatformError::Win32 {
+                operation: ADD_OP,
+                code,
+                message: format!("boot guard: Win32 error 0x{code:08X}"),
+            });
+            break;
+        }
+    }
+    free_sd_if_owned(sd);
+    outcome
+}
+
 /// Delete a filter previously added under our namespace signature.
 ///
 /// Returns `Ok(())` on success and on `FWP_E_FILTER_NOT_FOUND` is
@@ -1259,6 +1349,17 @@ mod tests {
             lib.contains(&sublayer),
             "service-paths.ps1 must carry {sublayer}"
         );
+        // The boot guard is outside our sub-layer and survives a BFE restart:
+        // without its keys the reset leaves signed-in people blocked.
+        for id in BOOT_GUARD_IDS {
+            let g = filter_id_to_guid(id);
+            let d = g.data4;
+            let key = format!(
+                "'{:08x}-{:04x}-{:04x}-{:02x}{:02x}-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}'",
+                g.data1, g.data2, g.data3, d[0], d[1], d[2], d[3], d[4], d[5], d[6], d[7]
+            );
+            assert!(lib.contains(&key), "service-paths.ps1 must carry {key}");
+        }
     }
 
     #[test]
@@ -1431,6 +1532,41 @@ mod tests {
         let read = unsafe { *p };
         assert_eq!(Ipv6Addr::from(read.addr), net);
         assert_eq!(read.prefixLength, 10);
+    }
+
+    /// A boot guard nobody can find is a block nobody removes: the first pass
+    /// and every teardown find our filters by this namespace.
+    #[test]
+    fn the_boot_guard_is_a_filter_of_ours() {
+        for id in BOOT_GUARD_IDS {
+            assert_eq!(filter_id_from_guid(&filter_id_to_guid(id)), Some(id));
+        }
+        assert_ne!(BOOT_GUARD_IDS[0], BOOT_GUARD_IDS[1]);
+    }
+
+    /// The block a reboot leaves is found by the same enumerate the first pass
+    /// and the teardown use, as a block on signed-in people, and goes with a
+    /// delete by id. Requires admin. Committed persistent filters would outlive
+    /// a failed run, so the transaction is aborted.
+    #[test]
+    #[ignore = "requires admin: FwpmFilterAdd0 needs elevation"]
+    fn the_boot_guard_is_found_and_removed_like_any_filter_of_ours() {
+        let token = engine_open().expect("FwpmEngineOpen0");
+        transaction_begin(&token).expect("FwpmTransactionBegin0");
+        add_boot_guard(&token).expect("add_boot_guard");
+        let listed = enumerate_our_filters(&token).expect("enumerate_our_filters");
+        for (id, layer) in [
+            (BOOT_GUARD_IDS[0], WfpLayerKey::AleAuthConnectV4),
+            (BOOT_GUARD_IDS[1], WfpLayerKey::AleAuthConnectV6),
+        ] {
+            let found = listed.iter().find(|r| r.id == id).expect("listed");
+            assert_eq!(found.layer, layer);
+            assert_eq!(found.action, WfpAction::Block);
+            assert_eq!(found.user_sid.as_deref(), Some("S-1-5-4"));
+            delete_filter(&token, id).expect("delete_filter");
+        }
+        transaction_abort(&token);
+        engine_close(token).expect("FwpmEngineClose0");
     }
 
     /// Smoke test: add → enumerate → delete round-trip. **Requires

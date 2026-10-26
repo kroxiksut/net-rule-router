@@ -25,7 +25,7 @@
 //! Adapters with `InterfaceType::Tunnel`, `InterfaceType::Loopback`, or
 //! known virtual manufacturer strings (Hyper-V, WSL, Docker, VMware,
 //! VirtualBox) are excluded from availability tracking. The
-//! `AdapterMonitor` skips them silently.
+//! `AdapterMonitor` still watches typed tunnels, which a secondary route rides.
 //!
 //! ## IPv6
 //!
@@ -305,11 +305,28 @@ pub fn classify_availability(info: &AdapterInfo) -> Option<AdapterAvailability> 
     if is_virtual_adapter(info) {
         return None;
     }
-    Some(match info.oper_status {
+    Some(link_state(info))
+}
+
+/// What the [`AdapterMonitor`] watches: what availability tracks, plus typed
+/// tunnels. A tunnel coming or going is the change a secondary route waits
+/// for; left out, only the OS change signal reported it. Read from the same
+/// enumeration, so it costs no OS call.
+fn monitored_availability(info: &AdapterInfo) -> Option<AdapterAvailability> {
+    classify_availability(info).or_else(|| {
+        let tunnel = info.interface_type == InterfaceType::Tunnel
+            && !description_matches_virtual_software(&info.description);
+        tunnel.then(|| link_state(info))
+    })
+}
+
+/// Up with IPv4, up without, or down.
+fn link_state(info: &AdapterInfo) -> AdapterAvailability {
+    match info.oper_status {
         IfOperStatus::Up if info.has_ipv4_address() => AdapterAvailability::Available,
         IfOperStatus::Up => AdapterAvailability::PresentNoIp,
         _ => AdapterAvailability::PresentDown,
-    })
+    }
 }
 
 /// The name to store for an adapter: the connection name the GUI lists, with
@@ -434,6 +451,7 @@ pub struct AdapterMonitor {
     quiet_read_every_ms: Option<u64>,
     feed_live: AtomicBool,
     change_reported: AtomicBool,
+    refresh_requested: AtomicBool,
     last_read_ms: AtomicU64,
 }
 
@@ -524,6 +542,7 @@ impl AdapterMonitor {
             quiet_read_every_ms: None,
             feed_live: AtomicBool::new(false),
             change_reported: AtomicBool::new(false),
+            refresh_requested: AtomicBool::new(false),
             last_read_ms: AtomicU64::new(NEVER_READ),
         }
     }
@@ -541,6 +560,12 @@ impl AdapterMonitor {
         self.feed_live.store(true, Ordering::Release);
     }
 
+    /// Ask the next [`Self::update_if_due`] for a [`Self::force_refresh`], so
+    /// what it finds reaches the same consumers as any other change.
+    pub fn request_refresh(&self) {
+        self.refresh_requested.store(true, Ordering::Release);
+    }
+
     /// The OS reported an interface, address or route change.
     pub fn note_os_change(&self) {
         self.change_reported.store(true, Ordering::Release);
@@ -548,6 +573,9 @@ impl AdapterMonitor {
 
     /// [`Self::update`] when a read is due, no changes otherwise.
     pub fn update_if_due(&self, now_ms: u64) -> Vec<AdapterAvailabilityChange> {
+        if self.refresh_requested.swap(false, Ordering::AcqRel) {
+            return self.force_refresh(now_ms);
+        }
         if self.read_due(now_ms) {
             self.update(now_ms)
         } else {
@@ -650,7 +678,7 @@ impl AdapterMonitor {
         // Classify current state from the fresh enumeration.
         let mut current: HashMap<u32, (String, AdapterAvailability)> = HashMap::new();
         for info in &infos {
-            if let Some(avail) = classify_availability(info) {
+            if let Some(avail) = monitored_availability(info) {
                 current.insert(info.index, (info.stable_id(), avail));
             }
         }
@@ -751,7 +779,8 @@ impl AdapterMonitor {
     /// Force an immediate re-enumeration, bypassing the debounce window.
     /// Used after sleep/resume to quickly re-establish state.
     /// Returns all adapters that changed compared to last confirmed state.
-    pub fn force_refresh(&self, _now_ms: u64) -> Vec<AdapterAvailabilityChange> {
+    pub fn force_refresh(&self, now_ms: u64) -> Vec<AdapterAvailabilityChange> {
+        self.last_read_ms.store(now_ms, Ordering::Release);
         // Clear any pending debounce state.
         self.pending.lock().unwrap().clear();
 
@@ -762,7 +791,7 @@ impl AdapterMonitor {
 
         let mut current: HashMap<u32, (String, AdapterAvailability)> = HashMap::new();
         for info in &infos {
-            if let Some(avail) = classify_availability(info) {
+            if let Some(avail) = monitored_availability(info) {
                 current.insert(info.index, (info.stable_id(), avail));
             }
         }
@@ -1218,6 +1247,65 @@ mod tests {
                        // force_refresh skips the window
         let changes = mon.force_refresh(0);
         assert_eq!(changes.len(), 1, "force_refresh must bypass debounce");
+    }
+
+    /// After a wake the state the monitor holds is from before the sleep. A
+    /// requested refresh reads at once — paced by the OS change feed or not,
+    /// debounce or not — and reports what changed, once.
+    #[test]
+    fn a_requested_refresh_reads_at_once_and_reports_once() {
+        let (src, mon) = monitor(5000);
+        let mon = mon.reading_on_change(Duration::from_secs(60));
+        mon.change_feed_live();
+        src.set(vec![eth_up_with_ip(5)]);
+        assert!(mon.update_if_due(0).is_empty(), "first sighting debounces");
+        assert!(mon.force_refresh(1).len() == 1, "baseline confirmed");
+
+        // Slept: the link is gone, and no OS signal reported it.
+        src.set(Vec::new());
+        assert!(mon.update_if_due(2_000).is_empty(), "paced: not due");
+
+        mon.request_refresh();
+        let changes = mon.update_if_due(2_100);
+        assert_eq!(changes.len(), 1, "{changes:?}");
+        assert_eq!(changes[0].new, AdapterAvailability::Absent);
+        assert!(
+            mon.update_if_due(2_200).is_empty(),
+            "one request, one forced read"
+        );
+    }
+
+    /// A tunnel is the link a secondary route waits for: its arrival and its
+    /// departure are reported by the monitor's own reads, with no OS signal.
+    #[test]
+    fn a_tunnel_coming_and_going_is_reported_without_an_os_signal() {
+        let (src, mon) = monitor(100);
+        src.set(vec![eth_up_with_ip(5)]);
+        mon.update(0);
+        mon.update(200);
+
+        src.set(vec![eth_up_with_ip(5), tunnel_vpn()]);
+        mon.update(300);
+        let up = mon.update(500);
+        assert_eq!(up.len(), 1, "tunnel arrival: {up:?}");
+        assert_eq!(
+            (up[0].index, up[0].new),
+            (3, AdapterAvailability::Available)
+        );
+
+        src.set(vec![eth_up_with_ip(5)]);
+        mon.update(600);
+        let gone = mon.update(800);
+        assert_eq!(gone.len(), 1, "tunnel departure: {gone:?}");
+        assert_eq!(
+            (gone[0].index, gone[0].new),
+            (3, AdapterAvailability::Absent)
+        );
+
+        // Loopback and virtual-machine networks stay out, as before.
+        src.set(vec![eth_up_with_ip(5), loopback(), hyper_v()]);
+        mon.update(700);
+        assert!(mon.update(900).is_empty());
     }
 
     #[test]

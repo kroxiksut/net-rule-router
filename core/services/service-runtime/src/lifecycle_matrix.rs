@@ -288,8 +288,8 @@ pub fn orphaned_blocks_at_start(leak_guard_armed: bool) -> OrphanedBlocks {
 /// The plan for an orderly stop.
 pub fn stop_plan(reason: StopReason, inputs: LifecycleInputs) -> StopPlan {
     match reason {
-        // Filters are not persistent and the routes go with the network; the
-        // only thing a teardown could add here is a window.
+        // Filters and routes go with the machine; a teardown could only add a
+        // window. The restart is held by the platform's boot copy instead.
         StopReason::MachineShutdown => StopPlan {
             routes: RouteTeardown::Keep,
             filters: FilterTeardown::Keep,

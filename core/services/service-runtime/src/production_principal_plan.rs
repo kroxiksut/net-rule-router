@@ -42,9 +42,9 @@ use nrr_shared::RouteRole;
 
 use crate::catch_all_exemptions::{collect_exemptions, CatchAllExemptions};
 use crate::enforcement_planner::{
-    never_blocked_networks, plan_catch_all_kill_switch, plan_doh_dot_block,
-    plan_fail_closed_block_all, plan_fail_closed_destinations, plan_fail_closed_networks,
-    plan_kill_switch_networks, NetworkHoldLog, NetworkHolds,
+    never_blocked_networks, plan_doh_dot_block, plan_fail_closed_block_all,
+    plan_fail_closed_destinations, plan_fail_closed_networks, plan_kill_switch_networks,
+    NetworkHoldLog, NetworkHolds,
 };
 use crate::killswitch_codegen::KillSwitchProtocols;
 use crate::machine_reading::MachineReading;
@@ -472,12 +472,13 @@ impl ProductionPrincipalPlanSource {
         // both installed would be one policy stated twice.
         let blanket = self.blanket_block(stored, &policy, posture, &flows, &ownership);
         let block_all_armed = !blanket.is_empty();
-        let forwarded_blanket =
-            if block_all_armed && !availability.secondary && policy.guard_forwarded_traffic {
-                self.forwarded_blanket(stored, &policy, &flows, &ownership)
-            } else {
-                Vec::new()
-            };
+        // Armed with the tunnel up (the blanket through it) as with it gone:
+        // the forwarded set says itself what may leave through the tunnel.
+        let forwarded_blanket = if block_all_armed && policy.guard_forwarded_traffic {
+            self.forwarded_blanket(stored, &policy, &flows, &ownership, availability.secondary)
+        } else {
+            Vec::new()
+        };
         // With the tunnel gone a secondary permit has no link to pin it to and
         // ranks above the hold: it would carry exactly what the hold is for out
         // the main link.
@@ -779,6 +780,10 @@ impl ProductionPrincipalPlanSource {
                 .map(|(report, _)| report.unresolved_apps.clone())
                 .unwrap_or_default(),
         );
+        status.set_unrouted(
+            principal,
+            planned.map_or(&[][..], |(report, _)| &report.unrouted_apps),
+        );
         let conflicts = planned
             .map(|(report, book)| {
                 let mut conflicts =
@@ -837,20 +842,22 @@ impl ProductionPrincipalPlanSource {
             return Vec::new();
         }
         let exemptions = self.exemptions_for(stored, policy);
-        // A remembered server alone is no licence: without the primary the
-        // attached subnets are unknown, and the block would cut the LAN.
-        if !exemptions.can_arm() || !self.links_resolve(policy) {
+        // The blanket is the user's own sockets: the tunnel daemon and the
+        // kernel's handshakes are not under it, so an unknown server seals
+        // nothing. An unresolved primary does: its attached subnets are
+        // unknown, and the block would cut the LAN.
+        if !self.links_resolve(policy) {
             tracing::warn!(
                 target: "nrr::enforcement",
-                msg_key = "persid-plan-blanket-block-refused",
+                msg_key = "persid-plan-blanket-block-no-main-link",
                 principal = stored,
-                "the settings ask for a blanket block, but no tunnel-server address could be read from the route table: arming it would seal the tunnel's own reconnect, so it is NOT armed",
+                "the settings ask for a blanket block, but the main link is not resolved: armed without its local networks it would cut the LAN, so it is NOT armed",
             );
             return Vec::new();
         }
         let protocols = KillSwitchProtocols::from_bits(policy.kill_switch_protocols);
         if matches!(posture, ProtectionPosture::CatchAllThroughTunnel) {
-            plan_catch_all_kill_switch(
+            crate::enforcement_planner::plan_user_scoped_catch_all(
                 stored,
                 &exemptions.server_ips,
                 &exemptions.local_subnets,
@@ -881,16 +888,19 @@ impl ProductionPrincipalPlanSource {
         }
     }
 
-    /// The blanket for what the machine forwards, once the tunnel is gone and
-    /// the owner's own blanket is armed. The main-link rule permits that let
-    /// the owner's direct hosts out are the owner's alone, so the direct hosts
-    /// and the main link's resolvers are stated here as the floor's own.
+    /// The blanket for what the machine forwards, while the owner's own
+    /// blanket is armed: with the tunnel up it lets out what leaves through the
+    /// tunnel, with it gone nothing but the floor. The main-link rule permits
+    /// that let the owner's direct hosts out are the owner's alone, so the
+    /// direct hosts and the main link's resolvers are stated here as the
+    /// floor's own.
     fn forwarded_blanket(
         &self,
         stored: &str,
         policy: &PerSidPolicySnapshot,
         rule_flows: &[FlowRule],
         ownership: &crate::address_ownership::AddressOwnership,
+        tunnel_up: bool,
     ) -> Vec<FlowRule> {
         let exemptions = self.exemptions_for(stored, policy);
         let mut direct = primary_destinations(rule_flows, ownership);
@@ -918,10 +928,12 @@ impl ProductionPrincipalPlanSource {
         blanket.extend(primary_network_permits(rule_flows));
         // The blanket spares no foreign tunnel whole; the narrowed permits
         // below are all a guest keeps through one.
-        crate::enforcement_planner::plan_forwarded_block_all_with_foreign(
-            blanket,
-            &self.foreign_tunnels_for(policy),
-        )
+        let foreign = self.foreign_tunnels_for(policy);
+        if tunnel_up {
+            crate::enforcement_planner::plan_forwarded_catch_all_with_foreign(blanket, &foreign)
+        } else {
+            crate::enforcement_planner::plan_forwarded_block_all_with_foreign(blanket, &foreign)
+        }
     }
 
     /// The main link's resolvers of both families, the only hosts the DNS
@@ -1025,7 +1037,7 @@ impl ProductionPrincipalPlanSource {
     ) -> Vec<nrr_platform_api::enforcement::RouteIntent> {
         let catch_alls = self.tunnel_catch_alls(policy);
         let networks = self.network_route_facts(stored, policy, &catch_alls);
-        plan_routes_with(
+        let mut routes = plan_routes_with(
             mode,
             book,
             has_primary,
@@ -1040,7 +1052,29 @@ impl ProductionPrincipalPlanSource {
             &catch_alls,
             &networks,
             support,
-        )
+        );
+        if has_primary {
+            let exemptions = self.exemptions_for(stored, policy);
+            let servers: Vec<std::net::IpAddr> = exemptions
+                .server_ips
+                .iter()
+                .copied()
+                .map(std::net::IpAddr::V4)
+                .chain(
+                    exemptions
+                        .server_ips_v6
+                        .iter()
+                        .copied()
+                        .map(std::net::IpAddr::V6),
+                )
+                .collect();
+            crate::enforcement_planner::pin_tunnel_servers_to_primary(
+                &servers,
+                families,
+                &mut routes,
+            );
+        }
+        routes
     }
 
     /// The `/32`s and `/128`s to the additional link that the next pass for
@@ -3473,19 +3507,20 @@ mod tests {
         );
     }
 
-    /// The refusal that keeps an outage from becoming permanent: without the
-    /// server's address the blanket block would seal the tunnel's own reconnect,
-    /// so it is not armed and the shortfall is reported. The rule hosts stay
-    /// pinned to the live tunnel rather than blocked outright: a block there
-    /// would cut them through a working tunnel.
+    /// "Everything" holds with the tunnel server unknown: the blanket covers
+    /// the user's own sockets alone, and neither the tunnel daemon nor the
+    /// kernel's handshakes are among them, so the reconnect is not sealed and
+    /// refusing would leave the user's traffic free to leave the main link.
     #[test]
-    fn without_a_server_route_the_blanket_block_is_refused() {
+    fn without_a_server_route_the_blanket_block_still_arms() {
         let (plan, coverage) =
             plan_on_machine(OneSecondaryRule, Policy::prefer_secondary(), true, false);
 
-        assert_eq!(blanket_blocks(&plan), 0);
-        assert!(!coverage.kill_switch_complete);
-        assert_eq!(held(&plan), Held::Pins);
+        assert!(
+            blanket_blocks(&plan) > 0,
+            "the user's traffic was left unprotected"
+        );
+        assert!(coverage.kill_switch_complete);
     }
 
     /// A memory that already holds `servers` and writes nowhere.
@@ -3577,7 +3612,7 @@ mod tests {
     }
 
     /// A tunnel server one user's links showed is that user's alone: another
-    /// user's blanket block must not arm on a hole their tunnel never had.
+    /// user's blanket block holds with no hole their tunnel never had.
     #[test]
     fn a_server_remembered_for_one_user_does_not_arm_another_users_block() {
         let alice = user();
@@ -3613,9 +3648,12 @@ mod tests {
         assert!(own_coverage.kill_switch_complete);
 
         let (other, other_coverage) = plan_for(&bob());
-        assert_eq!(blanket_blocks(&other), 0, "armed on another user's server");
-        assert!(!exempts(&other, DstMatch::HostV4(SERVER)));
-        assert!(!other_coverage.kill_switch_complete);
+        assert!(blanket_blocks(&other) > 0);
+        assert!(
+            !exempts(&other, DstMatch::HostV4(SERVER)),
+            "a hole to another user's server"
+        );
+        assert!(other_coverage.kill_switch_complete);
     }
 
     fn service_account_flows_of(plan: &EnforcementPlan) -> usize {
@@ -3707,6 +3745,68 @@ mod tests {
         }
     }
 
+    /// Everything protected through the tunnel, the tunnel up: what the
+    /// machine forwards is held to the tunnel whole, not only the rule hosts,
+    /// so the moment the tunnel goes none of it takes the main link. It keeps
+    /// the floor it keeps with the tunnel gone; protection off and the main
+    /// default route leave it as it was.
+    #[test]
+    fn everything_through_the_tunnel_holds_forwarded_traffic_to_it_whole() {
+        use nrr_platform_api::enforcement::{EgressConstraint, EgressRef, PrincipalScope};
+        let forwarded = |policy: Policy, tunnel_up: bool| -> Vec<FlowRule> {
+            let (api, links) = machine(true);
+            let (plan, _) = source(Arc::new(OneSecondaryRule), Arc::new(policy))
+                .with_machine_facts(
+                    api as Arc<dyn nrr_platform_api::route_table::RouteTablePort>,
+                    links as Arc<dyn nrr_platform_api::adapters::AdapterEventSource>,
+                )
+                .with_service_accounts(Arc::new(Vec::new))
+                .plan_with_coverage(&user(), availability(tunnel_up))
+                .expect("the rule must plan");
+            plan.flows
+                .into_iter()
+                .filter(|f| f.principal == PrincipalScope::Forwarded)
+                .collect()
+        };
+        let through = |f: &&FlowRule| {
+            f.verdict == Verdict::Permit
+                && f.egress == EgressConstraint::OnlyVia(EgressRef::Secondary)
+                && matches!(
+                    f.flow.dst,
+                    DstMatch::Any | DstMatch::SubnetV6 { prefix: 0, .. }
+                )
+        };
+        let blanket = |f: &&FlowRule| {
+            f.verdict == Verdict::Block
+                && f.precedence.class == PrecedenceClass::CatchAllBlock
+                && f.flow.dst == DstMatch::Any
+        };
+
+        let up = forwarded(Policy::prefer_secondary(), true);
+        assert_eq!(up.iter().filter(through).count(), 2, "{up:?}");
+        assert!(
+            up.iter().any(|f| blanket(&f)),
+            "a guest's other sites take the main link the moment the tunnel drops: {up:?}"
+        );
+        let gone = forwarded(Policy::prefer_secondary(), false);
+        for kept in gone.iter().filter(|f| {
+            f.verdict == Verdict::Permit && f.precedence.class == PrecedenceClass::CatchAllExempt
+        }) {
+            assert!(up.contains(kept), "closed while the tunnel is up: {kept:?}");
+        }
+
+        let off = forwarded(
+            Policy {
+                protection: LeakProtection::Off,
+                ..Policy::prefer_secondary()
+            },
+            true,
+        );
+        assert!(off.is_empty(), "{off:?}");
+        let main = forwarded(Policy::everything(), true);
+        assert!(!main.iter().any(|f| blanket(&f)), "{main:?}");
+    }
+
     struct MessengerRule;
     impl RulesProvider for MessengerRule {
         fn active_rules(&self) -> Option<ActiveRulesSnapshot> {
@@ -3788,8 +3888,8 @@ mod tests {
     }
 
     /// Our own host route via the main gateway has a server's shape. Read as
-    /// one, it would arm the block with a hole to nowhere and no hole for the
-    /// real server; the same route without our signature is a server.
+    /// one, it would give the block a hole to a rule host; the same route
+    /// without our signature is a server.
     #[test]
     fn our_own_host_route_is_never_taken_for_the_tunnel_server() {
         use nrr_platform_api::route_table::RouteTablePort;
@@ -3820,9 +3920,12 @@ mod tests {
         };
 
         let (plan, coverage) = plan_with(crate::route_codegen::SECONDARY_ROUTE_METRIC);
-        assert_eq!(blanket_blocks(&plan), 0, "armed on our own route");
-        assert!(!exempts(&plan, DstMatch::HostV4(ours)));
-        assert!(!coverage.kill_switch_complete);
+        assert!(blanket_blocks(&plan) > 0);
+        assert!(
+            !exempts(&plan, DstMatch::HostV4(ours)),
+            "our own route taken for a server"
+        );
+        assert!(coverage.kill_switch_complete);
 
         // Positive control: the same row without our signature is a server.
         let (plan, coverage) = plan_with(0);
@@ -4998,7 +5101,8 @@ mod tests {
         }
 
         /// The machine reading changes nothing for a book that names no
-        /// network, nor under a shape support without networks.
+        /// network, nor under a shape support without networks — but for the
+        /// tunnel server's own route while the tunnel carries everything.
         #[test]
         fn without_networks_the_route_plan_is_what_it_always_was() {
             let source = on_machine();
@@ -5031,7 +5135,7 @@ mod tests {
                 RouteBehaviorMode::PreferSecondaryWhenAvailable,
             ] {
                 for &(book, support) in &cases {
-                    let before = crate::enforcement_planner::plan_routes(
+                    let mut before = crate::enforcement_planner::plan_routes(
                         mode,
                         book,
                         true,
@@ -5041,6 +5145,11 @@ mod tests {
                         FamilyScope::V4Only,
                         crate::address_ownership::ZoneVsIpOrder::default(),
                         &[],
+                    );
+                    crate::enforcement_planner::pin_tunnel_servers_to_primary(
+                        &[IpAddr::V4(TUNNEL_SERVER)],
+                        FamilyScope::V4Only,
+                        &mut before,
                     );
                     assert_eq!(
                         routes(&source, mode, book, support),

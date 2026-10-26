@@ -98,11 +98,13 @@ fn an_exact_primary_address_inside_a_secondary_subnet_stays_primary() {
 fn a_primary_host_inside_a_secondary_subnet_stays_primary_but_a_zone_does_not() {
     let fqdn = MockFqdnCacheLookup::new();
     fqdn.set_ips("intranet.corp.example", vec![Ipv4Addr::new(10, 1, 0, 1)]);
-    fqdn.set_ips("wiki.zone.example", vec![Ipv4Addr::new(10, 1, 0, 2)]);
+    fqdn.set_ips("wiki.intra", vec![Ipv4Addr::new(10, 1, 0, 2)]);
+    fqdn.set_ips("wiki.zone.example", vec![Ipv4Addr::new(10, 1, 0, 3)]);
     let o = owners(
         vec![
             host("p-host", "intranet.corp.example"),
-            zone("p-zone", "zone.example"),
+            zone("p-zone", "intra"),
+            zone("p-site", "zone.example"),
         ],
         vec![subnet("s", "10.0.0.0/8")],
         &fqdn,
@@ -111,7 +113,12 @@ fn a_primary_host_inside_a_secondary_subnet_stays_primary_but_a_zone_does_not() 
     assert_eq!(
         owner(&o, v4(10, 1, 0, 2)).as_deref(),
         Some("10.0.0.0/8"),
-        "a network beats a zone"
+        "a network beats a single-label zone"
+    );
+    assert_eq!(
+        owner(&o, v4(10, 1, 0, 3)),
+        None,
+        "a zone of several labels beats a network, as a suffix does"
     );
 }
 
@@ -192,17 +199,29 @@ fn host_claims_keep_their_owner_and_beat_a_primary_network() {
 #[test]
 fn a_secondary_zone_host_inside_a_primary_network_goes_primary() {
     let fqdn = MockFqdnCacheLookup::new();
+    fqdn.set_ips("cdn.intra", vec![Ipv4Addr::new(10, 5, 0, 9)]);
+    fqdn.set_ips("www.intra", vec![Ipv4Addr::new(198, 51, 100, 9)]);
+    let o = owners(
+        vec![subnet("p", "10.5.0.0/16")],
+        vec![zone("s-zone", "intra")],
+        &fqdn,
+    );
+    assert_eq!(owner(&o, v4(10, 5, 0, 9)), None);
+    assert_eq!(owner(&o, v4(198, 51, 100, 9)).as_deref(), Some("www.intra"));
+}
+
+#[test]
+fn a_secondary_zone_of_several_labels_keeps_its_host_inside_a_primary_network() {
+    let fqdn = MockFqdnCacheLookup::new();
     fqdn.set_ips("cdn.zone.example", vec![Ipv4Addr::new(10, 5, 0, 9)]);
-    fqdn.set_ips("www.zone.example", vec![Ipv4Addr::new(198, 51, 100, 9)]);
     let o = owners(
         vec![subnet("p", "10.5.0.0/16")],
         vec![zone("s-zone", "zone.example")],
         &fqdn,
     );
-    assert_eq!(owner(&o, v4(10, 5, 0, 9)), None);
     assert_eq!(
-        owner(&o, v4(198, 51, 100, 9)).as_deref(),
-        Some("www.zone.example")
+        owner(&o, v4(10, 5, 0, 9)).as_deref(),
+        Some("cdn.zone.example")
     );
 }
 

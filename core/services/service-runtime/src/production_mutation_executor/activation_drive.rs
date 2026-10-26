@@ -26,6 +26,9 @@ impl ProductionMutationExecutor {
         };
         Self::canonicalize_rules_payload(&mut parsed, self.host_platform);
         self.carry_unrecognized(&mut parsed, principal);
+        if keeps_inactive(payload) {
+            self.carry_inactive(&mut parsed, principal);
+        }
         if let Err(e) = self.enforce_free_rule_cap(&parsed.rules_json, principal) {
             return MutationOutcome::Failed(e);
         }
@@ -38,7 +41,7 @@ impl ProductionMutationExecutor {
         if let Some(noop) = self.baseline_already_in_force(&parsed.rules_json, principal) {
             return noop;
         }
-        let base = base_revision_in(payload);
+        let base = rules_update_base(payload, principal);
         if let Some(e) = self.moved_rules_refusal(&parsed.rules_json, base, principal) {
             return MutationOutcome::Failed(e);
         }
@@ -292,19 +295,17 @@ impl ProductionMutationExecutor {
     // `pub(super)` because the impl is split across files and the caller
     // is now another module.
     pub(super) fn preview_reset_to_baseline(&self, principal: &str) -> ReviewSummaryResponse {
+        // The book in force, mid-activation included: the stored row may still
+        // name the revision an apply is replacing.
         let own = self
             .coordinator
-            .current_active_for(principal)
+            .own_rules_json_in_force_for(principal)
             .ok()
             .flatten();
         let discarded = own
-            .as_ref()
-            .and_then(|rec| {
-                crate::production_rules_provider::read_stored_rules(
-                    &rec.rules_json,
-                    &rec.revision_id,
-                )
-                .ok()
+            .as_deref()
+            .and_then(|json| {
+                crate::production_rules_provider::read_stored_rules(json, "reset-preview").ok()
             })
             .map(|dto| dto.primary.len() + dto.secondary.len());
         reset_review_summary(own.is_some(), discarded)
@@ -345,4 +346,14 @@ pub(super) fn base_revision_in(payload: &serde_json::Value) -> Option<&str> {
     payload
         .get(nrr_shared::ipc_payloads::BASE_REVISION_KEY)
         .and_then(serde_json::Value::as_str)
+}
+
+/// The rules a rules update was built from. One that does not say was built
+/// from none (`""`): a client that never read the rules cannot replace one it
+/// never saw. The administrator's baseline is copied over on purpose.
+pub(super) fn rules_update_base<'a>(
+    payload: &'a serde_json::Value,
+    principal: &str,
+) -> Option<&'a str> {
+    base_revision_in(payload).or((principal != nrr_storage::BASELINE_PRINCIPAL).then_some(""))
 }

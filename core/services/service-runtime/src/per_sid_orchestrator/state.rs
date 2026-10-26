@@ -322,13 +322,6 @@ pub struct PerSidApplyOrchestrator {
     /// [`Self::with_fake_ip_context_provider`] from the fake-IP setting, the
     /// enforcement mode, and the live stack state.
     pub(super) fake_ip_context: FakeIpContextProvider,
-    /// session registry of destinations positively
-    /// established as DIRECT (non-rule) hosts: a Mode-B steered direct answer,
-    /// or an FCrDNS forward-confirmed non-rule name. Under the catch-all
-    /// block-all each earns an ALE exempt + packet permit (minus anything
-    /// secondary-destined) so plain primary-path sites survive the posture.
-    /// `None` (default) keeps the strict block-all.
-    pub(super) known_direct: Option<Arc<crate::known_direct::KnownDirectRegistry>>,
     /// shared "block-all armed" posture for the GUI banner
     /// (see [`crate::app_enforcement_status::BlockAllPostureStatus`]). Written
     /// on every block-all transition edge. `None` (default) = log-only.
@@ -388,11 +381,4 @@ pub struct PerSidApplyOrchestrator {
     pub(super) foreign_cut_seen: Mutex<std::collections::HashMap<String, (usize, usize)>>,
     /// The images hosting the OS IKE service. Empty (default) opens no IKE.
     pub(super) ike_service_images: Vec<String>,
-    /// Asks for a full pass over every user. `None` (default) leaves the
-    /// others to their own next plan.
-    pub(super) peer_replan: Option<PeerReplanRequest>,
 }
-
-/// Asks for a full enforcement pass. Called from inside a compute, under the
-/// SID's apply lock, so it must return at once and run the pass elsewhere.
-pub type PeerReplanRequest = Arc<dyn Fn() + Send + Sync>;

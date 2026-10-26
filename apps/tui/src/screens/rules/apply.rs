@@ -31,6 +31,7 @@ use crate::backend::{Job, Reply};
 use crate::i18n::Texts;
 
 const KIND: &str = "rules-update";
+const RESET_KIND: &str = "rules-reset-to-baseline";
 
 /// Why something did not happen, in the service's terms; worded on screen.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -109,6 +110,32 @@ pub struct Pending {
     /// The rules the screen was built from (`base-revision`); the service
     /// refuses the write when they changed since. `None` writes unchecked.
     pub base_revision: Option<String>,
+    /// Not rules at all: the caller's own rules go and the baseline applies
+    /// (`rules-reset-to-baseline`).
+    pub reset_to_baseline: bool,
+}
+
+/// The reset to the administrator's baseline, as one payload the review and
+/// the confirm carry like any other.
+pub fn reset_pending() -> Pending {
+    Pending {
+        rules_json: String::new(),
+        content_hash: String::new(),
+        correlation_id: correlation_id("tui-reset"),
+        admin_baseline: false,
+        base_revision: None,
+        reset_to_baseline: true,
+    }
+}
+
+/// Nothing left to do: rules that match the service, or a caller already on
+/// the baseline (whose reset preview needs no review).
+fn nothing_to_do(pending: &Pending, summary: &ReviewSummaryResponse) -> bool {
+    if pending.reset_to_baseline {
+        !summary.requires_review
+    } else {
+        review_summary_is_empty(summary)
+    }
 }
 
 /// Rules as the canonical rules-json (`_buildRulesJsonFromModel`): a rule
@@ -148,6 +175,7 @@ pub fn pending_from(
         correlation_id: correlation_id("tui-apply"),
         admin_baseline,
         base_revision: base_revision.map(str::to_owned),
+        reset_to_baseline: false,
     })
 }
 
@@ -179,6 +207,18 @@ fn submit(
     dry_run: bool,
     token: Option<&str>,
 ) -> Result<Value, IpcClientError> {
+    if pending.reset_to_baseline {
+        let mut request = json!({
+            "mutation-kind": RESET_KIND,
+            "payload": { "correlation-id": pending.correlation_id },
+            "dry-run": dry_run,
+        });
+        if let Some(token) = token {
+            request["_envelope_confirmation_token"] = Value::from(token);
+        }
+        let op = IpcOperationName::MutationSubmit;
+        return client.call(op, request, ipc_operation_timeout(op));
+    }
     let mut request = json!({
         "mutation-kind": KIND,
         "payload": {
@@ -279,6 +319,24 @@ pub fn load_job(baseline: bool) -> Job {
     })
 }
 
+/// The administrator's rule-edit lock, read with the list: the window asks at
+/// start and on every reconnect, without the user opening Settings. A failed
+/// read leaves the lock as last known.
+pub fn edit_permission_job() -> Job {
+    Box::new(|client: &dyn IpcClient| {
+        let op = IpcOperationName::ServiceStabilityConfigGet;
+        let config = client
+            .call(op, json!({}), ipc_operation_timeout(op))
+            .ok()
+            .and_then(|v| v.as_object().cloned());
+        Reply::new(move |app| {
+            if let Some(config) = config {
+                super::adopt_edit_permission(app, &config);
+            }
+        })
+    })
+}
+
 pub fn preview_job(pending: Pending) -> Job {
     Box::new(move |client: &dyn IpcClient| {
         let previewed = match submit(client, &pending, true, None) {
@@ -305,7 +363,7 @@ fn classify(summary: ReviewSummaryResponse, token: String, pending: Pending) -> 
             Failure::Values(refusal.values)
         });
     }
-    if review_summary_is_empty(&summary) {
+    if nothing_to_do(&pending, &summary) {
         return Previewed::NothingToApply;
     }
     Previewed::Review(Box::new(Review {
@@ -386,7 +444,7 @@ fn settle_by_preview(client: &dyn IpcClient, pending: &Pending) -> Finished {
     };
     match summary {
         Err(failure) => Finished::Failed(failure),
-        Ok((summary, _)) => match preview_outcome(&summary, review_summary_is_empty) {
+        Ok((summary, _)) => match preview_outcome(&summary, |s| nothing_to_do(pending, s)) {
             Outcome::Applied => Finished::Applied { base: None },
             Outcome::Failed(code) => Finished::Failed(Failure::code(&code)),
         },

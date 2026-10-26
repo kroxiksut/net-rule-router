@@ -199,6 +199,14 @@ impl ConnectionObservationConsumer {
         {
             return;
         }
+        // Nor in the first seconds of the owner's outage: a link back within
+        // the notice grace was never news, and one that stays away is told by
+        // its status notice and by the next block.
+        if reason == nrr_domain::block_notice::BlockReason::RouteUnavailable
+            && self.inside_link_grace(rec)
+        {
+            return;
+        }
         if self.owner_scoped {
             if !self.announces_for_owner(rec, reason) {
                 return;
@@ -251,6 +259,22 @@ impl ConnectionObservationConsumer {
             },
             rec.observed_unix_ms,
         );
+    }
+
+    /// Whether `rec` fell inside the first [`NOTICE_GRACE_MS`] of its owner's
+    /// outage episode. A drop with no episode yet starts one. Unowned drops
+    /// have no episode to measure, so they keep today's notice.
+    ///
+    /// [`NOTICE_GRACE_MS`]: crate::app_enforcement_status::NOTICE_GRACE_MS
+    fn inside_link_grace(&self, rec: &ConnectionTraceRecord) -> bool {
+        let owner = rec.user_sid.as_deref().unwrap_or_default();
+        let Some(ring) = self.trace_ring.as_ref().filter(|_| !owner.is_empty()) else {
+            return false;
+        };
+        let at_ms = rec.observed_unix_ms.unwrap_or_else(now_unix_ms);
+        let began = ring.outage_blocks().episode_for_drop(owner, at_ms);
+        let grace = u64::try_from(crate::app_enforcement_status::NOTICE_GRACE_MS).unwrap_or(0);
+        at_ms < began.saturating_add(grace)
     }
 
     /// Whether `rec`'s owner hears of this drop: an outage once per episode of

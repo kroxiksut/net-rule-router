@@ -431,6 +431,12 @@ fn validate_network(
             args: prefix_arg(widest_prefix),
         };
     }
+    if let Some(address) = crate::validation::single_address_written(value) {
+        return RuleValueValidation::Warning {
+            message_key: "rules.validation.match-value-warning.single-address".to_string(),
+            args: BTreeMap::from([("address".to_string(), address.to_string())]),
+        };
+    }
     for warning in &warnings {
         match warning {
             ValidationWarning::SubnetHostBitsCleared { normalized, .. } => {
@@ -588,8 +594,8 @@ pub struct RefusedRuleValue {
 /// The rules in `book` whose value the per-row verdict refuses, in book order.
 /// A value `carried` (the book in force) already holds is spared: a stored book
 /// written before the check must stay editable, and refusing it would also stop
-/// every automatic edit of that book. A rule refused outright is never spared:
-/// reading the book in force drops it ([`drop_rules_refused_outright`]).
+/// every automatic edit of that book. A rule no book may apply is not refused
+/// either: it is stored and shown as not working, never applied.
 ///
 /// The service's acceptance gate: a protected program or folder is not its
 /// question. Such a rule is accepted into the book and withheld from
@@ -634,6 +640,7 @@ fn refused_values(
         })
         .collect();
     routed_rules(book)
+        .filter(|(rule, _)| refused_outright(rule).is_none())
         .filter_map(|(rule, role)| {
             wire_rule_values(rule)
                 .find(|entry| {
@@ -701,11 +708,11 @@ fn wire_protection(
         })
 }
 
-/// Removes from a stored `book` every rule no book may hold and returns them,
-/// in book order: an address that is never a destination ("this host", the
-/// limited broadcast), or an application value the pipeline refuses (too long,
-/// a control character, the bare `*`). Such a rule is refused anew everywhere;
-/// one already stored is gone once read, and the rest of the book loads.
+/// Removes from `book` every rule no book may apply and returns them, in book
+/// order: an address that is never a destination ("this host", the limited
+/// broadcast), or an application value the pipeline refuses (too long, a
+/// control character, the bare `*`). The decoder keeps such rules aside by
+/// itself ([`crate::rules_revision::RulesRevisionContent::inactive`]).
 pub fn drop_rules_refused_outright(book: &mut CanonicalRulesJsonV1) -> Vec<RefusedRuleValue> {
     let mut dropped = Vec::new();
     for rules in [&mut book.primary, &mut book.secondary] {
@@ -724,7 +731,13 @@ pub fn drop_rules_refused_outright(book: &mut CanonicalRulesJsonV1) -> Vec<Refus
 }
 
 /// The value that puts `rule` beyond any book, as the rules table shows it.
-fn refused_outright(rule: &RuleDto) -> Option<String> {
+pub(crate) fn refused_outright(rule: &RuleDto) -> Option<String> {
+    refused_outright_on(rule, HostPlatform::compiled())
+}
+
+/// [`refused_outright`] for a book read on `platform`: a program path is judged
+/// by the path style of the platform that reads it.
+pub(crate) fn refused_outright_on(rule: &RuleDto, platform: HostPlatform) -> Option<String> {
     let no_rule = RuleId(String::new());
     match &rule.address_match {
         Some(AddressMatchDto::ExactIpv4 { address } | AddressMatchDto::ExactIpv6 { address }) => {
@@ -755,7 +768,7 @@ fn refused_outright(rule: &RuleDto) -> Option<String> {
         _ => {}
     }
     let app = rule.app_match.as_ref()?;
-    wire_app_pattern(&app.pattern, HostPlatform::compiled(), &no_rule)
+    wire_app_pattern(&app.pattern, platform, &no_rule)
         .is_err()
         .then(|| app.pattern.value().to_owned())
 }

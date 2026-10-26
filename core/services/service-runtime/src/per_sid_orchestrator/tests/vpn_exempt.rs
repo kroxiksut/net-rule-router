@@ -402,7 +402,7 @@ impl FqdnCacheLookup for CensusCache {
 }
 
 /// Like [`fixture_with_resolution`], but with a scripted shared-IP census
-/// and an optional known-direct registry. `fake_ip_effective` scripts the
+/// `fake_ip_effective` scripts the
 /// live "hostname enforcement is active" signal the smart shared-IP
 /// exemption gates on: while `true` the fake-IP context
 /// provider yields an enabled scope, mirroring the production provider's
@@ -412,7 +412,6 @@ impl FqdnCacheLookup for CensusCache {
 fn fixture_with_census(
     resolution: Option<KillSwitchResolution>,
     shared: &[Ipv4Addr],
-    known_direct: Option<Arc<crate::known_direct::KnownDirectRegistry>>,
     fake_ip_effective: Arc<std::sync::atomic::AtomicBool>,
 ) -> (
     Arc<MockWindowsApi>,
@@ -429,7 +428,7 @@ fn fixture_with_census(
         shared: shared.iter().copied().collect(),
     });
     let audit = Arc::new(CollectAudit::default());
-    let mut orch = PerSidApplyOrchestrator::new(
+    let orch = PerSidApplyOrchestrator::new(
         session,
         Arc::clone(&source) as Arc<dyn RoutePolicySource>,
         Arc::clone(&rules) as Arc<dyn RulesProvider>,
@@ -445,9 +444,6 @@ fn fixture_with_census(
                 pool: nrr_platform_api::fake_ip::FakeIpPoolConfig::default(),
             })
     }));
-    if let Some(reg) = known_direct {
-        orch = orch.with_known_direct_registry(reg);
-    }
     (api, Arc::new(orch), source, rules)
 }
 
@@ -469,7 +465,6 @@ fn a_main_route_named_ip_is_spared_by_the_block_all_in_both_modes() {
         let (api, orch, src, rules) = fixture_with_census(
             None,
             &[shared],
-            None,
             Arc::new(AtomicBool::new(true)), // fake-IP effective
         );
         rules.set(ActiveRulesSnapshot {
@@ -507,65 +502,8 @@ fn a_main_route_named_ip_is_spared_by_the_block_all_in_both_modes() {
     }
 }
 
-#[test]
-fn known_direct_exemption_keeps_census_shared_ip_under_mode_b_block_all() {
-    //  — the known-direct subtraction removes only PINNED IPs. A
-    // census-shared IP (pin skipped while the secondary is unusable) stays
-    // exemptible, so a direct co-tenant registered by a Mode-B answer
-    // survives the block-all; a pinned (non-shared) secondary destination
-    // is still subtracted and stays blocked. Requires an effective fake-IP
-    // datapath since  (the rule host is then enforced by name).
-    use std::sync::atomic::AtomicBool;
-    let shared = Ipv4Addr::new(203, 0, 113, 163);
-    let pinned = Ipv4Addr::new(203, 0, 113, 9);
-    let registry = Arc::new(crate::known_direct::KnownDirectRegistry::default());
-    registry.register(&[shared, pinned]);
-    let (api, orch, src, rules) = fixture_with_census(
-        None,
-        &[shared],
-        Some(Arc::clone(&registry)),
-        Arc::new(AtomicBool::new(true)), // fake-IP effective
-    );
-    rules.set(ActiveRulesSnapshot {
-        rule_book: CanonicalRuleBook {
-            primary: CanonicalRuleSet::default(),
-            secondary: CanonicalRuleSet::from_rules(vec![
-                primary_ip_rule("r-sec-1", shared),
-                primary_ip_rule("r-sec-2", pinned),
-            ]),
-        },
-    });
-    let mut snap = snap_block_mode_b("Wi-Fi", "TAP");
-    snap.kill_switch_strict_shared_ips = false;
-    src.set("S-1-5-21-A", snap);
-
-    orch.install_for_sid("S-1-5-21-A").unwrap();
-    let filters = api.wfp_filters.lock().unwrap();
-    use nrr_platform_api::types::WfpLayerKey;
-    // Only filters in the catch-all EXEMPT band (0x0050_0000+) count —
-    // the rule's own ALE permit sits in a lower band and exists for both
-    // IPs regardless of the known-direct exemption.
-    let exempt_permit = |ip: Ipv4Addr| {
-        filters.iter().any(|f| {
-            f.layer == WfpLayerKey::AleAuthConnectV4
-                && f.action == WfpAction::Permit
-                && f.covers_v4(ip)
-                && f.weight >= 0x0050_0000
-        })
-    };
-    assert!(
-        exempt_permit(shared),
-        "census-shared known-direct IP earns its block-all exemption (pin skipped)"
-    );
-    assert!(
-        !exempt_permit(pinned),
-        "a pinned secondary destination is still subtracted from the exemption"
-    );
-}
-
-/// The rule book shared by the fake-IP-gate tests below: one census-shared
-/// IP a SECONDARY rule names, reachable on the primary only through the
-/// known-direct rescue.
+/// The rule book of the fake-IP-gate test below: one census-shared
+/// IP a SECONDARY rule names.
 ///
 /// No main-link rule on that address on purpose — an address both links
 /// name never reaches the kill-switch as a secondary destination at all
@@ -593,7 +531,6 @@ fn smart_exemption_requires_fake_ip_datapath() {
     let (api, orch, src, rules) = fixture_with_census(
         None,
         &[shared],
-        None,
         Arc::new(AtomicBool::new(false)), // fake-IP NOT effective
     );
     rules.set(shared_ip_rule_book(shared));
@@ -614,105 +551,6 @@ fn smart_exemption_requires_fake_ip_datapath() {
         }),
         "without an effective fake-IP datapath a census-shared secondary \
          destination must stay blocked under the block-all (strict subtraction)"
-    );
-}
-
-#[test]
-fn known_direct_exemption_denied_for_shared_ip_when_fake_ip_not_effective() {
-    //  — the known-direct rescue path (the proven
-    // egress route) must apply the same fake-IP gate: with the datapath
-    // down, a census-shared known-direct IP is subtracted like any other
-    // secondary destination and earns no block-all exemption.
-    use std::sync::atomic::AtomicBool;
-    let shared = Ipv4Addr::new(203, 0, 113, 163);
-    let registry = Arc::new(crate::known_direct::KnownDirectRegistry::default());
-    registry.register(&[shared]);
-    let (api, orch, src, rules) = fixture_with_census(
-        None,
-        &[shared],
-        Some(Arc::clone(&registry)),
-        Arc::new(AtomicBool::new(false)), // fake-IP NOT effective
-    );
-    rules.set(ActiveRulesSnapshot {
-        rule_book: CanonicalRuleBook {
-            primary: CanonicalRuleSet::default(),
-            secondary: CanonicalRuleSet::from_rules(vec![primary_ip_rule("r-sec", shared)]),
-        },
-    });
-    let mut snap = snap_block_mode_b("Wi-Fi", "TAP");
-    snap.kill_switch_strict_shared_ips = false;
-    src.set("S-1-5-21-A", snap);
-
-    orch.install_for_sid("S-1-5-21-A").unwrap();
-    let filters = api.wfp_filters.lock().unwrap();
-    use nrr_platform_api::types::WfpLayerKey;
-    assert!(
-        !filters.iter().any(|f| {
-            f.layer == WfpLayerKey::AleAuthConnectV4
-                && f.action == WfpAction::Permit
-                && f.covers_v4(shared)
-                && f.weight >= 0x0050_0000
-        }),
-        "known-direct must not rescue a census-shared secondary destination \
-         while fake-IP is not covering the rule host by name"
-    );
-}
-
-#[test]
-fn fake_ip_datapath_flip_retightens_shared_ip_exemption_on_recompute() {
-    // The gate is read LIVE on every compute, so the replan fired on a
-    // fake-IP toggle/datapath transition (the composition root's fake-IP
-    // replan hook, which runs the window-free `recompile_for_sid` diff) is
-    // sufficient to tighten or loosen the known-direct rescue: same SID,
-    // same rules, only the datapath signal flips between passes. The
-    // tightening pass must also DELETE the superseded permit — an add-only
-    // pass would leave the leak installed.
-    use std::sync::atomic::{AtomicBool, Ordering};
-    let shared = Ipv4Addr::new(203, 0, 113, 163);
-    let effective = Arc::new(AtomicBool::new(true));
-    let registry = Arc::new(crate::known_direct::KnownDirectRegistry::default());
-    registry.register(&[shared]);
-    let (api, orch, src, rules) = fixture_with_census(
-        None,
-        &[shared],
-        Some(Arc::clone(&registry)),
-        Arc::clone(&effective),
-    );
-    rules.set(shared_ip_rule_book(shared));
-    let mut snap = snap_block_mode_b("Wi-Fi", "TAP");
-    snap.kill_switch_strict_shared_ips = false;
-    src.set("S-1-5-21-A", snap);
-
-    use nrr_platform_api::types::WfpLayerKey;
-    // Only the catch-all EXEMPT band counts — the rule's own ALE permit
-    // sits lower and exists either way.
-    let shared_permitted = |api: &MockWindowsApi| {
-        api.wfp_filters.lock().unwrap().iter().any(|f| {
-            f.layer == WfpLayerKey::AleAuthConnectV4
-                && f.action == WfpAction::Permit
-                && f.covers_v4(shared)
-                && f.weight >= 0x0050_0000
-        })
-    };
-
-    orch.install_for_sid("S-1-5-21-A").unwrap();
-    assert!(
-        shared_permitted(&api),
-        "datapath effective: the smart exemption spares the shared IP"
-    );
-
-    effective.store(false, Ordering::Relaxed); // datapath died / toggle off
-    orch.recompile_for_sid("S-1-5-21-A").unwrap();
-    assert!(
-        !shared_permitted(&api),
-        "recompute after the datapath flip must retighten to the strict subtraction"
-    );
-
-    effective.store(true, Ordering::Relaxed); // datapath recovered
-    orch.recompile_for_sid("S-1-5-21-A").unwrap();
-    assert!(
-        shared_permitted(&api),
-        "recovery replan restores the smart exemption"
     );
 }
 
@@ -1001,13 +839,12 @@ fn a_cut_held_by_a_present_user_is_announced_to_the_next_one() {
     );
 }
 
-/// The machine-wide IPv6 packet cut is held only while one user alone blocks
-/// everything. Its holder's own inputs do not move when a second user arms or
-/// leaves, so that edge has to ask for the pass that re-plans the holder.
+/// With two users blocking everything, `ping -6` must stop for both: the
+/// IPv6 packet cut cannot name a user, and the second blocker dropping it left
+/// ICMPv6, GRE and ESP open to everyone. Each holds the cut; the other's
+/// exemptions sit beside it.
 #[test]
-fn a_second_blocker_arriving_or_leaving_re_plans_the_first_one() {
-    use std::sync::atomic::{AtomicUsize, Ordering};
-
+fn every_user_blocking_everything_holds_the_ipv6_packet_cut() {
     let api = Arc::new(MockWindowsApi::new());
     let session = Arc::new(WfpSession::open(Arc::clone(&api) as Arc<dyn WindowsApiPort>).unwrap());
     let src = Arc::new(ScriptedSource::default());
@@ -1017,7 +854,6 @@ fn a_second_blocker_arriving_or_leaving_re_plans_the_first_one() {
         "example.test",
         vec![std::net::IpAddr::V4(Ipv4Addr::new(203, 0, 113, 9))],
     );
-    let requests = Arc::new(AtomicUsize::new(0));
     let orch = PerSidApplyOrchestrator::new(
         session,
         Arc::clone(&src) as Arc<dyn RoutePolicySource>,
@@ -1028,13 +864,7 @@ fn a_second_blocker_arriving_or_leaving_re_plans_the_first_one() {
     .with_kill_switch_resolver(Arc::new(|_, _| None))
     .with_ipv6_guard_resolver(Arc::new(|_, _| {
         crate::enforcement_planner::Ipv6Guard::FiltersAndRoutes
-    }))
-    .with_peer_replan({
-        let requests = Arc::clone(&requests);
-        Arc::new(move || {
-            requests.fetch_add(1, Ordering::SeqCst);
-        })
-    });
+    }));
     rules.set(rules_with_secondary_host("example.test"));
     let packet_cut_of = |sid: &str| {
         let ids: std::collections::HashSet<u64> = orch
@@ -1048,7 +878,6 @@ fn a_second_blocker_arriving_or_leaving_re_plans_the_first_one() {
                 && f.action == WfpAction::Block
         })
     };
-    // What the requested pass does: every user's plan again.
     let pass = || {
         for sid in ["S-1-5-21-A", "S-1-5-21-B"] {
             orch.reconcile_secondary_coverage(sid).unwrap();
@@ -1057,35 +886,24 @@ fn a_second_blocker_arriving_or_leaving_re_plans_the_first_one() {
 
     src.set("S-1-5-21-A", snap_block_mode_b("Wi-Fi", "TAP"));
     orch.install_for_sid("S-1-5-21-A").unwrap();
-    assert!(packet_cut_of("S-1-5-21-A"), "alone, A holds the packet cut");
-    assert_eq!(requests.load(Ordering::SeqCst), 0, "nobody else to re-plan");
-
     src.set("S-1-5-21-B", snap_block_mode_b("Wi-Fi", "TAP"));
     orch.install_for_sid("S-1-5-21-B").unwrap();
-    assert!(!packet_cut_of("S-1-5-21-B"));
-    assert_eq!(
-        requests.load(Ordering::SeqCst),
-        1,
-        "B arming must ask for a pass, or A keeps cutting B's IPv6"
-    );
     pass();
     assert!(
-        !packet_cut_of("S-1-5-21-A"),
-        "with two blockers nobody holds the machine-wide cut"
+        packet_cut_of("S-1-5-21-A"),
+        "A blocks everything: its cut stands"
+    );
+    assert!(
+        packet_cut_of("S-1-5-21-B"),
+        "B blocks everything: its cut stands"
     );
 
     src.set("S-1-5-21-B", snap_primary_only("Wi-Fi"));
     orch.recompile_for_sid("S-1-5-21-B").unwrap();
-    assert_eq!(requests.load(Ordering::SeqCst), 2, "B leaving asks too");
     pass();
     assert!(
         packet_cut_of("S-1-5-21-A"),
-        "alone again, A gets its packet cut back"
-    );
-    assert_eq!(
-        requests.load(Ordering::SeqCst),
-        2,
-        "a re-plan that changes nobody's posture asks for nothing more"
+        "B leaving does not lift A's cut"
     );
 }
 

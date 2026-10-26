@@ -118,6 +118,22 @@ pub const AFFINITY: Key = key(
     "tray.auto-rules.detail-affinity",
     "belongs to this site {percent}% of the time",
 );
+/// What the additional route was found to do for a site that does not open
+/// over the main one, by `site_offer_reach` slug.
+pub const ADDITIONAL_REACH: [Key; 3] = [
+    key(
+        "tray.auto-rules.reach.confirmed",
+        "it opens over the additional route",
+    ),
+    key(
+        "tray.auto-rules.reach.unconfirmed",
+        "the additional route may help",
+    ),
+    key(
+        "tray.auto-rules.reach.unreachable",
+        "it does not open over the additional route either",
+    ),
+];
 pub const SIGNALS: [Key; 7] = [
     key("tray.auto-rules.signal.brand-related", "shares a name with the site"),
     key(
@@ -474,6 +490,7 @@ pub fn all() -> Vec<Key> {
         FILTER_ACTIVE,
     ];
     keys.extend(SIGNALS);
+    keys.extend(ADDITIONAL_REACH);
     keys.extend(LESS_CERTAIN_BASES);
     keys.extend_from_slice(HELP_KEYS);
     keys.extend_from_slice(PLAIN_KEYS);

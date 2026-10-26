@@ -83,6 +83,11 @@ const FAKEIP_POOL_PERMIT_BASE: u64 = KILLSWITCH_PERMIT_BASE + 0x000E_0000;
 // outranks it, so every main-named address keeps working for a pinned app —
 // uncapped, replacing the 64-entry per-(app, address) rescue permits.
 const APP_KILLSWITCH_BLOCK_BASE: u64 = 0x001C_0000;
+// The same block while application rules take all their addresses, mirrored
+// from `wfp_bands::APP_TAKEOVER_BLOCK_BASE`: the last window below the
+// kill-switch permits, so it outranks the primary rule permits but not the
+// app's own egress permit.
+const APP_TAKEOVER_BLOCK_BASE: u64 = 0x003F_F000;
 // DoH/DoT lockdown band, mirrored from `killswitch_codegen::DOH_BLOCK_BASE`.
 // Between the primary rule band (`0x0020_0000`) and the kill-switch block
 // band (`0x0030_0000`).
@@ -148,6 +153,8 @@ const _: () = {
     assert!(APP_EXEMPT_BASE > CATCHALL_EXEMPT_BASE);
     assert!(CATCHALL_EXEMPT_BASE > FAKEIP_POOL_PERMIT_BASE);
     assert!(FAKEIP_POOL_PERMIT_BASE > KILLSWITCH_PERMIT_BASE);
+    assert!(KILLSWITCH_PERMIT_BASE > APP_TAKEOVER_BLOCK_BASE);
+    assert!(APP_TAKEOVER_BLOCK_BASE > KILLSWITCH_BLOCK_BASE);
     assert!(KILLSWITCH_PERMIT_BASE > KILLSWITCH_BLOCK_BASE);
     assert!(KILLSWITCH_BLOCK_BASE > DOH_BLOCK_BASE);
     assert!(DOH_BLOCK_BASE > BASE_PRIMARY);

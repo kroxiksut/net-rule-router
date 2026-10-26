@@ -246,6 +246,23 @@ pub fn plan_catch_all_kill_switch(
     v6: Ipv6Exemptions<'_>,
     protocols: KillSwitchProtocols,
 ) -> Vec<FlowRule> {
+    if server_ips.is_empty() {
+        return Vec::new();
+    }
+    plan_user_scoped_catch_all(sid, server_ips, local_subnets, v6, protocols)
+}
+
+/// [`plan_catch_all_kill_switch`] for a platform whose blanket covers the
+/// user's own sockets alone: the tunnel daemon and the kernel's handshakes are
+/// not under it, so an unknown server seals no reconnect and is no reason to
+/// leave the user's traffic open. Empty only when no protocol is selected.
+pub fn plan_user_scoped_catch_all(
+    sid: &str,
+    server_ips: &[Ipv4Addr],
+    local_subnets: &[(Ipv4Addr, u8)],
+    v6: Ipv6Exemptions<'_>,
+    protocols: KillSwitchProtocols,
+) -> Vec<FlowRule> {
     let any_selected = protocols.tcp
         || protocols.udp
         || protocols.icmp
@@ -253,7 +270,7 @@ pub fn plan_catch_all_kill_switch(
         || protocols.gre
         || protocols.esp
         || protocols.other;
-    if server_ips.is_empty() || !any_selected {
+    if !any_selected {
         return Vec::new();
     }
     // `other` does not activate the packet layer
@@ -391,7 +408,7 @@ pub fn plan_catch_all_kill_switch(
 
 /// Above the IPv6 exemption band, where `killswitch_codegen` weighs its egress
 /// permit (`CATCHALL_EXEMPT_BASE + 100`).
-const CATCH_ALL_V6_EGRESS_ORDINAL: u32 = 100;
+pub(super) const CATCH_ALL_V6_EGRESS_ORDINAL: u32 = 100;
 
 /// First ordinal of the foreign-tunnel permits: past every exemption the
 /// blanket postures number, so the two never share a slot.

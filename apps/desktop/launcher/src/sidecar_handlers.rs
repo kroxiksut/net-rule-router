@@ -36,6 +36,7 @@
 
 use std::sync::{Arc, Mutex};
 
+use nrr_shared::preset_parser::{app_section_os_label, other_os_app_rules};
 use serde_json::{json, Value};
 
 use nrr_storage_sidecar::{
@@ -200,7 +201,29 @@ fn handle_passthrough_read(db: &SidecarDb, payload: &Value) -> SidecarHandlerRes
         .and_then(Value::as_str)
         .ok_or_else(|| missing("route"))?;
     let sections = db.read_passthrough(route)?;
-    Ok(json!({ "sections": sections }))
+    let other_os_rules = other_os_rules_of(&sections);
+    Ok(json!({ "sections": sections, "other-os-rules": other_os_rules }))
+}
+
+/// Another OS's programs in the sections, for the table to show read only;
+/// the sections themselves are what a write carries.
+fn other_os_rules_of(sections: &std::collections::BTreeMap<String, String>) -> Vec<Value> {
+    let mut rules = Vec::new();
+    for (name, raw_text) in sections {
+        let Some(os) = app_section_os_label(name) else {
+            continue;
+        };
+        for rule in other_os_app_rules(name, raw_text) {
+            rules.push(json!({
+                "os": os,
+                "enabled": rule.enabled,
+                "value": rule.stored_value(),
+                "comment": rule.comment,
+                "blocked": rule.blocked,
+            }));
+        }
+    }
+    rules
 }
 
 fn handle_passthrough_write(db: &SidecarDb, payload: &Value) -> SidecarHandlerResult {
@@ -464,6 +487,48 @@ mod tests {
         .expect("read");
         assert_eq!(read["sections"]["Linux"], "firefox\n");
         assert_eq!(read["sections"]["MacOS"], "Safari\n");
+    }
+
+    /// The table shows another OS's programs from what the read returns; a
+    /// section of a newer build or the running OS's own names none.
+    #[test]
+    fn passthrough_read_lists_another_os_programs() {
+        let foreign = if cfg!(target_os = "linux") {
+            "MacOS"
+        } else {
+            "Linux"
+        };
+        let tmp = tempfile::tempdir().unwrap_or_else(|e| panic!("tempdir: {e}"));
+        let handle = fresh_handle(&tmp.path().join("sidecar.db"));
+        let _ = handle_sidecar_request(
+            &handle,
+            "sidecar.passthrough.write",
+            &json!({
+                "route": "secondary",
+                "sections": {
+                    foreign: "firefox +children  # browser\n# thunderbird\n",
+                    "Ports": "443\n",
+                }
+            }),
+        )
+        .expect("write");
+
+        let read = handle_sidecar_request(
+            &handle,
+            "sidecar.passthrough.read",
+            &json!({ "route": "secondary" }),
+        )
+        .expect("read");
+        let os = if foreign == "MacOS" { "macOS" } else { "Linux" };
+        assert_eq!(
+            read["other-os-rules"],
+            json!([
+                { "os": os, "enabled": true, "value": "firefox +children",
+                  "comment": "browser", "blocked": false },
+                { "os": os, "enabled": false, "value": "thunderbird",
+                  "comment": "", "blocked": false },
+            ])
+        );
     }
 
     /// The count must be what was stored: an oversized section is refused, and
