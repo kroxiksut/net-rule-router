@@ -18,7 +18,10 @@ use nrr_domain::rules_file::HostPlatform;
 use nrr_storage::install_policy::{InstallPolicy, InstallPolicyRepository};
 use rusqlite::Connection;
 
-use super::bundle::{check_bundle, BundleBytes, CheckedBundle, ProvisionPart, ProvisionRefusal};
+use super::bundle::{
+    check_bundle, rules_of_routes, BundleBytes, CheckedBundle, ProvisionPart, ProvisionRefusal,
+    RouteRules,
+};
 use super::folder::{mark_processed, read_bundle_owned_by, ProcessedAs, ROOT_UID};
 use crate::ipc_handlers::mutation_token_store::StoredMutation;
 use crate::ipc_handlers::payloads::MutationKind;
@@ -101,29 +104,29 @@ fn apply_bundle(
 ) -> Result<(bool, bool), ProvisionRefusal> {
     let checked = check_bundle(bytes, HostPlatform::compiled())?;
     if checked.has_rules() {
-        import_rules(bytes, applier)?;
+        let routes = rules_of_routes(bytes, checked.settings.as_ref())?;
+        import_rules(routes, applier)?;
     }
     let policy = store_policy(&checked, applier)?;
     Ok((checked.has_rules(), policy))
 }
 
+/// The rules each route takes, whether from its own file or the settings file.
 fn import_rules(
-    bytes: &BundleBytes,
+    [primary, secondary]: [RouteRules<'_>; 2],
     applier: &ProvisionApplier<'_>,
 ) -> Result<(), ProvisionRefusal> {
-    let part = if bytes.primary.is_some() {
-        ProvisionPart::Primary
-    } else {
-        ProvisionPart::Secondary
-    };
+    let part = primary
+        .or(secondary)
+        .map_or(ProvisionPart::Primary, |(_, part)| part);
     let mut payload = serde_json::json!({
         "include-child-processes": false,
         "import-only-active": false,
     });
-    if let Some(primary) = bytes.primary.as_deref() {
+    if let Some((primary, _)) = primary {
         payload["primary-bytes-b64"] = BASE64_STANDARD.encode(primary).into();
     }
-    if let Some(secondary) = bytes.secondary.as_deref() {
+    if let Some((secondary, _)) = secondary {
         payload["secondary-bytes-b64"] = BASE64_STANDARD.encode(secondary).into();
     }
     let stored = StoredMutation {
@@ -153,8 +156,8 @@ fn store_policy(
     applier: &ProvisionApplier<'_>,
 ) -> Result<bool, ProvisionRefusal> {
     let unset = checked.options.secondary_unset;
-    let mode = checked.settings.and_then(|s| s.route_mode);
-    let leak = checked.settings.and_then(|s| s.leak_protection);
+    let mode = checked.settings.as_ref().and_then(|s| s.route_mode);
+    let leak = checked.settings.as_ref().and_then(|s| s.leak_protection);
     if unset.is_none() && mode.is_none() && leak.is_none() {
         return Ok(false);
     }

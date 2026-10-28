@@ -215,6 +215,13 @@ doc = false
 bench = false
 
 [[bin]]
+name = "icmp_reply"
+path = "fuzz_targets/icmp_reply.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
 name = "process_command_line"
 path = "fuzz_targets/process_command_line.rs"
 test = false
@@ -259,6 +266,13 @@ bench = false
 [[bin]]
 name = "rule_value_validation"
 path = "fuzz_targets/rule_value_validation.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "hosts_content"
+path = "fuzz_targets/hosts_content.rs"
 test = false
 doc = false
 bench = false

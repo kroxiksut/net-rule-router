@@ -259,7 +259,7 @@ Dialog {
                     Accessible.name: text
                     Accessible.description: dialog.tr(
                         "dialog.drift.load-from-file-description",
-                        "Re-import the saved file(s). Local edits are replaced.")
+                        "Load the saved file(s) into the app table, replacing local edits. Apply when ready.")
                     onClicked: { dialog.loadFromFileRequested(); dialog.close() }
                 }
                 ThemedButton {

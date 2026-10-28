@@ -10,10 +10,20 @@ work="$(mktemp -d)"
 trap 'rm -rf -- "$work"' EXIT
 
 pin="0123456789abcdef0123456789abcdef01234567"
+commit_time="$(date -u -d '2026-10-26 12:00' +%s)"
+# date_agreement <ISO date> [<Russian date>]: both headers, as the files carry them.
+date_agreement() {
+  local ru="${2:-$(printf '%s' "$1" | awk -F- '{ print $3 "." $2 "." $1 }')}"
+  printf '# Agreement\r\n\r\nAgreement revision 1 · %s · applies to alpha builds (1.2.x)\r\n' "$1" \
+    >"$work/root/docs/legal/eula.en.md"
+  printf '# Соглашение\n\nРедакция соглашения 1 · %s · относится к сборкам стадии альфа (1.2.x)\n' "$ru" \
+    >"$work/root/docs/legal/eula.ru.md"
+}
 make_root() {
   local root="$work/root"
   rm -rf -- "$root"
-  mkdir -p "$root/.github/workflows"
+  mkdir -p "$root/.github/workflows" "$root/docs/legal"
+  date_agreement 2026-10-26
   printf '[workspace]\nmembers = []\n\n[workspace.package]\nversion = "1.2.3-alpha"\n' >"$root/Cargo.toml"
   for wf in linux-quality windows-quality; do
     printf 'name: %s\non:\n  push:\njobs:\n  baseline:\n    steps:\n      - uses: actions/checkout@%s # v4\n' "$wf" "$pin" \
@@ -33,12 +43,14 @@ FAKE
 chmod +x "$work/gh"
 
 ok=".github/workflows/linux-quality.yml\tcompleted\tsuccess\thttps://x/1\n.github/workflows/windows-quality.yml\tcompleted\tsuccess\thttps://x/2\n"
+commit_args=(--commit-time "$commit_time")
 failures=0
 # expect <exit code> <text the output must hold, or ""> <guard args...>
 expect() {
   local want="$1" text="$2" got=0 out
   shift 2
-  out="$(GH="$work/gh" GITHUB_ACTIONS="" bash "$guard" --sha abc --repo o/r --root "$work/root" "$@" 2>&1)" || got=$?
+  out="$(GH="$work/gh" GITHUB_ACTIONS="" bash "$guard" --sha abc --repo o/r --root "$work/root" \
+    "${commit_args[@]}" "$@" 2>&1)" || got=$?
   if [ "$got" -ne "$want" ] || { [ -n "$text" ] && ! grep -qF -- "$text" <<<"$out"; }; then
     echo "FAIL: ${case_name}: exit $got (want $want), output:" >&2
     printf '%s\n' "$out" >&2
@@ -74,6 +86,26 @@ case_name="new push workflow not counted"; FAKE_RUNS="$ok" expect 1 "workflow li
 make_root
 rm "$work/root/.github/workflows/windows-quality.yml"
 case_name="CI workflow renamed away"; FAKE_RUNS="$ok" expect 1 "CI workflow windows-quality.yml is gone" --tag v1.2.3-alpha
+
+make_root
+date_agreement 2026-07-16
+case_name="agreement keeps an old date"; FAKE_RUNS="$ok" \
+  expect 1 "the agreement is dated 2026-07-16, but the tagged commit was made on 2026-10-26" --tag v1.2.3-alpha
+case_name="old agreement date, branch run"; FAKE_RUNS="$ok" expect 0 "Release guard passed"
+date_agreement 2026-10-27
+case_name="agreement dated the next day (time zone ahead of UTC)"; FAKE_RUNS="$ok" expect 0 "Release guard passed" --tag v1.2.3-alpha
+date_agreement 2026-10-25
+case_name="agreement dated the day before (time zone behind UTC)"; FAKE_RUNS="$ok" expect 0 "Release guard passed" --tag v1.2.3-alpha
+date_agreement 2026-10-26 25.10.2026
+case_name="the two languages name different days"; FAKE_RUNS="$ok" \
+  expect 1 "docs/legal/eula.ru.md is dated 2026-10-25, docs/legal/eula.en.md 2026-10-26" --tag v1.2.3-alpha
+printf '# Agreement\n\nNo header here.\n' >"$work/root/docs/legal/eula.en.md"
+case_name="agreement without a dated header"; FAKE_RUNS="$ok" \
+  expect 1 "no agreement date in the header of docs/legal/eula.en.md" --tag v1.2.3-alpha
+make_root
+commit_args=()
+case_name="commit date unreadable"; FAKE_RUNS="$ok" expect 1 "could not read the date of commit abc" --tag v1.2.3-alpha
+commit_args=(--commit-time "$commit_time")
 
 [ "$failures" -eq 0 ] || { echo "release-guard self-test: $failures case(s) failed" >&2; exit 1; }
 echo "release-guard self-test passed."

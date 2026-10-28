@@ -43,6 +43,12 @@ pub type BlockedNetworkFn = Arc<dyn Fn(&str, &BlockAttempt) -> Option<String> + 
 /// the cap only bounds memory if something upstream starts inventing SIDs.
 const MAX_TRACKED_PRINCIPALS: usize = 16;
 
+/// Notices pushed to one user per [`BLOCK_NOTICE_PUSH_WINDOW`]. A sweep across
+/// many blocked destinations is a new episode each; past this the episodes are
+/// still counted and logged, but no longer each put on the user's screen.
+pub const BLOCK_NOTICE_PUSH_BUDGET: usize = 8;
+pub const BLOCK_NOTICE_PUSH_WINDOW: Duration = Duration::from_secs(10);
+
 /// Owns one ledger per principal; logs on `nrr::block-notice` for every attempt
 /// that opens a fresh, unmuted episode. Delivery to the tray/GUI is a later
 /// step — this is the sole consumer of `record`'s result today.
@@ -55,6 +61,9 @@ pub struct BlockNoticeCenter {
     /// is built; empty until then and on platforms without one.
     lineage: Mutex<Option<Arc<dyn ProcessLineagePort>>>,
     blocked_network: Option<BlockedNetworkFn>,
+    /// Per principal, when the current push window opened and how many
+    /// notices it has carried.
+    push_windows: Mutex<HashMap<String, (Instant, usize)>>,
 }
 
 impl Default for BlockNoticeCenter {
@@ -73,7 +82,28 @@ impl BlockNoticeCenter {
             journal: None,
             lineage: Mutex::new(None),
             blocked_network: None,
+            push_windows: Mutex::new(HashMap::new()),
         }
+    }
+
+    /// Whether `sid` may be pushed one more notice now.
+    fn spend_push_budget(&self, sid: &str, now: Instant) -> bool {
+        let mut windows = self.push_windows.lock().unwrap_or_else(|p| p.into_inner());
+        if windows.len() >= MAX_TRACKED_PRINCIPALS && !windows.contains_key(sid) {
+            windows.retain(|_, (opened, _)| now.duration_since(*opened) < BLOCK_NOTICE_PUSH_WINDOW);
+            if windows.len() >= MAX_TRACKED_PRINCIPALS {
+                windows.clear();
+            }
+        }
+        let window = windows.entry(sid.to_owned()).or_insert((now, 0));
+        if now.duration_since(window.0) >= BLOCK_NOTICE_PUSH_WINDOW {
+            *window = (now, 0);
+        }
+        if window.1 >= BLOCK_NOTICE_PUSH_BUDGET {
+            return false;
+        }
+        window.1 += 1;
+        true
     }
 
     /// Name an attempt dropped by a network Block rule after that network, so
@@ -179,7 +209,11 @@ impl BlockNoticeCenter {
                     journal.append(sid, &notice, now_ms as i64);
                 }
             }
-            if let Some(bus) = self.events.as_ref() {
+            if let Some(bus) = self
+                .events
+                .as_ref()
+                .filter(|_| self.spend_push_budget(sid, Instant::now()))
+            {
                 bus.publish_for(
                     sid,
                     StatusUpdateEvent::BlockNoticeRaised {
@@ -538,6 +572,35 @@ mod tests {
         center.record(ALICE, &attempt());
 
         assert_eq!(bus.peek_pending_for(&sub.subscription_id, 10).len(), 1);
+    }
+
+    /// A program sweeping hundreds of blocked destinations opened an episode,
+    /// and pushed a notice, for each: the user's screen filled with cards and
+    /// the flood pushed every other event of theirs out of the ring.
+    #[test]
+    fn a_storm_of_new_episodes_pushes_a_bounded_number_of_notices() {
+        let bus = Arc::new(EventBus::new());
+        let alice = bus.subscribe_as("gui-a".to_string(), Some(ALICE.to_string()), None);
+        let bob = bus.subscribe_as("gui-b".to_string(), Some(BOB.to_string()), None);
+        let center = BlockNoticeCenter::new().with_event_bus(Arc::clone(&bus));
+
+        for n in 0..300 {
+            let mut sweep = attempt();
+            sweep.host = Some(format!("h{n}.example"));
+            center.record(ALICE, &sweep);
+        }
+        center.record(BOB, &attempt());
+
+        let pushed = bus.peek_pending_for(&alice.subscription_id, 1000).len();
+        assert!(
+            (1..=BLOCK_NOTICE_PUSH_BUDGET).contains(&pushed),
+            "{pushed} notices pushed for one sweep"
+        );
+        assert_eq!(
+            bus.peek_pending_for(&bob.subscription_id, 10).len(),
+            1,
+            "another user's storm spends nothing of this one's budget"
+        );
     }
 
     #[test]

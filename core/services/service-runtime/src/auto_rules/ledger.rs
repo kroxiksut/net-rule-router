@@ -341,10 +341,14 @@ impl AutoRulesEngine {
     ///
     /// A less certain offer is parked for a person instead, whatever produced
     /// it: the unattended bar already leaves them out, and this is the one
-    /// place a rule is written unasked, so the guarantee is held here too.
+    /// place a rule is written unasked, so the guarantee is held here too. So
+    /// is one covering a name a reverse lookup produced: the owner of the
+    /// address chose that name.
     pub(super) fn author_now(&self, sid: &str, fresh: &[PendingCandidate], now: SystemTime) -> u32 {
         let (asked, unasked): (Vec<PendingCandidate>, Vec<PendingCandidate>) =
-            fresh.iter().cloned().partition(|c| is_less_certain(&c.dto));
+            fresh.iter().cloned().partition(|c| {
+                is_less_certain(&c.dto) || self.covers_reverse_named(sid, &c.dto.proposed_match)
+            });
         if !asked.is_empty() {
             self.park(sid, asked, unix_ms(now));
         }

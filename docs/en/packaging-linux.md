@@ -115,9 +115,12 @@ cd netrulerouter-<version>-linux-x86_64
 sudo ./install.sh
 ```
 
-The archive puts the files in the same places the packages do, but nothing
-checks its requirements for you; they are listed in its `README.txt`. Prefer a
-package wherever your distribution takes one.
+The archive puts the files in the same places the packages do. On a system too
+old to run what it carries, `install.sh` installs nothing and says what to use
+instead: the archive without the window or the `netrulerouter` package alone,
+which give you the service and the [terminal interface](tui.md), or a newer
+system. Nothing checks its other requirements for you; they are listed in its
+`README.txt`. Prefer a package wherever your distribution takes one.
 
 ## What each variant requires
 

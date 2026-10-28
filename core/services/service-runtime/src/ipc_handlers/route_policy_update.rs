@@ -75,7 +75,9 @@ impl CheckedIpcHandler for RoutePolicyUpdateHandler {
         // no adapter of this machine. Refused here rather than in the GUI: a
         // stored binding to one produces an apply that silently changes nothing,
         // and the check belongs where every client passes.
-        if let Some(stable_id) = placeholder_binding(&req) {
+        if let Some(stable_id) =
+            placeholder_binding(&req, || self.writer.stored_for_sid(ctx.caller_stored()))
+        {
             return Err(map_write_error(RoutePolicyWriteError::PlaceholderAdapter {
                 stable_id,
             }));
@@ -230,14 +232,28 @@ fn sites_under_additional_route(req: &RoutePolicyUpdateRequest) -> bool {
         && req.mode == BehaviorModeDto::PreferSecondaryWhenAvailable
 }
 
-/// The first binding in `req` naming a placeholder adapter, if any.
-fn placeholder_binding(req: &RoutePolicyUpdateRequest) -> Option<String> {
-    [req.primary.as_ref(), req.secondary.as_ref()]
+/// The first slot `req` binds to a placeholder adapter it does not already
+/// hold. One stored before the refusal existed stays until rebound: refusing
+/// it would refuse every other setting the same write carries.
+fn placeholder_binding(
+    req: &RoutePolicyUpdateRequest,
+    stored: impl FnOnce() -> Option<nrr_shared::ipc_payloads::RoutePolicyDto>,
+) -> Option<String> {
+    let requested = [&req.primary, &req.secondary].map(|slot| {
+        slot.as_ref()
+            .map(|b| b.stable_id.clone())
+            .filter(|id| nrr_platform_api::interface_rows::is_preview_persistent_id(id))
+    });
+    if requested.iter().all(Option::is_none) {
+        return None;
+    }
+    let held = stored()
+        .map(|s| [s.primary, s.secondary].map(|slot| slot.map(|b| b.stable_id)))
+        .unwrap_or_default();
+    requested
         .into_iter()
-        .flatten()
-        .map(|b| b.stable_id.as_str())
-        .find(|id| nrr_platform_api::interface_rows::is_preview_persistent_id(id))
-        .map(str::to_string)
+        .zip(held)
+        .find_map(|(asked, held)| asked.filter(|id| held.as_ref() != Some(id)))
 }
 
 fn map_write_error(err: RoutePolicyWriteError) -> IpcError {
@@ -272,7 +288,7 @@ mod tests {
     use crate::ipc_handlers::payloads::{
         BehaviorModeDto, BindingSourceDto, LeakProtectionDto, RouteBindingDto, RoutePolicyDto,
     };
-    use crate::ipc_handlers::providers::SITES_NEEDS_MAIN_ROUTE_CODE;
+    use crate::ipc_handlers::providers::{PLACEHOLDER_ADAPTER_CODE, SITES_NEEDS_MAIN_ROUTE_CODE};
     use nrr_shared::ipc::{IpcClientProfile, IpcOperationName};
     use std::sync::Mutex;
 
@@ -495,6 +511,78 @@ mod tests {
         let req: RoutePolicyUpdateRequest = serde_json::from_value(merged).expect("request");
         assert!(req.external_address_auto_check);
         assert_eq!(req.leak_protection, LeakProtectionDto::Everything);
+    }
+
+    /// A placeholder binding stored before the refusal existed must not lock
+    /// the user out of every other setting: a write that leaves it as it is,
+    /// partial or whole, applies. Binding the other slot to a placeholder, or
+    /// moving it there, is still refused.
+    #[test]
+    fn a_stored_placeholder_does_not_refuse_a_write_that_leaves_it_alone() {
+        let placeholder = nrr_platform_api::interface_rows::PREVIEW_WIFI_PERSISTENT_ID;
+        let mut stored = sample_dto();
+        stored
+            .primary
+            .as_mut()
+            .expect("sample binds primary")
+            .stable_id = placeholder.into();
+        let writer = Arc::new(StoringWriter {
+            row: Mutex::new(stored.clone()),
+        });
+        let h =
+            RoutePolicyUpdateHandler::new(Arc::clone(&writer) as Arc<dyn RoutePolicyWriter>, None);
+
+        let mut partial = request_json(&sample_dto());
+        partial["leak-protection"] = serde_json::json!("everything");
+        partial["apply-only"] = serde_json::json!(["leak-protection"]);
+        h.handle(&req(partial), &ctx("S-1-5-21-A"))
+            .unwrap_or_else(|e| panic!("partial write refused: {}", e.message));
+        assert_eq!(
+            writer.row.lock().unwrap().leak_protection,
+            LeakProtectionDto::Everything
+        );
+
+        let mut whole = request_json(&stored);
+        whole["auto-rules-mode"] = serde_json::json!("auto");
+        h.handle(&req(whole), &ctx("S-1-5-21-A"))
+            .unwrap_or_else(|e| panic!("whole write refused: {}", e.message));
+        assert_eq!(writer.row.lock().unwrap().auto_rules_mode, "auto");
+
+        let mut other_slot = request_json(&stored);
+        other_slot["secondary"] = serde_json::json!({
+            "stable-id": nrr_platform_api::interface_rows::PREVIEW_VPN_PERSISTENT_ID,
+            "display-name": "VPN",
+            "user-confirmed": true,
+        });
+        let err = h
+            .handle(&req(other_slot), &ctx("S-1-5-21-A"))
+            .expect_err("a new placeholder binding is refused");
+        assert_eq!(err.code, IpcErrorCode::PreconditionFailed);
+
+        let mut moved = request_json(&stored);
+        moved["secondary"] = moved["primary"].clone();
+        moved.as_object_mut().expect("object").remove("primary");
+        let err = h
+            .handle(&req(moved), &ctx("S-1-5-21-A"))
+            .expect_err("a placeholder moved to the other slot is refused");
+        assert_eq!(err.code, IpcErrorCode::PreconditionFailed);
+    }
+
+    /// The refusal reaches a client as `precondition-failed`; its message opens
+    /// with the catalogued code so a client can word it.
+    #[test]
+    fn a_placeholder_refusal_opens_with_its_catalogued_code() {
+        let message = RoutePolicyWriteError::PlaceholderAdapter {
+            stable_id: "preview-adapter:wifi".into(),
+        }
+        .to_string();
+        assert!(
+            message.starts_with(&format!("{PLACEHOLDER_ADAPTER_CODE}:")),
+            "{message}"
+        );
+        assert!(
+            nrr_shared::client_error_codes::CLIENT_ERROR_CODES.contains(&PLACEHOLDER_ADAPTER_CODE)
+        );
     }
 
     #[test]

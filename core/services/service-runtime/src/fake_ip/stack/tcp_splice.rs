@@ -23,8 +23,28 @@ impl FakeIpStack {
         if packet.key.protocol != FlowProtocol::Tcp || !packet.is_connection_open {
             return;
         }
-        if self.flows.contains_key(&packet.key) {
-            return;
+        if let Some(flow) = self.flows.get(&packet.key) {
+            // A SYN on a tuple held in TIME-WAIT is the client reusing its
+            // port; smoltcp would drop it for the whole linger.
+            if self.sockets.get::<tcp::Socket>(flow.handle).state() != tcp::State::TimeWait {
+                return;
+            }
+            self.reap_flow(&packet.key);
+        }
+        // A closed connection lingering in TIME-WAIT carries nothing: it
+        // yields its slot before a live SYN is refused.
+        if self.flows.len() >= self.max_flows {
+            let lingering: Vec<FlowKey> = self
+                .flows
+                .iter()
+                .filter(|(_, f)| {
+                    self.sockets.get::<tcp::Socket>(f.handle).state() == tcp::State::TimeWait
+                })
+                .map(|(key, _)| *key)
+                .collect();
+            for key in &lingering {
+                self.reap_flow(key);
+            }
         }
         if self.flows.len() >= self.max_flows {
             self.health.record_tcp_flow_refused_at_capacity();
@@ -221,7 +241,11 @@ impl FakeIpStack {
                     Ok(n) => flow.shared.push_to_upstream(&chunk[..n]),
                 }
             }
-            if client_fin_may_propagate(flow.shared.dial_is_done(), socket.state()) {
+            if client_fin_may_propagate(
+                flow.shared.dial_is_done(),
+                socket.state(),
+                !socket.can_recv(),
+            ) {
                 flow.shared.signal_client_fin();
             }
 
@@ -288,14 +312,19 @@ impl FakeIpStack {
         }
 
         for key in finished {
-            if let Some(flow) = self.flows.remove(&key) {
-                self.sockets.remove(flow.handle);
-                flow.shared.mark_dead();
-                // Handles go to the graveyard, never joined here: a worker
-                // blocked on a stalled upstream would hold this join — and
-                // with it the poll thread, i.e. the entire datapath.
-                self.worker_graveyard.extend(flow.shared.take_workers());
-            }
+            self.reap_flow(&key);
+        }
+    }
+
+    /// Drop a flow with its socket; its workers exit on the dead flag.
+    fn reap_flow(&mut self, key: &FlowKey) {
+        if let Some(flow) = self.flows.remove(key) {
+            self.sockets.remove(flow.handle);
+            flow.shared.mark_dead();
+            // Handles go to the graveyard, never joined here: a worker
+            // blocked on a stalled upstream would hold this join — and
+            // with it the poll thread, i.e. the entire datapath.
+            self.worker_graveyard.extend(flow.shared.take_workers());
         }
     }
 }

@@ -312,8 +312,11 @@ fn settings_export_full_yaml_conforms_to_formats_md_2_4() {
     let out = exporter
         .export_settings(
             "S-1-5-21-test",
-            Some(r"C:\rules_primary.txt"),
-            Some(r"C:\rules_secondary.txt"),
+            &nrr_shared::ipc_payloads::SettingsExportFullRequest {
+                rules_file_path_primary: Some(r"C:\rules_primary.txt".to_owned()),
+                rules_file_path_secondary: Some(r"C:\rules_secondary.txt".to_owned()),
+                ..Default::default()
+            },
             "2026-05-20T12:00:00Z",
         )
         .expect("export");
@@ -321,7 +324,7 @@ fn settings_export_full_yaml_conforms_to_formats_md_2_4() {
     let yaml = &out.yaml_bytes_utf8;
     // Required top-level structure.
     assert!(yaml.starts_with("nrr_settings_export:\n"));
-    assert!(yaml.contains("version: 1\n"));
+    assert!(yaml.contains("version: 2\n"));
     assert!(yaml.contains("exported_at: \"2026-05-20T12:00:00Z\"\n"));
     // adapters: block with both roles populated.
     assert!(yaml.contains("system_id: \"mac=AA:BB:CC:DD:EE:FF;ifindex=3\""));

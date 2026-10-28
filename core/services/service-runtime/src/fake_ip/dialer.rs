@@ -91,6 +91,9 @@ pub struct UpstreamTarget {
     /// The served user whose links carry the flow, when it is not the
     /// routing user's.
     pub owner: Option<String>,
+    /// Every rule naming the host is a public top-level zone, so its private
+    /// addresses are not dialled through the tunnel, however they are found.
+    pub held_only_by_public_zone: bool,
 }
 
 impl UpstreamTarget {
@@ -105,6 +108,7 @@ impl UpstreamTarget {
             route,
             book_route: Some(route),
             owner: None,
+            held_only_by_public_zone: false,
         }
     }
 
@@ -439,6 +443,26 @@ impl SystemRelayDialer {
     /// This is the only DNS on the relay path, and it is on the dial thread by
     /// construction.
     fn dial_addresses(&self, target: &UpstreamTarget) -> Result<Vec<SocketAddr>, RelayError> {
+        let mut addresses = self.candidate_addresses(target)?;
+        if target.route == RouteRole::Secondary && target.held_only_by_public_zone {
+            addresses.retain(|a| {
+                nrr_domain::public_zone::admits_zone_learned_address(&target.hostname, a.ip())
+            });
+            if addresses.is_empty() {
+                return Err(RelayError::Upstream {
+                    detail: format!(
+                        "{} has only private addresses, which its public zone does not take into the tunnel",
+                        target.hostname
+                    ),
+                });
+            }
+        }
+        Ok(addresses)
+    }
+
+    /// [`Self::dial_addresses`] before the tunnel's say: the target's own, or
+    /// the ones looked up now.
+    fn candidate_addresses(&self, target: &UpstreamTarget) -> Result<Vec<SocketAddr>, RelayError> {
         if let Some(address) = target.address {
             let mut addresses = Vec::with_capacity(1 + target.fallbacks.len());
             addresses.push(address);
@@ -1123,6 +1147,7 @@ mod tests {
             route: RouteRole::Primary,
             book_route: Some(RouteRole::Primary),
             owner: None,
+            held_only_by_public_zone: false,
         }
     }
 
@@ -1300,6 +1325,43 @@ mod tests {
         stream.shutdown_write().expect("half close");
 
         assert_eq!(accepted.join().expect("join"), b"ping");
+    }
+
+    /// A stranger's `.ru` name that already holds a virtual address, looked up
+    /// again at dial time, answers 10.x: the tunnel is never dialled to it.
+    /// The policy is asked for every address the dialer means to reach, so a
+    /// 10.x it never hears of is a 10.x never dialled.
+    #[test]
+    fn a_public_zone_name_found_at_dial_time_is_never_dialled_to_a_private_address() {
+        struct AnswersPrivate;
+        impl RelayNameResolver for AnswersPrivate {
+            fn resolve(&self, _hostname: &str) -> Vec<IpAddr> {
+                vec!["10.1.2.3".parse().expect("ip")]
+            }
+        }
+        #[derive(Default)]
+        struct Asked(std::sync::Mutex<Vec<SocketAddr>>);
+        impl RelaySourceAddrs for Asked {
+            fn decide(&self, _route: RouteRole, remote: &SocketAddr) -> SourceBindDecision {
+                self.0
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .push(*remote);
+                SourceBindDecision::Refuse { reason: "test" }
+            }
+        }
+        let asked = Arc::new(Asked::default());
+        let dialer = SystemRelayDialer::new()
+            .with_name_resolver(Arc::new(AnswersPrivate))
+            .with_source_addrs(Arc::clone(&asked) as Arc<dyn RelaySourceAddrs>);
+        let mut target = unresolved_target("a1.attacker.ru", 443);
+        target.route = RouteRole::Secondary;
+        target.book_route = Some(RouteRole::Secondary);
+        target.held_only_by_public_zone = true;
+        assert!(dialer.connect_tcp(&target).is_err());
+        assert!(dialer.connect_udp(&target).is_err());
+        let asked = asked.0.lock().unwrap_or_else(|p| p.into_inner());
+        assert!(asked.is_empty(), "dialled toward {asked:?}");
     }
 
     #[test]

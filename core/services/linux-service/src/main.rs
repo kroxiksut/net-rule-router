@@ -55,6 +55,7 @@ fn main() -> ExitCode {
     {
         nrr_service_runtime::set_service_binary_version(env!("CARGO_PKG_VERSION"));
         let _ = nrr_service_runtime::process_started_at_ms();
+        nrr_service_runtime::install_throttled_panic_reports();
     }
     let args: Vec<String> = std::env::args().skip(1).collect();
     match cli::parse_command(&args) {

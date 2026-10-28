@@ -4,42 +4,57 @@
     {
       "name": "a new user's protection and answers always go",
       "input": { "held": null, "level": "sites", "doh": true, "touched": false },
-      "expected": { "protection": true, "stability": true }
+      "expected": { "protection": true, "stability": true, "fakeIp": true }
     },
     {
       "name": "a new user who changed nothing still writes",
       "input": { "held": null, "level": "off", "doh": false, "touched": true },
-      "expected": { "protection": true, "stability": true }
+      "expected": { "protection": true, "stability": true, "fakeIp": true }
     },
     {
       "name": "closed untouched by a user already set up writes nothing",
       "input": { "held": { "level": "everything", "doh": false }, "level": "everything", "doh": false, "touched": false },
-      "expected": { "protection": false, "stability": false }
+      "expected": { "protection": false, "stability": false, "fakeIp": false }
     },
     {
       "name": "a lowered level is written",
       "input": { "held": { "level": "everything", "doh": false }, "level": "sites", "doh": false, "touched": false },
-      "expected": { "protection": true, "stability": false }
+      "expected": { "protection": true, "stability": false, "fakeIp": false }
     },
     {
       "name": "lockdown switched on is written",
       "input": { "held": { "level": "sites", "doh": false }, "level": "sites", "doh": true, "touched": false },
-      "expected": { "protection": true, "stability": false }
+      "expected": { "protection": true, "stability": false, "fakeIp": false }
     },
     {
       "name": "a changed answer sends the answers only",
       "input": { "held": { "level": "sites", "doh": true }, "level": "sites", "doh": true, "touched": true },
-      "expected": { "protection": false, "stability": true }
+      "expected": { "protection": false, "stability": true, "fakeIp": false }
     },
     {
       "name": "both changed",
       "input": { "held": { "level": "off", "doh": true }, "level": "everything", "doh": true, "touched": true },
-      "expected": { "protection": true, "stability": true }
+      "expected": { "protection": true, "stability": true, "fakeIp": false }
+    },
+    {
+      "name": "a changed log window alone leaves the service's fake-IP alone",
+      "input": { "held": { "level": "sites", "doh": true }, "level": "sites", "doh": true, "touched": true, "fake-ip-touched": false },
+      "expected": { "protection": false, "stability": true, "fakeIp": false }
+    },
+    {
+      "name": "fake-IP switched by a user already set up is sent",
+      "input": { "held": { "level": "sites", "doh": true }, "level": "sites", "doh": true, "touched": false, "fake-ip-touched": true },
+      "expected": { "protection": false, "stability": true, "fakeIp": true }
+    },
+    {
+      "name": "a new user's fake-IP answer goes even untouched",
+      "input": { "held": null, "level": "sites", "doh": true, "touched": false, "fake-ip-touched": false },
+      "expected": { "protection": true, "stability": true, "fakeIp": true }
     },
     {
       "name": "lockdown switched off is written",
       "input": { "held": { "level": "off", "doh": true }, "level": "off", "doh": false, "touched": false },
-      "expected": { "protection": true, "stability": false }
+      "expected": { "protection": true, "stability": false, "fakeIp": false }
     }
   ]
 }

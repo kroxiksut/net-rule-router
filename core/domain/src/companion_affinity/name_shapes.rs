@@ -21,6 +21,30 @@ const MULTI_PART_PUBLIC_SUFFIXES: &[&str] = &[
     "com.ar", "com.hk", "com.mx", "com.sg", "com.tw",
 ];
 
+/// Hosting platforms where anyone holds a name one label deeper: a tenant is a
+/// site of its own, never the platform. Two-label endings only, like the table
+/// above.
+const HOSTING_PLATFORM_SUFFIXES: &[&str] = &[
+    "github.io",
+    "gitlab.io",
+    "pages.dev",
+    "workers.dev",
+    "netlify.app",
+    "vercel.app",
+    "web.app",
+    "firebaseapp.com",
+    "herokuapp.com",
+    "appspot.com",
+    "blogspot.com",
+    "cloudfront.net",
+    "azurewebsites.net",
+    "onrender.com",
+    "fly.dev",
+    "glitch.me",
+    "repl.co",
+    "ngrok.io",
+];
+
 /// A suffix rule on `suffix` would route the anchor itself — the site whose
 /// companions we are proposing. `*.x` covers `x`, so equality counts.
 pub(super) fn covers_the_anchor(anchor: &str, suffix: &str) -> bool {
@@ -106,6 +130,7 @@ pub fn registrable_domain(hostname: &str) -> Option<&str> {
     let last_two = second_dot.map_or(hostname, |i| &hostname[i + 1..]);
     let is_multi_part = MULTI_PART_PUBLIC_SUFFIXES
         .iter()
+        .chain(HOSTING_PLATFORM_SUFFIXES)
         .any(|s| s.eq_ignore_ascii_case(last_two));
     if !is_multi_part {
         return Some(last_two);

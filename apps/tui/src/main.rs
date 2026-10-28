@@ -175,6 +175,9 @@ fn run(
         .as_deref()
         .map(site_notices::load)
         .unwrap_or_default();
+    app.settings.prefs_damaged = prefs_path
+        .as_deref()
+        .and_then(screens::settings::prefs::damaged);
     app.settings.prefs_path = prefs_path;
     app.rules.baseline = platform::edits_baseline();
     app.rules.elevated = platform::runs_elevated();

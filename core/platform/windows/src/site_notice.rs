@@ -4,14 +4,13 @@
 //! trust in the user's name. So it starts only the tray beside its own binary,
 //! and only while no account outside SYSTEM, Administrators and
 //! TrustedInstaller could have replaced that file or planted one beside it,
-//! holding it open from the check until it has started, with the token and
-//! environment of the user the event is about.
+//! judging that on it and every folder above it held open from the check until
+//! it has started, with the token and environment of the user the event is
+//! about.
 #![allow(unsafe_code)]
 
 use std::ffi::OsStr;
-use std::fs::{File, OpenOptions};
 use std::os::windows::ffi::OsStrExt;
-use std::os::windows::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 
 use nrr_platform_api::session_notice::{
@@ -23,12 +22,13 @@ use windows::Win32::Foundation::{CloseHandle, HANDLE};
 use windows::Win32::Security::{
     GetTokenInformation, TokenElevationType, TokenElevationTypeFull, TOKEN_ELEVATION_TYPE,
 };
-use windows::Win32::Storage::FileSystem::FILE_SHARE_READ;
 use windows::Win32::System::Environment::{CreateEnvironmentBlock, DestroyEnvironmentBlock};
 use windows::Win32::System::RemoteDesktop::WTSQueryUserToken;
 use windows::Win32::System::Threading::{
     CreateProcessAsUserW, CREATE_UNICODE_ENVIRONMENT, PROCESS_INFORMATION, STARTUPINFOW,
 };
+
+use crate::trusted_location::{hold_chain, untrusted_writer_of, HeldChain};
 
 /// [`SiteNoticeLauncher`] that starts the tray beside this binary.
 pub struct WindowsSiteNotice {
@@ -45,47 +45,46 @@ impl WindowsSiteNotice {
     }
 }
 
-/// The tray, held open so that until it has started nothing can rewrite it,
-/// move it aside or move a folder above it.
+/// The tray and every folder above it, held so that until it has started
+/// nothing can rewrite it, move it aside, or rename or replace a folder on its
+/// path.
 #[derive(Debug)]
 pub struct PinnedTray {
-    /// What the handle resolves to, every link followed: the path checked and
-    /// the one started.
-    path: PathBuf,
-    _held: File,
+    held: HeldChain,
 }
 
 impl PinnedTray {
+    /// Where the tray really is, every link resolved: the path judged and the
+    /// one started.
     #[must_use]
     pub fn path(&self) -> &Path {
-        &self.path
+        self.held.path()
     }
 }
 
 fn pin_tray(tray: &Path) -> Result<PinnedTray, SiteNoticeRefused> {
-    // Read access, not only attributes: an open without data access records
-    // no share mode, and the file could be replaced under it.
-    let held = OpenOptions::new()
-        .read(true)
-        .share_mode(FILE_SHARE_READ.0)
-        .open(tray)
-        .map_err(|e| match e.kind() {
-            std::io::ErrorKind::NotFound => SiteNoticeRefused::NotFound,
-            _ => SiteNoticeRefused::Failed(format!("open {}: {e}", tray.display())),
-        })?;
-    if !held.metadata().is_ok_and(|m| m.is_file()) {
+    // Resolved first, so a short name or a link in the install path costs no
+    // notice; the chain is then opened refusing any link, and judged on what
+    // it holds.
+    let resolved = std::fs::canonicalize(tray).map_err(|e| match e.kind() {
+        std::io::ErrorKind::NotFound => SiteNoticeRefused::NotFound,
+        _ => SiteNoticeRefused::Failed(format!("resolve {}: {e}", tray.display())),
+    })?;
+    if !std::fs::metadata(&resolved).is_ok_and(|m| m.is_file()) {
         return Err(SiteNoticeRefused::NotFound);
     }
-    let path = crate::pinned_file::final_path(&held)
-        .map_err(|e| SiteNoticeRefused::Failed(format!("resolve {}: {e}", tray.display())))?;
-    Ok(PinnedTray { path, _held: held })
+    match hold_chain(&resolved) {
+        Ok(Some(held)) => Ok(PinnedTray { held }),
+        Ok(None) => Err(SiteNoticeRefused::NotFound),
+        Err(why) => Err(SiteNoticeRefused::UntrustedLocation(why)),
+    }
 }
 
-/// `tray`, held open, when it is there and only trusted accounts could change
-/// it or what sits beside it.
+/// `tray`, held with its folders, when it is there and only trusted accounts
+/// could change it, put a file beside it or replace a folder above it.
 pub fn verified_tray(tray: &Path) -> Result<PinnedTray, SiteNoticeRefused> {
     let pinned = pin_tray(tray)?;
-    match crate::trusted_location::untrusted_writer(&pinned.path) {
+    match untrusted_writer_of(&pinned.held) {
         Ok(None) => Ok(pinned),
         Ok(Some(who)) => Err(SiteNoticeRefused::UntrustedLocation(who)),
         // A folder whose permissions cannot be read is not one we trust.
@@ -221,6 +220,8 @@ fn start_in_session(
         ..Default::default()
     };
     let mut process = PROCESS_INFORMATION::default();
+    // Windows starts a program only by name, never from a handle; the held
+    // chain keeps that name leading to the judged file until the call returns.
     // SAFETY: every string is NUL-terminated and outlives the call; the
     // command-line buffer is writable as the API requires; the token and the
     // environment block are live until their guards drop after it. No handle

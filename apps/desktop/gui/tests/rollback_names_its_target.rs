@@ -1,11 +1,11 @@
 //! Safe rollback asks the service what it would restore before anything is
 //! confirmed, and judges the rollback by its operation record: "accepted" is
-//! not "rolled back". Runs the real `pure.js` through `node`; skipped when
-//! node is absent.
+//! not "rolled back". Runs the real `pure.js`.
 
-use std::io::Write;
+#[path = "support/js.rs"]
+mod js;
+
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
 
 fn repo_file(relative: &str) -> String {
     let path: PathBuf = Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -48,42 +48,11 @@ fn the_dry_run_answer_is_a_target_nothing_or_an_error() {
          ].join('|'));\n",
         source = repo_file("apps/desktop/qml/lib/pure.js").replace(".pragma library", ""),
     );
-    let Some(output) = run_node(&harness) else {
-        eprintln!("node not available — skipping the executable check");
-        return;
-    };
+    let output = js::run_js(&harness);
     assert_eq!(
         output.trim(),
         "ready:t:rev-a:|none:::|error:::revision-integrity-rejected|error:::timeout\
          |error:::bad-response|error:::bad-response",
         "{output}"
     );
-}
-
-/// Feed a program to `node` on stdin. `None` when node is not installed.
-fn run_node(program: &str) -> Option<String> {
-    let mut child = Command::new("node")
-        .arg("-")
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .unwrap_or_else(|e| {
-            panic!("this check runs the QML JavaScript through node; install Node.js ({e})")
-        });
-    let Some(stdin) = child.stdin.as_mut() else {
-        panic!("stdin was piped")
-    };
-    stdin
-        .write_all(program.as_bytes())
-        .unwrap_or_else(|e| panic!("write the harness to node: {e}"));
-    let out = child
-        .wait_with_output()
-        .unwrap_or_else(|e| panic!("node runs to completion: {e}"));
-    assert!(
-        out.status.success(),
-        "node rejected the harness: {}",
-        String::from_utf8_lossy(&out.stderr)
-    );
-    Some(String::from_utf8_lossy(&out.stdout).into_owned())
 }

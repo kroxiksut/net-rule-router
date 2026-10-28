@@ -1,44 +1,42 @@
-//! production [`SettingsExportSource`] for the
-//! `SettingsExportFull` read-only IPC op.
+//! Production [`SettingsExportSource`] for the read-only `SettingsExportFull`
+//! op: YAML per docs/en/rules-file-format.md §2, hand-rolled so the format
+//! stays explicit and no YAML crate is pulled in.
 //!
-//! Emits YAML conforming to docs/en/rules-file-format.md Settings Export Format. Hand-rolled emitter (no
-//! `serde_yaml` dependency) keeps the wire-format SSOT explicit and
-//! avoids an extra crate with an unmaintained advisory.
-//!
-//! ## Service-owned vs client-supplied data
-//!
-//! Service owns: adapter bindings (per-SID via `RouteBindingsRepository`),
-//! route behavior mode, leak protection.
-//!
-//! Client supplies in the request: rules-file paths on disk
-//! (`UiPreferences::last_saved_path_<role>`).
-//!
-//! ## Future YAML enhancements
-//!
-//! `file_change_behavior` and `include_child_processes` from docs/en/rules-file-format.md Settings Export Format are GUI preferences that may migrate to per-SID service storage.
-//! Currently emitted YAML does not include those keys. Forward-compat:
-//! readers MUST tolerate missing keys.
+//! The service supplies the caller's bindings, route mode, leak protection
+//! and the rules in force for them, written by the rules-file writer as
+//! block scalars; the client supplies the bound rules-file paths and the
+//! sections of those files this build does not apply (the service keeps
+//! neither). `provisioning::bundle` reads this shape back. Nothing here writes.
 
+use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use base64::Engine as _;
+use nrr_domain::rules_file::{HostPlatform, PassthroughSection, RulesFileSection};
+use nrr_shared::ipc_payloads::SettingsExportFullRequest;
+use nrr_shared::RouteRole;
 use nrr_storage::route_bindings::{RouteBindingsRepository, RoutePolicyRecord};
 use rusqlite::Connection;
 use sha2::{Digest, Sha256};
 
-/// Schema version of the `nrr_settings_export` YAML document.
-/// Mirrors docs/en/rules-file-format.md Settings Export Format (`version: 1`).
-pub const SETTINGS_EXPORT_YAML_VERSION: u32 = 1;
+use crate::production_preset_exporter::{
+    default_host_app_section, rules_file_text, rules_in_force, PresetExportError,
+};
+
+/// Schema version of the `nrr_settings_export` YAML document. Version 2 added
+/// the `rules:` section; the provisioning reader takes 1 and 2.
+pub const SETTINGS_EXPORT_YAML_VERSION: u32 = 2;
 
 /// Returns a UTF-8 YAML blob and its SHA-256 hex for the caller's
 /// settings snapshot.
 pub trait SettingsExportSource: Send + Sync {
+    /// `client` carries what only the caller knows: the bound rules-file
+    /// paths and the sections of those files this build does not apply.
     fn export_settings(
         &self,
         sid: &str,
-        rules_file_path_primary: Option<&str>,
-        rules_file_path_secondary: Option<&str>,
+        client: &SettingsExportFullRequest,
         exported_at_iso: &str,
     ) -> Result<SettingsExportOutput, SettingsExportError>;
 }
@@ -59,8 +57,10 @@ pub enum SettingsExportError {
     EmptySid,
     /// State DB mutex is poisoned.
     LockPoisoned,
-    /// Storage layer returned an error reading bindings.
+    /// Storage layer returned an error reading bindings or rules.
     StorageError(String),
+    /// The stored rules could not be decoded.
+    DecodeError(String),
 }
 
 impl std::fmt::Display for SettingsExportError {
@@ -69,6 +69,20 @@ impl std::fmt::Display for SettingsExportError {
             Self::EmptySid => f.write_str("caller SID is empty"),
             Self::LockPoisoned => f.write_str("state DB mutex poisoned"),
             Self::StorageError(e) => write!(f, "storage error: {e}"),
+            Self::DecodeError(e) => write!(f, "decode error: {e}"),
+        }
+    }
+}
+
+impl From<PresetExportError> for SettingsExportError {
+    fn from(e: PresetExportError) -> Self {
+        match e {
+            PresetExportError::LockPoisoned => Self::LockPoisoned,
+            PresetExportError::StorageError(e) => Self::StorageError(e),
+            PresetExportError::DecodeError(e) => Self::DecodeError(e),
+            PresetExportError::NoActiveRevision => {
+                Self::StorageError("no active revision".to_owned())
+            }
         }
     }
 }
@@ -90,8 +104,7 @@ impl SettingsExportSource for ProductionSettingsExporter {
     fn export_settings(
         &self,
         sid: &str,
-        rules_file_path_primary: Option<&str>,
-        rules_file_path_secondary: Option<&str>,
+        client: &SettingsExportFullRequest,
         exported_at_iso: &str,
     ) -> Result<SettingsExportOutput, SettingsExportError> {
         if sid.is_empty() {
@@ -105,12 +118,27 @@ impl SettingsExportSource for ProductionSettingsExporter {
         let record = repo
             .load_for_sid(sid)
             .map_err(|e| SettingsExportError::StorageError(e.to_string()))?;
+        let section = default_host_app_section();
+        let rules = rules_in_force(&guard, sid, section)?;
         drop(guard);
+        let platform = section.app_platform().unwrap_or(HostPlatform::compiled());
+        let [primary, secondary] = [
+            (RouteRole::Primary, &client.passthrough_sections_primary),
+            (RouteRole::Secondary, &client.passthrough_sections_secondary),
+        ]
+        .map(|(route, sections)| {
+            let carried = not_applied_here(sections, platform);
+            if rules.is_none() && carried.is_empty() {
+                return String::new();
+            }
+            rules_file_text(rules.as_ref(), route, section, &carried, None)
+        });
 
         let yaml_bytes_utf8 = emit_settings_yaml(
             &record,
-            rules_file_path_primary,
-            rules_file_path_secondary,
+            client.rules_file_path_primary.as_deref(),
+            client.rules_file_path_secondary.as_deref(),
+            [&primary, &secondary],
             exported_at_iso,
         );
         let mut hasher = Sha256::new();
@@ -121,6 +149,28 @@ impl SettingsExportSource for ProductionSettingsExporter {
             content_hash_hex,
         })
     }
+}
+
+/// The caller's sections this build does not apply here. A section it does
+/// apply is written from the rules in force; the caller's copy, or a header
+/// smuggled inside a body, would come back as applied rules on install.
+fn not_applied_here(
+    sections: &BTreeMap<String, String>,
+    platform: HostPlatform,
+) -> Vec<PassthroughSection> {
+    sections
+        .iter()
+        .filter(|(name, body)| {
+            !RulesFileSection::from_name(name).is_some_and(|known| known.is_active_on(platform))
+                && !body
+                    .lines()
+                    .any(|line| line.trim_start().starts_with("---"))
+        })
+        .map(|(name, body)| PassthroughSection {
+            name: name.clone(),
+            body: body.clone(),
+        })
+        .collect()
 }
 
 /// Base64-wraps the YAML bytes with the standard alphabet (RFC 4648,
@@ -163,6 +213,7 @@ fn emit_settings_yaml(
     record: &RoutePolicyRecord,
     rules_file_path_primary: Option<&str>,
     rules_file_path_secondary: Option<&str>,
+    [rules_primary, rules_secondary]: [&str; 2],
     exported_at_iso: &str,
 ) -> String {
     let mut out = String::new();
@@ -189,6 +240,11 @@ fn emit_settings_yaml(
     out.push_str("    secondary: ");
     out.push_str(&yaml_quote(rules_file_path_secondary.unwrap_or("")));
     out.push('\n');
+    out.push('\n');
+
+    out.push_str("  rules:\n");
+    emit_rules_text(&mut out, "primary", rules_primary);
+    emit_rules_text(&mut out, "secondary", rules_secondary);
     out.push('\n');
 
     // behavior: block — service-owned route mode and leak protection.
@@ -234,6 +290,26 @@ fn emit_adapter(
     }
 }
 
+/// A rules file as a literal block scalar, so the text stays the one rules
+/// format; no rules is `""`. The writer never starts a file with a space,
+/// so the indentation needs no indicator.
+fn emit_rules_text(out: &mut String, role: &str, text: &str) {
+    out.push_str("    ");
+    out.push_str(role);
+    if text.is_empty() {
+        out.push_str(": \"\"\n");
+        return;
+    }
+    out.push_str(": |\n");
+    for line in text.lines() {
+        if !line.is_empty() {
+            out.push_str("      ");
+            out.push_str(line);
+        }
+        out.push('\n');
+    }
+}
+
 /// Emits a double-quoted YAML scalar with `\` and `"` escaped per the
 /// YAML 1.2 spec, plus the control characters required for safety.
 fn yaml_quote(s: &str) -> String {
@@ -272,6 +348,10 @@ mod tests {
         Arc::new(Mutex::new(runner.into_connection()))
     }
 
+    fn no_client() -> SettingsExportFullRequest {
+        SettingsExportFullRequest::default()
+    }
+
     fn seed_bindings(conn: &Arc<Mutex<Connection>>, sid: &str, record: &RoutePolicyRecord) {
         let guard = conn.lock().unwrap();
         let repo = RouteBindingsRepository::new(&guard);
@@ -303,11 +383,11 @@ mod tests {
         let conn = open_state_db_in_memory();
         let exporter = ProductionSettingsExporter::new(Arc::clone(&conn));
         let out = exporter
-            .export_settings("S-1-5-21-test", None, None, "2026-05-20T12:00:00Z")
+            .export_settings("S-1-5-21-test", &no_client(), "2026-05-20T12:00:00Z")
             .expect("export");
         let yaml = &out.yaml_bytes_utf8;
         assert!(yaml.starts_with("nrr_settings_export:\n"));
-        assert!(yaml.contains("version: 1\n"));
+        assert!(yaml.contains("version: 2\n"));
         assert!(yaml.contains("exported_at: \"2026-05-20T12:00:00Z\"\n"));
         assert!(yaml.contains("primary:\n      system_id: \"\"\n"));
         assert!(yaml.contains("route_mode: \"prefer-primary\"\n"));
@@ -327,11 +407,11 @@ mod tests {
         let conn = open_state_db_in_memory();
         let exporter = ProductionSettingsExporter::new(Arc::clone(&conn));
         let out = exporter
-            .export_settings("S-1-5-21-test", None, None, "2026-05-20T12:00:00Z")
+            .export_settings("S-1-5-21-test", &no_client(), "2026-05-20T12:00:00Z")
             .expect("export");
         assert_eq!(
             out.content_hash_hex,
-            "3ea47bb7297b73ca67159dac8e0d064486b7bd7abaf5cadb128cd0dcd9faa7f4"
+            "50d5d944925828998aa9a997ca3b72fcb5f59b58c2398851542b70f963561365"
         );
     }
 
@@ -384,8 +464,11 @@ mod tests {
         let out = exporter
             .export_settings(
                 "S-1-5-21-test",
-                Some(r"C:\Users\u\rules_primary.txt"),
-                Some(r"C:\Users\u\rules_secondary.txt"),
+                &SettingsExportFullRequest {
+                    rules_file_path_primary: Some(r"C:\Users\u\rules_primary.txt".to_owned()),
+                    rules_file_path_secondary: Some(r"C:\Users\u\rules_secondary.txt".to_owned()),
+                    ..SettingsExportFullRequest::default()
+                },
                 "2026-05-20T12:00:00Z",
             )
             .expect("export");
@@ -422,21 +505,18 @@ mod tests {
         let conn = open_state_db_in_memory();
         let exporter = ProductionSettingsExporter::new(Arc::clone(&conn));
         let err = exporter
-            .export_settings("", None, None, "2026-05-20T12:00:00Z")
+            .export_settings("", &no_client(), "2026-05-20T12:00:00Z")
             .expect_err("empty SID must be rejected");
         assert_eq!(err, SettingsExportError::EmptySid);
     }
 
     #[test]
-    fn export_omits_file_change_behavior_per_16_8_2_landmine() {
-        // Forward-compat assertion: the YAML must NOT contain placeholder
-        // keys (so future readers
-        // unambiguously detect "field absent" rather than seeing a
-        // wrong default).
+    fn export_omits_file_change_behavior() {
+        // No placeholder keys: a reader must see "absent", not a wrong default.
         let conn = open_state_db_in_memory();
         let exporter = ProductionSettingsExporter::new(Arc::clone(&conn));
         let out = exporter
-            .export_settings("S-1-5-21-test", None, None, "2026-05-20T12:00:00Z")
+            .export_settings("S-1-5-21-test", &no_client(), "2026-05-20T12:00:00Z")
             .expect("export");
         assert!(!out.yaml_bytes_utf8.contains("file_change_behavior"));
         assert!(!out.yaml_bytes_utf8.contains("include_child_processes"));
@@ -447,10 +527,10 @@ mod tests {
         let conn = open_state_db_in_memory();
         let exporter = ProductionSettingsExporter::new(Arc::clone(&conn));
         let a = exporter
-            .export_settings("S-1-5-21-test", None, None, "2026-05-20T12:00:00Z")
+            .export_settings("S-1-5-21-test", &no_client(), "2026-05-20T12:00:00Z")
             .expect("a");
         let b = exporter
-            .export_settings("S-1-5-21-test", None, None, "2026-05-20T12:00:00Z")
+            .export_settings("S-1-5-21-test", &no_client(), "2026-05-20T12:00:00Z")
             .expect("b");
         assert_eq!(a, b);
     }

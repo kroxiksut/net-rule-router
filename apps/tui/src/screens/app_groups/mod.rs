@@ -90,6 +90,8 @@ enum Note {
     Limit,
     NotHypervisor(usize),
     NoTarget(usize),
+    /// Line mode: the item printed under that number has left the list.
+    Gone(usize),
     PinBusy,
     PinUnchanged,
     PinNoAdditional,
@@ -115,6 +117,10 @@ pub struct AppGroups {
     /// The adapter whose pin the hypervisor is changing now.
     pinning: Option<machines::PinKey>,
     pin_failure: Option<machines::PinFailure>,
+    /// Line mode: the list and the pinnable adapters as last printed, so a
+    /// typed number names what was printed under it.
+    printed: Vec<String>,
+    printed_pins: Vec<String>,
 }
 
 /// The texts were loaded or changed language.
@@ -382,6 +388,11 @@ impl Screen for AppGroupsScreen {
         }
         let selected = app.app_groups.selected;
         let count = app.app_groups.entries.len();
+        if matches!(key.code, KeyCode::Char('p' | 's' | ' '))
+            && crate::screens::focus_list_first(app)
+        {
+            return true;
+        }
         match key.code {
             KeyCode::Up => move_to(app, selected.saturating_sub(1)),
             KeyCode::Down => move_to(app, selected + 1),
@@ -402,26 +413,56 @@ impl Screen for AppGroupsScreen {
         if app.app_groups.machines.is_some() && machines::on_line(app, command, number) {
             return true;
         }
+        if command == "r" && number.is_empty() {
+            scan(app);
+            return true;
+        }
+        if !matches!(command, "m" | "p" | "s") {
+            return false;
+        }
+        let Some(n) = number.trim().parse::<usize>().ok().filter(|n| *n >= 1) else {
+            return false;
+        };
+        let Some(at) = numbered_entry(app, n) else {
+            return true;
+        };
         match command {
-            "r" if number.is_empty() => scan(app),
-            "m" => match number.trim().parse::<usize>() {
-                Ok(n) if n >= 1 => machines::open(app, n - 1),
-                _ => return false,
-            },
-            "p" | "s" => {
-                let route = if command == "p" {
-                    "primary"
-                } else {
-                    "secondary"
-                };
-                match number.trim().parse::<usize>() {
-                    Ok(n) if n >= 1 => choose(app, n - 1, route),
-                    _ => return false,
-                }
-            }
-            _ => return false,
+            "m" => machines::open(app, at),
+            "p" => choose(app, at, "primary"),
+            _ => choose(app, at, "secondary"),
         }
         true
+    }
+
+    fn on_printed(&self, app: &mut AppState) {
+        app.app_groups.printed = app.app_groups.entries.iter().map(entry_key).collect();
+        app.app_groups.printed_pins = machines::pin_keys(app);
+    }
+}
+
+fn entry_key(entry: &Entry) -> String {
+    format!(
+        "{}\u{1f}{}\u{1f}{}",
+        entry.slug,
+        entry.name,
+        entry.path.as_deref().unwrap_or_default()
+    )
+}
+
+/// Line mode's item `n` where it stands now, by what was printed under it;
+/// `None` with the reason noted.
+fn numbered_entry(app: &mut AppState, n: usize) -> Option<usize> {
+    let now: Vec<String> = app.app_groups.entries.iter().map(entry_key).collect();
+    match super::numbered_now(&app.app_groups.printed, &now, n) {
+        super::Numbered::At(at) => Some(at),
+        super::Numbered::Gone => {
+            app.app_groups.note = Some(Note::Gone(n));
+            None
+        }
+        super::Numbered::NoSuch => {
+            app.app_groups.note = Some(Note::NoItem(n));
+            None
+        }
     }
 }
 
@@ -494,6 +535,7 @@ fn note_lines(note: &Note, texts: &Texts) -> Vec<ViewLine> {
         }
         Note::NotHypervisor(n) => strong(item(keys::NOT_HYPERVISOR, n)),
         Note::NoTarget(n) => strong(item(keys::NO_TARGET, n)),
+        Note::Gone(n) => strong(item(crate::keys::PLAIN_NUMBER_GONE, n)),
         Note::PinBusy => strong(texts.get(keys::PIN_BUSY)),
         Note::PinUnchanged => strong(texts.get(keys::PIN_UNCHANGED)),
         Note::PinNoAdditional => strong(texts.fill(

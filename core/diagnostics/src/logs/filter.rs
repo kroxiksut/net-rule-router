@@ -22,7 +22,7 @@
 //! [`RATE_LIMIT_MAX_PER_WINDOW`] events per category per window.
 
 use std::collections::HashMap;
-use std::sync::Mutex;
+use std::sync::{Mutex, PoisonError};
 use std::time::Instant;
 
 use crate::taxonomy::{EventCategory, EventLevel, PrivacyClass};
@@ -156,9 +156,8 @@ pub struct LogFilter {
     rate_buckets: Mutex<HashMap<u8, RateBucket>>,
 }
 
-// Lock-poisoning `expect()` on the mode/rate-bucket locks propagates a prior
-// panic — not a recoverable error.
-#[allow(clippy::expect_used)]
+// Both locks guard plain values, so a poisoned one is still consistent: the log
+// must never be the reason a thread panics.
 impl LogFilter {
     pub fn new(initial_mode: LoggingMode) -> Self {
         Self {
@@ -169,12 +168,12 @@ impl LogFilter {
 
     /// Returns the current logging mode.
     pub fn mode(&self) -> LoggingMode {
-        *self.mode.lock().expect("LogFilter mode")
+        *self.mode.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
     /// Changes the logging mode (e.g., when user enables/disables diagnostic mode).
     pub fn set_mode(&self, mode: LoggingMode) {
-        *self.mode.lock().expect("LogFilter mode") = mode;
+        *self.mode.lock().unwrap_or_else(PoisonError::into_inner) = mode;
     }
 
     /// Returns `true` if an event with these properties should be written.
@@ -220,7 +219,10 @@ impl LogFilter {
                 LoggingMode::DeveloperTrace => u64::MAX,
             };
             let cat_key = category as u8;
-            let mut buckets = self.rate_buckets.lock().expect("rate buckets");
+            let mut buckets = self
+                .rate_buckets
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
             let bucket = buckets.entry(cat_key).or_insert_with(RateBucket::new);
             if !bucket.allow(max) {
                 return false;
@@ -232,13 +234,38 @@ impl LogFilter {
 
     /// Resets all rate-limit buckets (useful for tests).
     pub fn reset_rate_limits(&self) {
-        self.rate_buckets.lock().expect("rate buckets").clear();
+        self.rate_buckets
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clear();
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_panic_under_the_filter_locks_does_not_make_logging_panic() {
+        let f = LogFilter::new(LoggingMode::Default);
+        let poisoned = std::thread::scope(|s| {
+            s.spawn(|| {
+                let _mode = f.mode.lock().expect("unpoisoned yet");
+                let _buckets = f.rate_buckets.lock().expect("unpoisoned yet");
+                panic!("simulated panic under the filter locks");
+            })
+            .join()
+        });
+        assert!(poisoned.is_err(), "the locks must be poisoned for the test");
+
+        assert!(f.should_emit(
+            EventLevel::Info,
+            EventCategory::Cache,
+            PrivacyClass::PublicSummary
+        ));
+        f.set_mode(LoggingMode::Diagnostic);
+        assert_eq!(f.mode(), LoggingMode::Diagnostic);
+    }
 
     #[test]
     fn default_mode_allows_service_info() {

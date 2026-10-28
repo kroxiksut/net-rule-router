@@ -339,6 +339,8 @@ pub enum RoutePolicyWriteError {
 
 /// Opens the refusal's message, as the client error code it is catalogued under.
 pub const SITES_NEEDS_MAIN_ROUTE_CODE: &str = "route-policy-sites-needs-main-route";
+/// Opens the refusal's message, as the client error code it is catalogued under.
+pub const PLACEHOLDER_ADAPTER_CODE: &str = "route-policy-placeholder-adapter";
 
 impl std::fmt::Display for RoutePolicyWriteError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -349,7 +351,7 @@ impl std::fmt::Display for RoutePolicyWriteError {
             }
             Self::PlaceholderAdapter { stable_id } => write!(
                 f,
-                "{stable_id} is a placeholder adapter, not one of this machine: \
+                "{PLACEHOLDER_ADAPTER_CODE}: {stable_id} is a placeholder adapter, not one of this machine: \
                  bind a role only to an adapter a live enumeration reported"
             ),
             Self::PrimaryEqualsSecondary => {

@@ -77,7 +77,7 @@ pub fn same_content(a: &RuleRow, b: &RuleRow) -> bool {
     }
     a.enabled == b.enabled
         && a.rule_type.canonical_slug() == b.rule_type.canonical_slug()
-        && a.match_value.to_lowercase() == b.match_value.to_lowercase()
+        && crate::js::key_lower(&a.match_value) == crate::js::key_lower(&b.match_value)
         && a.target_route.as_str() == b.target_route.as_str()
         && a.verify == b.verify
         && a.comment == b.comment

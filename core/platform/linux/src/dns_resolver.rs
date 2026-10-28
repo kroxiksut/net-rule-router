@@ -20,7 +20,7 @@
 #![cfg(target_os = "linux")]
 
 use std::io::{Read, Write};
-use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpStream, UdpSocket};
+use std::net::{Ipv4Addr, SocketAddr, TcpStream, UdpSocket};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -481,15 +481,17 @@ impl DnsResolverPort for HostsFileFirstResolver {
         if canonical.is_empty() || canonical.contains('\0') {
             return Err(DnsResolverError::InvalidName { name: canonical });
         }
-        // The file is read for IPv4 only; an AAAA question goes past it.
-        if family == AddressFamily::Ipv4 {
-            if let Some(pin) = self.hosts.lookup(&canonical) {
-                return Ok(ResolvedRecord {
-                    canonical_hostname: canonical,
-                    addresses: vec![IpAddr::V4(pin.ip)],
-                    ttl_seconds: None,
-                });
-            }
+        // Each family is answered from the file's lines of that family.
+        let pinned = self
+            .hosts
+            .lookup(&canonical)
+            .and_then(|pin| pin.address_of(family == AddressFamily::Ipv6));
+        if let Some(address) = pinned {
+            return Ok(ResolvedRecord {
+                canonical_hostname: canonical,
+                addresses: vec![address],
+                ttl_seconds: None,
+            });
         }
         self.servers.resolve(hostname, family)
     }
@@ -498,6 +500,25 @@ impl DnsResolverPort for HostsFileFirstResolver {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::net::IpAddr;
+
+    /// The C library answers an IPv6 question from the file's IPv6 lines; a
+    /// pin there must answer it here too, not the servers.
+    #[test]
+    fn an_ipv6_question_is_answered_from_the_files_ipv6_line() {
+        use nrr_platform_api::dns::MockDnsResolver;
+        use nrr_platform_api::hosts_file::StaticHostsFileReader;
+
+        let pinned: IpAddr = "2001:db8::7".parse().expect("ip");
+        let resolver = HostsFileFirstResolver::with_hosts(
+            Arc::new(StaticHostsFileReader::from_pairs([("v6.example", pinned)])),
+            Arc::new(MockDnsResolver::new()) as Arc<dyn DnsResolverPort>,
+        );
+        let answer = resolver
+            .resolve("v6.example", AddressFamily::Ipv6)
+            .expect("the pin answers");
+        assert_eq!(answer.addresses, vec![pinned]);
+    }
 
     /// A hosts-file pin answers before any server is asked, loopback pins
     /// included (the downstream filter is what drops those), and a name the

@@ -45,6 +45,10 @@ QtObject {
     /// on every publish. `notices`: the notification settings the tray honours.
     property var snapshotProvider: null
 
+    /// The bound files as the user's settings file holds them now, set by the
+    /// tray's follower; null while unknown. See `Pure.trayRulesPaths`.
+    property var sharedBound: null
+
     property string _path: ""
 
     readonly property bool _bridgeReady: typeof nrrNativeBridge !== "undefined"
@@ -72,11 +76,15 @@ QtObject {
             "visible": snap.visible !== false,
             "rules-path-primary": String(snap.rulesPathPrimary || ""),
             "rules-path-secondary": String(snap.rulesPathSecondary || ""),
+            "bound-primary": String(snap.boundPrimary || ""),
+            "bound-secondary": String(snap.boundSecondary || ""),
             "rules-folder": String(snap.rulesFolder || ""),
             "include-comments": snap.includeComments !== false
         }
         var notices = _noticesOf(snap.notices)
         if (notices !== null) payload["notices"] = notices
+        var appearance = Pure.trayAppearanceOf(snap.appearance)
+        if (appearance !== null) payload["appearance"] = appearance
         nrrNativeBridge.writeTextFile(path, JSON.stringify(payload))
     }
 
@@ -96,6 +104,8 @@ QtObject {
             "visible": false,
             "rules-path-primary": String(snap.rulesPathPrimary || ""),
             "rules-path-secondary": String(snap.rulesPathSecondary || ""),
+            "bound-primary": String(snap.boundPrimary || ""),
+            "bound-secondary": String(snap.boundSecondary || ""),
             "rules-folder": String(snap.rulesFolder || ""),
             "include-comments": snap.includeComments !== false
         }
@@ -113,14 +123,14 @@ QtObject {
     /// Read the published snapshot.
     /// Returns `{ known, windowRunning, windowVisible, windowActive,
     /// rulesPathPrimary, rulesPathSecondary, rulesFolder, includeComments, at,
-    /// notices }`.
+    /// notices, appearance }`.
     /// `known` is false when no window has ever published on this machine — the
     /// caller then has no rules paths and cannot compare anything.
     function read() {
         var blank = {
             known: false, windowRunning: false, windowVisible: false, windowActive: false,
             rulesPathPrimary: "", rulesPathSecondary: "", rulesFolder: "",
-            includeComments: true, at: 0, notices: null
+            includeComments: true, at: 0, notices: null, appearance: null
         }
         var path = _resolvePath()
         if (path === "") return blank
@@ -142,7 +152,7 @@ QtObject {
         if (!parsed || typeof parsed !== "object") return blank
         var age = Date.now() - (Number(parsed.at) || 0)
         var running = parsed.gone !== true && age >= 0 && age < freshnessMs
-        return {
+        var snap = {
             known: true,
             windowRunning: running,
             // Closed to the tray the process lives on with its window hidden.
@@ -153,6 +163,9 @@ QtObject {
             windowActive: running && parsed.active === true,
             rulesPathPrimary: String(parsed["rules-path-primary"] || ""),
             rulesPathSecondary: String(parsed["rules-path-secondary"] || ""),
+            // Null from a window that predates them.
+            boundPrimary: _textOrNull(parsed["bound-primary"]),
+            boundSecondary: _textOrNull(parsed["bound-secondary"]),
             // The user's rule-set folder, as the window last knew it.
             rulesFolder: String(parsed["rules-folder"] || ""),
             // The user's "comments in rules files" choice; absent means the
@@ -160,8 +173,18 @@ QtObject {
             includeComments: parsed["include-comments"] !== false,
             at: Number(parsed.at) || 0,
             // Null from a window that predates them.
-            notices: _noticesOf(parsed.notices)
+            notices: _noticesOf(parsed.notices),
+            appearance: Pure.trayAppearanceOf(parsed.appearance)
         }
+        // A window gone and files bound elsewhere since: those are the files.
+        var paths = Pure.trayRulesPaths(snap, sharedBound)
+        snap.rulesPathPrimary = paths.primary
+        snap.rulesPathSecondary = paths.secondary
+        return snap
+    }
+
+    function _textOrNull(value) {
+        return typeof value === "string" ? value : null
     }
 
     // Every exit path ends in a quit or in destroying the window's objects.

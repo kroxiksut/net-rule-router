@@ -628,6 +628,35 @@
       }
     },
     {
+      "name": "a move whose rule has gone since is added",
+      "input": {
+        "text": "example.com\n",
+        "route": "primary",
+        "os": "windows",
+        "existing": [],
+        "choices": {
+          "1": {
+            "move": true
+          }
+        },
+        "verdicts": {
+          "domain|example.com": {
+            "status": "valid"
+          }
+        }
+      },
+      "expected": {
+        "rows": [
+          "1 domain ok add primary on - - - - - example.com"
+        ],
+        "lines": 1,
+        "excess": 0,
+        "bound": "",
+        "counts": "1/0/0/0",
+        "remaining": ""
+      }
+    },
+    {
       "name": "the rule limit",
       "input": {
         "text": "a.example\nb.example\nc.example\n",

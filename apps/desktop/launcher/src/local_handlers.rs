@@ -26,8 +26,13 @@
 //! |                                 | shows for one value, via `rule_value_validation`; with `route`,   |
 //! |                                 | the protection of system programs is judged too.                  |
 //! | `local.rule-values-verdicts`    | The verdict on each value of a pasted list of rules, in one call. |
+//! | `local.hosts-file.has-entries`  | Whether the OS hosts file holds a real mapping right now, asked   |
+//! |                                 | when Routing settings opens.                                      |
 //! | `local.user-settings.intent-*`  | What the user decided about the service's settings, read from and |
 //! |                                 | recorded in their own settings file, for "Restore my settings".   |
+//!
+//! `local.user-settings.follow` is not here: the launcher's loop answers it,
+//! since it holds the window's preferences (`prefs_persistence`).
 //!
 //! Slug shape mirrors the IpcOperationName convention
 //! (`<domain>.<resource>.<verb>`) — though `local.*` has no verb tier
@@ -121,6 +126,7 @@ pub fn handle_local_request(
         "local.vm-inventory.list" => handle_vm_inventory_list(payload),
         "local.vm-nat.bind" => handle_vm_nat_bind(payload),
         "local.system-theme" => Ok(handle_system_theme()),
+        "local.hosts-file.has-entries" => Ok(handle_hosts_file_has_entries()),
         "local.user-settings.intent-get" => Ok(crate::user_settings_bridge::intent_get()?),
         "local.user-settings.intent-record" => {
             Ok(crate::user_settings_bridge::intent_record(payload)?)
@@ -152,6 +158,18 @@ fn handle_system_theme() -> Value {
         "systemMode": resolution.system_mode.slug(),
         "systemModeDetected": resolution.system_mode_detected,
     })
+}
+
+/// Whether the OS hosts file holds a real mapping, read now through the reader
+/// the start-up context used: an edit made under a running window shows when
+/// Routing settings is opened again.
+fn handle_hosts_file_has_entries() -> Value {
+    let path = nrr_shared::platform_profile::PlatformProfile::current().hosts_file_path;
+    hosts_file_answer(std::path::Path::new(&path))
+}
+
+fn hosts_file_answer(path: &std::path::Path) -> Value {
+    json!({ "hasEntries": nrr_desktop_gui::ui_surface::hosts_file_has_entries(path) })
 }
 
 /// Scan the machine for likely VPN clients (running processes + installed
@@ -1119,5 +1137,48 @@ mod tests {
             assert_eq!(resp["ok"], false, "{payload}");
             assert_eq!(resp["error"], error, "{payload}");
         }
+    }
+
+    /// The window asks again when Routing settings opens; an unknown operation
+    /// would leave the hosts group as the start-up context had it.
+    #[test]
+    fn the_window_can_ask_whether_the_hosts_file_has_entries() {
+        let resp =
+            handle_local_request("local.hosts-file.has-entries", &json!({}), &empty_client())
+                .expect("the launcher answers");
+        assert!(resp["hasEntries"].is_boolean(), "{resp}");
+    }
+
+    /// Each answer reads the file as it is now: a mapping added after the
+    /// window started shows the group, and removing it hides the group again.
+    #[test]
+    fn the_hosts_answer_follows_an_edit_made_after_start() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let hosts = dir.path().join("hosts");
+        std::fs::write(&hosts, "# stock hosts file\n\n#127.0.0.1 off.example\n").expect("write");
+        assert_eq!(hosts_file_answer(&hosts)["hasEntries"], false);
+        std::fs::write(&hosts, "# stock hosts file\n127.0.0.1 ads.example\n").expect("write");
+        assert_eq!(hosts_file_answer(&hosts)["hasEntries"], true);
+        std::fs::write(&hosts, "# stock hosts file\n").expect("write");
+        assert_eq!(hosts_file_answer(&hosts)["hasEntries"], false);
+    }
+
+    /// A block list past the bound has entries by definition and is not read
+    /// into memory; a file that cannot be read keeps the group shown.
+    #[test]
+    fn an_oversized_or_unreadable_hosts_file_keeps_the_group() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let big = dir.path().join("hosts-big");
+        let comment_line = "# padding comment line\n";
+        let lines = (4 * 1024 * 1024) / comment_line.len() + 2;
+        std::fs::write(&big, comment_line.repeat(lines)).expect("write");
+        assert_eq!(hosts_file_answer(&big)["hasEntries"], true);
+        assert_eq!(
+            hosts_file_answer(&dir.path().join("absent"))["hasEntries"],
+            true
+        );
+        let not_utf8 = dir.path().join("hosts-utf16");
+        std::fs::write(&not_utf8, [0xFF, 0xFE, b'#', 0x00, 0xC3]).expect("write");
+        assert_eq!(hosts_file_answer(&not_utf8)["hasEntries"], true);
     }
 }

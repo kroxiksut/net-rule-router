@@ -3,7 +3,7 @@
 //! Currently houses `PresetExportGetHandler`. `PresetImportHandler`
 //! lives elsewhere (the import path goes through `MutationSubmit` →
 //! `ProductionMutationExecutor`, not a dedicated read-only op).
-//! `SettingsExportFullHandler` ships in a follow-up checkbox.
+//! `SettingsExportFullHandler` serves the full settings export.
 
 use std::sync::Arc;
 
@@ -104,8 +104,8 @@ impl IpcHandler for PresetExportGetHandler {
 }
 
 /// Handler for `IpcOperationName::SettingsExportFull`. Pure read;
-/// joins service-owned bindings/behavior with caller-supplied rules-file
-/// paths via the [`SettingsExportSource`], emits YAML + SHA-256 hex.
+/// joins service-owned bindings, behavior and rules with caller-supplied
+/// rules-file paths via the [`SettingsExportSource`], emits YAML + SHA-256 hex.
 pub struct SettingsExportFullHandler {
     source: Arc<dyn SettingsExportSource>,
     clock: Arc<dyn Clock>,
@@ -123,19 +123,15 @@ impl IpcHandler for SettingsExportFullHandler {
         let req: SettingsExportFullRequest =
             serde_json::from_value(request.payload.clone()).map_err(|e| malformed(OP, e))?;
         let exported_at_iso = format_iso_utc(self.clock.now_secs());
-        let out = self
-            .source
-            .export_settings(
-                ctx.caller_stored(),
-                req.rules_file_path_primary.as_deref(),
-                req.rules_file_path_secondary.as_deref(),
-                &exported_at_iso,
-            )
-            .map_err(|e| match e {
-                SettingsExportError::EmptySid => malformed_msg(OP, "caller SID is empty"),
-                SettingsExportError::LockPoisoned => internal(OP, "state DB mutex poisoned"),
-                SettingsExportError::StorageError(msg) => internal(OP, msg),
-            })?;
+        let out =
+            self.source
+                .export_settings(ctx.caller_stored(), &req, &exported_at_iso)
+                .map_err(|e| match e {
+                    SettingsExportError::EmptySid => malformed_msg(OP, "caller SID is empty"),
+                    SettingsExportError::LockPoisoned => internal(OP, "state DB mutex poisoned"),
+                    SettingsExportError::StorageError(msg)
+                    | SettingsExportError::DecodeError(msg) => internal(OP, msg),
+                })?;
         let response = SettingsExportFullResponse {
             yaml_bytes_b64: encode_yaml_bytes_b64(&out.yaml_bytes_utf8),
             content_hash: out.content_hash_hex,
@@ -442,12 +438,11 @@ example.com
         }
     }
 
-    /// Records each call's (sid, primary_path, secondary_path, exported_at_iso)
-    /// and returns a pre-seeded outcome.
+    /// Records each call's (sid, client part, exported_at_iso) and returns a
+    /// pre-seeded outcome.
     struct FakeSettingsSource {
         outcome: Mutex<Result<SettingsExportOutput, SettingsExportError>>,
-        #[allow(clippy::type_complexity)]
-        calls: Mutex<Vec<(String, Option<String>, Option<String>, String)>>,
+        calls: Mutex<Vec<(String, SettingsExportFullRequest, String)>>,
     }
 
     impl FakeSettingsSource {
@@ -473,14 +468,12 @@ example.com
         fn export_settings(
             &self,
             sid: &str,
-            rules_file_path_primary: Option<&str>,
-            rules_file_path_secondary: Option<&str>,
+            client: &SettingsExportFullRequest,
             exported_at_iso: &str,
         ) -> Result<SettingsExportOutput, SettingsExportError> {
             self.calls.lock().unwrap().push((
                 sid.to_string(),
-                rules_file_path_primary.map(str::to_string),
-                rules_file_path_secondary.map(str::to_string),
+                client.clone(),
                 exported_at_iso.to_string(),
             ));
             self.outcome.lock().unwrap().clone()
@@ -515,9 +508,15 @@ example.com
         let calls = source.calls.lock().unwrap();
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].0, "S-1-5-21-test");
-        assert_eq!(calls[0].1.as_deref(), Some("C:\\rules_primary.txt"));
-        assert_eq!(calls[0].2.as_deref(), Some("C:\\rules_secondary.txt"));
-        assert_eq!(calls[0].3, "2023-11-14T22:13:20Z");
+        assert_eq!(
+            calls[0].1.rules_file_path_primary.as_deref(),
+            Some("C:\\rules_primary.txt")
+        );
+        assert_eq!(
+            calls[0].1.rules_file_path_secondary.as_deref(),
+            Some("C:\\rules_secondary.txt")
+        );
+        assert_eq!(calls[0].2, "2023-11-14T22:13:20Z");
     }
 
     #[test]
@@ -528,8 +527,8 @@ example.com
         let envelope = settings_envelope(serde_json::json!({}));
         handler.handle(&envelope, &ctx()).expect("ok");
         let calls = source.calls.lock().unwrap();
-        assert!(calls[0].1.is_none());
-        assert!(calls[0].2.is_none());
+        assert!(calls[0].1.rules_file_path_primary.is_none());
+        assert!(calls[0].1.rules_file_path_secondary.is_none());
     }
 
     #[test]

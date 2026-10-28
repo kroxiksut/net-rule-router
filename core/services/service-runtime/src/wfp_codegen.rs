@@ -222,9 +222,9 @@ pub struct CodegenInput<'a> {
     /// twin of `PlannerInput::ipv6`. `V4Only` reproduces the shape from before
     /// IPv6 existed, filter for filter and weight for weight.
     pub families: crate::enforcement_planner::FamilyScope,
-    /// A Block may also drop at the packet layer, which has no user condition
-    /// and so acts for every account: only for the administrator's baseline.
-    /// A user's own Block holds at the connect layer, scoped to that user.
+    /// A Block also drops at the packet layer, which has no user condition and
+    /// so acts for every account. The service passes `false`
+    /// (`per_sid_orchestrator::PACKET_BLOCKS`): a Block holds per user.
     pub packet_blocks: bool,
 }
 
@@ -373,6 +373,15 @@ pub enum CodegenDiagnostic {
     /// the tunnel takes the main link's hosts with it. Aggregated per rule —
     /// `ip` is one example, `count` is how many that rule lost.
     AddressClaimedByPrimary {
+        rule_id: String,
+        ip: IpAddr,
+        count: usize,
+    },
+    /// A zone rule of the additional link left out private addresses its
+    /// public top-level zone does not take into the tunnel
+    /// (`nrr_domain::public_zone`). Aggregated like
+    /// [`Self::AddressClaimedByPrimary`].
+    PrivateAddressKeptOutOfTunnel {
         rule_id: String,
         ip: IpAddr,
         count: usize,
@@ -951,8 +960,9 @@ fn generate_for_rule(
             link,
         ));
         let steerable = |host: Option<&str>, ip: IpAddr| walk.borrow_mut().keeps(host, ip);
+        let held = crate::address_ownership::HeldBack::new(ownership, link, rule.action);
         emit_for_address_match(
-            sid, role_slug, ctx, pos, rule, addr_match, cache, &steerable, out,
+            sid, role_slug, ctx, pos, rule, addr_match, cache, &steerable, held, out,
         );
         out.diagnostics.extend(
             walk.into_inner()
@@ -987,9 +997,9 @@ fn emit_for_address_match(
     addr_match: &CanonicalAddressMatch,
     cache: &dyn FqdnCacheLookup,
     steerable: &dyn Fn(Option<&str>, IpAddr) -> bool,
+    mut held: crate::address_ownership::HeldBack<'_>,
     out: &mut CodegenOutput,
 ) {
-    let mut held: Option<(IpAddr, usize)> = None;
     match addr_match {
         // The pass names no IPv6 while no link carries the family.
         CanonicalAddressMatch::ExactIp(addr) if !ctx.families.admits(*addr) => {}
@@ -1012,7 +1022,7 @@ fn emit_for_address_match(
                     out,
                 );
             } else {
-                note_held(&mut held, addr);
+                held.note(addr);
             }
         }
         CanonicalAddressMatch::ExactFqdn(hostname) => {
@@ -1029,7 +1039,7 @@ fn emit_for_address_match(
                 if steerable(Some(hostname), ip) {
                     steerable_ips.push(ip);
                 } else {
-                    note_held(&mut held, ip);
+                    held.note(ip);
                 }
             }
             emit_packed_ip_filters(
@@ -1087,7 +1097,7 @@ fn emit_for_address_match(
             );
         }
     }
-    if let Some((ip, count)) = held {
+    if let Some((ip, count)) = held.claimed {
         let rule_id = rule.id.as_str().to_string();
         out.diagnostics.push(if ctx.is_block() {
             CodegenDiagnostic::BlockYieldedToNarrowerRule { rule_id, ip, count }
@@ -1095,14 +1105,13 @@ fn emit_for_address_match(
             CodegenDiagnostic::AddressClaimedByPrimary { rule_id, ip, count }
         });
     }
-}
-
-/// Record one held-back address: the first is kept as the example, all of them
-/// count.
-fn note_held(held: &mut Option<(IpAddr, usize)>, ip: IpAddr) {
-    match held {
-        Some((_, count)) => *count += 1,
-        None => *held = Some((ip, 1)),
+    if let Some((ip, count)) = held.outside_tunnel {
+        out.diagnostics
+            .push(CodegenDiagnostic::PrivateAddressKeptOutOfTunnel {
+                rule_id: rule.id.as_str().to_string(),
+                ip,
+                count,
+            });
     }
 }
 
@@ -1131,7 +1140,7 @@ fn emit_suffix_fanout<F>(
     kind: SuffixFanoutKind,
     cache: &dyn FqdnCacheLookup,
     steerable: &dyn Fn(Option<&str>, IpAddr) -> bool,
-    held: &mut Option<(IpAddr, usize)>,
+    held: &mut crate::address_ownership::HeldBack<'_>,
     out: &mut CodegenOutput,
     empty_diagnostic: F,
 ) where
@@ -1181,7 +1190,7 @@ fn emit_suffix_fanout<F>(
             if steerable(Some(&sub), ip) {
                 fanout_ips.push(ip);
             } else {
-                note_held(held, ip);
+                held.note(ip);
             }
         }
     }

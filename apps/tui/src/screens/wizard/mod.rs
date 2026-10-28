@@ -157,8 +157,11 @@ pub struct WizardState {
     diagnostic_logs: Option<&'static str>,
     /// The machine-wide answers went to the service this run.
     stability_sent: bool,
-    /// One of them was changed on the protection step.
+    /// The log window was changed on the protection step.
     stability_touched: bool,
+    /// Fake-IP was switched on the protection step; untouched, a user already
+    /// set up keeps the service's value.
+    fake_ip_touched: bool,
     /// What their write left to tell; outlives the run it came from.
     stability_notice: Option<stability::StabilityNotice>,
     /// What the service held when the setup opened, when the user was already
@@ -200,6 +203,7 @@ impl Default for WizardState {
             diagnostic_logs: None,
             stability_sent: false,
             stability_touched: false,
+            fake_ip_touched: false,
             stability_notice: None,
             protection_at_start: None,
             seeded: false,
@@ -644,7 +648,7 @@ fn perform(app: &mut AppState, action: Action) {
             seed_protection(app);
             app.wizard.fake_ip = !app.wizard.fake_ip;
             app.wizard.stability_sent = false;
-            app.wizard.stability_touched = true;
+            app.wizard.fake_ip_touched = true;
         }
         Action::DiagnosticLogs => {
             seed_protection(app);
@@ -913,6 +917,10 @@ fn seed_protection(app: &mut AppState) {
         state.doh_lockdown = sheet.doh_lockdown.unwrap_or(state.doh_lockdown);
         state.fake_ip = sheet.fake_ip.unwrap_or(state.fake_ip);
     }
+    // Read only for a setup on show: the snapshot seeds it in the background.
+    if held.is_some() && app.screen == ScreenId::Wizard {
+        stability::read_held(app);
+    }
 }
 
 fn send_protection(app: &mut AppState) {
@@ -923,7 +931,7 @@ fn send_protection(app: &mut AppState) {
     // Nothing changed for a user already set up: nothing to write.
     let chosen = (shown_level(app), app.wizard.doh_lockdown);
     let held = app.wizard.protection_at_start;
-    if !first_run_writes(held, chosen, app.wizard.stability_touched).protection {
+    if !first_run_writes(held, chosen, false, false).protection {
         return;
     }
     if !app.link.is_connected() {

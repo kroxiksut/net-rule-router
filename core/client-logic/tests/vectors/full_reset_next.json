@@ -49,10 +49,10 @@
           { "step": "purge-principal-data", "result": "forbidden" }
         ]
       },
-      "expected": { "action": "run", "step": "apply-empty-rules", "cleared": false, "why": "" }
+      "expected": { "action": "run", "step": "stop-service", "cleared": false, "why": "" }
     },
     {
-      "name": "failed purge goes on to the rules",
+      "name": "failed purge goes on to the service stop",
       "input": {
         "canElevate": false,
         "done": [
@@ -61,30 +61,16 @@
           { "step": "purge-principal-data", "result": "failed" }
         ]
       },
-      "expected": { "action": "run", "step": "apply-empty-rules", "cleared": false, "why": "" }
+      "expected": { "action": "run", "step": "stop-service", "cleared": false, "why": "" }
     },
     {
-      "name": "refused rules never reach the service stop",
+      "name": "service stop follows the purge: no rule book of the user's own is written",
       "input": {
         "canElevate": false,
         "done": [
           { "step": "clear-logs", "result": "ok" },
           { "step": "reset-sidecar", "result": "ok" },
-          { "step": "purge-principal-data", "result": "ok" },
-          { "step": "apply-empty-rules", "result": "forbidden" }
-        ]
-      },
-      "expected": { "action": "stop", "step": "apply-empty-rules", "cleared": false, "why": "needs-elevation" }
-    },
-    {
-      "name": "service stop is last",
-      "input": {
-        "canElevate": false,
-        "done": [
-          { "step": "clear-logs", "result": "ok" },
-          { "step": "reset-sidecar", "result": "ok" },
-          { "step": "purge-principal-data", "result": "ok" },
-          { "step": "apply-empty-rules", "result": "ok" }
+          { "step": "purge-principal-data", "result": "ok" }
         ]
       },
       "expected": { "action": "run", "step": "stop-service", "cleared": false, "why": "" }
@@ -97,7 +83,6 @@
           { "step": "clear-logs", "result": "failed" },
           { "step": "reset-sidecar", "result": "skipped" },
           { "step": "purge-principal-data", "result": "ok" },
-          { "step": "apply-empty-rules", "result": "ok" },
           { "step": "stop-service", "result": "ok" }
         ]
       },
@@ -111,7 +96,6 @@
           { "step": "clear-logs", "result": "ok" },
           { "step": "reset-sidecar", "result": "ok" },
           { "step": "purge-principal-data", "result": "ok" },
-          { "step": "apply-empty-rules", "result": "ok" },
           { "step": "stop-service", "result": "failed" }
         ]
       },

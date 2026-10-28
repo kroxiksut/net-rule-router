@@ -700,14 +700,18 @@ ColumnLayout {
         RowLayout {
             anchors.fill: parent
             spacing: root.uiTheme.spacingSm
-            Label {
+            SortHeader {
+                theme: root.uiTheme
+                onActivated: section.setLogSort("by-time")
                 Layout.preferredWidth: section.timeColumnWidth
                 text: root.tr("logs.column.time", "Time") + section.logSortArrow("by-time")
                 color: section.logSortBy === "by-time" ? root.uiTheme.colorAccent : root.textColor
                 font.bold: true
                 MouseArea { anchors.fill: parent; cursorShape: Qt.PointingHandCursor; onClicked: section.setLogSort("by-time") }
             }
-            Label {
+            SortHeader {
+                theme: root.uiTheme
+                onActivated: section.setLogSort("by-level")
                 Layout.preferredWidth: 140
                 text: root.tr("logs.column.level", "Level") + section.logSortArrow("by-level")
                 color: section.logSortBy === "by-level" ? root.uiTheme.colorAccent : root.textColor
@@ -715,14 +719,18 @@ ColumnLayout {
                 elide: Text.ElideRight
                 MouseArea { anchors.fill: parent; cursorShape: Qt.PointingHandCursor; onClicked: section.setLogSort("by-level") }
             }
-            Label {
+            SortHeader {
+                theme: root.uiTheme
+                onActivated: section.setLogSort("by-category")
                 Layout.preferredWidth: 120
                 text: root.tr("logs.column.category", "Category") + section.logSortArrow("by-category")
                 color: section.logSortBy === "by-category" ? root.uiTheme.colorAccent : root.textColor
                 font.bold: true
                 MouseArea { anchors.fill: parent; cursorShape: Qt.PointingHandCursor; onClicked: section.setLogSort("by-category") }
             }
-            Label {
+            SortHeader {
+                theme: root.uiTheme
+                onActivated: section.setLogSort("by-kind")
                 Layout.preferredWidth: 180
                 text: root.tr("logs.column.kind", "Event type") + section.logSortArrow("by-kind")
                 color: section.logSortBy === "by-kind" ? root.uiTheme.colorAccent : root.textColor
@@ -895,42 +903,54 @@ ColumnLayout {
         RowLayout {
             anchors.fill: parent
             spacing: root.uiTheme.spacingSm
-            Label {
+            SortHeader {
+                theme: root.uiTheme
+                onActivated: section.setAuditSort("by-seq")
                 Layout.preferredWidth: 60
                 text: root.tr("audit.column.seq", "Seq") + section.auditSortArrow("by-seq")
                 color: section.auditSortBy === "by-seq" ? root.uiTheme.colorAccent : root.textColor
                 font.bold: true
                 MouseArea { anchors.fill: parent; cursorShape: Qt.PointingHandCursor; onClicked: section.setAuditSort("by-seq") }
             }
-            Label {
+            SortHeader {
+                theme: root.uiTheme
+                onActivated: section.setAuditSort("by-time")
                 Layout.preferredWidth: section.timeColumnWidth
                 text: root.tr("logs.column.time", "Time") + section.auditSortArrow("by-time")
                 color: section.auditSortBy === "by-time" ? root.uiTheme.colorAccent : root.textColor
                 font.bold: true
                 MouseArea { anchors.fill: parent; cursorShape: Qt.PointingHandCursor; onClicked: section.setAuditSort("by-time") }
             }
-            Label {
+            SortHeader {
+                theme: root.uiTheme
+                onActivated: section.setAuditSort("by-kind")
                 Layout.preferredWidth: 180
                 text: root.tr("audit.column.kind", "Kind") + section.auditSortArrow("by-kind")
                 color: section.auditSortBy === "by-kind" ? root.uiTheme.colorAccent : root.textColor
                 font.bold: true
                 MouseArea { anchors.fill: parent; cursorShape: Qt.PointingHandCursor; onClicked: section.setAuditSort("by-kind") }
             }
-            Label {
+            SortHeader {
+                theme: root.uiTheme
+                onActivated: section.setAuditSort("by-result")
                 Layout.preferredWidth: 90
                 text: root.tr("audit.column.result", "Result") + section.auditSortArrow("by-result")
                 color: section.auditSortBy === "by-result" ? root.uiTheme.colorAccent : root.textColor
                 font.bold: true
                 MouseArea { anchors.fill: parent; cursorShape: Qt.PointingHandCursor; onClicked: section.setAuditSort("by-result") }
             }
-            Label {
+            SortHeader {
+                theme: root.uiTheme
+                onActivated: section.setAuditSort("by-reason")
                 Layout.preferredWidth: 220
                 text: root.tr("audit.column.reason", "Reason") + section.auditSortArrow("by-reason")
                 color: section.auditSortBy === "by-reason" ? root.uiTheme.colorAccent : root.textColor
                 font.bold: true
                 MouseArea { anchors.fill: parent; cursorShape: Qt.PointingHandCursor; onClicked: section.setAuditSort("by-reason") }
             }
-            Label {
+            SortHeader {
+                theme: root.uiTheme
+                onActivated: section.setAuditSort("by-revision")
                 Layout.fillWidth: true
                 text: root.tr("audit.column.revision", "Revision") + section.auditSortArrow("by-revision")
                 color: section.auditSortBy === "by-revision" ? root.uiTheme.colorAccent : root.textColor

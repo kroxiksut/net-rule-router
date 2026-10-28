@@ -214,7 +214,7 @@ Window {
             Accessible.description: ToolTip.text
             ToolTip.visible: hovered
             ToolTip.text: root.tr("rules.import-only-active.tooltip",
-                "When loading a preset, skip rules that are turned off in it (for example application rules, which can't route yet). Default comes from Settings → General; changing it here applies to this import only.")
+                "When loading a preset, skip rules that are turned off in it (for example application rules, which can't route yet). Default comes from Settings → General; changing it here applies to imports this session only.")
             contentItem: Text {
                 leftPadding: loadListOnlyActiveCheck.indicator.width + loadListOnlyActiveCheck.spacing
                 text: root.tr("rules.import-only-active.label", "Import only active rules")

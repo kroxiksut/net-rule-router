@@ -46,6 +46,8 @@ enum Cleared {
 #[derive(Debug, Default)]
 pub struct CacheState {
     asked: bool,
+    /// Read before the service came back: read again when shown.
+    reread: bool,
     loading: bool,
     entries: Vec<CacheEntryDto>,
     cursor: Option<PageCursor>,
@@ -136,6 +138,12 @@ fn read_page(
 }
 
 /// The first page for the current search, or (`reset` false) the next one.
+/// The service came back: entries read before may be gone.
+pub fn on_reconnected(app: &mut AppState) {
+    let state = &mut app.inspect.cache;
+    state.reread = state.asked;
+}
+
 fn load(app: &mut AppState, reset: bool) {
     let state = &mut app.inspect.cache;
     if reset {
@@ -146,6 +154,7 @@ fn load(app: &mut AppState, reset: bool) {
         state.advance = false;
     }
     state.asked = true;
+    state.reread = false;
     state.loading = true;
     state.error = None;
     let generation = state.generation;
@@ -351,7 +360,8 @@ impl Screen for CacheScreen {
 
     fn on_show(&self, app: &mut AppState) {
         let state = &app.inspect.cache;
-        if app.link.is_connected() && !state.loading && (!state.asked || state.error.is_some()) {
+        let stale = !state.asked || state.reread || state.error.is_some();
+        if app.link.is_connected() && !state.loading && stale {
             load(app, true);
         }
     }

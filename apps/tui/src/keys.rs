@@ -150,7 +150,7 @@ pub const DETAIL_LIMITED: Key = key(
 );
 pub const DETAIL_PAUSED: Key = key(
     "routing.status.detail-paused",
-    "Rules are disabled until you re-enable them.",
+    "Rules are disabled for the time chosen; they come back on their own when it is up, or when you turn them back on.",
 );
 
 // ── Connections (roles) ──────────────────────────────────────────────────────
@@ -482,6 +482,22 @@ pub const SETTINGS_UNREADABLE_BODY: Key = key(
     "notifications.settings-unreadable.body",
     "This session uses default settings and will not save changes, so your saved settings stay as they are. Close the app and open it again; if the file is locked by another program, free it first.",
 );
+pub const TUI_SETTINGS_DAMAGED_TITLE: Key = key(
+    "notifications.tui-settings-damaged.title",
+    "The terminal's settings file is damaged",
+);
+pub const TUI_SETTINGS_DAMAGED_BODY: Key = key(
+    "notifications.tui-settings-damaged.body",
+    "This session uses default settings and does not save changes, so {path} is left as it is: correct or delete it, and saving works again.",
+);
+pub const TUI_SETTINGS_UNREADABLE_TITLE: Key = key(
+    "notifications.tui-settings-unreadable.title",
+    "The terminal's settings file could not be read",
+);
+pub const TUI_SETTINGS_UNREADABLE_BODY: Key = key(
+    "notifications.tui-settings-unreadable.body",
+    "This session uses default settings and does not save changes, so {path} is left as it is. If another program holds the file or its permissions shut you out, free it, and saving works again.",
+);
 pub const DELIVERY_TITLE: Key = key(
     "notifications.delivery-incomplete.title",
     "The installation is incomplete",
@@ -632,6 +648,10 @@ pub const PLAIN_HELP_ENTER: Key = key(
 );
 pub const PLAIN_HELP_HELP: Key = key("tui.plain.help-help", "h or ?: this help");
 pub const PLAIN_UNKNOWN: Key = key("tui.plain.unknown", "Not understood: {input}");
+pub const PLAIN_NUMBER_GONE: Key = key(
+    "tui.plain.number-gone",
+    "Item {n} as it was listed is no longer in the list. Here is the list as it is now.",
+);
 pub const PLAIN_INPUT_ENDED_UNAPPLIED: Key = key(
     "tui.plain.input-ended-unapplied",
     "Input ended while rule changes were not applied. They were dropped; nothing was sent to the service.",
@@ -797,6 +817,10 @@ pub const ALL: &[Key] = &[
     BLOCK_NOTICE_BACKLOG_MORE,
     SETTINGS_UNREADABLE_TITLE,
     SETTINGS_UNREADABLE_BODY,
+    TUI_SETTINGS_DAMAGED_TITLE,
+    TUI_SETTINGS_DAMAGED_BODY,
+    TUI_SETTINGS_UNREADABLE_TITLE,
+    TUI_SETTINGS_UNREADABLE_BODY,
     DELIVERY_TITLE,
     DELIVERY_BODY,
     DELIVERY_PRESETS,
@@ -837,6 +861,7 @@ pub const ALL: &[Key] = &[
     PLAIN_HELP_ENTER,
     PLAIN_HELP_HELP,
     PLAIN_UNKNOWN,
+    PLAIN_NUMBER_GONE,
     PLAIN_INPUT_ENDED_UNAPPLIED,
     PLAIN_COMMANDS,
 ];

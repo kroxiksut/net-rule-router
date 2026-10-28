@@ -44,6 +44,11 @@ const KILL_SETTLE: Duration = Duration::from_secs(10);
 /// it, a hint reads as a hang rather than a slow step.
 const MAX_WAIT_HINT: Duration = Duration::from_secs(120);
 
+/// The longest a stop is waited for while the service still reports progress:
+/// past the sum of its own teardown budgets, short of what a user cut off from
+/// the network waits for before the reset ends the process.
+const STOP_WAIT_CEILING: Duration = Duration::from_secs(45);
+
 /// Best-effort drain budget applied when uninstall has to stop a running
 /// service first. Uninstall proceeds even if the service is slow to go down —
 /// SCM marks a still-running service for deletion on exit.
@@ -1063,7 +1068,7 @@ impl WindowsServiceControl {
                     "registering a service binary that non-administrators can change — development build only",
                 );
             }
-            return Ok(Placement::Register(source.to_path_buf()));
+            return direct_placement(source, registered_from(manager, source)?);
         }
         let relocation = |detail: String| ServiceControlError::Relocation { detail };
         let dir = crate::service_placement::installed_copy_dir().map_err(relocation)?;
@@ -1071,13 +1076,7 @@ impl WindowsServiceControl {
         let payload = crate::service_placement::Payload::read(source).map_err(relocation)?;
         let copy = payload.state_in(&dir).map_err(relocation)?;
         let placement = match plan_copy(copy, registered_from(manager, &target)?) {
-            CopyPlan::RefuseRegisteredElsewhere => {
-                return Err(ServiceControlError::InvalidState {
-                    detail: "the service is already registered from another folder; \
-                             reinstall replaces that registration"
-                        .to_string(),
-                })
-            }
+            CopyPlan::RefuseRegisteredElsewhere => return Err(already_registered_elsewhere()),
             CopyPlan::Nothing => Placement::AlreadyRegistered,
             CopyPlan::Register => {
                 crate::service_placement::prepare_copy_dir(&dir).map_err(relocation)?;
@@ -1107,6 +1106,28 @@ impl WindowsServiceControl {
             )));
         }
         Ok(placement)
+    }
+}
+
+/// A binary registered as it stands, measured against what is registered: a
+/// repeat install refreshes, as for the protected copy, rather than failing on
+/// the existing name.
+fn direct_placement(
+    source: &Path,
+    registered: RegisteredFrom,
+) -> Result<Placement, ServiceControlError> {
+    match registered {
+        RegisteredFrom::Nothing => Ok(Placement::Register(source.to_path_buf())),
+        RegisteredFrom::TheCopy { .. } => Ok(Placement::AlreadyRegistered),
+        RegisteredFrom::Elsewhere => Err(already_registered_elsewhere()),
+    }
+}
+
+fn already_registered_elsewhere() -> ServiceControlError {
+    ServiceControlError::InvalidState {
+        detail: "the service is already registered from another folder; \
+                 reinstall replaces that registration"
+            .to_string(),
     }
 }
 
@@ -1235,11 +1256,19 @@ fn same_file_path(left: &Path, right: &Path) -> bool {
 /// Translate an SCM failure into the neutral taxonomy. Only two OS codes carry
 /// meaning a caller can act on — everything else is reported verbatim.
 fn map_service_error(err: windows_service::Error) -> ServiceControlError {
-    // ERROR_ACCESS_DENIED = 5, ERROR_SERVICE_DOES_NOT_EXIST = 1060.
+    // ERROR_ACCESS_DENIED = 5, ERROR_SERVICE_DOES_NOT_EXIST = 1060,
+    // ERROR_SERVICE_EXISTS = 1073.
     if let windows_service::Error::Winapi(io_err) = &err {
         match io_err.raw_os_error() {
             Some(5) => return ServiceControlError::AccessDenied,
             Some(1060) => return ServiceControlError::NotInstalled,
+            Some(1073) => {
+                return ServiceControlError::InvalidState {
+                    detail: "the service is already registered; reinstall replaces that \
+                             registration"
+                        .to_string(),
+                }
+            }
             _ => {}
         }
     }
@@ -1299,32 +1328,40 @@ fn after_crash_command(binary: &Path) -> OsString {
     OsString::from(format!("\"{}\" after-crash", binary.display()))
 }
 
+/// The failure actions SCM is given for `policy`: a run-command action without
+/// its command is one SCM skips, leaving the network held after the restarts.
+fn failure_actions(
+    policy: &RecoveryPolicy,
+    binary: &Path,
+) -> windows_service::service::ServiceFailureActions {
+    use windows_service::service::{ServiceFailureActions, ServiceFailureResetPeriod};
+
+    let actions: Vec<ServiceAction> = failure_action_plan(policy)
+        .into_iter()
+        .map(|(action_type, delay)| ServiceAction { action_type, delay })
+        .collect();
+    let command = actions
+        .iter()
+        .any(|a| a.action_type == ServiceActionType::RunCommand)
+        .then(|| after_crash_command(binary));
+    ServiceFailureActions {
+        reset_period: ServiceFailureResetPeriod::After(Duration::from_secs(
+            policy.reset_period_secs as u64,
+        )),
+        reboot_msg: None,
+        command,
+        actions: Some(actions),
+    }
+}
+
 /// Configure SCM failure actions for an already-registered service.
 fn configure_recovery(
     service: &Service,
     policy: &RecoveryPolicy,
     binary: &Path,
 ) -> Result<(), ServiceControlError> {
-    use windows_service::service::{ServiceFailureActions, ServiceFailureResetPeriod};
-
-    let actions = failure_action_plan(policy);
-    let command = policy
-        .release_network_when_exhausted
-        .then(|| after_crash_command(binary));
-    let actions: Vec<ServiceAction> = actions
-        .into_iter()
-        .map(|(action_type, delay)| ServiceAction { action_type, delay })
-        .collect();
-
     service
-        .update_failure_actions(ServiceFailureActions {
-            reset_period: ServiceFailureResetPeriod::After(Duration::from_secs(
-                policy.reset_period_secs as u64,
-            )),
-            reboot_msg: None,
-            command,
-            actions: Some(actions),
-        })
+        .update_failure_actions(failure_actions(policy, binary))
         .map_err(|e| ServiceControlError::Mechanism {
             detail: format!("set failure actions: {}", winapi_detail(&e)),
         })?;
@@ -1483,18 +1520,44 @@ fn start_wait_over(
     now >= deadline.max(last_progress + wait_hint.min(MAX_WAIT_HINT))
 }
 
-/// Poll SCM until the service reports `Stopped` or the budget expires.
+/// A stop wait ends past the caller's `deadline` once the stopping service no
+/// longer promises more (its wait hint from its last checkpoint move), and at
+/// `ceiling` whatever it promises: its progress tick moves the checkpoint while
+/// any teardown step runs, a hung one included.
+fn stop_wait_over(
+    now: Instant,
+    deadline: Instant,
+    last_progress: Instant,
+    wait_hint: Duration,
+    ceiling: Instant,
+) -> bool {
+    now >= ceiling.min(deadline.max(last_progress + wait_hint.min(MAX_WAIT_HINT)))
+}
+
+/// Poll SCM until the service reports `Stopped`, honouring its own progress
+/// as [`stop_wait_over`] describes.
 fn wait_for_stopped(service: &Service, timeout: Duration) -> Result<(), ServiceControlError> {
-    let deadline = Instant::now() + timeout;
+    let waited_since = Instant::now();
+    let deadline = waited_since + timeout;
+    let ceiling = waited_since + timeout.max(STOP_WAIT_CEILING);
+    let mut progress: Option<(u32, Instant)> = None;
     loop {
         let status = service.query_status().map_err(map_service_error)?;
         if status.current_state == ServiceState::Stopped {
             return Ok(());
         }
-        if Instant::now() >= deadline {
+        let now = Instant::now();
+        let last_progress = match progress {
+            Some((checkpoint, at)) if checkpoint == status.checkpoint => at,
+            _ => {
+                progress = Some((status.checkpoint, now));
+                now
+            }
+        };
+        if stop_wait_over(now, deadline, last_progress, status.wait_hint, ceiling) {
             return Err(ServiceControlError::Timeout {
                 operation: "stop",
-                seconds: timeout.as_secs(),
+                seconds: waited_since.elapsed().as_secs(),
             });
         }
         std::thread::sleep(POLL_INTERVAL);
@@ -1769,6 +1832,33 @@ mod tests {
         assert!(delay >= Duration::from_secs(60), "the tail is a backoff");
     }
 
+    /// What a start restores must not read back as missing, and the
+    /// network-release step must carry the command SCM runs for it.
+    #[test]
+    fn restored_recovery_releases_the_network_once_the_restarts_are_spent() {
+        let binary = Path::new(r"C:\NRR\nrr-service.exe");
+        let mut no_release = RecoveryPolicy::production();
+        no_release.release_network_when_exhausted = false;
+        for policy in [RecoveryPolicy::production(), no_release] {
+            let set = failure_actions(&policy, binary);
+            assert!(
+                !recovery_missing(&set),
+                "a restored set must count as present"
+            );
+            let runs_command = set
+                .actions
+                .iter()
+                .flatten()
+                .any(|a| a.action_type == ServiceActionType::RunCommand);
+            assert_eq!(runs_command, policy.release_network_when_exhausted);
+            assert_eq!(
+                set.command,
+                runs_command.then(|| after_crash_command(binary)),
+                "the run-command step needs the after-crash command, and nothing else does"
+            );
+        }
+    }
+
     #[test]
     fn a_zero_tail_delay_leaves_the_service_stopped() {
         let mut policy = RecoveryPolicy::production();
@@ -1845,6 +1935,61 @@ mod tests {
             deadline,
             t0,
             Duration::from_secs(36_000)
+        ));
+    }
+
+    /// An install from an administrators-only folder, repeated, refreshes the
+    /// registration as a portable one does; it never dies on the existing name.
+    #[test]
+    fn a_repeat_install_of_a_protected_binary_refreshes_instead_of_failing() {
+        let source = Path::new(r"C:\Program Files\NetRuleRouter\nrr-service.exe");
+        assert!(matches!(
+            direct_placement(source, RegisteredFrom::Nothing),
+            Ok(Placement::Register(path)) if path == source
+        ));
+        assert!(matches!(
+            direct_placement(source, RegisteredFrom::TheCopy { running: true }),
+            Ok(Placement::AlreadyRegistered)
+        ));
+        assert!(matches!(
+            direct_placement(source, RegisteredFrom::Elsewhere),
+            Err(ServiceControlError::InvalidState { .. })
+        ));
+        // A registration that raced the check still points at the way out.
+        let exists = map_service_error(windows_service::Error::Winapi(
+            std::io::Error::from_raw_os_error(1073),
+        ));
+        assert!(
+            matches!(&exists, ServiceControlError::InvalidState { detail } if detail.contains("reinstall")),
+            "{exists:?}"
+        );
+    }
+
+    /// The service's teardown runs past the console's 15 s while reporting
+    /// progress; calling that a failure left `restart` without a service. A
+    /// hung teardown still ends at the ceiling, its progress tick or not.
+    #[test]
+    fn a_stop_slower_than_the_budget_is_waited_for_while_it_reports_progress() {
+        let t0 = Instant::now();
+        let deadline = t0 + Duration::from_secs(15);
+        let ceiling = t0 + STOP_WAIT_CEILING;
+        let hint = Duration::from_secs(30);
+        let tick = t0 + Duration::from_secs(16);
+        assert!(!stop_wait_over(
+            t0 + Duration::from_secs(18),
+            deadline,
+            tick,
+            hint,
+            ceiling
+        ));
+        assert!(stop_wait_over(ceiling, deadline, ceiling, hint, ceiling));
+        // No promise from the service: the caller's budget alone decides.
+        assert!(stop_wait_over(
+            deadline,
+            deadline,
+            t0,
+            Duration::ZERO,
+            ceiling
         ));
     }
 

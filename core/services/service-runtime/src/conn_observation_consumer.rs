@@ -630,6 +630,9 @@ pub struct ConnectionObservationConsumer {
     /// Reads which rule folders hold the script a connecting interpreter
     /// runs, so a rule by folder follows its scripts. `None` recognises none.
     script_launches: Option<Arc<crate::script_launches::ScriptLaunches>>,
+    /// The process holding an open TCP flow `(local, remote)`, for a
+    /// connection reported without a pid. `None` asks nobody.
+    flow_pid: Option<FlowPidFn>,
 
     /// When wired, every resolved trace is pushed into
     /// this ring so the Diagnostics panel can read recent connections over IPC.
@@ -804,6 +807,9 @@ pub type AppDestinationForgetFn = Arc<dyn Fn(Option<&str>, &str, std::net::Ipv4A
 /// The application patterns the rule book currently routes over the additional
 /// link. Read per batch: a rule edit must take effect without a restart.
 pub type RoutedAppsFn = Arc<dyn Fn() -> Vec<String> + Send + Sync>;
+
+/// `(local, remote)` of an open TCP flow → the pid holding it.
+pub type FlowPidFn = Arc<dyn Fn(SocketAddr, SocketAddr) -> Option<u32> + Send + Sync>;
 
 /// Which application rules' pins this observation proves to be collateral.
 ///

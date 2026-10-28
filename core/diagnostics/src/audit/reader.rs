@@ -408,12 +408,20 @@ fn file_name_of(path: &Path) -> String {
         .unwrap_or_default()
 }
 
-/// The event on a line, and the bytes its hash covers.
+/// The event on a line, and the bytes its hash covers: the line as written
+/// with its hash emptied, so a field from a newer build that this one does not
+/// know is still covered. A line where that spot cannot be found unambiguously
+/// is re-serialised instead.
 fn parse_event(line: &str) -> Option<(AuditEvent, String)> {
     let event = serde_json::from_str::<AuditEvent>(line).ok()?;
-    let mut bare = event.clone();
-    bare.event_hash = String::new();
-    let canonical = serde_json::to_string(&bare).ok()?;
+    let stored = format!("\"event_hash\":\"{}\"", event.event_hash);
+    let canonical = if !event.event_hash.is_empty() && line.matches(&stored).count() == 1 {
+        line.replacen(&stored, "\"event_hash\":\"\"", 1)
+    } else {
+        let mut bare = event.clone();
+        bare.event_hash = String::new();
+        serde_json::to_string(&bare).ok()?
+    };
     Some((event, canonical))
 }
 
@@ -806,6 +814,53 @@ mod tests {
             };
             writer.append(input).expect("append");
         }
+    }
+
+    /// A newer build writes a field this build does not know. Re-serialising
+    /// the parsed event drops it, so the hash did not match and an older build
+    /// put back after an upgrade reported a tampered audit trail.
+    #[test]
+    fn a_field_written_by_a_newer_build_is_no_hash_mismatch() {
+        let dir = tempfile::tempdir().expect("temp");
+        write_events(dir.path(), 1);
+        let path = AuditReader::new(dir.path()).list_files()[0].clone();
+        let first = std::fs::read_to_string(&path).expect("read");
+        let first = first.lines().next().expect("one line");
+        let first_hash = serde_json::from_str::<AuditEvent>(first)
+            .expect("event")
+            .event_hash;
+
+        let mut newer = serde_json::from_str::<AuditEvent>(first).expect("event");
+        newer.seq = 2;
+        newer.event_id = "adt-0002".into();
+        newer.prev_hash = Some(first_hash.clone());
+        newer.event_hash = String::new();
+        let canonical = serde_json::to_string(&newer).expect("json").replacen(
+            "\"result\":",
+            "\"added_later\":{\"x\":1},\"result\":",
+            1,
+        );
+        let hash = compute_chain_hash(&first_hash, &canonical);
+        let line = canonical.replacen(
+            "\"event_hash\":\"\"",
+            &format!("\"event_hash\":\"{hash}\""),
+            1,
+        );
+        assert!(line.contains("added_later") && line.contains(&hash));
+
+        let content = format!("{first}\n{line}\n");
+        let link = verify_file_link("nrr_audit_x.ndjson", Some(&content), None);
+        assert!(
+            link.whole.first_hash_break.is_none(),
+            "{:?}",
+            link.whole.first_hash_break
+        );
+
+        // The written bytes are what is checked: an edit to the new field is
+        // still caught.
+        let edited = content.replacen("\"x\":1", "\"x\":2", 1);
+        let link = verify_file_link("nrr_audit_x.ndjson", Some(&edited), None);
+        assert!(link.whole.first_hash_break.is_some());
     }
 
     #[test]

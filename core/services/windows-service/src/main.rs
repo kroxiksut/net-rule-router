@@ -117,6 +117,7 @@ fn main() -> std::process::ExitCode {
     // boot-timing card measures when the SERVICE started — not when the piece
     // of it that reports the measurement was built.
     let _ = nrr_service_runtime::process_started_at_ms();
+    nrr_service_runtime::install_throttled_panic_reports();
 
     let args: Vec<String> = env::args().collect();
     let mode = args

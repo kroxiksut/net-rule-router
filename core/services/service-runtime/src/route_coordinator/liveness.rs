@@ -225,9 +225,9 @@ impl SecondaryRouteCoordinator {
     /// nothing when the link has no v6 next hop — the planner's call, not
     /// this one's. Returns how many of `addresses` now have their route.
     ///
-    /// Cost: one cache snapshot and a plan over the hosts on `addresses` per
-    /// DNS answer that introduces an address, never per packet or connection;
-    /// the plan of the whole cache is the full recompute's.
+    /// Cost: index reads of the cache rows on `addresses` and a plan over
+    /// their hosts, per DNS answer that introduces an address, never per
+    /// packet or connection; the plan of the whole cache is the full pass's.
     pub fn route_first_contact(&self, sid: &str, addresses: &[std::net::IpAddr]) -> usize {
         if addresses.is_empty() {
             return 0;
@@ -258,10 +258,7 @@ impl SecondaryRouteCoordinator {
         let Some(snapshot) = self.rules_provider.active_rules_for(sid) else {
             return 0;
         };
-        let scoped = self
-            .fqdn_cache
-            .snapshot_for_compute()
-            .map(|full| full.scoped_to(addresses));
+        let scoped = self.fqdn_cache.snapshot_for_addresses(addresses);
         let cache = snapshot_or_live(scoped.as_ref(), self.fqdn_cache.as_ref());
         let wanted: Vec<RouteEntry> = self
             .planned_routes(

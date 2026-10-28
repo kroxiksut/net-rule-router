@@ -121,7 +121,6 @@ QtObject {
         if (step === "clear-logs") fireAndForget("rpcLogsClear", false, true)
         else if (step === "reset-sidecar") fireAndForget("rpcSidecarReset")
         else if (step === "purge-principal-data") _purgePrincipalData(allPrincipals, viaBool)
-        else if (step === "apply-empty-rules") applyEmptyRules(viaBool)
         else if (step === "stop-service") _stopService(viaBool)
         else report("skipped")
     }
@@ -202,13 +201,11 @@ QtObject {
         })
     }
 
-    // Silent two-phase empty PresetImport: makes the service's active
-    // revision empty (post-install state) WITHOUT opening the review dialog
-    // (the Full-reset confirm already gated the action). Same payload shape
-    // as `startBothRoutesPresetImportReviewFlow`; the confirm phase carries
-    // the dry-run token. Non-admin → confirm Forbidden → launcher R3 elevates
-    // (UAC) and retries; `onComplete(true)` only once the operation completed,
-    // else `onComplete(false, errorCode)`.
+    // Silent two-phase empty PresetImport into the caller's own rules, with no
+    // review dialog (the caller's confirm already gated it). Not a full reset
+    // step: an own empty book would cut the user off the baseline.
+    // `onComplete(true)` only once the operation completed, else
+    // `onComplete(false, errorCode)`.
     function applyEmptyRules(onComplete) {
         if (!root.bridgeAvailable || typeof nrrNativeBridge.rpcMutationSubmit !== "function") {
             onComplete(false)

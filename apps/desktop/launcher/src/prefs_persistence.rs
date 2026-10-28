@@ -17,10 +17,15 @@
 
 use std::time::{Duration, Instant};
 
+use nrr_shared::launcher_rpc::{parse_request_line, LauncherRpcResponse};
+use nrr_shared::user_settings::UserSettingsStore;
 use nrr_ui_support::ui_preferences::{UiPreferences, UiPreferencesStore};
+use serde_json::{json, Value};
 
 use crate::launcher::{diag_log, preferences_to_persist};
-use crate::user_settings_bridge::UserSettingsMirror;
+use crate::user_settings_bridge::{
+    overlay, preference_changes, UserSettingsMirror, FOLLOW_OPERATION,
+};
 
 /// How long a burst of publications may coalesce before the newest snapshot is
 /// written.
@@ -54,6 +59,22 @@ pub(crate) struct DebouncedPreferenceWriter {
     writes: u32,
     /// The shared user settings, written after each preferences save.
     user_settings: Option<UserSettingsMirror>,
+    /// The last snapshot's shared fields did not reach that file.
+    user_settings_unpublished: bool,
+}
+
+/// A follow answer for a file that would not load. Only damage is said, with
+/// the file and the reason; a lock or a moment's I/O error is not damage.
+fn unreadable_answer(stamp: &str, error: &nrr_shared::user_settings::UserSettingsError) -> Value {
+    let mut answer = json!({ "stamp": stamp, "changed": false, "unreadable": true });
+    if matches!(
+        error,
+        nrr_shared::user_settings::UserSettingsError::Damaged { .. }
+    ) {
+        answer["damaged"] = Value::Bool(true);
+        answer["reason"] = Value::String(error.to_string());
+    }
+    answer
 }
 
 impl DebouncedPreferenceWriter {
@@ -81,6 +102,7 @@ impl DebouncedPreferenceWriter {
             coalesced: 0,
             writes: 0,
             user_settings: None,
+            user_settings_unpublished: false,
         }
     }
 
@@ -167,13 +189,101 @@ impl DebouncedPreferenceWriter {
         }
     }
 
+    /// `local.user-settings.follow` `{since, adopt}`: the shared fields as
+    /// another client left them since the file's stamp `since`. With `adopt`
+    /// the window takes the answer: its unwritten snapshot lands first, so the
+    /// file never takes back the window's own change, and its later saves are
+    /// measured against what it took, so they do not undo the next change made
+    /// elsewhere. Without, nothing here moves (the tray only reads).
+    pub(crate) fn follow_user_settings(&mut self, payload: &Value) -> Value {
+        let since = payload
+            .get("since")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let adopt = payload.get("adopt").and_then(Value::as_bool) == Some(true);
+        let store = match self.user_settings.as_ref() {
+            Some(mirror) => UserSettingsStore::at(mirror.path().to_path_buf()),
+            None => match UserSettingsStore::open() {
+                Ok(store) => store,
+                Err(_) => return json!({ "stamp": "", "changed": false, "unreadable": true }),
+            },
+        };
+        if store.stamp() == since {
+            return json!({ "stamp": since, "changed": false });
+        }
+        if adopt {
+            self.flush();
+            // A change the file refused is tried again: the file may read now.
+            if self.user_settings_unpublished {
+                let base = self.base.clone();
+                self.publish_user_settings(&base);
+            }
+            // The window's own change is not in the file yet; taking the
+            // file now would hand the window the value it replaced.
+            if self.user_settings_unpublished {
+                // A damaged file is why the change waits: still say it.
+                return match store.load() {
+                    Err(error @ nrr_shared::user_settings::UserSettingsError::Damaged { .. }) => {
+                        unreadable_answer(since, &error)
+                    }
+                    _ => json!({ "stamp": since, "changed": false }),
+                };
+            }
+        }
+        let stamp = store.stamp();
+        let settings = match store.load() {
+            Ok(settings) => settings,
+            Err(error) => return unreadable_answer(&stamp, &error),
+        };
+        let mut followed = self.base.clone();
+        if let Some(settings) = &settings {
+            overlay(&mut followed, settings);
+        }
+        let changes = preference_changes(&self.base, &followed);
+        if adopt {
+            if let Some(mirror) = self.user_settings.as_mut() {
+                mirror.adopt(&followed);
+            }
+            self.base = followed;
+        }
+        let rules_files = settings.map_or(Value::Null, |settings| {
+            json!({
+                "primary": settings.rules_files.primary,
+                "secondary": settings.rules_files.secondary,
+            })
+        });
+        json!({
+            "stamp": stamp,
+            "changed": true,
+            "preferences": changes,
+            "rules-files": rules_files,
+        })
+    }
+
+    /// A host request this loop answers itself — it holds the window's
+    /// preferences — or `None` for the dispatcher.
+    pub(crate) fn answer_in_loop(&mut self, line: &str) -> Option<LauncherRpcResponse> {
+        // Most lines name another operation; most payloads are not worth a parse.
+        if !line.contains(FOLLOW_OPERATION) {
+            return None;
+        }
+        let request = parse_request_line(line)?.ok()?;
+        if request.operation != FOLLOW_OPERATION {
+            return None;
+        }
+        let answer = self.follow_user_settings(&request.payload);
+        Some(LauncherRpcResponse::ok(request.correlation_id, answer))
+    }
+
     /// Best effort: the preferences already landed, and a field that failed
     /// here is retried with the next snapshot because it still differs.
     fn publish_user_settings(&mut self, preferences: &UiPreferences) {
         let Some(mirror) = self.user_settings.as_mut() else {
             return;
         };
-        let line = match mirror.publish(preferences) {
+        let published = mirror.publish(preferences);
+        self.user_settings_unpublished = published.is_err();
+        let line = match published {
             Ok(false) => return,
             Ok(true) => format!(
                 "NRR_LAUNCHER[prefs] user settings written path={}",
@@ -188,8 +298,11 @@ impl DebouncedPreferenceWriter {
 #[cfg(test)]
 mod tests {
     use super::{DebouncedPreferenceWriter, PREFS_WRITE_DEBOUNCE};
+    use nrr_shared::user_settings::{UserSettings, UserSettingsStore};
     use nrr_shared::ThemeMode;
     use nrr_ui_support::ui_preferences::{UiPreferences, UiPreferencesStore};
+    use serde_json::{json, Value};
+    use std::path::{Path, PathBuf};
     use std::time::{Duration, Instant};
 
     const TAG: &str = "test";
@@ -410,6 +523,266 @@ mod tests {
             .expect("present");
         assert_eq!(on_disk.rules_folder, "/window/sets");
         assert_eq!(on_disk.rules_files.primary, "/terminal/rules_primary.txt");
+    }
+
+    fn writer_with_shared(dir: &tempfile::TempDir) -> (DebouncedPreferenceWriter, PathBuf) {
+        use crate::user_settings_bridge::open_session_in;
+        let shared = dir.path().join("user-settings.json");
+        let mut base = UiPreferences::default();
+        let mirror = open_session_in(UserSettingsStore::at(shared.clone()), &mut base, true);
+        assert!(mirror.is_some());
+        let writer = writer_over(
+            UiPreferencesStore::for_path(dir.path().join("ui-preferences.conf")),
+            base,
+        )
+        .with_user_settings(mirror);
+        (writer, shared)
+    }
+
+    fn terminal_writes(shared: &Path, change: impl FnOnce(&mut UserSettings)) {
+        UserSettingsStore::at(shared.to_path_buf())
+            .update(change)
+            .expect("terminal write");
+    }
+
+    fn on_disk(shared: &Path) -> UserSettings {
+        UserSettingsStore::at(shared.to_path_buf())
+            .load()
+            .expect("load")
+            .expect("present")
+    }
+
+    fn follow(writer: &mut DebouncedPreferenceWriter, since: &str) -> Value {
+        writer.follow_user_settings(&json!({ "since": since, "adopt": true }))
+    }
+
+    /// The terminal binds other files and another folder while the window
+    /// runs: the open window is told, in its own preference names.
+    #[test]
+    fn a_change_the_terminal_made_reaches_the_open_window() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let (mut writer, shared) = writer_with_shared(&dir);
+        terminal_writes(&shared, |s| {
+            s.rules_folder = "/terminal/sets".to_string();
+            s.rules_files.primary = "/terminal/sets/a/rules_primary.txt".to_string();
+            s.selected_set = "user:a".to_string();
+        });
+
+        let answer = follow(&mut writer, "");
+        assert_eq!(answer["changed"], true, "{answer}");
+        let prefs = &answer["preferences"];
+        assert_eq!(prefs["userPresetsDir"], "/terminal/sets");
+        assert_eq!(
+            prefs["lastSavedPathPrimary"],
+            "/terminal/sets/a/rules_primary.txt"
+        );
+        assert_eq!(
+            prefs["lastLoadedPathPrimary"], "/terminal/sets/a/rules_primary.txt",
+            "the Source line shows where the rules now come from"
+        );
+        assert_eq!(prefs["selectedPresetSet"], "user:a");
+        assert!(
+            prefs.get("lastSavedPathSecondary").is_none(),
+            "a field nobody changed is not sent: {prefs}"
+        );
+        assert_eq!(
+            answer["rules-files"]["primary"],
+            "/terminal/sets/a/rules_primary.txt"
+        );
+    }
+
+    /// Once the window holds what the terminal set, its next save carries that
+    /// value back: it is not the window's own change and must not undo what
+    /// the terminal set after it.
+    #[test]
+    fn a_window_that_took_a_terminal_change_does_not_undo_the_next_one() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let (mut writer, shared) = writer_with_shared(&dir);
+        terminal_writes(&shared, |s| {
+            s.rules_files.primary = "/terminal/one.txt".to_string();
+        });
+        follow(&mut writer, "");
+        terminal_writes(&shared, |s| {
+            s.rules_files.primary = "/terminal/two.txt".to_string();
+        });
+
+        let mut payload: Value =
+            serde_json::from_str(&payload_with_theme("dark")).expect("payload");
+        payload["lastSavedPathPrimary"] = "/terminal/one.txt".into();
+        writer.observe(&payload.to_string(), Instant::now());
+        writer.flush();
+
+        assert_eq!(on_disk(&shared).rules_files.primary, "/terminal/two.txt");
+    }
+
+    /// A change the window made a moment ago and has not written yet is the
+    /// newest word on its field: following the file must not take it back.
+    #[test]
+    fn following_the_file_keeps_the_windows_unwritten_change() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let (mut writer, shared) = writer_with_shared(&dir);
+        let mut payload: Value =
+            serde_json::from_str(&payload_with_theme("dark")).expect("payload");
+        payload["userPresetsDir"] = "/window/sets".into();
+        writer.observe(&payload.to_string(), Instant::now());
+        terminal_writes(&shared, |s| {
+            s.rules_files.primary = "/terminal/rules_primary.txt".to_string();
+        });
+
+        let answer = follow(&mut writer, "");
+        let prefs = &answer["preferences"];
+        assert!(prefs.get("userPresetsDir").is_none(), "{answer}");
+        assert_eq!(prefs["lastSavedPathPrimary"], "/terminal/rules_primary.txt");
+        let file = on_disk(&shared);
+        assert_eq!(file.rules_folder, "/window/sets");
+        assert_eq!(file.rules_files.primary, "/terminal/rules_primary.txt");
+    }
+
+    /// The window asks every few seconds; an unchanged file is answered from
+    /// its stamp, and only a rewrite is read.
+    #[test]
+    fn the_file_is_read_again_only_after_it_changed() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let (mut writer, shared) = writer_with_shared(&dir);
+        // A file just written is read again until it settles.
+        std::fs::File::options()
+            .write(true)
+            .open(&shared)
+            .and_then(|file| {
+                file.set_modified(std::time::SystemTime::now() - Duration::from_secs(3600))
+            })
+            .expect("date the file back");
+        let first = follow(&mut writer, "");
+        let stamp = first["stamp"].as_str().expect("stamp").to_owned();
+        assert!(!stamp.is_empty(), "{first}");
+
+        let again = follow(&mut writer, &stamp);
+        assert_eq!(again["changed"], false, "{again}");
+        assert!(again.get("preferences").is_none(), "{again}");
+
+        terminal_writes(&shared, |s| s.selected_set = "user:b".to_string());
+        let after = follow(&mut writer, &stamp);
+        assert_eq!(after["changed"], true, "{after}");
+        assert_eq!(after["preferences"]["selectedPresetSet"], "user:b");
+    }
+
+    /// A file damaged while the window runs is said, and stays as it is.
+    #[test]
+    fn a_file_damaged_while_the_window_runs_is_said_and_left_alone() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let (mut writer, shared) = writer_with_shared(&dir);
+        std::fs::write(&shared, "{broken").expect("damage");
+
+        let answer = follow(&mut writer, "");
+        assert_eq!(answer["unreadable"], true, "{answer}");
+        assert_eq!(
+            answer["damaged"], true,
+            "the window cannot tell the user: {answer}"
+        );
+        assert!(
+            answer["reason"]
+                .as_str()
+                .is_some_and(|r| r.contains("user-settings.json")),
+            "the user is not told which file: {answer}"
+        );
+        assert_eq!(answer["changed"], false);
+        assert!(answer.get("preferences").is_none());
+        assert_eq!(std::fs::read_to_string(&shared).expect("read"), "{broken");
+    }
+
+    /// The window changed a shared setting and the damaged file refused it:
+    /// that change waiting must not hide why it waits.
+    #[test]
+    fn a_damaged_file_is_said_while_the_windows_change_waits_for_it() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let (mut writer, shared) = writer_with_shared(&dir);
+        let first = follow(&mut writer, "");
+        let stamp = first["stamp"].as_str().expect("stamp").to_owned();
+        std::fs::write(&shared, "{broken").expect("damage");
+        let mut payload: Value =
+            serde_json::from_str(&payload_with_theme("dark")).expect("payload");
+        payload["userPresetsDir"] = "/window/sets".into();
+        writer.observe(&payload.to_string(), Instant::now());
+
+        let answer = follow(&mut writer, &stamp);
+        assert_eq!(answer["damaged"], true, "{answer}");
+        assert_eq!(answer["changed"], false);
+        assert_eq!(std::fs::read_to_string(&shared).expect("read"), "{broken");
+    }
+
+    /// The window opened while the shared file was damaged. Nothing is written
+    /// over it; once the user fixes it and the window has read it, the
+    /// window's next change of a shared setting reaches the terminal and tray.
+    #[test]
+    fn a_window_opened_over_a_damaged_file_writes_to_it_once_fixed() {
+        use crate::user_settings_bridge::open_session_in;
+        let dir = tempfile::tempdir().expect("temp dir");
+        let shared = dir.path().join("user-settings.json");
+        std::fs::write(&shared, "{broken").expect("damage");
+        let mut base = UiPreferences::default();
+        let mirror = open_session_in(UserSettingsStore::at(shared.clone()), &mut base, true);
+        let mut writer = writer_over(
+            UiPreferencesStore::for_path(dir.path().join("ui-preferences.conf")),
+            base,
+        )
+        .with_user_settings(mirror);
+        let with_folder = |folder: &str| {
+            let mut payload: Value =
+                serde_json::from_str(&payload_with_theme("dark")).expect("payload");
+            payload["userPresetsDir"] = folder.into();
+            payload.to_string()
+        };
+
+        writer.observe(&with_folder("/window/early"), Instant::now());
+        writer.flush();
+        let damaged = follow(&mut writer, "");
+        assert_eq!(damaged["damaged"], true, "{damaged}");
+        assert_eq!(std::fs::read_to_string(&shared).expect("read"), "{broken");
+
+        std::fs::remove_file(&shared).expect("the user removes the damaged file");
+        terminal_writes(&shared, |s| s.selected_set = "user:t".to_string());
+        let fixed = follow(&mut writer, damaged["stamp"].as_str().unwrap_or_default());
+        assert_eq!(fixed["changed"], true, "{fixed}");
+        assert!(
+            fixed["preferences"].get("userPresetsDir").is_none(),
+            "the change made while the file was damaged was taken back: {fixed}"
+        );
+        assert_eq!(on_disk(&shared).rules_folder, "/window/early");
+        writer.observe(&with_folder("/window/sets"), Instant::now());
+        writer.flush();
+
+        let file = on_disk(&shared);
+        assert_eq!(file.rules_folder, "/window/sets");
+        assert_eq!(file.selected_set, "user:t", "the terminal's value is kept");
+    }
+
+    /// The window's question is answered by the loop that holds its
+    /// preferences; every other request goes on to the dispatcher.
+    #[test]
+    fn the_follow_request_is_answered_in_the_loop() {
+        use nrr_shared::launcher_rpc::{encode_request_line, LauncherRpcRequest};
+        let dir = tempfile::tempdir().expect("temp dir");
+        let (mut writer, _shared) = writer_with_shared(&dir);
+        let line = |operation: &str, payload: Value| {
+            encode_request_line(&LauncherRpcRequest {
+                correlation_id: "c-9".to_string(),
+                operation: operation.to_string(),
+                payload,
+            })
+            .expect("line")
+        };
+
+        let follow = line("local.user-settings.follow", json!({ "since": "" }));
+        let answer = writer.answer_in_loop(&follow).expect("answered here");
+        assert_eq!(answer.correlation_id, "c-9");
+        assert!(answer.ok);
+        assert!(answer.payload.expect("payload").get("stamp").is_some());
+
+        let other = line(
+            "local.system-theme",
+            json!({ "note": "local.user-settings.follow" }),
+        );
+        assert!(writer.answer_in_loop(&other).is_none());
     }
 
     #[test]

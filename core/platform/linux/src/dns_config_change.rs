@@ -72,6 +72,12 @@ pub fn system_dirs() -> Vec<WatchedDir> {
             path: PathBuf::from("/run/resolvconf/interfaces"),
             names: None,
         },
+        // dhclient and a bare DHCP hook rewrite the file itself on every
+        // lease renewal; the guard puts the redirect back on this event.
+        WatchedDir {
+            path: PathBuf::from("/etc"),
+            names: Some(&["resolv.conf"]),
+        },
     ]
 }
 
@@ -322,6 +328,23 @@ mod tests {
     #[test]
     fn any_record_of_an_unfiltered_directory_counts() {
         assert!(is_relevant(&events(&event(2, 0x100, "tun0.inet")), filters));
+    }
+
+    /// dhclient rewrites `/etc/resolv.conf` itself on every lease renewal,
+    /// with no manager in between: unwatched, the redirect stayed lost until
+    /// the guard's next periodic check.
+    #[test]
+    fn a_lease_renewal_rewriting_etc_resolv_conf_is_a_change() {
+        let watched = system_dirs();
+        assert!(
+            watched
+                .iter()
+                .any(|dir| dir.path == std::path::Path::new("/etc")
+                    && dir
+                        .names
+                        .is_some_and(|names| names.contains(&"resolv.conf"))),
+            "{watched:?}"
+        );
     }
 
     #[test]

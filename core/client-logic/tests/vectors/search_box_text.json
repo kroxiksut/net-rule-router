@@ -1,0 +1,19 @@
+{
+  "description": "rules.js searchBoxText: what the rules list's search box keeps of the text that arrives; a URL with a scheme comes down to its host, anything else stays as typed",
+  "cases": [
+    { "name": "browser url", "input": { "text": "https://play.google.example/store/apps?id=1" }, "expected": "play.google.example" },
+    { "name": "www dropped", "input": { "text": "https://www.Site.example/" }, "expected": "site.example" },
+    { "name": "userinfo and port", "input": { "text": "http://user:pw@site.example:8443/x" }, "expected": "site.example" },
+    { "name": "unicode host", "input": { "text": "http://Пример.РФ/путь" }, "expected": "пример.рф" },
+    { "name": "no scheme keeps its path", "input": { "text": "site.example/page" }, "expected": "site.example/page" },
+    { "name": "subnet untouched", "input": { "text": "192.0.2.0/24" }, "expected": "192.0.2.0/24" },
+    { "name": "ipv6 untouched", "input": { "text": "2001:db8::/32" }, "expected": "2001:db8::/32" },
+    { "name": "host and port untouched", "input": { "text": "site.example:8080" }, "expected": "site.example:8080" },
+    { "name": "comment words untouched", "input": { "text": "Work Site" }, "expected": "Work Site" },
+    { "name": "scheme must start with a letter", "input": { "text": "1http://site.example/" }, "expected": "1http://site.example/" },
+    { "name": "underscore is no scheme", "input": { "text": "my_app://site.example/" }, "expected": "my_app://site.example/" },
+    { "name": "colon without slashes", "input": { "text": "mailto:user@site.example" }, "expected": "mailto:user@site.example" },
+    { "name": "scheme only", "input": { "text": "https://" }, "expected": "" },
+    { "name": "empty", "input": { "text": "" }, "expected": "" }
+  ]
+}

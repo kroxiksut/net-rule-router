@@ -168,6 +168,7 @@ Window {
     property bool _protectionSeeded: false
     property bool _protectionTouched: false
     property bool _stabilityTouched: false
+    property bool _fakeIpTouched: false
     property bool _serviceWritePending: false
     onServicePolicyKnownChanged: {
         _seedProtection()
@@ -191,22 +192,45 @@ Window {
             wantLeakProtection = _heldProtection.level
             wantDohLockdown = _heldProtection.doh
         }
+        if (_heldProtection) _seedFakeIp()
+    }
+
+    // A user already set up is shown the service's fake-IP, not the offer:
+    // the last value seen at once, then the service's own answer.
+    function _seedFakeIp() {
+        if (typeof root._readServiceMirror === "function") {
+            var mirror = root._readServiceMirror()["stability"] || {}
+            if (mirror["fake-ip-enabled"] !== undefined && !_fakeIpTouched)
+                wantFakeIp = mirror["fake-ip-enabled"] === true
+        }
+        var bridge = (typeof nrrNativeBridge !== "undefined") ? nrrNativeBridge : null
+        if (!root.serviceStabilitySupported || !root.bridgeAvailable || bridge === null
+                || typeof bridge.rpcServiceStabilityConfigGet !== "function")
+            return
+        var corr = bridge.rpcServiceStabilityConfigGet()
+        root.rpc.registerRpcCallback(corr, function(ok, payload) {
+            if (ok && payload && payload["fake-ip-enabled"] !== undefined && !_fakeIpTouched)
+                wantFakeIp = payload["fake-ip-enabled"] === true
+        })
     }
 
     function _writeServiceChoices() {
         _serviceWritePending = false
         var writes = Pure.firstRunWrites(_heldProtection, leakProtectionChoice, wantDohLockdown,
-            _stabilityTouched)
+            _stabilityTouched, _fakeIpTouched)
         if (writes.protection && root.routePolicyController) {
             root.routePolicyController.applyFirstRunProtections(leakProtectionChoice, wantDohLockdown)
         }
         if (!writes.stability) return
-        var patch = { "fake-ip-enabled": wantFakeIp }
+        var patch = {}
+        if (writes.fakeIp) patch["fake-ip-enabled"] = wantFakeIp
         if (wantDiagnosticLogs) {
             patch["verbose-logging-change"] = diagnosticLogsDuration
             patch["conn-trace-ndjson-change"] = diagnosticLogsDuration
             patch["conn-trace-gui"] = true
         }
+        // An empty write would still ask for an administrator.
+        if (Object.keys(patch).length === 0) return
         root.startupController.applyFirstRunStability(patch, "first-run")
     }
 
@@ -772,7 +796,7 @@ Window {
                     wrapMode: Text.WordWrap
                     color: root.mutedTextColor
                     visible: !firstRunWindow.secondaryAssigned && !firstRunWindow.secondaryDeferred
-                        && root.interfacesModel.count === 0
+                        && (root.interfacesModel.count === 0 || !root.interfacesAreLive)
                     text: root.tr("dialog.first-run-wizard.primary-adapter-unavailable",
                         "No connections to choose from yet — the background service reports them once it is running. You can set this later in Interfaces and routes.")
                 }
@@ -874,7 +898,7 @@ Window {
                     visible: root.serviceStabilitySupported && root.supports("fakeIp")
                     checked: firstRunWindow.wantFakeIp
                     text: root.tr("dialog.first-run-wizard.protection-fake-ip",
-                        "Route sites by name, so an address shared with another site is not dragged along")
+                        "Route sites by name, so an address shared with another site is not dragged along (uses a virtual network adapter; on Windows this loads its Wintun driver)")
                     contentItem: Label {
                         text: firstRunFakeIpCheck.text
                         leftPadding: firstRunFakeIpCheck.indicator.width + firstRunFakeIpCheck.spacing
@@ -883,7 +907,7 @@ Window {
                         verticalAlignment: Text.AlignVCenter
                     }
                     onToggled: {
-                        firstRunWindow._stabilityTouched = true
+                        firstRunWindow._fakeIpTouched = true
                         firstRunWindow.wantFakeIp = checked
                     }
                 }

@@ -137,7 +137,7 @@ Evaluation order, first match wins (a literal-IP Block vetoes every route on its
 6. Application
 7. Default route
 
-`core/domain/tests/priority_order_in_docs.rs` derives this order from the engine and holds README, quickstart and `rules-file-format` (EN/RU) to it.
+`core/domain/tests/priority_order_in_docs.rs` derives this order from the engine and holds README, quickstart, `rules-file-format` and `what-takes-priority` (EN/RU) to it.
 
 The same invariant settles application rules against address rules, and it is the address-ownership arbiter that enforces it: an address a rule names belongs to that rule, and an application keeps only the addresses nobody named.
 

@@ -1289,6 +1289,82 @@ fn fake_ip_scope_host_is_answered_with_the_virtual_address_and_skips_reconcile()
     assert_eq!(log.snapshot(), vec!["record"]);
 }
 
+/// A rule host every rule names only through a public top-level zone.
+struct PublicZoneOracle;
+impl RuleHostOracle for PublicZoneOracle {
+    fn is_rule_host(&self, _hostname: &str) -> bool {
+        true
+    }
+    fn held_only_by_public_zone(&self, _hostname: &str) -> bool {
+        true
+    }
+}
+
+fn fake_ip_for(host: &str) -> FakeFakeIp {
+    FakeFakeIp {
+        scope: vec![host.to_string()],
+        refuse: Vec::new(),
+        fake: ip(198, 18, 0, 5),
+    }
+}
+
+/// With fake-IP the relay would carry a stranger's `.ru` name to 10.x through
+/// the tunnel. Its private answer is handed back as is: no virtual address,
+/// nothing recorded for enforcement, no wait for a route that never comes.
+#[test]
+fn a_public_zone_name_answering_a_private_address_gets_no_virtual_address() {
+    let log = CallLog::default();
+    let out = handle_a_query(
+        "a1.attacker.ru",
+        aaaa_hold(),
+        &PublicZoneOracle,
+        &FakeUpstream {
+            answer: Ok(resolved(&[ip(10, 1, 2, 3)])),
+        },
+        &FakeSink(&log),
+        &FakeReconciler {
+            log: &log,
+            outcome: ReconcileOutcome::Installed,
+        },
+        &fake_ip_for("a1.attacker.ru"),
+        &OpenLeakGuard,
+        &NoEnforcement,
+    );
+    assert_eq!(
+        out,
+        QueryOutcome::Answer {
+            ips: vec![ip(10, 1, 2, 3)],
+            enforced: false,
+        }
+    );
+    assert!(log.snapshot().is_empty(), "{:?}", log.snapshot());
+
+    // Its public address is still the zone's to carry.
+    let out = handle_a_query(
+        "a1.attacker.ru",
+        aaaa_hold(),
+        &PublicZoneOracle,
+        &FakeUpstream {
+            answer: Ok(resolved(&[ip(10, 1, 2, 3), ip(30, 0, 0, 7)])),
+        },
+        &FakeSink(&log),
+        &FakeReconciler {
+            log: &log,
+            outcome: ReconcileOutcome::Installed,
+        },
+        &fake_ip_for("a1.attacker.ru"),
+        &OpenLeakGuard,
+        &NoEnforcement,
+    );
+    assert_eq!(
+        out,
+        QueryOutcome::Answer {
+            ips: vec![ip(198, 18, 0, 5)],
+            enforced: true,
+        }
+    );
+}
+
 #[test]
 fn a_rule_host_outside_fake_ip_scope_keeps_the_real_per_ip_path() {
     let log = CallLog::default();

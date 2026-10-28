@@ -200,3 +200,54 @@ fn an_unresolved_secondary_blocks_the_routed_app_itself() {
         "no destination-scoped block for the app-observed address here either"
     );
 }
+
+/// A Block in the baseline holds for each user who reads it, in that user's
+/// own filters: one without a user condition would also cut a user who
+/// diverged from the baseline and dropped or rerouted the rule, and only for
+/// as long as somebody on the baseline stays signed in.
+#[test]
+fn a_baseline_block_is_scoped_to_the_user_it_is_built_for() {
+    let blocked = Ipv4Addr::new(203, 0, 113, 66);
+    let api = Arc::new(MockWindowsApi::new());
+    let session = Arc::new(WfpSession::open(Arc::clone(&api) as Arc<dyn WindowsApiPort>).unwrap());
+    let source = Arc::new(ScriptedSource::default());
+    let rules = Arc::new(ScriptedRules::default());
+    let cache: Arc<dyn FqdnCacheLookup> = Arc::new(MockFqdnCacheLookup::new());
+    let audit = Arc::new(CollectAudit::default());
+    let orch = PerSidApplyOrchestrator::new(
+        session,
+        Arc::clone(&source) as Arc<dyn RoutePolicySource>,
+        Arc::clone(&rules) as Arc<dyn RulesProvider>,
+        cache,
+        Arc::clone(&audit) as Arc<dyn PerSidApplyAudit>,
+    );
+    rules.set(ActiveRulesSnapshot {
+        rule_book: CanonicalRuleBook {
+            primary: CanonicalRuleSet::from_rules(vec![CanonicalRule {
+                id: RuleId("r-block".into()),
+                enabled: true,
+                address_match: Some(CanonicalAddressMatch::ExactIp(IpAddr::V4(blocked))),
+                app_match: None,
+                comment: String::new(),
+                action: nrr_domain::RuleAction::Block,
+                origin: None,
+            }]),
+            secondary: CanonicalRuleSet::default(),
+        },
+    });
+    source.set("S-1-5-21-A", snap_block("Wi-Fi", "TAP"));
+    orch.install_for_sid("S-1-5-21-A").unwrap();
+
+    let live = api.wfp_filters.lock().unwrap().clone();
+    let blocks: Vec<_> = live
+        .iter()
+        .filter(|f| record_is_destination_block(f) && f.covers_v4(blocked))
+        .collect();
+    assert!(!blocks.is_empty(), "the baseline Block is enforced");
+    assert!(
+        blocks
+            .iter()
+            .all(|f| f.user_sid.as_deref() == Some("S-1-5-21-A")),
+        "a baseline Block reaches past its user: {blocks:?}"
+    );
+}

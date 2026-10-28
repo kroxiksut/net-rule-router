@@ -54,6 +54,8 @@ libc = "0.2"
 tempfile = "3"
 # `snapshot` tests round-trip `PlatformStateSnapshot` through JSON; OS-neutral.
 serde_json = "1"
+# `hosts_file` tests capture the warning an oversized hosts file logs.
+tracing-subscriber = { version = "0.3", default-features = false, features = ["registry"] }
 
 [features]
 # Opens private byte parsers to the fuzz targets under `fuzz/`; never set by a

@@ -52,7 +52,9 @@ Options:
 | `--help`, `--version` | Print the option list, or the version |
 
 Setting `NRR_TUI_PLAIN=1` selects line mode without typing `--plain` every
-time — convenient to put in your shell profile.
+time — convenient to put in your shell profile. Line mode, no colours and
+plain characters can also be switched on in Settings, Terminal; they are
+remembered for your account and take effect at the next start.
 
 On first start, if you have not set anything up yet, the first-run setup opens
 by itself.
@@ -61,16 +63,16 @@ by itself.
 
 | Key | Screen | What you do there |
 |-----|--------|-------------------|
-| `1` | Status | Whether the service is running and routing is active, limited or paused — in words; both routes and their adapters; the notification feed; pause and resume |
+| `1` | Status | Whether the service is running and routing is active, limited or paused — in words; both routes and their adapters; the notification feed, where each notice offers its own actions (see below) |
 | `2` | First run | Language, which adapter is primary and which additional, a rule set to start from, leak protection, routing sites by name, detailed diagnostic logs |
 | `3` | Interfaces and routes | Adapters with their type, state and addresses; which one carries which route; checking an adapter |
-| `4` | Rules | The rule table with search and filter; add, change, delete, switch on and off; mark a rule *not sure* to have it checked on the primary route first; your folder of rule sets; import and export; applying your changes. `c` checks whether the primary route reaches the sites of your additional-route rules, and the answer shows beside each rule, so you can see which rules still do real work; `Shift+O` lists the sites the primary route does not reach first. `v` adds a rule for a VPN's gateway, so a VPN that may connect only from one network (a work VPN allowed only from abroad, say) always connects through the route you choose: it asks for the program and the route, lists the addresses that program connected to lately, and takes a number or an address you type |
+| `4` | Rules | The rule table with search and filter; add, change, delete, switch on and off; mark a rule *Unsure — check where it works* to have it used on its own route while the site opens there, and sent over the other route, with an offer to move the rule, when only that one opens it; your folder of rule sets; import and export; applying your changes. `c` checks whether the primary route reaches the sites of your additional-route rules, and the answer shows beside each rule, so you can see which rules still do real work; `Shift+O` lists the sites the primary route does not reach first. `v` adds a rule for a VPN's gateway, so a VPN that may connect only from one network (a work VPN allowed only from abroad, say) always connects through the route you choose: it asks for the program and the route, lists the addresses that program connected to lately, and takes a number or an address you type |
 | `5` | Overlaps | Pairs of rules that cover the same traffic, and which route actually wins |
 | `6` | Suggested addresses | Accept or decline what the application suggests adding to your rules |
 | `7` | Connection trace | Recent connections and which route they took, with an explanation for any line. `o` opens the list of what was blocked while the additional route was down. `h` switches to your connection history — one line per program and destination, with how many times it connected — and `t` picks the period: the last hour, today or the last 7 days. `g` groups the list by program or by the folder a program lives in and remembers the choice; in a folder group `f` opens a rule for the whole folder. `i` and `a` open a rule for the chosen connection's address or program |
 | `8` | Cache | Names and the addresses they resolved to; search and clearing |
-| `9` | Diagnostics and logs | Service health, security alerts, the explanation for a host, the log, exporting the diagnostic archive |
-| `0` | Settings | Notifications, routing behaviour, service management, presets, logs and retention, and the other service-side settings the application has. In the menu, Settings opens into its sections, so the arrows take you straight to the one you need |
+| `9` | Diagnostics and logs | Service health, security alerts, the explanation for a host, the log, exporting the diagnostic archive. `c` checks a site that does not open (see below) |
+| `0` | Settings | Notifications and the notices you hid, routing behaviour (including turning your rules off for a while), what to do when applying fails, service management, presets, logs, retention and connection history, traffic statistics, updates, and the terminal interface's own options. In the menu, Settings opens into its sections, so the arrows take you straight to the one you need |
 
 Changes to rules are applied the same way as in the application: you first see
 a summary of what will be added, removed and changed, then confirm it.
@@ -109,6 +111,41 @@ a summary of what will be added, removed and changed, then confirm it.
   VirtualBox NAT adapter `a` sends all of that machine's traffic over the
   additional route, `f` lets it follow your rules again. `F` compares your
   linked rules files with the rules in force and merges them.
+- **Whole lists.** `X` saves one route's rules to a file, `L` adds the demo
+  rules, `W` clears all rules after asking, and `Z` goes back to the baseline
+  rules. `*` marks rules and `B` acts on all the marked ones at once.
+
+### Checking a site that does not open
+
+`c` on the Diagnostics screen asks for a site name and tells you whether the
+network or the site is at fault: for the site, its sign-in names and the names
+seen with it, which route each one takes and whether it answers there. The
+verdict says what to do next — the site answers and the browser needs its
+cookies cleared, the sign-in goes over a different route than the site, the
+route itself is not working, or your own rule denies the site. The same check
+is `c` on a line of the Connection trace and on a site notice in the feed, and
+`k` on a suggested address. Nothing is checked unless you ask.
+
+### Notifications
+
+The feed on the Status screen keeps every notice until you clear it. Among
+them: a site you opened does not open over the main connection, the main or
+the additional connection keeps dropping, the service stopped on its own (with
+the commands that start it again or restore the network), and connections
+held back while the additional route was down. On a notice, `m` stops
+showing ones like it — that kind of notice for a day, 7 days, 30 days or for
+good, or, for a blocked connection, that site, that program or every block
+notice — and `s` snoozes a blocked-connection notice. What you hid is listed,
+and can be shown again, in Settings, Notifications; it is hidden in the window
+and the tray too.
+
+### Turning your rules off for a while
+
+Settings, Routing behavior, *Apply rules* turns your routing and leak protection off
+for 15 minutes, an hour, 4 hours, until the computer or the service restarts,
+or until you turn them back on. When the time is up they come back on their
+own, a timed pause outlasts a restart of the service, and the other people
+signed in keep their rules.
 
 ## Keys
 
@@ -195,8 +232,7 @@ sudo loginctl enable-linger "$USER"
 
 Every signed-in user — at the seat or over SSH — is routed by their own rules
 at the same time; see [Several users on one computer](several-users.md).
-Background services follow the rules of the person at the seat, or of the
-first to sign in. A mode that routes the whole machine, containers included,
+Background services follow the rules of the user who signed in first. A mode that routes the whole machine, containers included,
 by one set of rules is planned for a later release.
 
 ## See also

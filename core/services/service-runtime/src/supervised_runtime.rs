@@ -896,7 +896,12 @@ pub fn run_supervised_runtime(
             // Shares the wake latch with the clock-gap watchdog: one wake, one re-arm.
             match crate::power_resume::PowerResumeRearm::start_deduped(
                 observer.as_ref(),
-                resume_hook(&supervisor, Arc::clone(hook), &deps.adapter_monitor),
+                resume_hook(
+                    &supervisor,
+                    Arc::clone(hook),
+                    &deps.adapter_monitor,
+                    deps.rebind_requests.clone(),
+                ),
                 crate::power_resume::RESUME_DEBOUNCE,
                 Some(Arc::clone(&liveness)),
                 deps.rebind_requests.clone(),
@@ -1249,17 +1254,22 @@ fn reviving(
     })
 }
 
-/// What a wake does, whichever source saw it: the adapter monitor re-reads at
-/// once — its state is from before the sleep, and the changes it finds reach
-/// the consumers of any other change — and the re-arm runs.
+/// What a wake does, whichever source saw it: the network readings cached
+/// before the sleep are dropped and the pass runs in full, the adapter monitor
+/// re-reads at once — its state is from before the sleep, and the changes it
+/// finds reach the consumers of any other change — and the re-arm runs.
 fn resume_hook(
     supervisor: &ServiceSupervisor,
     hook: Arc<dyn Fn() + Send + Sync>,
     monitor: &Arc<nrr_platform_api::AdapterMonitor>,
+    requests: Option<Arc<crate::power_resume::RebindRequests>>,
 ) -> Arc<dyn Fn() + Send + Sync> {
     let monitor = Arc::clone(monitor);
     let rearm = reviving(supervisor, hook);
     Arc::new(move || {
+        if let Some(requests) = &requests {
+            requests.refresh_for_wake();
+        }
         monitor.request_refresh();
         rearm();
     })
@@ -1329,10 +1339,16 @@ fn spawn_production_tasks(
         deps.route_recompute_hook.clone(),
         deps.rebind_requests.clone(),
     ) {
+        let on_wake = resume_hook(
+            supervisor,
+            Arc::clone(&hook),
+            &deps.adapter_monitor,
+            Some(Arc::clone(&requests)),
+        );
         if let Err(e) = supervisor.spawn(crate::power_resume::build_resume_watchdog_task(
             requests,
-            reviving(supervisor, Arc::clone(&hook)),
-            resume_hook(supervisor, hook, &deps.adapter_monitor),
+            reviving(supervisor, hook),
+            on_wake,
         )) {
             tracing::warn!(
                 target: "nrr::supervisor",

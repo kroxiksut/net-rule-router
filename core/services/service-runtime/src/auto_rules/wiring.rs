@@ -48,6 +48,7 @@ impl AutoRulesEngine {
             verify_runner: verify_primary::VerifyRunner::default(),
             site_not_opening: OnceLock::new(),
             main_link_blocked_parked: OnceLock::new(),
+            reverse_named: Mutex::new(crate::bounded_set::BoundedRecentSet::new(REVERSE_NAMED_CAP)),
         }
     }
 

@@ -1260,4 +1260,6 @@ fn relation_exists(conn: &Connection, kind: &str, name: &str) -> bool {
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
+mod released_databases;
+#[cfg(test)]
 mod tests;

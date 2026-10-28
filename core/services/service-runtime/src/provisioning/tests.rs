@@ -178,8 +178,10 @@ fn the_settings_reader_takes_the_exporters_own_output_and_ignores_its_adapters()
     let yaml = ProductionSettingsExporter::new(conn)
         .export_settings(
             "S-1-5-21-1",
-            Some("C:\\rules.txt"),
-            None,
+            &nrr_shared::ipc_payloads::SettingsExportFullRequest {
+                rules_file_path_primary: Some("C:\\rules.txt".to_owned()),
+                ..Default::default()
+            },
             "2026-10-17T00:00:00Z",
         )
         .expect("export")
@@ -213,7 +215,7 @@ fn the_settings_reader_refuses_what_it_does_not_understand() {
     for (text, code) in [
         ("version: 1\n", "not-a-settings-export"),
         (
-            "nrr_settings_export:\n  version: 2\n",
+            "nrr_settings_export:\n  version: 3\n",
             "unsupported-version",
         ),
         (
@@ -506,4 +508,327 @@ fn the_stage_verb_writes_only_what_it_checked() {
             .contains("block"));
     }
     let _ = good;
+}
+
+// ── the full settings export carries the rules ───────────────────────────────
+
+const RICH_PRIMARY: &str = "# NetRuleRouter rules file\n\
+--- Zones\n\
+corp-internal  # internal zone\n\
+\n\
+--- Domains\n\
+updates.example.org    # vendor updates\n\
+# old.example.com    # disabled\n\
+?accounts.example.com  # main route while it opens there\n\
+\n\
+--- IP\n\
+203.0.113.7\n\
+\n\
+--- CIDR\n\
+10.0.0.0/8  # corporate\n\
+\n\
+--- Ranges\n\
+192.0.2.10-192.0.2.40\n\
+\n\
+--- Windows\n\
+browser.exe  # browser\n\
+C:\\Tools\\Sync\\*\n\
+# powershell.exe\n\
+\n\
+--- Linux\n\
+other-browser\n\
+/opt/tools/*\n";
+
+const RICH_SECONDARY: &str = "--- Domains\n\
+*.streaming.example.com  # always through the tunnel\n\
+!telemetry.example.net  # never leaves this computer\n";
+
+/// The rules a book applies, without the ids an import assigns afresh.
+fn rules_without_ids(
+    book: &nrr_domain::canonical::CanonicalRuleBook,
+) -> (
+    Vec<nrr_domain::canonical::CanonicalRule>,
+    Vec<nrr_domain::canonical::CanonicalRule>,
+) {
+    let strip = |set: &nrr_domain::canonical::CanonicalRuleSet| {
+        set.rules()
+            .iter()
+            .cloned()
+            .map(|mut rule| {
+                rule.id = nrr_domain::RuleId(String::new());
+                rule
+            })
+            .collect::<Vec<_>>()
+    };
+    (strip(&book.primary), strip(&book.secondary))
+}
+
+fn export_of(conn: &Arc<Mutex<Connection>>, sid: &str) -> String {
+    export_with(conn, sid, &Default::default())
+}
+
+fn export_with(
+    conn: &Arc<Mutex<Connection>>,
+    sid: &str,
+    client: &nrr_shared::ipc_payloads::SettingsExportFullRequest,
+) -> String {
+    use crate::production_settings_exporter::{ProductionSettingsExporter, SettingsExportSource};
+    ProductionSettingsExporter::new(Arc::clone(conn))
+        .export_settings(sid, client, "2026-10-26T00:00:00Z")
+        .expect("export")
+        .yaml_bytes_utf8
+}
+
+/// A section no build of ours applies here: another system's programs.
+fn foreign_app_section() -> &'static str {
+    if HostPlatform::compiled() == HostPlatform::MacOS {
+        "Linux"
+    } else {
+        "MacOS"
+    }
+}
+
+/// Another system's programs ride along in the export, verbatim, so a restore
+/// from it keeps them; the install takes them as it takes them from a rules
+/// file, and none of them is applied here.
+#[test]
+fn a_full_export_keeps_the_sections_this_system_does_not_apply() {
+    let source = Fixture::new();
+    source.stage(&bundle(Some(GOOD_PRIMARY), Some(GOOD_SECONDARY)));
+    assert!(matches!(
+        source.apply(),
+        ProvisionApplyOutcome::Applied { rules: true, .. }
+    ));
+    let user = "S-1-5-21-1000-2000-3000-1001";
+    let foreign = foreign_app_section();
+    let client = nrr_shared::ipc_payloads::SettingsExportFullRequest {
+        passthrough_sections_primary: [(
+            foreign.to_owned(),
+            "Other Browser  # their browser\n# Old Tool\n".to_owned(),
+        )]
+        .into(),
+        // A section this build applies is the service's own to write: a copy
+        // from the caller would turn into applied rules on install.
+        passthrough_sections_secondary: [
+            ("Domains".to_owned(), "injected.example\n".to_owned()),
+            (
+                foreign.to_owned(),
+                "Tool\n--- Domains\nsmuggled.example\n".to_owned(),
+            ),
+        ]
+        .into(),
+        ..Default::default()
+    };
+    let yaml = export_with(&source.conn, user, &client);
+    let facts = read_settings_export(yaml.as_bytes()).expect("read");
+    let primary = facts.rules_primary.as_deref().expect("primary rules");
+    assert!(
+        primary.contains(&format!(
+            "--- {foreign}\nOther Browser  # their browser\n# Old Tool\n"
+        )),
+        "{yaml}"
+    );
+    assert!(primary.contains("primary.example"), "{yaml}");
+    assert!(!yaml.contains("injected.example"), "{yaml}");
+    assert!(!yaml.contains("smuggled.example"), "{yaml}");
+
+    let in_force = source.enforced_for(user).expect("rules in force");
+    let target = Fixture::new();
+    target.stage(&BundleBytes {
+        settings: Some(yaml.clone().into_bytes()),
+        ..BundleBytes::default()
+    });
+    assert!(matches!(
+        target.apply(),
+        ProvisionApplyOutcome::Applied { rules: true, .. }
+    ));
+    let installed = target
+        .enforced_for(nrr_storage::BASELINE_PRINCIPAL)
+        .expect("installed rules");
+    assert_eq!(
+        rules_without_ids(&installed),
+        rules_without_ids(&in_force),
+        "nothing of another system is applied: {yaml}"
+    );
+}
+
+/// No rules in force, but the bound file holds another system's programs: the
+/// export still carries them.
+#[test]
+fn foreign_sections_travel_without_rules_in_force() {
+    let foreign = foreign_app_section();
+    let client = nrr_shared::ipc_payloads::SettingsExportFullRequest {
+        passthrough_sections_primary: [(foreign.to_owned(), "Other Browser\n".to_owned())].into(),
+        ..Default::default()
+    };
+    let yaml = export_with(&state_conn(), "S-1-5-21-1", &client);
+    let facts = read_settings_export(yaml.as_bytes()).expect("read");
+    assert_eq!(
+        facts.rules_primary.as_deref(),
+        Some(format!("--- {foreign}\nOther Browser\n").as_str()),
+        "{yaml}"
+    );
+    assert_eq!(facts.rules_secondary, None);
+}
+
+/// A user's full settings export, handed to an unattended install on another
+/// computer, brings that user's rules of both routes with it.
+#[test]
+fn a_full_export_installs_the_same_rules_it_was_taken_from() {
+    let source = Fixture::new();
+    source.stage(&bundle(
+        Some(RICH_PRIMARY.as_bytes()),
+        Some(RICH_SECONDARY.as_bytes()),
+    ));
+    assert!(matches!(
+        source.apply(),
+        ProvisionApplyOutcome::Applied { rules: true, .. }
+    ));
+    // A user who never edited holds the baseline: that is what they export.
+    let user = "S-1-5-21-1000-2000-3000-1001";
+    let in_force = source.enforced_for(user).expect("rules in force");
+    let stored_before = source.rules_of(nrr_storage::BASELINE_PRINCIPAL);
+    // The service holds no free comments and no other system's section (the
+    // clients keep those in the bound files), so neither travels.
+    let yaml = export_of(&source.conn, user);
+    assert_eq!(source.rules_of(user), None, "an export writes nothing");
+    assert_eq!(
+        source.rules_of(nrr_storage::BASELINE_PRINCIPAL),
+        stored_before
+    );
+
+    let target = Fixture::new();
+    target.stage(&BundleBytes {
+        settings: Some(yaml.clone().into_bytes()),
+        ..BundleBytes::default()
+    });
+    assert!(
+        matches!(
+            target.apply(),
+            ProvisionApplyOutcome::Applied { rules: true, .. }
+        ),
+        "{yaml}"
+    );
+    let installed = target
+        .enforced_for(nrr_storage::BASELINE_PRINCIPAL)
+        .expect("installed rules");
+    assert_eq!(
+        rules_without_ids(&installed),
+        rules_without_ids(&in_force),
+        "{yaml}"
+    );
+    assert_eq!(
+        target.rules_of(nrr_storage::BASELINE_PRINCIPAL),
+        stored_before,
+        "rules kept aside travel too: {yaml}"
+    );
+}
+
+/// No rules anywhere is an export with an empty rules section, not a failure.
+#[test]
+fn a_user_with_no_rules_exports_an_empty_rules_section() {
+    let yaml = export_of(&state_conn(), "S-1-5-21-1");
+    assert!(
+        yaml.contains("  rules:\n    primary: \"\"\n    secondary: \"\"\n"),
+        "{yaml}"
+    );
+    let facts = read_settings_export(yaml.as_bytes()).expect("read");
+    assert_eq!(facts.rules_primary, None);
+    assert_eq!(facts.rules_secondary, None);
+}
+
+/// A route given rules twice is the administrator's choice to make, not one
+/// the service makes by dropping either copy.
+#[test]
+fn a_route_with_a_rules_file_and_rules_in_the_export_is_refused() {
+    let settings = "nrr_settings_export:\n  version: 2\n  rules:\n    primary: |\n      --- Domains\n      from-export.example\n";
+    let refusal = check_bundle(
+        &BundleBytes {
+            primary: Some(GOOD_PRIMARY.to_vec()),
+            settings: Some(settings.as_bytes().to_vec()),
+            ..BundleBytes::default()
+        },
+        HostPlatform::compiled(),
+    )
+    .expect_err("twice");
+    assert_eq!(
+        (refusal.part, refusal.code.as_str()),
+        (ProvisionPart::Settings, "rules-given-twice")
+    );
+    // The other route's file and the export's primary rules sit side by side.
+    let checked = check_bundle(
+        &BundleBytes {
+            secondary: Some(GOOD_SECONDARY.to_vec()),
+            settings: Some(settings.as_bytes().to_vec()),
+            ..BundleBytes::default()
+        },
+        HostPlatform::compiled(),
+    )
+    .expect("one copy per route");
+    assert!(checked.primary.is_some() && checked.secondary.is_some());
+}
+
+/// The embedded rules are hostile bytes like a rules file: refused rules name
+/// the settings file, and a block never grows past the import limit.
+#[test]
+fn rules_in_a_settings_file_meet_the_rules_file_gates() {
+    let broken = "nrr_settings_export:\n  version: 2\n  rules:\n    secondary: |\n      --- Domains\n      bad\u{7}name.example\n";
+    let refusal = check_bundle(
+        &BundleBytes {
+            settings: Some(broken.as_bytes().to_vec()),
+            ..BundleBytes::default()
+        },
+        HostPlatform::compiled(),
+    )
+    .expect_err("control character");
+    assert_eq!(refusal.part, ProvisionPart::Settings, "{refusal}");
+
+    let line = "      a.example\n";
+    let mut huge = String::from(
+        "nrr_settings_export:\n  version: 2\n  rules:\n    primary: |\n      --- Domains\n",
+    );
+    // The block counts what is left once its indentation is taken off.
+    while huge.len() < 2 * RULES_MAX_BYTES {
+        huge.push_str(line);
+    }
+    assert_eq!(
+        read_settings_export(huge.as_bytes()).err().map(|e| e.0),
+        Some("rules-too-large")
+    );
+}
+
+/// Version 1 never carried rules: a version-1 file with them is not ours.
+#[test]
+fn rules_belong_to_version_2_and_version_1_reads_as_before() {
+    let v1_with_rules = "nrr_settings_export:\n  version: 1\n  rules:\n    primary: |\n      --- Domains\n      a.example\n";
+    assert_eq!(
+        read_settings_export(v1_with_rules.as_bytes())
+            .err()
+            .map(|e| e.0),
+        Some("rules-need-version-2")
+    );
+    let v2 = "nrr_settings_export:\n  version: 2\n  rules:\n    primary: |\n      --- Domains\n      a.example  # kept\n\n      # disabled.example\n    secondary: \"\"\n  behavior:\n    route_mode: \"prefer-primary\"\n";
+    let facts = read_settings_export(v2.as_bytes()).expect("read");
+    assert_eq!(
+        facts.rules_primary.as_deref(),
+        Some("--- Domains\na.example  # kept\n\n# disabled.example\n")
+    );
+    assert_eq!(facts.rules_secondary, None);
+    assert_eq!(facts.route_mode, Some(BehaviorMode::PreferPrimary));
+    for (text, code) in [
+        (
+            "nrr_settings_export:\n  version: 2\n  rules:\n    primary: \"a.example\"\n",
+            "rules-not-a-block",
+        ),
+        (
+            "nrr_settings_export:\n  version: 2\n  rules:\n    primary: |\n        --- Domains\n      a.example\n",
+            "bad-block-indentation",
+        ),
+    ] {
+        assert_eq!(
+            read_settings_export(text.as_bytes()).err().map(|e| e.0),
+            Some(code),
+            "{text}"
+        );
+    }
 }

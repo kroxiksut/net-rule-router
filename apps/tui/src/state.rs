@@ -354,6 +354,8 @@ impl AppState {
                     crate::block_backlog::drain(self);
                     crate::local_network_offer::check(self);
                     crate::app_groups_offer::check(self);
+                    crate::screens::inspect::diagnostics::on_reconnected(self);
+                    crate::screens::inspect::cache::on_reconnected(self);
                     crate::screens::screen(self.screen).on_show(self);
                 }
                 loss

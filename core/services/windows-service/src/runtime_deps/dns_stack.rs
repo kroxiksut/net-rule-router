@@ -479,7 +479,10 @@ pub(super) fn build_hosts_bypass_resolver(
         bypass_enabled,
         upstream,
         Duration::from_millis(1500),
-    );
+    )
+    .with_hosts(Arc::new(
+        nrr_platform_api::hosts_file::OsHostsFileReader::new(),
+    ));
     if let Some(policy) = egress.clone() {
         resolver = resolver.with_egress(policy);
     }

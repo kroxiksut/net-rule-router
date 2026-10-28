@@ -7,9 +7,10 @@
 //! empty list. These tests pin both ends: the QML takes the service's number,
 //! and the list's default filter hides exactly the rows the service leaves out.
 
-use std::io::Write;
+#[path = "support/js.rs"]
+mod js;
+
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
 
 use nrr_shared::ipc_payloads::{
     AutoRuleCandidateDto, AutoRuleCandidatesListResponse, AutoRuleConsumerDto,
@@ -120,8 +121,7 @@ fn the_window_notices_only_news_and_never_an_empty_inbox() {
     );
 }
 
-/// Executable half, through the real `pure.js`. Skipped when no `node` is on
-/// PATH — the structural test above stays the unconditional guard.
+/// Executable half, through the real `pure.js`.
 #[test]
 fn the_default_list_shows_exactly_the_rows_the_service_counts() {
     let candidates = vec![
@@ -152,10 +152,7 @@ fn the_default_list_shows_exactly_the_rows_the_service_counts() {
         candidates = serde_json::to_string(&candidates)
             .unwrap_or_else(|e| panic!("candidates serialise: {e}")),
     );
-    let Some(output) = run_node(&harness) else {
-        eprintln!("node not available — skipping the executable list check");
-        return;
-    };
+    let output = js::run_js(&harness);
     let shown: usize = output
         .trim()
         .parse()
@@ -227,10 +224,7 @@ fn the_caption_and_the_popup_leave_out_what_the_list_hides() {
         candidates = serde_json::to_string(&candidates)
             .unwrap_or_else(|e| panic!("candidates serialise: {e}")),
     );
-    let Some(output) = run_node(&harness) else {
-        eprintln!("node not available — skipping the executable caption check");
-        return;
-    };
+    let output = js::run_js(&harness);
     let got: serde_json::Value = serde_json::from_str(output.trim())
         .unwrap_or_else(|e| panic!("harness printed JSON: {e}; output: {output}"));
     assert_eq!(got["ids"], 1, "the hidden host's id leaves with the host");
@@ -275,10 +269,7 @@ fn a_groups_actions_carry_only_the_hosts_the_list_shows() {
         candidates = serde_json::to_string(&candidates)
             .unwrap_or_else(|e| panic!("candidates serialise: {e}")),
     );
-    let Some(output) = run_node(&harness) else {
-        eprintln!("node not available — skipping the executable group-actions check");
-        return;
-    };
+    let output = js::run_js(&harness);
     let got: serde_json::Value = serde_json::from_str(output.trim())
         .unwrap_or_else(|e| panic!("harness printed JSON: {e}; output: {output}"));
     assert_eq!(
@@ -299,32 +290,4 @@ fn a_groups_actions_carry_only_the_hosts_the_list_shows() {
         serde_json::json!({ "pending": ["arc-1", "arc-2"], "dismissed": ["arc-5"] }),
         "with the toggle on, the served host is shown and acted on again"
     );
-}
-
-/// Feed a program to `node` on stdin. `None` when node is not installed.
-fn run_node(program: &str) -> Option<String> {
-    let mut child = Command::new("node")
-        .arg("-")
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .unwrap_or_else(|e| {
-            panic!("this check runs the QML JavaScript through node; install Node.js ({e})")
-        });
-    let Some(stdin) = child.stdin.as_mut() else {
-        panic!("stdin was piped")
-    };
-    stdin
-        .write_all(program.as_bytes())
-        .unwrap_or_else(|e| panic!("write the harness to node: {e}"));
-    let out = child
-        .wait_with_output()
-        .unwrap_or_else(|e| panic!("node runs to completion: {e}"));
-    assert!(
-        out.status.success(),
-        "node rejected the harness: {}",
-        String::from_utf8_lossy(&out.stderr)
-    );
-    Some(String::from_utf8_lossy(&out.stdout).into_owned())
 }

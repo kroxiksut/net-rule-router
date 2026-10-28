@@ -7,6 +7,7 @@ use nrr_platform_api::app_group_discovery::AppDiscoverySource;
 
 use super::*;
 use crate::link::Link;
+use crate::screens::settings::prefs;
 use crate::screens::suggestions::tests::drain;
 use crate::testing::{app_at, texts_en, FakeService, Fixture, Scratch};
 

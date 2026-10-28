@@ -63,6 +63,12 @@ pub(crate) fn is_doh_canary(hostname: &str) -> bool {
 /// matches no secondary rule takes the fail-open path.
 pub trait RuleHostOracle: Send + Sync {
     fn is_rule_host(&self, hostname: &str) -> bool;
+
+    /// Whether every rule naming `hostname` is a public top-level zone, so its
+    /// private addresses stay out of the tunnel (`nrr_domain::public_zone`).
+    fn held_only_by_public_zone(&self, _hostname: &str) -> bool {
+        false
+    }
 }
 
 /// Is the leak guard currently BLOCKING because the additional link could not

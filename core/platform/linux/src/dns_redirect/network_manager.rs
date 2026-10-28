@@ -11,7 +11,7 @@ use std::net::{Ipv4Addr, SocketAddr};
 use std::time::{Duration, Instant};
 
 use nrr_platform_api::dns::{
-    once_per_link, once_per_server, SystemDnsServersPort, UpstreamDnsCandidate,
+    once_per_link, once_per_server, SystemDnsServersPort, UpstreamDnsCandidate, UpstreamDnsServer,
 };
 use nrr_platform_api::dns_redirect::{RedirectHandle, RedirectState, SystemDnsRedirectPort};
 use nrr_platform_api::dns_scope::{InterfaceDnsScope, InterfaceDnsScopePort};
@@ -44,9 +44,14 @@ pub struct NmDevice {
     pub name: String,
     pub dns: Vec<Ipv4Addr>,
     pub domains: Vec<String>,
+    pub dns6: Vec<std::net::Ipv6Addr>,
 }
 
-/// Parse `nmcli -t -f GENERAL.DEVICE,IP4.DNS,IP4.DOMAIN device show`.
+/// The `nmcli` fields [`parse_nmcli_devices`] reads.
+const DEVICE_FIELDS: &str = "GENERAL.DEVICE,IP4.DNS,IP4.DOMAIN,IP6.DNS";
+
+/// Parse `nmcli -t -f` [`DEVICE_FIELDS`] `device show`. Terse output escapes
+/// the colons inside a value, an IPv6 address's included.
 pub fn parse_nmcli_devices(text: &str) -> Vec<NmDevice> {
     let mut out: Vec<NmDevice> = Vec::new();
     for line in text.lines() {
@@ -68,6 +73,10 @@ pub fn parse_nmcli_devices(text: &str) -> Vec<NmDevice> {
             if let Ok(ip) = value.parse() {
                 device.dns.push(ip);
             }
+        } else if key.starts_with("IP6.DNS") {
+            if let Ok(ip) = value.replace("\\:", ":").parse() {
+                device.dns6.push(ip);
+            }
         } else if key.starts_with("IP4.DOMAIN") {
             let suffix = value.trim_matches('.').to_ascii_lowercase();
             if !suffix.is_empty() {
@@ -80,16 +89,7 @@ pub fn parse_nmcli_devices(text: &str) -> Vec<NmDevice> {
 
 fn devices(commands: &dyn DnsCommands) -> Vec<NmDevice> {
     commands
-        .run(
-            "nmcli",
-            &[
-                "-t",
-                "-f",
-                "GENERAL.DEVICE,IP4.DNS,IP4.DOMAIN",
-                "device",
-                "show",
-            ],
-        )
+        .run("nmcli", &["-t", "-f", DEVICE_FIELDS, "device", "show"])
         .ok()
         .filter(|r| r.success)
         .map(|r| parse_nmcli_devices(&r.stdout))
@@ -259,6 +259,25 @@ impl<C: DnsCommands> NetworkManagerDnsServers<C> {
     }
 }
 
+impl<C: DnsCommands> NetworkManagerDnsServers<C> {
+    fn per_link_v6(&self) -> Vec<UpstreamDnsServer> {
+        devices(&self.0)
+            .into_iter()
+            .flat_map(|device| {
+                let index = super::link_index(&device.name);
+                device
+                    .dns6
+                    .into_iter()
+                    .filter(|server| super::forwardable_v6(*server))
+                    .map(move |server| UpstreamDnsServer {
+                        interface_index: index,
+                        server: std::net::IpAddr::V6(server),
+                    })
+            })
+            .collect()
+    }
+}
+
 impl<C: DnsCommands> SystemDnsServersPort for NetworkManagerDnsServers<C> {
     fn upstream_candidates_v4(&self) -> Vec<UpstreamDnsCandidate> {
         once_per_server(self.per_link_pairs(), |c| c.server)
@@ -266,6 +285,14 @@ impl<C: DnsCommands> SystemDnsServersPort for NetworkManagerDnsServers<C> {
 
     fn upstream_candidates_v4_per_link(&self) -> Vec<UpstreamDnsCandidate> {
         once_per_link(self.per_link_pairs())
+    }
+
+    fn upstream_candidates_v6(&self) -> Vec<UpstreamDnsServer> {
+        once_per_server(self.per_link_v6(), |s| s.server)
+    }
+
+    fn upstream_candidates_v6_per_link(&self) -> Vec<UpstreamDnsServer> {
+        once_per_link(self.per_link_v6())
     }
 }
 
@@ -277,7 +304,9 @@ impl<C: DnsCommands> InterfaceDnsScopePort for NetworkManagerDnsScopes<C> {
         devices(&self.0)
             .into_iter()
             .flat_map(|device| {
-                let NmDevice { name, dns, domains } = device;
+                let NmDevice {
+                    name, dns, domains, ..
+                } = device;
                 domains.into_iter().map(move |suffix| InterfaceDnsScope {
                     adapter_id: name.clone(),
                     display_name: name.clone(),

@@ -15,11 +15,12 @@
 //!   - Unix: `/etc/hosts`.
 //! - **One shared parser** ([`parse_hosts_map`]) builds a
 //!   `HashMap<hostname, HostsPin>` where `blocking` is set when the IP is
-//!   loopback (`127.0.0.0/8`) or unspecified (`0.0.0.0`).
+//!   loopback or unspecified, of either family.
 //! - **mtime-gated cache**: [`OsHostsFileReader`] re-reads and re-parses
 //!   only when the file's modified-time changes, so a rules-list call over
 //!   a huge ad-block `hosts` file does not re-parse on every request.
-//! - A missing / unreadable file yields an **empty map** — never an error.
+//! - A missing / unreadable / oversized file yields an **empty map** — never
+//!   an error.
 //!
 //! This module is fully OS-neutral — only [`default_hosts_path`]
 //! is `cfg`-gated, and even there the `cfg` only picks a path *string* (no
@@ -29,29 +30,40 @@
 //! are unaffected).
 
 use std::collections::HashMap;
-use std::net::Ipv4Addr;
-use std::path::PathBuf;
+use std::net::IpAddr;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::SystemTime;
 
 /// One resolved `hosts`-file pin for a hostname.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct HostsPin {
-    /// The IPv4 address the `hosts` file maps the hostname to.
-    pub ip: Ipv4Addr,
-    /// `true` when the address is loopback (`127.0.0.0/8`) or the
-    /// unspecified address (`0.0.0.0`) — the ad-block "black-hole"
-    /// convention (the hostname is effectively blocked). `false` for a
-    /// real redirect target.
+    /// The first address the `hosts` file maps the hostname to.
+    pub ip: IpAddr,
+    /// `true` when that address is loopback or unspecified — the ad-block
+    /// "black-hole" convention (the hostname is effectively blocked). `false`
+    /// for a real redirect target.
     pub blocking: bool,
+    /// The first address of the other family, when the file names one too:
+    /// the OS answers each family from its own line.
+    pub other: Option<IpAddr>,
 }
 
 impl HostsPin {
-    fn from_ip(ip: Ipv4Addr) -> Self {
+    fn from_ip(ip: IpAddr) -> Self {
         Self {
             blocking: ip.is_loopback() || ip.is_unspecified(),
             ip,
+            other: None,
         }
+    }
+
+    /// The address the OS hands out for the name in one family.
+    pub fn address_of(&self, ipv6: bool) -> Option<IpAddr> {
+        [Some(self.ip), self.other]
+            .into_iter()
+            .flatten()
+            .find(|a| a.is_ipv6() == ipv6)
     }
 }
 
@@ -59,8 +71,8 @@ impl HostsPin {
 pub trait HostsFileReader: Send + Sync {
     /// Return the current `hostname → pin` map. Implementations may cache
     /// and only re-read the underlying file when it changes. Hostnames are
-    /// lowercased with any trailing dot stripped. A missing or unreadable
-    /// file yields an empty map.
+    /// lowercased with any trailing dot stripped. A missing, unreadable or
+    /// oversized file yields an empty map.
     fn snapshot(&self) -> Arc<HashMap<String, HostsPin>>;
 
     /// Convenience exact-name lookup. `hostname` is normalized (trimmed,
@@ -91,11 +103,19 @@ pub fn normalize_hostname(hostname: &str) -> String {
 /// Rules (shared across OSes):
 /// - `#` starts a comment; everything to the end of the line is ignored.
 /// - Blank / whitespace-only lines are skipped.
-/// - The first whitespace-delimited token is the address; it must parse as
-///   IPv4 (IPv6 and any other lines are ignored for the Free tier).
+/// - The first whitespace-delimited token is the address, of either family;
+///   a line whose address does not parse is ignored.
 /// - Every remaining token is a hostname alias mapped to that address.
-/// - First entry wins on a duplicate hostname (matches resolver order).
+/// - First entry wins on a duplicate hostname, per family (matches resolver
+///   order).
+/// - At most [`MAX_HOSTS_ENTRIES`] names are kept: the first ones.
 pub fn parse_hosts_map(contents: &str) -> HashMap<String, HostsPin> {
+    parse_hosts_map_capped(contents, MAX_HOSTS_ENTRIES).0
+}
+
+/// [`parse_hosts_map`] with the cap as a parameter; `true` when names past it
+/// were dropped.
+fn parse_hosts_map_capped(contents: &str, cap: usize) -> (HashMap<String, HostsPin>, bool) {
     let mut map: HashMap<String, HostsPin> = HashMap::new();
     for raw_line in contents.lines() {
         // Strip inline comments (`10.0.0.1 host # note`).
@@ -110,20 +130,33 @@ pub fn parse_hosts_map(contents: &str) -> HashMap<String, HostsPin> {
         let Some(ip_token) = tokens.next() else {
             continue;
         };
-        // IPv6 (and any non-IPv4) address lines are ignored.
-        let Ok(ip) = ip_token.parse::<Ipv4Addr>() else {
+        // A scoped (`fe80::1%lo0`) or malformed address is no pin.
+        let Ok(ip) = ip_token.parse::<IpAddr>() else {
             continue;
         };
-        let pin = HostsPin::from_ip(ip);
         for alias in tokens {
             let host = normalize_hostname(alias);
             if host.is_empty() {
                 continue;
             }
-            map.entry(host).or_insert(pin);
+            if map.len() >= cap && !map.contains_key(&host) {
+                return (map, true);
+            }
+            // First line wins per family, as the resolver reads the file.
+            match map.entry(host) {
+                std::collections::hash_map::Entry::Vacant(slot) => {
+                    slot.insert(HostsPin::from_ip(ip));
+                }
+                std::collections::hash_map::Entry::Occupied(mut slot) => {
+                    let pin = slot.get_mut();
+                    if pin.address_of(ip.is_ipv6()).is_none() {
+                        pin.other = Some(ip);
+                    }
+                }
+            }
         }
     }
-    map
+    (map, false)
 }
 
 /// Resolve the OS `hosts`-file path for the current platform.
@@ -148,6 +181,69 @@ pub fn default_hosts_path() -> PathBuf {
     #[cfg(not(any(windows, unix)))]
     {
         PathBuf::from("hosts")
+    }
+}
+
+/// Larger than this, the hosts file is a block list: entries by definition.
+const HAS_ENTRIES_READ_LIMIT: u64 = 4 * 1024 * 1024;
+
+/// The largest published ad-block hosts lists stay under 32 MiB; a larger file
+/// is read as no overrides rather than held in the service's memory.
+const SERVICE_READ_LIMIT: u64 = 32 * 1024 * 1024;
+
+/// About what a 32 MiB list holds at one name per line; first names win.
+const MAX_HOSTS_ENTRIES: usize = 1_000_000;
+
+#[cfg(feature = "fuzzing")]
+#[doc(hidden)]
+pub mod fuzzing {
+    pub const HAS_ENTRIES_READ_LIMIT: u64 = super::HAS_ENTRIES_READ_LIMIT;
+    pub const SERVICE_READ_LIMIT: u64 = super::SERVICE_READ_LIMIT;
+}
+
+/// Whether the hosts file at `path` holds a real mapping, for the clients that
+/// hide the hosts settings over a stock file. Other programs write it, so it
+/// is read through one handle and never past the bound. Unreadable, oversized
+/// or not UTF-8 answers `true`: hiding a live setting is worse than showing an
+/// idle one.
+pub fn hosts_file_has_entries(path: &Path) -> bool {
+    match read_bounded(path, HAS_ENTRIES_READ_LIMIT) {
+        BoundedRead::Text(content) => {
+            nrr_shared::platform_profile::hosts_content_has_entries(&content)
+        }
+        BoundedRead::TooLarge(_) | BoundedRead::Unreadable => true,
+    }
+}
+
+enum BoundedRead {
+    Text(String),
+    /// At least this many bytes, more than the bound.
+    TooLarge(u64),
+    /// Missing, unreadable or not UTF-8.
+    Unreadable,
+}
+
+/// Reads `path` whole through one handle, never more than `limit + 1` bytes:
+/// other programs write the hosts file and may grow it while it is read.
+fn read_bounded(path: &Path, limit: u64) -> BoundedRead {
+    use std::io::Read;
+    let Ok(file) = std::fs::File::open(path) else {
+        return BoundedRead::Unreadable;
+    };
+    match file.metadata() {
+        Ok(meta) if meta.len() > limit => return BoundedRead::TooLarge(meta.len()),
+        Ok(_) => {}
+        Err(_) => return BoundedRead::Unreadable,
+    }
+    let mut bytes = Vec::new();
+    match file.take(limit.saturating_add(1)).read_to_end(&mut bytes) {
+        Ok(read) if read as u64 > limit => return BoundedRead::TooLarge(read as u64),
+        Ok(_) => {}
+        Err(_) => return BoundedRead::Unreadable,
+    }
+    match String::from_utf8(bytes) {
+        Ok(text) => BoundedRead::Text(text),
+        Err(_) => BoundedRead::Unreadable,
     }
 }
 
@@ -216,10 +312,29 @@ impl HostsFileReader for OsHostsFileReader {
         if slot.loaded && slot.mtime == current {
             return Arc::clone(&slot.map);
         }
-        let map = match std::fs::read_to_string(&self.path) {
-            Ok(text) => parse_hosts_map(&text),
-            // Missing / unreadable file → empty map, no error surfaced.
-            Err(_) => HashMap::new(),
+        // Read once per mtime, so each warning below is logged once per edit.
+        let map = match read_bounded(&self.path, SERVICE_READ_LIMIT) {
+            BoundedRead::Text(text) => {
+                let (map, capped) = parse_hosts_map_capped(&text, MAX_HOSTS_ENTRIES);
+                if capped {
+                    tracing::warn!(
+                        msg_key = "hosts-file-entries-capped",
+                        kept = map.len(),
+                        "hosts file has more names than are kept; the rest are ignored"
+                    );
+                }
+                map
+            }
+            BoundedRead::TooLarge(bytes) => {
+                tracing::warn!(
+                    msg_key = "hosts-file-too-large",
+                    bytes,
+                    cap = SERVICE_READ_LIMIT,
+                    "hosts file is larger than the read limit; it is not read"
+                );
+                HashMap::new()
+            }
+            BoundedRead::Unreadable => HashMap::new(),
         };
         let shared = Arc::new(map);
         slot.mtime = current;
@@ -240,16 +355,22 @@ impl StaticHostsFileReader {
         Self { map: Arc::new(map) }
     }
 
-    /// Build from `(hostname, ipv4)` pairs; `blocking` is classified from
+    /// Build from `(hostname, address)` pairs; `blocking` is classified from
     /// the IP just like the file parser.
-    pub fn from_pairs<I, S>(pairs: I) -> Self
+    pub fn from_pairs<I, S, A>(pairs: I) -> Self
     where
-        I: IntoIterator<Item = (S, Ipv4Addr)>,
+        I: IntoIterator<Item = (S, A)>,
         S: AsRef<str>,
+        A: Into<IpAddr>,
     {
         let map = pairs
             .into_iter()
-            .map(|(host, ip)| (normalize_hostname(host.as_ref()), HostsPin::from_ip(ip)))
+            .map(|(host, ip)| {
+                (
+                    normalize_hostname(host.as_ref()),
+                    HostsPin::from_ip(ip.into()),
+                )
+            })
             .collect();
         Self::new(map)
     }
@@ -264,6 +385,11 @@ impl HostsFileReader for StaticHostsFileReader {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::net::{Ipv4Addr, Ipv6Addr};
+
+    fn v4(a: u8, b: u8, c: u8, d: u8) -> IpAddr {
+        IpAddr::V4(Ipv4Addr::new(a, b, c, d))
+    }
 
     #[test]
     fn parses_comments_blanks_and_multi_alias_lines() {
@@ -277,22 +403,19 @@ mod tests {
 ";
         let map = parse_hosts_map(text);
         // localhost + its alias both mapped, comment ignored.
-        assert_eq!(
-            map.get("localhost").map(|p| p.ip),
-            Some(Ipv4Addr::LOCALHOST)
-        );
+        assert_eq!(map.get("localhost").map(|p| p.ip), Some(v4(127, 0, 0, 1)));
         assert_eq!(
             map.get("loopback.local").map(|p| p.ip),
-            Some(Ipv4Addr::LOCALHOST)
+            Some(v4(127, 0, 0, 1))
         );
         // Multi-alias redirect line maps both names to the same IP.
         assert_eq!(
             map.get("redirect.example.com").map(|p| p.ip),
-            Some(Ipv4Addr::new(203, 0, 113, 7))
+            Some(v4(203, 0, 113, 7))
         );
         assert_eq!(
             map.get("alias.example.com").map(|p| p.ip),
-            Some(Ipv4Addr::new(203, 0, 113, 7))
+            Some(v4(203, 0, 113, 7))
         );
         // Blank / whitespace-only / comment lines add nothing.
         assert_eq!(map.len(), 5);
@@ -310,22 +433,46 @@ mod tests {
         assert!(!map.get("real-redirect.example").unwrap().blocking);
     }
 
+    /// The OS answers an IPv6 lookup from the file's IPv6 lines: a name
+    /// pinned or blocked there only is pinned or blocked all the same.
     #[test]
-    fn ignores_ipv6_and_malformed_lines() {
+    fn ipv6_lines_pin_their_names_and_malformed_ones_are_ignored() {
         let map = parse_hosts_map(
             "::1 ip6-localhost\n\
-             fe80::1 ip6-router\n\
+             2001:db8::7 v6-only.example\n\
+             fe80::1%lo0 scoped.example\n\
              not-an-ip host.example\n\
              10.0.0.5 valid.example\n",
         );
-        assert!(!map.contains_key("ip6-localhost"));
-        assert!(!map.contains_key("ip6-router"));
+        assert!(map.get("ip6-localhost").expect("pinned").blocking);
+        assert_eq!(
+            map.get("v6-only.example").map(|p| p.ip),
+            Some(IpAddr::V6(Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 7)))
+        );
+        assert!(!map.contains_key("scoped.example"));
         assert!(!map.contains_key("host.example"));
         assert_eq!(
             map.get("valid.example").map(|p| p.ip),
-            Some(Ipv4Addr::new(10, 0, 0, 5))
+            Some(v4(10, 0, 0, 5))
         );
-        assert_eq!(map.len(), 1);
+        assert_eq!(map.len(), 3);
+    }
+
+    /// One name on a line of each family: each lookup gets its own family's
+    /// address, as the resolver answers it.
+    #[test]
+    fn a_name_on_lines_of_both_families_keeps_each_address() {
+        let map = parse_hosts_map(
+            "203.0.113.9 both.example\n\
+             2001:db8::9 both.example\n\
+             198.51.100.1 both.example\n",
+        );
+        let pin = map.get("both.example").expect("pinned");
+        assert_eq!(pin.address_of(false), Some(v4(203, 0, 113, 9)));
+        assert_eq!(
+            pin.address_of(true),
+            Some(IpAddr::V6(Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 9)))
+        );
     }
 
     #[test]
@@ -346,7 +493,7 @@ mod tests {
         );
         // Resolver order: the first mapping is authoritative.
         assert!(map.get("dup.example").unwrap().blocking);
-        assert_eq!(map.get("dup.example").unwrap().ip, Ipv4Addr::LOCALHOST);
+        assert_eq!(map.get("dup.example").unwrap().ip, v4(127, 0, 0, 1));
     }
 
     #[test]
@@ -397,6 +544,89 @@ mod tests {
         assert!(!snap3.contains_key("first.example"));
         assert!(snap3.contains_key("second.example"));
         assert!(!Arc::ptr_eq(&snap2, &snap3));
+    }
+
+    /// `msg_key` of every WARN event raised while `f` runs on this thread.
+    fn warn_keys_during<R>(f: impl FnOnce() -> R) -> (R, Vec<String>) {
+        use tracing_subscriber::layer::{Context, SubscriberExt};
+
+        #[derive(Default)]
+        struct Keys(Arc<Mutex<Vec<String>>>);
+        struct KeyVisitor<'a>(&'a mut Option<String>);
+        impl tracing::field::Visit for KeyVisitor<'_> {
+            fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+                if field.name() == "msg_key" {
+                    *self.0 = Some(value.to_owned());
+                }
+            }
+            fn record_debug(&mut self, _: &tracing::field::Field, _: &dyn std::fmt::Debug) {}
+        }
+        impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for Keys {
+            fn on_event(&self, event: &tracing::Event<'_>, _: Context<'_, S>) {
+                if *event.metadata().level() != tracing::Level::WARN {
+                    return;
+                }
+                let mut key = None;
+                event.record(&mut KeyVisitor(&mut key));
+                if let (Some(key), Ok(mut keys)) = (key, self.0.lock()) {
+                    keys.push(key);
+                }
+            }
+        }
+
+        let keys = Keys::default();
+        let seen = Arc::clone(&keys.0);
+        let subscriber = tracing_subscriber::registry().with(keys);
+        let out = tracing::subscriber::with_default(subscriber, f);
+        let seen = seen.lock().map(|k| k.clone()).unwrap_or_default();
+        (out, seen)
+    }
+
+    /// Another program can grow the hosts file without limit: the service never
+    /// holds it past the bound, it reads as no overrides, and says so once.
+    #[test]
+    fn an_oversized_hosts_file_is_not_read_and_is_reported() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("hosts");
+        std::fs::write(&path, "127.0.0.1 pinned.example\n").expect("write");
+        let file = std::fs::File::options()
+            .write(true)
+            .open(&path)
+            .expect("open");
+        file.set_len(SERVICE_READ_LIMIT + 1).expect("grow");
+        drop(file);
+
+        let reader = OsHostsFileReader::with_path(path);
+        let (map, warned) = warn_keys_during(|| {
+            let first = reader.snapshot();
+            let again = reader.snapshot();
+            (first, again)
+        });
+        assert!(map.0.is_empty(), "an oversized file must not yield pins");
+        assert!(map.1.is_empty());
+        assert_eq!(warned, vec!["hosts-file-too-large".to_owned()]);
+    }
+
+    /// Short names on one line cost almost nothing in the file and a whole
+    /// map entry each: the map stops at the cap, keeps the first names, and
+    /// the service says the list was cut.
+    #[test]
+    fn a_hosts_file_with_more_names_than_the_cap_keeps_the_first_ones() {
+        let mut text = String::from("0.0.0.0");
+        for i in 0..=MAX_HOSTS_ENTRIES {
+            text.push_str(&format!(" h{i}"));
+        }
+        text.push('\n');
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("hosts");
+        std::fs::write(&path, &text).expect("write");
+
+        let reader = OsHostsFileReader::with_path(path);
+        let (map, warned) = warn_keys_during(|| reader.snapshot());
+        assert_eq!(map.len(), MAX_HOSTS_ENTRIES);
+        assert!(map.contains_key("h0"));
+        assert!(!map.contains_key(&format!("h{MAX_HOSTS_ENTRIES}")));
+        assert_eq!(warned, vec!["hosts-file-entries-capped".to_owned()]);
     }
 
     #[test]

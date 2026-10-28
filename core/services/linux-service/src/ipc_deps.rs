@@ -334,6 +334,7 @@ pub(crate) fn build_ipc_surface(
             .map(|d| d.as_millis() as i64)
             .unwrap_or(0),
     );
+    signing.check_enforced_books();
 
     // Without an audit writer the coordinator still runs, but its trail is not
     // persisted. Bootstrap already reported why, so this stays silent about the
@@ -375,9 +376,8 @@ pub(crate) fn build_ipc_surface(
     // process's (`build_ipc_server`); a surface built and dropped, as in
     // tests, must not leave its audit writer, and with it the chain lock,
     // behind in a global.
-    let override_grants = nrr_service_runtime::override_grants::OverrideGrants::open(
+    let override_grants = signing.open_override_grants(
         Arc::clone(&state_conn),
-        signing.signing_key().map(<[u8]>::to_vec),
         audit_writer
             .as_ref()
             .map(|w| Arc::clone(w) as Arc<AuditTrail>),

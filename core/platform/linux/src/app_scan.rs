@@ -18,6 +18,16 @@ pub(crate) const MAX_ENTRIES_PER_DIR: usize = 65_536;
 /// Flatpak app would otherwise collapse into one row.
 const EXEC_WRAPPERS: &[&str] = &["env", "flatpak", "sh", "bash", "snap"];
 
+/// A `/proc/<pid>/exe` target without the ` (deleted)` the kernel appends once
+/// the file was replaced: a program upgraded while running is still that program.
+pub(crate) fn live_image_path(target: PathBuf) -> PathBuf {
+    let live = target
+        .to_string_lossy()
+        .strip_suffix(" (deleted)")
+        .map(PathBuf::from);
+    live.unwrap_or(target)
+}
+
 /// The system, Flatpak and Snap application dirs plus this user's own.
 pub(crate) fn application_dirs() -> Vec<PathBuf> {
     let mut dirs: Vec<PathBuf> = [
@@ -83,14 +93,9 @@ pub(crate) fn running_processes(proc_root: &Path) -> Vec<ProcessSeen> {
         })
         .filter_map(|entry| {
             let dir = entry.path();
-            let exe = std::fs::read_link(dir.join("exe")).ok().map(|target| {
-                // A replaced binary reads as `/path/app (deleted)`.
-                let text = target.to_string_lossy();
-                match text.strip_suffix(" (deleted)") {
-                    Some(live) => PathBuf::from(live),
-                    None => target,
-                }
-            });
+            let exe = std::fs::read_link(dir.join("exe"))
+                .ok()
+                .map(live_image_path);
             let comm = read_capped(&dir.join("comm"), MAX_COMM_BYTES)
                 .map(|c| c.trim().to_string())
                 .filter(|c| !c.is_empty());

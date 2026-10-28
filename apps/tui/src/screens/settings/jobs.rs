@@ -21,8 +21,8 @@ use nrr_shared::ipc_payloads::{
     LocalNetworksGetResponse, LocalNetworksSetResponse, LogRetentionConfigDto,
     LogRetentionConfigSetRequest, LogsClearResponse, ProductImpactDisableDryRunResponse,
     RetentionSettingsDto, RetentionSettingsSetRequest, RollbackTargetDto,
-    SettingsExportFullResponse, StorageUsageDto, ThirdPartyComponentsListResponse,
-    TrafficStatsGetResponse, TrafficStatsSettingsDto,
+    SettingsExportFullRequest, SettingsExportFullResponse, StorageUsageDto,
+    ThirdPartyComponentsListResponse, TrafficStatsGetResponse, TrafficStatsSettingsDto,
 };
 use serde::de::DeserializeOwned;
 use serde_json::{json, Map, Value};
@@ -1061,9 +1061,14 @@ enum ExportError {
 
 /// Writes the service's YAML to a new file; an existing file is never
 /// overwritten.
-fn export_to(client: &dyn IpcClient, path: &std::path::Path) -> Result<(), ExportError> {
+fn export_to(
+    client: &dyn IpcClient,
+    path: &std::path::Path,
+    request: &SettingsExportFullRequest,
+) -> Result<(), ExportError> {
+    let payload = serde_json::to_value(request).unwrap_or_else(|_| json!({}));
     let answer: SettingsExportFullResponse =
-        read(client, Op::SettingsExportFull, json!({})).map_err(ExportError::Service)?;
+        read(client, Op::SettingsExportFull, payload).map_err(ExportError::Service)?;
     let bytes = base64::engine::general_purpose::STANDARD
         .decode(answer.yaml_bytes_b64.as_bytes())
         .map_err(|e| {
@@ -1093,9 +1098,9 @@ fn write_new_file(path: &std::path::Path, bytes: &[u8]) -> Result<(), ExportErro
         .map_err(|e| ExportError::Write(e.to_string()))
 }
 
-pub fn export_settings(path: PathBuf) -> Job {
+pub fn export_settings(path: PathBuf, request: SettingsExportFullRequest) -> Job {
     job(move |client| {
-        let outcome = export_to(client, &path);
+        let outcome = export_to(client, &path, &request);
         let shown = path.display().to_string();
         Reply::new(move |app| match outcome {
             Ok(()) => app

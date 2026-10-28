@@ -8,7 +8,7 @@
 
 use crossterm::event::{KeyCode, KeyEvent};
 use nrr_client_logic::rebase::{keep_theirs_from_picks, Conflict, MergeView};
-use nrr_client_logic::rules_table::RuleRow;
+use nrr_client_logic::rules_table::{RuleRow, TargetRoute};
 use nrr_shared::display_text::display_text;
 use nrr_shared::ipc_payloads::RuleRowEntry;
 
@@ -38,12 +38,25 @@ enum Source {
     Files([String; 2]),
 }
 
+/// A rule one of the books names in both sets with both copies on; the merge
+/// keeps the main route's copy unless the user picks the other.
+#[derive(Debug)]
+pub struct Duplicate {
+    pub key: String,
+    /// What both copies match, as written.
+    pub summary: String,
+}
+
 #[derive(Debug)]
 pub struct Merge {
     source: Source,
     view: MergeView,
     /// Per conflict: `true` keeps the rules in force, `false` your version.
     theirs: Vec<bool>,
+    duplicates: Vec<Duplicate>,
+    /// Per duplicate: `true` keeps the additional route's copy.
+    keep_secondary: Vec<bool>,
+    /// Over the conflicts, then the duplicates.
     cursor: usize,
 }
 
@@ -61,22 +74,38 @@ impl Merge {
             base_revision,
             unrecognized,
         };
-        Self::of(Source::Edits(side), view)
+        Self::of(Source::Edits(side), view, Vec::new())
     }
 
     /// The bound files' text (primary, secondary) against the rules the
     /// service enforces.
-    pub fn files(texts: [String; 2], view: MergeView) -> Self {
-        Self::of(Source::Files(texts), view)
+    pub fn files(texts: [String; 2], view: MergeView, duplicates: Vec<Duplicate>) -> Self {
+        Self::of(Source::Files(texts), view, duplicates)
     }
 
-    fn of(source: Source, view: MergeView) -> Self {
+    fn of(source: Source, view: MergeView, duplicates: Vec<Duplicate>) -> Self {
         Self {
             theirs: vec![false; view.conflicts.len()],
+            keep_secondary: vec![false; duplicates.len()],
+            duplicates,
             source,
             view,
             cursor: 0,
         }
+    }
+
+    /// The duplicates whose additional route's copy stays, for the service.
+    fn keep_secondary_keys(&self) -> Vec<String> {
+        self.duplicates
+            .iter()
+            .zip(&self.keep_secondary)
+            .filter(|(_, keep)| **keep)
+            .map(|(d, _)| d.key.clone())
+            .collect()
+    }
+
+    fn picks_len(&self) -> usize {
+        self.theirs.len() + self.keep_secondary.len()
     }
 
     fn wording(&self) -> Wording {
@@ -101,7 +130,12 @@ impl Merge {
     }
 
     fn toggle(&mut self, at: usize) {
-        if let Some(pick) = self.theirs.get_mut(at) {
+        let conflicts = self.theirs.len();
+        let pick = match at.checked_sub(conflicts) {
+            None => self.theirs.get_mut(at),
+            Some(dup) => self.keep_secondary.get_mut(dup),
+        };
+        if let Some(pick) = pick {
             *pick = !*pick;
             self.cursor = at;
         }
@@ -192,8 +226,43 @@ pub fn lines(app: &AppState, merge: &Merge, texts: &Texts) -> Vec<ViewLine> {
             lines.extend(conflict_lines(app, merge, at, conflict, texts));
         }
     }
+    duplicate_lines(&mut lines, app, merge, texts);
     lines.push(ViewLine::text(texts.get(text::MERGE_KEYS)));
     lines
+}
+
+/// The rules a book names in both sets, numbered on after the conflicts,
+/// each with the route whose copy stays.
+fn duplicate_lines(lines: &mut Vec<ViewLine>, app: &AppState, merge: &Merge, texts: &Texts) {
+    if merge.duplicates.is_empty() {
+        return;
+    }
+    lines.push(ViewLine::new(vec![Segment::strong(format!(
+        "{} ({})",
+        texts.get(text::FILES_MERGE_DUPLICATES),
+        merge.duplicates.len()
+    ))]));
+    lines.push(ViewLine::text(texts.get(text::FILES_MERGE_DUPLICATES_HINT)));
+    let first = merge.theirs.len();
+    for (i, duplicate) in merge.duplicates.iter().enumerate() {
+        let at = first + i;
+        let route = if merge.keep_secondary.get(i).copied().unwrap_or(false) {
+            TargetRoute::Secondary
+        } else {
+            TargetRoute::Primary
+        };
+        let head = format!(
+            "{}. {} \u{2014} {}",
+            at + 1,
+            display_text(&duplicate.summary),
+            texts.fill(text::MERGE_STAYS, &[("side", route_text(&route, texts))])
+        );
+        lines.push(if at == merge.cursor && app.focus == Focus::Feed {
+            ViewLine::new(vec![Segment::selected(format!("> {head}"))])
+        } else {
+            ViewLine::text(format!("  {head}"))
+        });
+    }
 }
 
 fn conflict_lines(
@@ -252,7 +321,7 @@ pub fn on_key(app: &mut AppState, mut merge: Box<Merge>, key: KeyEvent) -> bool 
         }
         KeyCode::Up => merge.cursor = merge.cursor.saturating_sub(1),
         KeyCode::Down => {
-            merge.cursor = (merge.cursor + 1).min(merge.theirs.len().saturating_sub(1));
+            merge.cursor = (merge.cursor + 1).min(merge.picks_len().saturating_sub(1));
         }
         KeyCode::Char(' ') | KeyCode::Left | KeyCode::Right => {
             let at = merge.cursor;
@@ -303,10 +372,11 @@ fn leave(app: &mut AppState) {
 fn confirm(app: &mut AppState, merge: Box<Merge>) {
     let keep = merge.keep_theirs();
     let picks = merge.picks();
+    let keep_secondary = merge.keep_secondary_keys();
     let side = match merge.source {
         Source::Edits(side) => side,
         Source::Files(texts) => {
-            file_merge::confirm(app, texts, &picks);
+            file_merge::confirm(app, texts, &picks, keep_secondary);
             return;
         }
     };

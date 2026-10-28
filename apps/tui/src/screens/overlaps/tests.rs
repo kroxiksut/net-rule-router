@@ -318,6 +318,47 @@ fn a_rule_on_another_users_folder_is_listed_as_not_applied() {
     assert!(!text.contains("Addresses affected"), "{text}");
 }
 
+/// Line mode: pairs read after the screen was printed are printed when they
+/// arrive, not only on the next Enter.
+#[test]
+fn line_mode_prints_the_pairs_when_they_arrive() {
+    let fake = service();
+    let texts = texts_en();
+    let mut app = app_at(Link::Connected, Some(&Fixture::healthy()));
+    let mut session = PlainSession::new(Vec::new());
+    session.start(&app, &texts).expect("start");
+    session.input("5", &mut app, &texts).expect("open");
+    drain(&mut app, &fake);
+    session.changed(&app, &texts).expect("arrived");
+    let text = String::from_utf8(session.into_inner()).expect("UTF-8");
+    assert!(text.contains("video.example.com"), "{text}");
+}
+
+/// Line mode: a pair that left the list after it was printed is not replaced
+/// by its neighbour under the same number.
+#[test]
+fn a_typed_number_names_the_pair_as_printed() {
+    let fake = service();
+    let mut app = on_screen(&fake);
+    let video = winners(&app)
+        .iter()
+        .position(|w| w == "video.example.com")
+        .expect("the pair is listed")
+        + 1;
+    let other = if video == 1 { 2 } else { 1 };
+    crate::screens::screen(ScreenId::Overlaps).on_printed(&mut app);
+    // Rule 2 of the list is video.example.com: switched off, its pair ends.
+    app.open(ScreenId::Rules);
+    assert!(crate::screens::screen(ScreenId::Rules).on_line(&mut app, "t 2"));
+    app.open(ScreenId::Overlaps);
+    let screen = crate::screens::screen(ScreenId::Overlaps);
+    assert!(screen.on_line(&mut app, &format!("c {video}")));
+    assert_eq!(app.overlaps.pending_count(), 3, "nothing confirmed");
+    assert!(render(&app, 200, 60).contains("no longer in the list"));
+    assert!(screen.on_line(&mut app, &format!("c {other}")));
+    assert_eq!(app.overlaps.pending_count(), 2);
+}
+
 #[test]
 fn line_mode_offers_the_same_answers_by_number() {
     let fake = service();

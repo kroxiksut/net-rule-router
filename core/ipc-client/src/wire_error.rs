@@ -31,6 +31,13 @@ pub fn ipc_error_to_wire(err: &IpcClientError) -> (&'static str, String) {
             message,
             ..
         } => (forbidden_client_code(message), message.clone()),
+        // A read that changed nothing: the generic code tells the user to
+        // refresh in case a change went through.
+        IpcClientError::ServerError {
+            op: nrr_shared::ipc::IpcOperationName::SettingsExportFull,
+            code: IpcErrorCode::ResponseTooLarge,
+            message,
+        } => (codes::SETTINGS_EXPORT_TOO_LARGE, message.clone()),
         IpcClientError::ServerError { code, message, .. } => (code.client_slug(), message.clone()),
     }
 }
@@ -45,6 +52,20 @@ mod tests {
     fn an_operation_the_service_does_not_know_keeps_its_own_slug() {
         let err = server_error(IpcErrorCode::UnsupportedOperation, "any text");
         assert_eq!(ipc_error_to_wire(&err).0, "unsupported-operation");
+    }
+
+    /// An export that does not fit one answer changed nothing: the client
+    /// says so instead of the generic "refresh, it may have been applied".
+    #[test]
+    fn a_settings_export_too_large_to_answer_has_its_own_code() {
+        let export = IpcClientError::ServerError {
+            op: IpcOperationName::SettingsExportFull,
+            code: IpcErrorCode::ResponseTooLarge,
+            message: "the answer does not fit one IPC frame".into(),
+        };
+        assert_eq!(ipc_error_to_wire(&export).0, "settings-export-too-large");
+        let other = server_error(IpcErrorCode::ResponseTooLarge, "too large");
+        assert_eq!(ipc_error_to_wire(&other).0, "response-too-large");
     }
 
     #[test]

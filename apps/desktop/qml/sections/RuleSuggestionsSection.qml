@@ -776,7 +776,7 @@ ColumnLayout {
                 text: root.tr("rules.suggestions.inbox.action-forget-all", "Clear all")
                 ToolTip.visible: hovered
                 ToolTip.text: root.tr("rules.suggestions.inbox.action-forget-all-tooltip",
-                    "Removes every accumulated suggestion, answer and all, so addresses are offered again if they turn up next to your sites.")
+                    "Removes every suggestion together with your answers, so these addresses can be offered again later.")
                 Accessible.role: Accessible.Button
                 Accessible.name: text
                 Accessible.description: ToolTip.text
@@ -1194,8 +1194,8 @@ ColumnLayout {
                 wrapMode: Text.WordWrap
                 color: root.textColor
                 text: root.tr("rules.suggestions.inbox.clear-all-body",
-                    "{count} suggested address(es) will be forgotten entirely — answers included — so "
-                    + "they can be offered again later if they turn up next to your sites. This cannot be undone.")
+                    "{count} suggestions will be forgotten together with your answers, so "
+                    + "they can be offered again if they turn up beside your sites. This cannot be undone.")
                     .replace("{count}", String(section._allIds().length))
             }
             RowLayout {

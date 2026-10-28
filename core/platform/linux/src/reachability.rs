@@ -133,6 +133,14 @@ fn is_our_reply(datagram: &[u8], sequence: u16, payload: &[u8]) -> bool {
     echo_reply_parts(datagram) == Some((sequence, payload))
 }
 
+/// The fuzz target's entry: one datagram off the ICMP socket, in either shape
+/// it arrives in, matched as the liveness probe matches it.
+#[cfg(feature = "fuzzing")]
+#[doc(hidden)]
+pub fn fuzz_datagram(datagram: &[u8]) -> bool {
+    is_our_reply(datagram, 7, ECHO_PAYLOAD)
+}
+
 // ── Socket mechanism (Linux only) ────────────────────────────────────────────
 
 /// Send one echo request and wait for its reply.

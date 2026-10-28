@@ -48,6 +48,17 @@ pub trait RouteSelector: Send + Sync {
         self.route_for(hostname)
     }
 
+    /// Whether every rule of the routing user's book naming `hostname` is a
+    /// public top-level zone (`nrr_domain::public_zone`).
+    fn held_only_by_public_zone(&self, _hostname: &str) -> bool {
+        false
+    }
+
+    /// [`Self::held_only_by_public_zone`] in `principal`'s own book.
+    fn held_only_by_public_zone_for(&self, _principal: &str, hostname: &str) -> bool {
+        self.held_only_by_public_zone(hostname)
+    }
+
     /// A number that moves whenever a rule book may have changed. The stack
     /// re-decides every live flow when it moves, so a flow opened under the
     /// old book does not outlive it. Read once per poll step: cheap or never.
@@ -372,6 +383,9 @@ impl RelayCore {
                 route,
                 book_route,
                 owner: None,
+                // Asked only of a tunnel flow: the one it constrains.
+                held_only_by_public_zone: route == RouteRole::Secondary
+                    && self.routes.held_only_by_public_zone(&hostname),
             },
             hostname,
         }
@@ -443,6 +457,10 @@ impl RelayCore {
             };
             target.route = self.unless_vpn_client(route, client, destination);
             target.book_route = Some(route);
+            target.held_only_by_public_zone = target.route == RouteRole::Secondary
+                && self
+                    .routes
+                    .held_only_by_public_zone_for(&principal, &target.hostname);
         }
         target.owner = Some(principal);
         Ok(target)
@@ -910,6 +928,52 @@ mod tests {
             .expect("another user's own book routes the host");
         assert_eq!(carried.route, RouteRole::Secondary);
         assert_eq!(carried.book_route, Some(RouteRole::Secondary));
+    }
+
+    /// The routing user's book holds every host by a public zone alone; the
+    /// owner "S-1-5-21-2" names it narrowly.
+    struct PublicZoneOnly;
+
+    impl RouteSelector for PublicZoneOnly {
+        fn route_for(&self, _hostname: &str) -> Option<RouteRole> {
+            Some(RouteRole::Secondary)
+        }
+
+        fn held_only_by_public_zone(&self, _hostname: &str) -> bool {
+            true
+        }
+
+        fn held_only_by_public_zone_for(&self, principal: &str, _hostname: &str) -> bool {
+            principal != "S-1-5-21-2"
+        }
+    }
+
+    /// The dialer keeps a public zone's private addresses out of the tunnel
+    /// only if the flow tells it the host is held that way — by whichever
+    /// user's book carries the flow.
+    #[test]
+    fn a_flow_to_a_public_zone_name_tells_the_dialer_so() {
+        let (allocator, fake) = allocator_with("a1.attacker.ru");
+        let mut relay = RelayCore::new(
+            allocator,
+            FakeIpScope::enabled(Vec::<String>::new()),
+            Arc::new(StaticUpstreamResolver::new()),
+            Arc::new(PublicZoneOnly),
+        );
+        relay.set_dial_time_resolution(true);
+        let destination = SocketAddr::new(fake, 443);
+        let decided = match relay.decide(&packet(destination, true)) {
+            RelayDecision::Relay { target, .. } => target,
+            other => panic!("expected a relay, got {other:?}"),
+        };
+        assert!(decided.held_only_by_public_zone);
+
+        relay.set_flow_owners(Arc::new(OwnersByPort));
+        let other_user: SocketAddr = "10.0.0.2:50002".parse().expect("addr");
+        let carried = relay
+            .for_owner(decided, other_user, destination, Some(FlowTransport::Tcp))
+            .expect("carried");
+        assert!(!carried.held_only_by_public_zone, "the owner named it");
     }
 
     /// Routes by whose book is asked: "S-1-5-21-2" sends the host over the

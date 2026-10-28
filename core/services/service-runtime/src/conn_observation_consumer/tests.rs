@@ -2054,6 +2054,48 @@ fn a_folders_script_teaches_the_folder_rule_for_its_owner_only() {
     assert_eq!(launches.reads(), 2);
 }
 
+/// Without the source that reports a pid, a connection arrives with none. The
+/// script behind it still teaches its folder rule: the open flow names its
+/// process.
+#[test]
+fn a_folders_script_is_counted_when_its_connection_arrives_without_a_pid() {
+    use crate::app_observation_lookup::AppObservationLookup;
+    use nrr_platform_api::process_launch::{MockProcessLaunches, ProcessLaunch};
+    let folder = r"c:\tools\*";
+    let store = Arc::new(
+        AppObservationStore::new().with_path_style(nrr_shared::app_path::PathStyle::Windows),
+    );
+    assert!(store.ips_for_app(folder).is_empty());
+    let launches = Arc::new(MockProcessLaunches::default());
+    let line = r#""C:\Python\python.exe" -u C:\Tools\sync.py"#;
+    launches.set(
+        41,
+        1,
+        ProcessLaunch {
+            args: nrr_platform_api::process_launch::split_windows_command_line(line),
+            raw: Some(line.to_string()),
+            cwd: Some(r"C:\Users\a".to_string()),
+        },
+    );
+    let script_ip = Ipv4Addr::new(203, 0, 113, 64);
+    let consumer = script_consumer(&store, &launches).with_flow_pid(Arc::new(
+        move |_local: SocketAddr, remote: SocketAddr| {
+            (remote.ip() == IpAddr::V4(script_ip)).then_some(41)
+        },
+    ));
+
+    consumer.consume(
+        &[script_observation(
+            0,
+            r"C:\Python\python.exe",
+            SCRIPT_OWNER,
+            script_ip,
+        )],
+        SystemTime::now(),
+    );
+    assert_eq!(store.ips_for_app(folder), vec![script_ip]);
+}
+
 /// Victims of one dropped socket of `owner` to the test address.
 fn pin_victims(
     local: SocketAddrV4,

@@ -7,9 +7,10 @@
 //! user's word, it would launder a service default into "what the user
 //! wanted" and offer it back after the next reinstall.
 
-use std::io::Write;
+#[path = "support/js.rs"]
+mod js;
+
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
 
 use serde_json::{json, Value};
 
@@ -34,37 +35,12 @@ fn function_body<'a>(source: &'a str, name: &str) -> &'a str {
     &rest[..end]
 }
 
-/// `pure.js` plus `body`, run by node; `None` when node is not installed.
-fn run_pure(body: &str) -> Option<Value> {
-    let pure = repo_file("apps/desktop/qml/lib/pure.js").replace(".pragma library", "");
-    let mut child = Command::new("node")
-        .arg("-")
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .unwrap_or_else(|e| {
-            panic!("this check runs the QML JavaScript through node; install Node.js ({e})")
-        });
-    let Some(stdin) = child.stdin.as_mut() else {
-        panic!("stdin was piped")
-    };
-    stdin
-        .write_all(format!("{pure}\n{body}\n").as_bytes())
-        .unwrap_or_else(|e| panic!("write the harness to node: {e}"));
-    let out = child
-        .wait_with_output()
-        .unwrap_or_else(|e| panic!("node runs to completion: {e}"));
-    assert!(
-        out.status.success(),
-        "node rejected the harness: {}",
-        String::from_utf8_lossy(&out.stderr)
-    );
-    let text = String::from_utf8_lossy(&out.stdout).into_owned();
-    Some(
-        serde_json::from_str(text.trim())
-            .unwrap_or_else(|e| panic!("harness output is not JSON: {e}; output: {text}")),
-    )
+/// `pure.js` plus `body`, run; what it logged, as JSON.
+fn run_pure(body: &str) -> Value {
+    let pure = repo_file("apps/desktop/qml/lib/pure.js");
+    let text = js::run_js(&format!("{pure}\n{body}\n"));
+    serde_json::from_str(text.trim())
+        .unwrap_or_else(|e| panic!("harness output is not JSON: {e}; output: {text}"))
 }
 
 #[test]
@@ -95,7 +71,7 @@ fn only_a_confirmed_user_write_is_recorded() {
     let roles = repo_file("apps/desktop/qml/flows/InterfacesRolesController.qml");
     assert_eq!(roles.matches("\"user:interfaces\")").count(), 2);
 
-    if let Some(out) = run_pure(
+    let out = run_pure(
         r#"console.log(JSON.stringify([
             isUserWriteOrigin("user:routing-settings"),
             isUserWriteOrigin("offline-pending-apply"),
@@ -104,11 +80,8 @@ fn only_a_confirmed_user_write_is_recorded() {
             isUserWriteOrigin(""),
             isUserWriteOrigin(undefined)
         ]))"#,
-    ) {
-        assert_eq!(out, json!([true, true, false, false, false, false]));
-    } else {
-        eprintln!("node not available — skipping the origin check");
-    }
+    );
+    assert_eq!(out, json!([true, true, false, false, false, false]));
 }
 
 #[test]
@@ -213,21 +186,18 @@ fn the_tray_restores_the_protection_the_window_would() {
         "{note}"
     );
 
-    if let Some(out) = run_pure(
+    let out = run_pure(
         r#"var req = routePolicyProtectionRestore(
             { "leak-protection": "everything", "doh-lockdown-enabled": true },
             { "mode": "prefer-primary", "leak-protection": "off", "doh-lockdown-enabled": false });
         console.log(JSON.stringify([req["apply-only"], req["leak-protection"], req["doh-lockdown-enabled"]]))"#,
-    ) {
-        assert_eq!(
-            out,
-            json!([
-                ["doh-lockdown-enabled", "leak-protection"],
-                "everything",
-                true
-            ])
-        );
-    } else {
-        eprintln!("node not available — skipping the protection-restore check");
-    }
+    );
+    assert_eq!(
+        out,
+        json!([
+            ["doh-lockdown-enabled", "leak-protection"],
+            "everything",
+            true
+        ])
+    );
 }

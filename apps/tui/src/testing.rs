@@ -14,6 +14,7 @@ use serde_json::{json, Value};
 pub struct FakeService {
     status: Mutex<ConnectionStatus>,
     answers: Mutex<Vec<(IpcOperationName, Value)>>,
+    refusals: Mutex<Vec<(IpcOperationName, nrr_shared::ipc_transport::IpcErrorCode)>>,
     calls: Mutex<Vec<IpcOperationName>>,
     sent: Mutex<Vec<(IpcOperationName, Value)>>,
     pending_push: Mutex<Option<SyncSender<Value>>>,
@@ -32,6 +33,7 @@ impl FakeService {
                 IpcOperationName::StatusUpdatesSubscribe,
                 json!({ "subscription-id": "sub-1", "current-event-id": 0, "gap-detected": false }),
             )]),
+            refusals: Mutex::new(Vec::new()),
             calls: Mutex::new(Vec::new()),
             sent: Mutex::new(Vec::new()),
             pending_push: Mutex::new(None),
@@ -44,6 +46,11 @@ impl FakeService {
         let mut answers = lock(&self.answers);
         answers.retain(|(o, _)| *o != op);
         answers.push((op, payload));
+    }
+
+    /// Every later call of `op` is refused with `code`, ahead of any answer.
+    pub fn refuse(&self, op: IpcOperationName, code: nrr_shared::ipc_transport::IpcErrorCode) {
+        lock(&self.refusals).push((op, code));
     }
 
     /// Deliver a push frame to the committed subscriber.
@@ -76,6 +83,13 @@ impl IpcClient for FakeService {
     ) -> Result<Value, IpcClientError> {
         lock(&self.calls).push(operation);
         lock(&self.sent).push((operation, payload));
+        if let Some((_, code)) = lock(&self.refusals).iter().find(|(op, _)| *op == operation) {
+            return Err(IpcClientError::ServerError {
+                op: operation,
+                code: *code,
+                message: "scripted refusal".to_owned(),
+            });
+        }
         lock(&self.answers)
             .iter()
             .find(|(op, _)| *op == operation)
@@ -229,9 +243,30 @@ pub fn snapshot_json(f: &Fixture) -> Value {
     })
 }
 
+#[derive(Debug, PartialEq, Eq)]
+enum SnapshotPlan {
+    Compare,
+    Rewrite,
+    WriteMissing,
+    Refuse(&'static str),
+}
+
+/// Writing a snapshot is a developer's review step: under `CI` nothing is
+/// written, so a changed screen cannot turn the gate green by itself.
+fn snapshot_plan(update_requested: bool, under_ci: bool, file_exists: bool) -> SnapshotPlan {
+    match (update_requested, under_ci, file_exists) {
+        (true, true, _) => SnapshotPlan::Refuse("snapshots are not rewritten under CI"),
+        (true, false, _) => SnapshotPlan::Rewrite,
+        (false, _, true) => SnapshotPlan::Compare,
+        (false, true, false) => SnapshotPlan::Refuse("snapshot is missing"),
+        (false, false, false) => SnapshotPlan::WriteMissing,
+    }
+}
+
 /// Compare `actual` with `tests/snapshots/<name>.txt`. A missing file is
-/// written on a developer machine (review it before keeping it) and fails under
-/// `CI`; `NRR_TUI_UPDATE_SNAPSHOTS` rewrites a file that differs.
+/// written on a developer machine (review it before keeping it);
+/// `NRR_TUI_UPDATE_SNAPSHOTS` rewrites a file that differs. Under `CI` both
+/// fail instead.
 pub fn assert_snapshot(name: &str, actual: &str) {
     let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("tests/snapshots")
@@ -242,20 +277,26 @@ pub fn assert_snapshot(name: &str, actual: &str) {
         }
         std::fs::write(&path, actual).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
     };
-    if std::env::var_os("NRR_TUI_UPDATE_SNAPSHOTS").is_some() {
-        write();
-        return;
+    let existing = std::fs::read_to_string(&path).ok();
+    let plan = snapshot_plan(
+        std::env::var_os("NRR_TUI_UPDATE_SNAPSHOTS").is_some(),
+        std::env::var_os("CI").is_some(),
+        existing.is_some(),
+    );
+    match plan {
+        SnapshotPlan::Refuse(why) => panic!("{}: {why}", path.display()),
+        SnapshotPlan::Rewrite => {
+            write();
+            return;
+        }
+        SnapshotPlan::WriteMissing => {
+            write();
+            eprintln!("snapshot {} written; review it", path.display());
+            return;
+        }
+        SnapshotPlan::Compare => {}
     }
-    let Ok(expected) = std::fs::read_to_string(&path) else {
-        assert!(
-            std::env::var_os("CI").is_none(),
-            "snapshot {} is missing",
-            path.display()
-        );
-        write();
-        eprintln!("snapshot {} written; review it", path.display());
-        return;
-    };
+    let expected = existing.unwrap_or_default();
     assert_eq!(
         expected.replace("\r\n", "\n"),
         actual,
@@ -347,5 +388,68 @@ impl Scratch {
 impl Drop for Scratch {
     fn drop(&mut self) {
         let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+/// A file this process can no longer open while the value lives: held without
+/// sharing, as another program locks it (Windows), or with every permission
+/// taken away (Unix).
+pub struct HeldFile {
+    #[cfg(windows)]
+    _held: std::fs::File,
+    #[cfg(not(windows))]
+    path: std::path::PathBuf,
+}
+
+/// `None` where nothing shuts this process out (root on Unix): the caller
+/// skips rather than proves nothing.
+pub fn hold_unreadable(path: &std::path::Path) -> Option<HeldFile> {
+    #[cfg(windows)]
+    let held = {
+        use std::os::windows::fs::OpenOptionsExt;
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .share_mode(0)
+            .open(path)
+            .unwrap_or_else(|e| panic!("hold {}: {e}", path.display()));
+        HeldFile { _held: file }
+    };
+    #[cfg(not(windows))]
+    let held = {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o000))
+            .unwrap_or_else(|e| panic!("chmod {}: {e}", path.display()));
+        HeldFile {
+            path: path.to_owned(),
+        }
+    };
+    std::fs::File::open(path).is_err().then_some(held)
+}
+
+#[cfg(not(windows))]
+impl Drop for HeldFile {
+    fn drop(&mut self) {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&self.path, std::fs::Permissions::from_mode(0o644));
+    }
+}
+
+#[cfg(test)]
+mod snapshot_plan_tests {
+    use super::{snapshot_plan, SnapshotPlan};
+
+    #[test]
+    fn ci_never_rewrites_a_snapshot_even_when_asked() {
+        for exists in [true, false] {
+            assert!(
+                matches!(snapshot_plan(true, true, exists), SnapshotPlan::Refuse(_)),
+                "an update request under CI must fail, not rewrite (file exists: {exists})"
+            );
+        }
+        assert!(matches!(
+            snapshot_plan(false, true, false),
+            SnapshotPlan::Refuse(_)
+        ));
+        assert_eq!(snapshot_plan(false, true, true), SnapshotPlan::Compare);
     }
 }

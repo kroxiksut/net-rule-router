@@ -25,7 +25,7 @@ impl ActivationCoordinator {
         correlation_id: &str,
         now: i64,
     ) -> Result<Phase1Outcome, PolicyError> {
-        let conn = self.conn.lock().expect("connection mutex poisoned");
+        let conn = lock_state(&self.conn);
         let token_store = MutationTokenStoreSqlite::new(&conn);
         // Consume scoped to the principal AND to this revision: a token is
         // issued to activate ONE candidate and its payload says which, so both
@@ -52,21 +52,19 @@ impl ActivationCoordinator {
             ConsumeOutcome::Expired => return Err(PolicyError::ConfirmationTokenExpired),
         }
 
+        // The previous active revision to supersede is THIS principal's.
+        let previous_revision = self.revisions_repo(&conn).get_active_for(principal);
+        // Audit never runs under the state lock: a panic there poisons it.
+        drop(conn);
         self.audit.emit(ActivationAuditEvent::TokenConsumed {
             principal: principal.to_string(),
             revision_id: revision_id.as_str().to_string(),
             token: token.as_str().to_string(),
         });
-
-        // The previous active revision to supersede is THIS principal's.
-        let previous_revision = self
-            .revisions_repo(&conn)
-            .get_active_for(principal)
-            .map_err(|e| PolicyError::StorageFailure {
-                operation: "get_active",
-                message: e.to_string(),
-            })?;
-        drop(conn);
+        let previous_revision = previous_revision.map_err(|e| PolicyError::StorageFailure {
+            operation: "get_active",
+            message: e.to_string(),
+        })?;
 
         let sids = self.apply_target_sids(principal);
         let attempt_id = self.ids.new_attempt_id();
@@ -178,7 +176,7 @@ impl ActivationCoordinator {
         // rolls us out of - so it does not stop the activation; the transition
         // leaves its signature failing for whoever looks next.
         {
-            let conn = self.conn.lock().expect("connection mutex poisoned");
+            let conn = lock_state(&self.conn);
             let verdict = self
                 .revisions_repo(&conn)
                 .verify_row_hmac(revision_id.as_str())
@@ -208,7 +206,7 @@ impl ActivationCoordinator {
         // which recovery can see and settle, whereas a half-written database
         // cannot be reasoned about at all.
         {
-            let conn = self.conn.lock().expect("connection mutex poisoned");
+            let conn = lock_state(&self.conn);
             let tx = conn
                 .unchecked_transaction()
                 .map_err(|e| PolicyError::StorageFailure {
@@ -331,7 +329,7 @@ impl ActivationCoordinator {
         // also needs to know the machine was not fully put back.
         push_revert_failures(&mut reason, &revert_failures);
         {
-            let conn = self.conn.lock().expect("connection mutex poisoned");
+            let conn = lock_state(&self.conn);
             let repo = self.revisions_repo(&conn);
             repo.mark_apply_failed_for(principal, revision_id.as_str(), &reason, now)
                 .map_err(|e| PolicyError::StorageFailure {
@@ -391,7 +389,7 @@ impl ActivationCoordinator {
         // Best-effort: the store may be what failed. A row left a candidate
         // can still only be activated with a newly issued token.
         {
-            let conn = self.conn.lock().expect("connection mutex poisoned");
+            let conn = lock_state(&self.conn);
             if let Err(e) = self.revisions_repo(&conn).mark_apply_failed_for(
                 principal,
                 revision_id.as_str(),
@@ -473,7 +471,7 @@ impl ActivationCoordinator {
         let _ = phase1; // marker has already been written; no SID work to undo
         let reason = format!("pre-flight rejected {} SID(s)", sid_failures.len());
         {
-            let conn = self.conn.lock().expect("connection mutex poisoned");
+            let conn = lock_state(&self.conn);
             let repo = self.revisions_repo(&conn);
             repo.mark_apply_failed_for(principal, revision_id.as_str(), &reason, now)
                 .map_err(|e| PolicyError::StorageFailure {

@@ -314,6 +314,13 @@ QtObject {
             ? bridge.rpcSystemTheme()
             : ""
     }
+    // Whether the OS hosts file holds a real mapping now; "" means an older
+    // native host, and the page keeps the start-up answer.
+    function rpcHostsFileHasEntries() {
+        return (bridgeAvailable && typeof bridge.rpcHostsFileHasEntries === "function")
+            ? bridge.rpcHostsFileHasEntries()
+            : ""
+    }
     // The Help menu's "Check for updates"; "" means no bridge.
     function rpcUpdateCheckRun() {
         return (bridgeAvailable && typeof bridge.rpcUpdateCheckRun === "function")

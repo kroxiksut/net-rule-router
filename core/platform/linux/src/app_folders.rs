@@ -108,6 +108,13 @@ impl ProgramFolders for LinuxProgramFolders {
     }
 
     #[cfg(unix)]
+    fn identity(&self, folder: &Path) -> Option<u128> {
+        use std::os::unix::fs::MetadataExt;
+        let meta = std::fs::metadata(folder).ok()?;
+        Some((u128::from(meta.dev()) << 64) | u128::from(meta.ino()))
+    }
+
+    #[cfg(unix)]
     fn owner_may_list(&self, place: &Path, owner: &str) -> bool {
         crate::folder_access::uid_may_list(place, owner).unwrap_or(true)
     }

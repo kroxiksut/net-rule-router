@@ -135,6 +135,10 @@ QString NrrNativeBridge::rpcSystemTheme() {
     return emitRpcRequest(QStringLiteral("local.system-theme"), QJsonObject());
 }
 
+QString NrrNativeBridge::rpcHostsFileHasEntries() {
+    return emitRpcRequest(QStringLiteral("local.hosts-file.has-entries"), QJsonObject());
+}
+
 QString NrrNativeBridge::rpcServiceInfo() {
     return emitRpcRequest(QStringLiteral("local.service-info"),
                           QJsonObject());
@@ -162,6 +166,11 @@ QString NrrNativeBridge::rpcUserSettingsRulesFilesHandEdited(const QVariantMap &
 
 QString NrrNativeBridge::rpcUserSettingsRulesFileWrite(const QVariantMap &payload) {
     return emitRpcRequest(QStringLiteral("local.user-settings.rules-file-write"),
+                          QJsonObject::fromVariantMap(payload));
+}
+
+QString NrrNativeBridge::rpcUserSettingsFollow(const QVariantMap &payload) {
+    return emitRpcRequest(QStringLiteral("local.user-settings.follow"),
                           QJsonObject::fromVariantMap(payload));
 }
 
@@ -471,7 +480,9 @@ QString NrrNativeBridge::defaultRuleSetsDir(bool create) {
 
 bool NrrNativeBridge::writeFileBytes(const QString &path,
                                     const QString &base64) {
-    constexpr qint64 MAX_BYTES = 1024 * 1024;
+    // Whatever one service answer can carry: a settings export with the
+    // rules of both routes is larger than a single rules file.
+    constexpr qint64 MAX_BYTES = 4 * 1024 * 1024;
     const QByteArray bytes = QByteArray::fromBase64(
         base64.toUtf8(), QByteArray::AbortOnBase64DecodingErrors);
     if (bytes.isEmpty() && !base64.isEmpty()) {
@@ -480,7 +491,7 @@ bool NrrNativeBridge::writeFileBytes(const QString &path,
         return false;
     }
     if (bytes.size() > MAX_BYTES) {
-        qWarning() << "writeFileBytes: payload exceeds 1 MiB cap:"
+        qWarning() << "writeFileBytes: payload exceeds 4 MiB cap:"
                    << path << "size=" << bytes.size();
         return false;
     }

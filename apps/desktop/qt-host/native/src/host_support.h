@@ -298,6 +298,31 @@ inline QString systemExplorerPath() {
     return QDir(root).filePath(QStringLiteral("explorer.exe"));
 }
 
+/// `QProcess::startDetached` with channels of the child's own. The static form
+/// hands the child this host's stdio (Linux: fds 0-2; Windows: every
+/// inheritable handle, as Qt always inherits), and the launcher reading the
+/// host's pipes would then wait on them for as long as the child lives.
+inline bool startDetachedWithOwnChannels(const QString &program, const QStringList &arguments,
+                                         const QString &workingDirectory = QString(),
+                                         qint64 *pid = nullptr) {
+    QProcess process;
+    process.setProgram(program);
+    process.setArguments(arguments);
+    process.setWorkingDirectory(workingDirectory);
+    process.setStandardInputFile(QProcess::nullDevice());
+    process.setStandardOutputFile(QProcess::nullDevice());
+    process.setStandardErrorFile(QProcess::nullDevice());
+#ifdef Q_OS_WIN
+    // Redirection alone still inherits the launcher's pipe handles; a GUI child
+    // needs no handle from us, so it gets none, std handles included.
+    process.setCreateProcessArgumentsModifier([](QProcess::CreateProcessArguments *args) {
+        args->inheritHandles = false;
+        args->startupInfo->dwFlags &= ~static_cast<DWORD>(STARTF_USESTDHANDLES);
+    });
+#endif
+    return process.startDetached(pid);
+}
+
 inline QString resolveDefaultQmlRelativePath() {
     return QStringLiteral("apps/desktop/qml/Main.qml");
 }

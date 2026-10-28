@@ -1,7 +1,7 @@
 use super::*;
 use nrr_platform_api::hosts_file::HostsPin;
 use std::collections::HashMap;
-use std::net::Ipv4Addr;
+use std::net::{IpAddr, Ipv4Addr};
 
 fn row(rule_type: &str, match_value: &str) -> RuleRowEntry {
     RuleRowEntry {
@@ -38,18 +38,54 @@ fn hosts_map() -> HashMap<String, HostsPin> {
     m.insert(
         "ads.example.com".into(),
         HostsPin {
-            ip: Ipv4Addr::LOCALHOST,
+            ip: IpAddr::V4(Ipv4Addr::LOCALHOST),
             blocking: true,
+            other: None,
         },
     );
     m.insert(
         "mirror.example.com".into(),
         HostsPin {
-            ip: Ipv4Addr::new(203, 0, 113, 7),
+            ip: IpAddr::V4(Ipv4Addr::new(203, 0, 113, 7)),
             blocking: false,
+            other: None,
+        },
+    );
+    m.insert(
+        "v6.example.net".into(),
+        HostsPin {
+            ip: "2001:db8::7".parse().expect("ip"),
+            blocking: false,
+            other: None,
         },
     );
     m
+}
+
+/// A rule on `*.x` covers every name under it; one of them pinned in the
+/// hosts file is resolved there, past the rule, and the row must say so.
+#[test]
+fn a_name_pinned_under_a_suffix_rule_marks_the_rule() {
+    let mut r = resp(vec![
+        row("domain", "*.example.com"),
+        row("domain", "*.elsewhere.example"),
+    ]);
+    annotate_hosts_overrides(&mut r, &hosts_map());
+    let ov = r.rows[0].hosts_override.as_ref().expect("annotated");
+    assert_eq!(
+        ov.ip, "127.0.0.1",
+        "the first pinned name under it, in name order"
+    );
+    assert!(r.rows[1].hosts_override.is_none());
+}
+
+/// The OS answers an IPv6 lookup from the file's IPv6 lines.
+#[test]
+fn an_ipv6_pin_marks_its_rule() {
+    let mut r = resp(vec![row("domain", "v6.example.net")]);
+    annotate_hosts_overrides(&mut r, &hosts_map());
+    let ov = r.rows[0].hosts_override.as_ref().expect("annotated");
+    assert_eq!(ov.ip, "2001:db8::7");
 }
 
 #[test]
@@ -81,7 +117,7 @@ fn matching_is_case_insensitive_and_dot_tolerant() {
 fn non_matching_and_non_domain_rows_are_untouched() {
     let mut r = resp(vec![
         row("domain", "not-in-hosts.example.com"), // no hosts entry
-        row("domain", "*.example.com"),            // suffix wildcard — skipped
+        row("domain", "*.other.example"),          // nothing pinned under it
         row("zone", "ads.example.com"),            // zone type — skipped
         row("exact-ip", "127.0.0.1"),              // IP rule — skipped
         row("application", "browser.exe"),         // app rule — skipped

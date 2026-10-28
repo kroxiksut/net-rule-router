@@ -253,6 +253,27 @@ mod tests {
         assert!(seed.entries.iter().all(|s| s.entry.enabled));
     }
 
+    /// A browser whose system resolver belongs to a provider it knows upgrades
+    /// to that provider's encrypted DNS on its own, past the local resolver.
+    /// Those providers are blocked too, and reach existing installs as a new
+    /// seed version, never by rewriting an old one.
+    #[test]
+    fn the_providers_a_browser_upgrades_to_reach_existing_installs() {
+        let seed = builtin_seed();
+        for (target, label) in [
+            (v4(68, 105, 28, 11), "Cox"),
+            (DohTarget::Host("doh.cox.net".into()), "Cox DoH"),
+            (DohTarget::Host("dot.cox.net".into()), "Cox DoT"),
+            (v4(109, 236, 119, 2), "Levonet"),
+            (DohTarget::Host("dns.levonet.sk".into()), "Levonet DoH"),
+            (v4(130, 59, 31, 248), "Switch"),
+            (DohTarget::Host("dns.switch.ch".into()), "Switch DoH"),
+        ] {
+            let since = since_of(&seed, &target);
+            assert!(since.is_some_and(|v| v > 3), "{label}: {since:?}");
+        }
+    }
+
     /// The declared version must cover every entry the file introduces, or a
     /// forgotten bump would hide new rows from existing installs.
     #[test]
@@ -523,12 +544,13 @@ mod tests {
     }
 
     /// An install at version 2 — withdrawn address included, as it was seeded —
-    /// gains exactly the version-3 entries and loses the withdrawn one.
+    /// gains exactly the entries of every later version and loses the
+    /// withdrawn one.
     #[test]
-    fn an_install_at_v2_gets_exactly_the_v3_changes() {
+    fn an_install_at_v2_gets_exactly_the_later_changes() {
         let conn = state_conn();
         let seed = builtin_seed();
-        assert_eq!(seed.version, 3);
+        assert!(seed.version > 2);
         let mut v2: Vec<SeedEntry> = seed
             .entries
             .iter()
@@ -561,7 +583,7 @@ mod tests {
         let mut expected: Vec<&DohTarget> = seed
             .entries
             .iter()
-            .filter(|s| s.since == 3)
+            .filter(|s| s.since > 2)
             .map(|s| &s.entry.target)
             .collect();
         let key = |t: &&DohTarget| (t.kind_str(), t.value_str());
@@ -577,7 +599,7 @@ mod tests {
             );
         }
         assert_eq!(after.len(), seed.entries.len());
-        assert_eq!(applied(&conn), Some(3));
+        assert_eq!(applied(&conn), Some(seed.version));
     }
 
     /// A withdrawn address the user relabelled is theirs now and stays.

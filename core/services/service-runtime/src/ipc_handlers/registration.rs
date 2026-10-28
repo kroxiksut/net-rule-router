@@ -855,7 +855,11 @@ pub fn register_production_handlers(registry: &mut IpcHandlerRegistry, deps: Arc
             }
             IpcOperationName::PrincipalDataPurge => match deps.principal_data_purger.clone() {
                 Some(purger) => {
-                    registry.register_checked(op, PrincipalDataPurgeHandler::new(purger));
+                    registry.register_checked(
+                        op,
+                        PrincipalDataPurgeHandler::new(purger)
+                            .with_rules_reset(deps.mutation_executor.clone()),
+                    );
                 }
                 None => {
                     registry.register_checked(op, UnimplementedHandler::new(op));

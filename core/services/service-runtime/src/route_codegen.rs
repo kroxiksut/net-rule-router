@@ -268,6 +268,14 @@ pub enum RouteCodegenDiagnostic {
         ip: IpAddr,
         count: usize,
     },
+    /// A zone rule left out private addresses its public top-level zone does
+    /// not take into the tunnel (`nrr_domain::public_zone`). Aggregated like
+    /// [`Self::AddressClaimedByMainLink`].
+    PrivateAddressKeptOutOfTunnel {
+        rule_id: String,
+        ip: IpAddr,
+        count: usize,
+    },
     /// a mode wanted to send some traffic to the **primary**
     /// NIC but no usable primary target is bound: in mode B the per-rule
     /// exceptions can't be carved back off the tunnel; in mode A the `/2`
@@ -431,7 +439,7 @@ pub fn generate_secondary_routes(
         let mut per_rule = 0usize;
         // An address this rule may not steer — the other link's address rules
         // name it too. Held back rather than pinned, reported once per rule.
-        let mut held: Option<(IpAddr, usize)> = None;
+        let mut held = crate::address_ownership::HeldBack::new(ownership, link, rule.action);
         let steerable = |ip: IpAddr| ownership.address_rule_may_steer(ip, link);
         match &rule.address_match {
             Some(CanonicalAddressMatch::ExactIp(ip)) => {
@@ -439,7 +447,7 @@ pub fn generate_secondary_routes(
                 if steerable(ip) {
                     push_route(ip, target, &mut seen, &mut out, &mut per_rule);
                 } else {
-                    note_held(&mut held, ip);
+                    held.note(ip);
                 }
             }
             // Routed by `network_routes`, which needs both links' networks at once.
@@ -465,7 +473,7 @@ pub fn generate_secondary_routes(
                     crate::enforcement_planner::FamilyScope::Both,
                 ) {
                     if !steerable(ip) {
-                        note_held(&mut held, ip);
+                        held.note(ip);
                         continue;
                     }
                     if !push_route(ip, target, &mut seen, &mut out, &mut per_rule) {
@@ -519,9 +527,17 @@ pub fn generate_secondary_routes(
                 // the `app_match` guard above.)
             }
         }
-        if let Some((ip, count)) = held {
+        if let Some((ip, count)) = held.claimed {
             out.diagnostics
                 .push(RouteCodegenDiagnostic::AddressClaimedByMainLink {
+                    rule_id: rule.id.as_str().to_string(),
+                    ip,
+                    count,
+                });
+        }
+        if let Some((ip, count)) = held.outside_tunnel {
+            out.diagnostics
+                .push(RouteCodegenDiagnostic::PrivateAddressKeptOutOfTunnel {
                     rule_id: rule.id.as_str().to_string(),
                     ip,
                     count,
@@ -530,15 +546,6 @@ pub fn generate_secondary_routes(
     }
 
     out
-}
-
-/// Record one held-back address: the first is kept as the example, all of them
-/// count.
-fn note_held(held: &mut Option<(IpAddr, usize)>, ip: IpAddr) {
-    match held {
-        Some((_, count)) => *count += 1,
-        None => *held = Some((ip, 1)),
-    }
 }
 
 /// Mode-aware route generation. The desired route set
@@ -927,7 +934,7 @@ fn fanout_suffix(
     target: &SecondaryRouteTarget,
     cache: &dyn FqdnCacheLookup,
     steerable: &dyn Fn(IpAddr) -> bool,
-    held: &mut Option<(IpAddr, usize)>,
+    held: &mut crate::address_ownership::HeldBack<'_>,
     seen: &mut BTreeSet<IpAddr>,
     out: &mut RouteCodegenOutput,
     per_rule: &mut usize,
@@ -945,7 +952,7 @@ fn fanout_suffix(
             crate::enforcement_planner::FamilyScope::Both,
         ) {
             if !steerable(ip) {
-                note_held(held, ip);
+                held.note(ip);
                 continue;
             }
             if !push_route(ip, target, seen, out, per_rule) {

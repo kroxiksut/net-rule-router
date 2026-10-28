@@ -97,7 +97,7 @@ Dialog {
                 theme: root.ownerRoot ? root.ownerRoot.uiTheme : null
                 highlighted: true
                 text: root.tr("dialog.drift.apply-gui",
-                    "Apply application state")
+                    "Apply app state")
                 onClicked: { root.close(); root.applyAppStateRequested() }
             }
         }

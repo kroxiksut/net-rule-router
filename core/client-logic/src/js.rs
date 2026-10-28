@@ -14,6 +14,13 @@ pub(crate) fn trim(s: &str) -> &str {
     s.trim_matches(is_whitespace)
 }
 
+/// `keyLower` in `rules.js`: Unicode lowercase with a final sigma as a plain
+/// one. The window's engine lowercases without the final-sigma rule, so a key
+/// that kept it would name one rule two ways across the clients.
+pub(crate) fn key_lower(s: &str) -> String {
+    s.to_lowercase().replace('\u{3c2}', "\u{3c3}")
+}
+
 /// `!!value`.
 pub(crate) fn is_truthy(value: &Value) -> bool {
     match value {

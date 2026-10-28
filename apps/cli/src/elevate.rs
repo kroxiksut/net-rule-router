@@ -187,10 +187,7 @@ pub fn relay_request(args: &[String]) -> Option<RelayRequest> {
 /// that wait out the post-elevation settle before starting; everything else (a
 /// status read, an install of a stopped service) has nothing to tear down.
 fn takes_the_service_down(args: &[String]) -> bool {
-    matches!(
-        args.first().map(String::as_str),
-        Some("stop" | "restart" | "uninstall")
-    )
+    crate::parse::parse(args).is_ok_and(|invocation| crate::stops_service(&invocation.command))
 }
 
 /// What the elevated relay reported back.
@@ -672,15 +669,30 @@ mod tests {
 
     #[test]
     fn only_the_verbs_that_stop_the_service_wait_first() {
-        for verb in ["stop", "restart", "uninstall"] {
+        let argv =
+            |words: &str| -> Vec<String> { words.split_whitespace().map(str::to_string).collect() };
+        for verb in [
+            "stop",
+            "restart",
+            "uninstall",
+            "reinstall",
+            "reset-network --confirm --stop-service",
+        ] {
             assert!(
-                takes_the_service_down(&[verb.to_string()]),
+                takes_the_service_down(&argv(verb)),
                 "{verb} stops the service"
             );
         }
-        for verb in ["status", "start", "install", "version"] {
+        for verb in [
+            "status",
+            "start",
+            "install",
+            "version",
+            "reset-network --confirm",
+            "reset-network --stop-service",
+        ] {
             assert!(
-                !takes_the_service_down(&[verb.to_string()]),
+                !takes_the_service_down(&argv(verb)),
                 "{verb} has nothing to tear down"
             );
         }

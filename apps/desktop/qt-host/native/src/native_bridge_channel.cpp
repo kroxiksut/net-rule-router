@@ -167,7 +167,7 @@ void NrrNativeBridge::launchMainGuiWithAction(const QString &section, bool about
                          << "args=" << arguments.join(" ")
                          << "cwd=" << workingDir;
     qint64 pid = -1;
-    const bool success = QProcess::startDetached(mainGuiExecutable_, arguments, workingDir, &pid);
+    const bool success = startDetachedWithOwnChannels(mainGuiExecutable_, arguments, workingDir, &pid);
     qWarning().noquote() << "NRR_LAUNCH_GUI startDetached success=" << success
                          << "pid=" << pid;
 }
@@ -178,7 +178,7 @@ void NrrNativeBridge::openLogsFolder() {
         return;
     }
 #ifdef Q_OS_WIN
-    if (!QProcess::startDetached(systemExplorerPath(), {QDir::toNativeSeparators(logsDirectory_)})) {
+    if (!startDetachedWithOwnChannels(systemExplorerPath(), {QDir::toNativeSeparators(logsDirectory_)})) {
         qWarning() << "Failed to open logs folder via explorer.exe.";
     }
 #else

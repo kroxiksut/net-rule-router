@@ -80,9 +80,9 @@ impl NrptRuleStore for FakeStore {
         let mut rules = self.rules.lock().unwrap_or_else(|p| p.into_inner());
         let before = rules.len();
         rules.retain(|name, values| {
-            let half_written = !values.iter().any(|v| v.name == "Version");
-            let stale_copy = name != keep && has(values, &ours);
-            !(half_written || stale_copy)
+            let has_version = values.iter().any(|v| v.name == "Version");
+            let our_marker = OUR_MARKERS.iter().any(|m| has(values, &sz("Comment", m)));
+            !sweep_takes(name, has_version, our_marker, has(values, &ours), keep)
         });
         Ok(before - rules.len())
     }
@@ -358,25 +358,32 @@ fn a_rule_is_the_seven_values_the_dns_client_requires() {
 }
 
 #[test]
-fn redirect_writes_our_rule_under_its_fixed_key_and_confirms_it() {
+fn redirect_writes_our_rule_under_its_fixed_key_without_waiting_on_a_process() {
+    // The OS sends names to the listener from the moment the key is written;
+    // a process run before the call returns is that long without answers.
     let redirect = NrptDnsRedirect::new(accepting_runner(), FakeStore::default());
     let h = redirect.redirect_to(listener()).expect("redirect");
     assert_eq!(h.marker, NRPT_MARKER);
     assert_eq!(h.listener, listener());
     assert_eq!(redirect.store.writes(), [NRPT_RULE_KEY]);
     assert_eq!(redirect.store.keys(), [NRPT_RULE_KEY]);
+    assert!(redirect.runner.scripts().is_empty());
+    assert_eq!(
+        redirect.confirm(&h).expect("confirm"),
+        RedirectState::Active
+    );
     assert!(
         redirect.runner.scripts()[0].contains("Get-DnsClientNrptPolicy"),
-        "a successful write must still be confirmed against the table in force"
+        "a successful write is still confirmed against the table in force"
     );
 }
 
 #[test]
 fn redirect_clears_the_debris_that_would_have_the_table_rejected() {
-    // A half-written rule (its writer died) and a copy of ours under a
-    // random key (the cmdlet era) both go; the VPN client's rule stays.
+    // A half-written rule of ours and a copy of ours under a random key (the
+    // cmdlet era) both go; the VPN client's rule stays.
     let store = FakeStore::with(&[
-        ("{HALF}", half_written()),
+        ("{NRR-EXEMPT-0000000000000001}", half_written()),
         ("{OLD-OURS}", ours("127.0.0.1")),
         ("{VPN}", theirs()),
     ]);
@@ -386,26 +393,26 @@ fn redirect_clears_the_debris_that_would_have_the_table_rejected() {
 }
 
 #[test]
-fn redirect_withdraws_a_rule_the_os_does_not_honour() {
+fn confirm_tells_a_refused_rule_from_an_unreadable_table() {
     // The rule IS written; the effective table comes back empty: Windows
-    // evaluated the rule and refused it.
-    let redirect = NrptDnsRedirect::new(
-        ScriptedRunner::new(vec![("Get-DnsClientNrptPolicy", ok("   \n"))]),
+    // evaluated the rule and refused it, and the caller withdraws it.
+    let refused = NrptDnsRedirect::new(
+        ScriptedRunner::new(vec![(
+            "Get-DnsClientNrptPolicy",
+            ok("   
+"),
+        )]),
         FakeStore::default(),
     );
-    let err = redirect.redirect_to(listener()).unwrap_err();
-    assert!(matches!(err, PlatformError::Transient { .. }));
-    assert!(
-        redirect.store.keys().is_empty(),
-        "a rule the OS refuses must not be left behind for the next boot to trip over"
+    let h = refused.redirect_to(listener()).expect("redirect");
+    assert_eq!(
+        refused.confirm(&h).expect("confirm"),
+        RedirectState::Inactive
     );
-}
 
-#[test]
-fn redirect_survives_an_unreadable_policy_table() {
     // The query itself failed. That is not a rejection, and treating it as
     // one would disable Mode B on every host where the cmdlet is missing.
-    let redirect = NrptDnsRedirect::new(
+    let unreadable = NrptDnsRedirect::new(
         ScriptedRunner::new(vec![(
             "Get-DnsClientNrptPolicy",
             CommandOutput {
@@ -416,21 +423,16 @@ fn redirect_survives_an_unreadable_policy_table() {
         )]),
         FakeStore::default(),
     );
-    redirect
-        .redirect_to(listener())
-        .expect("an unreadable answer must not tear down a working redirect");
-    assert_eq!(
-        redirect.store.keys(),
-        [NRPT_RULE_KEY],
-        "nothing was refused, so nothing may be withdrawn"
-    );
+    let h = unreadable.redirect_to(listener()).expect("redirect");
+    assert!(unreadable.confirm(&h).is_err());
+    assert_eq!(unreadable.store.keys(), [NRPT_RULE_KEY]);
 }
 
 #[test]
 fn clear_orphan_counts_our_rule_and_the_debris_but_not_a_stranger() {
     let store = FakeStore::with(&[
         (NRPT_RULE_KEY, ours("127.0.0.1")),
-        ("{HALF}", half_written()),
+        ("{NRR-KEEP-0000000000000001}", half_written()),
         ("{OLD-OURS}", ours("127.0.0.1")),
         ("{VPN}", theirs()),
     ]);
@@ -438,6 +440,32 @@ fn clear_orphan_counts_our_rule_and_the_debris_but_not_a_stranger() {
     assert_eq!(store.keys(), ["{VPN}"]);
     // Nothing to clean is a successful sweep of zero, not a failure.
     assert_eq!(clear_orphan_redirect(&store).expect("clear"), 0);
+}
+
+/// Another program's rule without a `Version` may be one it is still writing,
+/// or one it keeps that way: deleting it breaks that program's names. Only a
+/// rule of ours — by its key or its marker — is ours to take back half-written.
+#[test]
+fn a_strangers_rule_without_a_version_survives_every_sweep() {
+    let ours_half = |marker: &str| vec![sz("Comment", marker), multi_sz("Name", ".")];
+    let store = FakeStore::with(&[
+        ("{STRANGER-HALF}", half_written()),
+        (NRPT_RULE_KEY, half_written()),
+        ("{NRR-KEEP-0000000000000001}", half_written()),
+        ("{OLD-OURS-HALF}", ours_half(NRPT_MARKER)),
+        ("{OLD-EXEMPT-HALF}", ours_half(NRPT_EXEMPT_MARKER)),
+        ("{VPN}", theirs()),
+    ]);
+    clear_orphan_redirect(&store).expect("clear");
+    assert_eq!(store.keys(), ["{STRANGER-HALF}", "{VPN}"]);
+
+    let redirect = NrptDnsRedirect::new(
+        accepting_runner(),
+        FakeStore::with(&[("{STRANGER-HALF}", half_written()), ("{VPN}", theirs())]),
+    );
+    redirect.redirect_to(listener()).expect("redirect");
+    redirect.restore(&handle()).expect("restore");
+    assert_eq!(redirect.store.keys(), ["{STRANGER-HALF}", "{VPN}"]);
 }
 
 /// The teardown's only process spawn used to be here. The NRPT restore

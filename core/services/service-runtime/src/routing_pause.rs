@@ -48,6 +48,7 @@ use nrr_storage::pause_state::{PauseEnd, RoutingPauseRecord, RoutingPauseStateRe
 
 use crate::activation_coordinator::Clock;
 use crate::active_sid_registry::{ActiveSidRegistry, ActiveSidsListener};
+use crate::state_lock::lock_state;
 
 // ── Errors ────────────────────────────────────────────────────────────────────
 
@@ -276,10 +277,8 @@ impl RoutingPauseCoordinator {
         let paused = Arc::new(PausedPrincipals::default());
         // A pause outlives a restart. An unreadable table leaves nobody paused
         // here, as every other reader of it does.
-        if let Ok(guard) = conn.lock() {
-            if let Ok(stored) = RoutingPauseStateRepository::new(&guard).list_paused() {
-                paused.replace(stored);
-            }
+        if let Ok(stored) = RoutingPauseStateRepository::new(&lock_state(&conn)).list_paused() {
+            paused.replace(stored);
         }
         Self {
             conn,
@@ -325,7 +324,7 @@ impl RoutingPauseCoordinator {
 
     /// The stored row before a write, so a refused dispatch can put it back.
     fn record(&self, sid: &str) -> Option<RoutingPauseRecord> {
-        let conn = self.conn.lock().expect("record connection mutex poisoned");
+        let conn = lock_state(&self.conn);
         RoutingPauseStateRepository::new(&conn)
             .get(sid)
             .ok()
@@ -336,7 +335,7 @@ impl RoutingPauseCoordinator {
     /// Best-effort: the refusal is what the caller reports, and a second
     /// storage failure on top of it cannot be acted on.
     fn restore(&self, sid: &str, previous: Option<&RoutingPauseRecord>, now: i64) {
-        let conn = self.conn.lock().expect("restore connection mutex poisoned");
+        let conn = lock_state(&self.conn);
         let repo = RoutingPauseStateRepository::new(&conn);
         let result = match previous {
             Some(rec) => {
@@ -429,10 +428,7 @@ impl RoutingPauseCoordinator {
             use nrr_storage::service_stability_config::{
                 RoutingStopPolicy, ServiceStabilityConfigRepository,
             };
-            let guard = self
-                .conn
-                .lock()
-                .expect("teardown_routes connection mutex poisoned");
+            let guard = lock_state(&self.conn);
             matches!(
                 ServiceStabilityConfigRepository::new(&guard)
                     .get_or_default()
@@ -485,7 +481,7 @@ impl RoutingPauseCoordinator {
         // Storage write first: a platform whose pass reads the flag learns the
         // pause from here, and the write is undone below if it refuses.
         {
-            let conn = self.conn.lock().expect("pause connection mutex poisoned");
+            let conn = lock_state(&self.conn);
             RoutingPauseStateRepository::new(&conn)
                 .set_paused_until(sid, true, reason, now, end)
                 .map_err(|e| PauseError::Storage {
@@ -535,7 +531,7 @@ impl RoutingPauseCoordinator {
         let now = self.clock.now_secs();
         let previous = self.record(sid);
         {
-            let conn = self.conn.lock().expect("resume connection mutex poisoned");
+            let conn = lock_state(&self.conn);
             RoutingPauseStateRepository::new(&conn)
                 .set_paused(sid, false, None, now)
                 .map_err(|e| PauseError::Storage {
@@ -625,10 +621,7 @@ impl RoutingPauseCoordinator {
     /// is tried again on the next call.
     pub fn lift_ended(&self, now_ms: i64, at_start: bool) -> Vec<String> {
         let ended = {
-            let conn = self
-                .conn
-                .lock()
-                .expect("lift_ended connection mutex poisoned");
+            let conn = lock_state(&self.conn);
             RoutingPauseStateRepository::new(&conn).list_ended(now_ms, at_start)
         };
         let ended = match ended {
@@ -682,10 +675,7 @@ impl RoutingPauseCoordinator {
         if sid.is_empty() {
             return Err(PauseError::EmptySid);
         }
-        let conn = self
-            .conn
-            .lock()
-            .expect("is_paused connection mutex poisoned");
+        let conn = lock_state(&self.conn);
         RoutingPauseStateRepository::new(&conn)
             .is_paused(sid)
             .map_err(|e| PauseError::Storage {
@@ -697,10 +687,7 @@ impl RoutingPauseCoordinator {
     /// Snapshot of every SID currently flagged paused. Startup logic uses
     /// this to skip recompile on tray reconnect for paused users.
     pub fn paused_sids(&self) -> Result<Vec<String>, PauseError> {
-        let conn = self
-            .conn
-            .lock()
-            .expect("paused_sids connection mutex poisoned");
+        let conn = lock_state(&self.conn);
         RoutingPauseStateRepository::new(&conn)
             .list_paused()
             .map_err(|e| PauseError::Storage {
@@ -725,14 +712,11 @@ impl RoutingPauseCoordinator {
             for sid in snapshot {
                 if paused.iter().any(|p| p == sid) {
                     let now = self.clock.now_secs();
-                    let paused_at = match RoutingPauseStateRepository::new(
-                        &self.conn.lock().expect("listener mutex"),
-                    )
-                    .get(sid)
-                    {
-                        Ok(Some(rec)) => rec.paused_at,
-                        _ => None,
-                    };
+                    let paused_at =
+                        match RoutingPauseStateRepository::new(&lock_state(&self.conn)).get(sid) {
+                            Ok(Some(rec)) => rec.paused_at,
+                            _ => None,
+                        };
                     self.audit
                         .emit(RoutingPauseAuditEvent::PausedOnTrayConnect {
                             sid: sid.clone(),
@@ -961,6 +945,28 @@ mod tests {
         assert_eq!(fx.dispatcher.remove_log(), vec!["S-A".to_string()]);
         let events = fx.audit.snapshot();
         assert!(matches!(events[0], RoutingPauseAuditEvent::Paused { .. }));
+    }
+
+    /// Pause is an emergency control: a panic elsewhere under the state lock
+    /// must not take it away until a restart.
+    #[test]
+    fn pause_and_resume_still_work_after_a_panic_under_the_state_lock() {
+        let fx = build_fx();
+        fx.registry
+            .on_connect("S-A", IpcClientProfile::TrayLightweight);
+        let poisoned = std::thread::scope(|s| {
+            s.spawn(|| {
+                let _guard = fx.coord.conn.lock().expect("unpoisoned yet");
+                panic!("simulated panic under the state lock");
+            })
+            .join()
+        });
+        assert!(poisoned.is_err(), "the lock must be poisoned for the test");
+
+        fx.coord.pause("S-A", None).expect("pause");
+        assert!(fx.coord.is_paused("S-A").expect("is_paused"));
+        fx.coord.resume("S-A").expect("resume");
+        assert!(!fx.coord.is_paused("S-A").expect("is_paused"));
     }
 
     #[test]

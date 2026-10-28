@@ -135,6 +135,19 @@ pub fn note_expected_stop() {
     }
 }
 
+/// Take this user's marker back when the stop it announced never ran.
+pub fn withdraw_expected_stop() {
+    if let Some(dir) = expected_stop_marker_dir() {
+        withdraw_expected_stop_in(&dir);
+    }
+}
+
+/// [`withdraw_expected_stop`] for a given directory. Removing a planted link
+/// removes the link, never its target.
+pub fn withdraw_expected_stop_in(dir: &std::path::Path) {
+    let _ = std::fs::remove_file(expected_stop_marker_in(dir));
+}
+
 /// [`note_expected_stop`] into a given directory. The directory must be a real
 /// one of ours; the file is written beside the marker and renamed over it, so a
 /// planted link at the marker is replaced, never written through.
@@ -208,6 +221,18 @@ mod tests {
         assert!(!expected_stop_marker_fresh_in(&dir));
         note_expected_stop_in(&dir);
         assert!(expected_stop_marker_fresh_in(&dir));
+    }
+
+    /// A stop refused for rights never happened; its marker must not vouch for
+    /// a crash in the minutes after.
+    #[test]
+    fn a_withdrawn_marker_vouches_for_nothing() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let dir = root.path().join("stop");
+        note_expected_stop_in(&dir);
+        withdraw_expected_stop_in(&dir);
+        assert!(!expected_stop_marker_fresh_in(&dir));
+        withdraw_expected_stop_in(&dir);
     }
 
     #[cfg(unix)]

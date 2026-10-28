@@ -1,14 +1,14 @@
 //! A stability patch carries only the keys the platform's service applies. A
 //! service without the whole row (Linux) still applies the verbose window and
 //! the connection-trace controls, so the GUI offers and sends exactly those —
-//! and nothing it would merely store. Runs the real `pure.js` through `node`
-//! against the real platform profiles; the executable checks are skipped when
-//! node is absent.
+//! and nothing it would merely store. Runs the real `pure.js` against the real
+//! platform profiles.
 #![allow(clippy::expect_used)]
 
-use std::io::Write;
+#[path = "support/js.rs"]
+mod js;
+
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
 
 use nrr_shared::ipc_payloads::ServiceStabilityConfigDto;
 use nrr_shared::platform_profile::PlatformProfile;
@@ -40,21 +40,17 @@ fn diagnostics_patch() -> Value {
     })
 }
 
-fn filtered(supports: &Value) -> Option<Value> {
-    let out = run_pure(&format!(
+fn filtered(supports: &Value) -> Value {
+    run_pure(&format!(
         "stabilityPatchForPlatform({}, {})",
         diagnostics_patch(),
         supports
-    ))?;
-    Some(out)
+    ))
 }
 
 #[test]
 fn a_platform_without_the_row_sends_only_the_verbose_and_trace_keys() {
-    let Some(linux) = filtered(&supports_of(PlatformProfile::linux())) else {
-        eprintln!("node not available — skipping the executable check");
-        return;
-    };
+    let linux = filtered(&supports_of(PlatformProfile::linux()));
     assert_eq!(
         linux,
         json!({
@@ -67,21 +63,15 @@ fn a_platform_without_the_row_sends_only_the_verbose_and_trace_keys() {
 
 #[test]
 fn a_platform_with_the_row_sends_the_patch_unchanged() {
-    let Some(windows) = filtered(&supports_of(PlatformProfile::windows())) else {
-        eprintln!("node not available — skipping the executable check");
-        return;
-    };
+    let windows = filtered(&supports_of(PlatformProfile::windows()));
     assert_eq!(windows, diagnostics_patch());
     // No profile in the context (mock/preview) reads as "everything supported".
-    assert_eq!(filtered(&Value::Null), Some(diagnostics_patch()));
+    assert_eq!(filtered(&Value::Null), diagnostics_patch());
 }
 
 #[test]
 fn a_platform_without_any_of_it_sends_nothing() {
-    let Some(macos) = filtered(&supports_of(PlatformProfile::macos())) else {
-        eprintln!("node not available — skipping the executable check");
-        return;
-    };
+    let macos = filtered(&supports_of(PlatformProfile::macos()));
     assert_eq!(macos, json!({}));
     let any = run_pure(&format!(
         "[{}, {}, {}].map(stabilityAnyKeyApplies)",
@@ -89,17 +79,14 @@ fn a_platform_without_any_of_it_sends_nothing() {
         supports_of(PlatformProfile::linux()),
         supports_of(PlatformProfile::macos())
     ));
-    assert_eq!(any, Some(json!([true, true, false])));
+    assert_eq!(any, json!([true, true, false]));
 }
 
 /// The capability table names real profile flags and real wire keys; a typo in
 /// either reads as "supported" or "never applies" without any error.
 #[test]
 fn the_capability_table_names_real_flags_and_real_keys() {
-    let Some(table) = run_pure("STABILITY_KEY_CAPABILITY") else {
-        eprintln!("node not available — skipping the executable check");
-        return;
-    };
+    let table = run_pure("STABILITY_KEY_CAPABILITY");
     let supports = supports_of(PlatformProfile::windows());
     // The request-only keys are echoed only when present, so the fixture names them.
     let dto: ServiceStabilityConfigDto = serde_json::from_value(json!({
@@ -119,7 +106,7 @@ fn the_capability_table_names_real_flags_and_real_keys() {
         );
         assert!(dto.get(key).is_some(), "{key} is not a stability wire key");
     }
-    let requires = run_pure("STABILITY_KEY_REQUIRES").expect("node ran a moment ago");
+    let requires = run_pure("STABILITY_KEY_REQUIRES");
     let requires = requires.as_object().expect("the table is an object");
     assert!(!requires.is_empty());
     for (key, capability) in requires {
@@ -179,42 +166,14 @@ fn every_writer_and_reader_goes_through_the_one_rule() {
     );
 }
 
-/// Evaluate `expr` against `pure.js` in node and return it as JSON.
-fn run_pure(expr: &str) -> Option<Value> {
+/// Evaluate `expr` against `pure.js` and return it as JSON.
+fn run_pure(expr: &str) -> Value {
     let program = format!(
         "{source}\nconsole.log(JSON.stringify({expr}));\n",
         source = repo_file("apps/desktop/qml/lib/pure.js").replace(".pragma library", ""),
     );
-    let out = run_node(&program)?;
-    Some(serde_json::from_str(out.trim()).unwrap_or_else(|e| panic!("{e}: {out}")))
-}
-
-/// Feed a program to `node` on stdin. `None` when node is not installed.
-fn run_node(program: &str) -> Option<String> {
-    let mut child = Command::new("node")
-        .arg("-")
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .unwrap_or_else(|e| {
-            panic!("this check runs the QML JavaScript through node; install Node.js ({e})")
-        });
-    let Some(stdin) = child.stdin.as_mut() else {
-        panic!("stdin was piped")
-    };
-    stdin
-        .write_all(program.as_bytes())
-        .unwrap_or_else(|e| panic!("write the harness to node: {e}"));
-    let out = child
-        .wait_with_output()
-        .unwrap_or_else(|e| panic!("node runs to completion: {e}"));
-    assert!(
-        out.status.success(),
-        "node rejected the harness: {}",
-        String::from_utf8_lossy(&out.stderr)
-    );
-    Some(String::from_utf8_lossy(&out.stdout).into_owned())
+    let out = js::run_js(&program);
+    serde_json::from_str(out.trim()).unwrap_or_else(|e| panic!("{e}: {out}"))
 }
 
 /// The first-run status line reports the keys that reached the service, not

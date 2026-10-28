@@ -931,6 +931,49 @@ mod tests {
         ));
     }
 
+    fn migrated_state_db() -> Arc<Mutex<rusqlite::Connection>> {
+        use nrr_storage::repository::MigrationRunner as _;
+        let runner = nrr_storage::SqliteMigrationRunner::for_state_db(
+            rusqlite::Connection::open_in_memory().expect("state db"),
+        );
+        runner.run_pending_migrations().expect("state migrations");
+        Arc::new(Mutex::new(runner.into_connection()))
+    }
+
+    #[test]
+    fn a_user_who_switched_history_off_stays_unrecorded_after_a_restart() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("nrr_conn_history.db");
+        let state = migrated_state_db();
+        let before = open_for_service(path.clone(), Some(Arc::clone(&state)));
+        before.set_prefs(ALICE, Some(false), None).expect("off");
+        drop(before);
+
+        let after = open_for_service(path, Some(state));
+        after.record(&rec(Some(ALICE), "a.exe", 1, T0), T0);
+        after.record(&rec(Some(BOB), "b.exe", 2, T0), T0);
+        assert!(
+            after.read(&mine(ALICE), T0).expect("alice").0.is_empty(),
+            "Alice's \"off\" must survive the service restart"
+        );
+        assert_eq!(after.read(&mine(BOB), T0).expect("bob").0.len(), 1);
+    }
+
+    #[test]
+    fn unreadable_choices_keep_the_history_closed() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        // A state DB without its schema: nobody's choice can be read.
+        let state = Arc::new(Mutex::new(
+            rusqlite::Connection::open_in_memory().expect("state db"),
+        ));
+        let h = open_for_service(dir.path().join("nrr_conn_history.db"), Some(state));
+        h.record(&rec(Some(ALICE), "a.exe", 1, T0), T0);
+        assert!(matches!(
+            h.read(&mine(ALICE), T0),
+            Err(HistoryError::Unavailable)
+        ));
+    }
+
     #[test]
     fn long_names_are_cut_at_a_character_boundary() {
         // One ASCII byte first, so the limit falls inside a two-byte character.

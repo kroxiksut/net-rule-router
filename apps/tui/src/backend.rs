@@ -332,8 +332,9 @@ fn subscribe(client: &Arc<dyn IpcClient>, events: &Sender<BackendEvent>) -> bool
     let _ = thread::Builder::new()
         .name("nrr-tui-push".into())
         .spawn(move || {
+            let mut reader = PushReader::default();
             while let Ok(frame) = pushes.recv() {
-                if let Some(event) = parse_push(&frame) {
+                if let Some(event) = reader.read(&frame) {
                     if events.send(BackendEvent::Push(event)).is_err() {
                         return;
                     }
@@ -348,6 +349,44 @@ fn subscribe(client: &Arc<dyn IpcClient>, events: &Sender<BackendEvent>) -> bool
 /// its event ring. An event this build cannot read (a newer service's kind or
 /// value) still says something changed, so it reads as a gap: what the screen
 /// derived from pushes is read again instead of silently falling behind.
+/// Event kinds this build does not know that one session remembers having
+/// re-read for; past it, further unknown kinds are dropped.
+const UNKNOWN_KINDS_REMEMBERED: usize = 64;
+
+/// [`parse_push`] for one subscription: a kind this build does not know asks
+/// for a re-read the first time it arrives, not on every frame of it.
+#[derive(Default)]
+pub struct PushReader {
+    unknown_kinds: std::collections::HashSet<String>,
+}
+
+impl PushReader {
+    pub fn read(&mut self, frame: &Value) -> Option<PushEvent> {
+        let event = frame.get("event")?;
+        let kind = event
+            .get("type")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        if kind.is_empty() || kind == "push-gap" {
+            return parse_push(frame);
+        }
+        match serde_json::from_value::<StatusUpdateEvent>(event.clone()) {
+            Ok(event) => Some(PushEvent::Status(Box::new(event))),
+            Err(e) if e.to_string().starts_with("unknown variant") => {
+                if self.unknown_kinds.contains(kind)
+                    || self.unknown_kinds.len() >= UNKNOWN_KINDS_REMEMBERED
+                    || kind.len() > 64
+                {
+                    return None;
+                }
+                self.unknown_kinds.insert(kind.to_owned());
+                Some(PushEvent::Gap)
+            }
+            Err(_) => Some(PushEvent::Gap),
+        }
+    }
+}
+
 pub fn parse_push(frame: &Value) -> Option<PushEvent> {
     let event = frame.get("event")?;
     if event.get("type").and_then(Value::as_str) == Some("push-gap") {
@@ -507,5 +546,29 @@ mod tests {
             } })),
             Some(PushEvent::Status(_))
         ));
+    }
+
+    /// A newer service publishing a kind this build does not know, frame after
+    /// frame, made every frame a full re-read of the snapshot, the rules and
+    /// the alerts. The first one says something new exists; the rest add
+    /// nothing.
+    #[test]
+    fn an_unknown_event_kind_asks_for_one_read_not_one_per_frame() {
+        let mut reader = PushReader::default();
+        let future = serde_json::json!({ "event-id": 7, "event": { "type": "from-the-future" } });
+        assert!(matches!(reader.read(&future), Some(PushEvent::Gap)));
+        assert!(reader.read(&future).is_none(), "the same kind again");
+        let other = serde_json::json!({ "event": { "type": "also-from-the-future" } });
+        assert!(matches!(reader.read(&other), Some(PushEvent::Gap)));
+        // A real hole is always a re-read, however often it comes.
+        let gap = serde_json::json!({ "event": { "type": "push-gap" } });
+        assert!(matches!(reader.read(&gap), Some(PushEvent::Gap)));
+        assert!(matches!(reader.read(&gap), Some(PushEvent::Gap)));
+        // So is a known kind whose value did not read.
+        let odd = serde_json::json!({ "event": {
+            "type": "routing-pause-state-changed", "sid": "S-1", "paused": "soon"
+        } });
+        assert!(matches!(reader.read(&odd), Some(PushEvent::Gap)));
+        assert!(matches!(reader.read(&odd), Some(PushEvent::Gap)));
     }
 }

@@ -1,0 +1,36 @@
+{
+  "format": 1,
+  "rules-folder": "D:/My Rule Sets",
+  "rules-files": {
+    "primary": "D:/My Rule Sets/work/rules_primary.txt",
+    "secondary": "D:/My Rule Sets/work/rules_secondary.txt",
+    "written": {
+      "D:/My Rule Sets/work/rules_primary.txt": "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08",
+      "D:/My Rule Sets/work/rules_secondary.txt": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    "tertiary": "D:/My Rule Sets/work/rules_tertiary.txt"
+  },
+  "selected-set": "user:work",
+  "service-intent": {
+    "route-policy": {
+      "leak-protection": "everything",
+      "doh-lockdown-enabled": true,
+      "mode": "prefer-secondary-when-available",
+      "primary": { "stable-id": "win-adapter:ethernet", "display-name": "Ethernet" },
+      "secondary": { "stable-id": "win-adapter:vpn", "display-name": "Example VPN" }
+    },
+    "notice-mutes": [
+      { "scope-kind": "app", "scope-value": "C:/Apps/Mail/mail.exe", "until-ms": 1800000000000 }
+    ],
+    "stability": { "fake-ip-enabled": true }
+  },
+  "accepted-eula": 1,
+  "merge-policy": "service-wins",
+  "window-parked": {
+    "route-policy": { "leak-protection": "sites" },
+    "stability": { "dns-fast-answers": false },
+    "binding": { "secondary": "win-adapter:vpn" },
+    "parked-at": 1700000000000
+  },
+  "setting-from-a-newer-build": { "kept": ["verbatim", 1] }
+}

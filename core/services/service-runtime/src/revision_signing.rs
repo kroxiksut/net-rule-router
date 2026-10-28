@@ -71,6 +71,40 @@ impl RevisionSigning {
         self.bootstrap.as_ref().map(|o| o.signing_key.as_slice())
     }
 
+    /// The confirmed overrides of the protection of system programs, read
+    /// under this start's key. A key reset not acknowledged yet keeps the
+    /// rows the lost key signed, for the acknowledgement to adopt.
+    #[must_use]
+    pub fn open_override_grants(
+        &self,
+        conn: Arc<Mutex<Connection>>,
+        audit: Option<Arc<AuditTrail>>,
+        now_ms: i64,
+    ) -> Arc<crate::override_grants::OverrideGrants> {
+        let key = self.signing_key().map(<[u8]>::to_vec);
+        if self
+            .bootstrap
+            .as_ref()
+            .is_some_and(|o| o.key_reset_unacknowledged)
+        {
+            crate::override_grants::OverrideGrants::open_under_key_reset(conn, key, audit, now_ms)
+        } else {
+            crate::override_grants::OverrideGrants::open(conn, key, audit, now_ms)
+        }
+    }
+
+    /// Makes every rules provider of this process check a stored book against
+    /// this start's key before it is enforced. Composition roots only: the key
+    /// is process-wide, and tests sign with keys of their own.
+    pub fn check_enforced_books(&self) {
+        if let Some(outcome) = self.bootstrap.as_ref() {
+            crate::production_rules_provider::install_signature_check(
+                outcome.signing_key.clone(),
+                Arc::clone(&self.key_store),
+            );
+        }
+    }
+
     /// Makes `coordinator` sign every row it writes and lets an acknowledged
     /// key reset clear its marker. Without a key it is returned unchanged.
     #[must_use]
@@ -145,7 +179,8 @@ pub fn other_principals_hold_revisions(
             .map(|principals| {
                 principals
                     .iter()
-                    .any(|p| p != caller && p != nrr_storage::BASELINE_PRINCIPAL)
+                    // The baseline is the administrator's, never the caller's.
+                    .any(|p| p != caller)
             })
             // Unreadable is not consent to speak for others.
             .unwrap_or(true)

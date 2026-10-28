@@ -625,7 +625,7 @@ QtObject {
 
     function _announceResetToBaselineFailed(code) {
         root.statusLine = root.tr("status.reset-baseline-failed",
-            "Could not start reset to baseline: ") +
+            "Could not reset to baseline: ") +
             ((typeof root.ipcErrorLabel === "function")
                 ? root.ipcErrorLabel(String(code || "unknown"))
                 : String(code || "unknown"))

@@ -1,7 +1,8 @@
 #![no_main]
 //! Files an administrator hands the installer, read again by the service at
 //! its first start: the settings-export and options readers, and the whole
-//! bundle check with the input split into its four files.
+//! bundle check with the input split into its four files. The bundle check
+//! sends the rules a settings file carries through the rules-file gates.
 
 use libfuzzer_sys::fuzz_target;
 use nrr_domain::rules_file::HostPlatform;

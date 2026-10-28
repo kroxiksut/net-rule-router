@@ -202,7 +202,7 @@
         "uninstall": "Uninstall service",
         "start": "Start service",
         "stop": "Stop service",
-        "stop-tooltip": "Stops the background service. By default all routes are removed and every connection returns to your main connection; leak-protection blocks are removed. (Turn on \"Keep matched routes on the additional adapter\" in Settings to keep your routed sites on the additional adapter — e.g. a work/corporate adapter.) Note: simply closing the app keeps routing active, because the service keeps running.",
+        "stop-tooltip": "Stops the background service. By default all routes are removed and every connection returns to your main connection; leak-protection blocks are removed. (Turn on \"Keep rule routes on the additional adapter after pause/stop\" in Settings to keep your routed sites on the additional adapter — e.g. a work/corporate adapter.) Note: simply closing the app keeps routing active, because the service keeps running.",
         "restart": "Restart service",
         "open-logs": "Open service logs folder",
         "gc-orphan-comments": "Clear orphan comments"
@@ -222,7 +222,7 @@
         "label": "Also start the tray at sign-in",
         "description": "The service starts at boot before anyone logs in and cannot open the tray itself. This starts the tray icon when you sign in — the same setting as “Start the tray automatically at sign-in” in General."
       },
-      "crash-recovery": "Service will auto-restart up to 3 times after failures.",
+      "crash-recovery": "After a failure the service restarts by itself; if failures repeat, the network returns to normal and the service keeps trying, less often.",
       "admin-auto-revoke": {
         "title": "Administrator rights",
         "disable-label": "Do not revoke administrator approval automatically",
@@ -280,7 +280,7 @@
       "import-secondary": "Import additional route preset...",
       "export-primary": "Export primary route preset...",
       "export-secondary": "Export additional route preset...",
-      "full-settings-description": "Export adapter bindings, behavior mode, and rules-file paths as a single YAML file. Useful for backing up or transferring your settings.",
+      "full-settings-description": "Export adapter bindings, your rules for both routes (those for other operating systems included), the paths of your rules files, the default route and leak protection as a single YAML file. Useful for backing up or transferring your settings.",
       "export-full-settings": "Export full settings (YAML)...",
       "bundled-presets": {
         "title": "Bundled presets",
@@ -426,7 +426,7 @@
         "status-paused": "Rules are disabled",
         "action-disable": "Disable rules",
         "action-enable": "Enable rules",
-        "persistence-hint": "Disabling stops applying rules until you re-enable them. Setting persists across restarts.",
+        "persistence-hint": "Disabling stops applying rules for the time chosen under “Turn rules back on”: they come back on their own when it is up, and with “When I turn them back on” only when you do.",
         "paused-since": "Paused since {timestamp}",
         "no-tray-warning": "Tray is not running. Rules apply only while the tray is active."
       },
@@ -443,7 +443,8 @@
         "note-everything": "Nothing leaves except through the additional connection, your local network and what your rules send over the main connection. If the additional connection drops, the internet waits until it returns."
       },
       "routing-method": {
-        "title": "Routing method"
+        "title": "Routing method",
+        "scope-note": "The settings in this group apply to every user of this computer and need administrator approval to change, except the shared-address ones, which are yours alone."
       },
       "enforcement-mode": {
         "label": "How routed traffic is enforced",
@@ -461,7 +462,7 @@
       },
       "fake-ip": {
         "label": "Route sites over virtual addresses (fake-IP)",
-        "note": "Each routed site is answered with its own virtual address, so routing stays per-site even when several sites share one real server address — and protection no longer races the first connection. Requires the local DNS resolver. On Windows, turning this on loads the bundled Wintun virtual-adapter driver (signed by WireGuard LLC). Off by default.",
+        "note": "Each routed site is answered with its own virtual address, so routing stays per-site even when several sites share one real server address — and protection no longer races the first connection. Requires the local DNS resolver. On Windows, turning this on loads the bundled Wintun virtual-adapter driver (signed by WireGuard LLC). On by default on a new install.",
         "driver-status": "Virtual-adapter driver (Wintun): "
       },
       "fake-ip-udp-relay": {
@@ -687,7 +688,7 @@
           "when-safe": "Turning it off is safe if this program does not open the sites your rules route: its lookups will then simply go past your domain rules. Leave it on if you rely on leak protection for everything."
         },
         "leak-protection": {
-          "what": "While leak protection is on, IPv6 stays closed: your rules do not route IPv6 yet, so this is how IPv6 traffic is kept from leaving around them.",
+          "what": "With leak protection set to Everything, IPv6 goes out only through the additional connection: while that connection is down or carries no IPv6, IPv6 waits. With Routed sites, only the IPv6 addresses of your routed sites are held, and only while the additional connection carries no IPv6.",
           "when-safe": "Turning leak protection off opens IPv6 again, but it also stops blocking your routed traffic when the additional route goes down. That is safe only if nothing you route needs to stay hidden, for example on a network you trust."
         }
       },
@@ -1129,7 +1130,7 @@
       "card-title": "Routing state",
       "detail-active": "Rules apply on this user session.",
       "detail-limited": "Some rules are not being applied right now. The notices say why.",
-      "detail-paused": "Rules are disabled until you re-enable them.",
+      "detail-paused": "Rules are disabled for the time chosen; they come back on their own when it is up, or when you turn them back on.",
       "detail-no-tray": "Run the tray icon to apply rules on this session.",
       "detail-no-rules": "Add rules in the Rules section, then click Save and review.",
       "detail-disconnected": "Showing preview data. Install and start the NetRuleRouter service to apply rules.",
@@ -1373,6 +1374,7 @@
         "one": "Discard {count} custom rule and restore the baseline rules.",
         "other": "Discard {count} custom rules and restore the baseline rules."
       },
+      "reset-files": "Your linked rules files will be rewritten with the baseline rules: {files}.",
       "column-added": "Added",
       "column-removed": "Removed",
       "column-modified": "Modified or retargeted",
@@ -1734,7 +1736,7 @@
       "protection-title": "Protection",
       "protection-description": "Recommended for everyone. Each of these can be changed later in Settings.",
       "protection-doh-lockdown": "Keep browsers from resolving routed sites past NetRuleRouter",
-      "protection-fake-ip": "Route sites by name, so an address shared with another site is not dragged along",
+      "protection-fake-ip": "Route sites by name, so an address shared with another site is not dragged along (uses a virtual network adapter; on Windows this loads its Wintun driver)",
       "protection-diagnostic-logs": "Write detailed diagnostic logs (only needed to report a problem)",
       "protection-mute-block-notices": "Do not show notifications about blocked traffic (rule suggestions still arrive)",
       "site-notice-note": "Even with the tray closed, NetRuleRouter tells you when a site you open does not open over the main connection. You can turn this off in Settings, Notifications.",
@@ -1902,9 +1904,10 @@
     "logs-clear-not-wired": "Logs clear is preview-only — service opcode is not wired yet.",
     "bridge-unavailable": "Service bridge not connected.",
     "import-read-failed": "Cannot read preset file. See logs for details.",
-    "no-source-file-bound": "No source file is bound yet. Use “Load rule list…” first.",
+    "no-source-file-bound": "No source file is bound yet. Use “Load rules list...” first.",
     "export-rpc-failed": "Export failed: ",
     "export-write-failed": "Cannot write preset file to the chosen path.",
+    "settings-export-write-failed": "Cannot write settings file to the chosen path.",
     "export-completed": "Preset exported.",
     "export-nothing-to-export": "There are no rules to export yet.",
     "rules-saved-service-stopped": "The service is not running, so the rules were not applied — saving them to your rules file instead.",
@@ -2003,8 +2006,7 @@
     "safe-disable": {
       "requested": "Safe disable requested",
       "cancelled": "Safe disable cancelled",
-      "completed": "Safe disable applied",
-      "intent-captured": "Safe disable intent captured (RPC bridge pending — see logs)"
+      "completed": "Safe disable applied"
     },
     "pending-apply-parked": "Changes parked. They will be applied when the service is running again.",
     "pending-apply-waiting": "Waiting for the service to come online…",
@@ -3240,7 +3242,7 @@
       "reason": {
         "route-unavailable": "The route these addresses are bound to is down right now, so none of them open. This is one notice for the whole route.",
         "blocked-by-rule": "A rule denies this address directly.",
-        "ipv6-blocked": "IPv6 is switched off while leak protection is on, and this address is IPv6. No rule blocked it — the switch is in Settings.",
+        "ipv6-blocked": "With leak protection set to Everything, IPv6 goes out only through the additional connection, and this IPv6 address could not. No rule blocked it — the switch is in Settings.",
         "dns-lockdown": "This app tried to reach a public DNS resolver of its own instead of the one NetRuleRouter provides, and encrypted-DNS blocking closed it. No rule blocked it — the switch is in Settings, under Routing.",
         "unattributed": "NetRuleRouter blocked this address, but could not identify which filter did it.",
         "unspecified": "No further detail available."
@@ -3248,7 +3250,7 @@
       "reason-short": {
         "route-unavailable": "Route is down",
         "blocked-by-rule": "Denied by a rule",
-        "ipv6-blocked": "IPv6 is switched off",
+        "ipv6-blocked": "IPv6 held by leak protection",
         "dns-lockdown": "Own encrypted DNS",
         "unattributed": "Blocked, filter unknown",
         "unspecified": "Blocked"
@@ -3532,7 +3534,7 @@
         "imported-seed": "Imported",
         "cache-rebuild": "Rebuilt",
         "os-cache-seed": "OS cache",
-        "reverse-confirmed": "Reverse-confirmed",
+        "reverse-confirmed": "Confirmed by the service",
         "browser-history-seed": "Browser history"
       },
       "source-filter": {
@@ -3795,6 +3797,7 @@
       "route-table-reconciled": "Route table updated: {added} added, {removed} removed, {desired_routes} in total",
       "adapters-changed-recompute": "Network adapter state changed ({adapter_changes}), recomputing routes",
       "ipc-request-failed": "Request {op} failed: {error_code}",
+      "ipc-audit-failed-emergency-ran": "The audit trail could not record request {op} ({error}); it ran anyway so that a full disk does not lock you out of this control.",
       "direct-host-shares-secondary-ip": "{direct_host} shares address {shared_ip} with the Additional-route rule {secondary_rule_host}, so its traffic goes over the Additional connection. Narrow that rule or route the host separately.",
       "push-subscription-opened": "An app subscribed to service notifications",
       "push-subscription-closed": "An app unsubscribed from service notifications ({subscribers} still subscribed)",
@@ -3878,6 +3881,8 @@
       "hostseed-apex-parked-no-address": "Suffix-rule host {hostname} has no address record after {confirmations} confirmations and is parked until the rule book changes; its subdomains stay covered.",
       "hostseed-resolver-unsupported": "DNS resolution is not supported on this platform ({reason}); rule-hostname seeding was aborted.",
       "hostseed-upsert-failed": "Could not save a resolved rule hostname to the address cache ({error}).",
+      "hosts-file-too-large": "The OS hosts file is {bytes} bytes, more than the {cap} that are read; its entries are not used until it shrinks.",
+      "hosts-file-entries-capped": "The OS hosts file names more hosts than are kept; the first {kept} are used and the rest are ignored.",
       "principal-routes-apply-failed": "System routes could not be applied ({reason}); traffic is filtered but not steered correctly.",
       "principal-routes-unresolved-no-link": "No live additional connection is available to route through; some users' routes were not installed.",
       "principal-blanket-block-not-armed": "The full traffic block these settings request could not be armed; traffic outside the routing rules is not being blocked.",
@@ -3898,7 +3903,7 @@
       "conn-unanswered-omitted": "{omitted} more unanswered connection(s) in the last minute were not listed.",
       "dnsobs-collateral-pin-skipped-secondary-unusable": "Skipped pinning shared address {shared_ip} (also used by {secondary_rule_host}) to the additional link because it is currently unusable; {direct_host} stays on the primary link and will be re-evaluated once the link recovers.",
       "dnsobs-os-cache-seeded": "Seeded the address cache from the OS DNS cache: {matched} matched, {refreshed} refreshed, {ignored} ignored.",
-      "dnsobs-reverse-confirmed-rule-host-cached": "Cached rule host {hostname} ({addresses} address(es)) confirmed by reverse lookup from a blocked connection.",
+      "dnsobs-reverse-confirmed-rule-host-cached": "Learned the addresses of rule host {hostname} ({addresses} address(es)).",
       "dnsobs-direct-tenant-forgotten-pending-companion": "Host {host} is a pending suggestion for the additional route; removed {rows} row(s) from the shared-address tracking so its addresses stay pinned there.",
       "dnsobs-upsert-failed": "Could not save an observed hostname to the address cache ({error}).",
       "svctask-retention-delete-failed": "Retention could not delete some {kind} files ({deleted} removed so far).",
@@ -3910,7 +3915,7 @@
       "rules-unrecognized-kept": "{unrecognized} rule(s) of a kind this version does not know are kept in the rule set but not applied.",
       "svctask-revisions-prune-failed": "Revision retention pass failed ({error}).",
       "svctask-revisions-touch-failed": "Could not update the last-cleanup timestamp for revision retention ({error}).",
-      "svctask-dns-observe-cached": "DNS observation cached new hosts under active rules: {matched} matched, {refreshed} refreshed, {ignored} ignored, {collateral} collateral.",
+      "svctask-dns-observe-cached": "DNS observation cached new hosts under active rules: {matched} matched, {refreshed} refreshed, {ignored} ignored, {shared_sites} shared with other sites.",
       "svctask-ipc-accept-scheduled": "IPC accept loop scheduled: task {task}, class {class}, up to {max_restarts} restarts (backoff {backoff_base_ms}-{backoff_cap_ms} ms).",
       "svctask-rule-hostname-seed": "Rule-hostname seeding: {resolved} resolved, {already_cached} already cached, {failed} failed, {apex_absent} apex absent.",
       "fqdncache-mutex-poisoned-ips": "The FQDN cache lock was poisoned; treating the hostname lookup as empty.",
@@ -3920,7 +3925,7 @@
       "fqdncache-site-lookup-failed": "Listing cached hostnames of a site in every zone failed; treating it as empty ({error}).",
       "fqdncache-mutex-poisoned-snapshot": "The FQDN cache lock was poisoned; taking an empty snapshot.",
       "fqdncache-snapshot-failed": "Taking a snapshot of the FQDN cache failed; treating it as empty ({error}).",
-      "fqdncache-shared-hosts-read-failed": "Reading the addresses shared with direct hosts from the FQDN cache failed; none are exempted from blocking this pass ({error}).",
+      "fqdncache-shared-hosts-read-failed": "Could not read which addresses are shared with sites outside your rules ({error}); this pass treats none of them as shared.",
       "bootstrap-audit-tail-truncated": "The audit trail is shorter than expected: anchored at sequence {anchor_seq}, found {found_seq} — some events were removed.",
       "audit-chain-restarted": "An administrator restarted the audit chain over {breaks} break(s) shown to them; the first was in {first_file}, line {first_line}.",
       "bootstrap-orphaned-candidates-rejected": "Startup cleanup rejected {count} orphaned candidate revision(s) left over from an interrupted run.",
@@ -3999,9 +4004,9 @@
       "svc-persid-pause-aware-reconcile-failed": "Failed to reapply rule enforcement while honoring paused users ({error}).",
       "svc-persid-fakeip-recompile-failed": "Failed to recompile filtering rules after a fake-IP configuration change ({error}).",
       "svc-conntrace-fcrdns-recent-match": "Matched {ip} to a recently seen answer for rule host {host} ({what}) — a permit will apply on the next check.",
-      "svc-conntrace-fcrdns-reverse-confirmed-rule": "Reverse-confirmed {ip} as a rule host ({what}) — a permit will apply on the next check.",
-      "svc-conntrace-fcrdns-reverse-confirmed-direct": "Reverse-confirmed {ip} as a direct (non-rule) host ({what}) — an exception will apply on the next check.",
-      "svc-conntrace-fcrdns-worker-spawn-failed": "Could not start the reverse-DNS naming worker: {error}.",
+      "svc-conntrace-fcrdns-reverse-confirmed-rule": "Identified {ip} as a rule host ({what}) — a permit will apply on the next check.",
+      "svc-conntrace-fcrdns-reverse-confirmed-direct": "Identified {ip} as a site outside your rules ({what}) — it is let through from the next check.",
+      "svc-conntrace-fcrdns-worker-spawn-failed": "Could not start the worker that identifies addresses: {error}.",
       "svc-conntrace-route-path-unavailable": "Connection trace disabled — the routing path is not available.",
       "svc-conntrace-vpn-client-app-learned": "Learned a VPN client application at {path} — it is now exempted from the block-all policy.",
       "svc-conntrace-etw-unavailable-merged": "The ETW connection observer is unavailable ({error}); continuing with the WFP observer only.",
@@ -4283,8 +4288,8 @@
       "persid-plan-rule-shape-unsupported": "{count} rule(s) are not enforced: they limit an address to one application, which cannot be carried out yet, so they were skipped rather than applied to every application ({rules}).",
       "persid-plan-suffix-truncated": "Rule {rule_id} for suffix {suffix} matched more hosts than the limit of {cap}; only the most recently seen hosts were enforced.",
       "persid-plan-pin-set-trimmed": "Leak protection address set trimmed: {kept} address(es) kept, {dropped} dropped (already routed elsewhere or covered by {app_covered} app-observed destination(s)).",
-      "persid-plan-shared-ip-excluded": "Smart leak protection excluded {excluded} shared address(es) from blocking (each is also used by a directly-visited host); {pinned} address(es) remain pinned.",
-      "persid-plan-service-dns-spared": "Additional-link rules name {count} DNS server(s) of the main link ({servers}). System services keep reaching them over the main link: cutting them would break name resolution for the whole machine. Mode B moves name resolution to the service.",
+      "persid-plan-shared-ip-excluded": "Leak protection leaves {excluded} address(es) shared with other sites out of blocking; {pinned} address(es) stay held.",
+      "persid-plan-service-dns-spared": "Additional-link rules name {count} DNS server(s) of the main link ({servers}). System services keep reaching them over the main link: cutting them would break name resolution for the whole machine. The local DNS resolver moves name resolution to the service.",
       "persid-service-accounts-owner-changed": "Users the route table serves changed ({previous} → {owner}): system services now follow their leak protection addresses.",
       "persid-plan-network-too-wide": "{count} network(s) routed through the additional adapter are wider than /{widest_prefix}, so leak protection does not block them while that adapter is down: their traffic may leave through the main adapter (for example: {sample}).",
       "foreign-tunnel-networks-over-cap": "{count} network(s) of other VPN tunnels are past the limit of {cap} per tunnel and address family and stay under leak protection while the additional adapter is down.",
@@ -4293,7 +4298,7 @@
       "persid-plan-kill-switch-active": "Leak protection active: {kill_switch_filters} filter(s) pinning {pinned_addresses} address(es).",
       "persid-plan-secondary-unresolved-fail-closed": "The additional connection could not be found; leak protection holds traffic until it returns ({fail_closed_filters} filter(s)).",
       "persid-plan-secondary-unresolved-heartbeat": "The additional connection is still not found after {elapsed_minutes} minute(s); leak protection keeps holding traffic ({fail_closed_filters} filter(s)).",
-      "persid-plan-standing-filter-alarm": "Standing filter count reached {filters}, above the alarm threshold of {threshold} (previous peak {previous_peak}): {by_band}.",
+      "persid-plan-standing-filter-alarm": "Standing filter count reached {filters}, above the alarm level (previous peak {previous_peak}): {by_band}.",
       "persid-plan-standing-filter-recovered": "Standing filter count dropped back to {filters}, below the alarm threshold.",
       "persid-plan-machine-filter-alarm": "Standing filters on the computer, all users together, reached {filters} (previous peak {previous_peak}), above the alarm threshold.",
       "persid-plan-machine-filter-recovered": "Standing filters on the computer dropped back to {filters}, below the alarm threshold.",
@@ -4471,30 +4476,31 @@
       "prod-diag-log-page-duplicate-positions": "Log page positions are not unique; paging can drop entries (duplicates: {duplicates}).",
       "prod-coord-activation-audit-append-failed": "Audit append failed for an activation event (error: {error}).",
       "dns-listener-short-name-completed": "Completed short name {label} using the network domain, resolving as {completed} from server {server}.",
-      "dns-listener-modeb-resolves-caught-up": "Mode B: rule-host resolution is keeping up again — answering from the upstream as usual.",
-      "dns-listener-direct-host-parked-suggestion": "Direct host {host} is a parked suggestion for the additional route — left there instead of being steered onto the main route.",
-      "dns-listener-modeb-direct-host-shared-address": "Mode B: direct host {host} shares every address with an additional-route rule — answered with a virtual address so it stays on the main route.",
+      "dns-listener-modeb-resolves-caught-up": "Local DNS resolver:rule-host resolution is keeping up again — answering from the upstream as usual.",
+      "dns-listener-direct-host-parked-suggestion": "{host}, a site outside your rules, is a parked suggestion for the additional route — left there instead of being steered onto the main route.",
+      "dns-listener-modeb-direct-host-shared-address": "Local DNS resolver: {host}, a site outside your rules, shares its addresses with an additional-route rule — answered so that it stays on the main route.",
       "dns-listener-local-resolver-knows-name": "A private resolver on this machine ({server}) knows a name the main upstream reported as non-existent.",
       "dns-listener-rule-host-ipv6-uncovered": "Rule host {host} was queried over IPv6, which this rule cannot cover — its IPv6 traffic leaves outside the rule.",
-      "dns-listener-modeb-resolve-slots-saturated": "Mode B: all {concurrent} rule-host resolve slots are waiting on an unresponsive upstream — serving rule hosts from the cache so the rest of the machine's DNS keeps working.",
-      "dns-listener-modeb-unrecognised-recv-error": "Mode B: an unrecognized error occurred while receiving a query ({error}, {consecutive_errors} in a row) — continuing to serve.",
-      "dns-listener-handler-panicked": "Mode B: handling one DNS query ({bytes} bytes) failed unexpectedly — the query was answered with a failure and the resolver keeps serving.",
+      "dns-listener-modeb-resolve-slots-saturated": "Local DNS resolver:all {concurrent} rule-host resolve slots are waiting on an unresponsive upstream — serving rule hosts from the cache so the rest of the machine's DNS keeps working.",
+      "dns-listener-modeb-unrecognised-recv-error": "Local DNS resolver:an unrecognized error occurred while receiving a query ({error}, {consecutive_errors} in a row) — continuing to serve.",
+      "dns-listener-handler-panicked": "Local DNS resolver:handling one DNS query ({bytes} bytes) failed unexpectedly — the query was answered with a failure and the resolver keeps serving.",
       "dns-first-contact-timing": "First-contact routes over the last minute: {calls} DNS answers waited on them, {avg_us} µs on average, {max_us} µs at most; {slow} took longer than 5 ms.",
-      "dns-listener-query-shed": "Mode B: a DNS query from {source} was failed at once instead of queued ({reason}; {shed} so far) — the resolver is saturated or one program is past its share.",
+      "dns-listener-query-shed": "Local DNS resolver:a DNS query from {source} was failed at once instead of queued ({reason}; {shed} so far) — the resolver is saturated or one program is past its share.",
       "dns-resolver-withheld-name-leak-guard": "Leak protection is blocking: the name of rule host {host} was not sent over the main link ({reason}) — the answer is withheld.",
       "dns-resolver-redirect-lifted-no-upstream": "Local DNS resolver: no upstream DNS server answers — system DNS is handed back to the OS until one does.",
       "dns-resolver-redirect-lifted-only-foreign": "Local DNS resolver: only another VPN's DNS server answers — system DNS is handed back to the OS and name-based routing is off until a resolver of ours answers.",
       "dns-upstream-dropped-foreign": "The upstream DNS server was dropped: its network now belongs to another VPN.",
       "dns-resolver-redirect-back-upstream-answers": "Local DNS resolver: an upstream DNS server answers again — system DNS is redirected to the resolver.",
+      "dns-resolver-redirect-refused": "Local DNS resolver: the system accepted the DNS redirect and then refused it — it was withdrawn, names resolve past the resolver, and it will be tried again.",
       "dns-resolver-tcp-bind-failed": "Local DNS resolver: could not listen for DNS over TCP on {addr} ({error}) — answers too large for a datagram will not resolve.",
-      "dns-stack-modeb-no-signed-in-user": "Mode B: no signed-in user yet — staying in reactive mode until sign-in.",
-      "dns-stack-modeb-armed": "Mode B armed: the local DNS resolver ({listener}) forwards non-rule queries to upstream {upstream}, which answered a probe.",
+      "dns-stack-modeb-no-signed-in-user": "Local DNS resolver:no signed-in user yet — staying in reactive mode until sign-in.",
+      "dns-stack-modeb-armed": "Local DNS resolver on: it ({listener}) forwards non-rule queries to upstream {upstream}, which answered a probe.",
       "dns-stack-servers-uncached": "Network changes cannot be watched ({error}); every unanswered name re-reads the machine's DNS servers.",
       "dns-servers-cache-config-feed-unwatched": "DNS configuration changes cannot be watched ({error}); the DNS server list still refreshes when a connection or route changes.",
       "dns-stack-changes-unwatched": "Network or DNS settings changes cannot be watched ({error}); the local resolver re-reads the connections' DNS domains on every check.",
       "dns-stack-short-name-suffixes-unread": "The short-name domains could not be read ({error}); the ones read before stay in use.",
       "dns-stack-local-suffixes-unread": "The home-network suffix list could not be read ({error}); the one read before stays in use.",
-      "dns-stack-modeb-no-upstream-answered": "Mode B was requested, but no upstream DNS server answered a probe — staying in reactive mode.",
+      "dns-stack-modeb-no-upstream-answered": "The local DNS resolver was requested, but no upstream DNS server answered a probe — staying in reactive mode.",
       "power-resume-rebind-requested": "Re-resolving the adapter binding on request ({reason}).",
       "power-resume-from-sleep": "The machine resumed from sleep — re-resolving the adapter binding and re-applying routes.",
       "prodmisc-failclosed-state": "Leak protection blocking traffic for the additional route: {fail_closed_active}.",
@@ -4660,7 +4666,7 @@
     "uac-declined": "Administrator approval is required to apply this change. The change was not applied.",
     "elevation-agent-missing": "Administrator approval could not be asked for: nothing in this session can show the password prompt. The change was not made.",
     "elevation-unavailable": "Administrator approval could not be checked: the system's authorization service did not answer. The change was not made.",
-    "invalid-version": "Service version is incompatible",
+    "invalid-version": "The service is from a different version of NetRuleRouter. Restart the service or update the app.",
     "malformed-request": "Request was rejected as malformed",
     "busy-conflict": "Service is busy with another operation",
     "service-relocation-failed": "The service could not be copied to a folder only administrators can change. Check that the application folder can be read and that there is free space on the system drive, then try again.",
@@ -4672,26 +4678,28 @@
     "storage-failure": "The service could not read or write its rules storage.",
     "not-implemented": "This is not available on this system yet.",
     "route-policy-sites-needs-main-route": "Routed sites protection works only when the main connection is the default route.",
+    "route-policy-placeholder-adapter": "This connection is from a sample list, not from this computer. Wait until the background service lists your connections, then choose one.",
     "unsupported-platform": "This is not available on this system, so nothing was changed.",
-    "precondition-failed": "Operation precondition not met",
-    "confirmation-expired": "Confirmation token expired — re-run review",
-    "confirmation-unknown": "Confirmation token unknown — re-run review",
+    "precondition-failed": "The service cannot do this in its current state. Refresh and try again.",
+    "confirmation-expired": "The confirmation of these changes expired. Review the changes and apply them again.",
+    "confirmation-unknown": "The confirmation of these changes is no longer valid. Review the changes and apply them again.",
     "service-degraded": "Service is degraded — try again later",
-    "recovery-required": "Service requires user recovery action",
+    "recovery-required": "After a failure the service stopped taking changes. Restart the service; if it happens again, save a diagnostics archive.",
     "unsupported-operation": "The running service is older than this app and does not know this action. Restart the service, or update it, and try again.",
     "response-too-large": "The service's answer was too large to send; the change itself may have been applied — refresh before trying again.",
+    "settings-export-too-large": "Your rules are too many to fit in one settings export. Nothing was written; save your rules as rules files instead.",
     "internal": "Internal service error",
     "gui-internal": "Internal error in the application — the change was not sent",
     "transport-disconnected": "Service is offline",
-    "timeout": "Request timed out",
-    "bad-response": "Service returned a malformed response",
-    "serialization-failed": "Request could not be encoded",
-    "client-shutdown": "IPC client is shutting down",
-    "unknown-operation": "Unknown operation",
+    "timeout": "The service did not answer in time. Try again.",
+    "bad-response": "The service answered in a way this app cannot read. Restart the service or update the app.",
+    "serialization-failed": "The app could not prepare this request. Try again; if it happens again, save a diagnostics archive.",
+    "client-shutdown": "The app is closing, so the request was not sent.",
+    "unknown-operation": "The running service is older than this app and does not know this action. Restart the service, or update it, and try again.",
     "unknown-preset-operation": "The rules-file export/parse operation isn't available.",
     "malformed-preset-payload": "The rules-file request was malformed.",
-    "rpc-timed-out": "Response timeout",
-    "safe-disable-rpc-pending": "Safe disable RPC bridge is not wired yet",
+    "rpc-timed-out": "The service did not answer in time. Try again.",
+    "safe-disable-rpc-pending": "Rules cannot be turned off from this window right now: it has no connection to the service. Restart the app and try again.",
     "rules-locked": "Your administrator manages the routing rules on this computer, so they cannot be changed here.",
     "network-covers-link": "The network covers the VPN server or a network this computer is connected to, so routing it would cut the connection its own traffic uses. Choose a network that does not include them.",
     "network-covers-fake-ip-pool": "The network overlaps the address range the program reserves for name-based routing. Choose a different network.",
@@ -4719,6 +4727,7 @@
     "preset-validation-failed": "The file could not be checked, so it was not imported.",
     "alert-not-found": "The service no longer has this alert.",
     "illegal-state-transition": "This alert has already been handled, so it cannot be changed again.",
+    "alert-rows-not-adopted": "The rules this alert lists were not accepted, so it stays open. Open it again and review them.",
     "alerts-storage-failure": "The service could not read or save the security alerts.",
     "alerts-store-unavailable": "Security alerts are not available in the service.",
     "rule-kind-unknown": "One of the rules is of a kind this version cannot read, so nothing was saved. Update the app, or remove that rule.",
@@ -4861,7 +4870,7 @@
       "reason": {
         "route-unavailable": "The route this connection needed was unavailable.",
         "blocked-by-rule": "A rule denies this connection.",
-        "ipv6-blocked": "IPv6 is switched off while leak protection is on, so this connection did not go out.",
+        "ipv6-blocked": "With leak protection set to Everything, IPv6 goes out only through the additional connection, so this connection did not go out.",
         "dns-lockdown": "This app went to its own DNS resolver instead of the one NetRuleRouter provides, and encrypted-DNS blocking closed it.",
         "unattributed": "NetRuleRouter blocked this connection, but could not identify which filter did it.",
         "unknown": "This connection was blocked."
@@ -4917,7 +4926,7 @@
       },
       "restored": {
         "title": "Routing is working again",
-        "body": "Your rules are being applied again. Pages that were refused while the connection was down keep showing the error until you reload them - press F5 on those tabs."
+        "body": "Your rules are being applied again. Pages that were refused while the connection was down keep showing the error until you reload them — press F5 on those tabs."
       },
       "primary-down": {
         "title": "The main connection is not up",
@@ -4984,6 +4993,18 @@
     "settings-unreadable": {
       "title": "Your settings could not be read",
       "body": "This session uses default settings and will not save changes, so your saved settings stay as they are. Close the app and open it again; if the file is locked by another program, free it first."
+    },
+    "tui-settings-damaged": {
+      "title": "The terminal's settings file is damaged",
+      "body": "This session uses default settings and does not save changes, so {path} is left as it is: correct or delete it, and saving works again."
+    },
+    "tui-settings-unreadable": {
+      "title": "The terminal's settings file could not be read",
+      "body": "This session uses default settings and does not save changes, so {path} is left as it is. If another program holds the file or its permissions shut you out, free it, and saving works again."
+    },
+    "user-settings-damaged": {
+      "title": "Your settings file is damaged",
+      "body": "This window keeps the settings it has. Until the file is fixed, changes to your rule-set folder, bound rules files and other shared settings do not reach the terminal or the tray, and theirs do not reach this window. The file is left as it is: correct or delete it, and the window reads it again by itself."
     },
     "delivery-incomplete": {
       "title": "The installation is incomplete",
@@ -5367,6 +5388,7 @@
       "help-enter": "Enter on its own: show this screen again",
       "help-help": "h or ?: this help",
       "unknown": "Not understood: {input}",
+      "number-gone": "Item {n} as it was listed is no longer in the list. Here is the list as it is now.",
       "input-ended-unapplied": "Input ended while rule changes were not applied. They were dropped; nothing was sent to the service.",
       "commands": "Commands on this screen",
       "status-restore": "r: restore your settings to a service that lost them",

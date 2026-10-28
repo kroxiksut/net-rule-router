@@ -16,6 +16,7 @@ mod reset;
 mod tests;
 mod text;
 
+use std::io;
 use std::path::PathBuf;
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
@@ -30,7 +31,7 @@ use nrr_shared::ipc_payloads::{
     BlockNoticeMuteDto, BlockNoticeMuteScopeDto, ConnHistoryListResponse, DohResolverEntryDto,
     DohResolversGetResponse, LocalDnsSuffixesGetResponse, LocalNetworksGetResponse,
     LogRetentionConfigDto, LogRetentionConfigSetRequest, RetentionSettingsDto,
-    RetentionSettingsSetRequest, RollbackTargetDto, StorageUsageDto,
+    RetentionSettingsSetRequest, RollbackTargetDto, SettingsExportFullRequest, StorageUsageDto,
     ThirdPartyComponentsListResponse, TrafficStatsGetResponse, TrafficStatsSettingsDto,
 };
 use nrr_shared::ipc_transport::IpcErrorCode;
@@ -380,6 +381,9 @@ pub struct SettingsState {
     pub prefs: TuiPrefs,
     /// Where the terminal's settings are saved; `None` cannot save.
     pub prefs_path: Option<PathBuf>,
+    /// Why that file did not read, at start or at the last save: saves are
+    /// refused until it reads again, and the Status screen says so.
+    pub prefs_damaged: Option<prefs::Damaged>,
     pub clock: Clock,
     pub service_probe: RegistrationProbe,
     /// The service binary shipped beside this terminal, when it is there.
@@ -390,6 +394,9 @@ pub struct SettingsState {
     pub supports: PlatformSupports,
     /// Where this OS keeps its hosts file, shown beside the bypass toggle.
     pub hosts_file_path: String,
+    /// The hosts file holds a real mapping; a stock file hides the group, as
+    /// in the window. Read each time Routing opens.
+    pub hosts_file_has_entries: bool,
     /// Who wins a rule the bound files and the service hold differently;
     /// read from the shared settings file when Rule sets opens.
     pub merge_policy: MergePolicyDto,
@@ -422,6 +429,7 @@ impl Default for SettingsState {
             log_clear_preview: Loadable::NotLoaded,
             prefs: TuiPrefs::default(),
             prefs_path: None,
+            prefs_damaged: None,
             clock: Clock::default(),
             service_probe: crate::platform::service_control,
             expected_service: sibling_service_binary(),
@@ -429,6 +437,7 @@ impl Default for SettingsState {
             console_hint: false,
             supports: PlatformProfile::current().supports,
             hosts_file_path: PlatformProfile::current().hosts_file_path,
+            hosts_file_has_entries: true,
             merge_policy: MergePolicyDto::Union,
             reset: reset::ResetState::default(),
             providers: providers::ProvidersState::default(),
@@ -447,6 +456,26 @@ fn sibling_service_binary() -> Option<PathBuf> {
 }
 
 impl SettingsState {
+    /// Saves the terminal's options to its file; `None` without one.
+    pub(crate) fn save_prefs(&mut self) -> Option<io::Result<()>> {
+        let path = self.prefs_path.as_deref()?;
+        let result = prefs::save(path, self.prefs);
+        Some(self.note_prefs_write(result))
+    }
+
+    /// Puts another part's section into the terminal's file; `None` without one.
+    pub(crate) fn write_prefs(&mut self, entries: Map<String, Value>) -> Option<io::Result<()>> {
+        let path = self.prefs_path.as_deref()?;
+        let result = prefs::write_merged(path, entries);
+        Some(self.note_prefs_write(result))
+    }
+
+    /// Every write reads the file first, so its outcome is the file's state.
+    fn note_prefs_write(&mut self, result: io::Result<()>) -> io::Result<()> {
+        self.prefs_damaged = result.as_ref().err().and_then(prefs::damage_of);
+        result
+    }
+
     fn say(&mut self, words: Words, tone: Option<StateTone>) {
         self.message = Some(Message { words, tone });
     }
@@ -754,6 +783,11 @@ fn open_section(app: &mut AppState, index: usize) -> bool {
     s.cursor = 0;
     s.mode = Mode::Browse;
     s.message = None;
+    if category == Category::Routing {
+        s.hosts_file_has_entries = nrr_platform_api::hosts_file::hosts_file_has_entries(
+            std::path::Path::new(&s.hosts_file_path),
+        );
+    }
     app.scroll = 0;
     load(app);
     true
@@ -1583,7 +1617,26 @@ fn activate(app: &mut AppState, item: &Item, input: Input) {
                 app.settings.refuse(Words::Key(text::EXPORT_NEED_PATH));
                 return;
             }
-            Some(jobs::export_settings(PathBuf::from(path)))
+            // The service keeps neither the bound files nor their sections
+            // this build does not apply: both reach the export from here, as
+            // from the window and as "Save to file" carries them.
+            let [passthrough_primary, passthrough_secondary] =
+                crate::screens::rules::bound_passthrough(app);
+            let bound = app
+                .rules
+                .settings_file
+                .as_deref()
+                .and_then(|file| crate::screens::rules::own_settings::read(file).ok())
+                .map(|settings| settings.rules_files)
+                .unwrap_or_default();
+            let named = |path: String| (!path.is_empty()).then_some(path);
+            let request = SettingsExportFullRequest {
+                rules_file_path_primary: named(bound.primary),
+                rules_file_path_secondary: named(bound.secondary),
+                passthrough_sections_primary: passthrough_primary,
+                passthrough_sections_secondary: passthrough_secondary,
+            };
+            Some(jobs::export_settings(PathBuf::from(path), request))
         }
         (ItemId::LogRetention(field), Input::Number(n)) => log_retention(app, field, n),
         (ItemId::ClearLogs, Input::Run) => Some(jobs::clear_logs()),
@@ -1963,18 +2016,52 @@ fn save_pref(app: &mut AppState, field: PrefField, on: bool) {
         s.refuse(Words::Key(text::PREF_NO_FILE));
         return;
     };
-    let mut prefs = s.prefs;
+    let before = s.prefs;
+    let prefs = &mut s.prefs;
     match field {
         PrefField::Plain => prefs.plain = on,
         PrefField::NoColor => prefs.no_color = on,
         PrefField::Ascii => prefs.ascii = on,
         PrefField::HideBlockAddresses => prefs.hide_block_addresses = on,
     }
-    match prefs::save(&path, prefs) {
-        Ok(()) => {
-            s.prefs = prefs;
-            s.done(Words::Key(text::PREF_SAVED));
+    match s.save_prefs() {
+        Some(Ok(())) => s.done(Words::Key(text::PREF_SAVED)),
+        // The choice holds for this run; the damaged file stays as it is.
+        Some(Err(_)) if s.prefs_damaged.is_some() => {
+            let words = prefs_damaged_words(&path, s.prefs_damaged);
+            s.refuse(words)
         }
-        Err(error) => s.failed(text::PREF_SAVE_FAILED, Failure::detail(error.to_string())),
+        Some(Err(error)) => {
+            s.prefs = before;
+            s.failed(text::PREF_SAVE_FAILED, Failure::detail(error.to_string()));
+        }
+        None => s.prefs = before,
     }
+}
+
+/// The title and body that say why the terminal's file does not read: a held
+/// file is not called damaged, since its content may be fine.
+pub(crate) fn prefs_damaged_keys(damage: Option<prefs::Damaged>) -> (Key, Key) {
+    match damage {
+        Some(prefs::Damaged::Unreadable) => (
+            crate::keys::TUI_SETTINGS_UNREADABLE_TITLE,
+            crate::keys::TUI_SETTINGS_UNREADABLE_BODY,
+        ),
+        _ => (
+            crate::keys::TUI_SETTINGS_DAMAGED_TITLE,
+            crate::keys::TUI_SETTINGS_DAMAGED_BODY,
+        ),
+    }
+}
+
+/// The terminal's file does not read: which file, why, and that nothing is
+/// saved over it.
+pub(crate) fn prefs_damaged_words(path: &std::path::Path, damage: Option<prefs::Damaged>) -> Words {
+    let path = nrr_shared::display_text::display_text(&path.display().to_string()).into_owned();
+    let (title, body) = prefs_damaged_keys(damage);
+    Words::Join(vec![
+        Words::Key(title),
+        Words::Raw(" ".to_owned()),
+        Words::Fill(body, vec![("path", path)]),
+    ])
 }

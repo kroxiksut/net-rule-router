@@ -110,7 +110,13 @@ SystemTrayIcon {
     // `rpc` is: SystemTrayIcon has no default property.
     property var uiTheme: ThemeTokens {
         themeMode: String((tray.theme || {}).effectiveMode || "light")
+        fontScalePercent: tray.fontScalePercent
+        systemFont: tray.systemFont
     }
+    // The window's text size and font, from the launch context and then from
+    // the presence file the window keeps current.
+    property int fontScalePercent: 100
+    property string systemFont: "system-default"
 
     // Generic tray prompt window. A SystemTrayIcon balloon cannot carry
     // buttons, so every tray notification that needs a decision is rendered
@@ -345,6 +351,12 @@ SystemTrayIcon {
     // and focused, and which files back the user's rules.
     property var guiPresence: GuiPresence {}
     property var readableToolTips: ReadableToolTips {}
+    // The bound files in the user's settings file: once the window is gone, a
+    // set bound in the terminal is where the tray's file work goes.
+    property var userSettingsFollower: UserSettingsFollower {
+        rpc: tray.rpc
+        onFollowed: function(preferences, rulesFiles) { tray.guiPresence.sharedBound = rulesFiles }
+    }
 
     // Notification settings changed in the window after this tray started.
     // A snapshot older than the tray is what the launch context already holds.
@@ -373,6 +385,7 @@ SystemTrayIcon {
         var n = presence ? presence.notices : null
         if (!n || presence.at <= _startedAtMs || presence.at <= _noticePrefsTakenAt) return
         _noticePrefsTakenAt = presence.at
+        _takeAppearance(presence.appearance)
         showNotifications = n.showNotifications
         notifySuggestionChanges = n.notifySuggestionChanges
         notifyBlockNotices = n.notifyBlockNotices
@@ -398,6 +411,7 @@ SystemTrayIcon {
     property var boundFileWriter: TrayBoundFileWriter {
         rpc: tray.rpc
         presence: tray.guiPresence
+        follower: tray.userSettingsFollower
         os: tray.platformProfile.os || ""
         textSource: tray
     }
@@ -1213,7 +1227,7 @@ SystemTrayIcon {
                     "Each item below says why it is offered.")
         } else if (noticeKind === "programs-blocked") {
             bodyText = tr("tray.auto-rules.body-app-blocked",
-                    "No connection of {name} goes through on the main route.")
+                    "Most connections of {name} fail on the main route.")
                 .replace("{name}", programNames)
         } else if (noticeKind === "mixed-blocked") {
             bodyText = tr("tray.auto-rules.body-mixed-blocked",
@@ -1492,9 +1506,9 @@ SystemTrayIcon {
         _activeNoticeId = noticeId
         promptWindow.present({
             titleText: tr("tray.rules-drift.title",
-                "Your rules files differ from what is applied"),
+                "Your rule files differ from what is applied"),
             bodyText: tr("tray.rules-drift.body",
-                "The rules saved in your files are not the ones currently being applied. Apply the files, or open the app to see the difference."),
+                "The rules saved in your files are not the ones being applied right now. Apply the files, or open the app to see the difference."),
             items: items,
             listAccessibleName: tr("tray.rules-drift.list-accessible-name",
                 "Rule files that differ"),
@@ -1898,7 +1912,7 @@ SystemTrayIcon {
             case "blocked-by-rule":
                 return tr("tray.block-notice.reason-short.blocked-by-rule", "Denied by a rule")
             case "ipv6-blocked":
-                return tr("tray.block-notice.reason-short.ipv6-blocked", "IPv6 is switched off")
+                return tr("tray.block-notice.reason-short.ipv6-blocked", "IPv6 held by leak protection")
             case "dns-lockdown":
                 return tr("tray.block-notice.reason-short.dns-lockdown", "Own encrypted DNS")
             case "unattributed":
@@ -1916,11 +1930,11 @@ SystemTrayIcon {
                     + "so none of them open. This is one notice for the whole route.")
             case "blocked-by-rule":
                 return tr("tray.block-notice.reason.blocked-by-rule",
-                    "A rule blocks this address directly.")
+                    "A rule denies this address directly.")
             case "ipv6-blocked":
                 return tr("tray.block-notice.reason.ipv6-blocked",
-                    "IPv6 is switched off while leak protection is on, and this address is IPv6. "
-                    + "No rule blocked it — the switch is in Settings.")
+                    "With leak protection set to Everything, IPv6 goes out only through the additional "
+                    + "connection, and this IPv6 address could not. No rule blocked it — the switch is in Settings.")
             case "dns-lockdown":
                 return tr("tray.block-notice.reason.dns-lockdown",
                     "This app tried to reach a public DNS resolver of its own instead of the one "
@@ -2132,7 +2146,7 @@ SystemTrayIcon {
             }
         }
         var appText = app !== ""
-            ? app : tr("notifications.block-notice.app-unknown", "unknown app")
+            ? app : tr("notifications.block-notice.app-unknown", "unknown application")
         var attempts = Number(first.attempts || 0) > 1
             ? tr("tray.block-notice.attempts", "{count} attempts")
                 .replace("{count}", String(first.attempts))
@@ -2435,7 +2449,7 @@ SystemTrayIcon {
             return tr("settings.routing.doh-lockdown.label", "Block browser DoH/DoT")
         if (key === "kill-switch-strict-shared-ips")
             return tr("settings.routing.kill-switch.shared-strict-label",
-                "Block shared addresses too")
+                "Strict: also block addresses shared with regular sites (may break them)")
         return tr("notifications.settings-lost.other-setting", "another routing setting")
     }
 
@@ -2832,7 +2846,7 @@ SystemTrayIcon {
                     ? tr("notifications.service-lost.body",
                         "The NetRuleRouter service stopped unexpectedly, so your rules are not applied. Start it again, or restore network access if the connection is cut.")
                     : tr("notifications.service-lost.body-start-only",
-                        "The NetRuleRouter service stopped unexpectedly, so your rules are not applied. Start it again."),
+                        "The NetRuleRouter service stopped unexpectedly, so your rules are not applied."),
                 primaryAction: {
                     label: tr("tray.menu.start-service", "Start service"),
                     actionId: "service-lost-start",
@@ -3631,7 +3645,7 @@ SystemTrayIcon {
             })
         }
         slots.push({
-            label: tr("tray.block-notice.mute.all", "Every block notification"),
+            label: tr("tray.block-notice.mute.all", "All blocks: any host, any app"),
             actionId: "block-notice-mute-all"
         })
         promptWindow.present({
@@ -4369,7 +4383,7 @@ SystemTrayIcon {
         return tr("tray.external.label", "External IP") + ": "
             + (_externalProbeBusy
                 ? tr("tray.external.checking", "checking…")
-                : tr("tray.external.unknown", "click to check"))
+                : tr("tray.external.unknown", "check"))
     }
 
     /// A menu is as wide as its widest row, and the status is a sentence. The
@@ -4945,6 +4959,13 @@ SystemTrayIcon {
         if (context.trayNoticeOpacityPercent !== undefined) {
             noticeOpacityPercent = parseInt(context.trayNoticeOpacityPercent) || 100
         }
+        _takeAppearance(Pure.trayAppearanceOf(context))
+    }
+
+    function _takeAppearance(appearance) {
+        if (!appearance) return
+        fontScalePercent = appearance.fontScalePercent
+        systemFont = appearance.systemFont
     }
 
     // ── What the tray says about itself ──────────────────────────────────────

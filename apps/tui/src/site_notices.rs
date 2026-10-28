@@ -145,16 +145,17 @@ pub fn load(path: &Path) -> SiteNoticeLog {
     }
 }
 
-fn save(app: &AppState) {
-    if let Some(path) = app.settings.prefs_path.as_deref() {
-        let mut entries = Map::new();
-        entries.insert(
-            SECTION.to_owned(),
-            Value::Object(app.site_notices.to_section()),
-        );
-        // Unsaved, it holds for this run; the next one may tell once more.
-        let _ = prefs::write_merged(path, entries);
+fn save(app: &mut AppState) {
+    if app.settings.prefs_path.is_none() {
+        return;
     }
+    let mut entries = Map::new();
+    entries.insert(
+        SECTION.to_owned(),
+        Value::Object(app.site_notices.to_section()),
+    );
+    // Unsaved, it holds for this run; the next one may tell once more.
+    let _ = app.settings.write_prefs(entries);
 }
 
 /// Whether the feed may tell that `host` does not open, and if so, that it

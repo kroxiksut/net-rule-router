@@ -645,12 +645,34 @@ fn write_taken(path: &std::path::Path, links: &[String]) -> Result<(), PlatformE
     })
 }
 
-/// A `resolvectl dns` value: `192.0.2.1`, `192.0.2.1:53`, `192.0.2.1#name`.
+/// A `resolvectl dns` IPv4 value: `192.0.2.1`, `192.0.2.1:53`, `192.0.2.1#name`.
 fn server_ip(value: &str) -> Option<Ipv4Addr> {
-    let host = value.split(['#', '%']).next()?;
-    host.parse()
-        .ok()
-        .or_else(|| host.rsplit_once(':').and_then(|(ip, _)| ip.parse().ok()))
+    match server_addr(value)? {
+        std::net::IpAddr::V4(ip) => Some(ip),
+        std::net::IpAddr::V6(_) => None,
+    }
+}
+
+/// A `resolvectl dns` value of either family; IPv6 also as `2001:db8::1`,
+/// `[2001:db8::1]:53` or `fe80::1%eth0`.
+fn server_addr(value: &str) -> Option<std::net::IpAddr> {
+    let host = value.split('#').next()?;
+    if let Some(bracketed) = host.strip_prefix('[') {
+        return bracketed.split([']', '%']).next()?.parse().ok();
+    }
+    let host = host.split('%').next()?;
+    host.parse().ok().or_else(|| {
+        host.rsplit_once(':')
+            .and_then(|(ip, _)| ip.parse::<Ipv4Addr>().ok())
+            .map(std::net::IpAddr::V4)
+    })
+}
+
+/// An IPv6 server something off this machine answers on: loopback is us or a
+/// local cache forwarding to us, and link-local needs a scope the upstream
+/// list cannot carry.
+pub(crate) fn forwardable_v6(server: std::net::Ipv6Addr) -> bool {
+    !(server.is_loopback() || server.is_unspecified() || server.is_unicast_link_local())
 }
 
 /// The machine's DNS servers per link, as resolved holds them — never through
@@ -673,28 +695,52 @@ impl<C: DnsCommands> nrr_platform_api::DnsCacheControlPort for ResolvedDnsCacheC
 pub struct ResolvedDnsServers<C: DnsCommands>(pub C);
 
 impl<C: DnsCommands> ResolvedDnsServers<C> {
-    /// Every link's servers, a server repeated for each link that lists it.
-    fn per_link_pairs(&self) -> Vec<UpstreamDnsCandidate> {
+    /// Every link's servers of both families, a server repeated for each link
+    /// that lists it; none on this machine.
+    fn per_link_all(&self) -> Vec<nrr_platform_api::dns::UpstreamDnsServer> {
         let Ok(reply) = self.0.run("resolvectl", &["dns"]) else {
             return Vec::new();
         };
         if !reply.success {
             return Vec::new();
         }
-        let mut out: Vec<UpstreamDnsCandidate> = Vec::new();
+        let mut out = Vec::new();
         for link in parse_resolvectl_links(&reply.stdout) {
             if link.name == REDIRECT_LINK {
                 continue;
             }
-            for server in link.values.iter().filter_map(|v| server_ip(v)) {
+            for server in link.values.iter().filter_map(|v| server_addr(v)) {
                 // `0.0.0.0` is delivered to this machine, as loopback is.
-                if server.is_loopback() || server.is_unspecified() {
-                    continue;
+                let usable = match server {
+                    std::net::IpAddr::V4(v4) => !(v4.is_loopback() || v4.is_unspecified()),
+                    std::net::IpAddr::V6(v6) => forwardable_v6(v6),
+                };
+                if usable {
+                    out.push(nrr_platform_api::dns::UpstreamDnsServer {
+                        interface_index: Some(link.index),
+                        server,
+                    });
                 }
-                out.push(UpstreamDnsCandidate::new(Some(link.index), server));
             }
         }
         out
+    }
+
+    fn per_link_pairs(&self) -> Vec<UpstreamDnsCandidate> {
+        self.per_link_all()
+            .into_iter()
+            .filter_map(|s| match s.server {
+                std::net::IpAddr::V4(v4) => Some(UpstreamDnsCandidate::new(s.interface_index, v4)),
+                std::net::IpAddr::V6(_) => None,
+            })
+            .collect()
+    }
+
+    fn per_link_v6(&self) -> Vec<nrr_platform_api::dns::UpstreamDnsServer> {
+        self.per_link_all()
+            .into_iter()
+            .filter(|s| s.server.is_ipv6())
+            .collect()
     }
 }
 
@@ -705,6 +751,22 @@ impl<C: DnsCommands> SystemDnsServersPort for ResolvedDnsServers<C> {
 
     fn upstream_candidates_v4_per_link(&self) -> Vec<UpstreamDnsCandidate> {
         once_per_link(self.per_link_pairs())
+    }
+
+    fn upstream_candidates_v6(&self) -> Vec<nrr_platform_api::dns::UpstreamDnsServer> {
+        once_per_server(self.per_link_v6(), |s| s.server)
+    }
+
+    fn upstream_candidates_v6_per_link(&self) -> Vec<nrr_platform_api::dns::UpstreamDnsServer> {
+        once_per_link(self.per_link_v6())
+    }
+
+    /// Both families from one `resolvectl` run, IPv4 first.
+    fn upstream_candidates_per_link(&self) -> Vec<nrr_platform_api::dns::UpstreamDnsServer> {
+        let (v4, v6): (Vec<_>, Vec<_>) = once_per_link(self.per_link_all())
+            .into_iter()
+            .partition(|s| s.server.is_ipv4());
+        v4.into_iter().chain(v6).collect()
     }
 }
 

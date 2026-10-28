@@ -1,5 +1,5 @@
 Service: OK
-╭> Screens─────────────────╮╭Connections — +4 more rows────────────────────────╮
+╭Screens───────────────────╮╭Connections — +4 more rows────────────────────────╮
 │  1 Status                ││The primary route uses the default interface; the │
 │  2 First run             ││additional route carries the traffic your rules   │
 │> 3 Interfaces and routes ││send to it.                                       │

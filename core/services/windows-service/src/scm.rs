@@ -148,7 +148,37 @@ fn scm_service_main(_args: Vec<OsString>) {
     if refused.is_none() {
         capture_stderr();
     }
-    let _ = run_scm_inner(refused, lockdown);
+    let ran = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        run_scm_inner(refused, lockdown)
+    }));
+    if ran.is_err() {
+        report_stopped_after_panic();
+    }
+}
+
+/// A panic out of the service body is reported as a failed stop, so SCM's
+/// recovery starts the service again and the next start sweeps what this one
+/// left. Unreported, the dispatcher would keep the process alive as "running"
+/// with nothing behind it; if even the report fails, aborting is what SCM
+/// reads as a crash.
+fn report_stopped_after_panic() {
+    let reported = service_control_handler::register(SERVICE_NAME, |_| {
+        ServiceControlHandlerResult::NotImplemented
+    })
+    .and_then(|handle| {
+        handle.set_service_status(ServiceStatus {
+            service_type: ServiceType::OWN_PROCESS,
+            current_state: ServiceState::Stopped,
+            controls_accepted: ServiceControlAccept::empty(),
+            exit_code: stopped_exit_code(false, true),
+            checkpoint: 0,
+            wait_hint: Duration::from_secs(0),
+            process_id: None,
+        })
+    });
+    if reported.is_err() {
+        std::process::abort();
+    }
 }
 
 /// Send stderr to a file in the log directory. Resolves the directory
@@ -184,6 +214,64 @@ fn running_controls() -> ServiceControlAccept {
         | ServiceControlAccept::SHUTDOWN
         | ServiceControlAccept::POWER_EVENT
         | ServiceControlAccept::SESSION_CHANGE
+}
+
+/// Why a stop control stops the service. Only a stop our own verb marked may
+/// be an upgrade, which leaves protection to the new instance; the upgrade
+/// marker is consumed only then.
+fn stop_reason(deliberate: bool, take_upgrade_marker: impl FnOnce() -> bool) -> StopReason {
+    if deliberate && take_upgrade_marker() {
+        StopReason::Upgrade
+    } else {
+        StopReason::ServiceStop
+    }
+}
+
+/// The exit code a stopped service reports. Any non-zero one makes SCM's
+/// recovery start it again, which is what a stop nobody asked for, or one that
+/// outran its limit, must get.
+fn stopped_exit_code(stop_overran: bool, unasked: bool) -> ServiceExitCode {
+    if stop_overran {
+        ServiceExitCode::ServiceSpecific(STOP_OVERRAN)
+    } else if unasked {
+        ServiceExitCode::ServiceSpecific(STOPPED_UNASKED)
+    } else {
+        ServiceExitCode::Win32(0)
+    }
+}
+
+/// The SCM state for a runtime state. A service that cannot enforce still
+/// reports running: SCM restarts a stopped one, and a restart does not cure
+/// what `RecoveryRequired` needs a person for.
+fn scm_state_for(state: ServiceRuntimeState) -> ServiceState {
+    match state {
+        ServiceRuntimeState::Starting => ServiceState::StartPending,
+        ServiceRuntimeState::Running
+        | ServiceRuntimeState::Degraded
+        | ServiceRuntimeState::RecoveryRequired
+        | ServiceRuntimeState::Disabled => ServiceState::Running,
+        ServiceRuntimeState::Stopping => ServiceState::StopPending,
+        ServiceRuntimeState::Stopped => ServiceState::Stopped,
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum StartPath {
+    /// The data tree could not be locked down: report stopped, exit code 0.
+    DataTreeRefused,
+    /// A restart scheduled before `nrr-cli stop`: sweep and stay stopped.
+    StayStopped,
+    Run,
+}
+
+fn start_path(data_tree_refused: bool, stay_stopped: bool) -> StartPath {
+    if data_tree_refused {
+        StartPath::DataTreeRefused
+    } else if stay_stopped {
+        StartPath::StayStopped
+    } else {
+        StartPath::Run
+    }
 }
 
 /// How long a skipped restart may spend sweeping before SCM reads it as hung:
@@ -244,7 +332,7 @@ fn run_scm_inner(refused: Option<String>, lockdown: Duration) -> Result<(), ScmE
     let unasked_stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let unasked_stop_for_handler = std::sync::Arc::clone(&unasked_stop);
 
-    let event_handler = move |control_event| -> ServiceControlHandlerResult {
+    let handle_control = move |control_event| -> ServiceControlHandlerResult {
         match control_event {
             // Logged on arrival: without this line a stop that never completes
             // is indistinguishable from a process that died on its own.
@@ -276,14 +364,10 @@ fn run_scm_inner(refused: Option<String>, lockdown: Duration) -> Result<(), ScmE
                         );
                     }
                 }
-                // An installer's stop leaves protection to the new instance.
-                let upgrade =
-                    deliberate && nrr_platform_windows::service_control::take_upgrade_stop_marker();
-                stop_for_handler.request_stop_for(if upgrade {
-                    StopReason::Upgrade
-                } else {
-                    StopReason::ServiceStop
-                });
+                stop_for_handler.request_stop_for(stop_reason(
+                    deliberate,
+                    nrr_platform_windows::service_control::take_upgrade_stop_marker,
+                ));
                 ServiceControlHandlerResult::NoError
             }
             // The machine is going down: the teardown hands DNS back and keeps
@@ -318,14 +402,23 @@ fn run_scm_inner(refused: Option<String>, lockdown: Duration) -> Result<(), ScmE
             _ => ServiceControlHandlerResult::NotImplemented,
         }
     };
+    // Called through `extern "system"`, where a panic aborts the process. A
+    // control that panicked is refused, so the sender is not told it was taken.
+    let event_handler = move |control_event| {
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            handle_control(control_event)
+        }))
+        .unwrap_or(ServiceControlHandlerResult::NotImplemented)
+    };
 
     let status_handle = service_control_handler::register(SERVICE_NAME, event_handler)
         .map_err(|e| ScmError::Handler(e.to_string()))?;
 
+    let path = start_path(refused.is_some(), stay_stopped);
     // Reported stopped rather than vanished, and with no error code: recovery
     // runs on one, and a start refused for the data tree would only be refused
     // again. The reason is in the log.
-    if let Some(reason) = refused {
+    if let (StartPath::DataTreeRefused, Some(reason)) = (&path, refused) {
         let _ = status_handle.set_service_status(ServiceStatus {
             service_type: ServiceType::OWN_PROCESS,
             current_state: ServiceState::Stopped,
@@ -340,7 +433,7 @@ fn run_scm_inner(refused: Option<String>, lockdown: Duration) -> Result<(), ScmE
     // Ends cleanly: an error code would schedule the next restart. First the
     // dead instance's leftovers go, as the stop would have taken them: nothing
     // else is coming to lift its blocks or hand the system DNS back.
-    if stay_stopped {
+    if path == StartPath::StayStopped {
         eprintln!(
             "nrr-service: a restart scheduled before `nrr-cli stop` was skipped; the service stays stopped as asked"
         );
@@ -393,15 +486,7 @@ fn run_scm_inner(refused: Option<String>, lockdown: Duration) -> Result<(), ScmE
     impl ServiceController for ScmController {
         fn report(&self, state: ServiceRuntimeState) {
             self.journal.observe(state);
-            let scm_state = match state {
-                ServiceRuntimeState::Starting => ServiceState::StartPending,
-                ServiceRuntimeState::Running
-                | ServiceRuntimeState::Degraded
-                | ServiceRuntimeState::RecoveryRequired
-                | ServiceRuntimeState::Disabled => ServiceState::Running,
-                ServiceRuntimeState::Stopping => ServiceState::StopPending,
-                ServiceRuntimeState::Stopped => ServiceState::Stopped,
-            };
+            let scm_state = scm_state_for(state);
             let controls_accepted = match scm_state {
                 ServiceState::Running => running_controls(),
                 _ => ServiceControlAccept::empty(),
@@ -425,12 +510,11 @@ fn run_scm_inner(refused: Option<String>, lockdown: Duration) -> Result<(), ScmE
                 controls_accepted,
                 exit_code: if scm_state != ServiceState::Stopped {
                     ServiceExitCode::Win32(0)
-                } else if nrr_service_runtime::supervised_runtime::stop_overran() {
-                    ServiceExitCode::ServiceSpecific(STOP_OVERRAN)
-                } else if self.unasked_stop.load(std::sync::atomic::Ordering::SeqCst) {
-                    ServiceExitCode::ServiceSpecific(STOPPED_UNASKED)
                 } else {
-                    ServiceExitCode::Win32(0)
+                    stopped_exit_code(
+                        nrr_service_runtime::supervised_runtime::stop_overran(),
+                        self.unasked_stop.load(std::sync::atomic::Ordering::SeqCst),
+                    )
                 },
                 checkpoint,
                 // A pending state with no hint tells SCM to expect an immediate
@@ -669,6 +753,65 @@ mod tests {
                 keep_rule_routes_on_stop: false,
             })
         );
+    }
+
+    /// An upgrade hands protection to the new instance, so only our own verb's
+    /// stop may be one: a stray upgrade marker must not turn `net stop` into a
+    /// stop that leaves the machine's blocks to nobody.
+    #[test]
+    fn only_a_deliberate_stop_can_be_an_upgrade() {
+        assert_eq!(stop_reason(true, || true), StopReason::Upgrade);
+        assert_eq!(stop_reason(true, || false), StopReason::ServiceStop);
+        let mut consulted = false;
+        assert_eq!(
+            stop_reason(false, || {
+                consulted = true;
+                true
+            }),
+            StopReason::ServiceStop
+        );
+        assert!(!consulted, "an unasked stop must leave the upgrade marker");
+    }
+
+    /// SCM restarts a service only on a non-zero exit code.
+    #[test]
+    fn an_unasked_or_overrun_stop_is_restarted_and_an_asked_one_is_not() {
+        let restarts = |code: ServiceExitCode| code != ServiceExitCode::Win32(0);
+        assert!(restarts(stopped_exit_code(false, true)));
+        assert!(restarts(stopped_exit_code(true, false)));
+        assert!(restarts(stopped_exit_code(true, true)));
+        assert!(!restarts(stopped_exit_code(false, false)));
+        assert_ne!(
+            stopped_exit_code(true, true),
+            stopped_exit_code(false, true),
+            "the log tells an overrun from an unasked stop"
+        );
+    }
+
+    /// A service that cannot enforce must stay up for the user to see why;
+    /// reported stopped, SCM would restart it into the same state forever.
+    #[test]
+    fn a_service_needing_recovery_reports_running() {
+        for state in [
+            ServiceRuntimeState::Running,
+            ServiceRuntimeState::Degraded,
+            ServiceRuntimeState::RecoveryRequired,
+            ServiceRuntimeState::Disabled,
+        ] {
+            assert_eq!(scm_state_for(state), ServiceState::Running, "{state:?}");
+        }
+        assert_eq!(
+            scm_state_for(ServiceRuntimeState::Stopped),
+            ServiceState::Stopped
+        );
+    }
+
+    #[test]
+    fn a_refused_data_tree_or_a_pending_stay_stopped_never_runs_the_service() {
+        assert_eq!(start_path(true, false), StartPath::DataTreeRefused);
+        assert_eq!(start_path(true, true), StartPath::DataTreeRefused);
+        assert_eq!(start_path(false, true), StartPath::StayStopped);
+        assert_eq!(start_path(false, false), StartPath::Run);
     }
 
     /// Every control the handler branches on has to be advertised too — an

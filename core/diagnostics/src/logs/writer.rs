@@ -23,7 +23,7 @@ use std::fs::File;
 use std::io::Write;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
 use crate::audit::writer::local_date_string;
@@ -91,7 +91,7 @@ struct LogWriterInner {
     last_presence_probe: Option<Instant>,
 }
 
-// `expect()`s here are invariants/lock-poisoning — panic-worthy, not errors.
+// The `expect()` is an invariant: `ensure_open` sets `current` or fails.
 #[allow(clippy::expect_used)]
 impl LogWriterInner {
     fn new(config: LogWriterConfig) -> Self {
@@ -202,8 +202,19 @@ impl LogWriter {
     }
 }
 
-// Lock-poisoning `expect()` propagates a prior panic — not recoverable.
-#[allow(clippy::expect_used)]
+impl LogWriter {
+    /// The log is never the reason a thread panics: a panic under the lock
+    /// leaves the file state unknown, so the next line opens a file afresh.
+    fn lock_inner(&self) -> MutexGuard<'_, LogWriterInner> {
+        self.inner.lock().unwrap_or_else(|poisoned| {
+            self.inner.clear_poison();
+            let mut inner = poisoned.into_inner();
+            inner.current = None;
+            inner
+        })
+    }
+}
+
 impl DiagnosticsSink for LogWriter {
     type Event = LogEvent;
 
@@ -222,7 +233,7 @@ impl DiagnosticsSink for LogWriter {
             return;
         };
         line.push('\n');
-        let mut inner = self.inner.lock().expect("LogWriter mutex");
+        let mut inner = self.lock_inner();
         match inner.write_line(line.as_bytes()) {
             Ok(OpenOutcome::Recreated) => {
                 self.recreated.fetch_add(1, Ordering::Relaxed);
@@ -235,10 +246,8 @@ impl DiagnosticsSink for LogWriter {
     }
 
     fn flush(&self) {
-        if let Ok(mut inner) = self.inner.lock() {
-            if let Some((file, _)) = inner.current.as_mut() {
-                let _ = file.flush();
-            }
+        if let Some((file, _)) = self.lock_inner().current.as_mut() {
+            let _ = file.flush();
         }
     }
 
@@ -336,6 +345,33 @@ mod tests {
         assert!(content.contains("after"), "post-deletion event: {content}");
         assert_eq!(writer.recreated_count(), 1);
         assert_eq!(writer.dropped_count(), 0, "the write itself succeeded");
+    }
+
+    /// The log is never a reason to fail: a panic under its lock must not turn
+    /// every later `tracing` line of every service thread into a panic.
+    #[test]
+    fn a_panic_under_the_log_lock_does_not_silence_or_crash_later_lines() {
+        let dir = tempfile::tempdir().expect("temp");
+        let writer = LogWriter::open(LogWriterConfig::new(dir.path()));
+        writer.emit(info_event("before"));
+        let poisoned = std::thread::scope(|s| {
+            s.spawn(|| {
+                let _inner = writer.inner.lock().expect("unpoisoned yet");
+                panic!("simulated panic under the log lock");
+            })
+            .join()
+        });
+        assert!(poisoned.is_err(), "the lock must be poisoned for the test");
+
+        writer.emit(info_event("after"));
+
+        let content: String = std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| std::fs::read_to_string(e.path()).unwrap())
+            .collect();
+        assert!(content.contains("after"), "line after the panic: {content}");
+        assert_eq!(writer.dropped_count(), 0);
     }
 
     #[test]

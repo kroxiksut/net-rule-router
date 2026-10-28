@@ -10,7 +10,6 @@ use nrr_shared::display_text::display_text;
 
 use crate::backend::{Job, Reply};
 use crate::i18n::{key, Key, Texts};
-use crate::screens::settings::prefs;
 use crate::state::{AppState, Effect, NoticeLevel};
 
 pub const OFFER: Key = key(
@@ -99,10 +98,8 @@ pub fn announce(app: &mut AppState, texts: &Texts, _now: std::time::Instant) -> 
     body.push(' ');
     body.push_str(&texts.get(HOW));
     app.settings.prefs.app_groups_offer_told = true;
-    if let Some(path) = app.settings.prefs_path.as_deref() {
-        // Unsaved, the offer comes back next run: a repeat, not a loss.
-        let _ = prefs::save(path, app.settings.prefs);
-    }
+    // Unsaved, the offer comes back next run: a repeat, not a loss.
+    let _ = app.settings.save_prefs();
     // News for when the user looks, not worth a bell.
     app.note_in_feed(NoticeLevel::Info, texts.get(TITLE), body)
 }

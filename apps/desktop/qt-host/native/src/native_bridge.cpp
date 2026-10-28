@@ -198,8 +198,8 @@ void NrrNativeBridge::openFolder(const QString &path) {
         return;
     }
 #ifdef Q_OS_WIN
-    QProcess::startDetached(systemExplorerPath(),
-                            {QDir::toNativeSeparators(info.absoluteFilePath())});
+    startDetachedWithOwnChannels(systemExplorerPath(),
+                                 {QDir::toNativeSeparators(info.absoluteFilePath())});
 #else
     QDesktopServices::openUrl(QUrl::fromLocalFile(info.absoluteFilePath()));
 #endif
@@ -214,14 +214,14 @@ void NrrNativeBridge::openContainingFolder(const QString &path) {
     QFileInfo info(path);
     if (info.exists()) {
         // `/select,` highlights the file inside its folder.
-        QProcess::startDetached(systemExplorerPath(),
-                                {QStringLiteral("/select,") + native});
+        startDetachedWithOwnChannels(systemExplorerPath(),
+                                     {QStringLiteral("/select,") + native});
     } else {
         // File gone — fall back to opening the parent directory.
         const QString dir = info.absolutePath();
         if (!dir.isEmpty()) {
-            QProcess::startDetached(systemExplorerPath(),
-                                    {QDir::toNativeSeparators(dir)});
+            startDetachedWithOwnChannels(systemExplorerPath(),
+                                         {QDir::toNativeSeparators(dir)});
         }
     }
 #else
@@ -364,7 +364,7 @@ bool NrrNativeBridge::ensureTrayRunning() {
     }
     qint64 pid = 0;
     const QString workdir = QFileInfo(trayGuiExecutable_).absolutePath();
-    const bool ok = QProcess::startDetached(
+    const bool ok = startDetachedWithOwnChannels(
         trayGuiExecutable_, QStringList{}, workdir, &pid);
     if (!ok) {
         qWarning().noquote()

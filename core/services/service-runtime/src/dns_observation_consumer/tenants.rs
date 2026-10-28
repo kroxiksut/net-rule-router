@@ -93,6 +93,36 @@ impl DnsObservationConsumer {
         }
     }
 
+    /// The direct tenants an address of the additional route's `rule_host`
+    /// had before the rule host arrived. The collateral path records a
+    /// tenant seen AFTER; this is the same record for one seen first, so the
+    /// order of two lookups a page controls cannot decide whether a direct
+    /// site rides the tunnel. A name the rules now cover is no bystander.
+    /// One in-memory lookup per address; a store write only on a hit.
+    pub(super) fn note_earlier_tenants(
+        &self,
+        rule_host: &str,
+        addresses: &[Ipv4Addr],
+        book: &nrr_domain::canonical::CanonicalRuleBook,
+        now: SystemTime,
+    ) {
+        let Some(names) = self.observed_names.as_ref() else {
+            return;
+        };
+        for ip in addresses {
+            let Some(earlier) = names.lookup(*ip) else {
+                continue;
+            };
+            if earlier.eq_ignore_ascii_case(rule_host)
+                || rule_set_matches(&earlier, &book.secondary)
+                || rule_set_matches(&earlier, &book.primary)
+            {
+                continue;
+            }
+            self.record_direct_tenant(&earlier, *ip, now, false);
+        }
+    }
+
     /// Upsert + classify: `matched` only when the ENFORCEABLE address set for
     /// `hostname` changed, `refreshed` when the write merely renewed recency.
     /// The before/after view is [`FqdnCacheLookup::ips_for_hostname`] — the

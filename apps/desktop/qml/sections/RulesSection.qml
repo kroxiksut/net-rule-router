@@ -1141,7 +1141,7 @@ ColumnLayout {
     // for prefs recorded before the display-only pair existed) and pushes them
     // through the existing import-review pipeline (dry-run → ReviewDiff →
     // ConfirmActivate). Re-reading a bundled preset is fine — it is a READ;
-    // only writes are factory-guarded. Distinct from "Load rule list…"
+    // only writes are factory-guarded. Distinct from "Load rules list..."
     // (picks a NEW file).
     function _updateRulesFromCurrentFile() {
         if (section._refuseWhenLocked()) return
@@ -1153,7 +1153,7 @@ ColumnLayout {
         var secAbs = String(root.rulesSourcePathFor("secondary") || "")
         if (primAbs === "" && secAbs === "") {
             root.statusLine = root.tr("status.no-source-file-bound",
-                "No source file is bound yet. Use “Load rule list…” first.")
+                "No source file is bound yet. Use “Load rules list...” first.")
             return
         }
         if (typeof nrrNativeBridge === "undefined" || !nrrNativeBridge
@@ -1483,7 +1483,7 @@ ColumnLayout {
                         root.updatePrefs({ showBundledPresets: false })
                     }
                     root.statusLine = root.tr("status.presets-hidden",
-                        "Bundled presets hidden. Re-enable them in Settings → General.")
+                        "Bundled presets hidden. Re-enable them in Settings → Presets.")
                 }
             }
         }
@@ -1579,7 +1579,7 @@ ColumnLayout {
             enabled: !section.mainRouteCheckBusy && root.rulesModel.count > 0
             ToolTip.visible: hovered && root.prefs.tooltipsEnabled
             ToolTip.text: root.tr("rules.main-route.action-check-tooltip",
-                "Tries to reach the addresses your rules name over the main connection, and marks what it finds beside each rule. Answering there does not mean the site works there — a rule may still be earning its place.")
+                "Tries to reach the addresses of your additional-route rules over the main connection, and shows the result in the Main route column. Answering there does not mean the site works there — a rule may still be earning its place.")
             Accessible.role: Accessible.Button
             Accessible.name: text
             Accessible.description: ToolTip.text
@@ -1672,7 +1672,7 @@ ColumnLayout {
                 id: rulesMoreMenu
                 onAboutToShow: section._fitMenuWidth(rulesMoreMenu)
                 MenuItem {
-                    text: root.tr("action.load-rule-list", "Load rule list...")
+                    text: root.tr("action.load-rule-list", "Load rules list...")
                     enabled: !section.rulesLocked
                     onTriggered: root.openLoadRuleListWindow()
                 }
@@ -1683,7 +1683,7 @@ ColumnLayout {
                 }
                 MenuItem {
                     text: root.tr("rules.action.show-service-rules",
-                        "Show rules applied by the service")
+                        "Show service rules")
                     enabled: !root.mutationsModel.hasInFlight
                     onTriggered: {
                         if (typeof root.reloadActiveRulesFromService === "function") {
@@ -2058,7 +2058,7 @@ ColumnLayout {
                 || typeof nrrNativeBridge.readFileBytes !== "function") {
             root.statusLine = root.tr(
                 "status.bridge-unavailable",
-                "Native bridge unavailable")
+                "Service bridge not connected.")
             return
         }
         var b64 = nrrNativeBridge.readFileBytes(path)
@@ -2368,15 +2368,12 @@ ColumnLayout {
             text: section.searchText
             onTextChanged: {
                 // A URL pasted from a browser is cleaned the way the add dialog
-                // cleans it. Only scheme-prefixed text: the host normalizer
-                // reads a subnet's `/` and an IPv6 address's `:` as URL parts.
-                if (/^[A-Za-z][A-Za-z0-9+.-]*:\/\//.test(text)) {
-                    var norm = Rules.normalizeHostInput("domain", text)
-                    if (norm !== text) {
-                        text = norm    // re-enters with clean text and stores it
-                        text = Qt.binding(function() { return section.searchText })
-                        return
-                    }
+                // cleans it, as the terminal's search does.
+                var norm = Rules.searchBoxText(text)
+                if (norm !== text) {
+                    text = norm    // re-enters with clean text and stores it
+                    text = Qt.binding(function() { return section.searchText })
+                    return
                 }
                 section.searchText = text
             }
@@ -2405,247 +2402,242 @@ ColumnLayout {
         }
     }
 
-    // Sort / filter bar. Flow wraps onto multiple rows when
-    // narrow. The search field used to live here too, but per UX feedback
-    // it now has its own full-width row above so wide windows do not leave
-    // a dead gap on the right.
-    Flow {
-        id: filterBar
+    // Sort / filter bar, on its own row below the search field. The Flow wraps
+    // onto more rows when narrow; the Item is what the layout sizes, so a
+    // second row pushes the table down (LESSONS_LEARNED recipe 32).
+    Item {
         Layout.fillWidth: true
-        width: parent ? parent.width : implicitWidth
-        spacing: root.uiTheme.spacingMd
+        Layout.preferredHeight: filterBar.height
+        Flow {
+            id: filterBar
+            anchors.left: parent.left
+            anchors.right: parent.right
+            spacing: root.uiTheme.spacingMd
 
-        Label {
-            id: sortLabel
-            text: root.uiRevision >= 0 ? root.tr("rules.sort.label", "Sort") : ""
-            color: root.textColor
-            verticalAlignment: Text.AlignVCenter
-            height: sortCombo.height
-        }
-        ThemedComboBox {
-            id: sortCombo
-            accessibleLabel: root.uiRevision >= 0 ? root.tr("rules.sort.label", "Sort") : ""
-            theme: root.uiTheme
-            implicitWidth: 220
-            model: Rules.RULES_SORT_COLUMNS
-            function sortLabel(id) { return root.tr("rules.sort." + id, id) }
-            labelResolver: function(item) { return sortCombo.sortLabel(item) }
-            currentIndex: Pure.optionIndexByValue(model, "by-display-order", 0)
-            // Imperative displayText: declarative bindings on `displayText`
-            // were dropped by Qt's default ComboBox after `onActivated` set
-            // `currentIndex` internally, leaving the closed control showing
-            // the raw model id ("disabled-only", "by-type") instead of the
-            // localized label. Setting it explicitly on every activation
-            // and on `uiRevision` change keeps it in sync regardless of
-            // binding evaluation order.
-            Component.onCompleted: sortCombo.displayText = sortCombo.sortLabel(sortCombo.model[sortCombo.currentIndex])
-            popup.width: root.comboPopupWidth(sortCombo, model, "",
-                function(item) { return sortCombo.sortLabel(item) })
-            onActivated: {
-                section.sortBy = model[currentIndex]
-                section.sortDir = "asc"
-                section.applySort()
-                sortCombo.displayText = sortCombo.sortLabel(model[currentIndex])
-            }
-            Connections {
-                target: root
-                // Guard against firing during initial section
-                // construction when `sortCombo` is briefly null.
-                function onUiRevisionChanged() {
-                    if (!sortCombo) return
-                    sortCombo.displayText = sortCombo.sortLabel(sortCombo.model[sortCombo.currentIndex])
-                }
-            }
-        }
-
-        Label {
-            id: statusLabel
-            text: root.uiRevision >= 0 ? root.tr("rules.filter.enabled.label", "Status") : ""
-            color: root.textColor
-            verticalAlignment: Text.AlignVCenter
-            height: enabledFilterCombo.height
-        }
-        ThemedComboBox {
-            id: enabledFilterCombo
-            accessibleLabel: root.uiRevision >= 0 ? root.tr("rules.filter.enabled.label", "Status") : ""
-            theme: root.uiTheme
-            implicitWidth: 220
-            model: Rules.RULES_STATUS_FILTERS
-            function statusLabel(id) { return root.tr("rules.filter.enabled." + id, id) }
-            labelResolver: function(item) { return enabledFilterCombo.statusLabel(item) }
-            currentIndex: 0
-            Component.onCompleted: enabledFilterCombo.displayText = enabledFilterCombo.statusLabel(enabledFilterCombo.model[enabledFilterCombo.currentIndex])
-            popup.width: root.comboPopupWidth(enabledFilterCombo, model, "",
-                function(item) { return enabledFilterCombo.statusLabel(item) })
-            onActivated: {
-                section.filterEnabled = model[currentIndex]
-                enabledFilterCombo.displayText = enabledFilterCombo.statusLabel(model[currentIndex])
-            }
-            Connections {
-                target: root
-                function onUiRevisionChanged() {
-                    if (!enabledFilterCombo) return
-                    enabledFilterCombo.displayText = enabledFilterCombo.statusLabel(enabledFilterCombo.model[enabledFilterCombo.currentIndex])
-                }
-            }
-        }
-
-        Label {
-            id: typeLabel
-            text: root.uiRevision >= 0 ? root.tr("rules.filter.type.label", "Type") : ""
-            color: root.textColor
-            verticalAlignment: Text.AlignVCenter
-            height: typeFilterCombo.height
-        }
-        ThemedComboBox {
-            id: typeFilterCombo
-            accessibleLabel: root.uiRevision >= 0 ? root.tr("rules.filter.type.label", "Type") : ""
-            theme: root.uiTheme
-            implicitWidth: 200
-            model: Rules.RULES_TYPE_FILTERS
-            function typeLabel(id) {
-                if (id === "all") return root.tr("rules.filter.type.all", "All types")
-                return root.tr("rules.filter.type." + id, root.tr("rules.type." + id, id))
-            }
-            labelResolver: function(item) { return typeFilterCombo.typeLabel(item) }
-            currentIndex: 0
-            Component.onCompleted: typeFilterCombo.displayText = typeFilterCombo.typeLabel(typeFilterCombo.model[typeFilterCombo.currentIndex])
-            popup.width: root.comboPopupWidth(typeFilterCombo, model, "",
-                function(item) { return typeFilterCombo.typeLabel(item) })
-            onActivated: {
-                section.filterType = model[currentIndex]
-                typeFilterCombo.displayText = typeFilterCombo.typeLabel(model[currentIndex])
-            }
-            Connections {
-                target: root
-                function onUiRevisionChanged() {
-                    if (!typeFilterCombo) return
-                    typeFilterCombo.displayText = typeFilterCombo.typeLabel(typeFilterCombo.model[typeFilterCombo.currentIndex])
-                }
-            }
-        }
-
-        // Route filter (requested). Mirrors the type filter.
-        Label {
-            id: routeFilterLabel
-            text: root.uiRevision >= 0 ? root.tr("rules.filter.route.label", "Route") : ""
-            color: root.textColor
-            verticalAlignment: Text.AlignVCenter
-            height: routeFilterCombo.height
-        }
-        ThemedComboBox {
-            id: routeFilterCombo
-            accessibleLabel: root.uiRevision >= 0 ? root.tr("rules.filter.route.label", "Route") : ""
-            theme: root.uiTheme
-            implicitWidth: 200
-            model: Rules.RULES_ROUTE_FILTERS
-            function routeLabelFor(id) {
-                if (id === "all") return root.tr("rules.filter.route.all", "All routes")
-                if (id === "unsure") return root.tr("rules.filter.route.unsure", "Unsure (?)")
-                if (id === "block") return root.tr("rules.filter.route.denied", "Denied")
-                return root.routeLabel(id)
-            }
-            labelResolver: function(item) { return routeFilterCombo.routeLabelFor(item) }
-            currentIndex: 0
-            Component.onCompleted: routeFilterCombo.displayText = routeFilterCombo.routeLabelFor(routeFilterCombo.model[routeFilterCombo.currentIndex])
-            popup.width: root.comboPopupWidth(routeFilterCombo, model, "",
-                function(item) { return routeFilterCombo.routeLabelFor(item) })
-            onActivated: {
-                section.filterRoute = model[currentIndex]
-                routeFilterCombo.displayText = routeFilterCombo.routeLabelFor(model[currentIndex])
-            }
-            Connections {
-                target: root
-                function onUiRevisionChanged() {
-                    if (!routeFilterCombo) return
-                    routeFilterCombo.displayText = routeFilterCombo.routeLabelFor(routeFilterCombo.model[routeFilterCombo.currentIndex])
-                }
-            }
-        }
-        // "Which of these did I not write?" — the service authors rules on its
-        // own initiative, and until now nothing in the table separated those
-        // from the user's own. The origin tag is already on every row.
-        CheckBox {
-            id: autoAddedFilterCheck
-            text: root.uiRevision >= 0
-                ? root.tr("rules.filter.auto-added", "Auto-added only") : ""
-            checked: section.filterAutoAddedOnly
-            onToggled: section.filterAutoAddedOnly = checked
-            contentItem: Text {
-                text: autoAddedFilterCheck.text
+            Label {
+                id: sortLabel
+                text: root.uiRevision >= 0 ? root.tr("rules.sort.label", "Sort") : ""
                 color: root.textColor
-                leftPadding: autoAddedFilterCheck.indicator.width + autoAddedFilterCheck.spacing
                 verticalAlignment: Text.AlignVCenter
+                height: sortCombo.height
             }
-        }
-        CheckBox {
-            id: notWorkingFilterCheck
-            text: root.uiRevision >= 0
-                ? root.tr("rules.filter.show-not-working", "Show rules that do not work") : ""
-            checked: section.showNotWorking
-            onToggled: section.showNotWorking = checked
-            Accessible.name: text
-            Accessible.description: root.uiRevision >= 0
-                ? root.tr("rules.filter.show-not-working-tooltip",
-                    "Rules whose value cannot be applied are kept in your set and shown with the reason. Delete one to remove it. Rules for other systems stay in the rules file and are applied only there.")
-                : ""
-            ToolTip.visible: hovered && root.prefs.tooltipsEnabled
-            ToolTip.text: Accessible.description
-            contentItem: Text {
-                text: notWorkingFilterCheck.text
+            ThemedComboBox {
+                id: sortCombo
+                accessibleLabel: root.uiRevision >= 0 ? root.tr("rules.sort.label", "Sort") : ""
+                theme: root.uiTheme
+                implicitWidth: 220
+                model: Rules.RULES_SORT_COLUMNS
+                function sortLabel(id) { return root.tr("rules.sort." + id, id) }
+                labelResolver: function(item) { return sortCombo.sortLabel(item) }
+                currentIndex: Pure.optionIndexByValue(model, "by-display-order", 0)
+                // Set imperatively: Qt's ComboBox dropped a `displayText`
+                // binding once `onActivated` moved `currentIndex`, and the
+                // closed control showed the raw model id.
+                Component.onCompleted: sortCombo.displayText = sortCombo.sortLabel(sortCombo.model[sortCombo.currentIndex])
+                popup.width: root.comboPopupWidth(sortCombo, model, "",
+                    function(item) { return sortCombo.sortLabel(item) })
+                onActivated: {
+                    section.sortBy = model[currentIndex]
+                    section.sortDir = "asc"
+                    section.applySort()
+                    sortCombo.displayText = sortCombo.sortLabel(model[currentIndex])
+                }
+                Connections {
+                    target: root
+                    // `sortCombo` is briefly null while the section is built.
+                    function onUiRevisionChanged() {
+                        if (!sortCombo) return
+                        sortCombo.displayText = sortCombo.sortLabel(sortCombo.model[sortCombo.currentIndex])
+                    }
+                }
+            }
+
+            Label {
+                id: statusLabel
+                text: root.uiRevision >= 0 ? root.tr("rules.filter.enabled.label", "Status") : ""
                 color: root.textColor
-                leftPadding: notWorkingFilterCheck.indicator.width + notWorkingFilterCheck.spacing
                 verticalAlignment: Text.AlignVCenter
+                height: enabledFilterCombo.height
             }
-        }
-        // «Recent»: what the user added, changed or deleted lately.
-        CheckBox {
-            id: recentFilterCheck
-            text: root.uiRevision >= 0 ? root.tr("rules.filter.recent.label", "Recent") : ""
-            checked: section.filterRecent
-            onToggled: section.filterRecent = checked
-            Accessible.name: text
-            Accessible.description: root.uiRevision >= 0
-                ? root.tr("rules.filter.recent.tooltip",
-                    "Show only the rules you added or changed lately, newest first, and the ones you deleted.")
-                : ""
-            ToolTip.visible: hovered && root.prefs.tooltipsEnabled
-            ToolTip.delay: 400
-            ToolTip.text: Accessible.description
-            contentItem: Text {
-                text: recentFilterCheck.text
+            ThemedComboBox {
+                id: enabledFilterCombo
+                accessibleLabel: root.uiRevision >= 0 ? root.tr("rules.filter.enabled.label", "Status") : ""
+                theme: root.uiTheme
+                implicitWidth: 220
+                model: Rules.RULES_STATUS_FILTERS
+                function statusLabel(id) { return root.tr("rules.filter.enabled." + id, id) }
+                labelResolver: function(item) { return enabledFilterCombo.statusLabel(item) }
+                currentIndex: 0
+                Component.onCompleted: enabledFilterCombo.displayText = enabledFilterCombo.statusLabel(enabledFilterCombo.model[enabledFilterCombo.currentIndex])
+                popup.width: root.comboPopupWidth(enabledFilterCombo, model, "",
+                    function(item) { return enabledFilterCombo.statusLabel(item) })
+                onActivated: {
+                    section.filterEnabled = model[currentIndex]
+                    enabledFilterCombo.displayText = enabledFilterCombo.statusLabel(model[currentIndex])
+                }
+                Connections {
+                    target: root
+                    function onUiRevisionChanged() {
+                        if (!enabledFilterCombo) return
+                        enabledFilterCombo.displayText = enabledFilterCombo.statusLabel(enabledFilterCombo.model[enabledFilterCombo.currentIndex])
+                    }
+                }
+            }
+
+            Label {
+                id: typeLabel
+                text: root.uiRevision >= 0 ? root.tr("rules.filter.type.label", "Type") : ""
                 color: root.textColor
-                leftPadding: recentFilterCheck.indicator.width + recentFilterCheck.spacing
                 verticalAlignment: Text.AlignVCenter
+                height: typeFilterCombo.height
             }
-        }
-        ThemedComboBox {
-            id: recentPeriodCombo
-            theme: root.uiTheme
-            visible: section.filterRecent
-            implicitWidth: 160
-            model: [ "hour", "today", "week" ]
-            function periodLabel(id) {
-                if (id === "hour") return root.tr("rules.filter.recent.hour", "Last hour")
-                if (id === "week") return root.tr("rules.filter.recent.week", "7 days")
-                return root.tr("rules.filter.recent.today", "Today")
+            ThemedComboBox {
+                id: typeFilterCombo
+                accessibleLabel: root.uiRevision >= 0 ? root.tr("rules.filter.type.label", "Type") : ""
+                theme: root.uiTheme
+                implicitWidth: 200
+                model: Rules.RULES_TYPE_FILTERS
+                function typeLabel(id) {
+                    if (id === "all") return root.tr("rules.filter.type.all", "All types")
+                    return root.tr("rules.filter.type." + id, root.tr("rules.type." + id, id))
+                }
+                labelResolver: function(item) { return typeFilterCombo.typeLabel(item) }
+                currentIndex: 0
+                Component.onCompleted: typeFilterCombo.displayText = typeFilterCombo.typeLabel(typeFilterCombo.model[typeFilterCombo.currentIndex])
+                popup.width: root.comboPopupWidth(typeFilterCombo, model, "",
+                    function(item) { return typeFilterCombo.typeLabel(item) })
+                onActivated: {
+                    section.filterType = model[currentIndex]
+                    typeFilterCombo.displayText = typeFilterCombo.typeLabel(model[currentIndex])
+                }
+                Connections {
+                    target: root
+                    function onUiRevisionChanged() {
+                        if (!typeFilterCombo) return
+                        typeFilterCombo.displayText = typeFilterCombo.typeLabel(typeFilterCombo.model[typeFilterCombo.currentIndex])
+                    }
+                }
             }
-            labelResolver: function(item) { return recentPeriodCombo.periodLabel(item) }
-            currentIndex: 1
-            Accessible.name: root.uiRevision >= 0
-                ? root.tr("rules.filter.recent.period", "Period of recent changes") : ""
-            Component.onCompleted: recentPeriodCombo.displayText = recentPeriodCombo.periodLabel(recentPeriodCombo.model[recentPeriodCombo.currentIndex])
-            popup.width: root.comboPopupWidth(recentPeriodCombo, model, "",
-                function(item) { return recentPeriodCombo.periodLabel(item) })
-            onActivated: {
-                section.recentPeriod = model[currentIndex]
-                recentPeriodCombo.displayText = recentPeriodCombo.periodLabel(model[currentIndex])
+
+            Label {
+                id: routeFilterLabel
+                text: root.uiRevision >= 0 ? root.tr("rules.filter.route.label", "Route") : ""
+                color: root.textColor
+                verticalAlignment: Text.AlignVCenter
+                height: routeFilterCombo.height
             }
-            Connections {
-                target: root
-                function onUiRevisionChanged() {
-                    if (!recentPeriodCombo) return
-                    recentPeriodCombo.displayText = recentPeriodCombo.periodLabel(recentPeriodCombo.model[recentPeriodCombo.currentIndex])
+            ThemedComboBox {
+                id: routeFilterCombo
+                accessibleLabel: root.uiRevision >= 0 ? root.tr("rules.filter.route.label", "Route") : ""
+                theme: root.uiTheme
+                implicitWidth: 200
+                model: Rules.RULES_ROUTE_FILTERS
+                function routeLabelFor(id) {
+                    if (id === "all") return root.tr("rules.filter.route.all", "All routes")
+                    if (id === "unsure") return root.tr("rules.filter.route.unsure", "Unsure (?)")
+                    if (id === "block") return root.tr("rules.filter.route.denied", "Denied")
+                    return root.routeLabel(id)
+                }
+                labelResolver: function(item) { return routeFilterCombo.routeLabelFor(item) }
+                currentIndex: 0
+                Component.onCompleted: routeFilterCombo.displayText = routeFilterCombo.routeLabelFor(routeFilterCombo.model[routeFilterCombo.currentIndex])
+                popup.width: root.comboPopupWidth(routeFilterCombo, model, "",
+                    function(item) { return routeFilterCombo.routeLabelFor(item) })
+                onActivated: {
+                    section.filterRoute = model[currentIndex]
+                    routeFilterCombo.displayText = routeFilterCombo.routeLabelFor(model[currentIndex])
+                }
+                Connections {
+                    target: root
+                    function onUiRevisionChanged() {
+                        if (!routeFilterCombo) return
+                        routeFilterCombo.displayText = routeFilterCombo.routeLabelFor(routeFilterCombo.model[routeFilterCombo.currentIndex])
+                    }
+                }
+            }
+            // The rules the service authored on its own, apart from the user's.
+            CheckBox {
+                id: autoAddedFilterCheck
+                text: root.uiRevision >= 0
+                    ? root.tr("rules.filter.auto-added", "Auto-added only") : ""
+                checked: section.filterAutoAddedOnly
+                onToggled: section.filterAutoAddedOnly = checked
+                contentItem: Text {
+                    text: autoAddedFilterCheck.text
+                    color: root.textColor
+                    leftPadding: autoAddedFilterCheck.indicator.width + autoAddedFilterCheck.spacing
+                    verticalAlignment: Text.AlignVCenter
+                }
+            }
+            CheckBox {
+                id: notWorkingFilterCheck
+                text: root.uiRevision >= 0
+                    ? root.tr("rules.filter.show-not-working", "Show rules that do not work") : ""
+                checked: section.showNotWorking
+                onToggled: section.showNotWorking = checked
+                Accessible.name: text
+                Accessible.description: root.uiRevision >= 0
+                    ? root.tr("rules.filter.show-not-working-tooltip",
+                        "Rules whose value cannot be applied are kept in your set and shown with the reason. Delete one to remove it. Rules for other systems stay in the rules file and are applied only there.")
+                    : ""
+                ToolTip.visible: hovered && root.prefs.tooltipsEnabled
+                ToolTip.text: Accessible.description
+                contentItem: Text {
+                    text: notWorkingFilterCheck.text
+                    color: root.textColor
+                    leftPadding: notWorkingFilterCheck.indicator.width + notWorkingFilterCheck.spacing
+                    verticalAlignment: Text.AlignVCenter
+                }
+            }
+            // «Recent»: what the user added, changed or deleted lately.
+            CheckBox {
+                id: recentFilterCheck
+                text: root.uiRevision >= 0 ? root.tr("rules.filter.recent.label", "Recent") : ""
+                checked: section.filterRecent
+                onToggled: section.filterRecent = checked
+                Accessible.name: text
+                Accessible.description: root.uiRevision >= 0
+                    ? root.tr("rules.filter.recent.tooltip",
+                        "Show only the rules you added or changed lately, newest first, and the ones you deleted.")
+                    : ""
+                ToolTip.visible: hovered && root.prefs.tooltipsEnabled
+                ToolTip.delay: 400
+                ToolTip.text: Accessible.description
+                contentItem: Text {
+                    text: recentFilterCheck.text
+                    color: root.textColor
+                    leftPadding: recentFilterCheck.indicator.width + recentFilterCheck.spacing
+                    verticalAlignment: Text.AlignVCenter
+                }
+            }
+            ThemedComboBox {
+                id: recentPeriodCombo
+                theme: root.uiTheme
+                visible: section.filterRecent
+                implicitWidth: 160
+                model: [ "hour", "today", "week" ]
+                function periodLabel(id) {
+                    if (id === "hour") return root.tr("rules.filter.recent.hour", "Last hour")
+                    if (id === "week") return root.tr("rules.filter.recent.week", "7 days")
+                    return root.tr("rules.filter.recent.today", "Today")
+                }
+                labelResolver: function(item) { return recentPeriodCombo.periodLabel(item) }
+                currentIndex: 1
+                Accessible.name: root.uiRevision >= 0
+                    ? root.tr("rules.filter.recent.period", "Period of recent changes") : ""
+                Component.onCompleted: recentPeriodCombo.displayText = recentPeriodCombo.periodLabel(recentPeriodCombo.model[recentPeriodCombo.currentIndex])
+                popup.width: root.comboPopupWidth(recentPeriodCombo, model, "",
+                    function(item) { return recentPeriodCombo.periodLabel(item) })
+                onActivated: {
+                    section.recentPeriod = model[currentIndex]
+                    recentPeriodCombo.displayText = recentPeriodCombo.periodLabel(model[currentIndex])
+                }
+                Connections {
+                    target: root
+                    function onUiRevisionChanged() {
+                        if (!recentPeriodCombo) return
+                        recentPeriodCombo.displayText = recentPeriodCombo.periodLabel(recentPeriodCombo.model[recentPeriodCombo.currentIndex])
+                    }
                 }
             }
         }

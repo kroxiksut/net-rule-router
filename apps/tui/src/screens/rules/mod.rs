@@ -35,9 +35,10 @@ use nrr_client_logic::rule_value_class::misplaced_target_type;
 use nrr_client_logic::rules_table::{search_box_text, RuleRow, RuleType, TargetRoute};
 use nrr_shared::display_text::display_text;
 use nrr_shared::ipc_payloads::{RulesListResponse, RULES_CHANGED_ELSEWHERE};
+use nrr_shared::merge_dto::MergePolicyDto;
 use nrr_shared::rules_json::FREE_MAX_RULES;
 use nrr_shared::rules_overlap::{find_route_overlaps, RouteOverlap};
-use nrr_shared::user_settings::UserSettingsError;
+use nrr_shared::user_settings::{UserSettings, UserSettingsError, UserSettingsStore};
 
 use self::apply::{Failure, Finished, Previewed, Review};
 use self::files::{Preset, RuleSet};
@@ -304,6 +305,8 @@ pub struct RulesState {
     /// line that says where the rules are saved; read when the list is read
     /// or the binding written, never per frame.
     pub bound_paths: Vec<String>,
+    /// The settings file's stamp when this terminal last read it on the tick.
+    pub settings_stamp: String,
     /// The rule-set folder was offered this run.
     pub folder_offered: bool,
     /// The demo rules are read in Russian.
@@ -840,16 +843,53 @@ fn changes_rules(command: &str) -> bool {
     CHANGING.contains(&command)
 }
 
+/// The window writes the settings file too. Called on the idle tick: when the
+/// file's stamp moved, what this terminal shows from it is read again, and
+/// `true` asks for a redraw.
+pub fn follow_settings_file(app: &mut AppState) -> bool {
+    let Some(file) = app.rules.settings_file.clone() else {
+        return false;
+    };
+    let stamp = UserSettingsStore::at(file.clone()).stamp();
+    if stamp == app.rules.settings_stamp {
+        return false;
+    }
+    app.rules.settings_stamp = stamp;
+    let settings = own_settings::read(&file);
+    app.rules.bound_paths = bound_paths_of(Some(&settings));
+    if let Ok(settings) = &settings {
+        app.settings.merge_policy = MergePolicyDto::from_slug(&settings.merge_policy);
+    }
+    crate::window_parked::refresh(app);
+    true
+}
+
 /// The window may bind other files at any time: the settings file is shared.
 fn refresh_bound_paths(app: &mut AppState) {
     let settings = app.rules.settings_file.as_deref().map(own_settings::read);
-    app.rules.bound_paths = match settings {
-        Some(Ok(settings)) => [settings.rules_files.primary, settings.rules_files.secondary]
-            .into_iter()
-            .filter(|path| !path.is_empty())
-            .collect(),
+    app.rules.bound_paths = bound_paths_of(settings.as_ref());
+}
+
+/// Each route's sections this build does not apply, as its bound file holds
+/// them now: what a rewrite of the file would carry.
+pub(crate) fn bound_passthrough(app: &mut AppState) -> [BTreeMap<String, String>; 2] {
+    let rules = &mut app.rules;
+    files::take_bound_passthrough(&mut rules.table, rules.settings_file.as_deref());
+    rules.table.passthrough.clone()
+}
+
+fn bound_paths_of(settings: Option<&Result<UserSettings, UserSettingsError>>) -> Vec<String> {
+    match settings {
+        Some(Ok(settings)) => [
+            &settings.rules_files.primary,
+            &settings.rules_files.secondary,
+        ]
+        .into_iter()
+        .filter(|path| !path.is_empty())
+        .cloned()
+        .collect(),
         _ => Vec::new(),
-    };
+    }
 }
 
 fn loaded(app: &mut AppState, result: Result<RulesListResponse, Failure>) {

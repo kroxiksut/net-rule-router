@@ -55,7 +55,8 @@ pub struct VerbSpec {
 const START_MODE_FLAG: FlagSpec = FlagSpec {
     name: "start-mode",
     value: Some("auto|on-demand"),
-    summary: "start with the operating system (default), or when the app is launched",
+    summary: "start with the operating system (default), or when the app is launched \
+              (Windows; elsewhere on-demand means started by hand)",
 };
 
 const PURGE_FLAG: FlagSpec = FlagSpec {

@@ -549,13 +549,53 @@ fn the_site_notice_is_offered_where_the_tray_can_be_started_and_turned_off_for_g
     answer(&mut app, &format!("i{row} 5"));
     drain(&mut app, &fake);
     assert_eq!(fake.sent(IpcOperationName::BlockNoticeMutesSet), [off]);
+}
 
+/// Where the tray cannot be started to tell it, "Don't report again" on the
+/// tray's card is still a mute: the row stays listed while it holds, so it
+/// can be lifted, and makes no "even while the tray is closed" promise.
+#[test]
+fn a_site_notice_muted_from_the_tray_can_be_lifted_where_the_tray_cannot_be_started() {
+    let fake = service();
+    let off = json!({ "scope": { "kind": "notice", "notice": "site-not-opening" } });
+    fake.answer(
+        IpcOperationName::BlockNoticeMutesList,
+        json!({ "mutes": [off.clone()] }),
+    );
+    fake.answer(
+        IpcOperationName::BlockNoticeMutesRemove,
+        json!({ "mutes": [] }),
+    );
+    let mut app = on_settings();
     app.settings.supports = PlatformProfile::linux().supports;
+    answer(&mut app, "c1");
+    drain(&mut app, &fake);
+    let listed = items::items(&app, Category::Notifications)
+        .into_iter()
+        .find(|item| item.id == ItemId::HideKind("site-not-opening"))
+        .expect("a mute the user cannot see is a mute the user cannot lift");
+    let title = listed.label.resolve(&texts_en());
+    assert!(
+        !title.contains("tray is closed"),
+        "promises a notice this platform cannot give: {title:?}"
+    );
+
+    let row = row_of(
+        &app,
+        Category::Notifications,
+        ItemId::HideKind("site-not-opening"),
+    );
+    answer(&mut app, &format!("i{row} 1"));
+    drain(&mut app, &fake);
+    assert_eq!(
+        fake.sent(IpcOperationName::BlockNoticeMutesRemove),
+        [json!({ "scope": off["scope"] })]
+    );
     assert!(
         !items::items(&app, Category::Notifications)
             .iter()
             .any(|item| item.id == ItemId::HideKind("site-not-opening")),
-        "offered where nothing could start the tray"
+        "still offered once nothing hides it, where nothing could start the tray"
     );
 }
 
@@ -590,6 +630,110 @@ fn an_export_needs_a_file_name_first() {
     assert_eq!(said(&app), texts_en().get(text::EXPORT_NEED_PATH));
 }
 
+/// The full settings export names the rules files the user bound, as the
+/// window's does: only the clients know them.
+#[test]
+fn the_full_export_names_the_bound_rules_files() {
+    let dir = Scratch::new("settings-export-bound");
+    let file = dir.path().join(USER_SETTINGS_FILE_NAME);
+    UserSettingsStore::at(file.clone())
+        .update(|s| {
+            s.set_primary_file("C:/Rules/rules_primary.txt");
+            s.set_secondary_file("C:/Rules/rules_secondary.txt");
+        })
+        .expect("seed");
+    let fake = service();
+    fake.answer(
+        IpcOperationName::SettingsExportFull,
+        json!({ "yaml-bytes-b64": "bnJyX3NldHRpbmdzX2V4cG9ydDoK", "content-hash": "" }),
+    );
+    let mut app = on_settings();
+    app.rules.settings_file = Some(file);
+    app.settings.export_path = dir.path().join("out.yaml").display().to_string();
+    answer(&mut app, "c5");
+    let row = row_of(&app, Category::Presets, ItemId::ExportRun);
+    answer(&mut app, &format!("i{row}"));
+    drain(&mut app, &fake);
+    let asked = fake.sent(IpcOperationName::SettingsExportFull);
+    let last = asked.last().expect("an export read");
+    assert_eq!(
+        last["rules-file-path-primary"],
+        json!("C:/Rules/rules_primary.txt")
+    );
+    assert_eq!(
+        last["rules-file-path-secondary"],
+        json!("C:/Rules/rules_secondary.txt")
+    );
+}
+
+/// Another system's programs in a bound file reach the export, as "Save to
+/// file" carries them: the service keeps none.
+#[test]
+fn the_full_export_carries_another_systems_sections_from_the_bound_file() {
+    let dir = Scratch::new("settings-export-foreign");
+    let primary = dir.path().join("rules_primary.txt");
+    let foreign = if cfg!(target_os = "macos") {
+        "Linux"
+    } else {
+        "MacOS"
+    };
+    std::fs::write(
+        &primary,
+        format!("--- Domains\na.example\n\n--- {foreign}\nOther Browser\n"),
+    )
+    .expect("bound file");
+    let file = dir.path().join(USER_SETTINGS_FILE_NAME);
+    UserSettingsStore::at(file.clone())
+        .update(|s| s.set_primary_file(&primary.display().to_string()))
+        .expect("seed");
+    let fake = service();
+    fake.answer(
+        IpcOperationName::SettingsExportFull,
+        json!({ "yaml-bytes-b64": "bnJyX3NldHRpbmdzX2V4cG9ydDoK", "content-hash": "" }),
+    );
+    let mut app = on_settings();
+    app.rules.settings_file = Some(file);
+    app.settings.export_path = dir.path().join("out.yaml").display().to_string();
+    answer(&mut app, "c5");
+    let row = row_of(&app, Category::Presets, ItemId::ExportRun);
+    answer(&mut app, &format!("i{row}"));
+    drain(&mut app, &fake);
+    let asked = fake.sent(IpcOperationName::SettingsExportFull);
+    let last = asked.last().expect("an export read");
+    assert_eq!(
+        last["passthrough-sections-primary"][foreign],
+        json!("Other Browser\n"),
+        "{last}"
+    );
+    assert!(
+        last.get("passthrough-sections-secondary").is_none(),
+        "{last}"
+    );
+}
+
+/// An export too large for one answer changed nothing and says so, not the
+/// generic "the change may have been applied".
+#[test]
+fn a_full_export_too_large_to_answer_says_what_to_do() {
+    let dir = Scratch::new("settings-export-too-large");
+    let fake = service();
+    fake.refuse(
+        IpcOperationName::SettingsExportFull,
+        nrr_shared::ipc_transport::IpcErrorCode::ResponseTooLarge,
+    );
+    let mut app = on_settings();
+    let out = dir.path().join("out.yaml");
+    app.settings.export_path = out.display().to_string();
+    answer(&mut app, "c5");
+    let row = row_of(&app, Category::Presets, ItemId::ExportRun);
+    answer(&mut app, &format!("i{row}"));
+    drain(&mut app, &fake);
+    let words = texts_en().get(crate::i18n::key("errors.settings-export-too-large", ""));
+    assert!(words.starts_with("Your rules are too many"), "{words}");
+    assert!(said(&app).contains(&words), "{}", said(&app));
+    assert!(!out.exists(), "nothing written");
+}
+
 #[test]
 fn the_merge_policy_is_read_from_and_saved_to_the_shared_settings() {
     let dir = Scratch::new("settings-merge-policy");
@@ -612,6 +756,24 @@ fn the_merge_policy_is_read_from_and_saved_to_the_shared_settings() {
     assert_eq!(recorded.merge_policy, "service-wins");
 }
 
+/// The window picks another merge policy while the section is open: the
+/// section shows it without being reopened.
+#[test]
+fn a_merge_policy_the_window_picked_reaches_the_open_section() {
+    let dir = Scratch::new("settings-merge-policy-follow");
+    let file = dir.path().join(USER_SETTINGS_FILE_NAME);
+    let mut app = on_settings();
+    app.rules.settings_file = Some(file.clone());
+    answer(&mut app, "c5");
+    assert_eq!(app.settings.merge_policy, MergePolicyDto::default());
+
+    UserSettingsStore::at(file)
+        .update(|s| s.merge_policy = "service-wins".to_string())
+        .expect("the window writes");
+    assert!(crate::screens::rules::follow_settings_file(&mut app));
+    assert_eq!(app.settings.merge_policy, MergePolicyDto::ServiceWins);
+}
+
 #[test]
 fn the_terminals_own_options_are_saved_to_its_file() {
     let dir = Scratch::new("settings-prefs");
@@ -624,6 +786,72 @@ fn the_terminals_own_options_are_saved_to_its_file() {
     assert!(app.settings.prefs.ascii);
     assert!(prefs::load(&path).ascii);
     assert_eq!(said(&app), texts_en().get(text::PREF_SAVED));
+}
+
+/// An option changed while the terminal's file is damaged: the file is kept
+/// byte for byte and the answer names it; the option holds for the run. Once
+/// the user corrects the file, the next change is saved into it.
+#[test]
+fn an_option_changed_over_a_damaged_file_keeps_the_file_until_it_is_fixed() {
+    let dir = Scratch::new("settings-prefs-damaged");
+    let path = dir.path().join("tui.json");
+    std::fs::write(&path, "{\"ascii\": fal").expect("seed");
+    let mut app = on_settings();
+    app.settings.prefs_path = Some(path.clone());
+    answer(&mut app, "c9");
+    let row = row_of(&app, Category::Terminal, ItemId::Pref(PrefField::Ascii));
+
+    answer(&mut app, &format!("i{row}"));
+    assert_eq!(
+        std::fs::read_to_string(&path).expect("read"),
+        "{\"ascii\": fal"
+    );
+    assert!(app.settings.prefs.ascii, "the choice holds for this run");
+    let answer_text = said(&app);
+    assert!(
+        answer_text.starts_with("The terminal's settings file is damaged")
+            && answer_text.contains(&path.display().to_string()),
+        "{answer_text}"
+    );
+
+    std::fs::write(&path, "{\"ascii\": false, \"kept\": 1}").expect("the user fixes it");
+    answer(&mut app, &format!("i{row}"));
+    answer(&mut app, &format!("i{row}"));
+    assert_eq!(said(&app), texts_en().get(text::PREF_SAVED));
+    assert!(prefs::load(&path).ascii);
+    assert!(prefs::read_object(&path).contains_key("kept"));
+}
+
+/// Another program holds the terminal's file, or its permissions shut the user
+/// out: the file is fine, so the answer says it could not be read, never that
+/// it is damaged, and nothing is written over it.
+#[test]
+fn an_option_changed_over_a_held_file_says_it_could_not_be_read() {
+    let dir = Scratch::new("settings-prefs-held");
+    let path = dir.path().join("tui.json");
+    std::fs::write(&path, "{\"ascii\": false, \"kept\": 1}").expect("seed");
+    let mut app = on_settings();
+    app.settings.prefs_path = Some(path.clone());
+    answer(&mut app, "c9");
+    let row = row_of(&app, Category::Terminal, ItemId::Pref(PrefField::Ascii));
+    let Some(held) = crate::testing::hold_unreadable(&path) else {
+        return;
+    };
+
+    answer(&mut app, &format!("i{row}"));
+    let answer_text = said(&app);
+    drop(held);
+    assert!(
+        answer_text.starts_with("The terminal's settings file could not be read")
+            && answer_text.contains(&path.display().to_string())
+            && !answer_text.contains("damaged"),
+        "{answer_text}"
+    );
+    assert!(app.settings.prefs.ascii, "the choice holds for this run");
+    assert_eq!(
+        std::fs::read_to_string(&path).expect("read"),
+        "{\"ascii\": false, \"kept\": 1}"
+    );
 }
 
 /// "Hide addresses" is also reached where the other notice settings are, and
@@ -923,6 +1151,35 @@ fn the_hosts_file_is_named_under_its_toggle() {
 
     app.settings.hosts_file_path.clear();
     assert!(!lines(&app).iter().any(|l| l.starts_with("OS hosts file")));
+}
+
+/// A stock hosts file (comments only) hides the whole hosts group, as the
+/// window does; a mapping added while the terminal runs shows it on the next
+/// visit to Routing.
+#[test]
+fn the_hosts_group_follows_the_file_each_time_routing_opens() {
+    let dir = Scratch::new("settings-hosts-group");
+    let hosts = dir.path().join("hosts");
+    std::fs::write(&hosts, "# stock file\n\n#127.0.0.1 commented.example\n").expect("write");
+    let mut app = on_settings();
+    app.settings.hosts_file_path = hosts.display().to_string();
+    let texts = texts_en();
+    let shows_group = |app: &AppState| {
+        items::items(app, Category::Routing).iter().any(|item| {
+            item.id == ItemId::Policy("resolve-hosts-bypass")
+                || item.label.resolve(&texts) == "Hosts file"
+        })
+    };
+
+    open_category(&mut app, Category::Routing);
+    routing_with(&mut app, json!({}), json!({}));
+    assert!(!shows_group(&app), "a comments-only file shows the group");
+
+    std::fs::write(&hosts, "127.0.0.1 ads.example\n").expect("write");
+    show_sections(&mut app);
+    open_category(&mut app, Category::Routing);
+    routing_with(&mut app, json!({}), json!({}));
+    assert!(shows_group(&app), "a file with a mapping hides the group");
 }
 
 /// With leak protection off the routing refinements stay offered: the service
@@ -2126,7 +2383,7 @@ fn a_service_registered_elsewhere_is_named_and_not_started_from_there() {
         )),
         "{text}"
     );
-    assert!(text.contains("auto-restart"), "{text}");
+    assert!(text.contains("restarts by itself"), "{text}");
     assert!(
         text.contains("Service logs folder: ") || text.contains("logs folder path unavailable"),
         "{text}"

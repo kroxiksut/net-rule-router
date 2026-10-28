@@ -54,6 +54,69 @@ fn a_first_contact_routes_only_what_the_planner_would() {
     );
 }
 
+/// Counts whole-cache and per-address snapshot requests.
+#[derive(Default)]
+struct CountingSnapshots {
+    live: MockFqdnCacheLookup,
+    whole: std::sync::atomic::AtomicUsize,
+    scoped: std::sync::atomic::AtomicUsize,
+}
+
+impl FqdnCacheLookup for CountingSnapshots {
+    fn ips_for_hostname(&self, hostname: &str) -> Vec<IpAddr> {
+        self.live.ips_for_hostname(hostname)
+    }
+    fn hostnames_under_suffix(&self, suffix: &str, limit: usize) -> Vec<String> {
+        self.live.hostnames_under_suffix(suffix, limit)
+    }
+    fn snapshot_for_compute(&self) -> Option<crate::fqdn_cache_lookup::FqdnCacheSnapshot> {
+        self.whole.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        None
+    }
+    fn snapshot_for_addresses(
+        &self,
+        _addresses: &[IpAddr],
+    ) -> Option<crate::fqdn_cache_lookup::FqdnCacheSnapshot> {
+        self.scoped
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        None
+    }
+}
+
+/// A first contact answers a DNS reply: reading the whole cache there held
+/// every resolver worker behind the cache lock for tens of milliseconds.
+#[test]
+fn a_first_contact_reads_only_the_rows_on_its_addresses() {
+    let api = Arc::new(MockWindowsApi::new());
+    let rules = Arc::new(FakeRules::new());
+    rules.set_secondary(
+        "S-IVANOV",
+        CanonicalRuleSet::from_rules(vec![
+            ip_rule("a", 203, 0, 113, 1),
+            ip_rule("b", 203, 0, 113, 2),
+        ]),
+    );
+    let cache = Arc::new(CountingSnapshots::default());
+    let coord = SecondaryRouteCoordinator::new(
+        Arc::clone(&api) as Arc<dyn RouteTablePort>,
+        Arc::clone(&rules) as Arc<dyn RulesProvider>,
+        Arc::new(FakePolicy::new()) as Arc<dyn RoutePolicySource>,
+        Arc::clone(&cache) as Arc<dyn FqdnCacheLookup>,
+        Arc::new(|| false) as RuleScopeProvider,
+    );
+    coord
+        .recompute_for("S-IVANOV", &res(Some(target())))
+        .expect("recompute");
+    cache.whole.store(0, std::sync::atomic::Ordering::SeqCst);
+
+    let routed =
+        coord.route_first_contact("S-IVANOV", &[IpAddr::V4(Ipv4Addr::new(203, 0, 113, 2))]);
+
+    assert_eq!(routed, 1, "the first contact still routes its address");
+    assert_eq!(cache.whole.load(std::sync::atomic::Ordering::SeqCst), 0);
+    assert_eq!(cache.scoped.load(std::sync::atomic::Ordering::SeqCst), 1);
+}
+
 /// A rule book whose next read hands out the book as it stood and then, before
 /// returning, moves to `newer` and runs `hook` — a first contact landing after
 /// the pass has read its plan's inputs.

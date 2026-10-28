@@ -64,6 +64,9 @@ struct Entry {
     used_at: Instant,
     watch: Option<NetworkChangeSubscription>,
     watch_tried: bool,
+    /// The folder object listed and watched, and when that was last checked.
+    identity: Option<u128>,
+    identity_checked_at: Instant,
 }
 
 #[derive(Clone)]
@@ -194,9 +197,10 @@ impl ProgramFolderIndex {
         let shared = &self.shared;
         let key = FolderKey { folder, subfolders };
         let now = Instant::now();
-        let retired = {
+        let (mut retired, check) = {
             let mut state = shared.lock();
             let retired = shared.forget_stale(&mut state, now);
+            let mut check = None;
             if let Some(entry) = state.entries.get_mut(&key) {
                 entry.used_at = now;
                 let ttl = if entry.watch.is_some() {
@@ -205,17 +209,43 @@ impl ProgramFolderIndex {
                     shared.timing.unwatched_ttl
                 };
                 if now.saturating_duration_since(entry.listed_at) < ttl {
-                    let listing = entry.listing.clone();
+                    // A watch follows the folder it opened, so a folder renamed
+                    // into its place is invisible to it: on the slow clock,
+                    // check that the same folder still sits at the path.
+                    let due = entry.watch.is_some()
+                        && now.saturating_duration_since(entry.identity_checked_at)
+                            >= shared.timing.unwatched_ttl;
+                    if !due {
+                        let listing = entry.listing.clone();
+                        drop(state);
+                        drop(retired);
+                        return listing;
+                    }
+                    check = Some((entry.identity, entry.listing.clone()));
+                }
+            }
+            (retired, check)
+        };
+        if let Some((known, listing)) = check {
+            let current = shared.folders.identity(&key.folder);
+            let mut state = shared.lock();
+            if let Some(entry) = state.entries.get_mut(&key) {
+                entry.identity_checked_at = now;
+                if current == known {
                     drop(state);
                     drop(retired);
                     return listing;
                 }
+                // Another folder: list it and watch it afresh.
+                entry.identity = current;
+                entry.watch_tried = false;
+                retired.extend(entry.watch.take());
             }
-            retired
-        };
+        }
         // Subscriptions end outside the lock: ending one waits for its
         // thread, which may be reporting a change and need the lock.
         drop(retired);
+        let identity = shared.folders.identity(&key.folder);
         let listing = shared.folders.list(&key.folder, subfolders);
         let wants_watch = {
             let mut state = shared.lock();
@@ -226,10 +256,14 @@ impl ProgramFolderIndex {
                 used_at: now,
                 watch: None,
                 watch_tried: false,
+                identity: None,
+                identity_checked_at: now,
             });
             entry.listing = listing.clone();
             entry.listed_at = now;
             entry.used_at = now;
+            entry.identity = identity;
+            entry.identity_checked_at = now;
             let wants = !entry.watch_tried && watched < WATCHED_FOLDER_CAP;
             entry.watch_tried |= wants;
             wants

@@ -63,9 +63,10 @@ Dialog {
             wrapMode: Text.Wrap
             color: root.ownerRoot ? root.ownerRoot.textColor : palette.text
             text: root.tr("dialog.full-reset.body",
-                "This resets ALL application settings to defaults, clears the rules "
-                + "applied by the service (back to an empty post-install state), and "
-                + "wipes saved comments and logs. The background service is NOT "
+                "This resets ALL application settings to defaults, deletes the rules "
+                + "the service keeps for you (back to a post-install state), wipes saved "
+                + "comments and logs, and stops the background service. Your own rules "
+                + "files on disk are left untouched, and the background service is NOT "
                 + "uninstalled. This cannot be undone.")
         }
         // Only asked when someone else's routing is actually stored here.

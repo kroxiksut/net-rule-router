@@ -783,7 +783,8 @@ pub(super) fn build(inputs: PerSidApplyInputs<'_>) -> PerSidApplyStack {
                 .with_auto_rules(Arc::clone(&auto_rules_engine))
                 // The same discarded observations, kept as names so
                 // the connection observer can say WHICH host is
-                // failing on the main link. Diagnostic only.
+                // failing on the main link, and the census can count
+                // a direct site seen before a rule host took its address.
                 .with_observed_host_names(
                     nrr_service_runtime::observed_host_names::global_observed_host_names(),
                 ),

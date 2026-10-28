@@ -9,9 +9,10 @@
 //! answer onto the context's shape. Settings -> Diagnostics and logs draws its
 //! storage card from the same snapshot.
 
-use std::io::Write;
+#[path = "support/js.rs"]
+mod js;
+
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
 
 use nrr_shared::diagnostics_dto::{
     DiagnosticsDataOrigin, DiagnosticsStatusDto, SecurityAlertDto, OTHER_PRINCIPAL_ALERT_ID,
@@ -105,7 +106,7 @@ fn alert(id: &str, state: &str, requires_action: bool) -> SecurityAlertDto {
     }
 }
 
-/// Executable half, through the real `pure.js`. Skipped without `node`.
+/// Executable half, through the real `pure.js`.
 #[test]
 fn a_service_answer_maps_onto_the_context_shape_and_a_stale_one_keeps_the_list() {
     let mut status = DiagnosticsStatusDto::unavailable();
@@ -133,10 +134,7 @@ fn a_service_answer_maps_onto_the_context_shape_and_a_stale_one_keeps_the_list()
           securityAlertsUnreadable(null), securityAlertsUnreadable({unreadable})]]))\n",
         source = repo_file("apps/desktop/qml/lib/pure.js").replace(".pragma library", ""),
     );
-    let Some(output) = run_node(&harness) else {
-        eprintln!("node not available — skipping the executable mapping check");
-        return;
-    };
+    let output = js::run_js(&harness);
     let got: serde_json::Value = serde_json::from_str(output.trim())
         .unwrap_or_else(|e| panic!("harness output is not JSON: {e}; output: {output}"));
     assert_eq!(
@@ -253,7 +251,7 @@ fn the_context_reads_each_card_field_from_the_dto_field_the_reread_maps() {
     }
 }
 
-/// Executable half, through the real `pure.js`. Skipped without `node`.
+/// Executable half, through the real `pure.js`.
 #[test]
 fn a_live_answer_replaces_every_card_and_a_failed_one_keeps_what_is_shown() {
     let mut status = DiagnosticsStatusDto::unavailable();
@@ -295,10 +293,7 @@ fn a_live_answer_replaces_every_card_and_a_failed_one_keeps_what_is_shown() {
           diagnosticsSnapshotIsLive(null)]]))\n",
         source = repo_file("apps/desktop/qml/lib/pure.js").replace(".pragma library", ""),
     );
-    let Some(output) = run_node(&harness) else {
-        eprintln!("node not available — skipping the executable merge check");
-        return;
-    };
+    let output = js::run_js(&harness);
     let got: serde_json::Value = serde_json::from_str(output.trim())
         .unwrap_or_else(|e| panic!("harness output is not JSON: {e}; output: {output}"));
     assert_eq!(
@@ -370,10 +365,7 @@ fn page_opens_are_throttled_by_the_last_live_answer_and_events_are_not() {
          diagnosticsReadDecision(false, false, 50000, 1000, 30000)]))\n",
         source = repo_file("apps/desktop/qml/lib/pure.js").replace(".pragma library", ""),
     );
-    let Some(output) = run_node(&harness) else {
-        eprintln!("node not available — skipping the throttle check");
-        return;
-    };
+    let output = js::run_js(&harness);
     let got: serde_json::Value = serde_json::from_str(output.trim())
         .unwrap_or_else(|e| panic!("harness output is not JSON: {e}; output: {output}"));
     assert_eq!(
@@ -428,7 +420,7 @@ fn the_settings_page_shows_the_window_snapshot_and_rereads_on_open() {
     );
 }
 
-/// Executable half, through the real `pure.js`. Skipped without `node`.
+/// Executable half, through the real `pure.js`.
 #[test]
 fn the_settings_view_maps_the_snapshot_and_draws_nothing_for_a_missing_card() {
     let mut status = DiagnosticsStatusDto::unavailable();
@@ -451,10 +443,7 @@ fn the_settings_view_maps_the_snapshot_and_draws_nothing_for_a_missing_card() {
          diagnosticsStorageView(null)]))\n",
         source = repo_file("apps/desktop/qml/lib/pure.js").replace(".pragma library", ""),
     );
-    let Some(output) = run_node(&harness) else {
-        eprintln!("node not available — skipping the settings view check");
-        return;
-    };
+    let output = js::run_js(&harness);
     let got: serde_json::Value = serde_json::from_str(output.trim())
         .unwrap_or_else(|e| panic!("harness output is not JSON: {e}; output: {output}"));
     assert_eq!(
@@ -511,7 +500,7 @@ fn the_acknowledgement_verdict_rides_the_windows_reread() {
     );
 }
 
-/// Executable half, through the real `pure.js`. Skipped without `node`.
+/// Executable half, through the real `pure.js`.
 #[test]
 fn an_acknowledgement_settles_only_on_a_readable_list_without_the_alert_active() {
     let mut still_active = DiagnosticsStatusDto::unavailable();
@@ -539,10 +528,7 @@ fn an_acknowledgement_settles_only_on_a_readable_list_without_the_alert_active()
         unreadable = json(&unreadable),
         stale = json(&DiagnosticsStatusDto::unavailable()),
     );
-    let Some(output) = run_node(&harness) else {
-        eprintln!("node not available — skipping the acknowledgement verdict check");
-        return;
-    };
+    let output = js::run_js(&harness);
     let got: serde_json::Value = serde_json::from_str(output.trim())
         .unwrap_or_else(|e| panic!("harness output is not JSON: {e}; output: {output}"));
     assert_eq!(
@@ -550,32 +536,4 @@ fn an_acknowledgement_settles_only_on_a_readable_list_without_the_alert_active()
         serde_json::json!(["unknown", "", "", "unknown", "unknown", "timeout"]),
         "an unreadable or missing list must never read as the alert handled"
     );
-}
-
-/// Feed a program to `node` on stdin. `None` when node is not installed.
-fn run_node(program: &str) -> Option<String> {
-    let mut child = Command::new("node")
-        .arg("-")
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .unwrap_or_else(|e| {
-            panic!("this check runs the QML JavaScript through node; install Node.js ({e})")
-        });
-    let Some(stdin) = child.stdin.as_mut() else {
-        panic!("stdin was piped")
-    };
-    stdin
-        .write_all(program.as_bytes())
-        .unwrap_or_else(|e| panic!("write the harness to node: {e}"));
-    let out = child
-        .wait_with_output()
-        .unwrap_or_else(|e| panic!("node runs to completion: {e}"));
-    assert!(
-        out.status.success(),
-        "node rejected the harness: {}",
-        String::from_utf8_lossy(&out.stderr)
-    );
-    Some(String::from_utf8_lossy(&out.stdout).into_owned())
 }

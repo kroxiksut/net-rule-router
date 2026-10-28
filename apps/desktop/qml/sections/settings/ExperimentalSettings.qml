@@ -9,7 +9,7 @@ import "../../components"
 GroupBox {
     id: group
     property var root
-    title: root.tr("settings.group.experimental", "Experimental")
+    title: root.tr("settings.group.experimental", "Experimental features")
     Layout.fillWidth: true
 
     ColumnLayout {

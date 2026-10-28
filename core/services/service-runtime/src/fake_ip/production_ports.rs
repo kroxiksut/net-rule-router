@@ -461,6 +461,19 @@ impl RouteSelector for RuleBookRouteSelector {
         route_in_book(snapshot.as_ref().map(|s| &s.rule_book), hostname)
     }
 
+    fn held_only_by_public_zone(&self, hostname: &str) -> bool {
+        (self.active_sid)().is_some_and(|sid| self.held_only_by_public_zone_for(&sid, hostname))
+    }
+
+    fn held_only_by_public_zone_for(&self, principal: &str, hostname: &str) -> bool {
+        self.active_book_for(principal).is_some_and(|s| {
+            crate::dns_observation_consumer::held_only_by_public_zone(
+                hostname,
+                &s.rule_book.secondary,
+            )
+        })
+    }
+
     /// Every input the enforcement book is read with: an activation publishes
     /// and withdraws the applying overlay, check verdicts, confirmations and
     /// `site.*` zone twins change the book with no activation at all, a new

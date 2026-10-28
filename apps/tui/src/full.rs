@@ -72,6 +72,7 @@ fn event_loop(
     // happened, not on every wake-up.
     let mut dirty = true;
     let mut drawn_at = Instant::now();
+    let mut followed_at = Instant::now();
     while !app.quit {
         if let Some(language) = app.language_change.take() {
             current = Texts::load(Some(&language), &[]);
@@ -94,6 +95,11 @@ fn event_loop(
             }
         }
         backend.send_outbox(&mut app.outbox);
+        // The window writes the shared settings file too: one stat a tick.
+        if now.duration_since(followed_at) >= IDLE_REDRAW {
+            followed_at = now;
+            dirty |= crate::screens::rules::follow_settings_file(app);
+        }
         if dirty || now.duration_since(drawn_at) >= IDLE_REDRAW {
             terminal.draw(|frame| draw(frame, app, texts, options, now))?;
             dirty = false;

@@ -905,6 +905,36 @@ fn a_machine_wide_answer_that_was_not_saved_is_told_in_the_feed() {
     assert_eq!(app.notice_count, before + 1, "once");
 }
 
+/// A user already set up who changes only the log window: fake-IP is shown
+/// and kept as the service holds it, never switched on by the offer.
+#[test]
+fn a_changed_log_window_leaves_the_services_fake_ip_alone() {
+    if !super::stability::offers_fake_ip() {
+        return;
+    }
+    let fake = stability_service();
+    fake.answer(
+        IpcOperationName::ServiceStabilityConfigGet,
+        json!({ "fake-ip-enabled": false }),
+    );
+    let mut app = app_at(Link::Connected, Some(&Fixture::healthy()));
+    app.open(ScreenId::Wizard);
+    app.wizard.go(Step::Protection);
+    take(&mut app, &Action::DiagnosticLogs);
+    run_jobs(&mut app, &fake);
+    let label = label(&Action::ToggleFakeIp, &app, &texts_en());
+    assert!(label.ends_with("No"), "{label}");
+    take(&mut app, &Action::Next);
+    run_jobs(&mut app, &fake);
+    let sent = stability_sent(&fake);
+    assert_eq!(sent.len(), 1);
+    assert_eq!(sent[0]["config"]["fake-ip-enabled"], json!(false));
+    assert_eq!(
+        sent[0]["config"]["verbose-logging-change"],
+        json!("one-hour")
+    );
+}
+
 /// A user already set up keeps the service's machine-wide settings unless
 /// they were changed here.
 #[test]

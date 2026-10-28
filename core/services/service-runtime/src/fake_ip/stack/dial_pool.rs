@@ -210,7 +210,9 @@ mod tests {
 
     /// A page opens its connections at once. With one worker parked, the
     /// burst must not queue behind it: each dial past the idle count gets a
-    /// worker of its own, so the burst takes one dial's time, not the sum.
+    /// worker of its own. Every burst dial is held until all of them have
+    /// started, so only dials running side by side get there, however slow
+    /// the machine is.
     #[test]
     fn a_burst_after_an_idle_worker_dials_in_parallel() {
         let pool = pool(8);
@@ -219,34 +221,43 @@ mod tests {
         pool.submit(Box::new(move || first.send(()).expect("send")))
             .expect("first dial");
         finished
-            .recv_timeout(Duration::from_secs(5))
+            .recv_timeout(Duration::from_secs(30))
             .expect("first dial ran");
-        let deadline = Instant::now() + Duration::from_secs(5);
+        let deadline = Instant::now() + Duration::from_secs(30);
         while guard(&pool.state).idle == 0 {
             assert!(Instant::now() < deadline, "the worker never parked");
             std::thread::sleep(Duration::from_millis(5));
         }
 
-        let started = Instant::now();
+        let gate = Arc::new((Mutex::new(false), Condvar::new()));
+        let (began, running) = mpsc::channel();
         for _ in 0..4 {
-            let done = done.clone();
+            let (done, began, gate) = (done.clone(), began.clone(), Arc::clone(&gate));
             pool.submit(Box::new(move || {
-                std::thread::sleep(Duration::from_millis(300));
+                began.send(()).expect("send");
+                let (open, opened) = &*gate;
+                let mut open = guard(open);
+                while !*open {
+                    open = opened.wait(open).unwrap_or_else(PoisonError::into_inner);
+                }
+                drop(open);
                 done.send(()).expect("send");
             }))
             .expect("burst dial");
         }
+        for n in 1..=4 {
+            running
+                .recv_timeout(Duration::from_secs(30))
+                .unwrap_or_else(|_| panic!("only {} of 4 burst dials ran at once", n - 1));
+        }
+        assert!(pool.live_workers() <= 8);
+        *guard(&gate.0) = true;
+        gate.1.notify_all();
         for _ in 0..4 {
             finished
-                .recv_timeout(Duration::from_secs(5))
-                .expect("burst dial ran");
+                .recv_timeout(Duration::from_secs(30))
+                .expect("burst dial finished");
         }
-        assert!(
-            started.elapsed() < Duration::from_millis(900),
-            "the burst ran one after another: {:?}",
-            started.elapsed()
-        );
-        assert!(pool.live_workers() <= 8);
         pool.close();
     }
 }

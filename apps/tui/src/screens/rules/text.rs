@@ -363,6 +363,14 @@ pub const FILES_MERGE_BODY: Key = key(
 pub const FILES_MERGE_BUCKET_FILE: Key = key("dialog.merge.bucket-file-only", "Only in the file");
 pub const FILES_MERGE_BUCKET_SERVICE: Key =
     key("dialog.merge.bucket-service-only", "Only in the app");
+pub const FILES_MERGE_DUPLICATES: Key = key(
+    "dialog.review-diff.duplicates-heading",
+    "Rules written into both routes",
+);
+pub const FILES_MERGE_DUPLICATES_HINT: Key = key(
+    "dialog.merge.duplicates-hint",
+    "Each of these was enabled on both routes, so the merge kept the main route's copy and switched the other one off. Pick a different route if that is not what you meant \u{2014} the other copy stays in your list, switched off.",
+);
 pub const FILES_MERGE_PICK_FILE: Key = key("dialog.merge.pick-file", "File");
 pub const FILES_MERGE_PICK_SERVICE: Key = key("dialog.merge.pick-service", "App");
 pub const FILES_MATCH: Key = key(
@@ -1679,6 +1687,8 @@ pub const ALL: &[Key] = &[
     FILES_MERGE_BODY,
     FILES_MERGE_BUCKET_FILE,
     FILES_MERGE_BUCKET_SERVICE,
+    FILES_MERGE_DUPLICATES,
+    FILES_MERGE_DUPLICATES_HINT,
     FILES_MERGE_PICK_FILE,
     FILES_MERGE_PICK_SERVICE,
     FILES_MATCH,

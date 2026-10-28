@@ -53,7 +53,7 @@ QtObject {
         if (!writer.canWrite) {
             console.log("[bound-file] not written: this window's native part has no rules-file writer:",
                         route, path)
-            root.statusLine = root.tr("status.bridge-unavailable", "Native bridge unavailable")
+            root.statusLine = root.tr("status.bridge-unavailable", "Service bridge not connected.")
             done(false, false, false)
             return
         }
@@ -454,7 +454,7 @@ QtObject {
     function _createAndWriteSet(containerDir, setName, onDone) {
         if (typeof nrrNativeBridge === "undefined" || !nrrNativeBridge
                 || typeof nrrNativeBridge.createPresetSetDir !== "function") {
-            root.statusLine = root.tr("status.bridge-unavailable", "Native bridge unavailable")
+            root.statusLine = root.tr("status.bridge-unavailable", "Service bridge not connected.")
             onDone(false)
             return
         }
@@ -518,10 +518,22 @@ QtObject {
             silent: true,
             onComplete: function(ok) {
                 if (!ok) return
-                _reconcileBoundFileDirty()
-                _followServiceIntoFiles(false)
+                _followServiceIntoBoundFiles()
             }
         })
+    }
+
+    /// The terminal may have bound another set and applied it a moment ago:
+    /// the files are named only once the window knows, or that set's rules
+    /// land in the files of the one the user left.
+    function _followServiceIntoBoundFiles() {
+        var follower = root.userSettingsFollower
+        var write = function() {
+            _reconcileBoundFileDirty()
+            _followServiceIntoFiles(false)
+        }
+        if (follower) follower.follow(write)
+        else write()
     }
 
     /// The rules in force changed, whoever wrote them. A clean table is
@@ -553,8 +565,7 @@ QtObject {
             ifStale: true,
             onComplete: function(ok, reloaded) {
                 if (!ok || !reloaded) return
-                _reconcileBoundFileDirty()
-                _followServiceIntoFiles(false)
+                _followServiceIntoBoundFiles()
             }
         })
     }
@@ -1028,7 +1039,7 @@ QtObject {
                     && typeof nrrNativeBridge.rpcRollbackRequest === "function")
             ? nrrNativeBridge.rpcRollbackRequest("", true, "") : ""
         if (!corr) {
-            dialog.errorText = root.tr("status.bridge-unavailable", "Native bridge unavailable")
+            dialog.errorText = root.tr("status.bridge-unavailable", "Service bridge not connected.")
             dialog.phase = "error"
             return
         }

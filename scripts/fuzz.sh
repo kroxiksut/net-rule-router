@@ -100,6 +100,7 @@ max_len=65536
 large_max_len() {
   case "$1" in
     ipc_frame | ipc_payloads) echo 4194308 ;;
+    hosts_content) echo 4194304 ;;
     provisioning_bundle) echo 7340032 ;;
     rules_file | rules_file_readers | preset_file | bulk_rules) echo 1048576 ;;
     conn_trace_groups | user_settings) echo 262144 ;;

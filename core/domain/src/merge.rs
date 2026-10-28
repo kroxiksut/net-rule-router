@@ -500,7 +500,10 @@ fn merge_pair(
     entries: &mut Vec<MergedRuleEntry>,
     conflicts: &mut Vec<MergeConflict>,
 ) {
-    if f_route == s_route && !rule_attributes_differ(f_rule, s_rule) {
+    // A block leaves by no route: the set it is written in is no difference,
+    // and the service's keeps the merge a no-op.
+    let both_block = f_rule.action == RuleAction::Block && s_rule.action == RuleAction::Block;
+    if (f_route == s_route || both_block) && !rule_attributes_differ(f_rule, s_rule) {
         // The service spelling wins when the two sides agree on everything
         // but the spelling (`x` versus `*.x`, paired only under subdomain
         // coverage): rewriting the revision to the file's spelling would turn
@@ -513,7 +516,7 @@ fn merge_pair(
         entries.push(MergedRuleEntry {
             identity_key: key,
             rule: kept.clone(),
-            route: f_route,
+            route: s_route,
             origin: MergeOrigin::Both,
             was_conflict: false,
         });
@@ -1227,6 +1230,21 @@ mod tests {
         let same = merge_rule_books(&file, &file, MergePolicy::Union, SubdomainCoverage::Off);
         assert!(same.is_noop());
         assert_eq!(same.merged.primary.len(), 2);
+    }
+
+    /// `!x` written in the primary file is the block the service keeps in the
+    /// other set: a block leaves by no route, so the set it sits in is no
+    /// difference, and asking the user to pick one is a question about nothing.
+    #[test]
+    fn a_block_written_in_the_other_set_is_the_same_rule() {
+        let file = book(vec![blocked(routed_host("r-1", "shop.test", ""))], vec![]);
+        let service = book(vec![], vec![blocked(routed_host("s-1", "shop.test", ""))]);
+        for policy in [MergePolicy::Union, MergePolicy::FileWins] {
+            let r = merge_rule_books(&file, &service, policy, SubdomainCoverage::Off);
+            assert!(r.conflicts.is_empty(), "{policy:?}: {:?}", r.conflicts);
+            assert!(r.is_noop(), "{policy:?}");
+            assert_eq!(r.merged.total_rule_count(), 1);
+        }
     }
 
     /// The block rule the service does not have is new, not a conflict with

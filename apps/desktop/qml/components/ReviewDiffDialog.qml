@@ -13,7 +13,7 @@ Dialog {
     id: root
     title: typeof root.tr === "function"
         ? (root.readOnly
-            ? root.tr("dialog.review-diff.title-readonly", "Preview pending changes")
+            ? root.tr("dialog.review-diff.title-readonly", "Preview parked changes")
             : root.tr("dialog.review-diff.title", "Review changes"))
         : (root.readOnly ? "Preview pending changes" : "Review changes")
 
@@ -176,6 +176,15 @@ Dialog {
         return ""
     }
 
+    /// The rules files bound to either route.
+    function _linkedRulesFiles() {
+        var prefs = ownerRoot ? ownerRoot.prefs : null
+        if (!prefs) return []
+        return [String(prefs.lastSavedPathPrimary || ""),
+                String(prefs.lastSavedPathSecondary || "")]
+            .filter(function(path) { return path !== "" })
+    }
+
     function diffSummaryText() {
         var raw = summary && summary["diff-summary"] ? String(summary["diff-summary"]) : ""
         if (raw === "") {
@@ -186,9 +195,16 @@ Dialog {
         // `"reset-to-baseline; discard N rule(s)"`; localise it.
         var rm = raw.match(/^reset-to-baseline;\s*discard\s+(\d+)\s+rule/)
         if (rm) {
-            return Plurals.counted(tr, "dialog.review-diff.reset-summary.", Number(rm[1]),
+            var reset = Plurals.counted(tr, "dialog.review-diff.reset-summary.", Number(rm[1]),
                 "Discard {count} custom rule and restore the baseline rules.",
                 "Discard {count} custom rules and restore the baseline rules.")
+            // The linked files follow the rules in force afterwards: said
+            // before the user agrees, not found out from the files.
+            var files = _linkedRulesFiles()
+            if (files.length === 0) return reset
+            return reset + " " + tr("dialog.review-diff.reset-files",
+                "Your linked rules files will be rewritten with the baseline rules: {files}.")
+                .replace("{files}", files.join(", "))
         }
         // The service's apply-plan counters (users, filters) are its own
         // bookkeeping; the user reviews rules, so the line counts rules.
@@ -293,6 +309,7 @@ Dialog {
                 color: root.ownerRoot ? root.ownerRoot.textColor : palette.text
             }
         }
+
 
         Label {
             Layout.fillWidth: true

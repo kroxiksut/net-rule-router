@@ -76,7 +76,7 @@ ColumnLayout {
                 "{rule}: {host} resolves to {ip}, and a deny of that address wins over any name rule, so the address is denied.")
             : kind === "network-carving-over-cap"
             ? root.tr("rules.overlaps.conflicts.carving-over-cap",
-                "{rule} holds more narrower rules than can be carved out of it, so it applies to its whole network and the narrower rules inside it do not take effect. Split it into smaller networks.")
+                "{rule} holds more narrower rules than can be carved out of it, so it is not fully enforced, and the narrower rules inside it keep working. Split it into smaller networks.")
             : kind === "unsupported-rule-shape"
             ? root.tr("rules.overlaps.conflicts.unsupported-shape",
                 "{rule} for {app} is not enforced: a rule that limits an address to one application cannot be carried out yet, so it is skipped rather than applied to every application.")

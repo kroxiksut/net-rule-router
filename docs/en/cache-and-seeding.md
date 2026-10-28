@@ -12,7 +12,7 @@ hostname currently resolves to. That mapping is the **FQDN/IP cache**.
 
 The cache is a local SQLite database, `nrr_fqdn_ip_cache.db`, that the
 background service reads and writes. For every hostname it holds one or more
-associated IPv4 addresses, plus bookkeeping about where each mapping came from
+associated addresses (IPv4 and IPv6), plus bookkeeping about where each mapping came from
 and how fresh it is.
 
 Two properties matter for how you think about it:
@@ -88,6 +88,10 @@ that profile's `History` SQLite database.
 extracted from the `moz_places` table of each profile's `places.sqlite`
 database.
 
+**Mail: Thunderbird** — only the names of the mail servers its accounts use,
+taken from each profile's `prefs.js`. Nothing else from the file is kept:
+like the browsers, it contributes host names and nothing more.
+
 **AI browsers (best-effort)** — Arc for Windows and Perplexity Comet, both
 Chromium-family. Arc is MSIX-packaged, so its profile is discovered by
 scanning `%LOCALAPPDATA%\Packages\TheBrowserCompany.Arc_*\LocalCache\Local\Arc\User Data`
@@ -141,6 +145,4 @@ connection instead, which the service's DNS observer cannot see or parse —
 so hosts resolved that way never produce a live-observation cache entry. The
 two mitigations above exist largely because of this: browser-history seeding
 pre-fills the cache independently of how the browser resolved a name, and a
-local DNS resolver (the default routing method) can intercept and observe lookups directly. The
-hostname confirmation described above also recovers many of these cases
-after the fact.
+local DNS resolver (the default routing method) can intercept and observe lookups directly.

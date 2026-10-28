@@ -65,7 +65,8 @@ fn may_be_the_way_out(info: &AdapterInfo, left_out: &[u32]) -> bool {
 }
 
 /// The links holding a default route of their own in the family, each once.
-/// One we installed holds nothing.
+/// One we installed holds nothing, and neither does one in a table only
+/// another program's own rule leads to (wg-quick, Tailscale).
 fn default_route_holders(
     adapters: &[AdapterInfo],
     routes: &[RouteEntry],
@@ -81,6 +82,7 @@ fn default_route_holders(
                 r.interface_index == *index
                     && r.prefix_length == 0
                     && !r.is_ours
+                    && r.table == crate::enforcement::RouteTableRef::Main
                     && r.destination.is_ipv6() == v6
             })
         })
@@ -351,6 +353,24 @@ mod tests {
             sole_default_route_holder(&adapters, &routes, true, &[]),
             Some(5)
         );
+    }
+
+    /// A PPPoE uplink beside wg-quick or a Tailscale exit node: the tunnel's
+    /// default sits in its own table, which only its own rule leads to. Counted
+    /// as a second holder, it made the uplink one more foreign tunnel.
+    #[test]
+    fn a_default_in_another_programs_table_does_not_unseat_the_uplink() {
+        let mut ppp = link(3, "ppp0");
+        ppp.interface_type = InterfaceType::Tunnel;
+        let adapters = [ppp, link(7, "wg0")];
+        let mut tunnel_default = route([0, 0, 0, 0], 0, [0, 0, 0, 0], 7);
+        tunnel_default.table = RouteTableRef::Tagged(51820);
+        let routes = [route([0, 0, 0, 0], 0, [0, 0, 0, 0], 3), tunnel_default];
+        assert_eq!(
+            sole_default_route_holder(&adapters, &routes, false, &[]),
+            Some(3)
+        );
+        assert_eq!(structural_uplinks(&adapters, &routes, &[]), vec![3]);
     }
 
     #[test]

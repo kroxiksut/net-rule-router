@@ -12,16 +12,14 @@ pub enum Step {
     ClearLogs,
     ResetSidecar,
     PurgePrincipalData,
-    ApplyEmptyRules,
     StopService,
 }
 
 /// The order the steps run in.
-pub const ORDER: [Step; 5] = [
+pub const ORDER: [Step; 4] = [
     Step::ClearLogs,
     Step::ResetSidecar,
     Step::PurgePrincipalData,
-    Step::ApplyEmptyRules,
     Step::StopService,
 ];
 
@@ -31,7 +29,6 @@ impl Step {
             Self::ClearLogs => "clear-logs",
             Self::ResetSidecar => "reset-sidecar",
             Self::PurgePrincipalData => "purge-principal-data",
-            Self::ApplyEmptyRules => "apply-empty-rules",
             Self::StopService => "stop-service",
         }
     }
@@ -94,8 +91,7 @@ pub enum Next {
 /// does not).
 pub fn next(can_elevate: bool, done: &[(Step, Outcome)]) -> Next {
     if let Some(&(step, Outcome::Forbidden)) = done.last() {
-        let needs_rights = matches!(step, Step::PurgePrincipalData | Step::ApplyEmptyRules);
-        if needs_rights && !can_elevate {
+        if step == Step::PurgePrincipalData && !can_elevate {
             return Next::NeedsElevation { step };
         }
     }
@@ -104,9 +100,7 @@ pub fn next(can_elevate: bool, done: &[(Step, Outcome)]) -> Next {
         None => {
             let ok = |wanted: Step| done.iter().any(|&(s, o)| s == wanted && o == Outcome::Ok);
             Next::Finish {
-                cleared: ok(Step::PurgePrincipalData)
-                    && ok(Step::ApplyEmptyRules)
-                    && ok(Step::StopService),
+                cleared: ok(Step::PurgePrincipalData) && ok(Step::StopService),
             }
         }
     }
@@ -131,15 +125,38 @@ mod tests {
         assert_eq!(next(false, &done), Next::Finish { cleared: true });
     }
 
+    /// After a full reset the user reads the shared baseline like a new one.
+    /// A step writing a rule book into their own partition (even an empty
+    /// one) after the purge left them diverged: no rules, and no baseline edit
+    /// ever reached them again.
+    #[test]
+    fn a_full_reset_writes_no_rule_book_of_its_own() {
+        let mut done = Vec::new();
+        let mut ran = Vec::new();
+        while let Next::Run(step) = next(false, &done) {
+            ran.push(step.as_str());
+            done.push((step, Good));
+        }
+        assert_eq!(
+            ran,
+            [
+                "clear-logs",
+                "reset-sidecar",
+                "purge-principal-data",
+                "stop-service"
+            ]
+        );
+    }
+
     #[test]
     fn the_service_is_stopped_last() {
-        assert_eq!(ORDER[4], Step::StopService);
+        assert_eq!(ORDER[ORDER.len() - 1], Step::StopService);
     }
 
     #[test]
     fn a_failed_best_effort_step_does_not_abort() {
         assert_eq!(next(false, &run(&[Failed])), Next::Run(Step::ResetSidecar));
-        let done = run(&[Failed, Skipped, Good, Good, Good]);
+        let done = run(&[Failed, Skipped, Good, Good]);
         assert_eq!(next(false, &done), Next::Finish { cleared: true });
     }
 
@@ -152,18 +169,7 @@ mod tests {
                 step: Step::PurgePrincipalData
             }
         );
-        assert_eq!(next(true, &done), Next::Run(Step::ApplyEmptyRules));
-    }
-
-    #[test]
-    fn refused_rules_never_reach_the_service_stop_without_elevation() {
-        let done = run(&[Good, Good, Good, Forbidden]);
-        assert_eq!(
-            next(false, &done),
-            Next::NeedsElevation {
-                step: Step::ApplyEmptyRules
-            }
-        );
+        assert_eq!(next(true, &done), Next::Run(Step::StopService));
     }
 
     #[test]
@@ -176,7 +182,7 @@ mod tests {
 
     #[test]
     fn a_failed_stop_downgrades_the_result() {
-        let done = run(&[Good, Good, Good, Good, Failed]);
+        let done = run(&[Good, Good, Good, Failed]);
         assert_eq!(next(false, &done), Next::Finish { cleared: false });
     }
 }

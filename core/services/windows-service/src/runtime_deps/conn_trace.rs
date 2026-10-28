@@ -17,6 +17,7 @@ pub(super) fn spawn_fcrdns_learner_worker(
     rx: std::sync::mpsc::Receiver<nrr_service_runtime::conn_observation_consumer::ReverseLearnJob>,
     consumer: Arc<nrr_service_runtime::dns_observation_consumer::DnsObservationConsumer>,
     companion: Option<CompanionFromReverseDeps<'_>>,
+    egress: Option<Arc<dyn nrr_service_runtime::dns_egress::DnsEgressPolicy>>,
     liveness: Arc<TaskLiveness>,
 ) {
     use nrr_service_runtime::dns_resolver_ports::{
@@ -35,7 +36,13 @@ pub(super) fn spawn_fcrdns_learner_worker(
     let upstream: Arc<dyn Fn() -> Option<std::net::SocketAddr> + Send + Sync> =
         Arc::new(move || pool.current_or_select());
 
-    let resolver = FcrdnsUpstreamResolver::new(upstream, Duration::from_millis(1500));
+    let mut resolver = FcrdnsUpstreamResolver::new(upstream, Duration::from_millis(1500));
+    if let Some(policy) = egress {
+        resolver = resolver.with_tunnel_policy(
+            policy,
+            nrr_service_runtime::dns_egress::global_dns_via_secondary(),
+        );
+    }
     // Two sinks over the same consumer: one for the exact-match fast path
     // below, one owned by the reverse-lookup learner.
     let exact_sink = ConsumerConfirmedHostSink::new(Arc::clone(&consumer));
@@ -61,7 +68,7 @@ pub(super) fn spawn_fcrdns_learner_worker(
             ) else {
                 return;
             };
-            engine.note_candidate_in_use(&sid, hostname, std::time::SystemTime::now());
+            engine.note_reverse_named_in_use(&sid, hostname, std::time::SystemTime::now());
         }));
     }
     let learner = ReverseDnsLearner::new(resolver, sink, MAX_ATTEMPTS_PER_SESSION);
@@ -295,7 +302,9 @@ pub(super) fn build_conn_trace_pair(
             nrr_service_runtime::script_launches::ScriptLaunches::new(Arc::new(
                 nrr_platform_windows::process_launch::WindowsProcessLaunches,
             )),
-        ));
+        ))
+        // The drop/allow events carry no pid; the open flow still names it.
+        .with_flow_pid(Arc::new(nrr_platform_windows::flow_owner::tcp_flow_pid));
     if let Some(forget) = app_destination_forget {
         consumer_builder = consumer_builder.with_app_destination_forget(forget);
     }

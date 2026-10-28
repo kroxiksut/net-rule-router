@@ -2342,3 +2342,119 @@ fn rollback_to_a_revision_holding_an_unsupported_shape_is_allowed() {
         .expect("present");
     assert_eq!(active.rules_json, app_and_address_rules_json());
 }
+
+// ── a panic under the state connection ───────────────────────────────────
+
+fn poison_state_conn(conn: &Mutex<Connection>) {
+    let poisoned = std::thread::scope(|s| {
+        s.spawn(|| {
+            let _guard = conn.lock().expect("unpoisoned yet");
+            panic!("simulated panic in another handler under the state lock");
+        })
+        .join()
+    });
+    assert!(poisoned.is_err(), "the lock must be poisoned for the test");
+}
+
+/// One handler panicking under the state lock must not freeze rule changes
+/// until a restart that nothing triggers.
+#[test]
+fn rules_can_still_be_submitted_and_applied_after_a_panic_under_the_state_lock() {
+    let fx = build_fixture(ApplyFailurePolicy::AllOrNothing);
+    poison_state_conn(&fx.conn);
+
+    let id = submit(&fx, "after-panic");
+    let token = issue_token(&fx, &id);
+    let outcome = fx
+        .coordinator
+        .activate(&id, &token, "c")
+        .expect("activation after the panic");
+    assert!(matches!(outcome, ActivationOutcome::Activated { .. }));
+}
+
+struct PanickingAudit;
+
+impl ActivationAuditEmitter for PanickingAudit {
+    fn emit(&self, _event: ActivationAuditEvent) {
+        panic!("simulated panic in the audit sink");
+    }
+}
+
+/// Ids that never collide with the fixture coordinator's own counter.
+#[derive(Default)]
+struct SecondCounterIds(std::sync::atomic::AtomicU64);
+
+impl SecondCounterIds {
+    fn next(&self, prefix: &str) -> String {
+        let n = self.0.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        format!("{prefix}-9{n:07}")
+    }
+}
+
+impl IdGenerator for SecondCounterIds {
+    fn new_revision_id(&self) -> RevisionId {
+        RevisionId::from_prefixed_string(self.next("rev")).expect("well-formed id")
+    }
+    fn new_token(&self) -> String {
+        self.next("tok")
+    }
+    fn new_attempt_id(&self) -> String {
+        self.next("att")
+    }
+}
+
+/// A panic in the audit sink must not poison the state connection: the rules
+/// provider reads a poisoned one as "unreadable" and enforcement stops moving.
+#[test]
+fn a_panicking_audit_sink_does_not_poison_the_state_connection() {
+    let fx = build_fixture(ApplyFailurePolicy::AllOrNothing);
+    let coordinator = ActivationCoordinator::new(
+        fx.conn.clone(),
+        fx.registry.clone(),
+        fx.dispatcher.clone() as Arc<dyn RulesApplyDispatcher>,
+        fx.marker.clone() as Arc<dyn ApplyMarkerStore>,
+        Arc::new(PanickingAudit) as Arc<dyn ActivationAuditEmitter>,
+        fx.clock.clone() as Arc<dyn Clock>,
+        Arc::new(SecondCounterIds::default()) as Arc<dyn IdGenerator>,
+        ApplyFailurePolicy::AllOrNothing,
+    );
+    let submission = || CandidateSubmission {
+        principal: nrr_storage::BASELINE_PRINCIPAL.to_string(),
+        rules_json: r#"{"rules":[]}"#.to_string(),
+        content_hash: "h-audit".to_string(),
+        source: RulesRevisionSource::GuiRulesEdit,
+        correlation_id: "corr-1".to_string(),
+        risk_level: Some(RiskLevel::Low),
+        review_summary_json: None,
+    };
+    for _ in 0..2 {
+        // The first stores the candidate, the second takes the dedup path.
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            coordinator.submit_candidate(submission())
+        }));
+        assert!(result.is_err(), "the sink panics");
+        assert!(
+            !fx.conn.is_poisoned(),
+            "audit panicked under the state lock"
+        );
+    }
+    let id = submit(&fx, "h-issue");
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        coordinator.issue_confirmation_token(&id, 300)
+    }));
+    assert!(result.is_err(), "the sink panics");
+    assert!(
+        !fx.conn.is_poisoned(),
+        "audit panicked under the state lock"
+    );
+
+    let token = issue_token(&fx, &id);
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        coordinator.activate(&id, &token, "c")
+    }));
+    assert!(result.is_err(), "the sink panics");
+    assert!(
+        !fx.conn.is_poisoned(),
+        "audit panicked under the state lock"
+    );
+}

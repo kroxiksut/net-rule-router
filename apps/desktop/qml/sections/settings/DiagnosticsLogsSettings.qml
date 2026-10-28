@@ -124,7 +124,10 @@ GroupBox {
             root.statusLine = root.tr("status.bridge-unavailable", "Service bridge not connected.")
             return
         }
-        var payload = {
+        // The set replaces all four limits: only the ones edited here travel,
+        // laid over a read made now, so a page that never loaded (or another
+        // client's change since) does not put defaults back.
+        var shown = {
             "log-max-age-days": Math.round(logsMaxAge.value),
             "log-max-size-bytes": Math.round(logsMaxSize.value)
                 * group._sizeUnitMultiplier(logsSizeUnitCombo.currentIndex),
@@ -132,21 +135,41 @@ GroupBox {
             "audit-max-size-bytes": Math.round(auditMaxSize.value)
                 * group._sizeUnitMultiplier(auditSizeUnitCombo.currentIndex)
         }
-        group._logRetentionApplying = true
-        var corr = nrrNativeBridge.rpcLogRetentionConfigSet(payload)
-        root.rpc.registerRpcCallback(corr, function(ok, resp, errorCode, errorMessage) {
+        var baseline = {
+            "log-max-age-days": group._logRetentionBaselineLogsMaxAgeDays,
+            "log-max-size-bytes": group._logRetentionBaselineLogsMaxSizeBytes,
+            "audit-max-age-days": group._logRetentionBaselineAuditMaxAgeDays,
+            "audit-max-size-bytes": group._logRetentionBaselineAuditMaxSizeBytes
+        }
+        var failed = function(errorCode) {
             group._logRetentionApplying = false
-            if (!ok) {
-                root.statusLine = root.tr("status.log-retention-failed",
-                    "Failed to save retention settings: ")
-                    + ((typeof root.ipcErrorLabel === "function")
-                        ? root.ipcErrorLabel(String(errorCode || "unknown"))
-                        : String(errorCode || "unknown"))
+            root.statusLine = root.tr("status.log-retention-failed",
+                "Failed to save retention settings: ")
+                + ((typeof root.ipcErrorLabel === "function")
+                    ? root.ipcErrorLabel(String(errorCode || "unknown"))
+                    : String(errorCode || "unknown"))
+        }
+        group._logRetentionApplying = true
+        var readCorr = nrrNativeBridge.rpcLogRetentionConfigGet()
+        root.rpc.registerRpcCallback(readCorr, function(readOk, fresh, readCode) {
+            if (!readOk || !fresh) {
+                failed(readCode)
                 return
             }
-            // resp is the authoritative LogRetentionConfigDto echo.
-            group._populateLogRetention(resp)
-            root.statusLine = root.tr("status.log-retention-saved", "Retention settings saved.")
+            var payload = {}
+            for (var key in shown)
+                payload[key] = shown[key] !== baseline[key] ? shown[key] : fresh[key]
+            var corr = nrrNativeBridge.rpcLogRetentionConfigSet(payload)
+            root.rpc.registerRpcCallback(corr, function(ok, resp, errorCode, errorMessage) {
+                if (!ok) {
+                    failed(errorCode)
+                    return
+                }
+                group._logRetentionApplying = false
+                // resp is the authoritative LogRetentionConfigDto echo.
+                group._populateLogRetention(resp)
+                root.statusLine = root.tr("status.log-retention-saved", "Retention settings saved.")
+            })
         })
     }
     function _fetchLogRetentionConfig() {
@@ -999,7 +1022,7 @@ GroupBox {
                 Label {
                     Layout.fillWidth: true
                     text: root.tr("diag.archive.session-only-caption",
-                        "Skips log entries recorded before this app session started. Service restarts within the session are still included; uncheck for the full log history.")
+                        "Skips log entries from previous days: the archive includes everything since the start of the day this session began, so app or service restarts during the day do not cut the history. Uncheck for the full log history.")
                     color: root.mutedTextColor
                     wrapMode: Text.WordWrap
                 }

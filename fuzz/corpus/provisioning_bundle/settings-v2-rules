@@ -1,0 +1,21 @@
+nrr_settings_export:
+  version: 2
+  rules_files:
+    primary: "C:/Rules/rules_primary.txt"
+  rules:
+    primary: |
+      --- Domains
+      a.example  # note
+      # off.example
+      ?check.example
+
+      --- Windows
+      browser.exe
+
+      --- MacOS
+      Other Browser  # kept, not applied
+    secondary: |-
+      --- Domains
+      !deny.example
+  behavior:
+    route_mode: "prefer-primary"

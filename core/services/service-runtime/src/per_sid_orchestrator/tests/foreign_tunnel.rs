@@ -268,11 +268,11 @@ fn assert_corp_spared_and_user_blocks_hold(api: &MockWindowsApi, posture: &str) 
         checked += 1;
     }
     assert!(checked > 0, "{posture}: nothing blocks");
+    // At the connect layer, the one that carries the user: a Block is that
+    // user's own, never a packet-layer cut for every account.
     for (layer, dst) in [
         (WfpLayerKey::AleAuthConnectV4, IpAddr::V4(CORP_BLOCKED)),
-        (WfpLayerKey::OutboundIpPacketV4, IpAddr::V4(CORP_BLOCKED)),
         (WfpLayerKey::AleAuthConnectV6, IpAddr::V6(CORP_BLOCKED_V6)),
-        (WfpLayerKey::OutboundIpPacketV6, IpAddr::V6(CORP_BLOCKED_V6)),
     ] {
         assert_eq!(
             verdict(&filters, via_foreign(layer, dst)),

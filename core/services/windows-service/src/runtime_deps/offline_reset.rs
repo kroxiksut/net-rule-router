@@ -163,8 +163,24 @@ fn strip_orphaned_block_filters_blocking() {
 /// "re-run elevated" message.
 pub(crate) fn run_offline_reset() -> std::process::ExitCode {
     unless_service_live(live_service_state(), || {
-        with_overrides_revoked(finish_offline_reset())
+        revoke_unless_refused(sweep_orphaned_machine_state(), with_overrides_revoked)
     })
+}
+
+/// The sweep's exit code, with the confirmed overrides revoked after it. Not
+/// after a refusal for rights: that caller can revoke nothing either, and its
+/// elevated re-run does both.
+fn revoke_unless_refused(
+    outcome: SweepOutcome,
+    revoke: impl FnOnce(std::process::ExitCode) -> std::process::ExitCode,
+) -> std::process::ExitCode {
+    let refused = matches!(outcome, SweepOutcome::PrivilegeRequired);
+    let code = exit_code_of(outcome);
+    if refused {
+        code
+    } else {
+        revoke(code)
+    }
 }
 
 /// A live service would put every piece straight back, and its blocks are a
@@ -261,7 +277,7 @@ pub(crate) fn run_stop_and_cleanup() -> std::process::ExitCode {
             return std::process::ExitCode::from(1);
         }
     }
-    let code = with_overrides_revoked(finish_offline_reset());
+    let code = revoke_unless_refused(sweep_orphaned_machine_state(), with_overrides_revoked);
     if let Some(hold) = hold {
         if let Err(e) = hold.release() {
             eprintln!(
@@ -296,8 +312,8 @@ fn live_service_state() -> Option<nrr_platform_api::service_control::ServiceRunS
     }
 }
 
-fn finish_offline_reset() -> std::process::ExitCode {
-    match sweep_orphaned_machine_state() {
+fn exit_code_of(outcome: SweepOutcome) -> std::process::ExitCode {
+    match outcome {
         SweepOutcome::Done => std::process::ExitCode::SUCCESS,
         // The console relays this verbatim as its own "needs privilege" code,
         // which is what its documented contract promises and what makes its
@@ -456,7 +472,7 @@ pub(crate) fn sweep_in_order(steps: &SweepSteps<'_>) -> SweepOutcome {
         }) => {
             eprintln!(
                 "cleanup: the Windows Base Filtering Engine did not answer within \
-                 {} s — it is wedged, and nothing here can move it.",
+                 {} s - it is wedged, and nothing here can move it.",
                 WFP_SWEEP_BUDGET.as_secs()
             );
             eprintln!(
@@ -485,36 +501,62 @@ pub(crate) fn sweep_in_order(steps: &SweepSteps<'_>) -> SweepOutcome {
         }
     };
 
-    // ── Summary ────────────────────────────────────────────────────────
-    println!("NetRuleRouter offline reset complete.");
-    println!("  WFP filters removed: {filters_removed}");
-    match routes_removed {
-        Some(n) => println!("  routes removed: {n}"),
-        None => println!("  routes removed: <sweep skipped — clears on reboot>"),
+    let (complete, summary) = summary(filters_removed, routes_removed, &dns_sweep);
+    for line in summary {
+        println!("{line}");
     }
-    match &dns_sweep.nrpt_rules {
-        Ok(n) => println!("  DNS redirect (NRPT) rules removed: {n}"),
-        Err(_) => println!("  DNS redirect (NRPT) rules: <sweep failed — see above>"),
-    }
-    match &dns_sweep.search_list {
-        Ok(true) => println!("  DNS suffix search list: restored"),
-        Ok(false) => println!("  DNS suffix search list: nothing of ours"),
-        Err(_) => println!("  DNS suffix search list: <sweep failed — see above>"),
-    }
-    println!("Reboot to fully clear any remainder.");
-    if dns_sweep.is_clean() {
+    if complete {
         SweepOutcome::Done
     } else {
         SweepOutcome::Failed
     }
 }
 
+/// Whether every step went through, and the report of it. "Complete" only
+/// then: a script reads the exit code, and routes left until a reboot are not
+/// a restored network. ASCII, since the console's output may land in an OEM
+/// code page.
+fn summary(
+    filters_removed: usize,
+    routes_removed: Option<usize>,
+    dns_sweep: &nrr_platform_windows::dns_redirect::OrphanDnsSweep,
+) -> (bool, Vec<String>) {
+    let complete = routes_removed.is_some() && dns_sweep.is_clean();
+    let mut lines = vec![
+        if complete {
+            "NetRuleRouter offline reset complete.".to_string()
+        } else {
+            "NetRuleRouter offline reset NOT complete - see above.".to_string()
+        },
+        format!("  WFP filters removed: {filters_removed}"),
+        match routes_removed {
+            Some(n) => format!("  routes removed: {n}"),
+            None => "  routes removed: <sweep failed - a reboot clears them>".to_string(),
+        },
+        nrpt_line(dns_sweep),
+    ];
+    lines.push(
+        match &dns_sweep.search_list {
+            Ok(true) => "  DNS suffix search list: restored",
+            Ok(false) => "  DNS suffix search list: nothing of ours",
+            Err(_) => "  DNS suffix search list: <sweep failed - see above>",
+        }
+        .to_string(),
+    );
+    lines.push("Reboot to fully clear any remainder.".to_string());
+    (complete, lines)
+}
+
+fn nrpt_line(dns_sweep: &nrr_platform_windows::dns_redirect::OrphanDnsSweep) -> String {
+    match &dns_sweep.nrpt_rules {
+        Ok(n) => format!("  DNS redirect (NRPT) rules removed: {n}"),
+        Err(_) => "  DNS redirect (NRPT) rules: <sweep failed - see above>".to_string(),
+    }
+}
+
 /// What the DNS half did, for a sweep that stopped before its summary.
 fn report_dns(dns_sweep: &nrr_platform_windows::dns_redirect::OrphanDnsSweep) {
-    match &dns_sweep.nrpt_rules {
-        Ok(n) => println!("  DNS redirect (NRPT) rules removed: {n}"),
-        Err(_) => println!("  DNS redirect (NRPT) rules: <sweep failed — see above>"),
-    }
+    println!("{}", nrpt_line(dns_sweep));
 }
 
 #[cfg(test)]
@@ -656,6 +698,79 @@ mod tests {
 
         assert_eq!(outcome, OrphanStrip::Stripped(orphans.len()));
         assert!(installed_ids(&api).is_empty());
+    }
+
+    fn clean_dns() -> nrr_platform_windows::dns_redirect::OrphanDnsSweep {
+        nrr_platform_windows::dns_redirect::OrphanDnsSweep {
+            nrpt_rules: Ok(1),
+            search_list: Ok(false),
+        }
+    }
+
+    /// Routes the sweep could not remove stay until a reboot: a script reading
+    /// the exit code must not be told the network is back.
+    #[test]
+    fn a_failed_route_sweep_is_not_a_complete_reset() {
+        let outcome = sweep_in_order(&SweepSteps {
+            dns: &clean_dns,
+            wfp: &|| Ok(2),
+            engine_options: &|| {},
+            routes: &|| Err("IP Helper refused".to_owned()),
+        });
+        assert!(matches!(outcome, SweepOutcome::Failed));
+        let (complete, lines) = summary(2, None, &clean_dns());
+        assert!(!complete);
+        assert!(!lines[0].contains("complete."), "{lines:?}");
+        assert!(matches!(
+            sweep_in_order(&SweepSteps {
+                dns: &clean_dns,
+                wfp: &|| Ok(2),
+                engine_options: &|| {},
+                routes: &|| Ok(1),
+            }),
+            SweepOutcome::Done
+        ));
+    }
+
+    /// The console relays this output, and in a redirected OEM code page
+    /// anything past ASCII arrives garbled.
+    #[test]
+    fn the_reset_report_is_plain_ascii() {
+        let denied = || PlatformError::AccessDenied { operation: "NRPT" };
+        let failed = nrr_platform_windows::dns_redirect::OrphanDnsSweep {
+            nrpt_rules: Err(denied()),
+            search_list: Err(denied()),
+        };
+        for dns in [clean_dns(), failed] {
+            for routes in [Some(1), None] {
+                let (_, lines) = summary(0, routes, &dns);
+                for line in lines {
+                    assert!(line.is_ascii(), "{line}");
+                }
+            }
+        }
+    }
+
+    /// Refused for rights, nothing was revoked either; "0 revoked" would be a
+    /// claim, and a failing revoke would lose the code the console elevates on.
+    #[test]
+    fn a_reset_refused_for_rights_revokes_nothing() {
+        use std::process::ExitCode;
+        let mut revoked = false;
+        let code = revoke_unless_refused(SweepOutcome::PrivilegeRequired, |code| {
+            revoked = true;
+            code
+        });
+        assert!(!revoked);
+        assert_eq!(code, ExitCode::from(3));
+        for outcome in [SweepOutcome::Done, SweepOutcome::Failed] {
+            let mut revoked = false;
+            revoke_unless_refused(outcome, |code| {
+                revoked = true;
+                code
+            });
+            assert!(revoked, "a reset that ran also revokes");
+        }
     }
 
     /// A wedged or refusing filter engine ends the sweep early. The NRPT

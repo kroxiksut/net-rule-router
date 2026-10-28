@@ -61,7 +61,7 @@ fn the_log_reads_back_and_the_settings_save_keeps_it() {
     let mut app = AppState::new(crate::screens::ScreenId::Status, false);
     app.settings.prefs_path = Some(path.clone());
     app.site_notices.told("site.example", T0);
-    save(&app);
+    save(&mut app);
     // The Settings screen writes the same file afterwards.
     prefs::save(&path, app.settings.prefs).expect("prefs saved");
     assert_eq!(load(&path), app.site_notices);

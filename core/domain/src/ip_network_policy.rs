@@ -129,6 +129,11 @@ pub fn is_private(block: IpBlock) -> bool {
     networks(PRIVATE).any(|net| net.covers(block))
 }
 
+/// Is `ip` inside a private or shared network ([`is_private`] for one address)?
+pub fn is_private_address(ip: IpAddr) -> bool {
+    networks(PRIVATE).any(|net| net.contains(ip))
+}
+
 /// The private networks [`is_private`] reads, both families.
 pub fn private_networks() -> impl Iterator<Item = IpBlock> {
     networks(PRIVATE)

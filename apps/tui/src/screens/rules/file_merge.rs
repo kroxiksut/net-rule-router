@@ -27,7 +27,7 @@ use nrr_shared::rules_json::RuleAction;
 use nrr_shared::RouteRole;
 
 use super::apply::{self, Failure, Pending};
-use super::merge::Merge;
+use super::merge::{Duplicate, Merge};
 use super::{ace, files, own_rules_on_screen, own_settings, text, Busy, Mode, Note};
 use crate::backend::Reply;
 use crate::screens::suggestions::call;
@@ -61,7 +61,8 @@ pub fn start(app: &mut AppState) -> bool {
     };
     app.rules.note = None;
     app.rules.busy = Some(Busy::Previewing);
-    app.outbox.push(merge_job(texts, policy, Vec::new(), false));
+    app.outbox
+        .push(merge_job(texts, policy, Vec::new(), Vec::new(), false));
     true
 }
 
@@ -105,13 +106,14 @@ fn ask(
     texts: &[String; 2],
     policy: MergePolicyDto,
     resolutions: Vec<ConflictResolutionDto>,
+    keep_secondary: Vec<String>,
 ) -> Result<MergeResultDto, Failure> {
     let request = MergePreviewRequest {
         primary_text: texts[0].clone(),
         secondary_text: texts[1].clone(),
         policy,
         resolutions,
-        keep_secondary: Vec::new(),
+        keep_secondary,
         include_child_processes: false,
     };
     call::<MergePreviewResponse>(client, IpcOperationName::RulesMergePreview, &request)
@@ -125,10 +127,11 @@ fn merge_job(
     texts: [String; 2],
     policy: MergePolicyDto,
     resolutions: Vec<ConflictResolutionDto>,
+    keep_secondary: Vec<String>,
     last: bool,
 ) -> crate::backend::Job {
     Box::new(move |client: &dyn IpcClient| {
-        let answer = ask(client, &texts, policy, resolutions);
+        let answer = ask(client, &texts, policy, resolutions, keep_secondary);
         Reply::new(move |app| {
             app.rules.busy = None;
             match answer {
@@ -146,10 +149,19 @@ fn failed(app: &mut AppState, failure: Failure) {
 
 fn previewed(app: &mut AppState, texts: [String; 2], result: &MergeResultDto) {
     let view = view_of(result);
+    let duplicates: Vec<Duplicate> = result
+        .normalized_duplicates
+        .iter()
+        .map(|d| Duplicate {
+            key: d.identity_key.clone(),
+            summary: d.match_summary.clone(),
+        })
+        .collect();
     // Nothing to merge: the service says the books are equal, nothing is left
     // to show, or the merged rules are the ones on screen. The files may still
     // spell them differently, and then they are rewritten, as the window does.
-    if result.noop || view.is_noop() || merges_to_screen(app, result) {
+    // A copy the merge switched off is something to show.
+    if result.noop || (view.is_noop() && duplicates.is_empty()) || merges_to_screen(app, result) {
         // Rules only the service holds are the ones the file lacked.
         let added: Vec<String> = result
             .service_only
@@ -160,7 +172,7 @@ fn previewed(app: &mut AppState, texts: [String; 2], result: &MergeResultDto) {
         converge(app, &added);
         return;
     }
-    app.rules.mode = Mode::Merge(Box::new(Merge::files(texts, view)));
+    app.rules.mode = Mode::Merge(Box::new(Merge::files(texts, view, duplicates)));
 }
 
 /// The merge produced exactly the rules on screen (the window's hash compare).
@@ -223,7 +235,12 @@ fn converge(app: &mut AppState, added: &[String]) {
 
 /// The picks go back to the service, which returns the merged rules; those
 /// go to the ordinary review.
-pub fn confirm(app: &mut AppState, texts: [String; 2], picks: &[(String, bool)]) {
+pub fn confirm(
+    app: &mut AppState,
+    texts: [String; 2],
+    picks: &[(String, bool)],
+    keep_secondary: Vec<String>,
+) {
     let resolutions = picks
         .iter()
         .map(|(key, service)| ConflictResolutionDto {
@@ -248,7 +265,8 @@ pub fn confirm(app: &mut AppState, texts: [String; 2], picks: &[(String, bool)])
         .filter_map(|(path, text)| path.map(|path| (path, text.clone())))
         .collect();
     app.rules.busy = Some(Busy::Previewing);
-    app.outbox.push(merge_job(texts, policy, resolutions, true));
+    app.outbox
+        .push(merge_job(texts, policy, resolutions, keep_secondary, true));
 }
 
 /// The file bound to each route, primary first.

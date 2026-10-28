@@ -37,7 +37,7 @@ use crate::dns_resolver::{
 use crate::dns_wire::{
     build_a_response, build_error_response, build_negative_response, only_v4,
     parse_address_response, parse_question, AddressResponseOutcome, ParsedQuestion, QTYPE_A,
-    QTYPE_AAAA, RCODE_NOERROR, RCODE_NXDOMAIN, RCODE_SERVFAIL,
+    QTYPE_AAAA, QTYPE_HTTPS, RCODE_NOERROR, RCODE_NXDOMAIN, RCODE_SERVFAIL,
 };
 
 /// TTL (seconds) stamped on resolver-built `A` responses. Deliberately SHORT so
@@ -350,6 +350,8 @@ pub struct DnsInterceptListener {
     /// rule can match unboundedly many names, and a diagnostic must not be
     /// the thing that grows without limit.
     aaaa_outside_policy_reported: Mutex<HashSet<String>>,
+    /// Gates the lines a fact would otherwise repeat on every query.
+    query_notes: query_notes::QueryNotes,
     upstream: Arc<dyn UpstreamResolver>,
     sink: Arc<dyn FactSink>,
     reconciler: Arc<dyn SyncReconciler>,
@@ -489,6 +491,7 @@ impl DnsInterceptListener {
     ) -> Self {
         Self {
             aaaa_outside_policy_reported: Mutex::new(HashSet::new()),
+            query_notes: query_notes::QueryNotes::default(),
             rule_host_lane: RuleHostLane::default(),
             rule_lane_saturated: AtomicBool::new(false),
             oracle,
@@ -735,14 +738,20 @@ impl DnsInterceptListener {
                     if addresses.is_empty() {
                         continue;
                     }
-                    tracing::info!(
-                        target: "nrr::dns-resolver",
-                        msg_key = "dns-listener-short-name-completed",
-                        label = %label,
-                        completed = %full,
-                        server = %target,
-                        "completed a short name with its network domain",
-                    );
+                    if let Some(not_logged) = self
+                        .query_notes
+                        .admit(&format!("short {full}"), Instant::now())
+                    {
+                        tracing::info!(
+                            target: "nrr::dns-resolver",
+                            msg_key = "dns-listener-short-name-completed",
+                            label = %label,
+                            completed = %full,
+                            server = %target,
+                            not_logged,
+                            "completed a short name with its network domain",
+                        );
+                    }
                     crate::short_name_completions::global_short_name_completions()
                         .record(label, &full);
                     let ttl = min_ttl.max(1);
@@ -853,6 +862,19 @@ impl DnsInterceptListener {
                 ListenerAction::Forward
             }
         }
+    }
+
+    /// Whether an HTTPS record's address hints for `qname` would name addresses
+    /// its A/AAAA answers do not: a virtual address stands in for its IPv4, or
+    /// its AAAA is suppressed. No allocation, no upstream.
+    fn hints_bypass_rule_answers(&self, qname: &str) -> bool {
+        use crate::enforcement_planner::Ipv6Guard;
+        self.oracle.is_rule_host(qname)
+            && (self.fake_ip.carries_on_v4(qname)
+                || matches!(
+                    (self.ipv6_disposition)(),
+                    None | Some(Ipv6Guard::FiltersOnly)
+                ))
     }
 
     /// The tunnel carries IPv6: resolve, enforce, then answer.
@@ -1013,6 +1035,10 @@ impl DnsInterceptListener {
             // rule host's name is not asked of the main link in any type.
             if self.oracle.is_rule_host(&q.qname) && self.leak_guard.blocking_for_host(&q.qname) {
                 return self.withheld(query);
+            }
+            if q.qtype == QTYPE_HTTPS && self.hints_bypass_rule_answers(&q.qname) {
+                return build_negative_response(query, RCODE_NOERROR, self.response_ttl)
+                    .map_or(ListenerAction::Forward, ListenerAction::Respond);
             }
             return ListenerAction::Forward;
         }
@@ -1570,12 +1596,18 @@ impl DnsInterceptListener {
         {
             return false;
         }
-        tracing::info!(
-            target: "nrr::dns-resolver",
-            msg_key = "dns-listener-direct-host-parked-suggestion",
-            host = %q.qname,
-            "direct host is a parked suggestion for the additional route — left on it instead of being steered onto the primary",
-        );
+        if let Some(not_logged) = self
+            .query_notes
+            .admit(&format!("parked {}", q.qname), Instant::now())
+        {
+            tracing::info!(
+                target: "nrr::dns-resolver",
+                msg_key = "dns-listener-direct-host-parked-suggestion",
+                host = %q.qname,
+                not_logged,
+                "direct host is a parked suggestion for the additional route — left on it instead of being steered onto the primary",
+            );
+        }
         true
     }
 
@@ -1601,14 +1633,20 @@ impl DnsInterceptListener {
             .collateral_fake
             .fake_direct_answer(&q.qname, &only_v4(addresses))?;
         let resp = build_a_response(query, &fake, self.response_ttl)?;
-        tracing::info!(
-            target: "nrr::dns-resolver",
-            msg_key = "dns-listener-modeb-direct-host-shared-address",
-            host = %q.qname,
-            fake = ?fake,
-            real = ?addresses,
-            "Mode B: direct host shares every address with a secondary rule — answered with a virtual address so it stays on the primary link",
-        );
+        if let Some(not_logged) = self
+            .query_notes
+            .admit(&format!("shared {}", q.qname), Instant::now())
+        {
+            tracing::info!(
+                target: "nrr::dns-resolver",
+                msg_key = "dns-listener-modeb-direct-host-shared-address",
+                host = %q.qname,
+                fake = ?fake,
+                real = ?addresses,
+                not_logged,
+                "Mode B: direct host shares every address with a secondary rule — answered with a virtual address so it stays on the primary link",
+            );
+        }
         Some(resp)
     }
 
@@ -1738,12 +1776,18 @@ impl DnsInterceptListener {
                 continue;
             };
             if !reply_is_nxdomain(&reply) {
-                tracing::info!(
-                    target: "nrr::dns-resolver",
-                    msg_key = "dns-listener-local-resolver-knows-name",
-                    server = %server,
-                    "a resolver on this machine knows a name the upstream called non-existent",
-                );
+                if let Some(not_logged) = self
+                    .query_notes
+                    .admit(&format!("resolver {server}"), Instant::now())
+                {
+                    tracing::info!(
+                        target: "nrr::dns-resolver",
+                        msg_key = "dns-listener-local-resolver-knows-name",
+                        server = %server,
+                        not_logged,
+                        "a resolver on this machine knows a name the upstream called non-existent",
+                    );
+                }
                 return Some(reply);
             }
         }
@@ -1988,6 +2032,8 @@ fn direct_answers(query: &[u8], q: &ParsedQuestion, reply: &[u8]) -> Option<Vec<
 fn v4_addresses(v4: &[Ipv4Addr]) -> Vec<IpAddr> {
     v4.iter().copied().map(IpAddr::V4).collect()
 }
+
+mod query_notes;
 
 #[cfg(test)]
 mod tests;

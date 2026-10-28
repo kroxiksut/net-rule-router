@@ -1,0 +1,13 @@
+{
+  "cases": [
+    { "name": "a Windows path", "input": { "path": "C:\\Users\\ann\\Rules\\rules_primary.txt" }, "expected": "C:/Users/ann/Rules" },
+    { "name": "a Unix path", "input": { "path": "/home/ann/rules/rules_primary.txt" }, "expected": "/home/ann/rules" },
+    { "name": "mixed separators", "input": { "path": "C:\\Users/ann\\rules.txt" }, "expected": "C:/Users/ann" },
+    { "name": "a bare file name names no folder", "input": { "path": "rules.txt" }, "expected": "" },
+    { "name": "a file at the root names no folder", "input": { "path": "/rules.txt" }, "expected": "" },
+    { "name": "empty", "input": { "path": "" }, "expected": "" },
+    { "name": "a trailing separator keeps the folder itself", "input": { "path": "C:\\Rules\\" }, "expected": "C:/Rules" },
+    { "name": "a non-ASCII folder", "input": { "path": "D:\\\u041f\u0440\u0430\u0432\u0438\u043b\u0430\\r.txt" }, "expected": "D:/\u041f\u0440\u0430\u0432\u0438\u043b\u0430" },
+    { "name": "a network share", "input": { "path": "\\\\srv\\share\\r.txt" }, "expected": "//srv/share" }
+  ]
+}

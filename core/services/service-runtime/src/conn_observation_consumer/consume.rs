@@ -90,6 +90,8 @@ impl ConnectionObservationConsumer {
         // about once.
         let mut scripts_this_batch: std::collections::HashMap<u32, Vec<String>> =
             std::collections::HashMap::new();
+        // Each costs a read of the connection table: a few per batch.
+        let mut flow_pid_lookups_left: u32 = 8;
 
         for obs in batch {
             // Asked of EVERY observation, before the filter below keeps only
@@ -374,9 +376,10 @@ impl ConnectionObservationConsumer {
                     } else {
                         None
                     };
+                    let pid = self.pid_of(obs, &store, &mut flow_pid_lookups_left);
                     let script_rules = self.script_rule_paths(
                         &store,
-                        obs.pid,
+                        pid,
                         path,
                         ScriptOwner {
                             per_user,
@@ -601,6 +604,28 @@ impl ConnectionObservationConsumer {
         }
         seen.insert(owner.to_owned(), links);
         links
+    }
+
+    /// `obs.pid`, or for a TCP connection reported without one, the process
+    /// still holding the flow — asked only while a rule names a path, within
+    /// `left` lookups.
+    fn pid_of(
+        &self,
+        obs: &ConnectionObservation,
+        store: &AppObservationStore,
+        left: &mut u32,
+    ) -> u32 {
+        if obs.pid != 0 || *left == 0 || !matches!(obs.protocol, TransportProtocol::Tcp) {
+            return obs.pid;
+        }
+        let Some(lookup) = self.flow_pid.as_ref() else {
+            return 0;
+        };
+        if self.script_launches.is_none() || !store.watches_paths() {
+            return 0;
+        }
+        *left -= 1;
+        lookup(obs.local, obs.remote).unwrap_or(0)
     }
 
     /// The rule paths whose script the process `pid` runs, for its own

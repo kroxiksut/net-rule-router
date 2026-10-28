@@ -98,5 +98,7 @@ too, even while another signed-in user's connection is up.
 
 ## See also
 
+- [What takes priority](what-takes-priority.md) — every case where two
+  things disagree, on one page
 - [The routing switches](routing-modes.md)
 - [The `nrr-tui` terminal interface](tui.md) — managing your rules over SSH

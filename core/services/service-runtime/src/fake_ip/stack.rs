@@ -647,6 +647,8 @@ struct UdpClientFlow {
     replies: Arc<UdpReplies>,
     worker: JoinHandle<()>,
     last_seen_at: u64,
+    /// Length of the client's latest datagram, quoted when its flow dies.
+    last_payload_len: usize,
     /// The book's route and the owner the flow was dialled for; the bind
     /// holds the name.
     book_route: Option<RouteRole>,
@@ -1583,8 +1585,12 @@ const HOLD_RETRY_WINDOW: std::time::Duration = std::time::Duration::from_secs(10
 ///
 /// A dial that FAILS never satisfies this — it marks the flow dead instead, and
 /// the writer exits on that.
-fn client_fin_may_propagate(dial_is_done: bool, state: tcp::State) -> bool {
+///
+/// The DRAIN test: a full queue stops the drain with bytes left in the socket,
+/// and a FIN raised then lets the writer finish before they reach it.
+fn client_fin_may_propagate(dial_is_done: bool, state: tcp::State, rx_drained: bool) -> bool {
     dial_is_done
+        && rx_drained
         && matches!(
             state,
             tcp::State::CloseWait

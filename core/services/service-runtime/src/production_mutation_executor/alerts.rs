@@ -21,6 +21,10 @@ use nrr_storage::revisions::{AdoptionOutcome, ScannedRow};
 use super::*;
 use crate::integrity_review;
 
+/// The refusal of an acknowledgement that left its tamper alert's rows
+/// unadopted.
+const ALERT_ROWS_NOT_ADOPTED: &str = "alert-rows-not-adopted";
+
 /// What an acknowledgement adopted, and what it was shown but left alone.
 #[derive(Clone, Copy, Debug, Default)]
 struct AdoptionSummary {
@@ -109,6 +113,29 @@ impl ProductionMutationExecutor {
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_millis() as i64)
             .unwrap_or(alert.updated_at);
+        // Acknowledging a DB tamper / key-reset alert adopts exactly the rows
+        // the dialog listed, and only those still holding the content shown.
+        let adoption = if crate::tamper_bootstrap::is_blocking_alert_kind(&alert.kind) {
+            self.adopt_acknowledged_rows(&alert, parsed.adopt_rows.as_deref(), repo, now_ms)
+        } else {
+            AdoptionSummary::default()
+        };
+        // A tamper alert is raised once per row content: lifted with its row
+        // still unadopted, nothing would ever name that row again.
+        if alert.kind == AuditEventKind::DbTamperDetected.as_str()
+            && self
+                .scope_of(&alert, repo.as_ref())
+                .map_or(true, |left| !left.is_empty())
+        {
+            return MutationOutcome::Failed(OperationError {
+                args: Default::default(),
+                code: ALERT_ROWS_NOT_ADOPTED.into(),
+                message: format!(
+                    "alert {} stays open: the rows it lists were not adopted",
+                    parsed.alert_id
+                ),
+            });
+        }
         // Recorded before the state moves: an acknowledgement the trail cannot
         // show did not happen.
         let recorded = match self.record_alert_state_change(&alert, target, principal, now_ms) {
@@ -128,13 +155,6 @@ impl ProductionMutationExecutor {
                 message: format!("alerts update_state failed: {e}"),
             });
         }
-        // Acknowledging a DB tamper / key-reset alert adopts exactly the rows
-        // the dialog listed, and only those still holding the content shown.
-        let adoption = if crate::tamper_bootstrap::is_blocking_alert_kind(&alert.kind) {
-            self.adopt_acknowledged_rows(&alert, parsed.adopt_rows.as_deref(), repo, now_ms)
-        } else {
-            AdoptionSummary::default()
-        };
         // Every session re-reads the list: the gate is machine-wide, and the
         // adoption may have raised alerts for rows changed since shown.
         if let Some(bus) = self.event_bus.as_ref() {
@@ -289,6 +309,9 @@ impl ProductionMutationExecutor {
                 Ok(summary) => {
                     // By kind, not id: every key loss raises its own alert id.
                     if alert.kind == AuditEventKind::KeyResetWithExistingData.as_str() {
+                        if let Some(grants) = crate::override_grants::installed() {
+                            grants.adopt_after_key_reset(now_ms);
+                        }
                         if let Err(e) = self.coordinator.clear_key_reset_marker() {
                             tracing::warn!(
                                 target: "nrr::tamper",

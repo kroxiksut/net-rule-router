@@ -573,6 +573,15 @@ pub(crate) fn build_supervised_runtime_deps(
         let net_change = nrr_platform_api::net_change::NetChangeGeneration::new();
         let net_subscription =
             net_change.follow(&nrr_platform_windows::network_change::WindowsNetworkChangeObserver);
+        // The OS notices fired while the machine slept.
+        rebind_requests.set_wake_refresh({
+            let generation = net_change.clone();
+            let full_pass = full_pass.clone();
+            Arc::new(move || {
+                generation.bump();
+                full_pass.request();
+            })
+        });
         let (routes_cached, routes_fresh) = change_hashed(net_change.clone(), {
             let api = Arc::clone(&api);
             move || api.get_ip_forward_table()
@@ -1357,10 +1366,15 @@ pub(crate) fn build_supervised_runtime_deps(
             }),
             _ => None,
         };
+        let fcrdns_egress = match (route_coordinator.as_ref(), active_routing_sid.as_ref()) {
+            (Some(coord), Some(sid)) => Some(build_dns_egress_policy(coord, Arc::clone(sid))),
+            _ => None,
+        };
         spawn_fcrdns_learner_worker(
             fcrdns_rx,
             Arc::clone(dns_consumer),
             companion,
+            fcrdns_egress,
             Arc::clone(&task_liveness),
         );
     }

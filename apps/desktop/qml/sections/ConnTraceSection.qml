@@ -1186,8 +1186,10 @@ ScrollView {
                     // Widths are fixed so the Verdict text — "Blocked (another
                     // program)" is the widest — shows in full by default; each
                     // header elides rather than overlapping its neighbour.
-                    Label {
+                    SortHeader {
                         id: connHdrProcess
+                        theme: root.uiTheme
+                        onActivated: section._toggleConnSort("process")
                         Layout.fillWidth: true
                         text: root.tr("diag.conn-trace.col-process", "Process")
                             + section._connSortArrow("process")
@@ -1203,8 +1205,10 @@ ScrollView {
                         ToolTip.text: root.tr("diag.conn-trace.col-process-tip",
                             "The application that opened the connection. Hover a row's process name to see its full path.")
                     }
-                    Label {
+                    SortHeader {
                         id: connHdrRemote
+                        theme: root.uiTheme
+                        onActivated: section._toggleConnSort("remote")
                         Layout.preferredWidth: section._connRemoteColWidth
                         text: root.tr("diag.conn-trace.col-remote", "Remote")
                             + section._connSortArrow("remote")
@@ -1218,10 +1222,12 @@ ScrollView {
                         }
                         ToolTip.visible: connHdrRemoteHover.hovered
                         ToolTip.text: root.tr("diag.conn-trace.col-remote-tip",
-                            "The destination address and port the connection went to.")
+                            "The destination address and port the connection went to. Below it, the name this address was answered for, when one was seen; \"(+N)\" means N more names share the address — hover the name for the full list.")
                     }
-                    Label {
+                    SortHeader {
                         id: connHdrEgress
+                        theme: root.uiTheme
+                        onActivated: section._toggleConnSort("egress")
                         Layout.preferredWidth: 110
                         text: root.tr("diag.conn-trace.col-egress", "Egress")
                             + section._connSortArrow("egress")
@@ -1237,8 +1243,10 @@ ScrollView {
                         ToolTip.text: root.tr("diag.conn-trace.col-egress-tip",
                             "Which network link the connection actually left through: Primary (your main link), Additional (the additional link, usually a VPN), Loopback (local, never leaves the PC), Other (another adapter), Unknown (couldn't be determined). This is observation only — it never changes routing.")
                     }
-                    Label {
+                    SortHeader {
                         id: connHdrVerdict
+                        theme: root.uiTheme
+                        onActivated: section._toggleConnSort("verdict")
                         Layout.preferredWidth: 180
                         text: root.tr("diag.conn-trace.col-verdict", "Verdict")
                             + section._connSortArrow("verdict")

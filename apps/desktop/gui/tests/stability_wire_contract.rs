@@ -19,10 +19,11 @@
 //! that overlays the user's recorded decisions. These tests pin both against
 //! the DTO here, so a drift fails `cargo test` instead of a hardware run.
 
+#[path = "support/js.rs"]
+mod js;
+
 use std::collections::BTreeSet;
-use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
 
 use nrr_shared::ipc_payloads::ServiceStabilityConfigDto;
 use serde_json::{json, Map, Value};
@@ -236,9 +237,8 @@ fn the_stability_set_payload_is_built_only_by_the_shared_merge() {
     );
 }
 
-/// Behavioural check of the merge itself, run through the real JS. Skipped when
-/// no `node` is on PATH — the structural tests above stay the unconditional
-/// guard, this one is the executable proof of the exact regression.
+/// Behavioural check of the merge itself, run through the real JS: the
+/// executable proof of the exact regression.
 #[test]
 fn merge_never_downgrades_a_recorded_intent_to_the_wire_default() {
     let live = Value::Object(config_at_wire_defaults());
@@ -257,10 +257,7 @@ fn merge_never_downgrades_a_recorded_intent_to_the_wire_default() {
         live = serde_json::to_string(&live).expect("live row serialises"),
     );
 
-    let Some(output) = run_node(&harness) else {
-        eprintln!("node not available — skipping the executable merge check");
-        return;
-    };
+    let output = js::run_js(&harness);
     let merged: ServiceStabilityConfigDto = serde_json::from_str(output.trim())
         .unwrap_or_else(|e| panic!("merge output is not a config DTO: {e}; output: {output}"));
 
@@ -309,34 +306,6 @@ fn a_log_window_request_is_never_echoed_or_replayed() {
             "an answer without a request must not carry {key}"
         );
     }
-}
-
-/// Feed a program to `node` on stdin. `None` when node is not installed.
-fn run_node(program: &str) -> Option<String> {
-    let mut child = Command::new("node")
-        .arg("-")
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .unwrap_or_else(|e| {
-            panic!("this check runs the QML JavaScript through node; install Node.js ({e})")
-        });
-    let Some(stdin) = child.stdin.as_mut() else {
-        panic!("stdin was piped")
-    };
-    stdin
-        .write_all(program.as_bytes())
-        .unwrap_or_else(|e| panic!("write the harness to node: {e}"));
-    let out = child
-        .wait_with_output()
-        .unwrap_or_else(|e| panic!("node runs to completion: {e}"));
-    assert!(
-        out.status.success(),
-        "node rejected the harness: {}",
-        String::from_utf8_lossy(&out.stderr)
-    );
-    Some(String::from_utf8_lossy(&out.stdout).into_owned())
 }
 
 /// Collect the `_`-prefixed properties a QML file declares.

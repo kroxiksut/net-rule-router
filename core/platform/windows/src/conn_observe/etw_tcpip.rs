@@ -341,6 +341,11 @@ fn classify_event(event_id: u16) -> Option<(bool, ConnectionProgress)> {
 /// allocation past the buffer's own growth: under a connect storm a slow
 /// callback makes ETW drop events.
 unsafe extern "system" fn event_record_callback(record: *mut EVENT_RECORD) {
+    // SAFETY: forwarded as ETW handed it: a live record for this call, or null.
+    crate::callback_guard::contain_panic("etw-tcpip", || unsafe { handle_record(record) });
+}
+
+unsafe fn handle_record(record: *mut EVENT_RECORD) {
     if record.is_null() {
         return;
     }

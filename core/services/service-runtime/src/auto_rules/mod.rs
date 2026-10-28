@@ -146,6 +146,10 @@ const UNREACHABLE_NOTICE_GAP_MS: i64 = 24 * 60 * 60 * 1_000;
 /// Bound on the hosts remembered for that; past it the notice stays quiet.
 const UNREACHABLE_NOTICE_CAP: usize = 256;
 
+/// Names a reverse lookup produced, remembered across principals. The lookups
+/// themselves are capped per session well below this.
+const REVERSE_NAMED_CAP: usize = 1024;
+
 /// Maximum principals tracked concurrently.
 ///
 /// Free is single-active-user, so in practice this is one. The cap exists so a
@@ -574,6 +578,9 @@ pub struct AutoRulesEngine {
     /// Told when an offer for a site the main link will not carry is parked
     /// (see [`MainLinkBlockedParkedFn`]).
     main_link_blocked_parked: OnceLock<MainLinkBlockedParkedFn>,
+    /// `(sid, host)` for names a reverse lookup produced: the address owner
+    /// chose them, so `auto` asks about an offer covering one.
+    reverse_named: Mutex<crate::bounded_set::BoundedRecentSet<(String, String)>>,
 }
 
 /// `(sid, host)`: a site `sid` opened fails on the main link and answered the

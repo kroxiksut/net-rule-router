@@ -24,7 +24,7 @@ import QtQuick.Layouts 1.15
 
 Dialog {
     id: dialog
-    title: tr("dialog.safe-disable.title", "Safe disable")
+    title: tr("dialog.safe-disable.title", "Turn off rules for a while")
 
     modal: true
     width: 520
@@ -83,7 +83,7 @@ Dialog {
             Layout.fillWidth: true
             text: dialog.tr(
                 "dialog.safe-disable.body",
-                "Temporarily disable enforcement and remove all routes and filters owned by NetRuleRouter. The service stays running; you can re-enable at any time. This action is audited."
+                "Your routing and leak protection stop for the time you choose: the routes and filters NetRuleRouter keeps for you are removed, and they come back on their own when it is up. Other users of this computer keep theirs. The service stays running; you can turn the rules back on earlier. This action is audited."
             )
             wrapMode: Text.Wrap
             font.pixelSize: 13

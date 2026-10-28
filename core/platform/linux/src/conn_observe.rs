@@ -226,11 +226,18 @@ pub(crate) struct SocketOwner {
 /// destination, which is what the routing path needs — so a miss yields
 /// `pid = 0` rather than a dropped event.
 pub(crate) fn socket_owners(wanted: &HashMap<u64, u32>) -> HashMap<u64, SocketOwner> {
+    socket_owners_in(std::path::Path::new("/proc"), wanted)
+}
+
+fn socket_owners_in(
+    proc_root: &std::path::Path,
+    wanted: &HashMap<u64, u32>,
+) -> HashMap<u64, SocketOwner> {
     use std::os::unix::fs::MetadataExt;
 
     let mut owners: HashMap<u64, SocketOwner> = HashMap::new();
     let uids: HashSet<u32> = wanted.values().copied().collect();
-    let Ok(entries) = std::fs::read_dir("/proc") else {
+    let Ok(entries) = std::fs::read_dir(proc_root) else {
         return owners;
     };
     for entry in entries.flatten() {
@@ -262,9 +269,11 @@ pub(crate) fn socket_owners(wanted: &HashMap<u64, u32>) -> HashMap<u64, SocketOw
                 continue;
             }
             let path = exe.get_or_insert_with(|| {
-                std::fs::read_link(entry.path().join("exe"))
-                    .ok()
-                    .map(|p| p.to_string_lossy().into_owned())
+                std::fs::read_link(entry.path().join("exe")).ok().map(|p| {
+                    crate::app_scan::live_image_path(p)
+                        .to_string_lossy()
+                        .into_owned()
+                })
             });
             owners.insert(
                 inode,
@@ -450,6 +459,24 @@ mod tests {
         assert_eq!(sockets[0].local, addr("10.0.2.15:51634"));
         assert_eq!(sockets[0].remote, addr("192.0.2.51:443"));
         assert!(sockets[1].remote.is_ipv6(), "a real v6 peer stays v6");
+    }
+
+    /// A package upgrade replaces the binary of a running program; its rule by
+    /// name must keep counting the connections it opens afterwards.
+    #[test]
+    fn a_program_upgraded_while_running_keeps_its_own_image_path() {
+        use std::os::unix::fs::{symlink, MetadataExt};
+        let root = tempfile::tempdir().expect("tempdir");
+        let process = root.path().join("4242");
+        std::fs::create_dir_all(process.join("fd")).expect("mkdir");
+        symlink("socket:[777]", process.join("fd").join("5")).expect("fd link");
+        symlink("/opt/app/app (deleted)", process.join("exe")).expect("exe link");
+        let uid = std::fs::metadata(&process).expect("stat").uid();
+
+        let owners = socket_owners_in(root.path(), &HashMap::from([(777, uid)]));
+        let owner = owners.get(&777).expect("the socket's owner is found");
+        assert_eq!(owner.pid, 4242);
+        assert_eq!(owner.exe.as_deref(), Some("/opt/app/app"));
     }
 
     #[test]

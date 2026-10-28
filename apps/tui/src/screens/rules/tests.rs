@@ -1171,6 +1171,42 @@ mod rules_folder {
         answer(app, &["o", &folder.display().to_string()]);
     }
 
+    /// The window binds another set while this screen is open: the line
+    /// naming where the rules are saved follows, without leaving the screen.
+    #[test]
+    fn a_binding_the_window_made_reaches_the_open_screen() {
+        let dir = Scratch::new("rules-follow-window");
+        let (mut app, _sets) = rules_with_settings(&dir, one_rule());
+        seed(&app, |s| {
+            s.rules_files.primary = "/home/rules_primary.txt".to_string();
+        });
+        super::super::follow_settings_file(&mut app);
+        assert_eq!(app.rules.bound_paths, ["/home/rules_primary.txt"]);
+
+        seed(&app, |s| {
+            s.rules_files.primary = "/elsewhere/rules_primary.txt".to_string();
+        });
+        assert!(
+            super::super::follow_settings_file(&mut app),
+            "a change is worth a redraw"
+        );
+        assert_eq!(app.rules.bound_paths, ["/elsewhere/rules_primary.txt"]);
+
+        let file = app.rules.settings_file.clone().expect("settings file");
+        std::fs::File::options()
+            .write(true)
+            .open(&file)
+            .and_then(|f| {
+                f.set_modified(std::time::SystemTime::now() - std::time::Duration::from_secs(3600))
+            })
+            .expect("let the file settle");
+        super::super::follow_settings_file(&mut app);
+        assert!(
+            !super::super::follow_settings_file(&mut app),
+            "an unchanged file is not read again"
+        );
+    }
+
     fn note(app: &AppState) -> String {
         app.rules
             .note
@@ -2980,6 +3016,49 @@ mod file_merge {
             review[0]["payload"]["content-hash"],
             "3e704b1a4e1e07560025ab7c8a9efc46cfd7a0203271f8ba00e83c335597f87e"
         );
+    }
+
+    fn twice(key: &str, summary: &str) -> Value {
+        json!({
+            "identity-key": key, "primary-rule-id": "r-0001",
+            "secondary-rule-id": "r-0002", "match-summary": summary
+        })
+    }
+
+    /// A rule a file names in both sets with both copies on: the merge kept
+    /// the main route's copy and switched the other off. The screen says so,
+    /// and a choice of the other route goes back with the merge instead of an
+    /// empty one that silently keeps the main route.
+    #[test]
+    fn a_rule_in_both_sets_is_shown_and_its_route_choice_goes_back() {
+        let dir = Scratch::new("file-merge-both-sets");
+        let fake = rules();
+        let mut app = bound(&dir, &fake);
+        let first = json!({ "result": {
+            "policy": "union", "noop": false, "unresolved": 0,
+            "file-only": [], "service-only": [], "conflicts": [],
+            "merged-rules-json": "{\"merged\":1}",
+            "normalized-duplicates": [twice("d1", "both.example")]
+        } });
+        fake.answer(IpcOperationName::RulesMergePreview, first);
+        answer(&mut app, &["F"]);
+        drain(&mut app, &fake);
+        assert!(
+            matches!(app.rules.mode, Mode::Merge(_)),
+            "a switched-off copy is a change to show, not nothing to merge"
+        );
+        let shown = screen_text(&app, ScreenId::Rules);
+        assert!(
+            shown.contains("Rules written into both routes (1)"),
+            "{shown}"
+        );
+        assert!(shown.contains("both.example"), "{shown}");
+        answer(&mut app, &["1", "y"]);
+        drain(&mut app, &fake);
+        let sent = fake.sent(IpcOperationName::RulesMergePreview);
+        assert_eq!(sent.len(), 2, "{sent:?}");
+        assert_eq!(sent[0]["keep-secondary"], json!([]));
+        assert_eq!(sent[1]["keep-secondary"], json!(["d1"]), "{sent:?}");
     }
 
     /// The policy chosen in either client decides both passes; a confirming

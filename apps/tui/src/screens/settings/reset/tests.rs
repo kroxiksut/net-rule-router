@@ -1,6 +1,5 @@
 #![allow(clippy::expect_used)]
 
-use base64::Engine as _;
 use std::cell::Cell;
 use std::sync::Mutex;
 use std::time::Duration;
@@ -83,11 +82,9 @@ fn the_steps_run_in_the_windows_order_and_the_service_stops_last() {
     let client = Script::new(&[]);
     let stops = Cell::new(0);
     let end = drive(&client, false, &|| {
-        // Every service-side step has already run when the stop comes.
-        assert_eq!(
-            client.ops(),
-            [Op::LogsClear, Op::PrincipalDataPurge, Op::MutationSubmit]
-        );
+        // Every service-side step has already run when the stop comes, and
+        // none wrote a rule book: the user is left reading the baseline.
+        assert_eq!(client.ops(), [Op::LogsClear, Op::PrincipalDataPurge]);
         stops.set(stops.get() + 1);
         stopped()
     });
@@ -171,20 +168,6 @@ fn a_refused_log_clear_does_not_stop_the_reset() {
     let client = Script::new(&[Op::LogsClear]);
     let end = drive(&client, false, &stopped);
     assert_eq!(end, Next::Finish { cleared: true });
-}
-
-#[test]
-fn the_empty_rules_carry_both_routes_with_no_rule_in_them() {
-    let client = Script::new(&[]);
-    drive(&client, false, &stopped);
-    let payload = client.payload(Op::MutationSubmit);
-    let sent = &payload["payload"];
-    for route in ["primary-bytes-b64", "secondary-bytes-b64"] {
-        let bytes = base64::engine::general_purpose::STANDARD
-            .decode(sent[route].as_str().expect("bytes"))
-            .expect("base64");
-        assert_eq!(String::from_utf8(bytes).expect("utf8"), EMPTY_RULES);
-    }
 }
 
 fn no_manager() -> Option<Box<dyn nrr_platform_api::service_control::ServiceControlPort>> {

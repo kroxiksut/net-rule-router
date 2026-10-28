@@ -104,6 +104,33 @@ fn the_unasked_writer_parks_a_less_certain_offer_instead_of_writing_it() {
     assert_eq!(parked(&f.engine), 1);
 }
 
+/// A name a reverse lookup produced is whatever the owner of the address chose
+/// to call it. `auto` asks a person about it instead of writing it into the
+/// user's rules.
+#[test]
+fn auto_parks_a_companion_named_by_reverse_lookup() {
+    let f = fixture(AutoRulesMode::Auto);
+    two_visits(&f.engine, &["cdn.example"]);
+    f.engine.note_reverse_named_in_use(
+        SID,
+        "edge.cdn.example",
+        SystemTime::UNIX_EPOCH + Duration::from_millis(100_500),
+    );
+
+    let summary = f.engine.tick(SID, later());
+    assert_eq!(summary.authored, 0, "nothing is written unasked");
+    assert!(f.author.calls().is_empty());
+    assert!(parked(&f.engine) >= 1, "the person is asked instead");
+
+    let other = fixture(AutoRulesMode::Auto);
+    two_visits(&other.engine, &["cdn.example"]);
+    assert_eq!(
+        other.engine.tick(SID, later()).authored,
+        1,
+        "the same companion seen only in lookups is still written"
+    );
+}
+
 /// Until a person says yes, a less certain offer does not change where any
 /// traffic goes.
 #[test]

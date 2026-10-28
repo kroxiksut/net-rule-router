@@ -26,9 +26,10 @@ use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use base64::Engine as _;
 use nrr_domain::rules_file::{
     rule_set_with_kept_to_rules_file_parsed, write_rules_file_with_passthrough, HostPlatform,
-    PassthroughSection, PresetMetadata, RulesFileSection,
+    PassthroughSection, PresetMetadata, RulesFileParsed, RulesFileSection,
 };
 use nrr_domain::rules_json_codec;
+use nrr_domain::rules_revision::RulesRevisionContent;
 use nrr_shared::RouteRole;
 use rusqlite::Connection;
 use sha2::{Digest, Sha256};
@@ -126,7 +127,7 @@ impl ProductionPresetExporter {
     }
 }
 
-const fn default_host_app_section() -> RulesFileSection {
+pub(crate) const fn default_host_app_section() -> RulesFileSection {
     #[cfg(target_os = "windows")]
     {
         RulesFileSection::Windows
@@ -158,31 +159,9 @@ impl PresetExportSource for ProductionPresetExporter {
             .conn
             .lock()
             .map_err(|_| PresetExportError::LockPoisoned)?;
-        // The book in force, as the rules provider resolves it: a revision
-        // mid-activation, the caller's own, then the shared baseline.
-        let book = crate::production_rules_provider::book_in_force_for(&guard, principal)
-            .map_err(PresetExportError::StorageError)?
+        let content = rules_in_force(&guard, principal, self.host_app_section)?
             .ok_or(PresetExportError::NoActiveRevision)?;
-
-        // Wire-shape parse first; this catches malformed/older blobs
-        // before the codec runs.
-        let dto =
-            crate::production_rules_provider::read_stored_rules(&book.rules_json, book.origin())
-                .map_err(|e| PresetExportError::DecodeError(format!("wire parse: {e}")))?;
-        // Names are spelled for the section they are written under.
-        let platform = self
-            .host_app_section
-            .app_platform()
-            .unwrap_or(HostPlatform::compiled());
-        let content = rules_json_codec::decode(dto, platform)
-            .map_err(|e| PresetExportError::DecodeError(format!("codec decode: {e}")))?;
-
-        let rule_set = content.rule_book.set_for(route);
-        let kept = match route {
-            RouteRole::Primary => &content.inactive.primary,
-            RouteRole::Secondary => &content.inactive.secondary,
-        };
-        let parsed = rule_set_with_kept_to_rules_file_parsed(rule_set, kept, self.host_app_section);
+        drop(guard);
 
         // Active revisions don't carry preset metadata (lost on import
         // canonicalization). When the caller asked for metadata, emit
@@ -200,8 +179,13 @@ impl PresetExportSource for ProductionPresetExporter {
                 body: body.clone(),
             })
             .collect();
-        let file_bytes_utf8 =
-            write_rules_file_with_passthrough(&parsed, &[], &carried, metadata.as_ref());
+        let file_bytes_utf8 = rules_file_text(
+            Some(&content),
+            route,
+            self.host_app_section,
+            &carried,
+            metadata.as_ref(),
+        );
         let mut hasher = Sha256::new();
         hasher.update(file_bytes_utf8.as_bytes());
         let content_hash_hex = format!("{:x}", hasher.finalize());
@@ -211,6 +195,54 @@ impl PresetExportSource for ProductionPresetExporter {
             content_hash_hex,
         })
     }
+}
+
+/// The rules `principal` is under, as the rules provider resolves them: a
+/// revision mid-activation, their own, then the shared baseline. `Ok(None)`
+/// when nothing is in force.
+pub(crate) fn rules_in_force(
+    guard: &Connection,
+    principal: &str,
+    host_app_section: RulesFileSection,
+) -> Result<Option<RulesRevisionContent>, PresetExportError> {
+    let Some(book) = crate::production_rules_provider::book_in_force_for(guard, principal)
+        .map_err(PresetExportError::StorageError)?
+    else {
+        return Ok(None);
+    };
+    let dto = crate::production_rules_provider::read_stored_rules(&book.rules_json, book.origin())
+        .map_err(|e| PresetExportError::DecodeError(format!("wire parse: {e}")))?;
+    // Names are spelled for the section they are written under.
+    let platform = host_app_section
+        .app_platform()
+        .unwrap_or(HostPlatform::compiled());
+    rules_json_codec::decode(dto, platform)
+        .map(Some)
+        .map_err(|e| PresetExportError::DecodeError(format!("codec decode: {e}")))
+}
+
+/// One route of `content` as rules-file text, rules kept aside included: the
+/// one writer every export of rules goes through. Without `content` only the
+/// passthrough sections are written.
+pub(crate) fn rules_file_text(
+    content: Option<&RulesRevisionContent>,
+    route: RouteRole,
+    host_app_section: RulesFileSection,
+    passthrough: &[PassthroughSection],
+    metadata: Option<&PresetMetadata>,
+) -> String {
+    let parsed = content.map_or_else(RulesFileParsed::default, |content| {
+        let kept = match route {
+            RouteRole::Primary => &content.inactive.primary,
+            RouteRole::Secondary => &content.inactive.secondary,
+        };
+        rule_set_with_kept_to_rules_file_parsed(
+            content.rule_book.set_for(route),
+            kept,
+            host_app_section,
+        )
+    });
+    write_rules_file_with_passthrough(&parsed, &[], passthrough, metadata)
 }
 
 /// Base64-encode the export bytes with the standard alphabet (RFC 4648,

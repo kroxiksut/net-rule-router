@@ -1648,6 +1648,41 @@ fn hosts_bypass_on_resolves_directly_past_the_system() {
     assert_eq!(rec.canonical_hostname, "pinned.example");
 }
 
+/// A hosts file that sends a rule host to a real address of its own: every
+/// program connects there, past the public answer the bypass asked for, so
+/// that address is the rule's too. A black-hole pin is never one.
+#[test]
+fn hosts_bypass_keeps_the_address_the_hosts_file_sends_programs_to() {
+    use nrr_platform_api::hosts_file::StaticHostsFileReader;
+    // The fake server answers one query, so each lookup gets its own.
+    let resolver = || {
+        let addr = spawn_fake_dns(|query| {
+            vec![build_a_response(query, &[ip(203, 0, 113, 7)], 120).expect("resp")]
+        });
+        HostsBypassDnsResolver::new(
+            system_with("pinned.example", &[ip(198, 51, 100, 20)]),
+            Arc::new(|| true),
+            Arc::new(move || Some(addr)),
+            Duration::from_secs(2),
+        )
+        .with_hosts(Arc::new(StaticHostsFileReader::from_pairs([
+            ("pinned.example", ip(198, 51, 100, 20)),
+            ("blackholed.example", ip(0, 0, 0, 0)),
+        ])))
+    };
+    let rec = resolver()
+        .resolve("pinned.example", AddressFamily::Ipv4)
+        .expect("direct answer");
+    assert_eq!(
+        rec.addresses,
+        vec![ip(203, 0, 113, 7), ip(198, 51, 100, 20)]
+    );
+    let rec = resolver()
+        .resolve("blackholed.example", AddressFamily::Ipv4)
+        .expect("direct answer");
+    assert_eq!(rec.addresses, vec![ip(203, 0, 113, 7)]);
+}
+
 #[test]
 fn hosts_bypass_falls_back_to_system_when_no_upstream() {
     let r = HostsBypassDnsResolver::new(
@@ -1874,4 +1909,73 @@ fn one_query_asks_who_is_served_once_and_the_next_query_asks_again() {
     // Outside a query nothing is remembered.
     assert_eq!(answer(), (true, true, false, false));
     assert!(asked.load(Ordering::SeqCst) > 3);
+}
+
+// ── FCrDNS lookups and "DNS through the tunnel" ─────────────────────────────
+
+/// A DNS server that only listens: whether it heard anything is the question.
+fn listening_dns() -> (UdpSocket, std::net::SocketAddr) {
+    let sock = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).expect("bind");
+    sock.set_nonblocking(true).expect("nonblocking");
+    let addr = sock.local_addr().expect("addr");
+    (sock, addr)
+}
+
+fn heard_a_query(sock: &UdpSocket) -> bool {
+    let mut buf = [0u8; 512];
+    sock.recv_from(&mut buf).is_ok()
+}
+
+struct FixedTunnel(Option<crate::dns_egress::DnsEgress>);
+impl crate::dns_egress::DnsEgressPolicy for FixedTunnel {
+    fn decide(&self, _attempt: u32) -> Option<crate::dns_egress::DnsEgress> {
+        self.0
+    }
+}
+
+/// With "DNS through the tunnel" on, the reverse lookup of a dropped address
+/// and its forward check never go to the provider's resolver: through the
+/// tunnel when it is up, not at all while it is down.
+#[test]
+fn reverse_lookups_follow_dns_through_the_tunnel() {
+    let (provider, provider_addr) = listening_dns();
+    let (public, public_addr) = listening_dns();
+    let upstream: Arc<dyn Fn() -> Option<std::net::SocketAddr> + Send + Sync> =
+        Arc::new(move || Some(provider_addr));
+    let setting_on = Arc::new(std::sync::atomic::AtomicBool::new(true));
+
+    let down = FcrdnsUpstreamResolver::new(Arc::clone(&upstream), Duration::from_millis(50))
+        .with_tunnel_policy(Arc::new(FixedTunnel(None)), Arc::clone(&setting_on));
+    assert!(down.resolve_ptr(ip(203, 0, 113, 9)).is_empty());
+    assert!(down.resolve_a("named.example").is_empty());
+    std::thread::sleep(Duration::from_millis(50));
+    assert!(
+        !heard_a_query(&provider),
+        "tunnel down: the provider hears nothing"
+    );
+
+    let up = FcrdnsUpstreamResolver::new(Arc::clone(&upstream), Duration::from_millis(50))
+        .with_tunnel_policy(
+            Arc::new(FixedTunnel(Some(crate::dns_egress::DnsEgress {
+                server: public_addr,
+                bind: Some(std::net::IpAddr::V4(Ipv4Addr::LOCALHOST)),
+                via_secondary: true,
+            }))),
+            Arc::clone(&setting_on),
+        );
+    let _ = up.resolve_ptr(ip(203, 0, 113, 9));
+    std::thread::sleep(Duration::from_millis(50));
+    assert!(
+        !heard_a_query(&provider),
+        "tunnel up: the provider hears nothing"
+    );
+    assert!(heard_a_query(&public), "the lookup went through the tunnel");
+
+    setting_on.store(false, std::sync::atomic::Ordering::Relaxed);
+    let _ = down.resolve_ptr(ip(203, 0, 113, 9));
+    std::thread::sleep(Duration::from_millis(50));
+    assert!(
+        heard_a_query(&provider),
+        "setting off: the provider is asked as before"
+    );
 }

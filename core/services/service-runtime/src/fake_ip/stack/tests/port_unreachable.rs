@@ -347,6 +347,26 @@ fn a_hard_read_error_marks_the_udp_flow_dead() {
     );
 }
 
+/// The server's port-unreachable lands on the upstream reader. A QUIC client
+/// that hears nothing waits out its own timer before falling back to TCP, so
+/// it must be told when the flow dies — not only if its next datagram happens
+/// to arrive before the dead flow is cleared away.
+#[test]
+fn a_udp_upstream_refused_by_the_server_reaches_the_client_without_another_datagram() {
+    let health = Arc::new(health::FakeIpHealth::new());
+    let emitted = client_bound_after_udp_datagrams(
+        Arc::new(DeadReadDialer) as Arc<dyn RelayDialer>,
+        &health,
+        1,
+        &|_| true,
+    );
+    assert!(
+        emitted.iter().any(|p| is_port_unreachable(p)),
+        "the client must learn the port is unreachable as soon as its flow dies"
+    );
+    assert_eq!(health.udp_unreachable_sent(), 1);
+}
+
 #[test]
 fn a_client_whose_reader_died_is_retired_instead_of_kept_forever() {
     // `send` on this upstream never fails, so a dead-reader flow must be

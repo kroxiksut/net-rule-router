@@ -104,7 +104,9 @@ self-documenting.
 ```
 
 Exactly three hyphens, one space, then the section name. Trailing whitespace
-is ignored. The name is case-sensitive.
+is ignored. Write the name as the section table above spells it; when reading,
+case does not matter (`--- domains` is the `Domains` section), and the app
+always writes the spelling from the table.
 
 #### Active rule
 
@@ -683,6 +685,8 @@ always wins over what an application taught the router.
 
 The header line `# NetRuleRouter rules file — version N` (and the preset header
 `# NetRuleRouter preset — version N`, §3.2) carries the file format version.
+Like the section names, this line is a fixed key: it stays in English whatever
+language the file is written in, and a translated one is not recognised.
 
 | Version | Adds |
 |---|---|
@@ -775,7 +779,10 @@ Key properties:
   in `rules_primary.txt` or `rules_secondary.txt`.
 - `!` works in every section: `Zones`, `Domains`, `IP`, `CIDR`, `Ranges` and the
   application sections (`Windows` / `Linux` / `MacOS`). A denied application
-  cannot connect anywhere.
+  cannot connect anywhere. On Linux an application rule is not airtight yet:
+  a denied program is stopped on the addresses it has been seen using, and a
+  connection it makes before it is recognised can still get through (see
+  [Known limitations](known-limitations.md)).
 - Turn a deny off like any rule — `# !telemetry.vendor.example` keeps it in the
   file, inactive.
 - A matched deny stops the connection at its tier (§1.5); no lower tier or the
@@ -960,22 +967,32 @@ Key properties:
 
 ### 2.1 Overview
 
-The settings export is a YAML file that captures the user's full configuration
-for backup or for transferring it to another installation. It is written when
-the user chooses "Export settings" and read when they choose "Import settings".
+The settings export is a YAML file that keeps your routing setup in one
+place: which connections you use for the two routes, your rules for both of
+them, and how routing behaves. It is written when you choose
+"Export full settings (YAML)" in Settings → Presets and settings, or
+"Export full settings" in the settings of the terminal interface.
 
-This section documents the data boundary and structure.
+There is no "Import settings" yet: neither the window nor the terminal
+interface reads the file back. Today one place reads it — an unattended
+installation, which takes your rules, the default route and the leak
+protection from it (see [Unattended installation](unattended-install.md)).
 
 ### 2.2 What is included
 
 - Adapter bindings: system ID, user label, confirmation status.
-- Rule file paths (not the rule file contents — only the paths).
-- Behavior settings: route mode, file-change behavior, child-process option.
+- Your rules for both routes, as they are in force for you, in the same text
+  as a rules file (section 1): disabled rules, comments on rules, `?`, `!`
+  and program and folder rules included.
+- The rules for other operating systems from your rules files, kept as they
+  are written (section 1.2, Platform filtering), so a restore from the export
+  does not lose them.
+- The paths of the rules files your rules are saved to, when you have them.
+- Behavior settings: the default route and the leak protection.
 
 ### 2.3 What is NOT included
 
-- The actual content of the rule files — those are separate files at the
-  stored paths.
+- Free comment lines of your rules files: they stay in the files.
 - UI preferences (theme, language, accessibility, route display labels,
   display toggles) — device-specific, carried over per device on migration.
 - Internal revision metadata (revision IDs, content hashes, audit events).
@@ -985,7 +1002,7 @@ This section documents the data boundary and structure.
 
 ```yaml
 nrr_settings_export:
-  version: 1
+  version: 2
   exported_at: "2026-04-18T12:00:00Z"
 
   adapters:
@@ -999,14 +1016,40 @@ nrr_settings_export:
       user_confirmed: true
 
   rules_files:
-    primary: "C:\\Users\\user\\AppData\\Local\\NetRuleRouter\\rules_primary.txt"
-    secondary: "C:\\Users\\user\\AppData\\Local\\NetRuleRouter\\rules_secondary.txt"
+    primary: "C:/Users/me/Documents/Rules/rules_primary.txt"
+    secondary: "C:/Users/me/Documents/Rules/rules_secondary.txt"
+
+  rules:
+    primary: |
+      --- Domains
+      updates.example.org  # vendor updates
+      ?accounts.example.com
+
+      --- Windows
+      browser.exe
+
+      --- Linux
+      browser
+    secondary: |
+      --- Domains
+      *.streaming.example.com
+      !telemetry.example.net
 
   behavior:
     route_mode: "prefer-primary"
-    file_change_behavior: "notify"
-    include_child_processes: false
+    leak_protection: "off"
 ```
+
+`rules.primary` and `rules.secondary` hold the text of each route's rules
+file, indented under the key (a YAML literal block, `|`). A route with no
+rules is written as `""`. The paths in `rules_files` are written empty when
+no rules file is bound to the route.
+
+`route_mode` is the default route: `prefer-primary` (the main connection) or
+`prefer-secondary-when-available` (the additional one). `leak_protection` is
+`off`, `sites` (Routed sites) or `everything`. A route with no connection
+bound is written with an empty `system_id` and `user_label` and
+`user_confirmed: false`.
 
 UI preferences (theme, language, accessibility, route display labels) are
 device-specific and intentionally **not** included in the export — they are
@@ -1016,22 +1059,16 @@ carry-over state per device, not part of the portable configuration.
 
 The `system_id` field uses the composite format
 `"mac=AA:BB:CC:DD:EE:FF;ifindex=N"`. This key is stable on the same device.
-On import to a different device, the GUI presents an adapter-selection dialog
-if the stored ID is not found.
+Another computer has connections of its own, so an unattended installation
+does not carry the bindings over.
 
-### 2.6 Rule file path handling on import
-
-If a rule file path in the export does not exist at import time, the GUI
-presents a dialog with three choices:
-
-1. **Browse for file** — locate the file at a new path.
-2. **Skip** — start with empty rules for that route.
-3. **Cancel** — abort the import entirely.
-
-### 2.7 Schema evolution
+### 2.6 Schema evolution
 
 Future versions may extend the YAML structure with additional fields; the
-`version` field allows readers to detect and handle schema differences.
+`version` field allows readers to detect and handle schema differences, and a
+reader tolerates a key it does not know as well as a missing one. Version 2
+added the `rules` section; a version 1 file, written before it, is still
+read.
 
 ---
 

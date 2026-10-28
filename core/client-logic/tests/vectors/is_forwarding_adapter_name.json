@@ -1,0 +1,16 @@
+{
+  "cases": [
+    { "name": "WSL adapter", "input": { "name": "vEthernet (WSL)" }, "expected": true },
+    { "name": "WSL adapter on newer builds", "input": { "name": "vEthernet (WSL (Hyper-V firewall))" }, "expected": true },
+    { "name": "WSL prefix in any letter case", "input": { "name": "VETHERNET (wsl)" }, "expected": true },
+    { "name": "another Hyper-V switch is not WSL", "input": { "name": "vEthernet (Default Switch)" }, "expected": false },
+    { "name": "docker bridge", "input": { "name": "docker0" }, "expected": true },
+    { "name": "compose bridge", "input": { "name": "br-1a2b3c" }, "expected": true },
+    { "name": "libvirt bridge", "input": { "name": "virbr0" }, "expected": true },
+    { "name": "podman bridge", "input": { "name": "cni-podman0" }, "expected": true },
+    { "name": "bridge prefixes are case-sensitive, as Linux names are", "input": { "name": "Docker0" }, "expected": false },
+    { "name": "a bridge name only as a prefix", "input": { "name": "eth-docker" }, "expected": false },
+    { "name": "plain Wi-Fi", "input": { "name": "Wi-Fi" }, "expected": false },
+    { "name": "empty", "input": { "name": "" }, "expected": false }
+  ]
+}

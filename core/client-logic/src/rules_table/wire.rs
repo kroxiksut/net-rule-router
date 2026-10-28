@@ -101,9 +101,9 @@ pub fn rule_row_to_wire_dto(
         }),
         RuleType::IpRange => Some(ip_range(&value)),
         RuleType::Application => {
-            // `+children` stays in the file, not in the name the service
-            // matches; `+override` travels as the request it is.
-            let override_requested = split_rule_flags(&value).1.override_requested;
+            // The flags come off the name the service matches and travel as
+            // the requests they are, so a file rewritten from the book keeps them.
+            let flags = split_rule_flags(&value).1;
             let value = without_rule_flags(&value).into_owned();
             // A separator makes it a path, which the service reads in its
             // platform's spelling; otherwise a `*` makes it a pattern, exactly
@@ -117,8 +117,8 @@ pub fn rule_row_to_wire_dto(
             };
             app_match = Some(AppMatchDto {
                 pattern,
-                include_child_processes: false,
-                override_requested,
+                include_child_processes: flags.children,
+                override_requested: flags.override_requested,
             });
             None
         }

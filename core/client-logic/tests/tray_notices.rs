@@ -179,3 +179,38 @@ fn a_rewritten_presence_file_cannot_break_the_tray() {
         );
     }
 }
+
+fn appearance_of(pure: &mut JsLib, json: &str) -> Value {
+    let text = serde_json::to_string(json).expect("json");
+    pure.eval_json(&format!("trayAppearanceOf(JSON.parse({text}))"))
+}
+
+/// The text size and font the tray takes from the same rewritable file: no
+/// value makes the tray's windows unreadably small or huge, and no string
+/// becomes a font name.
+#[test]
+fn a_rewritten_appearance_keeps_the_tray_readable() {
+    let mut pure = JsLib::pure();
+    for not_an_object in ["null", "[1]", "\"x\"", "7"] {
+        assert_eq!(appearance_of(&mut pure, not_an_object), Value::Null);
+    }
+    assert_eq!(
+        appearance_of(
+            &mut pure,
+            r#"{"fontScalePercent":200,"systemFont":"verdana"}"#
+        ),
+        json!({ "fontScalePercent": 200, "systemFont": "verdana" })
+    );
+    for (scale, kept) in [
+        ("1", 80),
+        ("-50", 100),
+        ("1e21", 300),
+        ("\"abc\"", 100),
+        ("null", 100),
+    ] {
+        let got = appearance_of(&mut pure, &format!(r#"{{"fontScalePercent":{scale}}}"#));
+        assert_eq!(got["fontScalePercent"], kept, "scale {scale}");
+    }
+    let odd = appearance_of(&mut pure, r#"{"systemFont":"Comic Sans; rm -rf"}"#);
+    assert_eq!(odd["systemFont"], "system-default");
+}

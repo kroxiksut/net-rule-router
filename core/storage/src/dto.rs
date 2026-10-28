@@ -309,6 +309,23 @@ pub struct AddressNames {
     pub total: u32,
 }
 
+/// The cache as a plan about a few addresses needs it, as
+/// [`CacheRepository::snapshot_for_addresses`] returns it.
+///
+/// [`CacheRepository::snapshot_for_addresses`]: crate::repository::CacheRepository::snapshot_for_addresses
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct AddressSnapshot {
+    /// `(canonical_host, ip, resolved_at)` on the addresses, in the order of
+    /// `snapshot_resolutions`.
+    pub resolutions: Vec<(String, IpAddr, SystemTime)>,
+    /// The hosts of `resolutions`, in the order of `snapshot_hostnames`.
+    pub hostnames: Vec<(String, i64)>,
+    /// The census on the addresses, as `shared_ip_direct_host_counts`.
+    pub direct_host_counts: Vec<(std::net::Ipv4Addr, u32)>,
+    /// The census addresses with a main-route tenant.
+    pub primary_ruled: Vec<std::net::Ipv4Addr>,
+}
+
 // ── Cache entries viewer ──────────────────────────────────────────────────────
 
 /// One flat `(hostname, ip)` resolution row for the read-only cache-entries

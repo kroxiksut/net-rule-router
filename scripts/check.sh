@@ -379,6 +379,9 @@ cyan "[check] panic strategy: panics unwind"
 check_panic_strategy
 cyan "[check] maintainer scripts: an upgrade brings a failed unit back"
 sh "$script_dir/tests/maintainer/run.sh"
+# Otherwise a broken guard is found only by the tag it refuses.
+cyan "[check] release guard: a wrong tag, agreement date or red CI is refused"
+bash "$script_dir/tests/release-guard/run.sh" >/dev/null
 
 if [ "$comment_hygiene_only" -eq 1 ]; then
   green "[check] comment hygiene only: passed"

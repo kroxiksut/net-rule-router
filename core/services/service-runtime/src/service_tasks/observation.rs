@@ -391,7 +391,7 @@ pub fn build_dns_observe_task(
                         matched = summary.matched,
                         refreshed = summary.refreshed,
                         ignored = summary.ignored,
-                        collateral = summary.collateral,
+                        shared_sites = summary.collateral,
                         "DNS observation tick cached new suffix/zone hosts",
                     );
                     if let Some(hook) = on_progress.as_ref() {

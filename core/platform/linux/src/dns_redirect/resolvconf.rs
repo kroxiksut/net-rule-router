@@ -201,6 +201,24 @@ impl ResolvconfDnsServers {
     }
 }
 
+impl ResolvconfDnsServers {
+    fn per_link_v6(&self) -> Vec<nrr_platform_api::dns::UpstreamDnsServer> {
+        let mut out = Vec::new();
+        for (record, text) in records(&self.files) {
+            let index = super::link_index(interface_of(&record));
+            out.extend(
+                super::resolv_conf::nameservers_v6(&text)
+                    .into_iter()
+                    .map(|server| nrr_platform_api::dns::UpstreamDnsServer {
+                        interface_index: index,
+                        server: std::net::IpAddr::V6(server),
+                    }),
+            );
+        }
+        out
+    }
+}
+
 impl SystemDnsServersPort for ResolvconfDnsServers {
     fn upstream_candidates_v4(&self) -> Vec<UpstreamDnsCandidate> {
         once_per_server(self.per_link_pairs(), |c| c.server)
@@ -208,6 +226,14 @@ impl SystemDnsServersPort for ResolvconfDnsServers {
 
     fn upstream_candidates_v4_per_link(&self) -> Vec<UpstreamDnsCandidate> {
         once_per_link(self.per_link_pairs())
+    }
+
+    fn upstream_candidates_v6(&self) -> Vec<nrr_platform_api::dns::UpstreamDnsServer> {
+        once_per_server(self.per_link_v6(), |s| s.server)
+    }
+
+    fn upstream_candidates_v6_per_link(&self) -> Vec<nrr_platform_api::dns::UpstreamDnsServer> {
+        once_per_link(self.per_link_v6())
     }
 }
 

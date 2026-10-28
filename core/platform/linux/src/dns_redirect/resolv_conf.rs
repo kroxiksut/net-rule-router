@@ -63,7 +63,7 @@ pub(crate) fn nameservers_v6(text: &str) -> Vec<std::net::Ipv6Addr> {
         let Ok(server) = rest.trim().parse::<std::net::Ipv6Addr>() else {
             continue;
         };
-        if server.is_loopback() || server.is_unspecified() || server.is_unicast_link_local() {
+        if !super::forwardable_v6(server) {
             continue;
         }
         if !servers.contains(&server) {

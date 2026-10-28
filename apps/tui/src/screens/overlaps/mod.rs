@@ -33,6 +33,8 @@ enum Note {
     NoItem(usize),
     CannotSend(usize),
     Gone(usize),
+    /// Line mode: the pair printed under that number has left the list.
+    NumberGone(usize),
     /// The rules list is being applied and cannot change meanwhile.
     Locked,
 }
@@ -51,6 +53,8 @@ pub struct Overlaps {
     /// Index into the shown pairs.
     selected: usize,
     note: Option<Note>,
+    /// Line mode: the shown pairs as last printed, by key.
+    printed: Vec<String>,
 }
 
 impl Overlaps {
@@ -219,16 +223,28 @@ impl Screen for OverlapsScreen {
                 let Ok(number) = number.parse::<usize>() else {
                     return false;
                 };
-                let count = app.overlaps.shown().len();
-                if number == 0 || number > count {
-                    app.overlaps.note = Some(Note::NoItem(number));
-                    return true;
+                let now: Vec<String> = app.overlaps.shown().iter().map(|p| p.key.clone()).collect();
+                match super::numbered_now(&app.overlaps.printed, &now, number) {
+                    super::Numbered::At(at) => {
+                        app.overlaps.selected = at;
+                        command(app, letter, at)
+                    }
+                    super::Numbered::Gone => {
+                        app.overlaps.note = Some(Note::NumberGone(number));
+                        true
+                    }
+                    super::Numbered::NoSuch => {
+                        app.overlaps.note = Some(Note::NoItem(number));
+                        true
+                    }
                 }
-                app.overlaps.selected = number - 1;
-                command(app, letter, number - 1)
             }
             _ => false,
         }
+    }
+
+    fn on_printed(&self, app: &mut AppState) {
+        app.overlaps.printed = app.overlaps.shown().iter().map(|p| p.key.clone()).collect();
     }
 }
 
@@ -368,6 +384,7 @@ fn head_lines(app: &AppState, texts: &Texts) -> Vec<ViewLine> {
             Note::NoItem(n) => item(keys::NO_ITEM, *n),
             Note::CannotSend(n) => item(keys::CANNOT_SEND, *n),
             Note::Gone(n) => item(keys::GONE, *n),
+            Note::NumberGone(n) => item(crate::keys::PLAIN_NUMBER_GONE, *n),
             Note::Locked => texts.get(keys::LOCKED),
         };
         lines.push(ViewLine::new(vec![Segment::strong(text)]));

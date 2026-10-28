@@ -23,7 +23,9 @@ use std::time::{Duration, Instant};
 
 use nrr_broker::protocol::client_answer_timeout;
 use nrr_broker::BrokerHandle;
-use nrr_ipc_client::{ipc_operation_bound, ipc_operation_timeout, ipc_request_timeout, IpcClient};
+use nrr_ipc_client::{
+    ipc_operation_bound, ipc_operation_timeout, ipc_request_timeout, FrameTraceBudget, IpcClient,
+};
 use nrr_shared::client_error_codes::{
     AUTOSTART_LOCAL_ERROR, BROKER_UNAVAILABLE, CONSOLE_PATH_ERROR, ELEVATED_OPERATION_RUNNING,
     SIDECAR_ERROR, UNKNOWN_OPERATION,
@@ -615,20 +617,19 @@ pub fn dispatch_request(
 /// lines. Lives for the duration of the subscription (until the
 /// receiver disconnects or the host stdin closes).
 ///
-/// This is the one hop between "the IPC client has the event" and "the QML
-/// surface has the event", and it used to be silent on every path — including
-/// the one where it gave up. A tray that stopped reacting was therefore
-/// indistinguishable from a service that stopped pushing, which is exactly the
-/// ambiguity that cost two test runs, so every frame and every exit reason is
-/// reported.
+/// The one hop between "the IPC client has the event" and "the QML surface has
+/// the event": every exit reason is reported, so a tray that stopped reacting
+/// can be told from a service that stopped pushing. Frames are reported within
+/// a [`FrameTraceBudget`], so a storm does not become one log line per frame.
 fn run_push_forwarder(
     rx: std::sync::mpsc::Receiver<serde_json::Value>,
     initial_subscription_id: String,
     client: Arc<dyn IpcClient>,
     stdin: SharedStdin,
 ) {
-    let mut forwarded: u64 = 0;
+    let log = FrameTraceBudget::default();
     loop {
+        let forwarded = log.seen();
         let payload = match rx.recv() {
             Ok(payload) => payload,
             Err(_) => {
@@ -694,11 +695,12 @@ fn run_push_forwarder(
             return;
         }
         let _ = guard.flush();
-        forwarded += 1;
-        eprintln!(
-            "nrr-launcher: push {event_type} (id={event_id}) forwarded to host \
-             (sub={subscription_id})"
-        );
+        if let Some(frame) = log.note() {
+            eprintln!(
+                "nrr-launcher: push {event_type} (id={event_id}) forwarded to host \
+                 (sub={subscription_id}, frame {frame})"
+            );
+        }
     }
 }
 
@@ -1544,5 +1546,148 @@ mod tests {
                 "RpcTransport.qml must read {field}"
             );
         }
+    }
+
+    /// The C++ bridge sources, CRLF folded, keyed by file name.
+    fn native_bridge_sources() -> Vec<(String, String)> {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../qt-host/native/src");
+        let mut sources: Vec<(String, String)> = std::fs::read_dir(&dir)
+            .expect("read the native bridge dir")
+            .filter_map(|entry| entry.ok().map(|e| e.path()))
+            .filter(|path| path.extension().is_some_and(|ext| ext == "cpp"))
+            .map(|path| {
+                let text = std::fs::read_to_string(&path).expect("read a bridge source");
+                let name = path.file_name().map(|n| n.to_string_lossy().into_owned());
+                (name.unwrap_or_default(), text.replace("\r\n", "\n"))
+            })
+            .collect();
+        sources.sort();
+        sources
+    }
+
+    /// Every literal operation the bridge emits, with the file it lives in.
+    fn bridge_operation_literals(sources: &[(String, String)]) -> Vec<(String, String)> {
+        const EMIT: &str = "emitRpcRequest(QStringLiteral(\"";
+        let mut ops = Vec::new();
+        for (file, text) in sources {
+            for (at, _) in text.match_indices(EMIT) {
+                let rest = &text[at + EMIT.len()..];
+                let end = rest.find('"').expect("a closed operation literal");
+                ops.push((file.clone(), rest[..end].to_string()));
+            }
+        }
+        ops
+    }
+
+    /// The "Safe rollback" menu shipped sending `rollback.request`, which no
+    /// service operation answers, so every press ended in `unknown-operation`.
+    /// Follow the button's own bridge call down to the operation and payload
+    /// the service decodes.
+    #[test]
+    fn the_safe_rollback_button_reaches_the_rollback_operation() {
+        use nrr_shared::ipc_payloads::RollbackRequest;
+        let qml = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../qml");
+        let controller = std::fs::read_to_string(qml.join("flows/BoundFilesController.qml"))
+            .expect("read the controller")
+            .replace("\r\n", "\n");
+        let bridge_call = |function: &str| -> String {
+            let body = controller
+                .split(&format!("function {function}()"))
+                .nth(1)
+                .unwrap_or_else(|| panic!("BoundFilesController.qml lost {function}"));
+            let body = &body[..body.find("\n    function ").unwrap_or(body.len())];
+            let at = body
+                .rfind("nrrNativeBridge.rpc")
+                .unwrap_or_else(|| panic!("{function} does not call the bridge"));
+            let name = &body[at + "nrrNativeBridge.".len()..];
+            name[..name.find('(').expect("a call")].to_string()
+        };
+        let method = bridge_call("openSafeRollback");
+        assert_eq!(
+            method,
+            bridge_call("_performSafeRollback"),
+            "the dry run and the rollback go through one bridge method"
+        );
+
+        let sources = native_bridge_sources();
+        let header = format!("QString NrrNativeBridge::{method}(");
+        let body = sources
+            .iter()
+            .find_map(|(_, text)| text.split(&header).nth(1))
+            .unwrap_or_else(|| panic!("no C++ definition of {method}"));
+        let body = &body[..body.find("\n}\n").expect("the method ends")];
+        let op = bridge_operation_literals(&[(String::new(), body.to_string())])
+            .pop()
+            .map(|(_, op)| op)
+            .unwrap_or_else(|| panic!("{method} emits no literal operation"));
+        let mut payload = serde_json::Map::new();
+        for (at, _) in body.match_indices("obj.insert(QStringLiteral(\"") {
+            let rest = &body[at + "obj.insert(QStringLiteral(\"".len()..];
+            let key = &rest[..rest.find('"').expect("a closed key literal")];
+            let value = match key {
+                "dry-run" => serde_json::Value::Bool(true),
+                _ => serde_json::Value::from("rev-7"),
+            };
+            payload.insert(key.to_string(), value);
+        }
+
+        let client = ScriptedClient::new(ScriptedOutcome::Ok(serde_json::json!({})));
+        let req = LauncherRpcRequest {
+            correlation_id: "c-rollback".into(),
+            operation: op.clone(),
+            payload: serde_json::Value::Object(payload),
+        };
+        let resp = handle_request(&req, &client);
+        assert!(
+            resp.ok,
+            "`{op}` never reached the service: {:?}",
+            resp.error
+        );
+        let (sent_op, mut sent) = client.last_call.lock().unwrap().clone().unwrap();
+        assert_eq!(sent_op, IpcOperationName::RollbackRequest, "`{op}`");
+
+        // The token travels in the envelope; everything else is a field the
+        // service reads, not one it silently defaults.
+        if let Some(map) = sent.as_object_mut() {
+            map.remove("_envelope_confirmation_token");
+        }
+        let known = serde_json::to_value(RollbackRequest {
+            target_revision_id: Some(String::new()),
+            dry_run: true,
+            admin_baseline: true,
+        })
+        .expect("serialize");
+        for key in sent.as_object().expect("an object payload").keys() {
+            assert!(
+                known.get(key).is_some(),
+                "the service does not read `{key}`"
+            );
+        }
+        let decoded: RollbackRequest = serde_json::from_value(sent).expect("decodes");
+        assert!(decoded.dry_run, "the dry run arrives as one");
+        assert_eq!(decoded.target_revision_id.as_deref(), Some("rev-7"));
+    }
+
+    /// Any bridge operation bound for the service must be one the dispatcher
+    /// forwards; a misspelled slug answers `unknown-operation` on every press.
+    #[test]
+    fn every_service_operation_the_bridge_sends_is_one_the_launcher_forwards() {
+        let ops = bridge_operation_literals(&native_bridge_sources());
+        assert!(ops.len() > 50, "the bridge scan found only {}", ops.len());
+        let unknown: Vec<String> = ops
+            .into_iter()
+            .filter(|(_, op)| {
+                !op.starts_with(LOCAL_OPERATION_PREFIX)
+                    && !op.starts_with(SIDECAR_OPERATION_PREFIX)
+                    && op != LOCAL_PRESET_PARSE_OP
+                    && !crate::autostart_local::is_local_autostart_op(op)
+                    && IpcOperationName::from_slug(op).is_none()
+            })
+            .map(|(file, op)| format!("{file}: {op}"))
+            .collect();
+        assert!(
+            unknown.is_empty(),
+            "no service operation answers: {unknown:?}"
+        );
     }
 }

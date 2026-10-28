@@ -203,9 +203,14 @@ impl Grant {
     fn from_row(row: &OverrideGrantRow, key: &[u8]) -> Result<Self, &'static str> {
         match verify_grant(&row.signed_fields(), &row.row_hmac, key) {
             HmacVerification::Verified => {}
-            HmacVerification::Unsigned => return Err("unsigned"),
-            HmacVerification::Tampered => return Err("tampered"),
+            HmacVerification::Unsigned => return Err(UNSIGNED),
+            HmacVerification::Tampered => return Err(TAMPERED),
         }
+        Self::parsed(row)
+    }
+
+    /// The row read as a grant, its signature not looked at.
+    fn parsed(row: &OverrideGrantRow) -> Result<Self, &'static str> {
         let effect = effect_of_stored(&row.effect).ok_or("malformed")?;
         let reason = ProtectionReason::from_slug(&row.reason)
             .filter(|reason| reason.overridable())
@@ -302,10 +307,18 @@ impl Ending {
     }
 }
 
+/// Why a stored row is not a grant: its signature. Every other reason is a
+/// malformed row.
+const UNSIGNED: &str = "unsigned";
+const TAMPERED: &str = "tampered";
+
 /// The service's confirmations: in memory, mirrored to the signed rows.
 pub struct OverrideGrants {
     conn: Arc<Mutex<Connection>>,
     key: Option<Vec<u8>>,
+    /// The key was lost and the reset is not acknowledged yet: rows signed by
+    /// the old key are kept, not honoured, until [`Self::adopt_after_key_reset`].
+    key_reset_pending: std::sync::atomic::AtomicBool,
     audit: Option<Arc<AuditTrail>>,
     events: OnceLock<Arc<EventBus>>,
     grants: Mutex<HashMap<GrantKey, Grant>>,
@@ -341,10 +354,34 @@ impl OverrideGrants {
         audit: Option<Arc<AuditTrail>>,
         now_ms: i64,
     ) -> Arc<Self> {
+        Self::open_with(conn, key, audit, now_ms, false)
+    }
+
+    /// [`Self::open`] on a start whose key replaced a lost one, before the
+    /// user acknowledged it: a row the new key cannot verify is the old key's,
+    /// so it is kept and not honoured rather than dropped.
+    #[must_use]
+    pub fn open_under_key_reset(
+        conn: Arc<Mutex<Connection>>,
+        key: Option<Vec<u8>>,
+        audit: Option<Arc<AuditTrail>>,
+        now_ms: i64,
+    ) -> Arc<Self> {
+        Self::open_with(conn, key, audit, now_ms, true)
+    }
+
+    fn open_with(
+        conn: Arc<Mutex<Connection>>,
+        key: Option<Vec<u8>>,
+        audit: Option<Arc<AuditTrail>>,
+        now_ms: i64,
+        key_reset_pending: bool,
+    ) -> Arc<Self> {
         let key = key.filter(|k| nrr_storage::revision_hmac::is_usable_signing_key(k));
         let this = Arc::new_cyclic(|weak| Self {
             conn,
             key,
+            key_reset_pending: std::sync::atomic::AtomicBool::new(key_reset_pending),
             audit,
             events: OnceLock::new(),
             grants: Mutex::new(HashMap::new()),
@@ -367,6 +404,56 @@ impl OverrideGrants {
     #[must_use]
     pub fn available(&self) -> bool {
         self.key.is_some()
+    }
+
+    fn reset_pending(&self) -> bool {
+        self.key_reset_pending.load(Ordering::Acquire)
+    }
+
+    /// The user acknowledged the key reset and the revisions it listed were
+    /// re-signed: the confirmations the old key signed are re-signed with the
+    /// new one and honoured again. Returns how many came back.
+    pub fn adopt_after_key_reset(&self, now_ms: i64) -> usize {
+        if !self.key_reset_pending.swap(false, Ordering::AcqRel) {
+            return 0;
+        }
+        let Some(key) = self.key.as_deref() else {
+            return 0;
+        };
+        let rows = OverrideGrantsRepository::new(&lock(&self.conn))
+            .list()
+            .unwrap_or_default();
+        let mut adopted = Vec::new();
+        for row in rows {
+            if !matches!(Grant::from_row(&row, key), Err(UNSIGNED | TAMPERED)) {
+                continue;
+            }
+            let Ok(grant) = Grant::parsed(&row) else {
+                continue;
+            };
+            let stored =
+                OverrideGrantsRepository::new(&lock(&self.conn)).upsert(&grant.signed_row(key));
+            if let Err(e) = stored {
+                tracing::warn!(
+                    target: "nrr::override",
+                    sid = %grant.sid,
+                    error = %e,
+                    "a confirmation could not be re-signed after the key reset",
+                );
+                continue;
+            }
+            if grant.live_at(now_ms) {
+                lock(&self.grants).insert(grant.key(), grant.clone());
+                adopted.push(grant);
+            }
+        }
+        for grant in &adopted {
+            self.arm(grant, now_ms);
+        }
+        if !adopted.is_empty() {
+            bump();
+        }
+        adopted.len()
     }
 
     fn load(&self, now_ms: i64) {
@@ -412,6 +499,14 @@ impl OverrideGrants {
                 Ok(grant) => {
                     self.delete_row(&grant);
                     self.audit_end(&grant, Ending::Expired, now_ms);
+                }
+                Err(why @ (UNSIGNED | TAMPERED)) if self.reset_pending() => {
+                    tracing::warn!(
+                        target: "nrr::override",
+                        sid = %row.sid,
+                        why,
+                        "a stored override waits for the key reset to be acknowledged; the protection holds its rule until then",
+                    );
                 }
                 Err(why) => {
                     // Taking an untrusted row away only tightens.

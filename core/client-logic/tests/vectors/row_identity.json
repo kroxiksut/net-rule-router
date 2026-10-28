@@ -2,6 +2,8 @@
   "description": "rules.js mergeKey / ruleSignature: import-merge identity and duplicate signature of a table row",
   "cases": [
     { "name": "domain", "input": { "row": { "ruleType": "domain", "matchValue": "Site.Example", "targetRoute": "secondary", "enabled": true } } },
+    { "name": "a final sigma keys as plain sigma, as the window's engine lowercases it", "input": { "row": { "ruleType": "domain", "matchValue": "ΟΔΟΣ", "targetRoute": "secondary", "enabled": true } }, "expected": { "mergeKey": "domain|οδοσ|secondary", "signature": "domain|secondary|οδοσ" } },
+    { "name": "a typed final sigma keys as plain sigma too", "input": { "row": { "ruleType": "domain", "matchValue": "οδος.example", "targetRoute": "secondary", "enabled": true } }, "expected": { "mergeKey": "domain|οδοσ.example|secondary", "signature": "domain|secondary|οδοσ.example" } },
     { "name": "suffix-domain folds into domain", "input": { "row": { "ruleType": "suffix-domain", "matchValue": "site.example", "targetRoute": "secondary", "enabled": true } } },
     { "name": "exact-ipv4 folds into exact-ip", "input": { "row": { "ruleType": "exact-ipv4", "matchValue": "192.0.2.7", "targetRoute": "primary", "enabled": true } } },
     { "name": "exact-ipv6 folds into exact-ip", "input": { "row": { "ruleType": "exact-ipv6", "matchValue": "2001:DB8::7", "targetRoute": "primary", "enabled": true } } },

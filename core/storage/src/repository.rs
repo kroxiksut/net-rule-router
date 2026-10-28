@@ -180,6 +180,15 @@ pub trait CacheRepository {
     /// same reason as the snapshot above.
     fn shared_ip_direct_host_counts(&self) -> StorageResult<Vec<(std::net::Ipv4Addr, u32)>>;
 
+    /// The four snapshot reads above cut down to `addresses`, by index
+    /// lookups: what a plan about a handful of new addresses needs, asked on
+    /// the DNS path, where reading every table on each answer cost tens of
+    /// milliseconds under the lock every writer waits on.
+    fn snapshot_for_addresses(
+        &self,
+        addresses: &[std::net::IpAddr],
+    ) -> StorageResult<crate::dto::AddressSnapshot>;
+
     /// List cached canonical hostnames whose name ends with
     /// `.{suffix}`. Used by the WFP filter codegen to fan-out
     /// `SuffixDomain` and `Zone` rules across the live

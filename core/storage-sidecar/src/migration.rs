@@ -69,6 +69,9 @@ pub fn migrate(conn: &mut Connection) -> SidecarResult<MigrationSummary> {
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
+mod released_databases;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use rusqlite::params;

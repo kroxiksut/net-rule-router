@@ -123,7 +123,7 @@ Item {
             }
             ownerRoot.statusLine = (code === "uac-declined")
                 ? ownerRoot.tr("progress.service-uac-declined",
-                    "Administrator prompt declined - operation cancelled.")
+                    "Administrator prompt declined — operation cancelled.")
                 : ownerRoot.tr("status.traffic-history-merge-failed",
                     "Could not save the answer: ") + String(msg || code || "")
         })
@@ -188,7 +188,7 @@ Item {
             }
             ownerRoot.statusLine = (code === "uac-declined")
                 ? ownerRoot.tr("progress.service-uac-declined",
-                    "Administrator prompt declined - operation cancelled.")
+                    "Administrator prompt declined — operation cancelled.")
                 : ownerRoot.tr("status.clear-failed", "Could not clear: ")
                     + String(msg || code || "")
         })

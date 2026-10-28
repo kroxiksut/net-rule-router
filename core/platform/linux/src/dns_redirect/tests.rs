@@ -532,6 +532,37 @@ fn only_a_resolve_source_on_the_hosts_line_counts() {
     assert!(!nsswitch_hosts_ask_resolved(""));
 }
 
+/// A network that hands out DNS only over IPv6: with no server read, the
+/// resolver had nothing to forward to and never armed there.
+#[test]
+fn a_links_ipv6_servers_are_upstreams_too() {
+    let fake = FakeResolved::default();
+    fake.add(
+        "wlp3s0",
+        3,
+        &[
+            "2001:db8::53",
+            "[2001:db8::54]:53#dns.example",
+            "fe80::1%wlp3s0",
+            "::1",
+        ],
+        &[],
+    );
+    let servers: Vec<(Option<u32>, std::net::IpAddr)> = ResolvedDnsServers(fake)
+        .upstream_candidates_per_link()
+        .into_iter()
+        .map(|c| (c.interface_index, c.server))
+        .collect();
+    assert_eq!(
+        servers,
+        vec![
+            (Some(3), "2001:db8::53".parse().expect("ip")),
+            (Some(3), "2001:db8::54".parse().expect("ip")),
+        ],
+        "link-local without its scope and loopback are unreachable or us"
+    );
+}
+
 #[test]
 fn link_lines_parse_with_their_index_and_values() {
     let links = parse_resolvectl_links(

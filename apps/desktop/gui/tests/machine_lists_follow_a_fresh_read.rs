@@ -172,3 +172,95 @@ fn retention_and_traffic_settings_lay_the_change_over_a_fresh_read() {
     let settings = qml("sections/settings/TrafficStatsSettings.qml");
     assert!(settings.contains("ctrl.applyPatch(patch)"));
 }
+
+/// The log and audit limits are replaced all four at once: a page whose read
+/// failed held the defaults, and saving one edited limit put the defaults back
+/// over the other three.
+#[test]
+fn log_retention_lays_the_change_over_a_fresh_read() {
+    let text = qml("sections/settings/DiagnosticsLogsSettings.qml");
+    let apply = between(
+        &text,
+        "function _applyLogRetention()",
+        "function _fetchLogRetentionConfig(",
+    );
+    assert!(
+        before(
+            apply,
+            "rpcLogRetentionConfigGet()",
+            "rpcLogRetentionConfigSet("
+        ),
+        "the limits are written without a read just before:\n{apply}"
+    );
+    assert!(
+        apply.contains("shown[key] !== baseline[key] ? shown[key] : fresh[key]"),
+        "an unedited limit must come from the fresh read:\n{apply}"
+    );
+}
+
+/// Every `*.set` the window calls, by how it is kept from writing back what it
+/// never read. A new setter fails here until it is placed and, if it replaces
+/// a whole value, held by a test above.
+#[test]
+fn every_setter_is_held_to_what_it_read() {
+    // Replace a whole list or row: each has its fresh-read test in this file
+    // or in `stability_wire_contract.rs`.
+    const WHOLE: &[&str] = &[
+        "rpcDohResolversSet",
+        "rpcLocalDnsSuffixesSet",
+        "rpcRouteVpnGatewaysSet",
+        "rpcRouteLinkProviderSet",
+        "rpcRetentionSettingsSet",
+        "rpcTrafficStatsSet",
+        "rpcLogRetentionConfigSet",
+        "rpcServiceStabilityConfigSet",
+    ];
+    // Carry one item or the fields named: nothing unread is restated.
+    const PARTIAL: &[&str] = &[
+        "rpcBlockNoticeMutesSet",
+        "rpcConnHistorySettingsSet",
+        "rpcLocalNetworksSet",
+        "rpcRefusingAnchorSet",
+        "rpcTrafficHistoryMergeSet",
+        "rpcApplyFailurePolicySet",
+    ];
+    let mut called = std::collections::BTreeSet::new();
+    let mut stack = vec![Path::new(env!("CARGO_MANIFEST_DIR")).join("../qml")];
+    while let Some(dir) = stack.pop() {
+        for entry in std::fs::read_dir(&dir).unwrap_or_else(|e| panic!("{}: {e}", dir.display())) {
+            let path = entry.unwrap_or_else(|e| panic!("{e}")).path();
+            if path.is_dir() {
+                stack.push(path);
+                continue;
+            }
+            if !path.extension().is_some_and(|e| e == "qml" || e == "js") {
+                continue;
+            }
+            let text = std::fs::read_to_string(&path).unwrap_or_default();
+            for (at, _) in text.match_indices("rpc") {
+                let name: String = text[at..]
+                    .chars()
+                    .take_while(|c| c.is_ascii_alphanumeric())
+                    .collect();
+                let set_call = name.len() > "rpcSet".len()
+                    && name.ends_with("Set")
+                    && text[at + name.len()..].starts_with('(');
+                if set_call && name[3..].starts_with(|c: char| c.is_ascii_uppercase()) {
+                    called.insert(name);
+                }
+            }
+        }
+    }
+    assert!(
+        called.contains("rpcDohResolversSet"),
+        "the scan found none of the known setters: {called:?}"
+    );
+    let unplaced: Vec<&String> = called
+        .iter()
+        .filter(|n| !WHOLE.contains(&n.as_str()) && !PARTIAL.contains(&n.as_str()))
+        .collect();
+    assert!(
+        unplaced.is_empty(),
+        "setters nobody has placed: {unplaced:?}"
+    );
+}

@@ -20,7 +20,7 @@ impl ActivationCoordinator {
         revision_id: &RevisionId,
     ) -> Result<RevisionRecord, PolicyError> {
         let record = {
-            let conn = self.conn.lock().expect("connection mutex poisoned");
+            let conn = lock_state(&self.conn);
             let repo = self.revisions_repo(&conn);
             let record =
                 repo.get_by_id(revision_id.as_str())
@@ -46,7 +46,7 @@ impl ActivationCoordinator {
             return Ok(());
         }
         let verification = {
-            let conn = self.conn.lock().expect("connection mutex poisoned");
+            let conn = lock_state(&self.conn);
             self.revisions_repo(&conn)
                 .verify_row_hmac(&record.revision_id)
                 .map_err(|e| PolicyError::StorageFailure {
@@ -72,7 +72,7 @@ impl ActivationCoordinator {
     // `pub(super)` because the impl is split across files and the parent is
     // now the caller.
     pub(super) fn principal_of(&self, revision_id: &RevisionId) -> Result<String, PolicyError> {
-        let conn = self.conn.lock().expect("connection mutex poisoned");
+        let conn = lock_state(&self.conn);
         let repo = self.revisions_repo(&conn);
         repo.principal_of(revision_id.as_str())
             .map_err(|e| PolicyError::StorageFailure {
@@ -90,7 +90,7 @@ impl ActivationCoordinator {
         target: &RollbackTarget,
     ) -> Result<RevisionRecord, PolicyError> {
         let record = {
-            let conn = self.conn.lock().expect("connection mutex poisoned");
+            let conn = lock_state(&self.conn);
             let repo = self.revisions_repo(&conn);
             match target {
                 // The LKG is THIS principal's most recent
@@ -169,7 +169,7 @@ impl ActivationCoordinator {
             return Ok(Vec::new());
         }
         let mut principals = {
-            let conn = self.conn.lock().expect("connection mutex poisoned");
+            let conn = lock_state(&self.conn);
             self.revisions_repo(&conn)
                 .distinct_principals()
                 .map_err(|e| PolicyError::StorageFailure {
@@ -180,7 +180,7 @@ impl ActivationCoordinator {
         // A pointer can outlive every row of its principal when an editor ran
         // without foreign keys; it still has to be cleared.
         let with_pointer = {
-            let conn = self.conn.lock().expect("connection mutex poisoned");
+            let conn = lock_state(&self.conn);
             self.revisions_repo(&conn)
                 .verify_all_pointers()
                 .map_err(|e| PolicyError::StorageFailure {
@@ -228,7 +228,7 @@ impl ActivationCoordinator {
             }
         };
         let suspect = {
-            let conn = self.conn.lock().expect("connection mutex poisoned");
+            let conn = lock_state(&self.conn);
             let repo = self.revisions_repo(&conn);
             let passes = |principal: &str| -> Result<bool, nrr_storage::StorageError> {
                 let Some(record) = repo.get_active_for(principal)? else {
@@ -267,7 +267,7 @@ impl ActivationCoordinator {
             return Ok(ActiveIntegrityOutcome::SkippedNoKey);
         }
         let history = {
-            let conn = self.conn.lock().expect("connection mutex poisoned");
+            let conn = lock_state(&self.conn);
             self.revisions_repo(&conn)
                 .activation_history_for(principal)
                 .map_err(|e| PolicyError::StorageFailure {
@@ -345,7 +345,7 @@ impl ActivationCoordinator {
             }
             None => {
                 let now = self.clock.now_secs();
-                let conn = self.conn.lock().expect("connection mutex poisoned");
+                let conn = lock_state(&self.conn);
                 // Same pair, same reason as the activation commit: a rollback
                 // that marks the revision and does not clear the pointer leaves
                 // the pointer naming a revision that is no longer active.
@@ -409,7 +409,7 @@ impl ActivationCoordinator {
                 message: e.to_string(),
             }
         };
-        let conn = self.conn.lock().expect("connection mutex poisoned");
+        let conn = lock_state(&self.conn);
         let repo = self.revisions_repo(&conn);
         let pointer_was = repo
             .get_active_pointer_for(principal)

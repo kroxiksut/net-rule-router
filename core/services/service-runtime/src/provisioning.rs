@@ -37,11 +37,12 @@ pub const SECONDARY_FILE: &str = "rules_secondary.txt";
 pub const SETTINGS_FILE: &str = "settings.yaml";
 pub const OPTIONS_FILE: &str = "options.conf";
 
-/// A settings export is a few hundred bytes; this leaves room for comments.
-pub const SETTINGS_MAX_BYTES: usize = 64 * 1024;
-pub const OPTIONS_MAX_BYTES: usize = 4 * 1024;
 /// The import limit: a provisioned file is an import.
 pub const RULES_MAX_BYTES: usize = nrr_domain::import::IMPORT_FILE_SIZE_LIMIT_BYTES as usize;
+/// Room for the settings themselves plus two rules files, each allowed twice
+/// its size for the indentation of its block (lines of five characters up).
+pub const SETTINGS_MAX_BYTES: usize = 64 * 1024 + 2 * 2 * RULES_MAX_BYTES;
+pub const OPTIONS_MAX_BYTES: usize = 4 * 1024;
 
 /// Exit codes of the `provision-check` and `provision-stage` verbs. The
 /// installers pass them through to their logs; the documentation names them.

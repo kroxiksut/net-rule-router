@@ -1,4 +1,5 @@
-//! The rule priority the user reads must be the one the engine runs.
+//! The rule priority the user reads must be the one the engine runs:
+//! README, quickstart, `rules-file-format` and `what-takes-priority`.
 //!
 //! The order is derived from `match_sample`, not restated: one rule of every
 //! kind matches the same destination, and the winner is removed until only the
@@ -216,6 +217,21 @@ fn rules_file_format_lists_the_engine_order() {
     ] {
         assert_eq!(
             listed_order(doc, heading, numbered_list_item),
+            expected,
+            "{doc}"
+        );
+    }
+}
+
+#[test]
+fn priority_page_lists_the_engine_order() {
+    let expected = engine_order();
+    for (doc, heading) in [
+        ("docs/en/what-takes-priority.md", "## Which rule wins"),
+        ("docs/ru/what-takes-priority.md", "## Какое правило главнее"),
+    ] {
+        assert_eq!(
+            listed_order(doc, heading, numbered_table_row),
             expected,
             "{doc}"
         );

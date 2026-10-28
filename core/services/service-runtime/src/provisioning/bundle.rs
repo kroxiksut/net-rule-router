@@ -14,7 +14,7 @@ use nrr_domain::{LeakProtection, RouteRole};
 use nrr_storage::install_policy::SecondaryUnset;
 use nrr_storage::route_bindings::BehaviorMode;
 
-use super::{exit, OPTIONS_MAX_BYTES, SETTINGS_MAX_BYTES};
+use super::{exit, OPTIONS_MAX_BYTES, RULES_MAX_BYTES, SETTINGS_MAX_BYTES};
 
 /// The raw files, each one optional.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -100,11 +100,14 @@ impl std::fmt::Display for ProvisionRefusal {
 
 /// What a settings export contributes. Adapter bindings and rule-file paths
 /// are deliberately not read: both name things of the machine it came from.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct SettingsFacts {
     pub route_mode: Option<BehaviorMode>,
     /// The floor of each new user's first leak protection.
     pub leak_protection: Option<LeakProtection>,
+    /// Rules-file text of each route; `None` when the export holds none.
+    pub rules_primary: Option<String>,
+    pub rules_secondary: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -127,20 +130,62 @@ impl CheckedBundle {
     }
 }
 
+/// The rules of one route and the part that carries them: its own file, or
+/// the settings export's copy.
+pub(crate) type RouteRules<'a> = Option<(&'a [u8], ProvisionPart)>;
+
+/// Each route's rules, from its file or from the settings export. Both for one
+/// route is refused: dropping either copy would leave the administrator
+/// believing in rules that are not in force.
+pub(crate) fn rules_of_routes<'a>(
+    bytes: &'a BundleBytes,
+    settings: Option<&'a SettingsFacts>,
+) -> Result<[RouteRules<'a>; 2], ProvisionRefusal> {
+    let pick = |file: Option<&'a [u8]>, file_part, embedded: Option<&'a String>, route: &str| match (
+        file, embedded,
+    ) {
+        (Some(_), Some(_)) => Err(ProvisionRefusal::new(
+            ProvisionPart::Settings,
+            "rules-given-twice",
+            format!("the {route} route has a rules file and rules in the settings file"),
+        )),
+        (Some(file), None) => Ok(Some((file, file_part))),
+        (None, Some(text)) => Ok(Some((text.as_bytes(), ProvisionPart::Settings))),
+        (None, None) => Ok(None),
+    };
+    Ok([
+        pick(
+            bytes.primary.as_deref(),
+            ProvisionPart::Primary,
+            settings.and_then(|s| s.rules_primary.as_ref()),
+            "primary",
+        )?,
+        pick(
+            bytes.secondary.as_deref(),
+            ProvisionPart::Secondary,
+            settings.and_then(|s| s.rules_secondary.as_ref()),
+            "secondary",
+        )?,
+    ])
+}
+
 /// Check every part, first refusal wins. Pure: no file, no database.
 pub fn check_bundle(
     bytes: &BundleBytes,
     platform: HostPlatform,
 ) -> Result<CheckedBundle, ProvisionRefusal> {
-    let primary = bytes
-        .primary
+    let settings = bytes
+        .settings
         .as_deref()
-        .map(|b| check_rules(b, RouteRole::Primary, platform))
+        .map(read_settings_export)
+        .transpose()
+        .map_err(|(code, detail)| ProvisionRefusal::new(ProvisionPart::Settings, code, detail))?;
+    let [primary, secondary] = rules_of_routes(bytes, settings.as_ref())?;
+    let primary = primary
+        .map(|(b, part)| check_rules(b, RouteRole::Primary, part, platform))
         .transpose()?;
-    let secondary = bytes
-        .secondary
-        .as_deref()
-        .map(|b| check_rules(b, RouteRole::Secondary, platform))
+    let secondary = secondary
+        .map(|(b, part)| check_rules(b, RouteRole::Secondary, part, platform))
         .transpose()?;
     if let (Some(p), Some(s)) = (primary.as_ref(), secondary.as_ref()) {
         let book = CanonicalRuleBook {
@@ -164,12 +209,6 @@ pub fn check_bundle(
             ));
         }
     }
-    let settings = bytes
-        .settings
-        .as_deref()
-        .map(read_settings_export)
-        .transpose()
-        .map_err(|(code, detail)| ProvisionRefusal::new(ProvisionPart::Settings, code, detail))?;
     let options = bytes
         .options
         .as_deref()
@@ -190,12 +229,9 @@ pub fn check_bundle(
 fn check_rules(
     bytes: &[u8],
     route: RouteRole,
+    part: ProvisionPart,
     platform: HostPlatform,
 ) -> Result<CanonicalRuleSet, ProvisionRefusal> {
-    let part = match route {
-        RouteRole::Primary => ProvisionPart::Primary,
-        RouteRole::Secondary => ProvisionPart::Secondary,
-    };
     let set = crate::production_mutation_executor::canonicalize_route_file_bytes(
         bytes, route, false, false, platform,
     )
@@ -276,6 +312,14 @@ type ReadError = (&'static str, String);
 
 /// UTF-8 text with the BOM stripped, within `limit` bytes and [`MAX_LINES`].
 fn bounded_text(bytes: &[u8], limit: usize) -> Result<&str, ReadError> {
+    let text = utf8_within(bytes, limit)?;
+    if text.lines().nth(MAX_LINES).is_some() {
+        return Err(too_many_lines());
+    }
+    Ok(text)
+}
+
+fn utf8_within(bytes: &[u8], limit: usize) -> Result<&str, ReadError> {
     if bytes.len() > limit {
         return Err((
             "file-too-large",
@@ -284,28 +328,91 @@ fn bounded_text(bytes: &[u8], limit: usize) -> Result<&str, ReadError> {
     }
     let text = std::str::from_utf8(bytes)
         .map_err(|_| ("file-encoding", "the file is not UTF-8".to_owned()))?;
-    let text = text.strip_prefix('\u{FEFF}').unwrap_or(text);
-    if text.lines().nth(MAX_LINES).is_some() {
-        return Err(("too-many-lines", format!("more than {MAX_LINES} lines")));
+    Ok(text.strip_prefix('\u{FEFF}').unwrap_or(text))
+}
+
+fn too_many_lines() -> ReadError {
+    ("too-many-lines", format!("more than {MAX_LINES} lines"))
+}
+
+/// Leading spaces; a tab is not indentation.
+fn indent_of(line: &str) -> usize {
+    line.len() - line.trim_start_matches(' ').len()
+}
+
+/// The lines of a literal block scalar (`|` clips to one final line break,
+/// `|-` strips it) under a key indented `key_indent`, consumed from `lines`.
+/// Its content may not pass [`RULES_MAX_BYTES`]: it is a rules file.
+fn read_block_scalar<'a>(
+    lines: &mut std::iter::Peekable<impl Iterator<Item = (usize, &'a str)>>,
+    key_indent: usize,
+    keep_final_break: bool,
+) -> Result<String, ReadError> {
+    let mut out = String::new();
+    let mut content_indent: Option<usize> = None;
+    let mut pending_blank = 0usize;
+    while let Some(&(number, raw)) = lines.peek() {
+        let line = raw.trim_end_matches('\r');
+        if line.trim().is_empty() {
+            pending_blank += 1;
+            lines.next();
+            continue;
+        }
+        let indent = indent_of(line);
+        let want = *content_indent.get_or_insert(indent);
+        if indent <= key_indent {
+            break;
+        }
+        if indent < want {
+            return Err(("bad-block-indentation", format!("line {}", number + 1)));
+        }
+        for _ in 0..pending_blank {
+            out.push('\n');
+        }
+        pending_blank = 0;
+        out.push_str(&line[want..]);
+        out.push('\n');
+        if out.len() > RULES_MAX_BYTES {
+            return Err((
+                "rules-too-large",
+                format!("more than {RULES_MAX_BYTES} bytes of rules"),
+            ));
+        }
+        lines.next();
     }
-    Ok(text)
+    if content_indent.is_some_and(|want| want <= key_indent) || out.is_empty() {
+        return Ok(String::new());
+    }
+    if !keep_final_break {
+        out.pop();
+    }
+    Ok(out)
 }
 
 /// Section depth a settings export never comes near.
 const MAX_DEPTH: usize = 8;
 
 /// The settings export as `production_settings_exporter` writes it: the
-/// `nrr_settings_export:` root, `version: 1`, `behavior.route_mode` and
-/// `behavior.leak_protection`.
+/// `nrr_settings_export:` root, `version` 1 or 2, `behavior.route_mode`,
+/// `behavior.leak_protection` and, from version 2, `rules.primary` and
+/// `rules.secondary` as literal block scalars. Lines outside the blocks count
+/// against [`MAX_LINES`]; each block against the rules-file size limit.
 pub fn read_settings_export(bytes: &[u8]) -> Result<SettingsFacts, ReadError> {
-    let text = bounded_text(bytes, SETTINGS_MAX_BYTES)?;
+    let text = utf8_within(bytes, SETTINGS_MAX_BYTES)?;
     let mut seen_root = false;
     let mut version: Option<String> = None;
     let mut route_mode: Option<String> = None;
     let mut leak_protection: Option<String> = None;
+    let mut rules: [Option<String>; 2] = [None, None];
     // Open sections, outermost first, each with the indent of its key.
     let mut open: Vec<(usize, &str)> = Vec::new();
-    for (number, raw) in text.lines().enumerate() {
+    let mut lines = text.lines().enumerate().peekable();
+    let mut structural = 0usize;
+    while let Some((number, raw)) = lines.next() {
+        structural += 1;
+        if structural > MAX_LINES {
+            return Err(too_many_lines());
+        }
         let at = || format!("line {}", number + 1);
         let line = raw.trim_end_matches('\r');
         let content = line.trim_start();
@@ -333,10 +440,32 @@ pub fn read_settings_export(bytes: &[u8]) -> Result<SettingsFacts, ReadError> {
             return Err(("not-a-key", at()));
         };
         let key = key.trim();
-        let value = unquote(value.trim()).map_err(|code| (code, at()))?;
         while open.last().is_some_and(|(depth, _)| *depth >= indent) {
             open.pop();
         }
+        let block = match value
+            .split_once(" #")
+            .map_or(value, |(before, _)| before)
+            .trim()
+        {
+            "|" => Some(true),
+            "|-" => Some(false),
+            _ => None,
+        };
+        if let Some(keep_final_break) = block {
+            let body = read_block_scalar(&mut lines, indent, keep_final_break)?;
+            let path: Vec<&str> = open.iter().map(|(_, name)| *name).collect();
+            let slot = match (path.as_slice(), key) {
+                (["rules"], "primary") => Some(0),
+                (["rules"], "secondary") => Some(1),
+                _ => None,
+            };
+            if let Some(slot) = slot {
+                rules[slot] = (!body.trim().is_empty()).then_some(body);
+            }
+            continue;
+        }
+        let value = unquote(value.trim()).map_err(|code| (code, at()))?;
         // A key with no value opens a section; its children sit deeper.
         if value.is_empty() {
             if open.len() == MAX_DEPTH {
@@ -350,6 +479,8 @@ pub fn read_settings_export(bytes: &[u8]) -> Result<SettingsFacts, ReadError> {
             ([], "version") => version = Some(value),
             (["behavior"], "route_mode") => route_mode = Some(value),
             (["behavior"], "leak_protection") => leak_protection = Some(value),
+            // Rules travel only as a block: anything else would be dropped.
+            (["rules"], "primary" | "secondary") => return Err(("rules-not-a-block", at())),
             _ => {}
         }
     }
@@ -357,15 +488,22 @@ pub fn read_settings_export(bytes: &[u8]) -> Result<SettingsFacts, ReadError> {
         return Err(("not-a-settings-export", "the file is empty".to_owned()));
     }
     match version.as_deref() {
-        Some("1") => {}
+        Some("1") if rules.iter().any(Option::is_some) => {
+            return Err((
+                "rules-need-version-2",
+                "a version 1 file carries no rules".to_owned(),
+            ))
+        }
+        Some("1" | "2") => {}
         Some(other) => {
             return Err((
                 "unsupported-version",
-                format!("version {other}; this build reads version 1"),
+                format!("version {other}; this build reads versions 1 and 2"),
             ))
         }
         None => return Err(("missing-version", "no `version:` line".to_owned())),
     }
+    let [rules_primary, rules_secondary] = rules;
     let mut leak_protection = match leak_protection.as_deref() {
         None | Some("") => None,
         Some(slug) => Some(slug.parse::<LeakProtection>().map_err(|_| {
@@ -391,6 +529,8 @@ pub fn read_settings_export(bytes: &[u8]) -> Result<SettingsFacts, ReadError> {
     Ok(SettingsFacts {
         route_mode,
         leak_protection,
+        rules_primary,
+        rules_secondary,
     })
 }
 

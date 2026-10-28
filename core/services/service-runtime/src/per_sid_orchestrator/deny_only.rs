@@ -51,7 +51,7 @@ impl PerSidApplyOrchestrator {
             zone_priority_over_ip: false,
             app_rules_take_all_addresses: false,
             families: ipv6.families(),
-            packet_blocks: self.rules_provider.rules_are_baseline_for(sid),
+            packet_blocks: super::PACKET_BLOCKS,
         });
         let unresolved_apps: Vec<String> = out
             .diagnostics

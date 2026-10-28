@@ -119,6 +119,29 @@ fn decide(
     }
 }
 
+/// The refusal code of an acknowledgement the executor turned down.
+fn refused(
+    exec: &ProductionMutationExecutor,
+    kind: MutationKind,
+    alert_id: &str,
+    rows: &[IntegrityRowRef],
+) -> String {
+    let outcome = exec.execute(
+        StoredMutation {
+            kind,
+            payload: serde_json::json!({ "alert-id": alert_id, "adopt-rows": rows }),
+            correlation_id: None,
+            issuer_sid: String::new(),
+            caller_is_elevated: true,
+        },
+        nrr_storage::BASELINE_PRINCIPAL,
+    );
+    match outcome {
+        MutationOutcome::Failed(error) => error.code,
+        other => panic!("expected a refusal, got {other:?}"),
+    }
+}
+
 fn verdict(env: &Env, key: &[u8], revision_id: &RevisionId) -> HmacVerification {
     let conn = env.fx.conn.lock().expect("conn");
     RevisionsRepository::with_signing_key(&conn, key.to_vec())
@@ -258,19 +281,24 @@ fn a_restart_does_not_raise_a_second_alert_for_the_same_content() {
     boot(&env, BOOT_MS + 1_000);
     let alert_id = only_tamper_alert(&env);
 
-    // Acknowledged without adopting: the row still fails, and still is not
-    // alerted twice.
+    // An acknowledgement that adopts nothing leaves the alert open: lifted,
+    // nothing would name the row again. Still one alert after a restart.
     let exec = executor(&env, vec![0x64; 32]);
-    decide(&exec, MutationKind::SecurityAlertAck, &alert_id, &[]);
+    assert_eq!(
+        refused(&exec, MutationKind::SecurityAlertAck, &alert_id, &[]),
+        "alert-rows-not-adopted"
+    );
     boot(&env, BOOT_MS + 2_000);
-    assert!(active_of(&env, AuditEventKind::DbTamperDetected).is_empty());
+    assert_eq!(only_tamper_alert(&env), alert_id);
     assert_eq!(
         verdict(&env, &[0x64; 32], &user),
         HmacVerification::Tampered,
-        "silencing a repeat never makes the row verify"
+        "a refused acknowledgement never makes the row verify"
     );
 
     // Positive control: another edit of the same row is a new alert.
+    let rows = shown(&exec, &alert_id);
+    decide(&exec, MutationKind::SecurityAlertAck, &alert_id, &rows);
     edit(&env, &user, r#"{"edited":2}"#);
     boot(&env, BOOT_MS + 3_000);
     assert_ne!(only_tamper_alert(&env), alert_id);
@@ -314,13 +342,15 @@ fn a_forged_list_adopts_nothing() {
         principal: nrr_storage::BASELINE_PRINCIPAL.to_string(),
         ..honest[0].clone()
     };
-    let result = decide(
-        &exec,
-        MutationKind::SecurityAlertAck,
-        &alert_id,
-        &[wrong_hash, other_row],
+    assert_eq!(
+        refused(
+            &exec,
+            MutationKind::SecurityAlertAck,
+            &alert_id,
+            &[wrong_hash, other_row],
+        ),
+        "alert-rows-not-adopted"
     );
-    assert_eq!(result["rows-adopted"], 0);
     assert_eq!(verdict(&env, &key, &user), HmacVerification::Tampered);
     assert_eq!(verdict(&env, &key, &baseline), HmacVerification::Verified);
 

@@ -1,0 +1,16 @@
+{
+  "plain": true,
+  "no-color": true,
+  "ascii": true,
+  "trace-grouping": "none",
+  "app-groups-offer-told": true,
+  "hide-block-addresses": true,
+  "archive-all-logs": true,
+  "archive-log-budget-mib": 64,
+  "site-notices": {
+    "shown": 1700000000000,
+    "shown:site.example": 1700000000000,
+    "answered:site.example": 1700000100000
+  },
+  "setting-from-a-newer-build": { "kept": ["verbatim", 1] }
+}

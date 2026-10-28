@@ -67,9 +67,23 @@ fn millis_since_epoch() -> i64 {
 /// The audit payload of an event about `principal`'s rules. A user's event
 /// names them under `sid`, the one field the audit reader scopes by; the
 /// baseline is everyone's and names nobody.
+/// [`payload_about`] naming the request that wrote it, when its id may go in
+/// the trail.
+fn payload_from(principal: &str, correlation_id: &str, mut payload: serde_json::Value) -> String {
+    if let (Some(id), Some(map)) = (
+        crate::production_ipc_audit::audit_correlation_id(correlation_id),
+        payload.as_object_mut(),
+    ) {
+        map.insert("correlation_id".into(), id.into());
+    }
+    payload_about(principal, payload)
+}
+
 fn payload_about(principal: &str, mut payload: serde_json::Value) -> String {
-    if principal != nrr_storage::BASELINE_PRINCIPAL {
-        if let Some(map) = payload.as_object_mut() {
+    if let Some(map) = payload.as_object_mut() {
+        if principal == nrr_storage::BASELINE_PRINCIPAL {
+            map.insert("baseline".into(), serde_json::Value::Bool(true));
+        } else {
             map.insert(
                 "sid".into(),
                 serde_json::Value::String(principal.to_owned()),
@@ -257,11 +271,12 @@ impl ActivationAuditEmitter for ProductionActivationAuditEmitter {
                 revision_id,
                 content_hash,
                 source,
-                correlation_id: _,
+                correlation_id,
                 was_dedup,
             } => {
-                let payload = payload_about(
+                let payload = payload_from(
                     &principal,
+                    &correlation_id,
                     json!({
                         "event": "submitted",
                         "content_hash": content_hash,
@@ -457,10 +472,11 @@ impl ActivationAuditEmitter for ProductionActivationAuditEmitter {
             ActivationAuditEvent::RollbackRequested {
                 principal,
                 target,
-                correlation_id: _,
+                correlation_id,
             } => {
-                let payload = payload_about(
+                let payload = payload_from(
                     &principal,
+                    &correlation_id,
                     json!({ "event": "rollback_requested", "target": target }),
                 );
                 self.append(
@@ -500,7 +516,7 @@ impl ActivationAuditEmitter for ProductionActivationAuditEmitter {
             ActivationAuditEvent::ResetToBaseline {
                 principal,
                 deleted_revisions,
-                correlation_id: _,
+                correlation_id,
             } => {
                 // a per-principal reset to baseline reads
                 // as a revert to the shared default: audit it under the
@@ -515,8 +531,9 @@ impl ActivationAuditEmitter for ProductionActivationAuditEmitter {
                         nrr_shared::ipc_payloads::REVISION_STATUS_RESET_TO_BASELINE,
                     );
                 }
-                let payload = payload_about(
+                let payload = payload_from(
                     &principal,
+                    &correlation_id,
                     json!({
                         "event": "reset_to_baseline",
                         "deleted": deleted_revisions,
@@ -793,18 +810,30 @@ impl ProductionRulesApplyDispatcher {
     ) -> Option<crate::per_sid_orchestrator::ActiveRulesSnapshot> {
         let mut snapshot =
             crate::production_rules_provider::decode_rules_snapshot(rules_json, origin)?;
-        snapshot.rule_book = crate::verify_overlay::effective(&snapshot.rule_book, sid);
-        if let Some(conn) = self.settings_conn.as_ref() {
+        let include_subdomains = self.settings_conn.as_ref().is_some_and(|conn| {
             let guard = conn.lock().unwrap_or_else(|p| p.into_inner());
-            if crate::production_rules_provider::include_subdomains_for(&guard, sid) {
-                snapshot.rule_book = snapshot.rule_book.with_subdomain_coverage();
-            }
-        }
-        // As the provider's enforcement read: a protected rule carried over
-        // from the book in force is not applied.
-        snapshot.rule_book = crate::protected_rules::withhold_for(sid, snapshot.rule_book).0;
+            crate::production_rules_provider::include_subdomains_for(&guard, sid)
+        });
+        snapshot.rule_book = dispatch_view(sid, snapshot.rule_book, include_subdomains);
         Some(snapshot)
     }
+}
+
+/// A dispatched book as the provider's enforcement read shapes it, in the same
+/// order: an activation that skipped a step would install less than the next
+/// recompute does, until that recompute comes.
+fn dispatch_view(
+    sid: &str,
+    book: nrr_domain::canonical::CanonicalRuleBook,
+    include_subdomains: bool,
+) -> nrr_domain::canonical::CanonicalRuleBook {
+    let mut book = crate::verify_overlay::effective(&book, sid);
+    if include_subdomains {
+        book = book.with_subdomain_coverage();
+    }
+    book = crate::any_zone_sites::expand(book);
+    // A protected rule carried over from the book in force is not applied.
+    crate::protected_rules::withhold_for(sid, book).0
 }
 
 /// The summary a SID with no reportable plan contributes.
@@ -1317,6 +1346,42 @@ mod tests {
         assert_ne!(token, attempt);
     }
 
+    /// A `site.*` rule the cache knows under `.ru` is enforced there from the
+    /// activation on, not only after the next recompute reads the provider.
+    #[test]
+    fn an_activation_installs_the_site_rule_under_every_zone_seen() {
+        use nrr_domain::canonical::{
+            CanonicalAddressMatch, CanonicalRule, CanonicalRuleBook, CanonicalRuleSet,
+        };
+        let cache = Arc::new(crate::fqdn_cache_lookup::MockFqdnCacheLookup::new());
+        cache.set_ips(
+            "shop.dispatchsite.ru",
+            vec![std::net::Ipv4Addr::new(192, 0, 2, 7)],
+        );
+        crate::any_zone_sites::install(cache);
+        let book = CanonicalRuleBook {
+            primary: CanonicalRuleSet::default(),
+            secondary: CanonicalRuleSet::from_rules(vec![CanonicalRule {
+                id: nrr_domain::RuleId("s".into()),
+                enabled: true,
+                address_match: Some(CanonicalAddressMatch::AnyZoneDomain("dispatchsite".into())),
+                app_match: None,
+                comment: String::new(),
+                action: nrr_domain::RuleAction::Route,
+                origin: None,
+            }]),
+        };
+        let view = dispatch_view("S-1-5-21-DISPATCH", book, false);
+        assert!(
+            view.secondary.rules().iter().any(|r| r.address_match
+                == Some(CanonicalAddressMatch::SuffixDomain(
+                    "dispatchsite.ru".into()
+                ))),
+            "{:?}",
+            view.secondary.rules()
+        );
+    }
+
     // ── Pre-flight warning mapping ───────────────────────────────────────────
 
     fn clean_preview() -> crate::per_sid_orchestrator::SidApplyPreview {
@@ -1647,6 +1712,49 @@ mod tests {
         assert_eq!(text(5, "trusted_source_revision_id"), Some(n.clone()));
         assert!(payloads[5]["new_active_revision_id"].is_null());
         assert!(writer.verify_chain(None).chain_ok);
+    }
+
+    /// A reader of the trail can tell a baseline revision from a user's and
+    /// link it to the admitted request that wrote it: the submission carries
+    /// the request's correlation id, every step the revision id.
+    #[test]
+    fn a_baseline_revision_is_named_as_such_and_linked_to_its_request() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let writer = Arc::new(AuditWriter::open(
+            nrr_diagnostics::audit::writer::AuditWriterConfig::new(dir.path()),
+        ));
+        let emitter = ProductionActivationAuditEmitter::new(
+            Arc::clone(&writer),
+            Arc::new(ProductionIdGenerator::new()),
+        );
+        let baseline = || nrr_storage::BASELINE_PRINCIPAL.to_string();
+        emitter.emit(ActivationAuditEvent::RevisionSubmitted {
+            principal: baseline(),
+            revision_id: "rev-base".into(),
+            content_hash: "hash".into(),
+            source: RulesRevisionSource::GuiRulesEdit,
+            correlation_id: "rules-update-admin-1".into(),
+            was_dedup: false,
+        });
+        emitter.emit(ActivationAuditEvent::RevisionActivated {
+            principal: baseline(),
+            revision_id: "rev-base".into(),
+            previous_revision_id: None,
+            succeeded_sids: vec![],
+            drift_sids: vec![],
+        });
+        emitter.emit(ActivationAuditEvent::ResetToBaseline {
+            principal: "S-1-A".into(),
+            deleted_revisions: 1,
+            correlation_id: "tui-reset-7".into(),
+        });
+
+        let payloads = payloads_in(dir.path());
+        assert_eq!(payloads[0]["correlation_id"], "rules-update-admin-1");
+        assert_eq!(payloads[0]["baseline"], true);
+        assert_eq!(payloads[1]["baseline"], true);
+        assert_eq!(payloads[2]["correlation_id"], "tui-reset-7");
+        assert!(payloads[2].get("baseline").is_none(), "a user's reset");
     }
 
     /// Every step of one user's activation, rollback, reset or integrity

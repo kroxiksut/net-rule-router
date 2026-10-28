@@ -148,6 +148,9 @@ pub struct ServiceSnapshot {
 /// handlers, and the runtime loop without external synchronisation.
 pub struct HealthAggregator {
     inner: Mutex<HealthAggregatorInner>,
+    /// Wall clock in epoch seconds; a test steps its own so staleness never
+    /// rests on how a guest's clock catches up.
+    clock: Box<dyn Fn() -> u64 + Send + Sync>,
 }
 
 struct HealthAggregatorInner {
@@ -184,6 +187,7 @@ impl HealthAggregator {
                 current_revision: None,
                 stale_after_secs: 30,
             }),
+            clock: Box::new(epoch_secs),
         }
     }
 
@@ -191,6 +195,12 @@ impl HealthAggregator {
         if let Ok(mut inner) = self.inner.lock() {
             inner.stale_after_secs = secs;
         }
+        self
+    }
+
+    #[cfg(test)]
+    fn with_clock(mut self, clock: impl Fn() -> u64 + Send + Sync + 'static) -> Self {
+        self.clock = Box::new(clock);
         self
     }
 
@@ -227,7 +237,7 @@ impl HealthAggregator {
         severity: ServiceHealthSeverity,
         message: impl Into<String>,
     ) {
-        let now = epoch_secs();
+        let now = (self.clock)();
         if let Ok(mut inner) = self.inner.lock() {
             inner.components.insert(
                 component,
@@ -251,7 +261,7 @@ impl HealthAggregator {
         severity: ServiceHealthSeverity,
         message: impl Into<String>,
     ) {
-        let now = epoch_secs();
+        let now = (self.clock)();
         if let Ok(mut inner) = self.inner.lock() {
             inner.sourced.insert(
                 (component, source),
@@ -293,7 +303,7 @@ impl HealthAggregator {
         severity: ServiceHealthSeverity,
         message: impl Into<String>,
     ) {
-        let now = epoch_secs();
+        let now = (self.clock)();
         if let Ok(mut inner) = self.inner.lock() {
             inner
                 .components
@@ -355,7 +365,7 @@ impl HealthAggregator {
     /// (`NoState` is not a Blocking error, so the policy component
     /// stays at Ok — but the policy_state still flips to NoState).
     pub fn record_policy(&self, outcome: &PolicyLoadResult) {
-        let now = epoch_secs();
+        let now = (self.clock)();
         if let Ok(mut inner) = self.inner.lock() {
             inner.policy_state = outcome.to_policy_state();
             inner.current_revision = outcome.current_revision().cloned();
@@ -398,7 +408,7 @@ impl HealthAggregator {
     /// Build a fresh snapshot from the current component table. Cheap
     /// — O(N) over component count.
     pub fn snapshot(&self) -> ServiceSnapshot {
-        let now = epoch_secs();
+        let now = (self.clock)();
         let inner = match self.inner.lock() {
             Ok(g) => g,
             Err(_) => return self.poisoned_snapshot(now),
@@ -681,22 +691,28 @@ mod tests {
         assert_eq!(snap.policy_state, ServicePolicyState::RecoveryRequired);
     }
 
+    /// A component silent past the threshold is flagged, and one heard within
+    /// it is not, whatever the machine's own clock does meanwhile: a guest
+    /// whose clock stands still and then jumps failed the sleep-based test.
     #[test]
     fn stale_marker_flips_when_component_is_old() {
-        let agg = HealthAggregator::new().with_stale_threshold(0);
+        use std::sync::atomic::{AtomicU64, Ordering};
+        use std::sync::Arc;
+        let now = Arc::new(AtomicU64::new(1_000));
+        let clock = Arc::clone(&now);
+        let agg = HealthAggregator::new().with_clock(move || clock.load(Ordering::SeqCst));
         agg.clear_lifecycle_override();
         agg.record(HealthComponent::Storage, ServiceHealthSeverity::Ok, "ok");
-        // Sleep one second so updated_at + 0 < now. We can't sleep
-        // long in unit tests; instead exploit threshold = 0 — every
-        // component is stale the moment we ask, even on the same epoch
-        // tick, because the inequality is `updated + threshold < now`,
-        // not `<=`. Force the gap via a small sleep.
-        std::thread::sleep(std::time::Duration::from_millis(1100));
+        now.store(1_030, Ordering::SeqCst);
+        assert!(!agg.snapshot().stale, "at the threshold it is still fresh");
+        now.store(1_031, Ordering::SeqCst);
         let snap = agg.snapshot();
         assert!(
             snap.stale,
             "expected stale=true for old component: {snap:?}"
         );
+        agg.record(HealthComponent::Storage, ServiceHealthSeverity::Ok, "ok");
+        assert!(!agg.snapshot().stale, "a fresh record clears it");
     }
 
     #[test]

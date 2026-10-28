@@ -9,7 +9,13 @@ use crate::ipc::{
     CheckedIpcHandler, HandlerOutcome, IpcError, IpcErrorCode, IpcHandler, IpcRequestContext,
     IpcRequestEnvelope, Prechecked,
 };
-use crate::ipc_handlers::providers::{PrincipalDataPurger, RoutePolicyWriteError};
+use crate::ipc_handlers::mutation_token_store::StoredMutation;
+use crate::ipc_handlers::operation_status_store::OperationError;
+use crate::ipc_handlers::providers::{
+    MutationExecutor, MutationOutcome, PrincipalDataPurger, RoutePolicyWriteError,
+    RULES_LOCKED_ERROR_CODE,
+};
+use nrr_shared::ipc_payloads::MutationKind;
 
 fn principal(ctx: &IpcRequestContext) -> Result<&str, IpcError> {
     let sid = ctx.caller_stored();
@@ -42,11 +48,40 @@ fn map_write_error(err: RoutePolicyWriteError) -> IpcError {
 
 pub struct PrincipalDataPurgeHandler {
     purger: std::sync::Arc<dyn PrincipalDataPurger>,
+    /// Runs the caller's rules erasure as a reset to the baseline.
+    rules_reset: Option<std::sync::Arc<dyn MutationExecutor>>,
 }
 
 impl PrincipalDataPurgeHandler {
     pub fn new(purger: std::sync::Arc<dyn PrincipalDataPurger>) -> Self {
-        Self { purger }
+        Self {
+            purger,
+            rules_reset: None,
+        }
+    }
+
+    /// Erasing one's own rules history goes through the reset to the baseline:
+    /// its gates, the activation in flight, its audit and its event.
+    #[must_use]
+    pub fn with_rules_reset(mut self, executor: std::sync::Arc<dyn MutationExecutor>) -> Self {
+        self.rules_reset = Some(executor);
+        self
+    }
+}
+
+/// The wire code of a gate the reset to the baseline would refuse at.
+fn gate_error(refusal: OperationError) -> IpcError {
+    let code = if refusal.code == RULES_LOCKED_ERROR_CODE {
+        IpcErrorCode::RulesLocked
+    } else if refusal.code == crate::tamper_bootstrap::SECURITY_ALERT_GATE_CODE {
+        IpcErrorCode::SecurityAlertUnacknowledged
+    } else {
+        IpcErrorCode::Forbidden
+    };
+    IpcError {
+        code,
+        message: refusal.message,
+        diagnostics_id: None,
     }
 }
 
@@ -80,6 +115,13 @@ impl CheckedIpcHandler for PrincipalDataPurgeHandler {
                 "clearing every user's data needs administrator approval",
             ));
         }
+        if req.include_rules_history {
+            if let Some(refusal) = self.rules_reset.as_ref().and_then(|executor| {
+                executor.closed_gate(MutationKind::RulesResetToBaseline, ctx.caller_is_elevated)
+            }) {
+                return Err(gate_error(refusal));
+            }
+        }
         Ok(req)
     }
 
@@ -95,6 +137,20 @@ impl CheckedIpcHandler for PrincipalDataPurgeHandler {
                 .purge_all_principals(req.include_rules_history)
                 .map_err(map_write_error)?
         } else {
+            if req.include_rules_history {
+                if let Some(executor) = self.rules_reset.as_ref() {
+                    let reset = StoredMutation {
+                        kind: MutationKind::RulesResetToBaseline,
+                        payload: serde_json::json!({}),
+                        correlation_id: Some("full-reset".into()),
+                        issuer_sid: sid.to_owned(),
+                        caller_is_elevated: ctx.caller_is_elevated,
+                    };
+                    if let MutationOutcome::Failed(refusal) = executor.execute(reset, sid) {
+                        return Err(gate_error(refusal));
+                    }
+                }
+            }
             let mut response = self
                 .purger
                 .purge_for_sid(sid, req.include_rules_history)
@@ -370,5 +426,113 @@ mod tests {
             .handle(&req(), &ctx(Some("S-A")))
             .expect_err("storage failure");
         assert_eq!(err.code, IpcErrorCode::Internal);
+    }
+
+    /// The fake executor behind a gate that is open or closed.
+    struct Gated {
+        inner: crate::ipc_handlers::test_fakes::FakeMutationExecutor,
+        closed: bool,
+    }
+
+    impl MutationExecutor for Gated {
+        fn preview(
+            &self,
+            kind: MutationKind,
+            payload: &serde_json::Value,
+            principal: &str,
+        ) -> crate::ipc_handlers::payloads::ReviewSummaryResponse {
+            self.inner.preview(kind, payload, principal)
+        }
+        fn execute(&self, payload: StoredMutation, principal: &str) -> MutationOutcome {
+            self.inner.execute(payload, principal)
+        }
+        fn closed_gate(
+            &self,
+            _kind: MutationKind,
+            _caller_is_elevated: bool,
+        ) -> Option<crate::ipc_handlers::operation_status_store::OperationError> {
+            self.closed.then(
+                || crate::ipc_handlers::operation_status_store::OperationError {
+                    args: Default::default(),
+                    code: crate::ipc_handlers::providers::RULES_LOCKED_ERROR_CODE.into(),
+                    message: "locked".into(),
+                },
+            )
+        }
+        fn rollback(&self, principal: &str, target: Option<&str>) -> MutationOutcome {
+            self.inner.rollback(principal, target)
+        }
+        fn rollback_target(
+            &self,
+            principal: &str,
+            target: Option<&str>,
+        ) -> Result<
+            Option<nrr_shared::ipc_payloads::RollbackTargetDto>,
+            crate::ipc_handlers::operation_status_store::OperationError,
+        > {
+            self.inner.rollback_target(principal, target)
+        }
+        fn safe_disable(
+            &self,
+            principal: &str,
+            reason: &str,
+            term: nrr_shared::ipc_payloads::SafeDisableTerm,
+        ) -> MutationOutcome {
+            self.inner.safe_disable(principal, reason, term)
+        }
+    }
+
+    /// Erasing one's rules history is a reset to the baseline like the menu's:
+    /// refused under the administrator's rules lock or a tamper alert, and
+    /// otherwise run as that reset, so an apply in flight, the audit and the
+    /// user's clients all hear of it.
+    #[test]
+    fn erasing_the_rules_history_is_a_reset_to_the_baseline() {
+        for closed in [true, false] {
+            let purger = Arc::new(RecordingPurger::new(Ok(
+                PrincipalDataPurgeResponse::default(),
+            )));
+            let reset = Arc::new(Gated {
+                inner: crate::ipc_handlers::test_fakes::FakeMutationExecutor::default(),
+                closed,
+            });
+            let handler =
+                PrincipalDataPurgeHandler::new(Arc::clone(&purger) as Arc<dyn PrincipalDataPurger>)
+                    .with_rules_reset(Arc::clone(&reset) as Arc<dyn MutationExecutor>);
+            let mut envelope = req();
+            envelope.payload = serde_json::json!({ "include-rules-history": true });
+            let result = handler.handle(&envelope, &ctx(Some("S-A")));
+            let calls = purger
+                .calls
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .clone();
+            if closed {
+                let err = result.expect_err("locked");
+                assert_eq!(err.code, IpcErrorCode::RulesLocked);
+                assert!(calls.is_empty(), "nothing erased under the lock");
+                assert_eq!(reset.inner.executed_count(), 0);
+            } else {
+                result.expect("purged");
+                assert_eq!(calls, ["S-A".to_string()]);
+                let ran = reset
+                    .inner
+                    .last_executed
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .clone()
+                    .expect("the reset ran");
+                assert_eq!(ran.kind, MutationKind::RulesResetToBaseline);
+                assert_eq!(
+                    reset
+                        .inner
+                        .last_principal
+                        .lock()
+                        .unwrap_or_else(|p| p.into_inner())
+                        .as_deref(),
+                    Some("S-A")
+                );
+            }
+        }
     }
 }

@@ -373,10 +373,8 @@ fn toggle_hide(app: &mut AppState) -> bool {
     app.feed.note = Some(Note::Addresses {
         hidden: prefs.hide_block_addresses,
     });
-    if let Some(path) = app.settings.prefs_path.as_deref() {
-        // Unsaved, it still holds for this run.
-        let _ = crate::screens::settings::prefs::save(path, app.settings.prefs);
-    }
+    // Unsaved, it still holds for this run.
+    let _ = app.settings.save_prefs();
     true
 }
 

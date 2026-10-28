@@ -217,6 +217,8 @@ pub struct FirstRunWrites {
     pub protection: bool,
     /// The machine-wide answers (fake-IP, diagnostic logs).
     pub stability: bool,
+    /// Fake-IP is among them: a changed log window alone never resends it.
+    pub fake_ip: bool,
 }
 
 /// A new user's answers always go; a user already set up keeps what the
@@ -226,10 +228,12 @@ pub fn first_run_writes(
     held: Option<(&str, bool)>,
     chosen: (&str, bool),
     stability_touched: bool,
+    fake_ip_touched: bool,
 ) -> FirstRunWrites {
     FirstRunWrites {
         protection: held != Some(chosen),
-        stability: held.is_none() || stability_touched,
+        stability: held.is_none() || stability_touched || fake_ip_touched,
+        fake_ip: held.is_none() || fake_ip_touched,
     }
 }
 

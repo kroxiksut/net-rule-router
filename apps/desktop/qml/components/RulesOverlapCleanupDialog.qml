@@ -167,7 +167,7 @@ Dialog {
                     wrapMode: Text.WordWrap
                     color: dialog._mutedColor()
                     text: dialog.tr("dialog.rules-overlap.deliberate-body",
-                        "These name a host under a wildcard but block it, or apply only to one program. That is what an exception looks like, so nothing here is removed for you. Rules that send a host over the other route are listed under Rules → Overlaps.")
+                        "These name a host under a wildcard but deny it, or apply only to one program. That is what an exception looks like, so nothing here is removed for you. Rules that send a host over the other route are listed under Rules → Overlaps.")
                 }
                 Repeater {
                     model: dialog._deliberate()

@@ -28,7 +28,7 @@ Browser-side encrypted DNS (DoH/DoT) hides names from the provider and from the 
 ## Known limitations of this release
 
 Each of these is described, with what to do about it, in [`docs/en/known-limitations.md`](docs/en/known-limitations.md), and stays listed until it is fixed:
-- leak protection is not in force for the first seconds after the computer starts, until the service has applied the rules;
+- with leak protection set to Routed sites, the protection is not in force for the first seconds after the computer starts, until the service has applied the rules (with Everything, the internet waits from the start instead);
 - without virtual addresses (fake-IP; Windows only, on by default for a new installation), sites that share one server address cannot be routed apart;
 - a rule for a site name does not cover an application that looks up names on its own while leak protection is off;
 - on Windows, leak protection that blocks everything for one user also holds back IPv6, ping and VPN protocols such as IPsec for the other users of the computer;
@@ -99,7 +99,7 @@ On Windows every executable loads libraries only from the Windows system directo
 |---|---|---|
 | `%ProgramData%\NetRuleRouter\` | Active policy and revisions, caches, logs, audit trail, backups | System and administrators only. Ordinary users reach its contents through the service, which scopes the answer to them. |
 | Service signing key | Integrity key for stored revisions | Readable only by the system account and bound to it. |
-| `%APPDATA%\NetRuleRouter\` | Per-user preferences: theme, language, accessibility, window state, route labels, remembered choices | Writable by that user. Roams with the profile on domain PCs. |
+| `%APPDATA%\NetRuleRouter\` | Per-user preferences: theme, language, accessibility, window state, route labels, remembered choices; where your rule sets and rules files are, and the notices you muted | Writable by that user. Roams with the profile on domain PCs. |
 | `%LOCALAPPDATA%\NetRuleRouter\` | Per-user, per-machine app cache | Writable by that user. |
 | Your rules files | Wherever you saved them | Yours. Imported, never enforced by reference. |
 

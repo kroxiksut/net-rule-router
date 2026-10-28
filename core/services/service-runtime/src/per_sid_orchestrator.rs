@@ -96,6 +96,11 @@ use crate::killswitch_codegen::{FailClosedExemptions, KillSwitchResolution};
 use crate::machine_reading::MachineReading;
 use crate::wfp_codegen::{generate_filters, CodegenInput};
 
+/// No Block is mirrored at the WFP packet layer: it carries no user, so a
+/// baseline Block there cut every account, a user who left the baseline too.
+/// A Block holds per user at the connect layer.
+const PACKET_BLOCKS: bool = false;
+
 mod types;
 pub use types::{
     ActiveRulesSnapshot, NoopPerSidApplyAudit, NoopRulesProvider, OrchestratorError,

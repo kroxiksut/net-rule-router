@@ -239,6 +239,17 @@ pub enum Numbered {
     NoSuch,
 }
 
+/// A letter that changes something, pressed from the menu, only gives the list
+/// the focus: the second press acts on a row the user has seen chosen.
+/// `true` when this press was spent on the focus.
+pub fn focus_list_first(app: &mut AppState) -> bool {
+    if app.focus == crate::state::Focus::Feed {
+        return false;
+    }
+    app.focus = crate::state::Focus::Feed;
+    true
+}
+
 pub fn numbered_now(printed: &[String], now: &[String], n: usize) -> Numbered {
     let Some(at) = n.checked_sub(1) else {
         return Numbered::NoSuch;

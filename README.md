@@ -108,12 +108,15 @@ check of the checksums, `SHA256SUMS` comes with the files:
 - **Two-route model** — a `primary` and an additional route, one active config at a time.
 - **Seven ways to match traffic** — by exact domain, by domain with all its subdomains, by a site in every zone (`bank.*`), by exact IPv4 or IPv6 address, by subnet or address range, by domain zone (a TLD or internal suffix such as `.ru` or `.intra`), or by application (the program's name, or the file or folder it is installed in; on Windows and Linux a folder rule also covers the programs a later update puts there and the scripts kept in it).
 - **Traffic statistics** — how much went through each connection today, during the current session of the additional connection and over every day kept (you choose how many), with a CSV export for any period.
-- **Per-name routing** *(Windows, on by default for a new installation: Settings → Routing behavior, once leak protection is on)* — sites that share one server address still go where their own rule says. Large platforms and CDNs put hundreds of names on a handful of addresses, and address-level routing cannot tell them apart; see [`docs/en/routing-modes.md`](docs/en/routing-modes.md).
+- **Per-name routing** *(Windows, on by default for a new installation: Settings → Routing behavior, whatever leak protection is set to)* — sites that share one server address still go where their own rule says. Large platforms and CDNs put hundreds of names on a handful of addresses, and address-level routing cannot tell them apart; see [`docs/en/routing-modes.md`](docs/en/routing-modes.md).
 - **Leak protection** — one choice: **Off** (the default), **Routed sites** (what your rules send through the additional connection never goes out the main one while strict blocking of shared addresses is on, as it is by default; everything else keeps working, except sites that share an address with a routed one) or **Everything** (nothing leaves except through the additional connection, your local network and what your rules send over the main one; if the additional connection drops, the internet waits until it returns). A corporate VPN beside yours keeps its own networks in every mode.
 - **Deny** — a site, an address, a subnet or a program you deny is not let through any connection: put `!` before it in a rules file, or choose "Deny" when you add a rule in the window, the tray or the terminal interface. A deny by address or subnet does not depend on names; there are no block lists, only the rules you write.
 - **Protected system programs** — a deny or an additional-route rule cannot take what the computer needs to stay on the network (the system folder, `svchost.exe`, the network services, a folder many programs share): the app refuses it before it is saved. When you do mean it, `+override` in the rules file asks for your confirmation, for a time you choose, with administrator approval where it reaches past your own programs; see [`docs/en/rules-file-format.md`](docs/en/rules-file-format.md#116-applying-a-rule-despite-the-protection-override).
 - **Many rules at once, and recent changes** — paste a list of sites, addresses and programs as lines of a rules file and each line is checked before it is added; the *Recent* filter shows what you added, changed or deleted in the last hour, today or 7 days, and puts a deleted rule back in one click. In the window and in the terminal interface alike.
 - **Connection history** — which of your programs connected where, and over which route, kept on this computer for 7 days unless you choose otherwise, grouped by program or by folder. Only you can read yours; it never goes into a diagnostic archive, and you can clear it or switch it off in Settings.
+- **Check site** — when a site does not open, one check tells whether the network or the site is at fault: which route the site, its sign-in and the names seen with it take, and whether each of them answers there, with what to do next. Run it from Diagnostics, from a line of the connection trace, from a suggestion or from the notice itself, in the window and in the terminal interface.
+- **Notices that point at the cause** — the tray and the terminal interface tell you when a site you open does not open over the main connection (on Windows even with the tray closed), when the main or the additional connection keeps dropping, and when the service stops on its own (this one the window shows too), with **Start service** and **Restore network** at hand. Any kind of notice can be hidden for a day, 7 days, 30 days or for good, and what you hide is hidden everywhere.
+- **Rules off for a while** — turn your routing and leak protection off for 15 minutes, an hour, 4 hours, until the next restart or until you turn them back on (*Turn off rules…* in the tray, or Settings). They come back on their own, and the other people signed in keep their rules.
 - **WSL, containers and virtual machines** — you choose whether their programs get the same leak protection as this computer or go unprotected while the additional route is down. Not yet verified on a live setup.
 - **Suggested addresses** — a routed site often pulls in helper domains of its own. The app collects them, shows which of your sites needs each one, and proposes adding them. Nothing is added behind your back, and ignoring a suggestion simply leaves that address on the main route.
 - **Overlaps** — when rules of the two routes cover the same sites (a zone on one route, a site inside it on the other), the narrower rule wins, and the app lists every such pair with the route its sites actually take. Confirm each one, or send those sites over the other route in one click. The same screen points out applied rules that work
@@ -166,8 +169,9 @@ Notes:
   network or a block of addresses through either connection with one rule.
   Ports and protocols are not supported.
 - IPv6 addresses work in rules. They travel the additional connection when it
-  carries IPv6; when it does not, they are held back rather than slipping out
-  over the main one. IPv6 has not been tested on a real IPv6 network yet. After
+  carries IPv6. When it does not, an IPv6 address your rules send there is held
+  back rather than slipping out over the main one while leak protection is on;
+  with leak protection off it goes over the main connection. IPv6 has not been tested on a real IPv6 network yet. After
   a rule change, connections already open over IPv6 keep their old route until
   the program reconnects (over IPv4 the app refreshes them), and a `?` on an
   IPv6 address never moves the rule.
@@ -178,6 +182,10 @@ Notes:
 > you want it to go; see the one-time step in [Quick start](#quick-start).
 > **After adding or removing rules, always press Apply: rules take effect only
 > once applied.**
+
+Everything else that can disagree — several people signed in, the protection
+and a pause, your rules file and the app — is settled in
+[`docs/en/what-takes-priority.md`](docs/en/what-takes-priority.md).
 
 ## Presets
 
@@ -288,8 +296,9 @@ it is a way to keep one machine healthy, not an automation API. See
 
 ## Terminal interface
 
-`nrr-tui` is the application in a terminal: status, setup, rules, suggestions,
-diagnostics and settings for a machine reached over SSH, a server without a
+`nrr-tui` is the application in a terminal: status and notifications, setup,
+rules, suggestions, connection history, the site check, diagnostics and
+settings for a machine reached over SSH, a server without a
 desktop, or anyone who prefers the keyboard. It works with screen readers
 (`--plain`), never relies on colour alone, and needs no administrator rights
 for your own rules. It runs only interactively — scripts use `nrr-cli`. See
@@ -309,7 +318,7 @@ See [`SECURITY.md`](SECURITY.md) for the full trust model.
 **Current:** two-route model, one active config per Windows user over a shared
 administrator baseline, domain / zone / IP / network / app rules (apps by name,
 file or folder), deny rules, per-name routing, presets, explain mode, leak protection, suggested addresses, traffic
-statistics with CSV export, connection history, diagnostics archive, administrative console, RU/EN.
+statistics with CSV export, connection history, site check, timed pause of the rules, diagnostics archive, administrative console, terminal interface, RU/EN.
 
 **In progress:** Linux support (the platform-specific pieces sit behind one
 interface per capability, so the shared decision logic is already OS-neutral),
@@ -319,9 +328,13 @@ then macOS.
 resolve to them, and route and protect them as they do IPv4; what remains is
 verifying it on real IPv6 networks before calling it finished.
 
-**Right after that:** a check that tells whether a server that does not answer
-is down or held back by one of your connections, and a warning when the
-additional connection nears your data plan's limit.
+**Right after that:**
+- checking a site over both connections: the site check tells you whether the
+  server itself is down or your provider or VPN holds it back, and offers to
+  move the rule;
+- own secure DNS for one program: a program with its own encrypted DNS, such as
+  a corporate client or a game, keeps working while protection stays on for
+  every other program.
 
 The full order of work, without dates: [ROADMAP.md](ROADMAP.md).
 
@@ -336,6 +349,7 @@ The full order of work, without dates: [ROADMAP.md](ROADMAP.md).
 | [`docs/en/rules-file-format.md`](docs/en/rules-file-format.md) | Preset & rule file format |
 | [`docs/en/routing-modes.md`](docs/en/routing-modes.md) | The routing switches: what each one buys you, and how they combine |
 | [`docs/en/what-routing-changes.md`](docs/en/what-routing-changes.md) | Who sees what once a site is routed — and what routing deliberately leaves alone |
+| [`docs/en/what-takes-priority.md`](docs/en/what-takes-priority.md) | What takes priority: which rule wins, whose rules apply when several people are signed in, the protection and a pause, your rules file and the app |
 | [`docs/en/several-users.md`](docs/en/several-users.md) | Several users signed in at once: everyone's rules apply, and the one Windows limitation |
 | [`docs/en/blocked-site-browser-errors.md`](docs/en/blocked-site-browser-errors.md) | What a browser error means when a routed site does not open |
 | [`docs/en/cache-and-seeding.md`](docs/en/cache-and-seeding.md) | How the FQDN/IP cache fills up, including opt-in browser-history seeding |

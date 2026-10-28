@@ -7,7 +7,8 @@
 # in /usr/bin, every tracked file of locales/ and presets/ (base); the unit,
 # the service alias, the logrotate and polkit files (service); the window, the
 # tray, their links, desktop entries and icons, every tracked QML file (gui);
-# the licence of each package. List here what nothing else names.
+# the licence and the third-party notice of each package. List here what
+# nothing else names.
 #
 # Line: <set> <path>. Sets: base (service, console, terminal interface),
 # service (what only a .deb or .rpm of the base adds), gui (window and tray),
@@ -18,6 +19,11 @@
 base     @libexec@/build-info.json
 base     @libexec@/scripts/reset-network.sh
 base     @libexec@/scripts/lib/service-paths.sh
+# The notices MIT and Apache-2.0 ask to travel with the binaries, and the
+# texts of each vendored crate compiled in, as <crate>-<file>.
+base     @libexec@/licenses/THIRD_PARTY_LICENSES.md
+base     @libexec@/licenses/tappers-LICENSE-MIT
+base     @libexec@/licenses/tappers-LICENSE-APACHE
 
 service  @unitdir@/netrulerouter-after-crash.service
 service  @unitdir@/netrulerouter-early.service
@@ -35,7 +41,9 @@ archive  uninstall.sh
 archive  lib/service-paths.sh
 archive  lib/desktop-paths.sh
 archive  lib/package-functions.sh
+archive  lib/glibc-floor
 archive  LICENSE
+archive  THIRD_PARTY_LICENSES.md
 archive  README.txt
 archive  README.ru.txt
 archive  root@libexec@/scripts/uninstall.sh

@@ -28,8 +28,14 @@ const PURGED_TABLES: &[&str] = &[
     "app_observed_destinations",
     "conn_history_prefs",
     "override_grants",
+    "override_revocations_pending",
     "vpn_gateway_confirmations",
+    // Only the user's own servers: the machine-wide set keeps `sid = ''`.
+    "vpn_bootstrap_endpoints",
 ];
+
+/// Backlogs: not something a user set up, so they alone do not list a user.
+const BACKLOG_TABLES: &[&str] = &["block_notice_journal", "override_revocations_pending"];
 
 /// Principals this database holds ANY state for, excluding the shared
 /// baseline. Full reset reads it to know whose data it is about to erase; the
@@ -43,14 +49,14 @@ const PURGED_TABLES: &[&str] = &[
 /// "N other users lose data" count shown before the reset was short by however
 /// many such users there were.
 ///
-/// A user with only undelivered block notices is not listed: a backlog is not
+/// A user with only undelivered notices is not listed: a backlog is not
 /// something they set up, and it ages out on its own.
 pub fn principals_with_state(conn: &Connection) -> StorageResult<Vec<String>> {
     let mut selects = vec!["SELECT principal AS p FROM revisions".to_string()];
     selects.extend(
         PURGED_TABLES
             .iter()
-            .filter(|t| **t != "block_notice_journal")
+            .filter(|t| !BACKLOG_TABLES.contains(t))
             .map(|t| format!("SELECT sid AS p FROM {t}")),
     );
     let sql = format!(
@@ -306,6 +312,18 @@ mod tests {
             params![sid],
         )
         .expect("vpn_gateway_confirmations");
+        conn.execute(
+            "INSERT INTO override_revocations_pending (sid, rule_value, effect, revoked_at, cause)
+             VALUES (?1, '/var/www/*', 'deny', 1, 'key-reset')",
+            params![sid],
+        )
+        .expect("override_revocations_pending");
+        conn.execute(
+            "INSERT INTO vpn_bootstrap_endpoints (sid, ip, port, protocol, source, learned_at)
+             VALUES (?1, '203.0.113.30', 443, 'tcp', 'observed', 1)",
+            params![sid],
+        )
+        .expect("vpn_bootstrap_endpoints");
     }
 
     fn row_count(conn: &Connection, table: &str, sid: &str) -> i64 {
@@ -494,6 +512,58 @@ mod tests {
                     | "lookup_events"
             ));
         }
+    }
+
+    /// A table added with a `sid` column and forgotten here survives "reset
+    /// everything" with that user's data in it. Each one is either purged or
+    /// named below with the reason it stays.
+    #[test]
+    fn every_table_keyed_by_user_is_purged_or_kept_on_purpose() {
+        const KEPT: &[&str] = &[
+            // Rules: their own reset path, never the auxiliary purge.
+            "revisions",
+            "active_revision_pointer",
+            "mutation_tokens",
+        ];
+        let conn = migrated_conn();
+        let mut stmt = conn
+            .prepare(
+                "SELECT m.name FROM sqlite_master m, pragma_table_info(m.name) c
+                 WHERE m.type = 'table' AND c.name IN ('sid', 'principal')
+                 ORDER BY m.name",
+            )
+            .expect("prepare");
+        let keyed: Vec<String> = stmt
+            .query_map([], |r| r.get(0))
+            .expect("query")
+            .collect::<rusqlite::Result<_>>()
+            .expect("collect");
+        let forgotten: Vec<&String> = keyed
+            .iter()
+            .filter(|t| !PURGED_TABLES.contains(&t.as_str()) && !KEPT.contains(&t.as_str()))
+            .collect();
+        assert!(
+            forgotten.is_empty(),
+            "user-keyed tables a full reset leaves behind: {forgotten:?}"
+        );
+    }
+
+    /// The machine-wide memory of tunnel servers (`sid = ''`) feeds every
+    /// user's block-all exemptions; one user's reset takes only their own rows.
+    #[test]
+    fn a_users_purge_keeps_the_machine_wide_tunnel_servers() {
+        let mut conn = migrated_conn();
+        for sid in ["", "S-A"] {
+            conn.execute(
+                "INSERT INTO vpn_bootstrap_endpoints (sid, ip, port, protocol, source, learned_at)
+                 VALUES (?1, '203.0.113.9', 443, 'tcp', 'observed', 1)",
+                params![sid],
+            )
+            .expect("seed");
+        }
+        purge_principal_data(&mut conn, "S-A").expect("purge");
+        assert_eq!(row_count(&conn, "vpn_bootstrap_endpoints", "S-A"), 0);
+        assert_eq!(row_count(&conn, "vpn_bootstrap_endpoints", ""), 1);
     }
 
     #[test]

@@ -2,7 +2,7 @@
 //! one stands for. Built from the state on every frame, so nothing is shown
 //! that the state does not hold; words stay keys until the view resolves them.
 
-use nrr_client_logic::notice_mutes::MUTABLE_NOTICE_KINDS;
+use nrr_client_logic::notice_mutes::{notice_kind_row, MUTABLE_NOTICE_KINDS};
 use nrr_client_logic::routing_settings::{self, RoutingContext};
 use nrr_client_logic::units::format_storage_bytes;
 use nrr_client_logic::{route_policy, stability};
@@ -485,22 +485,13 @@ fn notifications(app: &AppState) -> Vec<Item> {
             .block_notices
             .then_some((BLOCK_NOTICES, Words::Key(t::MUTE_ALL)));
         let site_notice = s.supports.site_notice_without_tray;
-        let kinds = block_row.into_iter().chain(
-            MUTABLE_NOTICE_KINDS
-                .iter()
-                .filter(move |k| {
-                    k.slug != nrr_client_logic::notice_mutes::SITE_NOT_OPENING_KIND || site_notice
-                })
-                .map(|k| {
-                    (
-                        k.slug,
-                        Words::Key(Key {
-                            id: k.title_key,
-                            en: k.title_en,
-                        }),
-                    )
-                }),
-        );
+        let kinds = block_row
+            .into_iter()
+            .chain(MUTABLE_NOTICE_KINDS.iter().filter_map(|k| {
+                let muted = kind_mute(mutes, k.slug).is_some();
+                notice_kind_row(k.slug, site_notice, muted)
+                    .map(|(id, en)| (k.slug, Words::Key(Key { id, en })))
+            }));
         for (kind, title) in kinds {
             let state = match kind_mute(mutes, kind) {
                 None => Words::Key(t::HIDDEN_SHOWN),
@@ -1052,20 +1043,22 @@ fn routing(app: &AppState) -> Vec<Item> {
         policy_toggle(policy, "browser-history-auto-seed", t::AUTO_SEED).note(t::AUTO_SEED_NOTE),
     );
     v.extend(local_suffixes(app));
-    v.push(heading(t::HOSTS_TITLE));
-    v.push(policy_toggle(
-        policy,
-        "resolve-hosts-bypass",
-        t::HOSTS_BYPASS,
-    ));
-    // Read only: the program never edits it, the user may.
-    if !s.hosts_file_path.is_empty() {
-        v.push(info(Words::Join(vec![
-            Words::Key(t::HOSTS_FILE),
-            raw(": "),
-            raw(s.hosts_file_path.clone()),
-        ])));
-        v.push(info(Words::Key(t::HOSTS_FILE_NOTE)));
+    if s.hosts_file_has_entries {
+        v.push(heading(t::HOSTS_TITLE));
+        v.push(policy_toggle(
+            policy,
+            "resolve-hosts-bypass",
+            t::HOSTS_BYPASS,
+        ));
+        // Read only: the program never edits it, the user may.
+        if !s.hosts_file_path.is_empty() {
+            v.push(info(Words::Join(vec![
+                Words::Key(t::HOSTS_FILE),
+                raw(": "),
+                raw(s.hosts_file_path.clone()),
+            ])));
+            v.push(info(Words::Key(t::HOSTS_FILE_NOTE)));
+        }
     }
     let offered = offered_routing_settings(app, stability_row.ok(), level);
     if offered.contains(&routing_settings::LOCAL_NETWORKS) {
@@ -1220,6 +1213,7 @@ fn routing_refinements(
         if !leak_row && !titled {
             titled = true;
             v.push(heading(t::ROUTING_METHOD));
+            v.push(info(Words::Key(t::ROUTING_METHOD_SCOPE)));
         }
         let item = match row {
             route_policy::KILL_SWITCH_PROTOCOLS_KEY => {

@@ -251,10 +251,28 @@ pub trait NrptRuleStore: Send + Sync {
     fn delete_rule(&self, key: &str) -> Result<bool, PlatformError>;
     /// Check our rule under `key` against `expected` and count damaged rules.
     fn scan(&self, key: &str, expected: &[RegistryValue]) -> Result<NrptTableScan, PlatformError>;
-    /// Delete what must not be there: every rule without a `Version`, and every
-    /// rule carrying `marker` under a key other than `keep` (copies from before
-    /// the key was fixed). Returns how many went.
+    /// Delete what [`sweep_takes`] says must not be there: our rules left
+    /// without a `Version`, and every rule carrying `marker` under a key other
+    /// than `keep` (copies from before the key was fixed). Returns how many went.
     fn sweep_orphans(&self, marker: &str, keep: &str) -> Result<usize, PlatformError>;
+}
+
+/// Every marker our rules carry.
+#[cfg(any(target_os = "windows", test))]
+const OUR_MARKERS: [&str; 3] = [NRPT_MARKER, NRPT_EXEMPT_MARKER, NRPT_KEEP_MARKER];
+
+/// Whether a sweep deletes the rule under `key`: a stale copy of `marker`'s
+/// rule under any key but `keep`, or a rule of ours left without a `Version`.
+/// Another writer's rule without one is left alone: it may be mid-write, and
+/// deleting it breaks that program's names.
+#[cfg(any(target_os = "windows", test))]
+fn sweep_takes(key: &str, has_version: bool, our_marker: bool, carries: bool, keep: &str) -> bool {
+    let our_key = key.eq_ignore_ascii_case(NRPT_RULE_KEY)
+        || key
+            .get(..5)
+            .is_some_and(|head| head.eq_ignore_ascii_case("{NRR-"));
+    let half_written_ours = !has_version && (our_key || our_marker);
+    half_written_ours || (carries && !key.eq_ignore_ascii_case(keep))
 }
 
 /// PowerShell listing candidate upstream IPv4 DNS servers as tab-separated
@@ -523,7 +541,7 @@ fn upstream_dns_lines_v6<R: CommandRunner>(
 /// Remove any orphaned NetRuleRouter Mode-B NRPT rule left by a prior crashed
 /// Resolver session, so a dead `:53` from a previous run never lingers and
 /// breaks all name resolution — plus the debris that breaks it another way: a
-/// half-written rule makes the DNS client reject the whole table. Safe to call
+/// half-written rule of ours makes the DNS client reject the whole table. Safe to call
 /// unconditionally at EVERY boot, regardless of the current enforcement mode.
 /// Never touches a VPN client's or an admin's own rule. Returns how many rules
 /// went, so the boot log can tell "nothing to clean" from "never ran".
@@ -795,8 +813,8 @@ impl<R: CommandRunner, S: NrptRuleStore> SystemDnsRedirectPort for NrptDnsRedire
     fn redirect_to(&self, listener: SocketAddr) -> Result<RedirectHandle, PlatformError> {
         let ip = listener.ip().to_string();
         self.forget_rule_sets();
-        // Debris first: a half-written rule, ours or anyone's, makes the DNS
-        // client reject the table our rule is about to join.
+        // Debris first: a half-written rule makes the DNS client reject the
+        // table our rule is about to join. Only ours is ours to remove.
         let swept = self.store.sweep_orphans(NRPT_MARKER, NRPT_RULE_KEY)?;
         if swept > 0 {
             tracing::warn!(
@@ -815,36 +833,26 @@ impl<R: CommandRunner, S: NrptRuleStore> SystemDnsRedirectPort for NrptDnsRedire
         if let Err(error) = self.inspect(&handle) {
             tracing::debug!(target: "nrr::dns-redirect", error = %error, "table scan after write failed");
         }
-        // Written is not honoured. Confirm against the table in force, and take
-        // a rejected rule back out: left in place it buys nothing and leaves
-        // the DNS client holding a policy it refuses, while the resolver above
-        // believes Mode B is armed.
-        match self.verify(&handle) {
-            Ok(RedirectState::Active) => Ok(handle),
-            Ok(RedirectState::Inactive) => {
-                let _ = self.store.delete_rule(NRPT_RULE_KEY);
-                Err(PlatformError::Transient {
-                    operation: "nrpt.redirect_to",
-                    detail: "NRPT rule was written but is absent from the policy table \
-                             Windows is using; the rule was withdrawn and system DNS \
-                             left untouched"
-                        .to_string(),
-                })
-            }
-            // Could not ask. Keep the redirect rather than tear down a working
-            // one: an unreadable answer is not a rejection, and treating it as
-            // one would disable Mode B wherever the query is unavailable.
-            Err(error) => {
-                tracing::warn!(
-                    target: "nrr::dns-redirect",
-                    msg_key = "win-dns-redirect-verify-unconfirmed",
-                    error = %error,
-                    "NRPT redirect installed but could not be confirmed against the \
-                     effective policy table; proceeding as armed",
-                );
-                Ok(handle)
-            }
+        // Written is not honoured; `confirm` asks the table in force, which
+        // costs a process and so is the caller's to run off the serving path.
+        Ok(handle)
+    }
+
+    /// Windows accepts the write and evaluates the table afterwards. A query
+    /// that could not run is not a refusal: treating it as one would disable
+    /// Mode B wherever the cmdlet is unavailable.
+    fn confirm(&self, handle: &RedirectHandle) -> Result<RedirectState, PlatformError> {
+        let verdict = self.verify(handle);
+        if let Err(error) = &verdict {
+            tracing::warn!(
+                target: "nrr::dns-redirect",
+                msg_key = "win-dns-redirect-verify-unconfirmed",
+                error = %error,
+                "NRPT redirect installed but could not be confirmed against the \
+                 effective policy table; proceeding as armed",
+            );
         }
+        verdict
     }
 
     /// Take the catch-all out AND every namespace we stepped out of.
@@ -1378,10 +1386,16 @@ mod transacted {
                 let Some(rule) = open(&path, "nrpt.sweep")? else {
                     continue;
                 };
-                let half_written = read_value(&rule, "Version")?.is_none();
-                let stale_copy = !name.eq_ignore_ascii_case(keep) && holds(&rule, &ours)?;
+                let has_version = read_value(&rule, "Version")?.is_some();
+                let mut our_marker = false;
+                for marker in super::OUR_MARKERS {
+                    our_marker |= holds(&rule, &super::sz("Comment", marker))?;
+                }
+                let carries = holds(&rule, &ours)?;
                 drop(rule);
-                if (half_written || stale_copy) && delete_tree(&path)? {
+                if super::sweep_takes(&name, has_version, our_marker, carries, keep)
+                    && delete_tree(&path)?
+                {
                     removed += 1;
                 }
             }

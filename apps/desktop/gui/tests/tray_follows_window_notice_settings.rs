@@ -90,6 +90,25 @@ fn the_tray_follows_a_change_made_after_it_started() {
     }
 }
 
+/// The tray's windows stayed at the default text size and font whatever the
+/// user chose: its theme never heard of either.
+#[test]
+fn the_tray_follows_the_windows_text_size_and_font() {
+    let tray = repo_file("apps/desktop/qml/Tray.qml");
+    assert!(tray.contains("fontScalePercent: tray.fontScalePercent"));
+    assert!(tray.contains("systemFont: tray.systemFont"));
+    assert!(function_body(&tray, "loadContext")
+        .contains("_takeAppearance(Pure.trayAppearanceOf(context))"));
+    assert!(
+        function_body(&tray, "_takeNoticePrefs").contains("_takeAppearance(presence.appearance)")
+    );
+    let main = repo_file("apps/desktop/qml/Main.qml");
+    assert!(main.contains("fontScalePercent: window.prefs.fontScalePercent"));
+    let presence = repo_file("apps/desktop/qml/components/GuiPresence.qml");
+    assert!(function_body(&presence, "publish").contains("Pure.trayAppearanceOf(snap.appearance)"));
+    assert!(function_body(&presence, "read").contains("Pure.trayAppearanceOf(parsed.appearance)"));
+}
+
 #[test]
 fn the_presence_reader_uses_the_shared_parser() {
     let presence = repo_file("apps/desktop/qml/components/GuiPresence.qml");

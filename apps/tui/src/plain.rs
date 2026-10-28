@@ -213,19 +213,26 @@ impl<W: Write> PlainSession<W> {
 }
 
 /// The screen as single lines that make sense on their own: the connection
-/// line, then each line under its panel's title. The feed is left out: its
-/// entries are printed as they arrive.
+/// line, then each line under its panel's title. The notice feed is left out:
+/// its entries are printed as they arrive. Other scrolling lists stay in, so a
+/// list the service sends after the screen was printed is printed too.
 fn summary(app: &AppState, texts: &Texts) -> Vec<String> {
     let view = screen(app.screen).view(app, texts);
+    let notice_feed = |panel: &crate::view::Panel| panel.feed && app.screen == ScreenId::Status;
     connection_lines(app, texts)
         .iter()
         .map(ViewLine::plain_text)
-        .chain(view.panels.iter().filter(|p| !p.feed).flat_map(|panel| {
-            panel
-                .lines
+        .chain(
+            view.panels
                 .iter()
-                .map(move |line| format!("{}: {}", panel.title, line.plain_text().trim()))
-        }))
+                .filter(|p| !notice_feed(p))
+                .flat_map(|panel| {
+                    panel
+                        .lines
+                        .iter()
+                        .map(move |line| format!("{}: {}", panel.title, line.plain_text().trim()))
+                }),
+        )
         .collect()
 }
 
@@ -335,6 +342,8 @@ pub fn run(
                 }
             }
             Ok(Incoming::Line(Some(line))) => {
+                // The window writes the shared settings file too.
+                crate::screens::rules::follow_settings_file(app);
                 session.input(&line, app, texts)?;
                 backend.send_outbox(&mut app.outbox);
                 if let Some(language) = app.language_change.take() {

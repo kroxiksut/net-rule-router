@@ -184,8 +184,7 @@ GroupBox {
     /// raises them, then every kind `nrr-domain` lets a user hide.
     readonly property var _hideableKinds: (group._blockNoticesSupported ? ["block-notices"] : [])
         .concat(Object.keys(Pure.MUTABLE_NOTICE_KINDS).filter(function (kind) {
-            // Only told where the service can start the tray to tell it.
-            return kind !== "site-not-opening" || root.supports("siteNoticeWithoutTray")
+            return group._kindRow(kind, group._blockNoticeMutes) !== null
         }))
     readonly property var _hideChoices: ["show"].concat(Object.keys(Pure.NOTICE_MUTE_CHOICES_MS))
 
@@ -195,8 +194,14 @@ GroupBox {
     function _kindTitle(kind) {
         if (kind === "block-notices")
             return root.tr("settings.block-notices.mutes.row-all", "All blocked-connection notices")
-        var title = Pure.MUTABLE_NOTICE_KINDS[kind] || [kind, kind]
+        var title = group._kindRow(kind, group._blockNoticeMutes)
+            || Pure.MUTABLE_NOTICE_KINDS[kind] || [kind, kind]
         return root.tr(title[0], title[1])
+    }
+    /// The [titleKey, titleEn] `kind` is listed under, or null when unlisted.
+    function _kindRow(kind, mutes) {
+        return Pure.noticeKindRow(kind, root.supports("siteNoticeWithoutTray"),
+            group._kindMute(kind, mutes) !== null)
     }
     /// The mute hiding `kind`, or null. `mutes` is passed so a binding on it
     /// re-reads when the list changes.

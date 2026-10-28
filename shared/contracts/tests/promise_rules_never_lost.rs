@@ -147,6 +147,11 @@ const GUARDS: &[(&str, &str, &str)] = &[
         "core/client-logic/tests/tray_addition_keeps_one_rule.rs",
         "an_override_on_the_same_route_is_the_rule_already_there",
     ),
+    (
+        "an update rebuilds a table of the service database",
+        "core/storage/src/migration/released_databases.rs",
+        "every_released_state_database_upgrades_without_losing_a_row",
+    ),
 ];
 
 fn repo_file(relative: &str) -> String {

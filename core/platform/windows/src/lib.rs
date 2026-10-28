@@ -51,8 +51,11 @@ pub mod autostart;
 // Runs a system tool under a budget, draining its pipes while it runs.
 #[cfg(windows)]
 mod bounded_command;
+// Keeps a panic in an OS callback from aborting the process.
 #[cfg(feature = "browser-stub")]
 pub mod browser_stub;
+#[cfg(windows)]
+mod callback_guard;
 pub mod conn_observe;
 pub mod constants;
 pub mod dns;

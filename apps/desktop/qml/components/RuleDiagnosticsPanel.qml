@@ -247,7 +247,7 @@ Frame {
                 && panel._probeReasonKey === ""
                 && panel._probeErrorCode === ""
             text: root.tr("diag.explain.empty",
-                "No explain sample available")
+                "No probe has been run yet. Enter a query above and click Probe.")
             color: root.mutedTextColor
             wrapMode: Text.WordWrap
         }

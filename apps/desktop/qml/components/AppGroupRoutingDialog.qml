@@ -276,7 +276,8 @@ Window {
                         "Traffic of WSL, Hyper-V, Docker, libvirt and other virtual machines does not belong to any "
                         + "program on this computer, so it cannot be given a route of its own. When it goes out "
                         + "through this computer, it follows the routes your rules set, as this computer's own "
-                        + "traffic does.")
+                        + "traffic does; a machine bridged straight onto your network goes past them. "
+                        + "Flexible routing for these environments is planned for the future.")
                 }
             }
 
@@ -468,7 +469,7 @@ Window {
                         text: root.tr("app-groups.vm-note",
                             "Virtual machine traffic follows the route assigned to its "
                             + "program. The default is the main route. A machine's local "
-                            + "networks always keep working, whichever route you pick.")
+                            + "networks (host-to-guest access) always keep working, whichever route you pick.")
                     }
                     Repeater {
                         model: root._virtualizationKinds

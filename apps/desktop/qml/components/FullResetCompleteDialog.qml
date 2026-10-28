@@ -54,8 +54,8 @@ Dialog {
             visible: !root.serviceCleared
             color: root.ownerRoot ? root.ownerRoot.uiTheme.colorWarning : "orange"
             text: root.tr("dialog.full-reset-done.service-warn",
-                "Note: the service rules could not be cleared (administrator "
-                + "approval is required). Re-run the reset and approve the prompt.")
+                "Note: some service-side data could not be cleared (administrator "
+                + "approval may be required, or a temporary error occurred). Re-run the reset.")
         }
         RowLayout {
             Layout.fillWidth: true

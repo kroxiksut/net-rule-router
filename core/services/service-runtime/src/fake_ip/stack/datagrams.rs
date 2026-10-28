@@ -304,6 +304,7 @@ impl FakeIpStack {
                     replies,
                     worker,
                     last_seen_at: now_ms,
+                    last_payload_len: pending.first_payload_len,
                     book_route: pending.book_route,
                     owner: pending.owner.clone(),
                 },
@@ -394,6 +395,7 @@ impl FakeIpStack {
         match flow.upstream.send(payload) {
             Ok(_) => {
                 flow.last_seen_at = now_ms;
+                flow.last_payload_len = payload.len();
                 true
             }
             // The upstream socket is gone (route torn down under the flow, peer
@@ -500,6 +502,7 @@ impl FakeIpStack {
     fn reap_idle_udp(&mut self, key: &(std::net::IpAddr, u16), now_ms: u64) {
         let cutoff = now_ms.saturating_sub(DEFAULT_SESSION_IDLE_MS);
         let mut reaped_workers = Vec::new();
+        let mut refused = Vec::new();
         let empty = if let Some(bind) = self.udp_binds.get_mut(key) {
             let stale: Vec<SocketAddr> = bind
                 .clients
@@ -512,6 +515,11 @@ impl FakeIpStack {
                 .collect();
             for client in stale {
                 if let Some(flow) = bind.clients.remove(&client) {
+                    // A dead reader is the server refusing (or the path
+                    // failing): the client hears it now, not at its own timer.
+                    if flow.replies.is_dead() {
+                        refused.push((client, flow.last_payload_len));
+                    }
                     flow.replies.mark_dead();
                     // Graveyard, not join — same poll-thread rule as TCP reap.
                     reaped_workers.push(flow.worker);
@@ -528,6 +536,9 @@ impl FakeIpStack {
             false
         };
         self.worker_graveyard.extend(reaped_workers);
+        for (client, payload_len) in refused {
+            self.send_port_unreachable(*key, client, payload_len);
+        }
         if empty {
             if let Some(bind) = self.udp_binds.remove(key) {
                 self.sockets.remove(bind.handle);

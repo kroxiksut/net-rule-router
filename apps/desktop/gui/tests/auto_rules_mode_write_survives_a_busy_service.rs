@@ -1,11 +1,11 @@
 //! "Add automatically" from the tray: a service too busy to answer in time
 //! gets the write again, and a failure that stays reaches the user instead of
-//! the console only. The executable check runs the real `pure.js` through
-//! `node`; skipped when node is absent.
+//! the console only. The executable check runs the real `pure.js`.
 
-use std::io::Write;
+#[path = "support/js.rs"]
+mod js;
+
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
 
 fn repo_file(relative: &str) -> String {
     let path: PathBuf = Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -16,37 +16,10 @@ fn repo_file(relative: &str) -> String {
         .replace("\r\n", "\n")
 }
 
-fn run_node(program: &str) -> Option<String> {
-    let mut child = Command::new("node")
-        .arg("-")
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .unwrap_or_else(|e| {
-            panic!("this check runs the QML JavaScript through node; install Node.js ({e})")
-        });
-    let Some(stdin) = child.stdin.as_mut() else {
-        panic!("stdin was piped")
-    };
-    stdin
-        .write_all(program.as_bytes())
-        .unwrap_or_else(|e| panic!("write the harness to node: {e}"));
-    let out = child
-        .wait_with_output()
-        .unwrap_or_else(|e| panic!("node runs to completion: {e}"));
-    assert!(
-        out.status.success(),
-        "node rejected the harness: {}",
-        String::from_utf8_lossy(&out.stderr)
-    );
-    Some(String::from_utf8_lossy(&out.stdout).into_owned())
-}
-
 #[test]
 fn only_a_late_answer_is_asked_again_and_not_forever() {
     let source = repo_file("apps/desktop/qml/lib/pure.js").replace(".pragma library", "");
-    let Some(out) = run_node(&format!(
+    let out = js::run_js(&format!(
         "{source}\nconsole.log(JSON.stringify([\
            busyRetryDelayMs('timeout', 0) > 0,\
            busyRetryDelayMs('rpc-timed-out', 1) > 0,\
@@ -55,10 +28,7 @@ fn only_a_late_answer_is_asked_again_and_not_forever() {
            busyRetryDelayMs('transport-disconnected', 0),\
            busyRetryDelayMs('', 0)\
          ]));\n"
-    )) else {
-        eprintln!("node not available — skipping the executable check");
-        return;
-    };
+    ));
     assert_eq!(out.trim(), "[true,true,-1,-1,-1,-1]");
 }
 

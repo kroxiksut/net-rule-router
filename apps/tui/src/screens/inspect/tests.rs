@@ -516,6 +516,162 @@ fn an_alert_change_elsewhere_re_reads_the_list_on_screen() {
     );
 }
 
+fn reads_of(fake: &FakeService, op: IpcOperationName) -> usize {
+    fake.operations().iter().filter(|o| **o == op).count()
+}
+
+fn service_restarts(app: &mut AppState, fake: &FakeService) {
+    for link in [Link::Stopped, Link::Connected] {
+        app.apply(
+            crate::backend::BackendEvent::Link(link),
+            &texts_en(),
+            Instant::now(),
+        );
+    }
+    settle(app, fake);
+}
+
+/// A restarted service may have restarted its audit chain or cleared alerts
+/// and cache entries: what was read before is read again, not kept unmarked.
+#[test]
+fn diagnostics_and_cache_are_read_again_after_the_service_comes_back() {
+    let fake = service();
+    let mut app = connected();
+    open(&mut app, &fake, ScreenId::Diagnostics);
+    let before = reads_of(&fake, IpcOperationName::SnapshotDiagnosticsGet);
+    service_restarts(&mut app, &fake);
+    assert_eq!(
+        reads_of(&fake, IpcOperationName::SnapshotDiagnosticsGet),
+        before + 1
+    );
+
+    open(&mut app, &fake, ScreenId::Cache);
+    let before = reads_of(&fake, IpcOperationName::CacheEntriesList);
+    service_restarts(&mut app, &fake);
+    assert_eq!(
+        reads_of(&fake, IpcOperationName::CacheEntriesList),
+        before + 1
+    );
+    // A screen not on show is read again once it is shown.
+    let before = reads_of(&fake, IpcOperationName::SnapshotDiagnosticsGet);
+    open(&mut app, &fake, ScreenId::Diagnostics);
+    assert_eq!(
+        reads_of(&fake, IpcOperationName::SnapshotDiagnosticsGet),
+        before + 1
+    );
+}
+
+fn alert_with(id: &str, reason: &str) -> Value {
+    let mut a = alert();
+    a["alert_id"] = json!(id);
+    a["reason_code"] = json!(reason);
+    a
+}
+
+fn answer_alerts(fake: &FakeService, alerts: Vec<Value>) {
+    let mut status = diagnostics_status();
+    status["security_status"]["active_alert_count"] = json!(alerts.len());
+    status["active_alerts"] = json!(alerts);
+    fake.answer(
+        IpcOperationName::SnapshotDiagnosticsGet,
+        json!({ "status": status }),
+    );
+}
+
+fn alerts_changed(app: &mut AppState, fake: &FakeService) {
+    app.apply(
+        crate::backend::BackendEvent::Push(crate::backend::PushEvent::Status(Box::new(
+            nrr_shared::ipc_payloads::StatusUpdateEvent::SecurityAlertsChanged,
+        ))),
+        &texts_en(),
+        Instant::now(),
+    );
+    settle(app, fake);
+}
+
+/// An alert raised elsewhere lands ahead of the chosen one: the cursor stays
+/// on its alert, so `a` never answers the newcomer.
+#[test]
+fn the_alert_cursor_stays_on_its_alert_when_the_list_changes() {
+    let fake = service();
+    answer_alerts(
+        &fake,
+        vec![
+            alert_with("alt-1", "first.reason"),
+            alert_with("alt-2", "second.reason"),
+        ],
+    );
+    let mut app = connected();
+    open(&mut app, &fake, ScreenId::Diagnostics);
+    answer_alerts(
+        &fake,
+        vec![
+            alert_with("alt-0", "newcomer.reason"),
+            alert_with("alt-1", "first.reason"),
+            alert_with("alt-2", "second.reason"),
+        ],
+    );
+    alerts_changed(&mut app, &fake);
+    let picture = render(&app, 100, 40);
+    let marked = picture
+        .lines()
+        .find(|l| l.contains("> ") && l.contains(".reason"))
+        .expect("a marked alert");
+    assert!(marked.contains("first.reason"), "{picture}");
+}
+
+/// Line mode: `a 1` names the alert printed first, wherever it went since.
+#[test]
+fn a_typed_alert_number_names_the_alert_as_printed() {
+    let fake = service();
+    answer_alerts(
+        &fake,
+        vec![
+            alert_with("alt-1", "first.reason"),
+            alert_with("alt-2", "second.reason"),
+        ],
+    );
+    let texts = texts_en();
+    let mut app = connected();
+    let mut session = PlainSession::new(Vec::new());
+    session.start(&app, &texts).expect("start");
+    session.input("9", &mut app, &texts).expect("open");
+    settle(&mut app, &fake);
+    session.input("", &mut app, &texts).expect("print again");
+    answer_alerts(
+        &fake,
+        vec![
+            alert_with("alt-0", "newcomer.reason"),
+            alert_with("alt-1", "first.reason"),
+            alert_with("alt-2", "second.reason"),
+        ],
+    );
+    alerts_changed(&mut app, &fake);
+    session.input("a 1", &mut app, &texts).expect("acknowledge");
+    settle(&mut app, &fake);
+    let sent =
+        serde_json::to_string(&fake.sent(IpcOperationName::MutationSubmit)).expect("requests");
+    assert!(sent.contains("alt-1"), "{sent}");
+    assert!(!sent.contains("alt-0"), "{sent}");
+}
+
+/// From the menu no alert is chosen in sight: `a` there only gives the list
+/// the focus, the next `a` acts on the marked alert.
+#[test]
+fn acknowledging_from_the_menu_first_gives_the_list_the_focus() {
+    let fake = service();
+    let mut app = connected();
+    open(&mut app, &fake, ScreenId::Diagnostics);
+    assert_eq!(app.focus, crate::state::Focus::Menu);
+    key(&mut app, KeyCode::Char('a'));
+    settle(&mut app, &fake);
+    assert!(!render(&app, 100, 40).contains("Acknowledge security alert"));
+    assert_eq!(app.focus, crate::state::Focus::Feed);
+    key(&mut app, KeyCode::Char('a'));
+    settle(&mut app, &fake);
+    assert!(render(&app, 100, 40).contains("Acknowledge security alert"));
+}
+
 #[test]
 fn an_alert_that_trusts_rule_sets_shows_them_before_acknowledging() {
     let fake = service();
@@ -523,6 +679,7 @@ fn an_alert_that_trusts_rule_sets_shows_them_before_acknowledging() {
     open(&mut app, &fake, ScreenId::Diagnostics);
     assert_snapshot("diagnostics-100x40", &render(&app, 100, 40));
 
+    key(&mut app, KeyCode::Tab);
     key(&mut app, KeyCode::Char('a'));
     settle(&mut app, &fake);
     let picture = render(&app, 100, 40);

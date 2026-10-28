@@ -1035,10 +1035,10 @@ mod tests {
         assert!(open_verified(&profile, &real, &me, 1024).is_ok());
 
         let link = profile.join("Local").join("Default");
-        if !make_dir_link(&foreign, &link) {
-            eprintln!("skipping: cannot create a directory link here");
-            return;
-        }
+        assert!(
+            make_dir_link(&foreign, &link),
+            "an unprivileged directory link must be creatable here"
+        );
         let redirected = link.join("History");
         assert!(
             redirected.is_file(),
@@ -1075,13 +1075,22 @@ mod tests {
         std::fs::write(&file, b"x").unwrap();
         let me = test_principal(dir.path());
         assert!(open_verified(dir.path(), &file, &me, 16).is_ok());
-        // Placeholder SID no local account carries.
-        let stranger = "S-1-5-21-0-0-0-4242";
-        if me == ADMINISTRATORS_SID || me == SYSTEM_SID {
-            eprintln!("skipping: this process's files are machine-owned");
-            return;
-        }
-        assert!(open_verified(dir.path(), &file, stranger, 16).is_err());
+
+        // A file the caller did not create, whoever the caller is: an elevated
+        // process owns its own files as Administrators, which every principal
+        // accepts, so the stranger is the system's own installer account.
+        let windir = std::env::var_os("SystemRoot").expect("SystemRoot");
+        let foreign = Path::new(&windir).join("System32").join("kernel32.dll");
+        let foreign = os::open_no_follow(&foreign).unwrap();
+        let owner = os::owner_sid(&foreign).unwrap();
+        assert!(
+            owner != me && owner != SYSTEM_SID && owner != ADMINISTRATORS_SID,
+            "kernel32.dll must belong to the installer account for this test, not {owner}"
+        );
+        assert_eq!(
+            os::check_owner(&foreign, &me),
+            Err("not owned by the requesting user".to_string())
+        );
     }
 
     #[test]
@@ -1334,10 +1343,10 @@ mod tests {
         );
         let me = test_principal(dir.path());
         let src = history_source(&profile, &db);
-        if !make_dir_link(&foreign, &with_suffix(&db, "-wal")) {
-            eprintln!("skipping: cannot create a directory link here");
-            return;
-        }
+        assert!(
+            make_dir_link(&foreign, &with_suffix(&db, "-wal")),
+            "an unprivileged directory link must be creatable here"
+        );
         let error = read_source_hostnames(&src, &me, std::slice::from_ref(&copies)).unwrap_err();
         assert!(error.starts_with("-wal:"), "{error}");
         assert_eq!(std::fs::read_dir(&copies).unwrap().count(), 0);

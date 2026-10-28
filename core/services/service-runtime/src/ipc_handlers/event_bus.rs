@@ -108,6 +108,11 @@ pub struct SubscriberState {
     pub last_activity: Instant,
     /// Set once the transport has a connection to wake.
     pub waker: Option<PushWaker>,
+    /// The stream already has a hole at its start (a resume that could not be
+    /// honoured, a replaced subscription that left events undelivered); the
+    /// transport says so before the first event. Clients read the marker, not
+    /// the subscribe answer's `gap-detected`.
+    pub resync_owed: bool,
 }
 
 /// Outcome of a `subscribe` call. The handler echoes
@@ -170,6 +175,17 @@ impl Ring {
             .copied()
             .unwrap_or(0);
         machine.max(own)
+    }
+}
+
+/// Machine-wide events reach everybody; somebody's own event reaches only
+/// them, and a subscriber whose principal the transport could not name sees
+/// none of those.
+fn visible_to(entry: &EventEntry, principal: Option<&str>) -> bool {
+    match (entry.audience.as_deref(), principal) {
+        (None, _) => true,
+        (Some(audience), Some(mine)) => audience == mine,
+        (Some(_), None) => false,
     }
 }
 
@@ -320,7 +336,9 @@ impl EventBus {
             // around: the client re-reads the state and follows from the head.
             Some(seen) => {
                 let resume_at = seen.saturating_add(1);
-                if lost_through >= resume_at {
+                // A cursor past the head was issued by an earlier run of the
+                // service; parked there, the subscription would hear nothing.
+                if resume_at > head || lost_through >= resume_at {
                     (head, true)
                 } else {
                     (resume_at, false)
@@ -357,6 +375,7 @@ impl EventBus {
                 cursor_event_id: cursor,
                 last_activity: now,
                 waker: None,
+                resync_owed: gap_detected,
             },
         );
 
@@ -400,14 +419,7 @@ impl EventBus {
         buf.events
             .iter()
             .filter(|e| e.event_id >= cursor)
-            .filter(|e| match (&e.audience, &principal) {
-                // Machine-wide: everybody sees it.
-                (None, _) => true,
-                // Somebody's own event reaches only them; a subscriber whose
-                // principal the transport could not name sees none of these.
-                (Some(audience), Some(mine)) => audience == mine,
-                (Some(_), None) => false,
-            })
+            .filter(|e| visible_to(e, principal.as_deref()))
             .take(max_count)
             .cloned()
             .collect()
@@ -417,17 +429,61 @@ impl EventBus {
     /// owed, the id to resume at past the hole. The cursor is left alone: the
     /// transport tells the client first and then advances past the hole.
     pub fn lost_events_resume_at(&self, subscription_id: &str) -> Option<u64> {
-        let (cursor, principal) = {
+        let (cursor, principal, owed) = {
             let subs = self.subscribers.lock().expect("subscribers poisoned");
             let sub = subs.get(subscription_id)?;
-            (sub.cursor_event_id, sub.principal.clone())
+            (sub.cursor_event_id, sub.principal.clone(), sub.resync_owed)
         };
         let lost_through = self
             .buffer
             .lock()
             .expect("event bus buffer poisoned")
             .lost_through(principal.as_deref());
-        (lost_through > 0 && lost_through >= cursor).then_some(lost_through + 1)
+        if lost_through > 0 && lost_through >= cursor {
+            Some(lost_through + 1)
+        } else {
+            owed.then_some(cursor.max(1))
+        }
+    }
+
+    /// The transport told the subscriber about its hole: resume at
+    /// `resume_at` and owe nothing more.
+    pub fn resync_sent(&self, subscription_id: &str, resume_at: u64) {
+        let mut subs = self.subscribers.lock().expect("subscribers poisoned");
+        if let Some(sub) = subs.get_mut(subscription_id) {
+            sub.cursor_event_id = sub.cursor_event_id.max(resume_at);
+            sub.resync_owed = false;
+            sub.last_activity = Instant::now();
+        }
+    }
+
+    /// `current` takes over from `previous` on the same connection. Whatever
+    /// `previous` still owed and `current` will not deliver is a hole the
+    /// client hears about; a `previous` the bus no longer knows may have owed
+    /// anything.
+    pub fn supersede(&self, previous: &str, current: &str) {
+        let mut subs = self.subscribers.lock().expect("subscribers poisoned");
+        let Some(next_cursor) = subs.get(current).map(|s| s.cursor_event_id) else {
+            return;
+        };
+        let owed = match subs.remove(previous) {
+            None => true,
+            Some(old) if old.resync_owed => true,
+            Some(old) => {
+                let buf = self.buffer.lock().expect("event bus buffer poisoned");
+                let lost = buf.lost_through(old.principal.as_deref());
+                (lost > 0 && lost >= old.cursor_event_id)
+                    || buf.events.iter().any(|e| {
+                        (old.cursor_event_id..next_cursor).contains(&e.event_id)
+                            && visible_to(e, old.principal.as_deref())
+                    })
+            }
+        };
+        if owed {
+            if let Some(sub) = subs.get_mut(current) {
+                sub.resync_owed = true;
+            }
+        }
     }
 
     /// Acknowledge delivery up to and including `event_id` for
@@ -831,16 +887,26 @@ mod tests {
         assert!(bus.peek_pending_for(&s.subscription_id, 0).is_empty());
     }
 
+    /// A cursor this run never issued comes from an earlier run of the service,
+    /// whose counter started again below it. Parked past the head, the
+    /// subscription heard nothing until the new run caught up with the old
+    /// number — hours of silence after a service restart.
     #[test]
-    fn empty_bus_subscribe_with_seen_id_clamps_to_head_no_gap() {
-        // No events buffered; client says it has seen id 5. Bus is
-        // empty, so "oldest" is None — `gap_detected` is false (no
-        // gap to detect). The cursor parks at head waiting for new
-        // events.
+    fn a_resume_cursor_ahead_of_the_head_is_not_a_silent_subscription() {
         let bus = EventBus::new();
-        let s = bus.subscribe("client-1".into(), Some(5));
-        assert!(!s.gap_detected);
+        bus.publish(adapters("ok"));
+        let s = bus.subscribe("client-1".into(), Some(500));
+        assert!(s.gap_detected, "what the old run had said may be stale");
         assert!(bus.peek_pending_for(&s.subscription_id, 16).is_empty());
+        let id = bus.publish(adapters("ok"));
+        let pending: Vec<u64> = bus
+            .peek_pending_for(&s.subscription_id, 16)
+            .iter()
+            .map(|e| e.event_id)
+            .collect();
+        assert_eq!(pending, vec![id], "this run's events reach it");
+        // Clients do not read `gap-detected`; the stream must say it too.
+        assert!(bus.lost_events_resume_at(&s.subscription_id).is_some());
     }
 
     #[test]

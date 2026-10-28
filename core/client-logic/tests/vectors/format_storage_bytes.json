@@ -11,7 +11,7 @@
     { "name": "one MiB", "input": { "bytes": 1048576 }, "expected": "1.0 MiB" },
     { "name": "five MiB", "input": { "bytes": 5242880 }, "expected": "5.0 MiB" },
     { "name": "one GiB", "input": { "bytes": 1073741824 }, "expected": "1.00 GiB" },
-    { "name": "odd GiB", "input": { "bytes": 2201170739 } },
+    { "name": "odd GiB", "input": { "bytes": 2201170739 }, "expected": "2.05 GiB" },
     { "name": "a TiB", "input": { "bytes": 1099511627776 }, "expected": "1024.00 GiB" }
   ]
 }

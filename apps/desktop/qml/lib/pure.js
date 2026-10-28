@@ -302,6 +302,19 @@ function trayNoticePrefsOf(raw) {
     }
 }
 
+// The text size and font the window publishes in the presence file, so the
+// tray's windows follow them. Any process of the user can rewrite that file:
+// anything but an object gives null, an unknown font the system one.
+var TRAY_SYSTEM_FONTS = ["system-default", "segoe-ui", "arial", "tahoma", "verdana"]
+function trayAppearanceOf(raw) {
+    if (!raw || typeof raw !== "object" || raw instanceof Array) return null
+    var font = String(raw.systemFont || "")
+    return {
+        fontScalePercent: normalizedFontScalePercent(raw.fontScalePercent),
+        systemFont: TRAY_SYSTEM_FONTS.indexOf(font) >= 0 ? font : "system-default"
+    }
+}
+
 // The bound files a merge now in force took: `paths` and `current` are each
 // route's bound file and its text now (`{ primary, secondary }`), `taken` the
 // texts the merge was built from (null for no merge). A file is taken only
@@ -388,6 +401,87 @@ function rememberedRulesPathFor(prefs, route, userPresetsDir) {
         if (isPathUnderDir(autoOpen, ownFolder)) return autoOpen
     }
     return autoOpen || loaded || saved
+}
+
+// ---- the user's settings file, changed by another client ----
+
+// The preferences the user's settings file carries for both clients.
+var USER_SETTINGS_PREF_KEYS = [
+    "userPresetsDir", "selectedPresetSet", "mergeConflictPolicy",
+    "lastSavedPathPrimary", "lastSavedPathSecondary",
+    "lastLoadedPathPrimary", "lastLoadedPathSecondary",
+    "serviceIntentJson", "acceptedEulaVersion"
+]
+
+// The id of the "settings file damaged" card after one follow answer;
+// `current` is the one on screen ("" for none). A new episode gets a new id,
+// so a card dismissed earlier does not silence it; an answer that did not
+// read the file keeps the card, one that read it withdraws it.
+function userSettingsDamageNoticeId(answer, current, nowMs) {
+    var shown = String(current || "")
+    if (!answer) return shown
+    if (answer.damaged === true)
+        return shown !== "" ? shown : "user-settings-damaged:" + String(nowMs)
+    if (answer.changed === true) return ""
+    return shown
+}
+
+// What the window takes of `incoming`, the shared fields another client
+// changed: `take` goes into the preferences, `rebase` into the Apply/Cancel
+// snapshot (`snapshot`, null when nothing waits). A buffered key the user
+// changed and has not applied keeps the user's value; Cancel then returns to
+// the incoming one.
+function userSettingsAdoption(prefs, snapshot, buffered, incoming) {
+    var p = prefs || {}
+    var b = buffered || {}
+    var src = incoming || {}
+    var take = {}
+    var rebase = {}
+    var changed = false
+    for (var i = 0; i < USER_SETTINGS_PREF_KEYS.length; i += 1) {
+        var key = USER_SETTINGS_PREF_KEYS[i]
+        if (!Object.prototype.hasOwnProperty.call(src, key)) continue
+        var value = src[key]
+        if (snapshot) {
+            rebase[key] = value
+            if (b[key] === true && snapshot[key] !== p[key]) continue
+        }
+        if (p[key] !== value) {
+            take[key] = value
+            changed = true
+        }
+    }
+    return { take: take, rebase: rebase, changed: changed }
+}
+
+function samePathText(a, b) {
+    var x = String(a || "")
+    var y = String(b || "")
+    if (x === "" || y === "") return x === y
+    return isPathUnderDir(x, y) && isPathUnderDir(y, x)
+}
+
+// The rules files the tray works with. The window's own answer while it runs.
+// Once it is gone, a route another client bound elsewhere since (`bound`, the
+// shared file's binding, differs from the one that answer stood on) follows
+// the shared file: writing the old file would put the new rules over another
+// set. `bound` null, or a window that did not publish its binding: the
+// answer stands.
+function trayRulesPaths(snap, bound) {
+    var s = snap || {}
+    var out = {
+        primary: String(s.rulesPathPrimary || ""),
+        secondary: String(s.rulesPathSecondary || "")
+    }
+    if (s.windowRunning === true || !bound || typeof bound !== "object") return out
+    var routes = [["primary", "boundPrimary"], ["secondary", "boundSecondary"]]
+    for (var i = 0; i < routes.length; i += 1) {
+        var stood = s[routes[i][1]]
+        if (stood === null || stood === undefined) continue
+        var now = String(bound[routes[i][0]] || "")
+        if (!samePathText(now, stood)) out[routes[i][0]] = now
+    }
+    return out
 }
 
 // ---- the user's rule-set folder ----
@@ -1858,6 +1952,19 @@ var NOTICE_MUTE_CHOICES_MS = {
     "forever": 0
 }
 
+// The [titleKey, titleEn] Settings lists notice `kind` under, or null when it
+// is not listed. The site notice is listed where the tray can be started to
+// tell it, and wherever a mute of it holds (the tray's card sets one on any
+// platform and only this row lifts it); there it makes no closed-tray promise.
+// Twin of `nrr_client_logic::notice_mutes::notice_kind_row`.
+function noticeKindRow(kind, siteNoticeWithoutTray, muted) {
+    var key = String(kind)
+    if (!Object.prototype.hasOwnProperty.call(MUTABLE_NOTICE_KINDS, key)) return null
+    if (key !== "site-not-opening" || siteNoticeWithoutTray === true)
+        return MUTABLE_NOTICE_KINDS[key]
+    return muted === true ? ["tray.site-not-opening.title", "A site does not open"] : null
+}
+
 // Keys of the route overlaps a rule saved from the rule dialog settles by
 // itself: the saved rule sits inside a wider rule of the other route and wins,
 // which is how an exception is written. A tie, an intersection or a new wide
@@ -2632,12 +2739,17 @@ function firstRunHeldProtection(policySaved, defaultRoute, leakProtection, dohAu
     }
 }
 
-// What the first-run setup writes when it ends: `{protection, stability}`.
-// A user already set up keeps what the service holds unless a choice changed.
-// Twin of `route_policy::first_run_writes`.
-function firstRunWrites(held, level, doh, stabilityTouched) {
+// What the first-run setup writes when it ends: `{protection, stability,
+// fakeIp}`. A user already set up keeps what the service holds unless a
+// choice changed. Twin of `route_policy::first_run_writes`.
+function firstRunWrites(held, level, doh, stabilityTouched, fakeIpTouched) {
     var same = !!held && held.level === level && held.doh === (doh === true)
-    return { protection: !same, stability: !held || stabilityTouched === true }
+    var fakeIp = !held || fakeIpTouched === true
+    return {
+        protection: !same,
+        stability: fakeIp || stabilityTouched === true,
+        fakeIp: fakeIp
+    }
 }
 
 // What moving leak protection from `current` to `next` (both settled against
@@ -4171,24 +4283,25 @@ function groupRouteOf(rules, programs) {
 }
 
 // The order of a full reset. The service is stopped last: every earlier step
-// needs it answering.
+// needs it answering. No step writes a rule book: after the purge the user
+// reads the baseline, like a new one.
 var FULL_RESET_ORDER = ["clear-logs", "reset-sidecar", "purge-principal-data",
-    "apply-empty-rules", "stop-service"]
+    "stop-service"]
 
 // What a full reset does after the steps done so far. `done` is a list of
 // { step, result } in the order run, result "ok" | "failed" | "forbidden" |
 // "skipped". A failed step does not abort the next ones, except a refused
-// purge or rules step when the client cannot elevate by itself: the flow
-// stops ("needs-elevation") instead of stopping a service whose rules are
-// still in place. Otherwise { action: "run", step } or, after the last step,
-// { action: "finish", cleared } (purge, rules and stop all "ok").
+// purge when the client cannot elevate by itself: the flow stops
+// ("needs-elevation") instead of stopping a service whose rules are still in
+// place. Otherwise { action: "run", step } or, after the last step,
+// { action: "finish", cleared } (purge and stop both "ok").
 function fullResetNext(canElevate, done) {
     var list = done || []
     var out = { action: "", step: "", cleared: false, why: "" }
     if (list.length > 0) {
         var last = list[list.length - 1]
         if (last.result === "forbidden" && canElevate !== true
-                && (last.step === "purge-principal-data" || last.step === "apply-empty-rules")) {
+                && last.step === "purge-principal-data") {
             out.action = "stop"
             out.step = last.step
             out.why = "needs-elevation"
@@ -4207,6 +4320,6 @@ function fullResetNext(canElevate, done) {
         return false
     }
     out.action = "finish"
-    out.cleared = ok("purge-principal-data") && ok("apply-empty-rules") && ok("stop-service")
+    out.cleared = ok("purge-principal-data") && ok("stop-service")
     return out
 }

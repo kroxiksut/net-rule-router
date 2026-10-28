@@ -409,12 +409,55 @@ fn forwards_aaaa_and_steers_non_rule_a() {
     );
 }
 
+/// A rule host answered with a virtual address, or whose IPv6 the tunnel
+/// cannot carry, gets no HTTPS record: its `ipv4hint`/`ipv6hint` hand the
+/// browser the real addresses, and a connection to them skips the per-site
+/// routing (or waits on a family the tunnel drops).
+#[test]
+fn an_https_record_does_not_hand_out_addresses_the_rule_host_is_not_answered_with() {
+    use crate::enforcement_planner::Ipv6Guard;
+    let nodata = |action: ListenerAction, why: &str| match action {
+        ListenerAction::Respond(bytes) => {
+            assert_eq!(bytes[3] & 0x0f, RCODE_NOERROR, "{why}: NOERROR");
+            assert_eq!(&bytes[6..8], &[0, 0], "{why}: no answer records");
+        }
+        other => panic!("{why}: expected NODATA, got {other:?}"),
+    };
+    let virtual_addresses = listener(
+        &["assistant.example"],
+        Ok(resolved(&[Ipv4Addr::new(100, 64, 1, 4)])),
+    )
+    .with_fake_ip(std::sync::Arc::new(CarriesOnV4(true)));
+    nodata(
+        virtual_addresses.answer_query(&query("assistant.example", QTYPE_HTTPS)),
+        "virtual addresses",
+    );
+    assert_eq!(
+        virtual_addresses.answer_query(&query("example.com", QTYPE_HTTPS)),
+        ListenerAction::Forward,
+        "a name no rule claims keeps its record"
+    );
+
+    for (guard, why) in [
+        (Some(Ipv6Guard::FiltersOnly), "the tunnel cannot carry IPv6"),
+        (None, "no plan yet"),
+    ] {
+        let l = listener(
+            &["assistant.example"],
+            Ok(resolved(&[Ipv4Addr::new(100, 64, 1, 4)])),
+        )
+        .with_ipv6_disposition(Arc::new(move || guard));
+        nodata(
+            l.answer_query(&query("assistant.example", QTYPE_HTTPS)),
+            why,
+        );
+    }
+}
+
 #[test]
 fn https_rr_is_forwarded_raw_for_rule_and_direct_hosts() {
-    // Pins today's behaviour, which is a known hole rather than a decision:
-    // an HTTPS answer's `ipv4hint` carries real addresses past both the
-    // rule-host interception and the direct-answer steering. CDN-fronted
-    // names populate that hint in practice.
+    // Real A answers and a v6 the tunnel carries (or nothing pins): the hints
+    // name the addresses the routes already follow.
     let l = listener(
         &["assistant.example"],
         Ok(resolved(&[Ipv4Addr::new(100, 64, 1, 4)])),
@@ -1176,6 +1219,38 @@ fn asking_the_private_resolvers_spends_one_budget_between_them() {
             (SECOND_RESOLVER, budget - first_answer_after),
         ]
     );
+}
+
+/// A domain PC asks its internal names over and over; a line per query would
+/// push the week the log is kept for out within a day.
+#[test]
+fn a_private_resolver_answering_every_query_is_logged_once() {
+    use tracing_subscriber::layer::SubscriberExt;
+    let listener = two_private_resolvers_listener(Duration::from_secs(2));
+    let dir = tempfile::TempDir::new().expect("temp dir");
+    let writer = Arc::new(nrr_diagnostics::LogWriter::open(
+        nrr_diagnostics::LogWriterConfig::new(dir.path()),
+    ));
+    let subscriber =
+        tracing_subscriber::registry().with(nrr_diagnostics::NdjsonTracingLayer::new(writer));
+    tracing::subscriber::with_default(subscriber, || {
+        for _ in 0..50 {
+            let (reply, _) = ask_on_a_manual_clock(&listener, Duration::from_secs(1), |_, _, q| {
+                (
+                    Duration::from_millis(5),
+                    build_a_response(q, &[Ipv4Addr::new(10, 1, 2, 3)], 60),
+                )
+            });
+            assert!(reply.is_some(), "the private resolver answers");
+        }
+    });
+    let wanted = "diag.event.dns-listener-local-resolver-knows-name";
+    let lines: usize = std::fs::read_dir(dir.path())
+        .expect("logs dir")
+        .map(|e| std::fs::read_to_string(e.expect("entry").path()).expect("read"))
+        .map(|text| text.lines().filter(|l| l.contains(wanted)).count())
+        .sum();
+    assert_eq!(lines, 1, "one fact, one line");
 }
 
 /// The first resolver is mute and spends its whole window; the second answers.

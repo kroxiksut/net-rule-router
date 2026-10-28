@@ -346,6 +346,7 @@ struct ClientInner {
     /// Counter behind the replayed subscription's `request-id`, so a replay
     /// never collides with an in-flight caller request.
     replay_seq: AtomicU64,
+    delivered_trace: crate::FrameTraceBudget,
 }
 
 impl ClientInner {
@@ -367,6 +368,7 @@ impl ClientInner {
             last_subscribe: Mutex::new(None),
             subscription_id: Mutex::new(None),
             replay_seq: AtomicU64::new(0),
+            delivered_trace: crate::FrameTraceBudget::default(),
         }
     }
 
@@ -924,7 +926,13 @@ fn route_push_frame(inner: &Arc<ClientInner>, frame: &Value, source: &str) {
     };
     send_pending_gap(inner, tx);
     match tx.try_send(payload) {
-        Ok(()) => client_trace!("nrr-ipc-client: push {event_type} delivered (source={source})"),
+        Ok(()) => {
+            if let Some(n) = inner.delivered_trace.note() {
+                client_trace!(
+                    "nrr-ipc-client: push {event_type} delivered (source={source}, frame {n})"
+                );
+            }
+        }
         Err(e) => {
             client_trace!("nrr-ipc-client: push {event_type} dropped — channel full ({e})");
             inner.push_gap.store(true, Ordering::SeqCst);

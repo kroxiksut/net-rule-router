@@ -154,7 +154,6 @@ fn dial_tcp_with_hold_genuine_network_error_never_holds_even_when_off() {
 
     let shared = FlowShared::new(StackWaker::new());
     let instant_rst = AtomicBool::new(false); // hold-and-retry is enabled...
-    let started = std::time::Instant::now();
     let (result, mode, attempts) = dial_tcp_with_hold(
         shared.as_ref(),
         &AlwaysUpstreamError,
@@ -164,12 +163,8 @@ fn dial_tcp_with_hold_genuine_network_error_never_holds_even_when_off() {
         Duration::from_secs(5), // ...with a long window that must NOT be used
     );
     assert!(matches!(result, Err(RelayError::Upstream { .. })));
-    assert_eq!(mode, "instant");
+    assert_eq!(mode, "instant", "a genuine network error must never hold");
     assert_eq!(attempts, 1);
-    assert!(
-        started.elapsed() < Duration::from_millis(500),
-        "a genuine network error must fail fast, never hold"
-    );
 }
 
 #[test]
@@ -191,12 +186,14 @@ fn dial_tcp_with_hold_retries_and_succeeds_when_instant_rst_is_off() {
     assert_eq!(dialer.call_count(), 3);
 }
 
+/// The hold ends with its window. Every retry sleeps at least one interval,
+/// so a window of six intervals allows at most six retries; a stalled machine
+/// only makes fewer, never more.
 #[test]
 fn dial_tcp_with_hold_gives_up_after_the_window_when_still_refused() {
     let dialer = FlakyPolicyDialer::new(u32::MAX); // never resolves
     let shared = FlowShared::new(StackWaker::new());
     let instant_rst = AtomicBool::new(false);
-    let started = std::time::Instant::now();
     let (result, mode, attempts) = dial_tcp_with_hold(
         shared.as_ref(),
         &dialer,
@@ -211,45 +208,62 @@ fn dial_tcp_with_hold_gives_up_after_the_window_when_still_refused() {
     ));
     assert_eq!(mode, "held");
     assert!(
-        attempts >= 2,
-        "must have retried at least once before giving up, got {attempts}"
+        (2..=7).contains(&attempts),
+        "must retry within the window and stop at its end, got {attempts}"
     );
-    assert!(
-        started.elapsed() < Duration::from_secs(2),
-        "must give up promptly once the window elapses, not hang"
-    );
+    assert_eq!(dialer.call_count(), attempts);
+}
+
+/// A dialer that refuses by policy and reports the flow dead on its
+/// `dies_on`-th call, as a client reset arriving mid-hold.
+struct DyingFlowDialer {
+    inner: FlakyPolicyDialer,
+    shared: Arc<FlowShared>,
+    dies_on: u32,
+}
+impl dialer::RelayDialer for DyingFlowDialer {
+    fn connect_tcp(
+        &self,
+        target: &dialer::UpstreamTarget,
+    ) -> Result<Box<dyn dialer::RelayStream>, dialer::RelayError> {
+        let result = self.inner.connect_tcp(target);
+        if self.inner.call_count() == self.dies_on {
+            self.shared.mark_dead();
+        }
+        result
+    }
+    fn connect_udp(
+        &self,
+        target: &dialer::UpstreamTarget,
+    ) -> Result<Box<dyn dialer::RelayDatagram>, dialer::RelayError> {
+        self.inner.connect_udp(target)
+    }
 }
 
 #[test]
 fn dial_tcp_with_hold_stops_retrying_when_the_flow_dies_mid_hold() {
-    let dialer = FlakyPolicyDialer::new(u32::MAX); // never resolves
     let shared = FlowShared::new(StackWaker::new());
+    let dialer = DyingFlowDialer {
+        inner: FlakyPolicyDialer::new(u32::MAX), // never resolves
+        shared: Arc::clone(&shared),
+        dies_on: 3,
+    };
     let instant_rst = AtomicBool::new(false);
-    {
-        let shared = Arc::clone(&shared);
-        std::thread::spawn(move || {
-            std::thread::sleep(Duration::from_millis(30));
-            shared.mark_dead();
-        });
-    }
-    let started = std::time::Instant::now();
-    let (result, mode, _attempts) = dial_tcp_with_hold(
+    let (result, mode, attempts) = dial_tcp_with_hold(
         shared.as_ref(),
         &dialer,
         &hold_test_target(),
         &instant_rst,
         Duration::from_millis(10),
-        Duration::from_secs(10), // long window — the death must cut it short
+        Duration::from_secs(600), // a window the death must cut short
     );
     assert!(matches!(
         result,
         Err(RelayError::SourcePolicyRefused { .. })
     ));
     assert_eq!(mode, "held");
-    assert!(
-        started.elapsed() < Duration::from_secs(2),
-        "a dead flow must stop the hold promptly instead of running out the window"
-    );
+    assert_eq!(attempts, 3, "no dial after the flow died");
+    assert_eq!(dialer.inner.call_count(), 3);
 }
 
 /// A dialer that parks the dial for one designated upstream until released,

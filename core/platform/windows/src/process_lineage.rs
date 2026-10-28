@@ -155,6 +155,11 @@ impl ProcessLineagePort for EtwProcessLineage {
 
 /// C-ABI record callback: starts and exits into the ring.
 unsafe extern "system" fn event_record_callback(record: *mut EVENT_RECORD) {
+    // SAFETY: forwarded as ETW handed it: a live record for this call, or null.
+    crate::callback_guard::contain_panic("etw-process", || unsafe { handle_record(record) });
+}
+
+unsafe fn handle_record(record: *mut EVENT_RECORD) {
     if record.is_null() {
         return;
     }

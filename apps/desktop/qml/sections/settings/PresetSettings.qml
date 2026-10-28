@@ -105,9 +105,11 @@ GroupBox {
             wrapMode: Text.WordWrap
             text: root.tr(
                 "settings.presets.full-settings-description",
-                "Export adapter bindings, behavior mode, and rules-file " +
-                "paths as a single YAML file. Useful for backing up or " +
-                "transferring your settings.")
+                "Export adapter bindings, your rules for both routes (those " +
+                "for other operating systems included), the paths of your " +
+                "rules files, the default route and leak protection as a " +
+                "single YAML file. Useful for backing up or transferring " +
+                "your settings.")
         }
         ThemedButton {
             theme: root.uiTheme
@@ -391,7 +393,7 @@ GroupBox {
         if (typeof nrrNativeBridge === "undefined" || !nrrNativeBridge
                 || typeof nrrNativeBridge.bundledPresetsRoot !== "function") {
             root.statusLine = root.tr("status.bridge-unavailable",
-                "Native bridge unavailable")
+                "Service bridge not connected.")
             return
         }
         var dir = String(nrrNativeBridge.bundledPresetsRoot() || "")
@@ -427,7 +429,7 @@ GroupBox {
         if (typeof nrrNativeBridge === "undefined" || !nrrNativeBridge
                 || typeof nrrNativeBridge.createPresetSetDir !== "function") {
             root.statusLine = root.tr("status.bridge-unavailable",
-                "Native bridge unavailable")
+                "Service bridge not connected.")
             return
         }
         // Writing into the app's own folder survives until the next update
@@ -494,7 +496,7 @@ GroupBox {
                 || typeof nrrNativeBridge.readFileBytes !== "function") {
             root.statusLine = root.tr(
                 "status.bridge-unavailable",
-                "Native bridge unavailable")
+                "Service bridge not connected.")
             return
         }
         var b64 = nrrNativeBridge.readFileBytes(path)
@@ -525,14 +527,26 @@ GroupBox {
                 || typeof nrrNativeBridge.rpcSettingsExportFull !== "function") {
             root.statusLine = root.tr(
                 "status.bridge-unavailable",
-                "Native bridge unavailable")
+                "Service bridge not connected.")
             return
         }
-        // The server does not yet expose UiPreferences::last_saved_path_<role>.
-        // Pass empty strings; the server emits
-        // empty paths in `rules_files:` block, which the YAML reader
-        // tolerates (user can fill them in later by re-importing).
-        var corr = nrrNativeBridge.rpcSettingsExportFull("", "")
+        // The bound files and the sections of them this system does not apply
+        // live with us, not in the service: the export learns them from us,
+        // as "Save to file" does.
+        var writer = root.boundFilesController.writer
+        writer.readPassthroughSections("primary", function(primarySections) {
+            writer.readPassthroughSections("secondary", function(secondarySections) {
+                _requestSettingsExport(path, primarySections, secondarySections)
+            })
+        })
+    }
+
+    function _requestSettingsExport(path, primarySections, secondarySections) {
+        var corr = nrrNativeBridge.rpcSettingsExportFull(
+            String(root.prefs.lastSavedPathPrimary || ""),
+            String(root.prefs.lastSavedPathSecondary || ""),
+            primarySections || ({}),
+            secondarySections || ({}))
         if (root.rpc && typeof root.rpc.registerRpcCallback === "function") {
             root.rpc.registerRpcCallback(corr, function(ok, p, code, msg) {
                 if (!ok) {
@@ -548,7 +562,7 @@ GroupBox {
                 var ok2 = nrrNativeBridge.writeFileBytes(path, b64)
                 if (!ok2) {
                     root.statusLine = root.tr(
-                        "status.export-write-failed",
+                        "status.settings-export-write-failed",
                         "Cannot write settings file to the chosen path.")
                     return
                 }

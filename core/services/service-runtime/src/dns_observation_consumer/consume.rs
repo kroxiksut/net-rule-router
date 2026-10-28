@@ -305,6 +305,9 @@ impl DnsObservationConsumer {
                 if crate::any_zone_sites::opens_a_zone(&snapshot.rule_book, &obs.hostname) {
                     crate::any_zone_sites::note_new_zone();
                 }
+                if in_secondary {
+                    self.note_earlier_tenants(&obs.hostname, &routable, &snapshot.rule_book, now);
+                }
             } else {
                 summary.ignored = summary.ignored.saturating_add(1);
                 // Discarded from the CACHE, kept as a name. An address

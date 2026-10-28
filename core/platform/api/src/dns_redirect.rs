@@ -65,6 +65,15 @@ pub trait SystemDnsRedirectPort: Send + Sync {
     /// Report whether our redirect is currently active — read from the
     /// configuration the OS is actually using, which can cost a process.
     fn verify(&self, handle: &RedirectHandle) -> Result<RedirectState, PlatformError>;
+    /// Whether the OS honours a redirect [`Self::redirect_to`] just wrote, where
+    /// it can accept the write and refuse the rule afterwards. Slow: the caller
+    /// asks off the serving path and withdraws the redirect on `Inactive`; an
+    /// error means "could not ask", never a refusal. Default: `Active`, for a
+    /// platform whose write is the configuration in force.
+    fn confirm(&self, handle: &RedirectHandle) -> Result<RedirectState, PlatformError> {
+        let _ = handle;
+        Ok(RedirectState::Active)
+    }
     /// Cheap self-check of what we CONFIGURED: our redirect is present and
     /// intact, and nothing sits beside it that makes the OS reject the whole
     /// configuration. Meant for a periodic guard, where `verify`'s cost is not.

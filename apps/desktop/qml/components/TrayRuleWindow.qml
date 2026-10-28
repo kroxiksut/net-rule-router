@@ -69,9 +69,14 @@ ApplicationWindow {
     }
     /// The service counts its own limit; the form marks nothing over it here.
     function bulkRuleRoom() { return -1 }
-    /// A pasted list of rules (`Rules.planBulkRules`): its new rules and the
-    /// moves the user ticked go to the service in one apply.
+    /// A pasted list of rules: its new rules and the moves the user ticked go
+    /// to the service in one apply. The plan on screen was made against the
+    /// rules read when the form opened, so `_submitBulk` plans it again.
     function saveBulkRules(plan) {
+        _submitBulk()
+    }
+    /// The adds and the moves of a bulk `plan` as table rows.
+    function _bulkItems(plan) {
         var adds = []
         var moves = []
         var rows = (plan && plan.rows) || []
@@ -89,8 +94,7 @@ ApplicationWindow {
             if (r.action === "add") adds.push(item)
             else moves.push(item)
         }
-        _bulkRemaining = String((plan && plan.remaining) || "")
-        _submitBulk(adds, moves)
+        return { adds: adds, moves: moves }
     }
 
     // ── Window ──
@@ -390,10 +394,13 @@ ApplicationWindow {
         })
     }
 
-    /// The adds and the moves of a pasted list against the rules read again
-    /// now, sent as one rule book. A move whose rule is gone is added instead.
-    function _submitBulk(adds, moves) {
+    /// The pasted list planned against the rules read again now
+    /// (`Rules.planBulkSubmission`) and sent as one rule book. A move whose
+    /// rule is gone is added instead; a line whose value has since appeared on
+    /// another route goes back into the form with the form's reason.
+    function _submitBulk() {
         _pendingItems = []
+        _bulkRemaining = ""
         _setState("busy", tr("tray.add-rule.saving", "Adding the rule\u2026"))
         _loadRows(function(ok) {
             if (!ok) {
@@ -401,8 +408,11 @@ ApplicationWindow {
                     "Could not read your rules from the service, so nothing was added. Check that the service is running."))
                 return
             }
-            var first = Rules.planRuleAddition(trayRuleWindow._rows, adds, false)
-            var second = Rules.planRuleAddition(first.rows, moves, true)
+            var fresh = Rules.planBulkSubmission(ruleDialog.bulkPlanInput(), trayRuleWindow._rows)
+            trayRuleWindow._bulkRemaining = String(fresh.remaining || "")
+            var items = trayRuleWindow._bulkItems(fresh)
+            var first = Rules.planRuleAddition(trayRuleWindow._rows, items.adds, false)
+            var second = Rules.planRuleAddition(first.rows, items.moves, true)
             var plan = {
                 rows: second.rows,
                 added: first.added + second.added,
@@ -414,12 +424,32 @@ ApplicationWindow {
                 bulk: true
             }
             if (plan.added === 0 && plan.changed === 0) {
+                if (trayRuleWindow._giveBackRemaining()) return
                 trayRuleWindow._setState("duplicate",
                     tr("dialog.rule.duplicate-title", "Rule already exists"))
                 return
             }
             trayRuleWindow._send(plan)
         })
+    }
+
+    /// The lines a pasted list did not take, back in the form, which shows why
+    /// for each. Shown again if the user closed it meanwhile: they are the
+    /// user's typing, not to be dropped. False when there were none.
+    function _giveBackRemaining() {
+        var remaining = _bulkRemaining
+        _bulkRemaining = ""
+        if (remaining === "") return false
+        _state = ""
+        _message = ""
+        ruleDialog.resumeBulk(remaining)
+        if (!visible) {
+            show()
+            raise()
+            requestActivate()
+        }
+        ruleDialog.open()
+        return true
     }
 
     // A deny is not a route: the messages below say "denied" where the
@@ -501,13 +531,7 @@ ApplicationWindow {
             Rules.additionUndoRecord(plan), _awaitsConfirmation(plan))
         _state = ""
         // Lines a pasted list left behind come back into the form to be fixed.
-        if (plan.bulk === true && _bulkRemaining !== "" && visible) {
-            var remaining = _bulkRemaining
-            _bulkRemaining = ""
-            ruleDialog.resumeBulk(remaining)
-            ruleDialog.open()
-            return
-        }
+        if (plan.bulk === true && _giveBackRemaining()) return
         _closeSoon()
         _releaseIfIdle()
     }
@@ -639,6 +663,8 @@ ApplicationWindow {
                 { added: 0, removed: plan.removed, changed: plan.restored },
                 function(applied, r) {
                     if (applied) {
+                        for (var c = 0; c < plan.comments.length; c += 1)
+                            support.writeComment(plan.comments[c])
                         trayRuleWindow.trayHost.boundFileWriter.mirrorServiceIntoFiles()
                         trayRuleWindow._undoDone(tr("tray.add-rule.undone", "Undone: the rules are as they were."))
                     } else if (String((r && r.reason) || "") === "unexpected-diff") {

@@ -391,10 +391,15 @@ fn console_command(facts: &Facts) -> String {
 fn run_state_finding(run_state: &str, console: &str) -> Finding {
     match run_state {
         "running" => Finding::pass("state", "running"),
+        // A stop that was a crash can leave the network cut off, and the
+        // installer sends exactly that user here.
         "stopped" => Finding::warn(
             "state",
             "stopped",
-            format!("Start it from an elevated console: {console} start"),
+            format!(
+                "Start it from an elevated console: {console} start. If the network \
+                 is cut off: {console} reset-network --confirm"
+            ),
         ),
         other => Finding::pass("state", other.to_string()),
     }
@@ -792,6 +797,19 @@ mod tests {
         let findings = assess(&facts);
         assert_eq!(find(&findings, "state").level, Level::Warn);
         assert_eq!(exit_code(&findings, &facts.registration), exit::SUCCESS);
+    }
+
+    /// The installer sends a user whose service failed here; a stop that was
+    /// a crash may have left the network cut off, and starting is not the
+    /// only way back.
+    #[test]
+    fn a_stopped_service_names_the_way_back_to_the_network() {
+        let findings = assess(&facts(installed(
+            Some(installed_binary(BinaryRole::Service)),
+            "stopped",
+        )));
+        let hint = find(&findings, "state").hint.clone().unwrap_or_default();
+        assert!(hint.contains("reset-network --confirm"), "{hint}");
     }
 
     #[test]

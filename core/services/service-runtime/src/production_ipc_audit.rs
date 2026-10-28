@@ -159,14 +159,32 @@ where
                 Ok(_) => {}
             }
         }
-        let summary = serde_json::json!({
+        let mut summary = serde_json::json!({
             "operation": operation,
             "class": request.operation_class.slug(),
             "elevated": ctx.caller_is_elevated,
             "profile": format!("{:?}", ctx.client_profile),
         });
+        let correlation = request
+            .payload
+            .pointer("/payload/correlation-id")
+            .or_else(|| request.payload.get("correlation-id"))
+            .and_then(serde_json::Value::as_str)
+            .and_then(audit_correlation_id);
+        if let (Some(id), Some(map)) = (correlation, summary.as_object_mut()) {
+            map.insert("correlation_id".into(), id.into());
+        }
         self.append(ctx, risk_of(request), summary, now)
     }
+}
+
+/// The caller's correlation id as the trail may carry it: what links an
+/// admitted request to the revision it writes. The caller chooses it, so one
+/// longer than an id or not plain printable ASCII is left out.
+pub(crate) fn audit_correlation_id(raw: &str) -> Option<&str> {
+    const MAX: usize = 128;
+    (!raw.is_empty() && raw.len() <= MAX && raw.bytes().all(|b| b.is_ascii_graphic()))
+        .then_some(raw)
 }
 
 /// Risk level for a request the pre-execution audit can judge from its payload.
@@ -289,6 +307,36 @@ mod tests {
             Some("S-1-5-21-A"),
             "the actor is hashed, never stored raw",
         );
+    }
+
+    /// The admission names the request's correlation id, the one the revision
+    /// it writes carries: who asked is then known for each revision. A caller
+    /// cannot bloat the trail through it.
+    #[test]
+    fn the_record_carries_the_correlation_id_the_revision_will_carry() {
+        let sink = Arc::new(RecordingSink::default());
+        let emitter = ProductionIpcAuditEmitter::new(Arc::clone(&sink));
+        let with = |correlation: &str| IpcRequestEnvelope {
+            payload: serde_json::json!({
+                "mutation-kind": "rules-update",
+                "payload": { "correlation-id": correlation, "rules-json": "{}" },
+            }),
+            ..envelope()
+        };
+        emitter
+            .record_request(&with("rules-update-gui-1"), &ctx())
+            .expect("write");
+        emitter
+            .record_request(&with(&"x".repeat(10_000)), &ctx())
+            .expect("write");
+
+        let events = sink.events.lock().unwrap_or_else(|p| p.into_inner());
+        let summary = |i: usize| -> serde_json::Value {
+            serde_json::from_str(events[i].payload_summary_json.as_deref().expect("summary"))
+                .expect("json")
+        };
+        assert_eq!(summary(0)["correlation_id"], "rules-update-gui-1");
+        assert!(summary(1).get("correlation_id").is_none());
     }
 
     static CLOCK_MS: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);

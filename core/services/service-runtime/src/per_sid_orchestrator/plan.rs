@@ -228,7 +228,7 @@ impl PerSidApplyOrchestrator {
             zone_priority_over_ip: policy.zone_priority_over_ip,
             app_rules_take_all_addresses: policy.app_rules_take_all_addresses,
             families: ipv6.families(),
-            packet_blocks: self.rules_provider.rules_are_baseline_for(sid),
+            packet_blocks: super::PACKET_BLOCKS,
         });
         // Shadow-compare the neutral pipeline against the live one, BEFORE the
         // fake-IP augmentation is folded in — not because the planner cannot

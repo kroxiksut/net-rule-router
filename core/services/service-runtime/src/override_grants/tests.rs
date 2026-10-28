@@ -268,6 +268,52 @@ fn a_confirmation_outlives_the_service_but_not_its_key() {
     );
 }
 
+/// A lost key is not a forged row: while the reset waits for the user's
+/// acknowledgement the confirmations are kept, not honoured, and the
+/// acknowledgement that adopts the rows brings them back under the new key.
+#[test]
+fn a_key_reset_keeps_the_confirmations_until_it_is_acknowledged() {
+    let conn = state_conn();
+    let owner = "S-1-5-21-override-key-reset";
+    {
+        let (grants, _) = opened(&conn, Some(KEY.to_vec()));
+        grants
+            .grant(
+                &preview_for(owner, false),
+                OverrideTerm::OneWeek,
+                owner,
+                now_ms(),
+            )
+            .expect("granted");
+    }
+    let new_key = vec![9u8; 32];
+    let audit = Arc::new(RecordingAudit::default());
+    let after_reset = OverrideGrants::open_under_key_reset(
+        Arc::clone(&conn),
+        Some(new_key.clone()),
+        Some(Arc::clone(&audit) as Arc<AuditTrail>),
+        now_ms(),
+    );
+    assert!(after_reset.grants_for(owner).is_empty(), "not honoured yet");
+    assert_eq!(
+        OverrideGrantsRepository::new(&lock(&conn))
+            .list()
+            .expect("rows")
+            .len(),
+        1,
+        "the confirmation is still stored"
+    );
+
+    assert_eq!(after_reset.adopt_after_key_reset(now_ms()), 1);
+    assert_eq!(after_reset.grants_for(owner).len(), 1);
+    let (next_start, _) = opened(&conn, Some(new_key));
+    assert_eq!(
+        next_start.grants_for(owner).len(),
+        1,
+        "signed under the new key"
+    );
+}
+
 /// A row put into the database by hand lifts nothing: unsigned or forged, it
 /// is removed at the next start and the removal audited.
 #[test]

@@ -55,6 +55,22 @@ fn the_wizard_writes_only_what_the_shared_decision_allows() {
     );
 }
 
+/// A user already set up who changes only the log window must not have
+/// fake-IP switched on by the window's offer.
+#[test]
+fn fake_ip_is_written_only_when_the_shared_decision_says_so() {
+    let wizard = qml("components/FirstRunWindow.qml");
+    let write = function_body(&wizard, "_writeServiceChoices");
+    assert!(write.contains("_stabilityTouched, _fakeIpTouched)"));
+    assert!(write.contains("if (writes.fakeIp) patch[\"fake-ip-enabled\"] = wantFakeIp"));
+    assert!(!write.contains("{ \"fake-ip-enabled\": wantFakeIp }"));
+    let seed = function_body(&wizard, "_seedFakeIp");
+    assert!(
+        seed.contains("!_fakeIpTouched"),
+        "a choice made here stands"
+    );
+}
+
 #[test]
 fn the_wizard_starts_from_what_the_service_holds() {
     let wizard = qml("components/FirstRunWindow.qml");

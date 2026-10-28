@@ -199,7 +199,7 @@ pub fn value_is_ipv6_literal(rule_type: &RuleType, value: &str) -> bool {
 /// `x.*` (`valueIsAnyZone`): a site in every zone names no single host, so
 /// "check where it works" has nothing to check.
 pub fn value_is_any_zone(value: &str) -> bool {
-    value.trim().ends_with(".*")
+    crate::js::trim(value).ends_with(".*")
 }
 
 /// Provenance of a rule the application authored on the user's behalf.
@@ -276,7 +276,7 @@ impl RuleRow {
         format!(
             "{}|{}|{}",
             self.rule_type.canonical_slug(),
-            self.match_value.to_lowercase(),
+            crate::js::key_lower(&self.match_value),
             self.target_route.as_str()
         )
     }
@@ -287,7 +287,7 @@ impl RuleRow {
         format!(
             "{}|{}",
             self.rule_type.canonical_slug(),
-            self.match_value.to_lowercase()
+            crate::js::key_lower(&self.match_value)
         )
     }
 
@@ -298,7 +298,7 @@ impl RuleRow {
             "{}|{}|{}",
             self.rule_type.canonical_slug(),
             self.target_route.as_str().to_lowercase(),
-            self.match_value.to_lowercase()
+            crate::js::key_lower(&self.match_value)
         )
     }
 }

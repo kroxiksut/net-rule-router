@@ -286,12 +286,18 @@ impl IpcResponseEnvelope {
     }
 
     pub fn err(request: &IpcRequestEnvelope, error: IpcError) -> Self {
+        Self::err_with_ids(
+            request.request_id.clone(),
+            request.correlation_id.clone(),
+            error,
+        )
+    }
+
+    /// [`Self::err`] for a request that is no longer at hand.
+    fn err_with_ids(request_id: String, correlation_id: Option<String>, error: IpcError) -> Self {
         Self {
-            request_id: request.request_id.clone(),
-            correlation_id: request
-                .correlation_id
-                .clone()
-                .unwrap_or_else(|| request.request_id.clone()),
+            correlation_id: correlation_id.unwrap_or_else(|| request_id.clone()),
+            request_id,
             operation_id: None,
             ok: false,
             stale: false,
@@ -825,7 +831,28 @@ impl IpcRouter {
             has_token = request.confirmation_token.as_deref().map(|s| !s.is_empty()).unwrap_or(false),
             "ipc request received",
         );
-        let (response, disposition) = self.dispatch_inner(request, ctx);
+        let (request_id, correlation_id) =
+            (request.request_id.clone(), request.correlation_id.clone());
+        // A panicking handler costs its own request, never the worker: the
+        // client gets an answer instead of waiting out its timeout.
+        let (response, disposition) =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                self.dispatch_inner(request, ctx)
+            }))
+            .unwrap_or_else(|_| {
+                tracing::error!(
+                    target: "nrr::ipc::dispatch",
+                    op = op_slug,
+                    "a request handler panicked; the request was answered with an error",
+                );
+                let error = IpcError {
+                    code: IpcErrorCode::Internal,
+                    message: format!("{op_slug} failed inside the service"),
+                    diagnostics_id: None,
+                };
+                let response = IpcResponseEnvelope::err_with_ids(request_id, correlation_id, error);
+                (response, Disposition::Answered)
+            });
         let dur_us = dispatch_started.elapsed().as_micros() as u64;
         if response.ok {
             tracing::debug!(
@@ -938,7 +965,7 @@ impl IpcRouter {
     fn admit_and_run(
         &self,
         request: IpcRequestEnvelope,
-        ctx: IpcRequestContext,
+        mut ctx: IpcRequestContext,
         disposition: &mut Disposition,
     ) -> IpcResponseEnvelope {
         // Derived, never accepted — see `dispatch`.
@@ -1052,7 +1079,9 @@ impl IpcRouter {
         //    refusals with different advice, never permission.
         if class.requires_elevation() && !ctx.caller_is_elevated {
             match self.authorize(class.authorization_action(), class.slug(), &ctx) {
-                AuthorizationOutcome::Granted => {}
+                // Granted for this request: the handler, its locks and the
+                // audit treat it as an administrator's, as the rights it got.
+                AuthorizationOutcome::Granted => ctx.caller_is_elevated = true,
                 AuthorizationOutcome::Refused(message) => {
                     return IpcResponseEnvelope::err(
                         &request,
@@ -1121,17 +1150,28 @@ impl IpcRouter {
         };
 
         // 7. Audit privileged mutations *before* execution; a failed write
-        //    is a refusal, so an unaudited mutation never runs.
+        //    is a refusal, so an unaudited mutation never runs — except the
+        //    controls a person needs when the disk is full.
         if class.is_mutating() {
             if let Err(e) = self.audit.record_request(&request, &ctx) {
-                return IpcResponseEnvelope::err(
-                    &request,
-                    IpcError {
-                        code: IpcErrorCode::Internal,
-                        message: format!("audit write failed: {e}"),
-                        diagnostics_id: None,
-                    },
-                );
+                if runs_when_audit_fails(request.operation) {
+                    tracing::warn!(
+                        target: "nrr::ipc::dispatch",
+                        msg_key = "ipc-audit-failed-emergency-ran",
+                        op = request.operation.slug(),
+                        error = %e,
+                        "the audit trail could not record this request; it ran anyway, as a way out must not depend on free disk space",
+                    );
+                } else {
+                    return IpcResponseEnvelope::err(
+                        &request,
+                        IpcError {
+                            code: IpcErrorCode::Internal,
+                            message: format!("audit write failed: {e}"),
+                            diagnostics_id: None,
+                        },
+                    );
+                }
             }
         }
 
@@ -1141,6 +1181,19 @@ impl IpcRouter {
             Err(error) => IpcResponseEnvelope::err(&request, error),
         }
     }
+}
+
+/// The controls that still run when the audit trail cannot be written: on a
+/// full disk, refusing them would leave the person no way to switch protection
+/// down or pause it, nor to free space by clearing the logs.
+fn runs_when_audit_fails(op: IpcOperationName) -> bool {
+    matches!(
+        op,
+        IpcOperationName::ProductImpactDisableTemporary
+            | IpcOperationName::RoutingPauseToggle
+            | IpcOperationName::RoutePolicyUpdate
+            | IpcOperationName::LogsClear
+    )
 }
 
 // ── Tests ────────────────────────────────────────────────────────────────────
@@ -1217,6 +1270,128 @@ mod tests {
         ) -> HandlerOutcome {
             Ok(serde_json::json!({ "echo": request.operation.slug() }))
         }
+    }
+
+    /// Panics on `{"boom": true}`, answers otherwise.
+    struct PanicsOnBoom;
+    impl CheckedIpcHandler for PanicsOnBoom {
+        type Checked = ();
+        fn precheck(
+            &self,
+            _request: &IpcRequestEnvelope,
+            _ctx: &IpcRequestContext,
+        ) -> Result<(), IpcError> {
+            Ok(())
+        }
+        fn execute(
+            &self,
+            _checked: Prechecked<()>,
+            request: &IpcRequestEnvelope,
+            _ctx: &IpcRequestContext,
+        ) -> HandlerOutcome {
+            if request.payload.get("boom").is_some() {
+                panic!("simulated handler panic");
+            }
+            Ok(serde_json::json!({}))
+        }
+    }
+
+    /// A request whose handler panics is answered with an error, and the next
+    /// mutation is not refused as busy by a slot the panic left taken.
+    #[test]
+    fn a_panicking_handler_answers_its_request_and_frees_the_mutation_queue() {
+        let mut reg = IpcHandlerRegistry::new();
+        reg.register_checked(IpcOperationName::RoutingPauseToggle, PanicsOnBoom);
+        let router = IpcRouter::new(reg, Arc::new(NoopAuditEmitter), 1);
+        let toggle = |payload| IpcRequestEnvelope {
+            payload,
+            ..req(
+                IpcOperationName::RoutingPauseToggle,
+                IpcOperationClass::UserScopedConfiguration,
+                IPC_PROTOCOL_VERSION,
+                None,
+            )
+        };
+
+        let answer = router.dispatch(toggle(serde_json::json!({ "boom": true })), elevated_gui());
+        assert!(!answer.ok);
+        assert_eq!(
+            answer.error.as_ref().map(|e| e.code),
+            Some(IpcErrorCode::Internal)
+        );
+        assert_eq!(answer.request_id, "req-RoutingPauseToggle");
+
+        let next = router.dispatch(toggle(serde_json::json!({})), elevated_gui());
+        assert!(next.ok, "next request refused: {:?}", next.error);
+    }
+
+    /// The disk is full, so nothing can be audited.
+    struct FullDiskAudit;
+    impl IpcAuditEmitter for FullDiskAudit {
+        fn record_request(
+            &self,
+            _r: &IpcRequestEnvelope,
+            _c: &IpcRequestContext,
+        ) -> Result<(), String> {
+            Err("There is not enough space on the disk. (os error 112)".into())
+        }
+    }
+
+    /// On a full disk a person can still pause, switch protection down and
+    /// clear the logs to free space; an ordinary edit stays refused unaudited.
+    #[test]
+    fn a_full_disk_does_not_take_away_the_way_out() {
+        let mut reg = IpcHandlerRegistry::new();
+        for op in [
+            IpcOperationName::RoutingPauseToggle,
+            IpcOperationName::ProductImpactDisableTemporary,
+            IpcOperationName::LogsClear,
+            IpcOperationName::MutationSubmit,
+        ] {
+            reg.register_checked(op, EchoHandler);
+        }
+        let router = IpcRouter::new(reg, Arc::new(FullDiskAudit), 1);
+
+        let pause = req(
+            IpcOperationName::RoutingPauseToggle,
+            IpcOperationClass::UserScopedConfiguration,
+            IPC_PROTOCOL_VERSION,
+            None,
+        );
+        let disable = req(
+            IpcOperationName::ProductImpactDisableTemporary,
+            IpcOperationClass::SafeDisable,
+            IPC_PROTOCOL_VERSION,
+            Some("token-from-dry-run"),
+        );
+        let clear = req(
+            IpcOperationName::LogsClear,
+            IpcOperationClass::MachineScopedAction,
+            IPC_PROTOCOL_VERSION,
+            None,
+        );
+        for request in [pause, disable, clear] {
+            let op = request.operation;
+            let answer = router.dispatch(request, elevated_gui());
+            assert!(
+                answer.ok,
+                "{op:?} refused on a full disk: {:?}",
+                answer.error
+            );
+        }
+
+        let edit = req(
+            IpcOperationName::MutationSubmit,
+            IpcOperationClass::MutationRequest,
+            IPC_PROTOCOL_VERSION,
+            Some("token-from-dry-run"),
+        );
+        let answer = router.dispatch(edit, elevated_gui());
+        assert_eq!(
+            answer.error.map(|e| e.code),
+            Some(IpcErrorCode::Internal),
+            "an ordinary edit must not run unaudited"
+        );
     }
 
     fn make_router() -> IpcRouter {
@@ -1944,6 +2119,64 @@ mod tests {
         let asked = authority.0.lock().expect("lock").clone();
         assert_eq!(asked.len(), 1);
         assert_eq!(asked[0].uid, 1000);
+    }
+
+    /// Notes the elevation flag the audit and the handler were handed.
+    #[derive(Default)]
+    struct ElevationSeen(std::sync::Mutex<Vec<bool>>);
+    impl IpcAuditEmitter for ElevationSeen {
+        fn record_request(
+            &self,
+            _r: &IpcRequestEnvelope,
+            c: &IpcRequestContext,
+        ) -> Result<(), String> {
+            self.0.lock().expect("lock").push(c.caller_is_elevated);
+            Ok(())
+        }
+    }
+    struct ElevationSeenHandler(Arc<ElevationSeen>);
+    impl CheckedIpcHandler for ElevationSeenHandler {
+        type Checked = ();
+        fn precheck(
+            &self,
+            _request: &IpcRequestEnvelope,
+            ctx: &IpcRequestContext,
+        ) -> Result<(), IpcError> {
+            self.0 .0.lock().expect("lock").push(ctx.caller_is_elevated);
+            Ok(())
+        }
+        fn execute(
+            &self,
+            _checked: Prechecked<()>,
+            _request: &IpcRequestEnvelope,
+            ctx: &IpcRequestContext,
+        ) -> HandlerOutcome {
+            self.0 .0.lock().expect("lock").push(ctx.caller_is_elevated);
+            Ok(serde_json::json!({}))
+        }
+    }
+
+    /// A baseline edit the authority allowed is an administrator's edit: the
+    /// rules lock lets it through and the audit says it had rights.
+    #[test]
+    fn an_operation_the_authority_allowed_runs_and_is_recorded_as_elevated() {
+        use nrr_platform_api::authorization::{AuthorizationDecision, FixedAuthority};
+
+        let seen = Arc::new(ElevationSeen::default());
+        let mut reg = IpcHandlerRegistry::new();
+        reg.register_checked(
+            IpcOperationName::RollbackRequest,
+            ElevationSeenHandler(Arc::clone(&seen)),
+        );
+        let router = IpcRouter::new(reg, seen.clone(), 1)
+            .with_authority(Arc::new(FixedAuthority(AuthorizationDecision::Allowed)));
+        let response = router.dispatch(baseline_rollback_request(), linux_gui_user());
+        assert!(response.ok, "{:?}", response.error);
+        assert_eq!(
+            *seen.0.lock().expect("lock"),
+            vec![true, true, true],
+            "precheck, audit and execute all see the rights the authority granted"
+        );
     }
 
     /// Each outcome of the question reaches the client as its own code, and

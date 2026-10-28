@@ -111,6 +111,10 @@ pub struct AddressOwnership {
     /// no network is claimed.
     main_zone_only: HashSet<IpAddr>,
     additional_zone_only: HashSet<IpAddr>,
+    /// Private addresses the additional link holds only through a public
+    /// top-level zone: no name there takes them into the tunnel
+    /// (`nrr_domain::public_zone`).
+    zone_refused: HashSet<IpAddr>,
     /// Addresses application rules took from the address rules, by the link
     /// whose program uses them. Empty unless `app_takeover` is set.
     app_taken: HashMap<IpAddr, Link>,
@@ -225,6 +229,8 @@ impl AddressOwnership {
         hosts.sort_unstable();
         hosts.dedup();
 
+        let mut zone_learned: HashSet<IpAddr> = HashSet::new();
+        let mut additional_vouched: HashSet<IpAddr> = additional_literal.clone();
         for host in hosts {
             // The same per-family view of the host the codegens pin, so the
             // arbiter and the emitters cannot disagree about which addresses a
@@ -240,6 +246,16 @@ impl AddressOwnership {
                 host_route_rank.insert(host.to_string(), rank);
                 for ip in &ips {
                     raise(*ip, rank, host);
+                }
+            }
+            if let Some(claim) = additional_names.get(host) {
+                // Held only by a public top-level zone: a stranger's name.
+                if *claim == NameClaim::Zone(1) {
+                    zone_learned.extend(ips.iter().copied().filter(|ip| {
+                        !nrr_domain::public_zone::admits_zone_learned_address(host, *ip)
+                    }));
+                } else {
+                    additional_vouched.extend(ips.iter().copied());
                 }
             }
             match (main_names.get(host), additional_names.get(host)) {
@@ -260,6 +276,10 @@ impl AddressOwnership {
             }
         }
 
+        let zone_refused: HashSet<IpAddr> = zone_learned
+            .into_iter()
+            .filter(|ip| !additional_vouched.contains(ip) && !networks.names(*ip, Link::Additional))
+            .collect();
         let main_claimed = main.clone();
         if order == ZoneVsIpOrder::ExactIpFirst {
             for ip in &additional_literal {
@@ -316,6 +336,7 @@ impl AddressOwnership {
             networks,
             main_zone_only,
             additional_zone_only,
+            zone_refused,
             app_taken: HashMap::new(),
             app_takeover: false,
             explicit_sorted: OnceLock::new(),
@@ -466,9 +487,21 @@ impl AddressOwnership {
     pub fn address_rule_may_steer(&self, ip: IpAddr, for_link: Link) -> bool {
         let other = match for_link {
             Link::Main => Link::Additional,
-            Link::Additional => Link::Main,
+            Link::Additional => {
+                if self.zone_refused.contains(&ip) {
+                    return false;
+                }
+                Link::Main
+            }
         };
         self.owner_of(ip) != Some(other)
+    }
+
+    /// Whether no name brings `ip` into the tunnel: a private address the
+    /// additional link holds only through a public top-level zone.
+    #[must_use]
+    pub fn keeps_out_of_tunnel(&self, ip: IpAddr) -> bool {
+        self.zone_refused.contains(&ip)
     }
 
     /// Whether an ADDRESS rule's FILTER on `for_link` may act on this address:
@@ -1109,6 +1142,40 @@ impl NetworkClaims {
             .take_while(move |net| net.network() <= outer.last())
             .filter(move |net| net.prefix_len() > outer.prefix_len() && outer.covers(**net))
             .filter_map(move |net| self.by_block.get(net).map(|claim| (*net, claim)))
+    }
+}
+
+/// The addresses one address rule did not act on, by why, so a codegen
+/// reports the cause that fired: the other link's claim, or a public zone's
+/// private address kept out of the tunnel. One example and a count each.
+pub(crate) struct HeldBack<'a> {
+    ownership: &'a AddressOwnership,
+    /// A route rule of the additional link: the only one a zone refusal binds.
+    tunnel_route: bool,
+    pub(crate) claimed: Option<(IpAddr, usize)>,
+    pub(crate) outside_tunnel: Option<(IpAddr, usize)>,
+}
+
+impl<'a> HeldBack<'a> {
+    pub(crate) fn new(ownership: &'a AddressOwnership, link: Link, action: RuleAction) -> Self {
+        Self {
+            ownership,
+            tunnel_route: link == Link::Additional && !matches!(action, RuleAction::Block),
+            claimed: None,
+            outside_tunnel: None,
+        }
+    }
+
+    pub(crate) fn note(&mut self, ip: IpAddr) {
+        let slot = if self.tunnel_route && self.ownership.keeps_out_of_tunnel(ip) {
+            &mut self.outside_tunnel
+        } else {
+            &mut self.claimed
+        };
+        match slot {
+            Some((_, count)) => *count += 1,
+            None => *slot = Some((ip, 1)),
+        }
     }
 }
 
@@ -2059,7 +2126,28 @@ mod tests {
             }
         }
 
+        /// For address-only books: this oracle asks without a hostname over an
+        /// empty cache, so a name rule would be invisible to both sides alike.
         fn assert_agrees(book: &CanonicalRuleBook, probes: &[&str]) {
+            let named = book
+                .primary
+                .rules()
+                .iter()
+                .chain(book.secondary.rules())
+                .find(|r| {
+                    r.address_match.as_ref().is_some_and(|m| {
+                        !matches!(
+                            m,
+                            CanonicalAddressMatch::ExactIp(_)
+                                | CanonicalAddressMatch::Subnet(_)
+                                | CanonicalAddressMatch::IpRange(..)
+                        )
+                    })
+                });
+            assert!(
+                named.is_none(),
+                "a name rule needs the hostname-aware oracle (engine_owner_for): {named:?}"
+            );
             let ownership = resolve(book, &MockFqdnCacheLookup::new());
             for probe in probes {
                 let at = ip(probe);

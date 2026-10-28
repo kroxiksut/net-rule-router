@@ -45,7 +45,7 @@ QtObject {
     /// dialog buckets. Conflicts default to the file-provisional side (Union).
     function _openMergeDialog() {
         if (!_mergeBridgeReady()) {
-            root.statusLine = root.tr("status.bridge-unavailable", "Native bridge unavailable")
+            root.statusLine = root.tr("status.bridge-unavailable", "Service bridge not connected.")
             return
         }
         mergeFromEdits = false
@@ -69,8 +69,7 @@ QtObject {
     function openMergeWithPendingEdits() {
         if (typeof nrrNativeBridge === "undefined" || !nrrNativeBridge
                 || typeof nrrNativeBridge.rpcRulesList !== "function") {
-            root.statusLine = root.tr("errors.rules-changed-elsewhere",
-                "Your rules were changed elsewhere since you opened them. Nothing was applied.")
+            root.statusLine = root.tr("status.bridge-unavailable", "Service bridge not connected.")
             return
         }
         mergeFromEdits = true
@@ -103,9 +102,10 @@ QtObject {
         var corr = nrrNativeBridge.rpcRulesList()
         root.rpc.registerRpcCallback(corr, function(ok, p) {
             if (!ok || !p) { done(null); return }
-            var rows = (p.rows || []).map(root._serviceRuleRowToModelRow)
+            // The notes as the service lists them: one erased elsewhere stays
+            // erased, as in the terminal UI.
             done({
-                rows: Rules.rebaseFreshWithNotes(rows, [_editsRows, _editsBase]),
+                rows: (p.rows || []).map(root._serviceRuleRowToModelRow),
                 base: (p["base-revision"] !== undefined && p["base-revision"] !== null)
                     ? String(p["base-revision"]) : null
             })
@@ -230,7 +230,7 @@ QtObject {
     function _applyMerge(resolutions, keepSecondaryKeys) {
         if (typeof nrrNativeBridge === "undefined" || !nrrNativeBridge
                 || typeof nrrNativeBridge.rpcRulesMergePreview !== "function") {
-            root.statusLine = root.tr("status.bridge-unavailable", "Native bridge unavailable")
+            root.statusLine = root.tr("status.bridge-unavailable", "Service bridge not connected.")
             return
         }
         if (mergeFromEdits) {
@@ -312,7 +312,7 @@ QtObject {
         if (typeof nrrNativeBridge === "undefined" || !nrrNativeBridge
                 || typeof nrrNativeBridge.readFileBytes !== "function") {
             root.statusLine = root.tr("status.bridge-unavailable",
-                "Native bridge unavailable")
+                "Service bridge not connected.")
             return
         }
         var override = paths || {}
@@ -379,7 +379,7 @@ QtObject {
         }
         if (!root.bridgeAvailable) {
             root.statusLine = root.tr("status.bridge-unavailable",
-                "Native bridge unavailable")
+                "Service bridge not connected.")
             return
         }
         var rulesJson = root._buildRulesJsonFromModel()
@@ -503,7 +503,7 @@ QtObject {
     function _driftApplyGuiState() {
         if (!root.bridgeAvailable) {
             root.statusLine = root.tr("status.bridge-unavailable",
-                "Native bridge unavailable")
+                "Service bridge not connected.")
             return
         }
         var rulesJson = root._buildRulesJsonFromModel()
@@ -872,7 +872,7 @@ QtObject {
     /// fetched rather than paying for a second one.
     function _openMergeUnlessPointless() {
         if (!_mergeBridgeReady()) {
-            root.statusLine = root.tr("status.bridge-unavailable", "Native bridge unavailable")
+            root.statusLine = root.tr("status.bridge-unavailable", "Service bridge not connected.")
             return
         }
         mergeFromEdits = false

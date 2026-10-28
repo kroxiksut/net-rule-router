@@ -645,6 +645,60 @@ fn zone_fans_out_over_cached_hosts_under_tld() {
     assert_eq!(out.filters.len(), 2);
 }
 
+/// The pin set is what the leak guard holds to the tunnel: a stranger's name
+/// under `.ru` answering with a private address must not put it there.
+#[test]
+fn a_public_zone_name_answering_a_private_address_is_not_pinned_to_the_tunnel() {
+    let cache = MockFqdnCacheLookup::new();
+    cache.set_ips(
+        "a1.attacker.ru",
+        vec![Ipv4Addr::new(10, 1, 2, 3), Ipv4Addr::new(203, 0, 113, 7)],
+    );
+    cache.set_ips("git.corp.intra", vec![Ipv4Addr::new(10, 9, 9, 9)]);
+    let rule_book = book(
+        vec![],
+        vec![zone_rule("r-ru", "ru"), zone_rule("r-intra", "intra")],
+    );
+    let out = generate_filters(CodegenInput {
+        sid: "S",
+        rule_book: &rule_book,
+        fqdn_cache: &cache,
+        app_observations: &MockAppObservationLookup::new(),
+        app_resolver: &NoopAppPathResolver,
+        secondary_ip_denylist: &std::collections::HashSet::new(),
+        zone_priority_over_ip: false,
+        app_rules_take_all_addresses: false,
+        families: crate::enforcement_planner::FamilyScope::V4Only,
+        packet_blocks: true,
+    });
+    let pinned = &out.secondary_dest_ips;
+    let has = |a: Ipv4Addr| pinned.contains(&IpAddr::V4(a));
+    assert!(!has(Ipv4Addr::new(10, 1, 2, 3)), "{pinned:?}");
+    assert!(has(Ipv4Addr::new(203, 0, 113, 7)), "{pinned:?}");
+    assert!(has(Ipv4Addr::new(10, 9, 9, 9)), "{pinned:?}");
+    // Said for what it is: nothing on the main link claims the address, so a
+    // reader of the diagnostics must not be sent looking for a main rule.
+    assert_eq!(
+        out.diagnostics
+            .iter()
+            .filter(|d| matches!(d, CodegenDiagnostic::AddressClaimedByPrimary { .. }))
+            .count(),
+        0,
+        "{:?}",
+        out.diagnostics
+    );
+    assert!(
+        out.diagnostics
+            .contains(&CodegenDiagnostic::PrivateAddressKeptOutOfTunnel {
+                rule_id: "r-ru".into(),
+                ip: IpAddr::V4(Ipv4Addr::new(10, 1, 2, 3)),
+                count: 1,
+            }),
+        "{:?}",
+        out.diagnostics
+    );
+}
+
 #[test]
 fn zone_with_no_cached_hosts_emits_zone_empty_diagnostic() {
     let cache = MockFqdnCacheLookup::new();

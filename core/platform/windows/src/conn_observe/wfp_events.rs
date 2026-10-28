@@ -669,6 +669,14 @@ unsafe fn restore_uint32_option(
 /// captured for leak visibility — NRR routes none of them in Free, so their
 /// egress resolves as unknown downstream (the v6-leak signal).
 unsafe extern "system" fn net_event_callback(context: *mut c_void, event: *const FWPM_NET_EVENT2) {
+    // SAFETY: forwarded as the engine handed them: our live context and an
+    // event valid for this call, or nulls.
+    crate::callback_guard::contain_panic("wfp-net-event", || unsafe {
+        handle_net_event(context, event)
+    });
+}
+
+unsafe fn handle_net_event(context: *mut c_void, event: *const FWPM_NET_EVENT2) {
     if context.is_null() || event.is_null() {
         return;
     }

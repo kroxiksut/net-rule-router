@@ -515,7 +515,7 @@ QtObject {
         root.updatePrefs(patch)
         root.emitPrefs()
         root.statusLine = root.tr("status.role-unassigned",
-            "{role} unassigned").replace("{role}", root.routeLabel(role))
+            "{role} unassigned from this adapter.").replace("{role}", root.routeLabel(role))
         // Mirror the binding into the service policy so enforcement sees the
         // cleared slot. Unbinding must be explicit: a blank pref alone means
         // "leave as is" on the service side, never "unbind".

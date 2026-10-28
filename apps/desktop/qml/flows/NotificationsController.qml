@@ -160,6 +160,34 @@ QtObject {
         })
     }
 
+    // ── Damaged settings file ────────────────────────────────────────────────
+    //
+    // The shared settings file stopped reading while the window runs. The
+    // window keeps its values and nothing rewrites the file; the user is told
+    // once per episode, and the card goes when the file reads again.
+    property string _userSettingsDamageId: ""
+
+    function noteUserSettingsAnswer(answer) {
+        var id = Pure.userSettingsDamageNoticeId(answer, _userSettingsDamageId, Date.now())
+        if (id === _userSettingsDamageId) return
+        if (_userSettingsDamageId !== "") _dropPushNotice(_userSettingsDamageId)
+        _userSettingsDamageId = id
+        if (id === "") return
+        var body = root.tr("notifications.user-settings-damaged.body",
+            "This window keeps the settings it has. Until the file is fixed, changes to your rule-set folder, bound rules files and other shared settings do not reach the terminal or the tray, and theirs do not reach this window. The file is left as it is: correct or delete it, and the window reads it again by itself.")
+        var reason = String((answer && answer.reason) || "").trim()
+        if (reason !== "") body += " (" + reason + ")"
+        _addPushNotice({
+            "id": id,
+            "kind": "user-settings-damaged",
+            "severity": "warning",
+            "dismissible": true,
+            "title": root.tr("notifications.user-settings-damaged.title",
+                "Your settings file is damaged"),
+            "body": body
+        })
+    }
+
     // ── Incomplete package ───────────────────────────────────────────────────
     //
     // What this copy of the program lacks: the launcher's payload lookup

@@ -106,7 +106,7 @@ Frame {
         var parts = [Pure.displayText(String(n.name || ""))
             + " (" + root.tr("diag.site-check.role." + n.role, String(n.role || "")) + ")"]
         parts.push(String(n.address || "") !== "" ? String(n.address)
-            : root.tr("diag.site-check.no-address", "address not known"))
+            : root.tr("diag.site-check.no-address", "address not known: not opened lately"))
         parts.push(_routeText(String(n.route || "")))
         parts.push(root.tr("diag.site-check.answer." + n.answer, String(n.answer || "")))
         var line = parts.join(" · ")

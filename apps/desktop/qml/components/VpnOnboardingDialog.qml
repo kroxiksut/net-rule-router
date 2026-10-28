@@ -273,7 +273,7 @@ Window {
     modality: Qt.ApplicationModal
     flags: Qt.Dialog
     color: ownerRoot ? ownerRoot.panelColor : "#202020"
-    title: tr("vpn-onboarding.title", "Set up your VPN")
+    title: tr("vpn-onboarding.title", "Your VPN client")
     transientParent: ownerRoot ? ownerRoot : null
 
     onVisibleChanged: {

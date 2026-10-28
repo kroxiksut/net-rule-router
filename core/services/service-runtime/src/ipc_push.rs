@@ -66,7 +66,7 @@ pub fn adopt_subscription(
         Some(previous) if previous == new_id => SubscriptionChange::Unchanged,
         Some(previous) => {
             if let Some(bus) = event_bus {
-                bus.unsubscribe(&previous);
+                bus.supersede(&previous, &new_id);
             }
             SubscriptionChange::Replaced {
                 previous,
@@ -128,9 +128,9 @@ where
             target: "nrr::ipc-push",
             subscription_id,
             resume_at,
-            "subscriber fell behind the event ring, resync marker sent"
+            "subscriber's stream has a hole, resync marker sent"
         );
-        event_bus.advance_cursor(subscription_id, resume_at - 1);
+        event_bus.resync_sent(subscription_id, resume_at);
     }
     loop {
         let pending = event_bus.peek_pending_for(subscription_id, batch_size);
@@ -327,6 +327,90 @@ mod tests {
         let frame: StatusUpdatePushFrame =
             serde_json::from_value(sent[0].payload.clone().expect("payload")).expect("decode");
         assert_eq!(frame.event_id, id);
+    }
+
+    fn first_frame_type(sent: &[IpcResponseEnvelope]) -> Option<String> {
+        sent.first()
+            .and_then(|e| e.payload.as_ref())
+            .and_then(|p| p["event"]["type"].as_str().map(str::to_owned))
+    }
+
+    /// A window that subscribes again on its connection starts at the head;
+    /// what the replaced subscription had not delivered yet is gone, and the
+    /// window, which re-reads nothing after its own subscribe, kept rendering
+    /// a state those events had changed.
+    #[test]
+    fn a_resubscribe_that_leaves_events_undelivered_announces_the_hole() {
+        let bus = EventBus::new();
+        let first = bus.subscribe("gui-1".into(), None).subscription_id;
+        let mut current = None;
+        adopt_subscription(&mut current, &subscribe_response(&first), Some(&bus));
+        bus.publish(adapters_event());
+
+        let second = bus.subscribe("gui-2".into(), None).subscription_id;
+        adopt_subscription(&mut current, &subscribe_response(&second), Some(&bus));
+        let mut sent = Vec::new();
+        assert!(!flush_push_frames(&bus, &second, 32, collector(&mut sent)));
+        assert_eq!(
+            first_frame_type(&sent).as_deref(),
+            Some(PUSH_GAP_EVENT_TYPE),
+            "{sent:?}"
+        );
+
+        // Announced once.
+        let mut again = Vec::new();
+        assert!(!flush_push_frames(&bus, &second, 32, collector(&mut again)));
+        assert!(again.is_empty(), "{again:?}");
+    }
+
+    /// Nothing was owed: the new subscription makes nobody re-read.
+    #[test]
+    fn a_resubscribe_with_everything_delivered_sends_no_marker() {
+        let bus = EventBus::new();
+        let first = bus.subscribe("gui-1".into(), None).subscription_id;
+        let mut current = None;
+        adopt_subscription(&mut current, &subscribe_response(&first), Some(&bus));
+        bus.publish(adapters_event());
+        let mut delivered = Vec::new();
+        assert!(!flush_push_frames(
+            &bus,
+            &first,
+            32,
+            collector(&mut delivered)
+        ));
+
+        let second = bus.subscribe("gui-2".into(), None).subscription_id;
+        adopt_subscription(&mut current, &subscribe_response(&second), Some(&bus));
+        let mut sent = Vec::new();
+        assert!(!flush_push_frames(&bus, &second, 32, collector(&mut sent)));
+        assert!(sent.is_empty(), "{sent:?}");
+    }
+
+    /// A cursor from an earlier run of the service: the client hears that its
+    /// picture may be stale, then what this run publishes.
+    #[test]
+    fn a_resume_from_an_earlier_service_run_starts_with_the_marker() {
+        let bus = EventBus::new();
+        let s = bus.subscribe("gui-1".into(), Some(500));
+        let id = bus.publish(adapters_event());
+        let mut sent = Vec::new();
+        assert!(!flush_push_frames(
+            &bus,
+            &s.subscription_id,
+            32,
+            collector(&mut sent)
+        ));
+        assert_eq!(
+            first_frame_type(&sent).as_deref(),
+            Some(PUSH_GAP_EVENT_TYPE)
+        );
+        let next: StatusUpdatePushFrame =
+            serde_json::from_value(sent[1].payload.clone().expect("payload")).expect("decode");
+        assert_eq!(next.event_id, id);
+        let marker_id = sent[0].payload.as_ref().expect("payload")["event-id"]
+            .as_u64()
+            .expect("id");
+        assert!(marker_id < id, "ids stay monotonic");
     }
 
     #[test]

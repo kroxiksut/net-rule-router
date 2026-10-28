@@ -1,0 +1,14 @@
+{
+  "description": "pure.js noticeKindRow",
+  "cases": [
+    { "name": "an ordinary kind is listed everywhere", "input": { "kind": "rules-drift", "siteNoticeWithoutTray": false, "muted": false }, "expected": ["tray.rules-drift.title", "Your rules files differ from what is applied"] },
+    { "name": "site notice where the tray can be started", "input": { "kind": "site-not-opening", "siteNoticeWithoutTray": true, "muted": false }, "expected": ["settings.notifications.site-not-opening", "A site does not open (told even while the tray is closed)"] },
+    { "name": "site notice muted where the tray can be started", "input": { "kind": "site-not-opening", "siteNoticeWithoutTray": true, "muted": true }, "expected": ["settings.notifications.site-not-opening", "A site does not open (told even while the tray is closed)"] },
+    { "name": "site notice nothing hides where the tray cannot be started", "input": { "kind": "site-not-opening", "siteNoticeWithoutTray": false, "muted": false }, "expected": null },
+    { "name": "site notice muted from the tray where it cannot be started stays liftable", "input": { "kind": "site-not-opening", "siteNoticeWithoutTray": false, "muted": true }, "expected": ["tray.site-not-opening.title", "A site does not open"] },
+    { "name": "an ordinary kind muted keeps its own title", "input": { "kind": "link-keeps-dropping", "siteNoticeWithoutTray": false, "muted": true }, "expected": ["notifications.link-keeps-dropping.title", "A connection keeps dropping"] },
+    { "name": "block notices as a class are not a notice kind", "input": { "kind": "block-notices", "siteNoticeWithoutTray": true, "muted": false }, "expected": null },
+    { "name": "an empty kind", "input": { "kind": "", "siteNoticeWithoutTray": false, "muted": true }, "expected": null },
+    { "name": "a kind the service does not know", "input": { "kind": "made-up", "siteNoticeWithoutTray": true, "muted": true }, "expected": null }
+  ]
+}

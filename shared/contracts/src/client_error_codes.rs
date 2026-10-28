@@ -18,6 +18,8 @@ pub const SERIALIZATION_FAILED: &str = "serialization-failed";
 pub const CLIENT_SHUTDOWN: &str = "client-shutdown";
 /// A change the client held back: the service reads another payload revision.
 pub const SERVICE_CONTRACT_MISMATCH: &str = "service-contract-mismatch";
+/// The full settings export did not fit one answer from the service.
+pub const SETTINGS_EXPORT_TOO_LARGE: &str = "settings-export-too-large";
 
 // The launcher's refusals of the window's own requests.
 pub const UNKNOWN_OPERATION: &str = "unknown-operation";
@@ -72,6 +74,7 @@ pub const CLIENT_ERROR_CODES: &[&str] = &[
     SERIALIZATION_FAILED,
     CLIENT_SHUTDOWN,
     SERVICE_CONTRACT_MISMATCH,
+    SETTINGS_EXPORT_TOO_LARGE,
     // A refused or failed change, from the service's mutation executor.
     "malformed-payload",
     "rule-cap-exceeded",
@@ -107,6 +110,7 @@ pub const CLIENT_ERROR_CODES: &[&str] = &[
     "not-implemented",
     // A refused route-policy write.
     "route-policy-sites-needs-main-route",
+    "route-policy-placeholder-adapter",
     // Rule-file import.
     "payload-too-large",
     "file-encoding",
@@ -118,6 +122,7 @@ pub const CLIENT_ERROR_CODES: &[&str] = &[
     // Security alerts and the audit trail.
     "alert-not-found",
     "illegal-state-transition",
+    "alert-rows-not-adopted",
     "alerts-storage-failure",
     "alerts-store-unavailable",
     "audit-unavailable",

@@ -1,0 +1,15 @@
+{
+  "cases": [
+    { "name": "a plain name", "input": { "name": "Home" }, "expected": true },
+    { "name": "spaces and Cyrillic are fine", "input": { "name": "Мои правила" }, "expected": true },
+    { "name": "empty", "input": { "name": "" }, "expected": false },
+    { "name": "only spaces", "input": { "name": "   " }, "expected": false },
+    { "name": "only a byte-order mark", "input": { "name": "﻿" }, "expected": false },
+    { "name": "the current folder", "input": { "name": " . " }, "expected": false },
+    { "name": "a parent step", "input": { "name": "a..b" }, "expected": false },
+    { "name": "a forward slash", "input": { "name": "a/b" }, "expected": false },
+    { "name": "a backslash", "input": { "name": "a\\b" }, "expected": false },
+    { "name": "drive syntax", "input": { "name": "C:" }, "expected": false },
+    { "name": "a single dot inside is fine", "input": { "name": "v1.2" }, "expected": true }
+  ]
+}

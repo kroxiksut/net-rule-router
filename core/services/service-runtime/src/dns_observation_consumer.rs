@@ -158,7 +158,8 @@ pub struct DnsObservationConsumer {
     /// Where the names of RULE-LESS hosts are remembered, so the connection
     /// observer can name a destination that fails on the main link. The
     /// observations this consumer discards are exactly the ones that index
-    /// needs. `None` (default) leaves it unfed.
+    /// needs. Also read back for the census: see `note_earlier_tenants`.
+    /// `None` (default) leaves it unfed.
     observed_names: Option<Arc<crate::observed_host_names::ObservedHostNames>>,
 }
 
@@ -205,8 +206,8 @@ pub(crate) fn secondary_ip_claims(
     secondary: &CanonicalRuleSet,
     fqdn: &dyn FqdnCacheLookup,
 ) -> SecondaryIpClaims {
-    /// Cap suffix/zone fan-out to match the codegen's bound.
-    const SUFFIX_FANOUT_LIMIT: usize = 1024;
+    // The codegen's own bound: past it, hosts the rule pins would have no owner.
+    const SUFFIX_FANOUT_LIMIT: usize = crate::wfp_codegen::SUFFIX_FANOUT_BACKSTOP;
     let mut owners: HashMap<Ipv4Addr, String> = HashMap::new();
     let mut closer: HashSet<Ipv4Addr> = HashSet::new();
     for rule in secondary.rules().iter().filter(|r| r.enabled) {
@@ -283,6 +284,27 @@ pub(crate) fn rule_set_matches(hostname: &str, set: &CanonicalRuleSet) -> bool {
         .iter()
         .filter(|r| r.enabled)
         .any(|r| rule_covers(r, hostname))
+}
+
+/// Whether `set` routes `hostname` only through a public top-level zone: a
+/// name its owner chose, which brings no private address into the tunnel.
+/// The same claims the ownership arbiter counts: Block and app rules none.
+pub(crate) fn held_only_by_public_zone(hostname: &str, set: &CanonicalRuleSet) -> bool {
+    let mut public_zone = false;
+    for rule in set.rules().iter().filter(|r| {
+        r.enabled
+            && r.app_match.is_none()
+            && !matches!(r.action, nrr_domain::RuleAction::Block)
+            && rule_covers(r, hostname)
+    }) {
+        match &rule.address_match {
+            Some(CanonicalAddressMatch::Zone(z)) if nrr_domain::public_zone::is_public_zone(z) => {
+                public_zone = true;
+            }
+            _ => return false,
+        }
+    }
+    public_zone
 }
 
 /// What a rule set has to say about one hostname, in a single walk.

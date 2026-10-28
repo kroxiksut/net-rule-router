@@ -604,6 +604,73 @@ fn a_resume_rearm_revives_a_retired_task_and_clears_its_component() {
     let _ = supervisor.shutdown();
 }
 
+/// The notices that would have dropped the network readings fired while the
+/// machine slept: a wake must drop them itself, or the pass it starts is
+/// judged on the pre-sleep table and skipped as "nothing moved".
+#[test]
+fn a_wake_drops_the_network_readings_taken_before_the_sleep() {
+    use nrr_platform_api::net_change::{ChangeCached, NetChangeGeneration};
+    use nrr_platform_api::network_change::{
+        NetworkChangeCallback, NetworkChangeObserver, NetworkChangeSubscription,
+    };
+
+    struct SilentFeed;
+    impl NetworkChangeObserver for SilentFeed {
+        fn subscribe(
+            &self,
+            _on_change: NetworkChangeCallback,
+        ) -> Result<NetworkChangeSubscription, nrr_platform_api::error::PlatformError> {
+            Ok(NetworkChangeSubscription::inert())
+        }
+    }
+
+    let generation = NetChangeGeneration::new();
+    let _feed = generation.follow(&SilentFeed).expect("followed");
+    let reads = Arc::new(AtomicUsize::new(0));
+    let table = {
+        let reads = Arc::clone(&reads);
+        ChangeCached::new(generation.clone(), move || {
+            Some(reads.fetch_add(1, Ordering::SeqCst))
+        })
+    };
+    let full_pass = crate::pass_inputs::FullPassRequest::default();
+    let requests = Arc::new(crate::power_resume::RebindRequests::new());
+    requests.set_wake_refresh({
+        let generation = generation.clone();
+        let full_pass = full_pass.clone();
+        Arc::new(move || {
+            generation.bump();
+            full_pass.request();
+        })
+    });
+    assert_eq!(table.get(), Some(0), "read before the sleep");
+
+    let supervisor = ServiceSupervisor::new(
+        StopToken::new(),
+        Arc::new(HealthFailureSink::new(Arc::new(HealthAggregator::new()))),
+    );
+    let passes = Arc::new(AtomicUsize::new(0));
+    let on_wake = resume_hook(
+        &supervisor,
+        {
+            let passes = Arc::clone(&passes);
+            Arc::new(move || {
+                passes.fetch_add(1, Ordering::SeqCst);
+            })
+        },
+        &fresh_deps().adapter_monitor,
+        Some(Arc::clone(&requests)),
+    );
+    on_wake();
+    assert_eq!(passes.load(Ordering::SeqCst), 1);
+    assert_eq!(table.get(), Some(1), "the pre-sleep reading was served");
+    assert!(
+        full_pass.take(),
+        "the wake's pass may be skipped as unchanged"
+    );
+    let _ = supervisor.shutdown();
+}
+
 /// A tick that never returns: the audit finds it past its deadline and the
 /// registry's component moves; a tick that comes back clears it again.
 #[test]
@@ -1201,6 +1268,7 @@ fn a_resume_asks_the_adapter_monitor_for_one_forced_read() {
             counted.fetch_add(1, Ordering::SeqCst);
         }),
         &monitor,
+        None,
     );
     on_wake();
     assert_eq!(rearms.load(Ordering::SeqCst), 1, "the re-arm still runs");

@@ -1120,12 +1120,9 @@ impl ProductionPrincipalPlanSource {
         let Some(rules) = self.rules.active_rules_for(stored) else {
             return Vec::new();
         };
-        // The cache cut down to these addresses: the plan decides about them
-        // as over the whole cache, at the cost of the few hosts on them.
-        let scoped = self
-            .fqdn_cache
-            .snapshot_for_compute()
-            .map(|full| full.scoped_to(addresses));
+        // Only the rows on these addresses: the plan decides about them as
+        // over the whole cache, at the cost of the few hosts on them.
+        let scoped = self.fqdn_cache.snapshot_for_addresses(addresses);
         let cache =
             crate::fqdn_cache_lookup::snapshot_or_live(scoped.as_ref(), self.fqdn_cache.as_ref());
         let denied = crate::secondary_ip_policy::secondary_ip_denylist(

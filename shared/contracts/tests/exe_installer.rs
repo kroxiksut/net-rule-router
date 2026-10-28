@@ -80,6 +80,41 @@ fn a_check_that_did_not_start_is_not_reported_as_a_refused_file() {
     assert!(prepare.contains("ProvisionNotChecked"));
 }
 
+/// An upgrade cancelled, or refused, after Setup stopped the old service left
+/// no service running: rules no longer followed, and with protection kept for
+/// the new files, the network held by filters nothing maintains.
+#[test]
+fn a_cancelled_upgrade_starts_the_stopped_service_again() {
+    let script = installer_script();
+    let prepare = routine(&script, "PrepareToInstall");
+    let stop = prepare
+        .find("'-Action Stop'")
+        .expect("Setup stops the service");
+    let remembered = prepare
+        .find("ServiceStoppedBySetup := True")
+        .expect("the stop is remembered");
+    assert!(
+        remembered < stop,
+        "remembered before the stop runs, so a stop that half-failed counts too"
+    );
+    let post_install = routine(&script, "CurStepChanged");
+    let register = post_install.find("'-Action Register'").expect("register");
+    let cleared = post_install
+        .find("ServiceStoppedBySetup := False")
+        .expect("a finished install hands the service to Register");
+    assert!(cleared > register);
+    let deinit = routine(&script, "DeinitializeSetup");
+    assert!(
+        deinit.contains("if ServiceStoppedBySetup then") && deinit.contains("'-Action Resume'"),
+        "{deinit}"
+    );
+    let actions = read("packaging/windows/setup-actions.ps1");
+    assert!(
+        actions.contains("'Resume' {"),
+        "setup-actions.ps1 has no Resume"
+    );
+}
+
 #[test]
 fn a_silent_install_without_a_registered_service_does_not_exit_with_zero() {
     let script = installer_script();

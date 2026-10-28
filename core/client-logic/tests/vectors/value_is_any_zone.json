@@ -1,0 +1,13 @@
+{
+  "cases": [
+    { "name": "a site in every zone", "input": { "value": "example.*" }, "expected": true },
+    { "name": "surrounding spaces do not matter", "input": { "value": "  example.*  " }, "expected": true },
+    { "name": "a byte-order mark pasted after it is space", "input": { "value": "example.*﻿" }, "expected": true },
+    { "name": "a no-break space after it is space", "input": { "value": "example.* " }, "expected": true },
+    { "name": "a plain host", "input": { "value": "example.com" }, "expected": false },
+    { "name": "a wildcard in front is a suffix rule", "input": { "value": "*.example.com" }, "expected": false },
+    { "name": "a star without its dot", "input": { "value": "example*" }, "expected": false },
+    { "name": "the star must end the value", "input": { "value": "example.*.com" }, "expected": false },
+    { "name": "empty", "input": { "value": "" }, "expected": false }
+  ]
+}

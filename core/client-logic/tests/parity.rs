@@ -309,11 +309,12 @@ fn first_run_writes_match_js() {
         &mut JsLib::pure(),
         |input| {
             format!(
-                "firstRunWrites({}, {}, {}, {})",
+                "firstRunWrites({}, {}, {}, {}, {})",
                 arg(input, "held"),
                 arg(input, "level"),
                 arg(input, "doh"),
-                arg(input, "touched")
+                arg(input, "touched"),
+                arg(input, "fake-ip-touched")
             )
         },
         |input| {
@@ -329,8 +330,13 @@ fn first_run_writes_match_js() {
                 held,
                 chosen,
                 input["touched"].as_bool().unwrap_or(false),
+                input["fake-ip-touched"].as_bool().unwrap_or(false),
             );
-            json!({ "protection": writes.protection, "stability": writes.stability })
+            json!({
+                "protection": writes.protection,
+                "stability": writes.stability,
+                "fakeIp": writes.fake_ip
+            })
         },
     );
 }

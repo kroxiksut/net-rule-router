@@ -208,6 +208,9 @@ pub struct PrincipalEnforcementCycle {
     /// alone was not enough: nobody reads the service log to find out why their
     /// IPv6 stopped working.
     events: Option<Arc<crate::ipc_handlers::event_bus::EventBus>>,
+    /// The coverage notices last published, as (principal, reason): one is
+    /// published again only after it stopped being true.
+    coverage_announced: Mutex<std::collections::BTreeSet<(String, &'static str)>>,
     /// The plans installed by the previous pass — and, because the lock is held
     /// for the WHOLE pass, the thing that serialises passes against each other.
     /// Three callers drive this cycle (the timer, an apply from the GUI, a link
@@ -361,6 +364,7 @@ impl PrincipalEnforcementCycle {
             enforcer,
             routes: None,
             events: None,
+            coverage_announced: Mutex::new(std::collections::BTreeSet::new()),
             fail_closed_posture: None,
             dns_cache_control: None,
             last_applied: Mutex::new(None),
@@ -960,25 +964,18 @@ impl PrincipalEnforcementCycle {
 
     /// Tell the principals who need to know, and only them.
     ///
-    /// Published on a CHANGE, never on the identical re-apply that follows every
-    /// ten seconds: a notice repeated forever is one the user learns to dismiss
-    /// without reading.
+    /// Published when a principal's coverage CHANGES, never again while it
+    /// holds: the plans change whenever anyone edits a rule, and a notice
+    /// repeated each time is one the user learns to dismiss without reading.
     fn notify_coverage(
         &self,
         unprotected: &[String],
         wants_machine_wide_cut: &std::collections::BTreeMap<String, bool>,
     ) {
-        let Some(bus) = self.events.as_ref() else {
-            return;
-        };
-        for sid in unprotected {
-            bus.publish_for(
-                sid.clone(),
-                nrr_shared::ipc_payloads::StatusUpdateEvent::ProtectionCoverageChanged {
-                    reason: "blanket-block-not-armed".to_string(),
-                },
-            );
-        }
+        let mut standing: std::collections::BTreeSet<(String, &'static str)> = unprotected
+            .iter()
+            .map(|sid| (sid.clone(), "blanket-block-not-armed"))
+            .collect();
         // Somebody armed a cut the packet layer cannot scope. Everyone else
         // active loses ICMP and IPv6 without having asked for it, so they are
         // told - the alternative was that their network changed silently.
@@ -986,18 +983,33 @@ impl PrincipalEnforcementCycle {
         let anybody_cuts = !nrr_platform_api::enforcement::EnforcementCapabilities::current()
             .per_user_all_protocol_scoping
             && wants_machine_wide_cut.values().any(|v| *v);
-        if !anybody_cuts {
-            return;
+        if anybody_cuts {
+            standing.extend(
+                wants_machine_wide_cut
+                    .iter()
+                    .filter(|(_, wants)| !**wants)
+                    .map(|(sid, _)| (sid.clone(), "machine-wide-cut-by-another-user")),
+            );
         }
-        for (sid, wants) in wants_machine_wide_cut {
-            if !*wants {
-                bus.publish_for(
-                    sid.clone(),
-                    nrr_shared::ipc_payloads::StatusUpdateEvent::ProtectionCoverageChanged {
-                        reason: "machine-wide-cut-by-another-user".to_string(),
-                    },
-                );
-            }
+        let fresh: Vec<(String, &'static str)> = {
+            let mut announced = self
+                .coverage_announced
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            let fresh = standing.difference(&announced).cloned().collect();
+            *announced = standing;
+            fresh
+        };
+        let Some(bus) = self.events.as_ref() else {
+            return;
+        };
+        for (sid, reason) in fresh {
+            bus.publish_for(
+                sid,
+                nrr_shared::ipc_payloads::StatusUpdateEvent::ProtectionCoverageChanged {
+                    reason: reason.to_string(),
+                },
+            );
         }
     }
 
@@ -1265,6 +1277,49 @@ mod tests {
             .landed()
             .expect_err("half a policy");
         assert!(err.contains("no gateway"), "{err}");
+    }
+
+    /// Coverage was announced on every pass whose plans changed, and another
+    /// user's rule edit changes the plans: the same "not in force yet" card
+    /// came back for this user each time somebody else saved a rule.
+    #[test]
+    fn a_coverage_notice_is_published_on_its_change_only() {
+        use nrr_shared::ipc_payloads::StatusUpdateEvent;
+
+        let bus = std::sync::Arc::new(crate::ipc_handlers::event_bus::EventBus::new());
+        let user = bus.subscribe_as("gui-a".into(), Some("S-1-A".into()), Some(0));
+        let cycle = PrincipalEnforcementCycle::new(
+            std::sync::Arc::new(ScriptedPrincipals {
+                answer: Some(Vec::new()),
+            }),
+            std::sync::Arc::new(PlanEveryone {
+                without_policy: Vec::new(),
+            }),
+            std::sync::Arc::new(RecordingEnforcer::new(false)),
+        )
+        .with_events(std::sync::Arc::clone(&bus));
+        let unarmed = |sub: &str| {
+            bus.peek_pending_for(sub, 64)
+                .iter()
+                .filter(|e| {
+                    matches!(
+                        &e.event,
+                        StatusUpdateEvent::ProtectionCoverageChanged { reason }
+                            if reason == "blanket-block-not-armed"
+                    )
+                })
+                .count()
+        };
+        let none = std::collections::BTreeMap::new();
+        let unprotected = vec!["S-1-A".to_string()];
+
+        cycle.notify_coverage(&unprotected, &none);
+        cycle.notify_coverage(&unprotected, &none);
+        assert_eq!(unarmed(&user.subscription_id), 1, "the same state twice");
+
+        cycle.notify_coverage(&[], &none);
+        cycle.notify_coverage(&unprotected, &none);
+        assert_eq!(unarmed(&user.subscription_id), 2, "unarmed again is news");
     }
 
     /// The packet layer carries no user context, so a cut one principal asks

@@ -711,6 +711,32 @@ fn secondary_ip_owners_maps_ips_to_their_rule_host() {
     );
 }
 
+/// Every host of a suffix the codegen pins has an owner: a direct site sharing
+/// the address of the 2000th one is a co-tenant, not something the rule claims
+/// alone, whatever window the census had read.
+#[test]
+fn secondary_ip_owners_cover_every_host_the_codegen_pins_under_a_suffix() {
+    let fqdn = MockFqdnCacheLookup::new();
+    let hosts = 2_000u16;
+    assert!(usize::from(hosts) <= crate::wfp_codegen::SUFFIX_FANOUT_BACKSTOP);
+    for n in 0..hosts {
+        let [hi, lo] = n.to_be_bytes();
+        fqdn.set_ips(
+            &format!("h{n:04}.example.com"),
+            vec![Ipv4Addr::new(100, 64, hi, lo)],
+        );
+    }
+    let secondary = CanonicalRuleSet::from_rules(vec![suffix_rule("r", "example.com")]);
+    let owners = build_secondary_ip_owners(&secondary, &fqdn);
+    let [hi, lo] = (hosts - 1).to_be_bytes();
+    assert_eq!(
+        owners
+            .get(&Ipv4Addr::new(100, 64, hi, lo))
+            .map(String::as_str),
+        Some("h1999.example.com")
+    );
+}
+
 #[test]
 fn detects_collateral_when_direct_host_shares_a_secondary_ip() {
     let (cache, lookup) = in_memory_cache();
@@ -956,6 +982,85 @@ fn a_neighbour_claimed_as_narrowly_stays_a_census_tenant() {
             .unwrap_or(0)
             >= 1,
         "an equally specific claim is not outranked"
+    );
+}
+
+/// The page loads first, then its images under the user's zone rule answer
+/// with the page's own address. The direct site on it was seen before any
+/// rule host was, and it still counts: otherwise the order of two lookups
+/// the page controls decides whether the user's direct site rides the tunnel.
+#[test]
+fn a_direct_site_seen_before_a_zone_name_took_its_address_keeps_its_census_seat() {
+    let (cache, lookup) = in_memory_cache();
+    let names = Arc::new(crate::observed_host_names::ObservedHostNames::new());
+    let c = consumer(
+        vec![zone_rule("z1", "example")],
+        Arc::clone(&cache),
+        Arc::clone(&lookup) as Arc<dyn FqdnCacheLookup>,
+        active_sid("S-A"),
+    )
+    .with_observed_host_names(Arc::clone(&names));
+    c.consume(
+        &[obs("page.attacker.test", [100, 64, 9, 9])],
+        SystemTime::now(),
+    );
+    c.consume(
+        &[obs("a1.attacker.example", [100, 64, 9, 9])],
+        SystemTime::now(),
+    );
+    let guard = cache.lock().unwrap_or_else(|p| p.into_inner());
+    assert_eq!(
+        guard
+            .direct_host_count_for_ip(Ipv4Addr::new(100, 64, 9, 9))
+            .unwrap_or(0),
+        1,
+        "the direct site seen first is a tenant of the address"
+    );
+}
+
+/// A name seen rule-less before the user's rule covered it is the user's
+/// own host now, not a bystander: it must not vote the address off the tunnel.
+#[test]
+fn a_name_the_rules_now_cover_is_no_earlier_bystander() {
+    let (cache, lookup) = in_memory_cache();
+    let names = Arc::new(crate::observed_host_names::ObservedHostNames::new());
+    names.record("img.mail.example", &[Ipv4Addr::new(100, 64, 9, 9)]);
+    let c = consumer(
+        vec![zone_rule("z1", "example")],
+        Arc::clone(&cache),
+        Arc::clone(&lookup) as Arc<dyn FqdnCacheLookup>,
+        active_sid("S-A"),
+    )
+    .with_observed_host_names(Arc::clone(&names));
+    c.consume(&[obs("mail.example", [100, 64, 9, 9])], SystemTime::now());
+    let guard = cache.lock().unwrap_or_else(|p| p.into_inner());
+    assert_eq!(
+        guard
+            .direct_host_count_for_ip(Ipv4Addr::new(100, 64, 9, 9))
+            .unwrap_or(0),
+        0
+    );
+}
+
+/// The resolver's question: is this name a stranger's under a public zone?
+/// Only when no narrower rule, and no internal zone, also names it.
+#[test]
+fn only_a_public_zone_alone_makes_a_name_a_strangers() {
+    let ru = CanonicalRuleSet::from_rules(vec![zone_rule("z", "ru")]);
+    assert!(held_only_by_public_zone("a1.attacker.ru", &ru));
+    let named = CanonicalRuleSet::from_rules(vec![
+        zone_rule("z", "ru"),
+        exact_fqdn_rule("e", "git.example.ru"),
+    ]);
+    assert!(!held_only_by_public_zone("git.example.ru", &named));
+    let site =
+        CanonicalRuleSet::from_rules(vec![zone_rule("z", "ru"), suffix_rule("s", "example.ru")]);
+    assert!(!held_only_by_public_zone("git.example.ru", &site));
+    let internal = CanonicalRuleSet::from_rules(vec![zone_rule("z", "intra")]);
+    assert!(!held_only_by_public_zone("git.corp.intra", &internal));
+    assert!(
+        !held_only_by_public_zone("elsewhere.example", &ru),
+        "not named at all"
     );
 }
 

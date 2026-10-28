@@ -88,6 +88,14 @@ function normalizeHostInput(ruleType, raw) {
     return s
 }
 
+// What the rules list's search box keeps of `text`: a URL with a scheme comes
+// down to its host. Only then: the host cleaner reads a subnet's `/` and an
+// IPv6 address's `:` as URL parts. Twin of `search_box_text`.
+function searchBoxText(text) {
+    var s = String(text || "")
+    return /^[A-Za-z][A-Za-z0-9+.-]*:\/\//.test(s) ? normalizeHostInput("domain", s) : s
+}
+
 // The one spelling of a rule-type slug. `suffix-domain` and `domain` describe
 // the same wire-level kind, as do `exact-ipv4` and `exact-ip`; which spelling a
 // row carries depends only on where it came from (service snapshot vs the edit
@@ -106,8 +114,14 @@ function canonicalRuleTypeSlug(ruleType) {
 // and the two then shared one comment row in the sidecar.
 function mergeKey(row) {
     return canonicalRuleTypeSlug(row.ruleType) + "|" +
-        String(row.matchValue || "").toLowerCase() + "|" +
+        keyLower(row.matchValue) + "|" +
         String(row.targetRoute || "")
+}
+
+// `js::key_lower`: lowercase with a final sigma as a plain one. QV4 lowercases
+// without the final-sigma rule and Rust with it; a key must not differ by engine.
+function keyLower(value) {
+    return String(value || "").toLowerCase().replace(/ς/g, "σ")
 }
 
 // Normalize a rule id to canonical `R-NNNN` (4-digit, zero-padded) form.
@@ -131,7 +145,7 @@ function ruleSignature(row) {
     var t = canonicalRuleTypeSlug(row.ruleType)
     return t + "|"
         + String(row.targetRoute || "").toLowerCase() + "|"
-        + String(row.matchValue || "").toLowerCase()
+        + keyLower(row.matchValue)
 }
 
 // Canonical (type, value, route) tuple the sidecar RPC layer expects. Distinct
@@ -522,12 +536,13 @@ function _rowWireDto(row, aceEncodeHost, options, asTyped) {
         case "application":
             // A `*` makes it a pattern, exactly as the preset parser reads it.
             // Emitting `exact` for `disko*.exe` stored a filename no process can
-            // ever have, so the rule matched nothing at all. `+children` stays
-            // in the file, not in the name the service matches.
+            // ever have, so the rule matched nothing at all.
             // A separator makes it a path, which the service reads in its
             // platform's spelling.
-            // `+override` travels as the request it is, absent when unset.
-            var asksOverride = !asTyped && _bulkSplitRuleFlags(value).override
+            // The flags come off the name and travel as the requests they
+            // are; `override-requested` is absent when unset.
+            var flags = asTyped ? { children: false, override: false } : _bulkSplitRuleFlags(value)
+            var asksOverride = flags.override
             if (!asTyped) value = withoutRuleFlags(value)
             dto["app-match"] = {
                 pattern: {
@@ -535,7 +550,7 @@ function _rowWireDto(row, aceEncodeHost, options, asTyped) {
                         : (value.indexOf("*") >= 0 ? "glob" : "exact"),
                     value: value
                 },
-                "include-child-processes": false
+                "include-child-processes": flags.children === true
             }
             if (asksOverride) dto["app-match"]["override-requested"] = true
             break
@@ -1202,17 +1217,17 @@ function planRuleAddition(rows, items, moveElsewhere) {
 // A rule's identity apart from its route: type and value, as
 // `planRuleAddition` and the service's recent changes match rules.
 function ruleValueKey(row) {
-    return canonicalRuleTypeSlug(row.ruleType) + "|" + String(row.matchValue || "").toLowerCase()
+    return canonicalRuleTypeSlug(row.ruleType) + "|" + keyLower(row.matchValue)
 }
 
 // What one add left, for taking it back: `{ added: [state], moved: [{ before,
 // after }] }`, a state being `{ ruleType, matchValue, targetRoute, enabled,
-// verify }`. Built from a `planRuleAddition` plan (or several merged).
+// verify, comment }`. Built from a `planRuleAddition` plan (or several merged).
 function additionUndoRecord(plan) {
     var pick = function(r) {
         return { ruleType: String(r.ruleType || ""), matchValue: String(r.matchValue || ""),
             targetRoute: String(r.targetRoute || ""), enabled: r.enabled !== false,
-            verify: r.verify === true }
+            verify: r.verify === true, comment: String(r.comment || "") }
     }
     var p = plan || {}
     var record = { added: (p.addedRows || []).map(pick), moved: [] }
@@ -1230,19 +1245,23 @@ function additionUndoRecord(plan) {
 }
 
 // Taking back the add `record` (`additionUndoRecord`) from `rows`: a rule it
-// added leaves, a rule it moved goes back where it was. When any of them is
-// gone or no longer as the add left it, the user changed it since, and
-// nothing is touched. Returns { rows, removed, restored, conflict }.
+// added leaves, a rule it moved goes back where it was, its comment written
+// again under the old route (`comments`: the rows to write, as comments are
+// kept per route). When any of them is gone or no longer as the add left it,
+// comment included, the user changed it since, and nothing is touched.
+// Returns { rows, removed, restored, comments, conflict }.
 function planAdditionUndo(rows, record) {
     var out = []
     for (var i = 0; i < _rowCount(rows); i += 1) out.push(_rowAt(rows, i))
     var r = record || {}
-    var untouched = { rows: out.slice(), removed: 0, restored: 0, conflict: true }
+    var untouched = { rows: out.slice(), removed: 0, restored: 0, comments: [], conflict: true }
     var same = function(row, s) {
         return String(row.targetRoute || "") === s.targetRoute
             && (row.enabled !== false) === s.enabled
             && rowIsVerify(row) === rowIsVerify(s)
+            && String(row.comment || "") === String(s.comment || "")
     }
+    var comments = []
     var find = function(s) {
         var key = ruleValueKey(s)
         for (var k = 0; k < out.length; k += 1) if (ruleValueKey(out[k]) === key) return k
@@ -1266,12 +1285,18 @@ function planAdditionUndo(rows, record) {
         for (var f in out[to]) back[f] = out[to][f]
         back.targetRoute = moved[m].before.targetRoute
         back.verify = moved[m].before.verify
+        back.comment = String(moved[m].before.comment || "")
         out[to] = back
         restored += 1
+        // An empty one would clear whatever stands there, which no undo wrote.
+        if (back.comment !== "") {
+            comments.push({ ruleType: back.ruleType, matchValue: back.matchValue,
+                targetRoute: back.targetRoute, comment: back.comment })
+        }
     }
     var kept = []
     for (var j = 0; j < out.length; j += 1) if (!drop[j]) kept.push(out[j])
-    return { rows: kept, removed: removed, restored: restored,
+    return { rows: kept, removed: removed, restored: restored, comments: comments,
         conflict: removed + restored === 0 }
 }
 
@@ -2369,6 +2394,27 @@ function bulkPendingVerdicts(plan) {
     return out
 }
 
+// The table's rules as the bulk planner's `existing`.
+function bulkExisting(rows) {
+    var out = []
+    for (var i = 0; i < _rowCount(rows); i += 1) {
+        var r = _rowAt(rows, i)
+        out.push({ type: String(r.ruleType || ""), value: String(r.matchValue || ""),
+            route: String(r.targetRoute || "") })
+    }
+    return out
+}
+
+// What Save sends: `input` (as `planBulkRules` takes it) planned again against
+// `rows`, the rules at Save. They may have changed since the plan on screen,
+// and a line planned against the old ones would be neither applied nor kept.
+function planBulkSubmission(input, rows) {
+    var p = {}
+    for (var k in (input || {})) p[k] = input[k]
+    p.existing = bulkExisting(rows)
+    return planBulkRules(p)
+}
+
 // ---- unsaved edits over rules changed elsewhere ----
 
 function _copyRow(row) {
@@ -2383,7 +2429,7 @@ function _copyRow(row) {
 function rowSameContent(a, b) {
     return !!a.enabled === !!b.enabled
         && canonicalRuleTypeSlug(a.ruleType) === canonicalRuleTypeSlug(b.ruleType)
-        && String(a.matchValue || "").toLowerCase() === String(b.matchValue || "").toLowerCase()
+        && keyLower(a.matchValue) === keyLower(b.matchValue)
         && String(a.targetRoute || "") === String(b.targetRoute || "")
         && !!a.verify === !!b.verify
         && String(a.comment || "") === String(b.comment || "")
@@ -2504,27 +2550,6 @@ function rebaseSnapshot(rows) {
             originAnchor: String(r.originAnchor || ""),
             originAdded: String(r.originAdded || "")
         })
-    }
-    return out
-}
-
-// `fresh` rows with the note a rule has in the sidecar, which the service's
-// list does not carry: an empty note is filled from the same rule among
-// `known` (the edited rows first, then the base).
-function rebaseFreshWithNotes(fresh, known) {
-    var notes = Object.create(null)
-    for (var k = 0; k < known.length; k += 1) {
-        for (var j = 0; j < known[k].length; j += 1) {
-            var key = mergeKey(known[k][j])
-            if (!(key in notes) && known[k][j].comment) notes[key] = String(known[k][j].comment)
-        }
-    }
-    var out = []
-    for (var i = 0; i < fresh.length; i += 1) {
-        var row = _copyRow(fresh[i])
-        var note = notes[mergeKey(row)]
-        if (!row.comment && note) row.comment = note
-        out.push(row)
     }
     return out
 }

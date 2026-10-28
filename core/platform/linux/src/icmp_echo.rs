@@ -154,6 +154,14 @@ impl IcmpEchoPort for LinuxIcmpEcho {
     }
 }
 
+/// The fuzz target's entry: one datagram off the raw socket, which any host
+/// on the network can send, classified as the probe's receive loop does.
+#[cfg(feature = "fuzzing")]
+#[doc(hidden)]
+pub fn fuzz_datagram(datagram: &[u8]) -> Option<EchoOutcome> {
+    classify(datagram, Ipv4Addr::new(192, 0, 2, 10), 0x2a2b, 7, b"probe")
+}
+
 #[cfg(not(target_os = "linux"))]
 impl IcmpEchoPort for LinuxIcmpEcho {
     fn echo(&self, _probe: &EchoProbe) -> Result<EchoOutcome, PlatformError> {

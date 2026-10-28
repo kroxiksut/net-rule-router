@@ -107,6 +107,8 @@ fn choose(app: &mut AppState, name: &str) {
         .expect("the adapter is listed");
     app.interfaces.cursor = index;
     app.interfaces.cursor_key = None;
+    // Choosing a row is done in the list, which has the focus then.
+    app.focus = crate::state::Focus::Feed;
 }
 
 /// The list re-sorts under the cursor; the chosen adapter stays chosen, so
@@ -221,6 +223,22 @@ fn a_role_write_sends_the_whole_policy_with_the_new_binding() {
     );
     assert_eq!(app.interfaces.busy, None);
     assert!(matches!(app.interfaces.outcome, Some(Outcome::Changed(_))));
+}
+
+/// From the menu the first row (the main adapter) is under the cursor: `p`
+/// there must not unbind it before the list has the focus.
+#[test]
+fn a_role_letter_from_the_menu_first_gives_the_list_the_focus() {
+    let fake = service();
+    let mut app = app_with(machine());
+    assert_eq!(app.focus, crate::state::Focus::Menu);
+    press(&mut app, 'p');
+    assert_eq!(run_jobs(&mut app, &fake), 0, "nothing written");
+    assert!(fake.sent(IpcOperationName::RoutePolicyUpdate).is_empty());
+    assert_eq!(app.focus, crate::state::Focus::Feed);
+    press(&mut app, 'p');
+    run_jobs(&mut app, &fake);
+    assert_eq!(fake.sent(IpcOperationName::RoutePolicyUpdate).len(), 1);
 }
 
 #[test]

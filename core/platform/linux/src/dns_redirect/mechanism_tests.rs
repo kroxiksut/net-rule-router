@@ -270,7 +270,10 @@ impl DnsCommands for FakeMachine {
                 }
                 reply(true, "")
             }
-            ("nmcli", ["-t", "-f", "GENERAL.DEVICE,IP4.DNS,IP4.DOMAIN", "device", "show"]) => {
+            (
+                "nmcli",
+                ["-t", "-f", "GENERAL.DEVICE,IP4.DNS,IP4.DOMAIN,IP6.DNS", "device", "show"],
+            ) => {
                 let mut out = String::new();
                 for (name, dns, domains) in &self.state.lock().expect("lock").devices {
                     out.push_str(&format!("GENERAL.DEVICE:{name}\n"));
@@ -812,6 +815,64 @@ fn nmcli_terse_output_parses_per_device() {
     );
     assert_eq!(devices[0].domains, vec!["lan.example".to_string()]);
     assert!(devices[1].dns.is_empty());
+}
+
+/// A device that gets DNS only over IPv6 offers it as an upstream; terse
+/// output escapes the colons of the address.
+#[test]
+fn a_devices_ipv6_servers_are_upstreams_too() {
+    struct Nmcli;
+    impl DnsCommands for Nmcli {
+        fn run(&self, program: &str, args: &[&str]) -> Result<CommandReply, PlatformError> {
+            assert_eq!(program, "nmcli");
+            assert_eq!(args.last(), Some(&"show"));
+            Ok(CommandReply {
+                success: true,
+                stdout:
+                    "GENERAL.DEVICE:wlan0\nIP6.DNS[1]:2001\\:db8\\:\\:53\nIP6.DNS[2]:fe80\\:\\:1\n"
+                        .to_string(),
+                stderr: String::new(),
+            })
+        }
+        fn run_with_input(
+            &self,
+            _program: &str,
+            _args: &[&str],
+            _input: &str,
+        ) -> Result<CommandReply, PlatformError> {
+            unreachable!("nothing is written")
+        }
+    }
+    let servers: Vec<std::net::IpAddr> = NetworkManagerDnsServers(Nmcli)
+        .upstream_candidates_per_link()
+        .into_iter()
+        .map(|c| c.server)
+        .collect();
+    assert_eq!(
+        servers,
+        vec!["2001:db8::53".parse::<std::net::IpAddr>().expect("ip")]
+    );
+}
+
+/// An interface whose record names only IPv6 servers offers them too.
+#[test]
+fn a_records_ipv6_servers_are_upstreams_too() {
+    let (_dir, files) = scratch("resolvconf-v6");
+    let dir = files.resolvconf_record_dirs[0].clone();
+    std::fs::write(
+        dir.join("wlan0.dhcp6"),
+        "nameserver 2001:db8::53\nnameserver fe80::1\n",
+    )
+    .expect("record");
+    let servers: Vec<std::net::IpAddr> = ResolvconfDnsServers { files }
+        .upstream_candidates_per_link()
+        .into_iter()
+        .map(|c| c.server)
+        .collect();
+    assert_eq!(
+        servers,
+        vec!["2001:db8::53".parse::<std::net::IpAddr>().expect("ip")]
+    );
 }
 
 // ── resolvconf ───────────────────────────────────────────────────────────────

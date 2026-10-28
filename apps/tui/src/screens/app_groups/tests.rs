@@ -142,6 +142,93 @@ fn a_route_is_an_edit_of_the_rules_list_not_an_apply() {
     );
 }
 
+/// Line mode: a re-scan that lands after the list was printed must not move a
+/// typed number onto another program.
+#[test]
+fn a_typed_number_names_the_group_as_printed_after_a_rescan() {
+    let (mut app, _) = on_screen();
+    screen(ScreenId::AppGroups).on_printed(&mut app);
+    let generation = app.app_groups.generation;
+    let torrent = found(
+        AppGroupKind::BitTorrent,
+        "qBittorrent",
+        Some("C:\\Program Files\\qBittorrent\\qbittorrent.exe"),
+    );
+    // The hypervisor is gone: the torrent client is listed first now.
+    scanned(&mut app, generation, &[torrent], &[]);
+    assert!(screen(ScreenId::AppGroups).on_line(&mut app, "s 1"));
+    assert!(app_rules(&app).is_empty(), "the printed item 1 has left");
+    assert!(
+        text(&app).contains("no longer in the list"),
+        "{}",
+        text(&app)
+    );
+    // Printed third, after the hypervisor and the display-only WSL.
+    assert!(screen(ScreenId::AppGroups).on_line(&mut app, "s 3"));
+    assert_eq!(
+        app_rules(&app),
+        vec![("qbittorrent.exe".into(), "secondary".into(), true)]
+    );
+}
+
+/// The same for a machine's adapters, re-read after every pin.
+#[test]
+fn a_typed_pin_number_names_the_adapter_as_printed() {
+    let mut app = with_machines(None);
+    screen(ScreenId::AppGroups).on_printed(&mut app);
+    let generation = app.app_groups.generation;
+    // A new machine is listed ahead of the printed one.
+    let mut inventory = lab_with_adapters(None);
+    let mut newcomer = inventory.machines[0].clone();
+    newcomer.id = "m0".into();
+    newcomer.name = "Another".into();
+    inventory.machines.insert(0, newcomer);
+    scanned(&mut app, generation, &[], &[inventory]);
+    app.outbox.take();
+    assert!(screen(ScreenId::AppGroups).on_line(&mut app, "a 1"));
+    assert_eq!(app.outbox.len(), 1);
+    assert_eq!(
+        app.app_groups
+            .pinning
+            .as_ref()
+            .map(|k| k.machine_id.as_str()),
+        Some("m1"),
+        "the adapter printed as 1, not the newcomer"
+    );
+}
+
+fn press(app: &mut AppState, c: char) {
+    crate::full::handle_key(
+        app,
+        crossterm::event::KeyEvent::new(KeyCode::Char(c), crossterm::event::KeyModifiers::NONE),
+        &texts_en(),
+    );
+}
+
+/// From the menu no group is marked in sight: a route letter there only gives
+/// the list the focus.
+#[test]
+fn a_route_letter_from_the_menu_first_gives_the_list_the_focus() {
+    let (mut app, _) = on_screen();
+    press(&mut app, 's');
+    assert!(app_rules(&app).is_empty(), "nothing routed");
+    assert_eq!(app.focus, crate::state::Focus::Feed);
+    press(&mut app, 's');
+    assert_eq!(app_rules(&app).len(), 2);
+}
+
+/// The same for a machine's adapter: a pin changes the hypervisor at once.
+#[test]
+fn a_pin_letter_from_the_menu_first_gives_the_list_the_focus() {
+    let mut app = with_machines(None);
+    app.focus = crate::state::Focus::Menu;
+    app.outbox.take();
+    press(&mut app, 'a');
+    assert!(app.outbox.take().is_empty(), "the hypervisor is not called");
+    press(&mut app, 'a');
+    assert_eq!(app.outbox.len(), 1);
+}
+
 #[test]
 fn sending_a_group_back_to_the_main_route_removes_its_rules() {
     let (mut app, _) = on_screen();

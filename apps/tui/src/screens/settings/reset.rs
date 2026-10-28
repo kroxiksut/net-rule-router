@@ -6,13 +6,12 @@
 
 use std::time::{Duration, Instant};
 
-use base64::Engine as _;
 use nrr_client_logic::full_reset::{next, Next, Outcome, Step};
 use nrr_ipc_client::{ipc_operation_timeout, IpcClient};
 use nrr_platform_api::service_control::{ServiceControlError, ServiceControlPort, ServiceRunState};
 use nrr_shared::ipc::IpcOperationName as Op;
 use nrr_shared::ipc_payloads::{
-    LogsClearRequest, PresetImportPayload, PrincipalDataCountResponse, PrincipalDataPurgeRequest,
+    LogsClearRequest, PrincipalDataCountResponse, PrincipalDataPurgeRequest,
 };
 use nrr_shared::user_settings::UserSettingsStore;
 use serde_json::Value;
@@ -21,7 +20,6 @@ use super::items::Words;
 use super::{Failure, Input, Loadable};
 use crate::backend::{Job, RegistrationProbe, Reply};
 use crate::i18n::{key, Key};
-use crate::screens::wizard::import;
 use crate::state::AppState;
 
 pub const TITLE: Key = key("dialog.full-reset.title", "Full reset");
@@ -67,10 +65,6 @@ const STOP_WAIT: Duration = Duration::from_secs(30);
 const START_WAIT: Duration = Duration::from_secs(30);
 const ANSWER_WAIT: Duration = Duration::from_secs(15);
 const ANSWER_POLL: Duration = Duration::from_millis(500);
-
-/// The rules file with no rule in it, the state a fresh install starts from.
-const EMPTY_RULES: &str =
-    "--- Zones\n\n--- Domains\n\n--- IP\n\n--- Windows\n\n--- Linux\n\n--- MacOS\n";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ResetRow {
@@ -151,21 +145,6 @@ fn to_value<T: serde::Serialize>(request: &T) -> Value {
     serde_json::to_value(request).unwrap_or(Value::Null)
 }
 
-fn empty_rules_payload() -> Value {
-    let bytes = base64::engine::general_purpose::STANDARD.encode(EMPTY_RULES);
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or_default();
-    to_value(&PresetImportPayload {
-        primary_bytes_b64: Some(bytes.clone()),
-        secondary_bytes_b64: Some(bytes),
-        include_child_processes: false,
-        correlation_id: Some(format!("tui-full-reset-{}-{nanos}", std::process::id())),
-        ..PresetImportPayload::default()
-    })
-}
-
 fn run_step(
     client: &dyn IpcClient,
     step: Step,
@@ -191,11 +170,6 @@ fn run_step(
                 all_principals: everyone,
             }),
         )),
-        Step::ApplyEmptyRules => match import::run(client, &empty_rules_payload()) {
-            Ok(()) => Outcome::Ok,
-            Err(slug) if slug == "forbidden" => Outcome::Forbidden,
-            Err(_) => Outcome::Failed,
-        },
         Step::StopService => stop(),
     }
 }

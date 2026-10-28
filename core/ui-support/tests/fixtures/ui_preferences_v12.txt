@@ -61,6 +61,7 @@ kill_switch_banner_acknowledged=true
 missing_secondary_banner_acknowledged=true
 traffic_stats_period=session
 traffic_export_unit=gb
+conn_trace_group_by=folder
 diagnostics_archive_redaction_level=diagnostics
 diagnostics_archive_session_only=false
 archive_log_budget_mib=64

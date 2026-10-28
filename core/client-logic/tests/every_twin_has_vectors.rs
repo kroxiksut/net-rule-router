@@ -9,15 +9,59 @@ use std::path::{Path, PathBuf};
 
 /// Twins without a vector today. Shrink only: a new twin gets its vector in
 /// the same change instead of a line here.
-const KNOWN_GAPS: &[&str] = &[
-    "app_route_of",
-    "is_forwarding_adapter_name",
-    "present_adapter_ids",
-    "value_is_any_zone",
-    "is_usable_set_name",
-    "rules_file_folder",
-    "security_alerts_unreadable",
+const KNOWN_GAPS: &[&str] = &[];
+
+/// Vector files with cases that pin no answer: there the twins are held only
+/// to each other, and a change made in both passes. Shrink only.
+const UNPINNED_VECTOR_FILES: &[&str] = &[
+    "adapters.json",
+    "auto_rule_groups.json",
+    "parsed_rules.json",
+    "rollback_verdict.json",
+    "route_policy_effective.json",
+    "row_identity.json",
+    "service_wire_rows.json",
+    "verify_verdict_notice.json",
+    "wire_dto.json",
 ];
+
+#[test]
+fn every_vector_names_its_answer() {
+    let dir = crate_dir().join("tests/vectors");
+    let mut unpinned = BTreeSet::new();
+    for entry in std::fs::read_dir(&dir).expect("read vectors") {
+        let path = entry.expect("vectors entry").path();
+        if path.extension().is_none_or(|e| e != "json") {
+            continue;
+        }
+        let document: serde_json::Value = serde_json::from_str(&read(&path))
+            .unwrap_or_else(|e| panic!("{}: not JSON: {e}", path.display()));
+        let Some(cases) = document["cases"].as_array() else {
+            continue;
+        };
+        if cases.iter().any(|case| case.get("expected").is_none()) {
+            let name = path.file_name().and_then(std::ffi::OsStr::to_str);
+            unpinned.insert(name.expect("file name").to_owned());
+        }
+    }
+    let new: Vec<&String> = unpinned
+        .iter()
+        .filter(|f| !UNPINNED_VECTOR_FILES.contains(&f.as_str()))
+        .collect();
+    assert!(
+        new.is_empty(),
+        "cases without `expected` (write the answer the user is promised): {new:?}"
+    );
+    let stale: Vec<&str> = UNPINNED_VECTOR_FILES
+        .iter()
+        .copied()
+        .filter(|f| !unpinned.contains(*f))
+        .collect();
+    assert!(
+        stale.is_empty(),
+        "every case pins its answer now, drop them from UNPINNED_VECTOR_FILES: {stale:?}"
+    );
+}
 
 fn crate_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))

@@ -105,6 +105,7 @@ pub(crate) fn build_runtime_deps(
     if let Some(stack) = policy.as_ref() {
         stack.rules_provider.set_health(Arc::clone(&health));
     }
+    let wake_refresh = policy.as_ref().map(|stack| Arc::clone(&stack.wake_refresh));
     // The user whose book stops reading is told at once, alone.
     nrr_service_runtime::rules_book_notice::attach_events(Arc::clone(&event_bus));
     let (
@@ -507,9 +508,13 @@ pub(crate) fn build_runtime_deps(
         // logind's user edges: Mode B and the route pass follow a sign-in at
         // once instead of on the next periodic re-arm.
         logon_session_observer: Some(Arc::new(LogindLogonSessionObserver)),
-        rebind_requests: recompute_hook
-            .is_some()
-            .then(|| Arc::new(nrr_service_runtime::power_resume::RebindRequests::new())),
+        rebind_requests: recompute_hook.is_some().then(|| {
+            let requests = Arc::new(nrr_service_runtime::power_resume::RebindRequests::new());
+            if let Some(refresh) = wake_refresh {
+                requests.set_wake_refresh(refresh);
+            }
+            requests
+        }),
         // Application rules learn their destinations from the connections the
         // programs make: procfs lists the sockets, and the store is the same one
         // the planner reads. Our own drops join them where NFLOG can be read.
@@ -1123,6 +1128,8 @@ pub(crate) struct PolicyStack {
     pub first_contact: nrr_service_runtime::dns_resolver_ports::FirstContactFn,
     /// The same for an AAAA answer's addresses.
     pub first_contact_v6: nrr_service_runtime::dns_resolver_ports::FirstContactV6Fn,
+    /// Run on a wake: the pass re-reads the network and runs in full.
+    pub wake_refresh: Arc<dyn Fn() + Send + Sync>,
 }
 
 /// Assemble the policy stack, or explain why the daemon cannot enforce.
@@ -1587,16 +1594,26 @@ pub(crate) fn build_policy_stack(
 
     // Everything a pass reads, as change numbers: an idle pass then costs a few
     // reads instead of a plan and an `nft` run.
-    let pass_inputs = {
+    let (pass_inputs, wake_refresh) = {
         use nrr_platform_api::route_table::RouteTablePort;
         use nrr_service_runtime::pass_inputs::{
             applying_revision, change_hashed, hashed, rule_overrides, table_writes,
-            verify_verdicts, PassInputs, PLAN_BLIND_STATE_TABLES,
+            verify_verdicts, FullPassRequest, PassInputs, PLAN_BLIND_STATE_TABLES,
         };
         // Routes and adapters are read again only after the kernel reports a
         // change; a refused subscription leaves them read per call.
         let net_change = nrr_platform_api::net_change::NetChangeGeneration::new();
         let net_subscription = net_change.follow(&LinuxNetworkChangeObserver);
+        // The kernel's notices fired while the machine slept.
+        let full_pass = FullPassRequest::default();
+        let wake_refresh: Arc<dyn Fn() + Send + Sync> = {
+            let generation = net_change.clone();
+            let full_pass = full_pass.clone();
+            Arc::new(move || {
+                generation.bump();
+                full_pass.request();
+            })
+        };
         let (adapters_cached, _) = change_hashed(net_change.clone(), move || {
             adapter_port_for_inputs.enumerate_all()
         });
@@ -1605,7 +1622,8 @@ pub(crate) fn build_policy_stack(
         });
         let cache = Arc::clone(&cache_store);
         let observations = Arc::clone(&app_observations);
-        PassInputs::new()
+        let inputs = PassInputs::new()
+            .with_full_pass_request(full_pass)
             .with_source("applying", applying_revision())
             .with_source("verdicts", verify_verdicts())
             .with_source("overrides", rule_overrides())
@@ -1650,7 +1668,8 @@ pub(crate) fn build_policy_stack(
             .with_own_writes_source(
                 "selectors",
                 hashed(nrr_platform_linux::policy_routing::installed_selectors_fingerprint),
-            )
+            );
+        (inputs, wake_refresh)
     };
 
     // Who paused their routing: the pass leaves them out, which is what takes
@@ -1824,6 +1843,7 @@ pub(crate) fn build_policy_stack(
         ),
         conn_trace_log,
         cycle,
+        wake_refresh,
         traffic_sampler: open_traffic_sampler(&artifacts.topology.traffic_db_path),
     })
 }

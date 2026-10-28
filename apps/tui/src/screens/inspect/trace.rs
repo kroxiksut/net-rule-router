@@ -31,7 +31,7 @@ use super::{
 };
 use crate::backend::Reply;
 use crate::i18n::{Key, Texts};
-use crate::screens::settings::{prefs, Clock};
+use crate::screens::settings::Clock;
 use crate::screens::{Screen, ScreenId};
 use crate::state::AppState;
 use crate::view::{Panel, ScreenView, Segment, ViewLine};
@@ -334,13 +334,12 @@ fn next_grouping(current: TraceGrouping) -> TraceGrouping {
 fn set_grouping(app: &mut AppState, grouping: TraceGrouping) {
     app.settings.prefs.trace_grouping = grouping;
     app.inspect.trace.pager = Pager::default();
-    app.inspect.trace.grouping_unsaved = match app.settings.prefs_path.as_deref() {
-        Some(path) => prefs::save(path, app.settings.prefs)
-            .err()
-            .map(|error| error.to_string()),
-        // Without a configuration folder there is nowhere to remember it.
-        None => None,
-    };
+    // Without a configuration folder there is nowhere to remember it.
+    app.inspect.trace.grouping_unsaved = app
+        .settings
+        .save_prefs()
+        .and_then(Result::err)
+        .map(|error| error.to_string());
 }
 
 /// "Rule for this folder…": the Rules screen's add form holding the folder

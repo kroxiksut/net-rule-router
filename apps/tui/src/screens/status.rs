@@ -379,6 +379,20 @@ fn routing_lines(app: &AppState, texts: &Texts) -> Vec<ViewLine> {
             Segment::plain(format!(" {}", texts.get(keys::SETTINGS_UNREADABLE_BODY))),
         ]));
     }
+    if let Some(path) = app
+        .settings
+        .prefs_path
+        .as_deref()
+        .filter(|_| app.settings.prefs_damaged.is_some())
+    {
+        let path = nrr_shared::display_text::display_text(&path.display().to_string()).into_owned();
+        let (title, body) =
+            crate::screens::settings::prefs_damaged_keys(app.settings.prefs_damaged);
+        lines.push(ViewLine::new(vec![
+            Segment::state(texts.get(title), StateTone::Caution),
+            Segment::plain(format!(" {}", texts.fill(body, &[("path", path)]))),
+        ]));
+    }
     if let Some(line) = delivery_line(app, texts) {
         lines.push(line);
     }
@@ -958,6 +972,68 @@ mod tests {
                     && l.contains("default settings")),
             "{:?}",
             shown(&app)
+        );
+    }
+
+    /// The terminal's own file is damaged: every part that remembers something
+    /// tries to save, and the user reads one line naming the file, not one per
+    /// save; once the file is fixed, saving works and the line goes.
+    #[test]
+    fn a_damaged_terminal_file_is_said_once_with_its_path() {
+        let dir = crate::testing::Scratch::new("status-tui-json-damaged");
+        let path = dir.path().join("tui.json");
+        std::fs::write(&path, "{ \"plain\": tr").expect("seed");
+        let mut app = app_at(Link::Connected, Some(&Fixture::healthy()));
+        app.settings.prefs_path = Some(path.clone());
+        app.settings.prefs.ascii = true;
+        let _ = app.settings.save_prefs();
+        let _ = app.settings.save_prefs();
+        let _ = app.settings.write_prefs(serde_json::Map::new());
+
+        let told: Vec<String> = shown(&app)
+            .into_iter()
+            .filter(|l| l.starts_with("The terminal's settings file is damaged"))
+            .collect();
+        assert_eq!(told.len(), 1, "{:?}", shown(&app));
+        assert!(told[0].contains(&path.display().to_string()), "{told:?}");
+        assert_eq!(
+            std::fs::read_to_string(&path).expect("read"),
+            "{ \"plain\": tr"
+        );
+
+        std::fs::remove_file(&path).expect("the user deletes it");
+        assert!(matches!(app.settings.save_prefs(), Some(Ok(()))));
+        assert!(!shown(&app).iter().any(|l| l.contains("is damaged")));
+        assert!(crate::screens::settings::prefs::load(&path).ascii);
+    }
+
+    /// A terminal file another program holds is not damaged: the line says it
+    /// could not be read and names it, and the file is not written.
+    #[test]
+    fn a_held_terminal_file_is_said_as_not_read_not_damaged() {
+        let dir = crate::testing::Scratch::new("status-tui-json-held");
+        let path = dir.path().join("tui.json");
+        std::fs::write(&path, "{\"plain\": false}").expect("seed");
+        let mut app = app_at(Link::Connected, Some(&Fixture::healthy()));
+        app.settings.prefs_path = Some(path.clone());
+        app.settings.prefs.ascii = true;
+        let Some(held) = crate::testing::hold_unreadable(&path) else {
+            return;
+        };
+        let _ = app.settings.save_prefs();
+        let lines = shown(&app);
+        drop(held);
+
+        let told: Vec<&String> = lines
+            .iter()
+            .filter(|l| l.starts_with("The terminal's settings file could not be read"))
+            .collect();
+        assert_eq!(told.len(), 1, "{lines:?}");
+        assert!(told[0].contains(&path.display().to_string()), "{told:?}");
+        assert!(!lines.iter().any(|l| l.contains("is damaged")), "{lines:?}");
+        assert_eq!(
+            std::fs::read_to_string(&path).expect("read"),
+            "{\"plain\": false}"
         );
     }
 

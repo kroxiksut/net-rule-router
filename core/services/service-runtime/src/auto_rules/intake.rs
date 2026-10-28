@@ -117,6 +117,34 @@ impl AutoRulesEngine {
         );
     }
 
+    /// [`Self::note_candidate_in_use`] for a name a reverse lookup produced.
+    pub fn note_reverse_named_in_use(&self, sid: &str, hostname: &str, at: SystemTime) {
+        if hostname.is_empty() {
+            return;
+        }
+        self.reverse_named
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .observe((sid.to_string(), hostname.to_ascii_lowercase()));
+        self.note_candidate_in_use(sid, hostname, at);
+    }
+
+    /// Whether `proposed` names or covers a host a reverse lookup named for `sid`.
+    pub(super) fn covers_reverse_named(&self, sid: &str, proposed: &str) -> bool {
+        let proposed = proposed.to_ascii_lowercase();
+        self.reverse_named
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .iter()
+            .any(|(owner, host)| {
+                owner == sid
+                    && (host == &proposed
+                        || host
+                            .strip_suffix(proposed.as_str())
+                            .is_some_and(|rest| rest.ends_with('.')))
+            })
+    }
+
     /// Reports how a host behaved on the primary route. Only hosts the ledger
     /// already tracks are affected — an outcome is evidence about a candidate,
     /// never a reason to start tracking one, so a busy machine does not turn

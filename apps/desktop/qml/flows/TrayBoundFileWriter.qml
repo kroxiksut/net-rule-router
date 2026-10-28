@@ -22,6 +22,8 @@ QtObject {
     property var rpc: null
     /// GuiPresence instance — supplies the linked rules-file paths.
     property var presence: null
+    /// UserSettingsFollower keeping `presence` told of bindings made elsewhere.
+    property var follower: null
     /// `PlatformProfile.os`: picks the application section of the file.
     property string os: ""
     /// The tray window, whose `tr()` words the file's syntax hint.
@@ -57,23 +59,30 @@ QtObject {
     function mirrorServiceIntoFiles() {
         if (_inFlight) { _again = true; return }
         if (!_bridgeReady || !rpc || !presence) return
+        _inFlight = true
+        // The terminal may have bound another set a moment ago, and its rules
+        // are what landed: the files are named only after that is known.
+        if (follower) follower.follow(function() { writer._mirror() })
+        else _mirror()
+    }
+
+    function _mirror() {
         var snap = presence.read()
         // Without the window's answer we do not know which files back the
         // user's rules, and guessing which file to overwrite is worse than
         // doing nothing.
-        if (!snap.known) return
+        if (!snap.known) { _settled(); return }
         // The window is up and owns the write; two writers on one file is the
         // bug that cost a whole run's preferences once already.
-        if (snap.windowRunning) return
+        if (snap.windowRunning) { _settled(); return }
         var paths = {
             primary: String(snap.rulesPathPrimary || ""),
             secondary: String(snap.rulesPathSecondary || "")
         }
-        if (paths.primary === "" && paths.secondary === "") return
+        if (paths.primary === "" && paths.secondary === "") { _settled(); return }
 
-        _inFlight = true
         var corr = nrrNativeBridge.rpcRulesList()
-        if (!corr || String(corr) === "") { _inFlight = false; return }
+        if (!corr || String(corr) === "") { _settled(); return }
         rpc.registerRpcCallback(corr, function(ok, payload, code, msg) {
             if (!ok || !payload) {
                 console.log("tray bound-file: rules.list failed:", code, msg)

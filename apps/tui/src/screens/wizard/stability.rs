@@ -68,15 +68,36 @@ pub fn log_window_label(window: Option<&str>) -> Key {
 }
 
 /// The patch the answers make, cut to what this platform's service applies.
-fn patch(fake_ip: bool, logs: Option<&str>) -> Map<String, Value> {
+fn patch(fake_ip: Option<bool>, logs: Option<&str>) -> Map<String, Value> {
     let mut partial = Map::new();
-    partial.insert("fake-ip-enabled".into(), Value::Bool(fake_ip));
+    if let Some(fake_ip) = fake_ip {
+        partial.insert("fake-ip-enabled".into(), Value::Bool(fake_ip));
+    }
     if let Some(window) = logs {
         partial.insert("verbose-logging-change".into(), Value::from(window));
         partial.insert("conn-trace-ndjson-change".into(), Value::from(window));
         partial.insert("conn-trace-gui".into(), Value::Bool(true));
     }
     patch_for_platform(&partial, Some(&supports()))
+}
+
+/// A user already set up is shown the service's fake-IP, not the offer.
+pub fn read_held(app: &mut AppState) {
+    if !offers_fake_ip() || !app.link.is_connected() {
+        return;
+    }
+    app.outbox.push(Box::new(|client: &dyn IpcClient| {
+        let read = Op::ServiceStabilityConfigGet;
+        let held = client
+            .call(read, json!({}), ipc_operation_timeout(read))
+            .ok()
+            .and_then(|row| row.get("fake-ip-enabled").and_then(Value::as_bool));
+        Reply::new(move |app| {
+            if let Some(on) = held.filter(|_| !app.wizard.fake_ip_touched) {
+                app.wizard.fake_ip = on;
+            }
+        })
+    }));
 }
 
 /// Send the answers once per run. A user already set up keeps what the
@@ -89,10 +110,14 @@ pub fn send(app: &mut AppState) {
     }
     let held = state.protection_at_start;
     let chosen = (state.leak_protection, state.doh_lockdown);
-    if !first_run_writes(held, chosen, state.stability_touched).stability {
+    let writes = first_run_writes(held, chosen, state.stability_touched, state.fake_ip_touched);
+    if !writes.stability {
         return;
     }
-    let partial = patch(state.fake_ip, state.diagnostic_logs);
+    let partial = patch(
+        writes.fake_ip.then_some(state.fake_ip),
+        state.diagnostic_logs,
+    );
     if partial.is_empty() {
         return;
     }

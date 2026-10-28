@@ -163,9 +163,9 @@ pub enum RulesRead {
 pub trait RulesProvider: Send + Sync {
     fn active_rules(&self) -> Option<ActiveRulesSnapshot>;
 
-    /// Whether `principal` reads the administrator's baseline, whose Block may
-    /// act for every account at the packet layer, rather than a book of their
-    /// own, whose Block stays theirs. Fixtures default to the baseline.
+    /// Whether `principal` reads the administrator's baseline rather than a
+    /// book of their own; where the packet layer carries the user (Linux), a
+    /// baseline Block holds there too. Fixtures default to the baseline.
     fn rules_are_baseline_for(&self, _principal: &str) -> bool {
         true
     }

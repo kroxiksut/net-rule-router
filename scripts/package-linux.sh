@@ -298,7 +298,8 @@ check_package() {
   esac || die "could not list the files of $file"
   expected="$(expected_paths "$unit_dir" "$@")" || die "could not work out what $file must hold"
   require_contents "$(basename "$file")" "$listing" "$expected
-/usr/share/doc/$package/copyright"
+/usr/share/doc/$package/copyright
+/usr/share/doc/$package/THIRD_PARTY_LICENSES.md"
 }
 
 # An archive whose top folder is $2, holding the sets $3... under root/.
@@ -463,7 +464,7 @@ EOF
 # The service, the console, the terminal interface, and what they read beside
 # themselves. Shared by the netrulerouter package and both archives.
 stage_base() {
-  local root="$1" name
+  local root="$1" name text
   install -d -m 0755 "$root$libexec" "$root$NRR_COMMAND_LINK_DIR"
   install -m 0755 "$service_bin" "$root$libexec/$NRR_SERVICE_EXE_NAME"
   for name in "${NRR_CONSOLE_EXE_NAMES[@]}"; do
@@ -477,6 +478,13 @@ stage_base() {
   # Recovery for a machine the service left without network.
   install -D -m 0755 -T "$script_dir/reset-network.sh" "$root$libexec/scripts/reset-network.sh"
   install -D -m 0644 -T "$script_dir/lib/service-paths.sh" "$root$libexec/scripts/lib/service-paths.sh"
+  # The notices the crate licences ask to travel with the binaries, and the
+  # texts of the vendored crate the service compiles in.
+  install -D -m 0644 -T "$repo_root/THIRD_PARTY_LICENSES.md" "$root$libexec/licenses/THIRD_PARTY_LICENSES.md"
+  for text in "$repo_root"/third_party/tappers/LICENSE*; do
+    [ -f "$text" ] || die "missing the licence texts of third_party/tappers"
+    install -m 0644 -T "$text" "$root$libexec/licenses/tappers-${text##*/}"
+  done
   write_build_info "$root$libexec/build-info.json"
 }
 
@@ -514,10 +522,11 @@ stage_gui() {
 
 # What only a package carries: the unit and its companions, rendered by the
 # daemon itself so they cannot differ from what `install` writes, and the
-# licence where the distribution looks for it.
+# licence and third-party notice where the distribution looks for them.
 add_package_footprint() {
   local root="$1" package="$2" with_service="$3"
   install -D -m 0644 -T "$repo_root/LICENSE" "$root/usr/share/doc/$package/copyright"
+  install -m 0644 -T "$repo_root/THIRD_PARTY_LICENSES.md" "$root/usr/share/doc/$package/THIRD_PARTY_LICENSES.md"
   [ "$with_service" -eq 1 ] || return 0
   "$service_bin" package-files "$root" >/dev/null ||
     die "$service_bin package-files failed (for another architecture this machine must be able to run it)"
@@ -891,6 +900,7 @@ build_tarball() {
   local stem="$1" flavour="$2" flavour_ru="$3" requirements="$4" requirements_ru="$5" glibc="$6"
   shift 6
   local top="$work/tar/$stem" root
+  [ -n "$glibc" ] || die "could not measure the glibc the binaries of $stem need (readelf found no GLIBC_ versions)"
   mkdir -p "$top"
   root="$top/root"
   mkdir -p "$root"
@@ -908,7 +918,11 @@ build_tarball() {
   install -D -m 0644 -T "$script_dir/lib/service-paths.sh" "$top/lib/service-paths.sh"
   install -D -m 0644 -T "$script_dir/lib/desktop-paths.sh" "$top/lib/desktop-paths.sh"
   install -D -m 0644 -T "$repo_root/packaging/linux/maintainer/functions.sh" "$top/lib/package-functions.sh"
+  # install.sh refuses an older glibc by this: the archive has no package
+  # manager to do it, and the loader stops a program before it can say why.
+  printf '%s\n' "$glibc" >"$top/lib/glibc-floor"
   install -m 0644 "$repo_root/LICENSE" "$top/LICENSE"
+  install -m 0644 "$repo_root/THIRD_PARTY_LICENSES.md" "$top/THIRD_PARTY_LICENSES.md"
   write_tarball_readme "$top/README.txt" "$flavour" "$requirements" "$glibc"
   write_tarball_readme_ru "$top/README.ru.txt" "$flavour_ru" "$requirements_ru" "$glibc"
   normalize_modes "$top"

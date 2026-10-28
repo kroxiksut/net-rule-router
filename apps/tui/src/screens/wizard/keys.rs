@@ -108,7 +108,7 @@ pub const DOH_LOCKDOWN: Key = key(
 );
 pub const FAKE_IP: Key = key(
     "dialog.first-run-wizard.protection-fake-ip",
-    "Route sites by name, so an address shared with another site is not dragged along",
+    "Route sites by name, so an address shared with another site is not dragged along (uses a virtual network adapter; on Windows this loads its Wintun driver)",
 );
 pub const DIAGNOSTIC_LOGS: Key = key(
     "dialog.first-run-wizard.protection-diagnostic-logs",

@@ -75,6 +75,39 @@ pub struct ProductionRulesProvider {
 /// The health voice an unreadable book speaks with.
 pub const RULES_READ_SOURCE: &str = "rules-read";
 
+/// The start's signing key, which a stored book is checked against before it
+/// is enforced. One per process, as the key is.
+struct SignatureCheck {
+    key: Vec<u8>,
+    key_store: Arc<dyn nrr_platform_api::key_store::KeyStore>,
+}
+
+static SIGNATURE_CHECK: std::sync::OnceLock<SignatureCheck> = std::sync::OnceLock::new();
+
+/// Makes every provider of this process check a stored book's signature when
+/// it decodes it. A second call is ignored.
+pub fn install_signature_check(
+    key: Vec<u8>,
+    key_store: Arc<dyn nrr_platform_api::key_store::KeyStore>,
+) {
+    let _ = SIGNATURE_CHECK.set(SignatureCheck { key, key_store });
+}
+
+/// Whether `revision_id`'s row fails its signature: edited outside the
+/// service. An unsigned row (written by a start without a key) is backfilled
+/// at the next start, and under an unacknowledged key reset every row fails,
+/// which its own alert covers; neither is held back here.
+fn stored_book_is_forged(conn: &Connection, revision_id: &str) -> bool {
+    let Some(check) = SIGNATURE_CHECK.get() else {
+        return false;
+    };
+    let forged = matches!(
+        RevisionsRepository::with_signing_key(conn, check.key.clone()).verify_row_hmac(revision_id),
+        Ok(Some(nrr_storage::revision_hmac::HmacVerification::Tampered))
+    );
+    forged && !crate::tamper_bootstrap::resign_pending(check.key_store.as_ref(), &check.key)
+}
+
 /// Every client reads the health answer, so the message counts accounts and
 /// names none; who and why go to the log.
 fn unreadable_health_message(accounts: usize) -> String {
@@ -353,6 +386,19 @@ impl ProductionRulesProvider {
             Source::Stored {
                 principal: ref p, ..
             } => match repo.get_active_for(p) {
+                // Held as unreadable, not as no rules: the installed set stays
+                // until the integrity watch rolls the row back.
+                Ok(Some(record))
+                    if for_enforcement && stored_book_is_forged(&guard, &record.revision_id) =>
+                {
+                    return self.unreadable(
+                        principal,
+                        format!(
+                            "the stored rule book {} does not match its signature",
+                            record.revision_id
+                        ),
+                    );
+                }
                 // Keyed by the row actually decoded: another connection may
                 // have switched the active revision since the identity read.
                 Ok(Some(record)) => (

@@ -256,7 +256,7 @@ mod tests {
         );
         // A `Command::spawn` in a parallel test forks this process and can hold
         // a copy of the descriptor until its exec; production never forks it.
-        let third = claim_within(&dir, "gui", Duration::from_secs(2));
+        let third = claim_within(&dir, "gui", Duration::from_secs(10));
         assert!(third.is_some(), "releasing the claim must free the key");
     }
 
@@ -284,7 +284,7 @@ mod tests {
         assert!(path.exists(), "a dead owner leaves its file behind");
         // Same fork window as in the test above: a parallel spawn may still
         // hold the dropped socket for a moment.
-        let claim = claim_within(&dir, "tray", Duration::from_secs(2));
+        let claim = claim_within(&dir, "tray", Duration::from_secs(10));
         assert!(
             claim.is_some(),
             "a file with no live socket must be reclaimed"

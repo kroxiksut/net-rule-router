@@ -111,11 +111,78 @@ fn one_line(value: &str) -> bool {
     !value.contains(['\n', '\r'])
 }
 
+/// Asked by an open window or tray: what changed in the file since a stamp.
+/// Answered by the launcher's loop, which holds the window's preferences.
+pub(crate) const FOLLOW_OPERATION: &str = "local.user-settings.follow";
+
+/// The shared fields `after` holds differently from `before`, under the names
+/// the window's preferences give them.
+pub(crate) fn preference_changes(
+    before: &UiPreferences,
+    after: &UiPreferences,
+) -> Map<String, Value> {
+    let fields: [(&str, Value, Value); 9] = [
+        (
+            "userPresetsDir",
+            before.user_presets_dir.clone().into(),
+            after.user_presets_dir.clone().into(),
+        ),
+        (
+            "selectedPresetSet",
+            before.selected_preset_set.clone().into(),
+            after.selected_preset_set.clone().into(),
+        ),
+        (
+            "mergeConflictPolicy",
+            before.merge_conflict_policy.clone().into(),
+            after.merge_conflict_policy.clone().into(),
+        ),
+        (
+            "lastSavedPathPrimary",
+            before.last_saved_path_primary.clone().into(),
+            after.last_saved_path_primary.clone().into(),
+        ),
+        (
+            "lastSavedPathSecondary",
+            before.last_saved_path_secondary.clone().into(),
+            after.last_saved_path_secondary.clone().into(),
+        ),
+        (
+            "lastLoadedPathPrimary",
+            before.last_loaded_path_primary.clone().into(),
+            after.last_loaded_path_primary.clone().into(),
+        ),
+        (
+            "lastLoadedPathSecondary",
+            before.last_loaded_path_secondary.clone().into(),
+            after.last_loaded_path_secondary.clone().into(),
+        ),
+        (
+            "serviceIntentJson",
+            before.service_intent_json.clone().into(),
+            after.service_intent_json.clone().into(),
+        ),
+        (
+            "acceptedEulaVersion",
+            before.accepted_eula_version.into(),
+            after.accepted_eula_version.into(),
+        ),
+    ];
+    fields
+        .into_iter()
+        .filter(|(_, old, new)| old != new)
+        .map(|(key, _, new)| (key.to_owned(), new))
+        .collect()
+}
+
 /// Writes the shared fields this session changes.
 pub(crate) struct UserSettingsMirror {
     store: UserSettingsStore,
     /// The shared fields as this session last read or wrote them.
     known: UserSettings,
+    /// The file did not read when the session opened, so it was never seeded:
+    /// the first write that finds it absent writes it whole.
+    unseeded: bool,
 }
 
 impl UserSettingsMirror {
@@ -123,11 +190,28 @@ impl UserSettingsMirror {
         Self {
             store,
             known: settings_from_preferences(preferences),
+            unseeded: false,
+        }
+    }
+
+    /// For a session that opened over a file it could not read. Every write
+    /// re-reads the file and refuses a damaged one, so nothing lands until the
+    /// user fixes it; then the session's own changes since it opened do.
+    fn waiting(store: UserSettingsStore, preferences: &UiPreferences) -> Self {
+        Self {
+            unseeded: true,
+            ..Self::new(store, preferences)
         }
     }
 
     pub(crate) fn path(&self) -> &std::path::Path {
         self.store.path()
+    }
+
+    /// The window now holds `preferences`: a value it took from the file is
+    /// not its own change when its next snapshot carries it back.
+    pub(crate) fn adopt(&mut self, preferences: &UiPreferences) {
+        self.known = settings_from_preferences(preferences);
     }
 
     /// Merges into the file each shared field `preferences` holds differently
@@ -139,6 +223,10 @@ impl UserSettingsMirror {
         let mine = settings_from_preferences(preferences);
         if !self.known.clone().adopt_changes(&self.known, &mine) {
             return Ok(false);
+        }
+        if self.unseeded {
+            self.store.load_or_seed(|| mine.clone())?;
+            self.unseeded = false;
         }
         let known = &self.known;
         self.store.update(|current| {
@@ -492,9 +580,10 @@ pub(crate) fn open_session_in(
             Some(UserSettingsMirror::new(store, preferences))
         }
         Err(error) => {
-            // A file we cannot read is the user's copy; it is not rewritten.
-            eprintln!("nrr-launcher: user settings not read, not written this session: {error}");
-            None
+            // A file we cannot read is the user's copy; it is not rewritten
+            // until it reads again.
+            eprintln!("nrr-launcher: user settings not read, not written until they read: {error}");
+            Some(UserSettingsMirror::waiting(store, preferences))
         }
     }
 }
@@ -905,9 +994,38 @@ mod tests {
         let path = store_in(&dir).path().to_path_buf();
         std::fs::write(&path, "{broken").expect("seed");
         let mut prefs = preferences();
-        assert!(open_session_in(store_in(&dir), &mut prefs, true).is_none());
+        let mirror = open_session_in(store_in(&dir), &mut prefs, true);
         assert_eq!(prefs, preferences());
         assert_eq!(std::fs::read_to_string(&path).expect("read"), "{broken");
+
+        let mut mirror = mirror.expect("written once the file reads again");
+        prefs.selected_preset_set = "user:changed".to_string();
+        assert!(mirror.publish(&prefs).is_err());
+        assert_eq!(std::fs::read_to_string(&path).expect("read"), "{broken");
+    }
+
+    /// The user deletes the damaged file instead of fixing it: the window's
+    /// next change writes all of its shared settings, not that one field over
+    /// empty ones, or the terminal loses the folder and the bound files.
+    #[test]
+    fn a_damaged_file_deleted_by_the_user_is_written_whole_by_the_window() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = store_in(&dir).path().to_path_buf();
+        std::fs::write(&path, "{broken").expect("seed");
+        let mut prefs = preferences();
+        let mut mirror = open_session_in(store_in(&dir), &mut prefs, true).expect("mirror");
+        std::fs::remove_file(&path).expect("the user deletes it");
+
+        prefs.selected_preset_set = "user:b".to_string();
+        assert!(mirror.publish(&prefs).expect("publish"));
+
+        let written = store_in(&dir).load().expect("load").expect("written");
+        assert_eq!(written.selected_set, "user:b");
+        assert_eq!(written.rules_folder, "/home/user/sets");
+        assert_eq!(
+            written.rules_files.primary,
+            "/home/user/sets/a/rules_primary.txt"
+        );
     }
 
     #[test]

@@ -359,7 +359,8 @@ ColumnLayout {
                     }
                     ToolTip.visible: hovered
                     ToolTip.delay: 400
-                    ToolTip.text: root.tr("settings.routing.auto-rules.note", "")
+                    ToolTip.text: root.tr("settings.routing.auto-rules.note",
+                        "A routed site often loads its images and video from other domains your rules do not list, so the page opens but its content does not. By default NetRuleRouter collects these missing domains and offers them in the tray — nothing is added to your rules without your confirmation. “Apply automatically” adds them for you; “Off” stops collecting them altogether.")
                     function _indexOfSlug(slug) {
                         for (var i = 0; i < autoRulesModeCombo.model.count; i += 1)
                             if (String(autoRulesModeCombo.model.get(i).slug) === slug)
@@ -932,7 +933,7 @@ ColumnLayout {
                                     parts.push(root.tr("interfaces.connectivity." + of.connectivityState,
                                                        String(of.connectivityState)))
                                 if (of.externalIp && of.externalIp !== "")
-                                    parts.push(root.tr("interfaces.external-ip.prefix", "ext")
+                                    parts.push(root.tr("interfaces.external-ip.prefix", "ext IP")
                                                + " " + String(of.externalIp))
                                 else if (of.externalIpStatus && of.externalIpStatus !== "")
                                     parts.push(root.tr("interfaces.external-ip." + of.externalIpStatus,

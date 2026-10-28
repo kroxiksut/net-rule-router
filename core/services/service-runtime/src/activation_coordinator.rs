@@ -71,6 +71,7 @@ use nrr_storage::{
 
 use crate::active_sid_registry::ActiveSidRegistry;
 use crate::crash_recovery::{ApplyAttemptMarker, ApplyMarkerStore, ApplyPhase};
+use crate::state_lock::lock_state;
 
 mod fixtures;
 mod gate;
@@ -267,7 +268,7 @@ impl ActivationCoordinator {
         if self.signing_key.is_none() {
             return Ok(Vec::new());
         }
-        let conn = self.conn.lock().expect("connection mutex poisoned");
+        let conn = lock_state(&self.conn);
         self.revisions_repo(&conn)
             .integrity_scan()
             .map_err(|e| PolicyError::StorageFailure {
@@ -282,7 +283,7 @@ impl ActivationCoordinator {
         &self,
         requests: &[nrr_storage::revisions::AdoptionRequest<'_>],
     ) -> Result<Vec<nrr_storage::revisions::AdoptionOutcome>, PolicyError> {
-        let conn = self.conn.lock().expect("connection mutex poisoned");
+        let conn = lock_state(&self.conn);
         self.revisions_repo(&conn)
             .adopt_rows(requests)
             .map_err(|e| PolicyError::StorageFailure {
@@ -375,7 +376,7 @@ impl ActivationCoordinator {
         if let Some(folder) = folder_on_both_routes(&submission.rules_json, carried.as_deref()) {
             return Err(PolicyError::FolderOnBothRoutes { folder });
         }
-        let conn = self.conn.lock().expect("connection mutex poisoned");
+        let conn = lock_state(&self.conn);
         let repo = self.revisions_repo(&conn);
         let principal = submission.principal.as_str();
 
@@ -387,6 +388,8 @@ impl ActivationCoordinator {
             })?
         {
             let id = parse_revision_id(&existing.revision_id)?;
+            // Audit never runs under the state lock: a panic there poisons it.
+            drop(conn);
             self.audit.emit(ActivationAuditEvent::RevisionSubmitted {
                 principal: principal.to_string(),
                 revision_id: existing.revision_id.clone(),
@@ -420,6 +423,7 @@ impl ActivationCoordinator {
                 operation: "insert_candidate",
                 message: e.to_string(),
             })?;
+        drop(conn);
 
         self.audit.emit(ActivationAuditEvent::RevisionSubmitted {
             principal: principal.to_string(),
@@ -515,7 +519,7 @@ impl ActivationCoordinator {
         let payload = serde_json::json!({ "op": "activate", "revision_id": revision_id.as_str() })
             .to_string();
 
-        let conn = self.conn.lock().expect("connection mutex poisoned");
+        let conn = lock_state(&self.conn);
         let store = MutationTokenStoreSqlite::new(&conn);
         store
             .issue_for(&principal, &token, &payload, now, expires)
@@ -523,6 +527,7 @@ impl ActivationCoordinator {
                 operation: "issue_token",
                 message: e.to_string(),
             })?;
+        drop(conn);
 
         self.audit.emit(ActivationAuditEvent::TokenIssued {
             principal,
@@ -604,7 +609,7 @@ impl ActivationCoordinator {
             // plan with this revision; only this thread sees it, so nothing
             // enforces it before the check passes.
             let preview = {
-                let conn = self.conn.lock().expect("connection mutex poisoned");
+                let conn = lock_state(&self.conn);
                 crate::applying_revision_overlay::preview_on_this_thread(
                     &conn,
                     &principal,
@@ -645,7 +650,7 @@ impl ActivationCoordinator {
         // reconcile ticks, the Linux enforcement pass — must see the revision
         // being applied, not the one it replaces.
         let overlay = {
-            let conn = self.conn.lock().expect("connection mutex poisoned");
+            let conn = lock_state(&self.conn);
             crate::applying_revision_overlay::publish(&conn, &principal, &record.rules_json)
         };
         let phase2 = self.phase2_apply(&targets, &record.rules_json);
@@ -725,7 +730,7 @@ impl ActivationCoordinator {
             risk_level: target_record.risk_level,
         };
         {
-            let conn = self.conn.lock().expect("connection mutex poisoned");
+            let conn = lock_state(&self.conn);
             self.revisions_repo(&conn)
                 .insert_candidate_for(principal, &new_record)
                 .map_err(|e| PolicyError::StorageFailure {
@@ -837,7 +842,7 @@ impl ActivationCoordinator {
             .enter(self.activation_wait)
             .ok_or(PolicyError::ActivationBusy)?;
         let deleted = {
-            let conn = self.conn.lock().expect("connection mutex poisoned");
+            let conn = lock_state(&self.conn);
             self.revisions_repo(&conn)
                 .delete_all_revisions_for(principal)
                 .map_err(|e| PolicyError::StorageFailure {
@@ -880,7 +885,7 @@ impl ActivationCoordinator {
         &self,
         principal: &str,
     ) -> Result<Option<RevisionRecord>, PolicyError> {
-        let conn = self.conn.lock().expect("connection mutex poisoned");
+        let conn = lock_state(&self.conn);
         self.revisions_repo(&conn)
             .get_active_for(principal)
             .map_err(|e| PolicyError::StorageFailure {
@@ -909,7 +914,7 @@ impl ActivationCoordinator {
         &self,
         principal: &str,
     ) -> Result<Option<String>, String> {
-        let conn = self.conn.lock().expect("connection mutex poisoned");
+        let conn = lock_state(&self.conn);
         if let Some(json) = crate::applying_revision_overlay::applying_for(&conn, principal) {
             return Ok(Some(json.to_string()));
         }
@@ -925,13 +930,13 @@ impl ActivationCoordinator {
         &self,
         principal: &str,
     ) -> Result<Option<crate::production_rules_provider::BookInForce>, String> {
-        let conn = self.conn.lock().expect("connection mutex poisoned");
+        let conn = lock_state(&self.conn);
         crate::production_rules_provider::book_in_force_for(&conn, principal)
     }
 
     /// The base a write by `principal` must name to be applied.
     pub(crate) fn base_revision_for(&self, principal: &str) -> Result<String, PolicyError> {
-        let conn = self.conn.lock().expect("connection mutex poisoned");
+        let conn = lock_state(&self.conn);
         crate::production_rules_provider::base_revision_for(&conn, principal).map_err(|message| {
             PolicyError::StorageFailure {
                 operation: "base_revision",
@@ -952,7 +957,7 @@ impl ActivationCoordinator {
         if self.base_revision_for(principal)? == base {
             return Ok(());
         }
-        let conn = self.conn.lock().expect("connection mutex poisoned");
+        let conn = lock_state(&self.conn);
         if let Err(e) = self.revisions_repo(&conn).mark_apply_failed_for(
             principal,
             revision_id.as_str(),
@@ -975,7 +980,7 @@ impl ActivationCoordinator {
         if principal == nrr_storage::BASELINE_PRINCIPAL {
             return false;
         }
-        let conn = self.conn.lock().expect("connection mutex poisoned");
+        let conn = lock_state(&self.conn);
         crate::applying_revision_overlay::applying_for(&conn, principal).is_none()
             && matches!(
                 self.revisions_repo(&conn).get_active_for(principal),
@@ -984,7 +989,7 @@ impl ActivationCoordinator {
     }
 
     pub fn last_known_good(&self) -> Result<Option<RevisionId>, PolicyError> {
-        let conn = self.conn.lock().expect("connection mutex poisoned");
+        let conn = lock_state(&self.conn);
         let lkg = self.revisions_repo(&conn).last_known_good().map_err(|e| {
             PolicyError::StorageFailure {
                 operation: "last_known_good",

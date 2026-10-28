@@ -111,7 +111,8 @@ Window {
             clip: true
             visible: licenseWindow.activeTab === "mpl"
             ScrollBar.vertical.policy: ScrollBar.AsNeeded
-            TextArea {
+            ThemedTextArea {
+                theme: root.uiTheme
                 readOnly: true
                 activeFocusOnTab: true
                 wrapMode: TextArea.Wrap
@@ -120,6 +121,9 @@ Window {
                 selectionColor: root.accentColor
                 selectedTextColor: palette.highlightedText
                 background: CardSurface { theme: root.uiTheme; cornerRadius: root.uiTheme.radiusSm }
+                // Reached by Tab; the tab button's label names what is read here.
+                Accessible.role: Accessible.StaticText
+                Accessible.name: root.tr("label.license", "License")
             }
         }
         ScrollView {
@@ -128,7 +132,8 @@ Window {
             clip: true
             visible: licenseWindow.activeTab === "eula"
             ScrollBar.vertical.policy: ScrollBar.AsNeeded
-            TextArea {
+            ThemedTextArea {
+                theme: root.uiTheme
                 readOnly: true
                 activeFocusOnTab: true
                 wrapMode: TextArea.Wrap

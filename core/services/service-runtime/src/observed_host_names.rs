@@ -23,6 +23,10 @@
 //! entries in the rule index: the compiler refuses the mix-up that a shared type
 //! would let through silently.
 //!
+//! One reader beside diagnostics: the shared-address census counts a name seen
+//! here first as a direct tenant of the address a rule host then takes. That
+//! can only withhold a pin, never place one.
+//!
 //! ## Bounds
 //!
 //! Inherited whole from [`crate::recent_rule_addresses::RecentRuleAddressIndex`]

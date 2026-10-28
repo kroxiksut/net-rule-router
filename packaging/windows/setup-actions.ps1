@@ -6,6 +6,8 @@
 #
 #   Stop        before files are replaced: stop the service so its binary is free;
 #               the stop is an upgrade's, so protection stays for the new files
+#   Resume      Setup stopped the service and ended without installing: start
+#               it again, unless it is disabled
 #   MarkStop    before the MSI's own stop: mark it as wanted, or the service
 #               restarts itself mid-removal; -Upgrade when a newer MSI replaces
 #               this one, so protection stays
@@ -37,7 +39,7 @@
 [CmdletBinding()]
 param(
     [Parameter(Mandatory = $true)]
-    [ValidateSet('Stop', 'MarkStop', 'Register', 'Unregister', 'RemoveUserData', 'Rollback', 'Provision')]
+    [ValidateSet('Stop', 'Resume', 'MarkStop', 'Register', 'Unregister', 'RemoveUserData', 'Rollback', 'Provision')]
     [string] $Action,
 
     [Parameter()]
@@ -291,6 +293,17 @@ switch ($Action) {
         if (-not (Stop-NrrService)) {
             Write-Host "    $NrrServiceName did not stop"
             $exitCode = 1
+        }
+    }
+    'Resume' {
+        $service = Get-Service -Name $NrrServiceName -ErrorAction SilentlyContinue
+        if ($service -and $service.Status -eq 'Stopped' -and "$($service.StartType)" -ne 'Disabled') {
+            Write-Host "==> starting $NrrServiceName again"
+            $null = Invoke-NativeCommand -FilePath (Get-SystemTool 'sc.exe') -ArgumentList @('start', $NrrServiceName)
+            if (-not (Wait-ServiceStatus -Name $NrrServiceName -Status Running -Seconds 30)) {
+                Write-Host "    $NrrServiceName did not start again"
+                $exitCode = 1
+            }
         }
     }
     'MarkStop' {

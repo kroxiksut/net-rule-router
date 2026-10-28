@@ -1115,6 +1115,34 @@
     ],
     "conflicts": []
    }
+  },
+  {
+   "name": "a note erased elsewhere stays erased under edits to another rule",
+   "input": {
+    "base": [
+     { "id": "R-0001", "enabled": true, "ruleType": "domain", "matchValue": "a.example", "targetRoute": "secondary", "verify": false, "comment": "work" }
+    ],
+    "edited": [
+     { "id": "R-0001", "enabled": true, "ruleType": "domain", "matchValue": "a.example", "targetRoute": "secondary", "verify": false, "comment": "work" },
+     { "id": "R-0002", "enabled": true, "ruleType": "domain", "matchValue": "b.example", "targetRoute": "secondary", "verify": false, "comment": "" }
+    ],
+    "fresh": [
+     { "id": "R-0001", "enabled": true, "ruleType": "domain", "matchValue": "a.example", "targetRoute": "secondary", "verify": false, "comment": "" }
+    ],
+    "keep": []
+   },
+   "expected": {
+    "rows": [
+     "R-0001 domain a.example secondary on",
+     " domain b.example secondary on"
+    ],
+    "added": [
+     " domain b.example secondary on"
+    ],
+    "changed": [],
+    "removed": [],
+    "conflicts": []
+   }
   }
  ]
 }

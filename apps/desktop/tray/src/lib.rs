@@ -133,6 +133,10 @@ struct TrayContextPayload {
     /// itself gate anything on it today; carried through for parity with the
     /// main GUI context.
     routing_detailed_mode: bool,
+    /// The text size and font the user chose, so the tray's windows follow
+    /// them as the main window does.
+    font_scale_percent: u16,
+    system_font: &'static str,
     theme: TrayThemeContext,
     primary_actions: Vec<TrayActionContext>,
     quick_actions: Vec<TrayActionContext>,
@@ -208,6 +212,8 @@ pub fn write_qt_tray_context_file(
         hide_block_notice_addresses: preferences.hide_block_notice_addresses,
         tray_notice_opacity_percent: preferences.tray_notice_opacity_percent,
         routing_detailed_mode: preferences.routing_detailed_mode,
+        font_scale_percent: preferences.accessibility_ui_font_scale_percent,
+        system_font: preferences.accessibility_system_font.slug(),
         theme: TrayThemeContext {
             selected_mode: theme.selected_mode.slug().to_string(),
             effective_mode: theme.effective_mode.slug().to_string(),
@@ -424,6 +430,44 @@ mod tests {
                 Some(wanted),
             );
         }
+    }
+
+    /// Someone who enlarged the text reads the tray's notices and its add-rule
+    /// window at that size too, not at the default.
+    #[test]
+    fn tray_context_carries_the_text_size_and_font() {
+        use nrr_ui_support::theme::resolve_theme;
+        use nrr_ui_support::tray::tray_runtime_snapshot;
+        use nrr_ui_support::ui_preferences::{SystemFontFamily, UiPreferences};
+
+        let shell = nrr_shared::gui_shell_v1();
+        let preferences = UiPreferences {
+            accessibility_ui_font_scale_percent: 200,
+            accessibility_system_font: SystemFontFamily::Verdana,
+            ..UiPreferences::default()
+        };
+        let theme = resolve_theme(preferences.theme_mode);
+        let runtime = tray_runtime_snapshot(
+            &shell,
+            true,
+            None,
+            theme.effective_mode,
+            nrr_ui_support::tray::TrayServiceLink::Unknown,
+        );
+        let path = super::write_qt_tray_context_file(
+            &runtime,
+            &preferences.language,
+            &preferences,
+            super::TrayContextUrls::default(),
+            super::HostAnswerDeadlines::default(),
+            &[],
+        )
+        .expect("context file is written to the temp dir");
+        let raw = std::fs::read_to_string(&path).expect("context file is readable");
+        let _ = std::fs::remove_file(&path);
+        let parsed: serde_json::Value = serde_json::from_str(&raw).expect("context file is JSON");
+        assert_eq!(parsed["fontScalePercent"], 200);
+        assert_eq!(parsed["systemFont"], "verdana");
     }
 
     /// `RpcTransport.qml` reads its answer deadlines from here; without them

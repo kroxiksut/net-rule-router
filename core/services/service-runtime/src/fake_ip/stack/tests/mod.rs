@@ -13,10 +13,10 @@ fn a_half_close_waits_for_the_dial_that_carries_the_request() {
         tcp::State::TimeWait,
     ] {
         assert!(
-            !client_fin_may_propagate(false, state),
+            !client_fin_may_propagate(false, state, true),
             "{state:?}: while the dial is in flight the client's bytes are still in the socket buffer, so forwarding the FIN sends the upstream home empty-handed",
         );
-        assert!(client_fin_may_propagate(true, state), "{state:?}");
+        assert!(client_fin_may_propagate(true, state, true), "{state:?}");
     }
     // Before the handshake completes there is no half-close to forward.
     for state in [
@@ -24,7 +24,24 @@ fn a_half_close_waits_for_the_dial_that_carries_the_request() {
         tcp::State::SynReceived,
         tcp::State::Established,
     ] {
-        assert!(!client_fin_may_propagate(true, state), "{state:?}");
+        assert!(!client_fin_may_propagate(true, state, true), "{state:?}");
+    }
+}
+
+/// An upload faster than the tunnel fills the queue and leaves the rest in
+/// the socket: a FIN forwarded then cuts off that tail.
+#[test]
+fn a_half_close_waits_for_the_bytes_still_in_the_socket() {
+    for state in [
+        tcp::State::CloseWait,
+        tcp::State::Closing,
+        tcp::State::LastAck,
+        tcp::State::TimeWait,
+    ] {
+        assert!(
+            !client_fin_may_propagate(true, state, false),
+            "{state:?}: the upstream would receive a truncated request",
+        );
     }
 }
 use super::super::{dialer, health, relay};

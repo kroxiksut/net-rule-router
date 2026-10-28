@@ -65,6 +65,10 @@ pub const MAX_RULES_FILE_BYTES: u64 = 1024 * 1024;
 
 static WRITE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
+/// Far above the tick of any file clock.
+const STAMP_SETTLE: Duration = Duration::from_secs(2);
+static STAMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
 /// The user's bound rules files: where their rules are written. `""` is none.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct RulesFiles {
@@ -631,6 +635,29 @@ impl UserSettingsStore {
 
     pub fn path(&self) -> &Path {
         &self.path
+    }
+
+    /// Size and modification time of the file, which a rewrite moves; `""`
+    /// when there is none. Two rewrites of one size inside one tick of the
+    /// file clock share both, so a file younger than [`STAMP_SETTLE`] gets a
+    /// stamp no later call repeats, and is read again until it settles.
+    pub fn stamp(&self) -> String {
+        let Ok(meta) = fs::metadata(&self.path) else {
+            return String::new();
+        };
+        let modified = meta.modified().ok();
+        let nanos = modified
+            .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+            .map_or(0, |since| since.as_nanos());
+        let settled = modified
+            .and_then(|time| time.elapsed().ok())
+            .is_some_and(|age| age >= STAMP_SETTLE);
+        if settled {
+            format!("{}:{nanos}", meta.len())
+        } else {
+            let fresh = STAMP_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+            format!("{}:{nanos}:{fresh}", meta.len())
+        }
     }
 
     /// `None` when there is no file yet.
@@ -1414,5 +1441,32 @@ mod tests {
             store.update(|s| s.selected_set = "user:a".to_string()),
             Err(UserSettingsError::Busy { .. })
         ));
+    }
+
+    /// The open clients re-read the file only when its stamp moves. Two
+    /// rewrites of one size inside one tick of the file clock look alike, so
+    /// a fresh file never repeats its stamp; a settled one keeps it.
+    #[test]
+    fn a_rewrite_moves_the_stamp_and_a_settled_file_keeps_it() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let store = store_in(&dir);
+        assert_eq!(store.stamp(), "", "no file, no stamp");
+
+        store
+            .update(|s| s.selected_set = "user:a".to_string())
+            .expect("first");
+        let first = store.stamp();
+        store
+            .update(|s| s.selected_set = "user:b".to_string())
+            .expect("same size, moments later");
+        assert_ne!(store.stamp(), first);
+
+        let hour_ago = SystemTime::now() - Duration::from_secs(3600);
+        fs::File::options()
+            .write(true)
+            .open(store.path())
+            .and_then(|file| file.set_modified(hour_ago))
+            .expect("date the file back");
+        assert_eq!(store.stamp(), store.stamp(), "nothing changed");
     }
 }

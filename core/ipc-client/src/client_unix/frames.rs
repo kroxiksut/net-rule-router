@@ -210,7 +210,11 @@ pub(super) fn route_push_frame(inner: &Arc<ClientInner>, frame: &Value, source: 
     send_pending_gap(inner, tx);
     match tx.try_send(payload) {
         Ok(()) => {
-            client_trace!("nrr-ipc-client(unix): push {event_type} delivered (source={source})")
+            if let Some(n) = inner.delivered_trace.note() {
+                client_trace!(
+                    "nrr-ipc-client(unix): push {event_type} delivered (source={source}, frame {n})"
+                );
+            }
         }
         Err(e) => {
             client_trace!("nrr-ipc-client(unix): push {event_type} dropped — channel full ({e})");

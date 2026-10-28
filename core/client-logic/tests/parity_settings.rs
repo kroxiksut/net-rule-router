@@ -9,7 +9,8 @@ mod js_harness;
 
 use js_harness::{arg, check, text, JsLib};
 use nrr_client_logic::notice_mutes::{
-    notice_kind_muted, notice_mute_request, MUTABLE_NOTICE_KINDS, NOTICE_MUTE_CHOICES_MS,
+    notice_kind_muted, notice_kind_row, notice_mute_request, MUTABLE_NOTICE_KINDS,
+    NOTICE_MUTE_CHOICES_MS,
 };
 use nrr_client_logic::routing_settings::{self, RoutingContext};
 use nrr_client_logic::stability;
@@ -63,6 +64,30 @@ fn notice_kind_muted_matches_js() {
                 text(input, "kind"),
                 int(input, "now"),
             ))
+        },
+    );
+}
+
+#[test]
+fn notice_kind_row_matches_js() {
+    check(
+        "notice_kind_row",
+        &mut JsLib::pure(),
+        |input| {
+            format!(
+                "noticeKindRow({}, {}, {})",
+                arg(input, "kind"),
+                arg(input, "siteNoticeWithoutTray"),
+                arg(input, "muted")
+            )
+        },
+        |input| {
+            notice_kind_row(
+                text(input, "kind"),
+                input["siteNoticeWithoutTray"] == Value::Bool(true),
+                input["muted"] == Value::Bool(true),
+            )
+            .map_or(Value::Null, |(key, en)| json!([key, en]))
         },
     );
 }

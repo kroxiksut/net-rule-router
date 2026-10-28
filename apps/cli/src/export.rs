@@ -17,6 +17,7 @@ use nrr_shared::ipc::IpcOperationName;
 use nrr_shared::ipc_payloads::{DiagnosticsExportArchiveRequest, DiagnosticsExportArchiveResponse};
 
 use crate::exit;
+use crate::link::Link;
 
 /// How long to wait for the archive. Generous: the service walks logs, audit
 /// and storage to build it, and a support archive is worth waiting for.
@@ -24,13 +25,8 @@ const EXPORT_TIMEOUT: Duration = Duration::from_secs(120);
 
 pub fn run(exe: &str) -> u8 {
     let (client, link) = crate::link::open();
-    if link != crate::link::Link::Connected {
-        eprintln!(
-            "The {} service is not answering.",
-            nrr_shared::product_identity::PRODUCT_NAME
-        );
-        eprintln!("Check that it is installed and running: {exe} status");
-        return exit::NOT_RESPONDING;
+    if let Some(code) = unconnected(&link, exe) {
+        return code;
     }
 
     // Built from the SSOT type rather than a hand-written object. Every field
@@ -57,6 +53,25 @@ pub fn run(exe: &str) -> u8 {
     ) {
         Ok(payload) => report_archive(&payload, exe),
         Err(err) => report_failure(err, exe),
+    }
+}
+
+/// Why the export cannot be asked for, with its exit code; `None` once
+/// connected. A service that answered with a refusal is up: sending its user
+/// off to check whether it runs gets a working service restarted.
+fn unconnected(link: &Link, exe: &str) -> Option<u8> {
+    let product = nrr_shared::product_identity::PRODUCT_NAME;
+    match link {
+        Link::Connected => None,
+        Link::Refused(reason) => {
+            eprintln!("The {product} service refused this console: {reason}");
+            Some(exit::FAILED)
+        }
+        Link::NotRunning | Link::NotAnswering => {
+            eprintln!("The {product} service is not answering.");
+            eprintln!("Check that it is installed and running: {exe} status");
+            Some(exit::NOT_RESPONDING)
+        }
     }
 }
 
@@ -131,6 +146,21 @@ mod tests {
     use super::*;
 
     const ARCHIVE: &str = "archives/nrr-diag.zip";
+
+    /// Another protocol version or a refused slot is an answer from a running
+    /// service, not silence.
+    #[test]
+    fn a_service_that_refused_is_not_reported_as_silent() {
+        assert_eq!(
+            unconnected(&Link::Refused("protocol 3 vs 2".into()), "nrr-cli"),
+            Some(exit::FAILED)
+        );
+        assert_eq!(
+            unconnected(&Link::NotAnswering, "nrr-cli"),
+            Some(exit::NOT_RESPONDING)
+        );
+        assert_eq!(unconnected(&Link::Connected, "nrr-cli"), None);
+    }
 
     #[test]
     fn an_archive_this_account_can_open_is_reported_written() {

@@ -1064,6 +1064,37 @@ mod tests {
         told
     }
 
+    /// The publisher reports on every pass: one drop seen as several "down"
+    /// reports, a switch to "gone" and several "ok" ones is still one drop, so
+    /// two such drops are not yet a link that keeps dropping.
+    #[test]
+    fn a_drop_reported_on_every_pass_counts_once() {
+        let board = RouteEnforcementStatus::new();
+        let mut due = Vec::new();
+        for start in [0, 30] {
+            let reports = [
+                ("secondary-down", start),
+                ("secondary-down", start + 1),
+                ("adapter-gone", start + 2),
+                ("ok", start + 5),
+                ("ok", start + 6),
+                ("ok", start + 7),
+            ];
+            for (status, at) in reports {
+                let (_, told) = board.record_with_flap_at(
+                    "S-1",
+                    &status_report(status, "secondary"),
+                    at * 1000,
+                );
+                if told {
+                    due.push(at);
+                }
+            }
+        }
+        assert!(due.is_empty(), "two drops told as three: {due:?}");
+        assert_eq!(flap_told(&board, "S-1", &[(60, 65)]), [65]);
+    }
+
     /// Each drop is too short to announce, yet three in two minutes are a
     /// connection that keeps failing: told once, at the third.
     #[test]

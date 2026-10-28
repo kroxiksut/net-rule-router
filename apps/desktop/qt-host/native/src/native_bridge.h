@@ -489,16 +489,15 @@ public:
                                                 const QString &confirmationToken,
                                                 const QString &term);
 
-    /// Read-only full settings export. Calls
-    /// `settings.export.full` and returns the correlation id. The
-    /// server-owned bits (adapters + behavior mode) come from per-SID
-    /// state; the two `rulesFilePath*` arguments forward the GUI's
-    /// `UiPreferences::last_saved_path_<role>` so the YAML's
-    /// `rules_files:` block carries the user's chosen on-disk paths.
-    /// Empty strings ⇒ corresponding field omitted from the payload.
+    /// Read-only full settings export (`settings.export.full`); returns the
+    /// correlation id. The paths are the bound rules files and the two
+    /// objects their sections this build does not apply (name to raw body,
+    /// from the sidecar): the service keeps neither. Empty ⇒ omitted.
     Q_INVOKABLE QString rpcSettingsExportFull(
         const QString &rulesFilePathPrimary,
-        const QString &rulesFilePathSecondary);
+        const QString &rulesFilePathSecondary,
+        const QJsonObject &passthroughPrimary = QJsonObject(),
+        const QJsonObject &passthroughSecondary = QJsonObject());
 
     /// Read a file from disk and return its content
     /// base64-wrapped. Used by the GUI's `Qt.labs.platform.FileDialog`
@@ -592,6 +591,10 @@ public:
     /// colour-scheme hint cannot express) still outranks light/dark.
     Q_INVOKABLE QString rpcSystemTheme();
 
+    /// Async wrapper over the launcher-local `local.hosts-file.has-entries`
+    /// RPC: `{hasEntries}` read now, by the reader the start-up context used.
+    Q_INVOKABLE QString rpcHostsFileHasEntries();
+
     /// Async wrapper over `local.service-info` RPC.
     /// Returns the GUI/service version + protocol pair so the
     /// compatibility banner can render "Service X.Y.Z (vN), App
@@ -616,6 +619,10 @@ public:
     /// the one write of a rules file. It refuses a file edited by hand
     /// (`rules-file-hand-edited`) unless `overwrite` is set.
     Q_INVOKABLE QString rpcUserSettingsRulesFileWrite(const QVariantMap &payload);
+    /// `local.user-settings.follow` (`{since, adopt}`): what another client
+    /// changed in the user's settings file since the stamp `since`. Answers
+    /// `{stamp, changed, preferences?, rules-files?, unreadable?}`.
+    Q_INVOKABLE QString rpcUserSettingsFollow(const QVariantMap &payload);
 
     /// Async wrapper over the launcher-local `local.update-check.run` RPC: the
     /// Help menu's "Check for updates". Answers `{status: "update-available",
@@ -747,8 +754,8 @@ public:
     /// persist the `file-bytes-b64` returned by `rpcSettingsExportFull`.
     ///
     /// Returns `true` on success, `false` on any error (invalid
-    /// base64, permission denied, parent directory missing). The 1 MiB
-    /// cap is enforced symmetrically with `readFileBytes`.
+    /// base64, permission denied, parent directory missing). Capped at
+    /// 4 MiB, what one service answer can carry.
     Q_INVOKABLE bool writeFileBytes(const QString &path,
                                     const QString &base64);
 

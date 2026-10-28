@@ -315,6 +315,10 @@ pub const SHARED_ANY: Key = key(
     "Always route the whole shared IP (aggressive)",
 );
 pub const ROUTING_METHOD: Key = key("settings.routing.routing-method.title", "Routing method");
+pub const ROUTING_METHOD_SCOPE: Key = key(
+    "settings.routing.routing-method.scope-note",
+    "The settings in this group apply to every user of this computer and need administrator approval to change, except the shared-address ones, which are yours alone.",
+);
 pub const ENFORCEMENT: Key = key(
     "settings.routing.enforcement-mode.label",
     "How routed traffic is enforced",
@@ -671,7 +675,7 @@ pub const SERVICE_FIX_MODE: Key = key(
 pub const RULES_PAUSE_TITLE: Key = key("settings.routing.pause.title", "Apply rules");
 pub const RULES_PAUSE_HINT: Key = key(
     "settings.routing.pause.persistence-hint",
-    "Disabling stops applying rules until you re-enable them. Setting persists across restarts.",
+    "Disabling stops applying rules for the time chosen under “Turn rules back on”: they come back on their own when it is up, and with “When I turn them back on” only when you do.",
 );
 pub const ROLLBACK_TITLE: Key = key("action.safe-rollback", "Safe rollback");
 pub const ROLLBACK_LOOKUP: Key = key(
@@ -769,7 +773,7 @@ pub const MERGE_POLICY_NO_FILE: Key = key(
 );
 pub const EXPORT_DESCRIPTION: Key = key(
     "settings.presets.full-settings-description",
-    "Export adapter bindings, behavior mode, and rules-file paths as a single YAML file. Useful for backing up or transferring your settings.",
+    "Export adapter bindings, your rules for both routes (those for other operating systems included), the paths of your rules files, the default route and leak protection as a single YAML file. Useful for backing up or transferring your settings.",
 );
 pub const EXPORT_PATH: Key = key("tui.settings.presets.export-path", "File to write");
 pub const EXPORT_RUN: Key = key("tui.settings.presets.export", "Export full settings");
@@ -1123,14 +1127,44 @@ pub const ERRORS: &[(&str, Key)] = &[
             "Rules cannot be changed until the security alert in Diagnostics is reviewed and acknowledged.",
         ),
     ),
-    ("invalid-version", key("errors.invalid-version", "Service version is incompatible")),
+    (
+        "invalid-version",
+        key(
+            "errors.invalid-version",
+            "The service is from a different version of NetRuleRouter. Restart the service or update the app.",
+        ),
+    ),
     ("malformed-request", key("errors.malformed-request", "Request was rejected as malformed")),
     ("busy-conflict", key("errors.busy-conflict", "Service is busy with another operation")),
-    ("precondition-failed", key("errors.precondition-failed", "Operation precondition not met")),
-    ("confirmation-expired", key("errors.confirmation-expired", "Confirmation token expired")),
-    ("confirmation-unknown", key("errors.confirmation-unknown", "Confirmation token unknown")),
+    (
+        "precondition-failed",
+        key(
+            "errors.precondition-failed",
+            "The service cannot do this in its current state. Refresh and try again.",
+        ),
+    ),
+    (
+        "confirmation-expired",
+        key(
+            "errors.confirmation-expired",
+            "The confirmation of these changes expired. Review the changes and apply them again.",
+        ),
+    ),
+    (
+        "confirmation-unknown",
+        key(
+            "errors.confirmation-unknown",
+            "The confirmation of these changes is no longer valid. Review the changes and apply them again.",
+        ),
+    ),
     ("service-degraded", key("errors.service-degraded", "Service is degraded")),
-    ("recovery-required", key("errors.recovery-required", "Service requires user recovery action")),
+    (
+        "recovery-required",
+        key(
+            "errors.recovery-required",
+            "After a failure the service stopped taking changes. Restart the service; if it happens again, save a diagnostics archive.",
+        ),
+    ),
     (
         "unsupported-operation",
         key(
@@ -1145,12 +1179,43 @@ pub const ERRORS: &[(&str, Key)] = &[
             "The service's answer was too large to send; the change itself may have been applied — refresh before trying again.",
         ),
     ),
+    (
+        "settings-export-too-large",
+        key(
+            "errors.settings-export-too-large",
+            "Your rules are too many to fit in one settings export. Nothing was written; save your rules as rules files instead.",
+        ),
+    ),
     ("internal", key("errors.internal", "Internal service error")),
     ("transport-disconnected", key("errors.transport-disconnected", "Service is offline")),
-    ("timeout", key("errors.timeout", "Request timed out")),
-    ("bad-response", key("errors.bad-response", "Service returned a malformed response")),
-    ("serialization-failed", key("errors.serialization-failed", "Request could not be encoded")),
-    ("client-shutdown", key("errors.client-shutdown", "IPC client is shutting down")),
+    (
+        "timeout",
+        key(
+            "errors.timeout",
+            "The service did not answer in time. Try again.",
+        ),
+    ),
+    (
+        "bad-response",
+        key(
+            "errors.bad-response",
+            "The service answered in a way this app cannot read. Restart the service or update the app.",
+        ),
+    ),
+    (
+        "serialization-failed",
+        key(
+            "errors.serialization-failed",
+            "The app could not prepare this request. Try again; if it happens again, save a diagnostics archive.",
+        ),
+    ),
+    (
+        "client-shutdown",
+        key(
+            "errors.client-shutdown",
+            "The app is closing, so the request was not sent.",
+        ),
+    ),
     (
         "uac-declined",
         key(
@@ -1211,7 +1276,7 @@ pub const IP_ROUTING_NOTE: Key = key(
 );
 pub const FAKE_IP_NOTE: Key = key(
     "settings.routing.fake-ip.note",
-    "Each routed site is answered with its own virtual address, so routing stays per-site even when several sites share one real server address. Off by default.",
+    "Each routed site is answered with its own virtual address, so routing stays per-site even when several sites share one real server address — and protection no longer races the first connection. Requires the local DNS resolver. On Windows, turning this on loads the bundled Wintun virtual-adapter driver (signed by WireGuard LLC). On by default on a new install.",
 );
 pub const FAKE_IP_DRIVER: Key = key(
     "settings.routing.fake-ip.driver-status",
@@ -1253,7 +1318,7 @@ pub const SERVICE_STALE: Key = key(
 );
 pub const SERVICE_CRASH_RECOVERY: Key = key(
     "settings.service.crash-recovery",
-    "Service will auto-restart up to 3 times after failures.",
+    "After a failure the service restarts by itself; if failures repeat, the network returns to normal and the service keeps trying, less often.",
 );
 pub const SERVICE_LOGS_FOLDER: Key = key(
     "tui.settings.service.logs-folder",
@@ -1511,6 +1576,7 @@ pub fn all() -> Vec<Key> {
         SHARED_MAJORITY_RULES,
         SHARED_ANY,
         ROUTING_METHOD,
+        ROUTING_METHOD_SCOPE,
         ENFORCEMENT,
         ENFORCEMENT_RESOLVER,
         ENFORCEMENT_REACTIVE,

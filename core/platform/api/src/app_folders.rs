@@ -218,6 +218,13 @@ pub trait ProgramFolders: Send + Sync {
             reason: "no folder watch on this platform",
         })
     }
+
+    /// Which folder object sits at `folder` now (volume and file id, device
+    /// and inode). A watch follows the folder it opened; when another folder
+    /// is renamed into its place this answer changes. `None`: unknown.
+    fn identity(&self, _folder: &Path) -> Option<u128> {
+        None
+    }
 }
 
 /// What `path` covers for `owner` now, read straight from `folders`: nothing

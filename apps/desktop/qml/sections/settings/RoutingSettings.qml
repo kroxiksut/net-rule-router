@@ -1057,13 +1057,13 @@ ColumnLayout {
                 panel.dnsViaSecondary = v
                 root.statusLine = v
                     ? root.tr("status.dns-via-secondary-on",
-                        "Name lookups now go through the additional connection.")
+                        "DNS now goes through the tunnel.")
                     : root.tr("status.dns-via-secondary-off",
-                        "Name lookups go through the main connection again.")
+                        "DNS goes through the main connection again.")
                 return
             }
             root.statusLine = root.tr("status.dns-via-secondary-failed",
-                "Could not change where name lookups go: ")
+                "Could not change where DNS goes: ")
                 + ((typeof root.ipcErrorLabel === "function") ? root.ipcErrorLabel(code) : code)
             // A failed push must never leave the checkbox showing a state the
             // service does not hold - re-sync from the live config.
@@ -1320,8 +1320,23 @@ ColumnLayout {
             dohLockdownGroup._dohLoad()
     }
 
+    // Starts from the start-up context; every visit asks the launcher again, so
+    // a mapping added or removed under a running window shows here.
+    property bool hostsFileHasEntries: !root.platformProfile
+        || root.platformProfile.hostsFileHasEntries !== false
+
+    function _reloadHostsFileState() {
+        var corr = root.rpc.rpcHostsFileHasEntries()
+        if (!corr || corr === "") return
+        root.rpc.registerRpcCallback(corr, function(ok, payload) {
+            if (ok && payload && typeof payload.hasEntries === "boolean")
+                panel.hostsFileHasEntries = payload.hasEntries
+        })
+    }
+
     Component.onCompleted: {
         _reloadServiceBackedControls()
+        _reloadHostsFileState()
         panel._backendWasConnected = (typeof root._routingBackendConnected === "function")
             && root._routingBackendConnected()
         // Built lazily: a request made before this category first opened is
@@ -1398,7 +1413,7 @@ ColumnLayout {
         return root.tr("settings.routing.focus.blocked", "Just blocked: {apps}.")
             .replace("{apps}", apps.length > 0
                 ? Pure.displayTextList(apps).join(", ")
-                : root.tr("notifications.block-notice.app-unknown", "unknown app"))
+                : root.tr("notifications.block-notice.app-unknown", "unknown application"))
     }
     function _focusDetails() {
         var addresses = panel._focusContext.addresses || []
@@ -1463,7 +1478,7 @@ ColumnLayout {
     // `auto-rules-mode`, another window applies something — left this showing
     // the value from mount time until the next reconnect. Opening the page is
     // the moment its answer has to be current.
-    onVisibleChanged: if (visible) _reloadServiceBackedControls()
+    onVisibleChanged: if (visible) { _reloadServiceBackedControls(); _reloadHostsFileState() }
 
     // After the offline pending-changes dialog applies
     // or discards, re-load every control from the (now updated) service so the
@@ -1611,7 +1626,7 @@ ColumnLayout {
                 wrapMode: Text.WordWrap
                 font.pixelSize: root.uiTheme.baseFontSizePx - 1
                 text: root.tr("settings.routing.pause.persistence-hint",
-                    "Disabling stops applying rules until you re-enable them. Setting persists across restarts.")
+                    "Disabling stops applying rules for the time chosen under “Turn rules back on”: they come back on their own when it is up, and with “When I turn them back on” only when you do.")
             }
         }
     }
@@ -2029,7 +2044,7 @@ ColumnLayout {
                 details: root.uiRevision >= 0 && visible ? panel._focusDetails() : ""
                 whatItDoes: root.uiRevision >= 0
                     ? root.tr("settings.routing.focus.leak-protection.what",
-                        "While leak protection is on, IPv6 stays closed: your rules do not route IPv6 yet, so this is how IPv6 traffic is kept from leaving around them.")
+                        "With leak protection set to Everything, IPv6 goes out only through the additional connection: while that connection is down or carries no IPv6, IPv6 waits. With Routed sites, only the IPv6 addresses of your routed sites are held, and only while the additional connection carries no IPv6.")
                     : ""
                 whenSafe: root.uiRevision >= 0
                     ? root.tr("settings.routing.focus.leak-protection.when-safe",
@@ -2157,7 +2172,7 @@ ColumnLayout {
                 wrapMode: Text.WordWrap
                 font.pixelSize: root.uiTheme.baseFontSizePx - 1
                 text: root.tr("settings.routing.kill-switch.description",
-                    "Leak protection decides what happens to your traffic while the additional connection is unavailable: the VPN is disconnected, not started yet, or was reinstalled under a new name.")
+                    "Leak protection decides what happens to your traffic while the additional connection is unavailable: the VPN is disconnected, not started yet, or was reinstalled under a new name. \"Routed sites\" holds what your rules send through the additional connection — sites, IPs and applications; everything else keeps working as usual. \"Everything\" holds all traffic except your local network and what your rules send over the main connection.")
             }
 
             // Coverage caveat. Protection is IP-based
@@ -2351,7 +2366,7 @@ ColumnLayout {
                     wrapMode: Text.WordWrap
                     font.pixelSize: root.uiTheme.baseFontSizePx - 1
                     text: root.tr("settings.routing.kill-switch.protocols.desc",
-                        "Which IP protocols leak protection drops. ICMP covers ping/traceroute. TCP/UDP are enforced at the connection layer; ICMP/IGMP/GRE/ESP at the packet layer. All on by default — uncheck to let a protocol through even while the block is active.")
+                        "Which IP protocols leak protection drops. ICMP covers ping/traceroute. TCP/UDP are enforced at the connection layer; ICMP/IGMP/GRE/ESP at the packet layer. All on by default — uncheck to let a protocol through even while the block is active. ICMP, IGMP, GRE and ESP are cut for the whole computer, not only for your account.")
                 }
             }
         }
@@ -2378,6 +2393,18 @@ ColumnLayout {
                 color: root.mutedTextColor
                 wrapMode: Text.WordWrap
                 text: root.platformUnsupportedText
+            }
+
+            Label {
+                Layout.fillWidth: true
+                Layout.preferredWidth: 0
+                visible: panel.offered.indexOf("service-stability-unavailable") < 0
+                color: root.mutedTextColor
+                wrapMode: Text.WordWrap
+                text: root.uiRevision >= 0
+                    ? root.tr("settings.routing.routing-method.scope-note",
+                        "The settings in this group apply to every user of this computer and need administrator approval to change, except the shared-address ones, which are yours alone.")
+                    : ""
             }
 
             Label {
@@ -2641,7 +2668,7 @@ ColumnLayout {
                 wrapMode: Text.WordWrap
                 font.pixelSize: root.uiTheme.baseFontSizePx - 1
                 text: root.tr("settings.routing.fake-ip.note",
-                    "Each routed site is answered with its own virtual address, so routing stays per-site even when several sites share one real server address — and protection no longer races the first connection. Requires the local DNS resolver. On Windows, turning this on loads the bundled Wintun virtual-adapter driver (signed by WireGuard LLC). Off by default.")
+                    "Each routed site is answered with its own virtual address, so routing stays per-site even when several sites share one real server address — and protection no longer races the first connection. Requires the local DNS resolver. On Windows, turning this on loads the bundled Wintun virtual-adapter driver (signed by WireGuard LLC). On by default on a new install.")
             }
             // Driver status line — hidden on builds that ship no driver binary
             // (Linux/macOS: kernel TUN is native) and until the probe answers.
@@ -2843,7 +2870,7 @@ ColumnLayout {
                         wrapMode: Text.WordWrap
                         font.pixelSize: root.uiTheme.baseFontSizePx - 1
                         text: root.tr("settings.routing-behavior.shared-ip.note",
-                            "Some sites (e.g. behind Cloudflare) share one IP with unrelated sites, and IP routing can't tell them apart. “Balanced” routes such an IP through the additional adapter only when your sites are the majority on it; “Cautious” only when that IP carries most of your rules; “Aggressive” always routes it (the others on it come along too). Truly separating two sites on one IP by name is not supported yet.")
+                            "Some sites (e.g. behind Cloudflare) share one IP with unrelated sites, and IP routing can't tell them apart. “Balanced” routes such an IP through the additional adapter only when your sites are the majority on it; “Cautious” only when that IP carries most of your rules; “Aggressive” always routes it (the others on it come along too). Truly separating two sites on one IP by name is not implemented in the current version.")
                     }
 
                     // Blocking axis. Big sites serve many hostnames from one
@@ -3982,7 +4009,7 @@ ColumnLayout {
                 wrapMode: Text.WordWrap
                 font.pixelSize: root.uiTheme.baseFontSizePx - 1
                 text: root.tr("settings.routing.auto-rules.note",
-                    "A routed site often loads its images and video from other domains your rules do not list, so the page opens but its content does not. By default NetRuleRouter collects these missing domains and offers them in the tray — nothing is added to your rules without your confirmation. \"Apply automatically\" adds them for you; \"Off\" stops collecting them altogether.")
+                    "A routed site often loads its images and video from other domains your rules do not list, so the page opens but its content does not. By default NetRuleRouter collects these missing domains and offers them in the tray — nothing is added to your rules without your confirmation. “Apply automatically” adds them for you; “Off” stops collecting them altogether.")
             }
 
             // Offer delivery-shaped names on first sight instead of waiting for
@@ -4318,7 +4345,7 @@ ColumnLayout {
                 wrapMode: Text.WordWrap
                 font.pixelSize: root.uiTheme.baseFontSizePx - 1
                 text: root.tr("settings.routing.doh-lockdown.note",
-                    "Off by default. Browsers that resolve names over DNS-over-HTTPS (DoH) or DNS-over-TLS (DoT) hide their queries, so routed sites resolved that way bypass leak protection. Turning this on blocks known encrypted-DNS endpoints so name resolution falls back to plaintext DNS that NetRuleRouter can observe.")
+                    "Browsers that resolve names over DNS-over-HTTPS (DoH) or DNS-over-TLS (DoT) hide their queries, so routed sites resolved that way bypass your rules and leak protection. Turning this on blocks known encrypted-DNS endpoints so name resolution falls back to plaintext DNS that NetRuleRouter can observe.")
             }
 
             // ── Part A: scope selector (gated on the master toggle) ──
@@ -4818,12 +4845,11 @@ ColumnLayout {
     // row. The whole group hides when the OS hosts file carries only comments
     // and blank lines (`hostsFileHasEntries === false`) — a stock hosts file
     // has no real mappings, so these controls would be meaningless noise; any
-    // real mapping entry flips the flag true and reveals the group. An older
-    // context that doesn't emit the flag (undefined) falls back to showing it.
+    // real mapping entry reveals the group (`panel.hostsFileHasEntries`).
     GroupBox {
         Layout.fillWidth: true
         title: root.tr("settings.routing.hosts-group.title", "Hosts file")
-        visible: !root.platformProfile || root.platformProfile.hostsFileHasEntries !== false
+        visible: panel.hostsFileHasEntries
         ColumnLayout {
             anchors.left: parent.left
             anchors.right: parent.right

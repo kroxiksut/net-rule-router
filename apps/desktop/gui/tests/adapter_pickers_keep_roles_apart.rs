@@ -1,10 +1,11 @@
 //! An adapter bound to one route is not offered for the other, and each one is
 //! shown with the hint the service's own recommendation gives it. Runs the real
-//! `pure.js` through `node`; the executable half is skipped when node is absent.
+//! `pure.js`.
 
-use std::io::Write;
+#[path = "support/js.rs"]
+mod js;
+
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
 
 fn repo_file(relative: &str) -> String {
     let path: PathBuf = Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -23,10 +24,7 @@ fn an_adapter_holding_one_role_is_withheld_from_the_other() {
                       adapterHeldOtherRole(null, 'primary')].join(','));\n",
         source = repo_file("apps/desktop/qml/lib/pure.js").replace(".pragma library", ""),
     );
-    let Some(output) = run_node(&harness) else {
-        eprintln!("node not available — skipping the executable check");
-        return;
-    };
+    let output = js::run_js(&harness);
     assert_eq!(output.trim(), "primary,,,", "{output}");
 }
 
@@ -46,10 +44,7 @@ fn the_hint_comes_from_the_recommendation_and_never_repeats_the_kind() {
                       adapterRoleHintSlug(null)].join(','));\n",
         source = repo_file("apps/desktop/qml/lib/pure.js").replace(".pragma library", ""),
     );
-    let Some(output) = run_node(&harness) else {
-        eprintln!("node not available — skipping the executable check");
-        return;
-    };
+    let output = js::run_js(&harness);
     assert_eq!(output.trim(), "looks-primary,looks-vpn,,,", "{output}");
 }
 
@@ -71,10 +66,7 @@ fn a_link_with_no_way_out_is_marked_before_any_recommendation() {
                       adapterRoleHintSlug(uplink)].join(','));\n",
         source = repo_file("apps/desktop/qml/lib/pure.js").replace(".pragma library", ""),
     );
-    let Some(output) = run_node(&harness) else {
-        eprintln!("node not available — skipping the executable check");
-        return;
-    };
+    let output = js::run_js(&harness);
     assert_eq!(output.trim(), "no-internet,,looks-primary", "{output}");
 }
 
@@ -104,32 +96,4 @@ fn both_surfaces_consult_the_rule() {
             && screen.contains("!_someoneElseHoldsSecondary && !_holdsPrimaryHere"),
         "the interfaces screen lets one adapter take both roles"
     );
-}
-
-/// Feed a program to `node` on stdin. `None` when node is not installed.
-fn run_node(program: &str) -> Option<String> {
-    let mut child = Command::new("node")
-        .arg("-")
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .unwrap_or_else(|e| {
-            panic!("this check runs the QML JavaScript through node; install Node.js ({e})")
-        });
-    let Some(stdin) = child.stdin.as_mut() else {
-        panic!("stdin was piped")
-    };
-    stdin
-        .write_all(program.as_bytes())
-        .unwrap_or_else(|e| panic!("write the harness to node: {e}"));
-    let out = child
-        .wait_with_output()
-        .unwrap_or_else(|e| panic!("node runs to completion: {e}"));
-    assert!(
-        out.status.success(),
-        "node rejected the harness: {}",
-        String::from_utf8_lossy(&out.stderr)
-    );
-    Some(String::from_utf8_lossy(&out.stdout).into_owned())
 }

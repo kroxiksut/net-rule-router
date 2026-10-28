@@ -2,13 +2,13 @@
 //! service's `NoticeKind` (which refuses any other slug), the `pure.js` table
 //! the windows read, and the tray buttons that offer the mute — and a kind
 //! missing from one of them is a button that fails or a mute nobody honours.
-//! The executable checks run the real `pure.js` through `node`; skipped when
-//! node is absent.
+//! The executable checks run the real `pure.js`.
+
+#[path = "support/js.rs"]
+mod js;
 
 use std::collections::BTreeSet;
-use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
 
 fn repo_file(relative: &str) -> String {
     let path: PathBuf = Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -96,6 +96,12 @@ fn settings_lists_every_kind_the_buttons_can_hide() {
         page.contains("Object.keys(Pure.MUTABLE_NOTICE_KINDS)"),
         "the Notifications page no longer builds its rows from the shared kind table"
     );
+    // A kind muted from a tray card stays listed so it can be lifted; the page
+    // asks the shared decision rather than filtering by platform alone.
+    assert!(
+        page.contains("Pure.noticeKindRow(") && !page.contains("kind !== \"site-not-opening\""),
+        "the Notifications page decides which kinds to list by itself"
+    );
     let card = repo_file("apps/desktop/qml/components/NotificationCenterPopup.qml");
     assert!(
         card.contains("muteNoticeFor("),
@@ -119,10 +125,7 @@ fn a_mute_silences_its_own_kind_until_it_lapses() {
                       noticeKindMuted(null, 'external-address', 5)].join(','));\n",
         source = repo_file("apps/desktop/qml/lib/pure.js").replace(".pragma library", ""),
     );
-    let Some(output) = run_node(&harness) else {
-        eprintln!("node not available — skipping the executable check");
-        return;
-    };
+    let output = js::run_js(&harness);
     assert_eq!(output.trim(), "true,true,false,false,false", "{output}");
 }
 
@@ -138,10 +141,7 @@ fn the_chooser_answers_become_the_requests_the_service_accepts() {
          ]));\n",
         source = repo_file("apps/desktop/qml/lib/pure.js").replace(".pragma library", ""),
     );
-    let Some(output) = run_node(&harness) else {
-        eprintln!("node not available — skipping the executable check");
-        return;
-    };
+    let output = js::run_js(&harness);
     assert_eq!(
         output.trim(),
         "[{\"scope\":{\"kind\":\"notice\",\"notice\":\"secondary-down\"},\"until-unix-ms\":604801000},\
@@ -170,34 +170,6 @@ fn every_mutable_card_names_its_kind_for_withdrawal() {
             "a `{kind}` card is admitted by its mute but never withdrawn by it"
         );
     }
-}
-
-/// Feed a program to `node` on stdin. `None` when node is not installed.
-fn run_node(program: &str) -> Option<String> {
-    let mut child = Command::new("node")
-        .arg("-")
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .unwrap_or_else(|e| {
-            panic!("this check runs the QML JavaScript through node; install Node.js ({e})")
-        });
-    let Some(stdin) = child.stdin.as_mut() else {
-        panic!("stdin was piped")
-    };
-    stdin
-        .write_all(program.as_bytes())
-        .unwrap_or_else(|e| panic!("write the harness to node: {e}"));
-    let out = child
-        .wait_with_output()
-        .unwrap_or_else(|e| panic!("node runs to completion: {e}"));
-    assert!(
-        out.status.success(),
-        "node rejected the harness: {}",
-        String::from_utf8_lossy(&out.stderr)
-    );
-    Some(String::from_utf8_lossy(&out.stdout).into_owned())
 }
 
 /// A mute set in the tray while Settings is still loading the list: the load

@@ -84,19 +84,6 @@ pub fn apply_job(
     })
 }
 
-/// Replaces the rules in force with `payload`: a dry run, then its confirmation.
-/// Nothing to change is success; the error is the service's code.
-pub(crate) fn run(client: &dyn IpcClient, payload: &Value) -> Result<(), String> {
-    let preview = read_preview(&submit(client, payload, None)?);
-    if let Some(code) = preview.refused {
-        return Err(code);
-    }
-    if preview.empty {
-        return Ok(());
-    }
-    apply(client, payload, &preview.token)
-}
-
 fn apply(client: &dyn IpcClient, payload: &Value, token: &str) -> Result<(), String> {
     let answer = submit(client, payload, Some(token))?;
     let operation = answer

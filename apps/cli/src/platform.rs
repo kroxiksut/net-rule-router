@@ -57,6 +57,33 @@ pub fn offline_reset_verb() -> Option<&'static str> {
     Some("cleanup")
 }
 
+/// The service binary's verb that lets the unprivileged launcher start an
+/// on-demand service. `None` where no launcher starts the service, so an
+/// on-demand install there is started by hand.
+#[cfg(windows)]
+pub fn on_demand_grant_verb() -> Option<&'static str> {
+    Some("set-start-demand")
+}
+
+/// Nothing starts a unit that does not start at boot: the launcher here
+/// refuses on-demand, and the daemon has no such verb.
+#[cfg(not(windows))]
+pub fn on_demand_grant_verb() -> Option<&'static str> {
+    None
+}
+
+/// The offline reset that needs no service binary, as the package ships it.
+#[cfg(windows)]
+pub fn reset_script() -> &'static str {
+    r"scripts\reset-network.ps1 from the installation folder"
+}
+
+/// The offline reset that needs no service binary, as the package ships it.
+#[cfg(not(windows))]
+pub fn reset_script() -> &'static str {
+    "scripts/reset-network.sh from the installation folder"
+}
+
 /// The reset verb that stops a running service first; `None` where there is
 /// no reset at all.
 pub fn stop_and_reset_verb() -> Option<&'static str> {

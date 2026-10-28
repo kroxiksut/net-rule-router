@@ -41,6 +41,66 @@ tree="$here/root"
 # shellcheck source=../maintainer/functions.sh
 . "$here/lib/package-functions.sh"
 
+# True when version $1 is older than $2 (dotted numbers).
+version_older() {
+  local IFS=. i
+  local -a a b
+  read -r -a a <<<"$1"
+  read -r -a b <<<"$2"
+  for i in 0 1 2; do
+    [ "${a[i]:-0}" -lt "${b[i]:-0}" ] && return 0
+    [ "${a[i]:-0}" -gt "${b[i]:-0}" ] && return 1
+  done
+  return 1
+}
+
+# On an older glibc the loader stops our programs before they can say why: the
+# window started from the menu never appears. The floor was measured from the
+# binaries as the archive was built; checked before sudo asks for a password.
+refuse_older_glibc() {
+  local floor system="" line number='[0-9]+(\.[0-9]+)+'
+  floor="$(head -n 1 -- "$here/lib/glibc-floor" 2>/dev/null || true)"
+  if ! [[ "$floor" =~ ^$number$ ]]; then
+    echo "This archive is incomplete: $here/lib/glibc-floor is missing or damaged." >&2
+    exit 1
+  fi
+  line="$(getconf GNU_LIBC_VERSION 2>/dev/null || true)"
+  if [[ "$line" =~ ^glibc\ ($number) ]]; then
+    system="${BASH_REMATCH[1]}"
+  else
+    line="$(ldd --version 2>&1 | head -n 1 || true)"
+    if [[ "$line" =~ (GLIBC|GNU\ libc).*\ ($number)$ ]]; then
+      system="${BASH_REMATCH[2]}"
+    fi
+  fi
+  if [ -z "$system" ]; then
+    echo "$NRR_PRODUCT_NAME needs glibc $floor or newer, and this system's C library is not glibc" >&2
+    echo "(a musl-based system?) or could not be identified. Nothing was installed." >&2
+    exit 1
+  fi
+  version_older "$system" "$floor" || return 0
+  echo "This archive needs glibc $floor or newer; this system has glibc $system." >&2
+  if [ -d "$tree/usr/share/applications" ]; then
+    local name headless="$NRR_PRODUCT_NAME_UNIX-headless-<version>-linux-<arch>.tar.gz"
+    name="$(basename -- "$here")"
+    case "$name" in
+      "$NRR_PRODUCT_NAME_UNIX"-[0-9]*) headless="$NRR_PRODUCT_NAME_UNIX-headless-${name#"$NRR_PRODUCT_NAME_UNIX"-}.tar.gz" ;;
+    esac
+    cat >&2 <<EOF
+Its window would not start here, so nothing was installed. Instead, use either
+  - the archive without the window, $headless,
+    or the $NRR_PRODUCT_NAME_UNIX package alone: the service, nrr-cli and the
+    nrr-tui terminal interface, which has the same features as the window;
+  - or a system with glibc $floor or newer.
+EOF
+  else
+    echo "Its programs would not start here, so nothing was installed. Use a system with glibc $floor or newer." >&2
+  fi
+  exit 1
+}
+
+refuse_older_glibc
+
 if [ "$(id -u)" -ne 0 ]; then
   if ! command -v sudo >/dev/null 2>&1; then
     echo "install.sh needs root, and sudo was not found. Re-run as root." >&2

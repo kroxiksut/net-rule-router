@@ -1949,6 +1949,55 @@ fn an_active_blocking_alert_refuses_a_rollback() {
     }
 }
 
+/// A rollback puts stored rules back into force: they pass the content gates
+/// an edit passes today, or a revision saved before a gate existed returns.
+#[test]
+fn a_rollback_to_rules_an_edit_would_refuse_is_refused() {
+    const SID: &str = "S-1-5-21-1000-1000-1000-1002";
+    let (exec, conn) = build_test_executor();
+    let book = |comment: &str| {
+        serde_json::json!({
+            "schema-version": 1,
+            "primary": [],
+            "secondary": [{
+                "id": "r-1",
+                "enabled": true,
+                "address-match": { "kind": "exact-fqdn", "value": "host.example" },
+                "comment": comment,
+                "action": "route",
+            }],
+        })
+        .to_string()
+    };
+    seed_active_book(&exec, SID, book("old"));
+    let old = exec
+        .coordinator
+        .current_active_for(SID)
+        .unwrap()
+        .expect("old")
+        .revision_id;
+    seed_active_book(&exec, SID, book("new"));
+    conn.lock()
+        .unwrap()
+        .execute(
+            "UPDATE revisions SET rules_json = ?1 WHERE revision_id = ?2",
+            rusqlite::params![book("bell\u{7}"), old],
+        )
+        .unwrap();
+
+    assert_eq!(
+        refusal_code(exec.rollback(SID, None)),
+        CONTROL_CHARACTER_CODE
+    );
+    let in_force = exec
+        .coordinator
+        .current_active_for(SID)
+        .unwrap()
+        .expect("active")
+        .rules_json;
+    assert!(in_force.contains("\"new\""), "{in_force}");
+}
+
 /// One rule with the given conditions, as a submitted `rules-update` payload.
 fn shaped_rules_update(
     address: bool,

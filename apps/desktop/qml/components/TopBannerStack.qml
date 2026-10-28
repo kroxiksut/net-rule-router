@@ -418,7 +418,7 @@ Item {
                 // when the real state was simply "nothing applied yet".
                 text: root._serviceRulesEmpty
                     ? root.tr("status.drift-banner-empty-service",
-                        "The routing service has no rules yet — apply your rules via Details.")
+                        "The service has none of your rules — nothing is being routed yet.")
                     : root.tr("status.drift-banner",
                         "Rules in the file, the app, and the service do not all agree.")
                 verticalAlignment: Text.AlignVCenter
@@ -665,11 +665,11 @@ Item {
                 text: "✕"
                 Accessible.role: Accessible.Button
                 Accessible.name: root.uiRevision >= 0
-                    ? root.tr("status.vpn-split-conflict-dismiss", "Dismiss")
+                    ? root.tr("status.vpn-split-conflict-dismiss", "Got it — don't show this for this adapter again")
                     : ""
                 ToolTip.visible: hovered && root.prefs.tooltipsEnabled
                 ToolTip.text: root.uiRevision >= 0
-                    ? root.tr("status.vpn-split-conflict-dismiss", "Dismiss")
+                    ? root.tr("status.vpn-split-conflict-dismiss", "Got it — don't show this for this adapter again")
                     : ""
                 onClicked: {
                     // Persist a per-adapter acknowledgment, the

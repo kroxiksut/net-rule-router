@@ -899,7 +899,7 @@ ScrollView {
                         visible: section._cacheEntries.length > 0
                             || section._cacheEntriesFilter !== ""
                         placeholderText: root.tr("diag.cache.entries-search-placeholder",
-                            "Exact name or IP; *.search.example — subdomains; *google* — any match")
+                            "Exact name or IP; *.google.com — subdomains; *google* — any match")
                         // Debounce so a single keystroke no longer runs
                         // an O(n) filter + full row rebuild + a recursive page
                         // drain. cacheSearchDebounce applies the filter and drains
@@ -1153,7 +1153,9 @@ ScrollView {
                     Layout.fillWidth: true
                     visible: section._cacheEntries.length > 0
                     spacing: root.uiTheme.spacingSm
-                    Label {
+                    SortHeader {
+                        theme: root.uiTheme
+                        onActivated: section._toggleCacheSort("host")
                         Layout.fillWidth: true
                         Layout.preferredWidth: section._cacheColHostW
                         Layout.minimumWidth: section._cacheColHostMinW
@@ -1172,8 +1174,10 @@ ScrollView {
                         Layout.preferredWidth: section._cacheColIpW
                         Layout.fillHeight: true
                         implicitHeight: cacheColIpHdr.implicitHeight
-                        Label {
+                        SortHeader {
                             id: cacheColIpHdr
+                            theme: root.uiTheme
+                            onActivated: section._toggleCacheSort("ip")
                             anchors.fill: parent
                             leftPadding: 9
                             verticalAlignment: Text.AlignVCenter
@@ -1200,8 +1204,10 @@ ScrollView {
                         Layout.preferredWidth: section._cacheColSourceW
                         Layout.fillHeight: true
                         implicitHeight: cacheColSourceHdr.implicitHeight
-                        Label {
+                        SortHeader {
                             id: cacheColSourceHdr
+                            theme: root.uiTheme
+                            onActivated: section._toggleCacheSort("source")
                             anchors.fill: parent
                             leftPadding: 9
                             verticalAlignment: Text.AlignVCenter
@@ -1228,8 +1234,10 @@ ScrollView {
                         Layout.preferredWidth: section._cacheColRouteW
                         Layout.fillHeight: true
                         implicitHeight: cacheColRouteHdr.implicitHeight
-                        Label {
+                        SortHeader {
                             id: cacheColRouteHdr
+                            theme: root.uiTheme
+                            onActivated: section._toggleCacheSort("route")
                             anchors.fill: parent
                             leftPadding: 9
                             verticalAlignment: Text.AlignVCenter
@@ -1256,8 +1264,10 @@ ScrollView {
                         Layout.preferredWidth: section._cacheColFreshW
                         Layout.fillHeight: true
                         implicitHeight: cacheColFreshHdr.implicitHeight
-                        Label {
+                        SortHeader {
                             id: cacheColFreshHdr
+                            theme: root.uiTheme
+                            onActivated: section._toggleCacheSort("freshness")
                             anchors.fill: parent
                             leftPadding: 9
                             verticalAlignment: Text.AlignVCenter

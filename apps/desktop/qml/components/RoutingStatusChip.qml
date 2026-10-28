@@ -41,7 +41,7 @@ Rectangle {
     readonly property string detailText: {
         if (chip.statusKey === "paused")
             return root.tr("routing.status.detail-paused",
-                "Rules are disabled until you re-enable them.")
+                "Rules are disabled for the time chosen; they come back on their own when it is up, or when you turn them back on.")
         if (chip.statusKey === "no-tray")
             return root.tr("routing.status.detail-no-tray",
                 "Run the tray icon to apply rules on this session.")

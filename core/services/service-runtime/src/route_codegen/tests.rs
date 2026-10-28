@@ -453,6 +453,48 @@ fn suffix_and_zone_fan_out_to_cached_subdomain_ips() {
     assert!(out2.routes.iter().any(|r| r.destination == ip(99, 0, 0, 9)));
 }
 
+/// The Windows route table and the first-contact route read this codegen: a
+/// stranger's name under `.ru` answering 10.x must not route 10.x into the
+/// tunnel, while an internal zone's host keeps its corporate route.
+#[test]
+fn a_public_zone_name_answering_a_private_address_gets_no_tunnel_route() {
+    let cache = MockFqdnCacheLookup::new();
+    cache.set_ips("a1.attacker.ru", vec![ip(10, 1, 2, 3), ip(30, 0, 0, 7)]);
+    cache.set_ips("git.corp.intra", vec![ip(10, 9, 9, 9)]);
+    let secondary = ruleset(vec![
+        rule("r-ru", true, CanonicalAddressMatch::Zone("ru".into())),
+        rule("r-intra", true, CanonicalAddressMatch::Zone("intra".into())),
+    ]);
+    let book = nrr_domain::canonical::CanonicalRuleBook {
+        primary: ruleset(Vec::new()),
+        secondary: secondary.clone(),
+    };
+    let ownership = crate::address_ownership::AddressOwnership::resolve(&book, &cache);
+    let out = generate_secondary_routes(
+        &secondary,
+        &target(),
+        &cache,
+        &no_apps(),
+        &HashSet::new(),
+        &ownership,
+        crate::address_ownership::Link::Additional,
+    );
+    let dests: BTreeSet<IpAddr> = out.routes.iter().map(|r| r.destination).collect();
+    let has = |a: Ipv4Addr| dests.contains(&IpAddr::V4(a));
+    assert!(!has(ip(10, 1, 2, 3)), "{dests:?}");
+    assert!(has(ip(30, 0, 0, 7)), "{dests:?}");
+    assert!(has(ip(10, 9, 9, 9)), "{dests:?}");
+    // Its own reason, not the main link's claim nobody made.
+    assert_eq!(
+        out.diagnostics,
+        vec![RouteCodegenDiagnostic::PrivateAddressKeptOutOfTunnel {
+            rule_id: "r-ru".into(),
+            ip: IpAddr::V4(ip(10, 1, 2, 3)),
+            count: 1,
+        }]
+    );
+}
+
 #[test]
 fn suffix_routes_its_apex_while_a_zone_never_routes_its_bare_label() {
     //  — `*.corp.example` covers "corp.example" itself, so the

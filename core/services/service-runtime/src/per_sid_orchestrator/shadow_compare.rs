@@ -223,7 +223,7 @@ impl PerSidApplyOrchestrator {
             // compare two different questions.
             ipv6,
             // The live pass asked the same question.
-            packet_blocks: self.rules_provider.rules_are_baseline_for(sid),
+            packet_blocks: super::PACKET_BLOCKS,
         };
         let plan = EnforcementPlan {
             principal,

@@ -481,7 +481,7 @@ ApplicationWindow {
                 "dismissible": true,
                 "title": unenforcedAppRules.length > 0
                     ? tr("notifications.app-unresolved.title",
-                        "App rules aren't active yet")
+                        "App rules applied, but some apps weren't found")
                     : tr("notifications.app-unresolved.title-unrouted",
                         "App rules applied, but some don't route their program"),
                 "body": _unenforcedAppNoticeBody(),
@@ -759,7 +759,7 @@ ApplicationWindow {
             case "protocol-mismatch":
                 return tr(
                     "connection.banner.protocol-mismatch",
-                    "Service version mismatch — please update")
+                    "Service version mismatch — please update NetRuleRouter")
             case "refused":
                 // The service is running and said no — retrying changes
                 // nothing, so the banner asks for the one thing that can.
@@ -2291,6 +2291,19 @@ ApplicationWindow {
         if (!hadPendingEdits) prefsSnapshot = null
         emitPrefs()
     }
+    /// Takes what another client changed in the user's settings file. The
+    /// choice was made there, so Apply/Cancel does not light up for it; one
+    /// still waiting for Apply here keeps the user's value.
+    function adoptSharedPrefs(incoming) {
+        var step = Pure.userSettingsAdoption(prefs, prefsSnapshot, _bufferedPrefKeys, incoming)
+        if (prefsSnapshot !== null && Object.keys(step.rebase).length > 0) {
+            prefsSnapshot = Object.assign({}, prefsSnapshot, step.rebase)
+        }
+        if (!step.changed) return
+        prefs = normalizePrefs(Object.assign({}, prefs, step.take))
+        uiRevision += 1
+        if (prefsSnapshot === null) emitPrefs()
+    }
     function applyPendingPrefs() {
         if (prefsSnapshot === null) return
         prefsSnapshot = null
@@ -2712,12 +2725,20 @@ ApplicationWindow {
                 visible: window.visible,
                 rulesPathPrimary: window._comparableRulesPathFor("primary"),
                 rulesPathSecondary: window._comparableRulesPathFor("secondary"),
+                // The binding that answer stands on: a tray left alone sees
+                // from it whether another client bound other files since.
+                boundPrimary: String(window.prefs.lastSavedPathPrimary || ""),
+                boundSecondary: String(window.prefs.lastSavedPathSecondary || ""),
                 rulesFolder: window.userPresetsDir,
                 // So the tray writes the linked files the way this window does.
                 includeComments: (typeof boundFilesController !== "undefined" && boundFilesController)
                     ? boundFilesController._emitComments() : true,
                 // The tray reads these once at start; this keeps it current.
-                notices: window._committedNoticePrefs()
+                notices: window._committedNoticePrefs(),
+                appearance: {
+                    fontScalePercent: window.prefs.fontScalePercent,
+                    systemFont: window.prefs.systemFont
+                }
             }
         }
     }
@@ -2743,6 +2764,8 @@ ApplicationWindow {
     // file is published from `onPrefsChanged`, which already exists.)
     onActiveChanged: {
         if (typeof guiPresence !== "undefined" && guiPresence) guiPresence.publish()
+        if (active && typeof userSettingsFollower !== "undefined" && userSettingsFollower)
+            userSettingsFollower.follow()
     }
     // Closed to the tray: the tray's "Add rule…" stops handing over to a hidden window.
     onVisibleChanged: {
@@ -3105,6 +3128,15 @@ ApplicationWindow {
     BoundFilesController {
         id: boundFilesController
         root: window
+    }
+    // The terminal client writes the user's settings file too.
+    property alias userSettingsFollower: userSettingsFollower
+    UserSettingsFollower {
+        id: userSettingsFollower
+        rpc: rpcTransport
+        adopt: true
+        onFollowed: function(preferences, rulesFiles) { window.adoptSharedPrefs(preferences) }
+        onAnswered: function(payload) { notificationsController.noteUserSettingsAnswer(payload) }
     }
     // Helper for the VPN-onboarding handlers. Writes the confirmed
     // link-provider app set to the service (role "secondary"; an empty array
@@ -4778,7 +4810,7 @@ ApplicationWindow {
                     "A rule denies this connection.")
             case "ipv6-blocked":
                 return tr("notifications.block-notice.reason.ipv6-blocked",
-                    "IPv6 is switched off while leak protection is on, so this connection did not go out.")
+                    "With leak protection set to Everything, IPv6 goes out only through the additional connection, so this connection did not go out.")
             case "dns-lockdown":
                 return tr("notifications.block-notice.reason.dns-lockdown",
                     "This app went to its own DNS resolver instead of the one NetRuleRouter provides, "
@@ -6236,8 +6268,7 @@ ApplicationWindow {
         if (!bridgeAvailable
                 || typeof nrrNativeBridge.rpcProductImpactDisable
                     !== "function") {
-            // Bridge not wired (preview / no RPC) — settle the toast
-            // as failed with a pending-bridge code (B.6 localised).
+            // No bridge (preview): the toast says the rules stay on.
             if (operationToastStack && operationToastStack.model) {
                 operationToastStack.model.settle(corr, "failed",
                     "safe-disable-rpc-pending")
@@ -6732,7 +6763,7 @@ ApplicationWindow {
     // Exit closes the window for real; the close button is what goes to the tray.
     Action { id: exitAction; text: tr("action.exit-application", "Exit"); shortcut: StandardKey.Quit; icon.source: uiIconSource("exit"); onTriggered: { window.exitRequested = true; window.close() } }
     Action { id: aboutAction; text: tr("action.open-about-window", "About"); shortcut: "F1"; icon.source: uiIconSource("about"); onTriggered: openChildWindow(aboutWindow) }
-    Action { id: licenseAction; text: tr("action.open-license-window", "License"); shortcut: "Ctrl+Shift+L"; icon.source: uiIconSource("about"); onTriggered: openChildWindow(licenseWindow) }
+    Action { id: licenseAction; text: tr("action.open-license-window", "Licenses"); shortcut: "Ctrl+Shift+L"; icon.source: uiIconSource("about"); onTriggered: openChildWindow(licenseWindow) }
     // Disabled when the service's log directory is not readable by this user:
     // the context carries a URL only when the folder can actually be listed, and
     // an action that opens an empty window explains nothing. Diagnostics ->
@@ -7664,12 +7695,12 @@ ApplicationWindow {
             title: Pure.menuTitleText(tr("menu.file", "File"), "F")
             popupType: Popup.Item
             implicitWidth: menuPopupWidth([
-                Pure.menuActionText(tr("action.load-rule-list", "Load rule list..."), "Ctrl+O"),
+                Pure.menuActionText(tr("action.load-rule-list", "Load rules list..."), "Ctrl+O"),
                 Pure.menuActionText(tr("action.export-current-rule-list", "Export current list..."), "Ctrl+Shift+S"),
                 Pure.menuActionText(tr("action.export-settings", "Export settings..."), "Ctrl+Alt+S"),
                 Pure.menuActionText(exitAction.text, "Ctrl+Q")
             ])
-            ShortcutMenuItem { theme: uiTheme; labelText: tr("action.load-rule-list", "Load rule list..."); shortcutText: "Ctrl+O"; enabled: !window.ruleEditsLocked; onTriggered: openLoadRuleListWindow() }
+            ShortcutMenuItem { theme: uiTheme; labelText: tr("action.load-rule-list", "Load rules list..."); shortcutText: "Ctrl+O"; enabled: !window.ruleEditsLocked; onTriggered: openLoadRuleListWindow() }
             // Show WHAT is being exported, then ask where to put it.
             ShortcutMenuItem { theme: uiTheme; labelText: tr("action.export-current-rule-list", "Export current list..."); shortcutText: "Ctrl+Shift+S"; onTriggered: { rulesAction.trigger(); boundFilesController.exportCurrentRulesInteractive(null) } }
             ShortcutMenuItem { theme: uiTheme; labelText: tr("action.export-settings", "Export settings..."); shortcutText: "Ctrl+Alt+S"; onTriggered: settingsAction.trigger() }
@@ -7890,7 +7921,7 @@ ApplicationWindow {
                         color: notificationsChip.warn ? uiTheme.colorWarning : uiTheme.colorAccent
                     }
                     Label {
-                        text: window.tr("notifications.chip-label", "Alerts")
+                        text: window.tr("notifications.chip-label", "Notifications")
                             + " (" + notificationsController.notificationCount + ")"
                         color: window.textColor
                         verticalAlignment: Text.AlignVCenter
@@ -8308,7 +8339,7 @@ ApplicationWindow {
                 || typeof nrrNativeBridge.resolvePresetPath !== "function"
                 || typeof nrrNativeBridge.readFileBytes !== "function") {
             statusLine = tr("status.bridge-unavailable",
-                "Service bridge not connected")
+                "Service bridge not connected.")
             return
         }
         var primaryPath = nrrNativeBridge.resolvePresetPath(
@@ -8599,7 +8630,7 @@ ApplicationWindow {
                 || nrrNativeBridge === null
                 || typeof nrrNativeBridge.rpcSidecarCommentGc !== "function") {
             statusLine = tr("status.sidecar-comments-gc-unavailable",
-                "Comment sidecar is not available in this build.")
+                "Comment storage is not available in this build.")
             return
         }
         var active = []

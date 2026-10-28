@@ -1,0 +1,57 @@
+{
+  "cases": [
+    { "name": "no rules is primary", "input": { "rules": [], "program": "a.exe" }, "expected": "primary" },
+    {
+      "name": "an exact rule gives its route",
+      "input": { "rules": [{ "value": "a.exe", "route": "secondary", "enabled": true }], "program": "a.exe" },
+      "expected": "secondary"
+    },
+    {
+      "name": "the first covering rule decides",
+      "input": {
+        "rules": [
+          { "value": "a*.exe", "route": "secondary", "enabled": true },
+          { "value": "abc.exe", "route": "primary", "enabled": true }
+        ],
+        "program": "abc.exe"
+      },
+      "expected": "secondary"
+    },
+    {
+      "name": "a disabled rule covers nothing",
+      "input": {
+        "rules": [
+          { "value": "abc.exe", "route": "secondary", "enabled": false },
+          { "value": "abc.exe", "route": "primary", "enabled": true }
+        ],
+        "program": "abc.exe"
+      },
+      "expected": "primary"
+    },
+    {
+      "name": "a folder pattern covers the programs in it",
+      "input": { "rules": [{ "value": "C:\\Apps\\*", "route": "secondary", "enabled": true }], "program": "C:\\Apps\\tool.exe" },
+      "expected": "secondary"
+    },
+    {
+      "name": "a question mark is literal",
+      "input": { "rules": [{ "value": "a?.exe", "route": "secondary", "enabled": true }], "program": "ab.exe" },
+      "expected": "primary"
+    },
+    {
+      "name": "flags after the value are not part of the pattern",
+      "input": { "rules": [{ "value": "a.exe +children", "route": "secondary", "enabled": true }], "program": "a.exe" },
+      "expected": "secondary"
+    },
+    {
+      "name": "letters compare without case",
+      "input": { "rules": [{ "value": "Tool.EXE", "route": "secondary", "enabled": true }], "program": "tool.exe" },
+      "expected": "secondary"
+    },
+    {
+      "name": "a program no rule covers is primary",
+      "input": { "rules": [{ "value": "a.exe", "route": "secondary", "enabled": true }], "program": "b.exe" },
+      "expected": "primary"
+    }
+  ]
+}

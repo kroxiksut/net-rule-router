@@ -323,6 +323,8 @@ enum Ack {
         rows: Vec<UnverifiedRowDto>,
     },
     Done(Result<(), String>),
+    /// Line mode: the alert printed under that number has left the list.
+    Gone(usize),
 }
 
 #[derive(Debug)]
@@ -360,6 +362,8 @@ enum Archive {
 #[derive(Debug, Default)]
 struct Log {
     asked: bool,
+    /// Read before the service came back: read again when shown.
+    reread: bool,
     loading: bool,
     entries: Vec<LogEntryDto>,
     cursor: Option<PageCursor>,
@@ -377,6 +381,7 @@ struct Log {
 #[derive(Debug, Default)]
 struct AuditTrail {
     asked: bool,
+    reread: bool,
     loading: bool,
     entries: Vec<AuditEntryDto>,
     cursor: Option<PageCursor>,
@@ -391,6 +396,8 @@ struct AuditTrail {
 pub struct DiagState {
     part: Part,
     asked: bool,
+    /// The overview was read before the service came back.
+    reread: bool,
     loading: bool,
     health: Option<Result<ServiceHealthResponse, String>>,
     status: Option<DiagnosticsStatusDto>,
@@ -399,6 +406,8 @@ pub struct DiagState {
     alerts_known: bool,
     alerts_unreadable: bool,
     alert_pager: Pager,
+    /// Line mode: the alerts as last printed, by id.
+    printed_alerts: Vec<String>,
     ack: Ack,
     explain: Explain,
     typing: Option<(Field, String)>,
@@ -419,6 +428,7 @@ impl Default for DiagState {
         Self {
             part: Part::default(),
             asked: false,
+            reread: false,
             loading: false,
             health: None,
             status: None,
@@ -427,6 +437,7 @@ impl Default for DiagState {
             alerts_known: false,
             alerts_unreadable: false,
             alert_pager: Pager::default(),
+            printed_alerts: Vec::new(),
             ack: Ack::default(),
             explain: Explain::default(),
             typing: None,
@@ -465,6 +476,13 @@ fn apply_status(state: &mut DiagState, read: StatusRead) {
             state.status_error = None;
             state.status = serde_json::from_value(status.clone()).ok();
             if let Some(items) = security_alert_items(&status) {
+                // The cursor stays on its alert, wherever the new list puts it.
+                let chosen = state.alerts.get(state.alert_pager.selected);
+                if let Some(at) =
+                    chosen.and_then(|old| items.iter().position(|a| a.alert_id == old.alert_id))
+                {
+                    state.alert_pager.selected = at;
+                }
                 state.alerts = items;
                 state.alerts_known = true;
                 state.alerts_unreadable = false;
@@ -481,11 +499,21 @@ fn apply_status(state: &mut DiagState, read: StatusRead) {
 fn load_status(app: &mut AppState) {
     let state = &mut app.inspect.diag;
     state.asked = true;
+    state.reread = false;
     state.loading = true;
     queue(app, |client| {
         let read = read_status(client);
         Reply::new(move |app| apply_status(&mut app.inspect.diag, read))
     });
+}
+
+/// The service came back: what was read before (a broken chain, alerts, its
+/// health) may be gone, so each part is read again when shown.
+pub fn on_reconnected(app: &mut AppState) {
+    let state = &mut app.inspect.diag;
+    state.reread = state.asked;
+    state.log.reread = state.log.asked;
+    state.audit.reread = state.audit.asked;
 }
 
 /// An alert was raised or acknowledged elsewhere: the list on screen is
@@ -856,6 +884,7 @@ fn load_log(app: &mut AppState, reset: bool) {
         log.advance = false;
     }
     log.asked = true;
+    log.reread = false;
     log.loading = true;
     log.error = None;
     let generation = log.generation;
@@ -953,6 +982,7 @@ fn load_audit(app: &mut AppState, reset: bool) {
         audit.advance = false;
     }
     audit.asked = true;
+    audit.reread = false;
     audit.loading = true;
     audit.error = None;
     let generation = audit.generation;
@@ -1038,9 +1068,9 @@ fn switch_part(app: &mut AppState) {
     };
     let connected = app.link.is_connected();
     let state = &app.inspect.diag;
-    if state.part == Part::Log && !state.log.asked && connected {
+    if state.part == Part::Log && (!state.log.asked || state.log.reread) && connected {
         load_log(app, true);
-    } else if state.part == Part::Audit && !state.audit.asked && connected {
+    } else if state.part == Part::Audit && (!state.audit.asked || state.audit.reread) && connected {
         load_audit(app, true);
     }
 }
@@ -1140,18 +1170,20 @@ impl Screen for DiagnosticsScreen {
             return;
         }
         let state = &app.inspect.diag;
-        if !state.loading && (!state.asked || state.status_error.is_some()) {
+        if !state.loading && (!state.asked || state.reread || state.status_error.is_some()) {
             load_status(app);
         }
         let log = &app.inspect.diag.log;
-        if app.inspect.diag.part == Part::Log && !log.loading && (!log.asked || log.error.is_some())
+        if app.inspect.diag.part == Part::Log
+            && !log.loading
+            && (!log.asked || log.reread || log.error.is_some())
         {
             load_log(app, true);
         }
         let audit = &app.inspect.diag.audit;
         if app.inspect.diag.part == Part::Audit
             && !audit.loading
-            && (!audit.asked || audit.error.is_some())
+            && (!audit.asked || audit.reread || audit.error.is_some())
         {
             load_audit(app, true);
         }
@@ -1253,10 +1285,18 @@ impl Screen for DiagnosticsScreen {
             Part::Audit => audit_line(app, line),
         }
     }
+
+    fn on_printed(&self, app: &mut AppState) {
+        let state = &mut app.inspect.diag;
+        state.printed_alerts = state.alerts.iter().map(|a| a.alert_id.clone()).collect();
+    }
 }
 
 fn overview_key(app: &mut AppState, key: KeyEvent) -> bool {
     let offered = restart_offered(&app.inspect.diag);
+    if key.code == KeyCode::Char('a') && crate::screens::focus_list_first(app) {
+        return true;
+    }
     let state = &mut app.inspect.diag;
     match key.code {
         KeyCode::Char('a') => acknowledge_selected(app),
@@ -1286,11 +1326,18 @@ fn overview_line(app: &mut AppState, line: &str) -> bool {
     let state = &mut app.inspect.diag;
     match command(line) {
         ("a", number) => {
-            let len = state.alerts.len();
-            if !state.alert_pager.pick(number, len) {
+            let Some(n) = number.trim().parse::<usize>().ok() else {
                 return false;
+            };
+            let now: Vec<String> = state.alerts.iter().map(|a| a.alert_id.clone()).collect();
+            match crate::screens::numbered_now(&state.printed_alerts, &now, n) {
+                crate::screens::Numbered::At(at) => {
+                    state.alert_pager.selected = at;
+                    acknowledge_selected(app);
+                }
+                crate::screens::Numbered::Gone => state.ack = Ack::Gone(n),
+                crate::screens::Numbered::NoSuch => return false,
             }
-            acknowledge_selected(app);
         }
         ("e", host) => probe(app, host, "", ""),
         ("c", host) => super::site_check::start(app, host),
@@ -1332,10 +1379,8 @@ fn archive_option(app: &mut AppState, change: ArchiveChange) {
     let prefs = &mut app.settings.prefs;
     prefs.archive_all_logs = all_logs;
     prefs.archive_log_budget_mib = budget;
-    if let Some(path) = app.settings.prefs_path.as_deref() {
-        // Unsaved, the choice still holds for this run.
-        let _ = crate::screens::settings::prefs::save(path, app.settings.prefs);
-    }
+    // Unsaved, the choice still holds for this run.
+    let _ = app.settings.save_prefs();
 }
 
 /// The archive options the user kept from an earlier run. A size the list
@@ -1716,6 +1761,9 @@ fn ack_lines(state: &DiagState, texts: &Texts) -> Vec<ViewLine> {
     match &state.ack {
         Ack::Idle => Vec::new(),
         Ack::Working => vec![ViewLine::text(texts.get(keys::ALERT_ACKING))],
+        Ack::Gone(n) => vec![ViewLine::text(
+            texts.fill(crate::keys::PLAIN_NUMBER_GONE, &[("n", n.to_string())]),
+        )],
         Ack::Done(Ok(())) => vec![ViewLine::text(texts.get(keys::ALERT_ACK_DONE))],
         Ack::Done(Err(slug)) => vec![ViewLine::text(format!(
             "{}{}",

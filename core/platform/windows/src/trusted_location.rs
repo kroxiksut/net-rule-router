@@ -128,20 +128,50 @@ fn open_trusting(
     file: &Path,
     trusted: &dyn Fn(&str) -> bool,
 ) -> Result<Option<std::fs::File>, String> {
+    let Some(held) = hold_chain(file)? else {
+        return Ok(None);
+    };
+    match judge_held(&held, Beside::NotOpenToEveryone, trusted)? {
+        Some(why) => Err(why),
+        None => Ok(Some(held.file)),
+    }
+}
+
+/// A file and every folder from the drive down to it, each opened as the
+/// entry itself rather than a link's target and resolved to the place its
+/// name says. The file is held without sharing write or delete, which on its
+/// own keeps every folder above it from being renamed; each folder is held
+/// without sharing delete too, unless another process already holds it so.
+/// While this lives, the file's name leads to these same objects.
+#[derive(Debug)]
+pub(crate) struct HeldChain {
+    /// The drive first, the file's own folder last.
+    folders: Vec<(PathBuf, std::fs::File)>,
+    path: PathBuf,
+    file: std::fs::File,
+}
+
+impl HeldChain {
+    pub(crate) fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
+/// `file` held as [`HeldChain`] says, judged for nothing but links and
+/// location. `Ok(None)` when it or a folder above it is absent.
+pub(crate) fn hold_chain(file: &Path) -> Result<Option<HeldChain>, String> {
     use std::os::windows::fs::OpenOptionsExt;
     const FILE_SHARE_READ: u32 = 0x1;
     let dir = file
         .parent()
         .filter(|dir| !dir.as_os_str().is_empty())
         .ok_or_else(|| format!("{} has no folder", file.display()))?;
-    // Each folder from the drive down is held, so none can be renamed or
-    // replaced until the file is open, and each is judged on its handle.
     let mut chain: Vec<&Path> = dir
         .ancestors()
         .take_while(|ancestor| !ancestor.as_os_str().is_empty())
         .collect();
     chain.reverse();
-    let mut held = Vec::with_capacity(chain.len());
+    let mut folders = Vec::with_capacity(chain.len());
     for folder in chain {
         let handle = match open_to_judge(folder) {
             Ok(handle) => handle,
@@ -149,17 +179,7 @@ fn open_trusting(
             Err(e) => return Err(format!("open {}: {e}", folder.display())),
         };
         judged_in_place(&handle, folder, false)?;
-        let descriptor = SecurityDescriptor::of_handle(&handle)?;
-        if let Some(found) = untrusted_rights_in(&descriptor, REPLACES_SUBTREE, trusted)? {
-            return Err(format!(
-                "{found} can replace what is inside {}",
-                folder.display()
-            ));
-        }
-        if folder == dir && open_to_everyone_in(&descriptor)? {
-            return Err(format!("anyone can add files to {}", dir.display()));
-        }
-        held.push(handle);
+        folders.push((folder.to_path_buf(), handle));
     }
     let opened = match std::fs::OpenOptions::new()
         .read(true)
@@ -172,12 +192,59 @@ fn open_trusting(
         Err(e) => return Err(format!("open {}: {e}", file.display())),
     };
     judged_in_place(&opened, file, true)?;
-    let descriptor = SecurityDescriptor::of_handle(&opened)?;
-    if let Some(found) = untrusted_rights_in(&descriptor, REPLACES_FILE, trusted)? {
-        return Err(format!("{found} can change {}", file.display()));
+    Ok(Some(HeldChain {
+        folders,
+        path: file.to_path_buf(),
+        file: opened,
+    }))
+}
+
+/// What the file's own folder must not let an ordinary account do.
+#[derive(Clone, Copy)]
+enum Beside {
+    /// Add or remove anything: a program loads a library from beside itself
+    /// before the system's.
+    Nothing,
+    /// Let every account add files: such a folder is nobody's install folder,
+    /// whoever wrote the file in it.
+    NotOpenToEveryone,
+}
+
+/// Who besides the trusted accounts could change the held program, add files
+/// beside it or replace a folder above it, judged on the held handles; `None`
+/// when nobody.
+pub(crate) fn untrusted_writer_of(held: &HeldChain) -> Result<Option<String>, String> {
+    judge_held(held, Beside::Nothing, &is_trusted)
+}
+
+fn judge_held(
+    held: &HeldChain,
+    beside: Beside,
+    trusted: &dyn Fn(&str) -> bool,
+) -> Result<Option<String>, String> {
+    let own = held.folders.len().saturating_sub(1);
+    for (index, (folder, handle)) in held.folders.iter().enumerate() {
+        let descriptor = SecurityDescriptor::of_handle(handle)?;
+        let (rights, verb) = match beside {
+            Beside::Nothing if index == own => (PLANTS_BESIDE, "add files to"),
+            _ => (REPLACES_SUBTREE, "replace what is inside"),
+        };
+        if let Some(found) = untrusted_rights_in(&descriptor, rights, trusted)? {
+            return Ok(Some(format!("{found} can {verb} {}", folder.display())));
+        }
+        if matches!(beside, Beside::NotOpenToEveryone)
+            && index == own
+            && open_to_everyone_in(&descriptor)?
+        {
+            return Ok(Some(format!(
+                "anyone can add files to {}",
+                folder.display()
+            )));
+        }
     }
-    drop(held);
-    Ok(Some(opened))
+    let descriptor = SecurityDescriptor::of_handle(&held.file)?;
+    Ok(untrusted_rights_in(&descriptor, REPLACES_FILE, trusted)?
+        .map(|found| format!("{found} can change {}", held.path.display())))
 }
 
 const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
@@ -185,7 +252,8 @@ const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
 /// A folder opened to read its permissions, never through a link; held
 /// without sharing delete, so it cannot be renamed while held. A folder some
 /// process holds with delete access is opened without the pin: where each
-/// handle resolves is still checked.
+/// handle resolves is still checked, and a file held below it still keeps it
+/// from being renamed.
 fn open_to_judge(path: &Path) -> std::io::Result<std::fs::File> {
     use std::os::windows::fs::OpenOptionsExt;
     const FILE_READ_ATTRIBUTES: u32 = 0x80;
@@ -1267,6 +1335,17 @@ mod tests {
                 .expect("run icacls")
         };
         assert_eq!(sid_may_list(dir.path(), &me), Ok(true), "a folder it made");
+        // CI runners give a new folder explicit entries, which `/inheritance:r`
+        // leaves in place; planted here so every machine starts the same way.
+        let planted = icacls(&[
+            "/grant",
+            &format!("*{me}:(OI)(CI)F"),
+            "*S-1-5-32-544:(OI)(CI)F",
+            "/Q",
+        ]);
+        assert!(planted.status.success(), "icacls: {planted:?}");
+        let reset = icacls(&["/reset", "/Q"]);
+        assert!(reset.status.success(), "icacls: {reset:?}");
         let closed = icacls(&["/inheritance:r", "/grant:r", "*S-1-5-18:(OI)(CI)F", "/Q"]);
         assert!(closed.status.success(), "icacls: {closed:?}");
         let verdict = sid_may_list(dir.path(), &me);
@@ -1345,6 +1424,61 @@ mod tests {
         let why = through_link.expect_err("refused");
         assert!(why.contains("is a link"), "{why}");
         assert!(matches!(direct, Ok(Some(_))), "{direct:?}");
+    }
+
+    /// A program the service would start in a user's name, in a folder that
+    /// user owns, is reported from what the held handles say.
+    #[test]
+    fn a_program_in_a_folder_a_user_owns_is_reported_on_its_handles() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let program = dir.path().join("tray.bin");
+        std::fs::write(&program, b"placeholder").expect("write");
+        own_by_this_user(dir.path());
+        let held = hold_chain(&program).expect("held").expect("present");
+        let found = untrusted_writer_of(&held).expect("readable");
+        assert!(found.is_some(), "a folder the test user owns is trusted");
+    }
+
+    /// A junction anywhere on the program's path would let what is judged
+    /// and what is started be two different files: the hold refuses it.
+    #[test]
+    fn a_junction_in_a_programs_folder_chain_is_refused() {
+        let target = tempfile::tempdir().expect("tempdir");
+        std::fs::write(target.path().join("tray.bin"), b"placeholder").expect("write");
+        let holder = tempfile::tempdir().expect("tempdir");
+        let link = holder.path().join("NetRuleRouter");
+        let made = std::process::Command::new(crate::system_shell::system32_exe("cmd.exe"))
+            .args(["/C", "mklink", "/J"])
+            .arg(&link)
+            .arg(target.path())
+            .output()
+            .expect("run mklink");
+        if !made.status.success() {
+            return; // Junctions need no privilege, but a locked-down host may refuse.
+        }
+        let through_link = hold_chain(&link.join("tray.bin"));
+        let direct = hold_chain(&target.path().join("tray.bin"));
+        let _ = std::fs::remove_dir(&link);
+        let why = through_link.expect_err("held through a junction");
+        assert!(why.contains(&link.display().to_string()), "{why}");
+        assert!(matches!(direct, Ok(Some(_))), "{direct:?}");
+    }
+
+    /// While a folder is held nobody may rename it or remove it to put a
+    /// junction in its place.
+    #[test]
+    fn a_held_folder_cannot_be_renamed_or_removed() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let folder = dir.path().join("NetRuleRouter");
+        std::fs::create_dir(&folder).expect("mkdir");
+        let aside = dir.path().join("aside");
+        let held = open_to_judge(&folder).expect("held");
+        let renamed = std::fs::rename(&folder, &aside);
+        let removed = std::fs::remove_dir(&folder);
+        drop(held);
+        assert!(renamed.is_err(), "renamed while held");
+        assert!(removed.is_err(), "removed while held");
+        std::fs::rename(&folder, &aside).expect("released");
     }
 
     #[test]
@@ -1547,6 +1681,12 @@ mod tests {
         // Administrators (this account, here) may read it and change its
         // permissions, never its contents.
         let me = me();
+        // Explicit entries as a CI runner gives a new file; the seal replaces them.
+        icacls(
+            &sealed,
+            &["/grant", &format!("*{me}:F"), "*S-1-5-32-544:F", "/Q"],
+        );
+        icacls(&sealed, &["/reset", "/Q"]);
         icacls(
             &sealed,
             &[

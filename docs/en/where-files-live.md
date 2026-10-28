@@ -58,8 +58,10 @@ Per-user, and the place your personal preferences live. On a domain PC with roam
 | What | Why it is there |
 |---|---|
 | `managed\ui-preferences.conf` | Theme, language, font and accessibility settings, window size, the section you had open, your route labels |
+| `user-settings.json` | Where your rule sets live, which two rules files are yours and which set is picked, the licence you accepted, the notices you muted, and your own choices on settings the service keeps. The window and the terminal interface both read it, so they agree even when the service is not running |
+| `tui.json` | The terminal interface's own options — line mode, colours, frame lines — how you grouped the connection trace, and when it last told you about a site that does not open |
 
-This file is plain text. It holds no rules and no routing policy — deleting it gives you a fresh-looking app with your routing untouched.
+These files are plain text, and none of them holds the rules themselves. Deleting `tui.json` only resets the terminal interface's own options. Deleting `ui-preferences.conf` gives you a fresh-looking app with your routing untouched. Deleting `user-settings.json` makes the app forget where your rules files are and which set you picked, so it asks again — keep it unless you mean to start over.
 
 ## Per-machine cache: `%LOCALAPPDATA%\NetRuleRouter\`
 
@@ -112,7 +114,7 @@ By hand, if you would rather see each step:
 
 1. Close the app.
 2. From an administrator console, run `nrr-cli uninstall --purge`. That stops the service, deregisters it and deletes the folder it owns — which is the part you cannot delete by hand — except the security audit trail; add `--purge-audit` to delete that as well.
-3. Delete `%APPDATA%\NetRuleRouter\`, `%LOCALAPPDATA%\NetRuleRouter\` and `%TEMP%\NetRuleRouter\` if you also want the app to forget your theme, language and window layout.
+3. Delete `%APPDATA%\NetRuleRouter\`, `%LOCALAPPDATA%\NetRuleRouter\` and `%TEMP%\NetRuleRouter\` if you also want the app to forget your theme, language and window layout — and where your rules files are, which it will ask again.
 4. Install the service again and load your rules files.
 
 You get a factory-fresh install with your rules intact, which is the point of keeping them outside the app in the first place.

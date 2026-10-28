@@ -295,6 +295,7 @@ pub(super) struct DiagnosticTally {
     pub(super) app_rule_dest_claimed_by_main_link: usize,
     pub(super) app_rule_dest_used_by_other_process: usize,
     pub(super) address_claimed_by_main_link: usize,
+    pub(super) private_kept_out_of_tunnel: usize,
     pub(super) primary_exceptions_unavailable: usize,
     pub(super) network_yields_to_local_network: usize,
     pub(super) network_routed_around_tunnel_server: usize,
@@ -321,6 +322,7 @@ pub(super) fn diagnostic_tally(
                 t.app_rule_dest_used_by_other_process += 1
             }
             D::AddressClaimedByMainLink { count, .. } => t.address_claimed_by_main_link += count,
+            D::PrivateAddressKeptOutOfTunnel { count, .. } => t.private_kept_out_of_tunnel += count,
             D::PrimaryExceptionsUnavailable => t.primary_exceptions_unavailable += 1,
             D::NetworkYieldsToLocalNetwork { .. } => t.network_yields_to_local_network += 1,
             D::NetworkRoutedAroundTunnelServer { .. } => t.network_routed_around_tunnel_server += 1,

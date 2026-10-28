@@ -5,9 +5,10 @@
 //! `Pure.escapeMarkup`, and the trace's name cell is plain text.
 #![allow(clippy::expect_used)]
 
-use std::io::Write;
+#[path = "support/js.rs"]
+mod js;
+
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
 
 fn repo_file(relative: &str) -> String {
     let path: PathBuf = Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -95,46 +96,19 @@ fn the_trace_name_cell_is_plain_text() {
     );
 }
 
-fn run_pure(expr: &str) -> Option<String> {
+fn run_pure(expr: &str) -> String {
     let program = format!(
         "{source}\nconsole.log(JSON.stringify({expr}));\n",
-        source = repo_file("apps/desktop/qml/lib/pure.js").replace(".pragma library", ""),
+        source = repo_file("apps/desktop/qml/lib/pure.js"),
     );
-    let mut child = Command::new("node")
-        .arg("-")
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .unwrap_or_else(|e| {
-            panic!("this check runs the QML JavaScript through node; install Node.js ({e})")
-        });
-    let Some(stdin) = child.stdin.as_mut() else {
-        panic!("stdin was piped")
-    };
-    stdin
-        .write_all(program.as_bytes())
-        .unwrap_or_else(|e| panic!("write the harness to node: {e}"));
-    let out = child
-        .wait_with_output()
-        .unwrap_or_else(|e| panic!("node runs to completion: {e}"));
-    assert!(
-        out.status.success(),
-        "node rejected the harness: {}",
-        String::from_utf8_lossy(&out.stderr)
-    );
-    let text = String::from_utf8_lossy(&out.stdout).into_owned();
-    Some(serde_json::from_str::<String>(text.trim()).unwrap_or_else(|e| panic!("{e}: {text}")))
+    let text = js::run_js(&program);
+    serde_json::from_str::<String>(text.trim()).unwrap_or_else(|e| panic!("{e}: {text}"))
 }
 
 #[test]
 fn escaping_round_trips_through_the_spoken_text() {
-    let Some(escaped) = run_pure("escapeMarkup('<font size=7>a&b</font>')") else {
-        eprintln!("node not available — skipping the executable check");
-        return;
-    };
+    let escaped = run_pure("escapeMarkup('<font size=7>a&b</font>')");
     assert_eq!(escaped, "&lt;font size=7&gt;a&amp;b&lt;/font&gt;");
-    let spoken = run_pure("markupToPlain('<b>' + escapeMarkup('x<y>&amp;') + '</b>')")
-        .expect("node was available a moment ago");
+    let spoken = run_pure("markupToPlain('<b>' + escapeMarkup('x<y>&amp;') + '</b>')");
     assert_eq!(spoken, "x<y>&amp;");
 }

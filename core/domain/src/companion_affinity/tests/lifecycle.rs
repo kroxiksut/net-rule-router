@@ -26,6 +26,22 @@ fn registrable_domain_heuristic_cases() {
     assert_eq!(registrable_domain("www.foo.CO.UK"), Some("foo.CO.UK"));
 }
 
+/// Anyone can own a name under a hosting platform. Two tenants there are two
+/// sites: folding them into the platform would let one page's helpers turn
+/// into an offer to route every site the platform hosts.
+#[test]
+fn a_hosting_platform_tenant_is_its_own_site() {
+    for (host, site) in [
+        ("a.tenant.github.io", "tenant.github.io"),
+        ("b.tenant.pages.dev", "tenant.pages.dev"),
+        ("tenant.herokuapp.com", "tenant.herokuapp.com"),
+        ("d111.cloudfront.net", "d111.cloudfront.net"),
+    ] {
+        assert_eq!(registrable_domain(host), Some(site), "{host}");
+    }
+    assert_eq!(registrable_domain("pages.dev"), None);
+}
+
 // ── A rule the user deleted ──────────────────────────────────────────────
 
 #[test]

@@ -105,14 +105,98 @@ pub fn detect_sleep_gap(
     (gap >= threshold).then_some(gap)
 }
 
+/// Sleeps kept; older ones drop first. A day of lid-closes stays far below it.
+const SLEEP_LEDGER_CAP: usize = 64;
+
+/// Sleep an age may leave out, in total: after longer away an address seen
+/// before it is no longer trusted to be the same host's.
+pub const MAX_CREDITED_SLEEP: Duration = Duration::from_secs(24 * 60 * 60);
+
+/// The sleeps this process saw, as wall-clock spans, so an age read off the
+/// wall clock can leave out the time nothing could have confirmed anything.
+/// A sleep before the process started is unknown and counts as awake.
+#[derive(Debug, Default)]
+pub struct SleepLedger {
+    /// `(fell asleep, woke)`, sorted and never overlapping.
+    sleeps: Mutex<Vec<(SystemTime, SystemTime)>>,
+}
+
+impl SleepLedger {
+    /// The machine woke at `woke` after `slept`. The OS notice and the clock
+    /// gap report one sleep twice; overlapping spans merge.
+    pub fn record(&self, woke: SystemTime, slept: Duration) {
+        let Some(fell) = woke.checked_sub(slept) else {
+            return;
+        };
+        if slept.is_zero() {
+            return;
+        }
+        let mut sleeps = self.sleeps.lock().unwrap_or_else(|p| p.into_inner());
+        sleeps.push((fell, woke));
+        sleeps.sort_unstable();
+        let mut merged: Vec<(SystemTime, SystemTime)> = Vec::with_capacity(sleeps.len());
+        for &(start, end) in sleeps.iter() {
+            match merged.last_mut() {
+                Some(last) if start <= last.1 => last.1 = last.1.max(end),
+                _ => merged.push((start, end)),
+            }
+        }
+        let excess = merged.len().saturating_sub(SLEEP_LEDGER_CAP);
+        merged.drain(..excess);
+        *sleeps = merged;
+    }
+
+    /// The earliest moment from which `awake` of waking time reaches `now`:
+    /// `now - awake` with the sleeps in between added back, up to
+    /// [`MAX_CREDITED_SLEEP`]. `None` before the clock's epoch.
+    pub fn awake_cutoff(&self, now: SystemTime, awake: Duration) -> Option<SystemTime> {
+        let sleeps = self.sleeps.lock().unwrap_or_else(|p| p.into_inner());
+        let (mut at, mut remaining, mut budget) = (now, awake, MAX_CREDITED_SLEEP);
+        for &(fell, woke) in sleeps.iter().rev() {
+            if fell >= at {
+                continue;
+            }
+            let woke = woke.min(at);
+            let awake_since = at.duration_since(woke).unwrap_or_default();
+            if awake_since >= remaining {
+                break;
+            }
+            remaining -= awake_since;
+            let credited = woke.duration_since(fell).unwrap_or_default().min(budget);
+            budget -= credited;
+            at = woke.checked_sub(credited)?;
+            if budget.is_zero() {
+                break;
+            }
+        }
+        at.checked_sub(remaining)
+    }
+}
+
+/// The ledger both resume sources feed and enforcement windows read.
+pub fn process_sleeps() -> Arc<SleepLedger> {
+    static LEDGER: std::sync::OnceLock<Arc<SleepLedger>> = std::sync::OnceLock::new();
+    Arc::clone(LEDGER.get_or_init(Arc::default))
+}
+
 /// Cross-cutting "re-resolve the binding now" request. Producers (the
 /// fail-closed posture heartbeat) only set a flag; the watchdog task drains it
 /// and runs the re-arm off every lock the producer might hold.
-#[derive(Debug, Default)]
+#[derive(Default)]
 pub struct RebindRequests {
     pending: AtomicU64,
     reason: Mutex<Option<&'static str>>,
     wake: WakeLatch,
+    wake_refresh: std::sync::OnceLock<Arc<dyn Fn() + Send + Sync>>,
+}
+
+impl std::fmt::Debug for RebindRequests {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RebindRequests")
+            .field("pending", &self.pending)
+            .field("wake", &self.wake)
+            .finish_non_exhaustive()
+    }
 }
 
 impl RebindRequests {
@@ -141,6 +225,20 @@ impl RebindRequests {
     /// Shared by both resume sources, which already share this value.
     pub fn wake_latch(&self) -> &WakeLatch {
         &self.wake
+    }
+
+    /// What a wake must do before its pass: drop the network readings cached
+    /// before the sleep and ask for a full pass. The notices that would have
+    /// done so fired while the service slept, and a pass judged on those
+    /// readings finds nothing moved. First writer wins.
+    pub fn set_wake_refresh(&self, refresh: Arc<dyn Fn() + Send + Sync>) {
+        let _ = self.wake_refresh.set(refresh);
+    }
+
+    pub fn refresh_for_wake(&self) {
+        if let Some(refresh) = self.wake_refresh.get() {
+            refresh();
+        }
     }
 }
 
@@ -205,11 +303,24 @@ impl PowerResumeRearm {
             liveness.map(|liveness| (liveness, "power")),
         );
         let poke = trigger.poker();
+        // Where `Instant` counts sleep the clock gap sees none; the notice pair
+        // is then the only measure of it.
+        let fell_asleep: Mutex<Option<SystemTime>> = Mutex::new(None);
         let subscription = observer.subscribe(Arc::new(move |event| match event {
-            PowerEvent::Resume => poke(),
+            PowerEvent::Resume => {
+                let fell = fell_asleep.lock().unwrap_or_else(|p| p.into_inner()).take();
+                if let Some(fell) = fell {
+                    let woke = SystemTime::now();
+                    if let Ok(slept) = woke.duration_since(fell) {
+                        process_sleeps().record(woke, slept);
+                    }
+                }
+                poke();
+            }
             // Nothing is acted on before a sleep: the sleep undoes it, and the
             // wake re-derives it all. The next resume is a new wake.
             PowerEvent::Suspend => {
+                *fell_asleep.lock().unwrap_or_else(|p| p.into_inner()) = Some(SystemTime::now());
                 if let Some(requests) = requests.as_ref() {
                     requests.wake_latch().forget();
                 }
@@ -249,6 +360,9 @@ pub fn build_resume_watchdog_task(
             );
             last_mono = now_mono;
             last_wall = now_wall;
+            if let Some(gap) = gap {
+                process_sleeps().record(now_wall, gap);
+            }
             watchdog_tick(gap, &requests, rearm_hook.as_ref(), wake_hook.as_ref());
             TaskOutcome::Continue
         },
@@ -505,6 +619,52 @@ mod tests {
         assert!(!is_same_wake((mono, wall), (mono + w, wall + w), w));
         // A wall clock stepped back is a correction; monotonic time decides.
         assert!(is_same_wake((mono, wall + soon), (mono + soon, wall), w));
+    }
+
+    /// Two sleeps inside the window, one reported by both resume sources: the
+    /// awake time is counted around each sleep once, never across it.
+    #[test]
+    fn the_awake_cutoff_steps_over_each_sleep_once() {
+        let hour = Duration::from_secs(3600);
+        let now = SystemTime::UNIX_EPOCH + 1000 * hour;
+        let ledger = SleepLedger::default();
+        assert_eq!(ledger.awake_cutoff(now, 6 * hour), Some(now - 6 * hour));
+        // Asleep from -12 h to -2 h, reported by the notice pair and by the
+        // clock gap, whose tick lands up to a few seconds after the wake.
+        ledger.record(now - 2 * hour, 10 * hour);
+        ledger.record(now - 2 * hour + Duration::from_secs(5), 10 * hour);
+        let late_tick = Duration::from_secs(5);
+        // 2 h awake after it, 4 h more before it.
+        let expected = Some(now - 16 * hour - late_tick);
+        assert_eq!(ledger.awake_cutoff(now, 6 * hour), expected);
+        // A sleep before the window starts changes nothing.
+        ledger.record(now - 30 * hour, hour);
+        assert_eq!(ledger.awake_cutoff(now, 6 * hour), expected);
+        // A window that ends inside the awake stretch after the sleep.
+        assert_eq!(ledger.awake_cutoff(now, hour), Some(now - hour));
+    }
+
+    /// A week away with the lid closed: addresses confirmed before it may now
+    /// belong to someone else, so no more than a day of sleep is credited,
+    /// however the sleep is split.
+    #[test]
+    fn a_week_asleep_credits_one_day_at_most() {
+        let hour = Duration::from_secs(3600);
+        let now = SystemTime::UNIX_EPOCH + 1000 * hour;
+        let ledger = SleepLedger::default();
+        ledger.record(now - hour, 7 * 24 * hour);
+        assert_eq!(
+            ledger.awake_cutoff(now, 6 * hour),
+            Some(now - 6 * hour - MAX_CREDITED_SLEEP)
+        );
+
+        let split = SleepLedger::default();
+        split.record(now - hour, 20 * hour);
+        split.record(now - 22 * hour, 20 * hour);
+        assert_eq!(
+            split.awake_cutoff(now, 6 * hour),
+            Some(now - 6 * hour - MAX_CREDITED_SLEEP)
+        );
     }
 
     #[test]

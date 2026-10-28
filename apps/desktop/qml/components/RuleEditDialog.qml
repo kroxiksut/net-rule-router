@@ -474,7 +474,7 @@ Dialog {
         var key = String(a["warning-key"] || "")
         var verdict = _verdictFor(localRuleType, localValue)
         if (key !== "" && (verdict === null || verdict.messageKey !== key)) {
-            lines.push(root.tr(key, root.tr("rules.validation.warning", "Warning")))
+            lines.push(root.tr(key, root.tr("rules.validation.warning", "Valid with warnings")))
         }
         return lines.join("\n")
     }
@@ -575,7 +575,7 @@ Dialog {
         var verdict = _verdictFor(localRuleType, localValue)
         return verdict === null ? ""
             : verdictMessage(verdict.messageKey, verdict.args,
-                root.tr("rules.validation.warning", "Warning"))
+                root.tr("rules.validation.warning", "Valid with warnings"))
     }
 
     // ── Several rules at once ──
@@ -618,14 +618,18 @@ Dialog {
         }
         return false
     }
-    function _bulkExisting() {
-        var out = []
-        for (var i = 0; i < root.rulesModel.count; i += 1) {
-            var r = root.rulesModel.get(i)
-            out.push({ type: String(r.ruleType || ""), value: String(r.matchValue || ""),
-                route: String(r.targetRoute || "") })
+    /// What the planner reads besides the rules: the host plans it against the
+    /// rules it holds at Save (`Rules.planBulkSubmission`).
+    function bulkPlanInput() {
+        return {
+            text: bulkText,
+            route: localRoute,
+            os: String(root.platformProfile.os || ""),
+            apps: _typeOffered("application"),
+            choices: _bulkLiveChoices(),
+            verdicts: _bulkVerdicts,
+            room: root.bulkRuleRoom()
         }
-        return out
     }
     function _bulkLineText(lines, n) {
         return n >= 1 && n <= lines.length ? String(lines[n - 1]).replace(/\r$/, "").trim() : ""
@@ -644,16 +648,7 @@ Dialog {
             bulkPlan = _emptyBulkPlan
             return
         }
-        var plan = Rules.planBulkRules({
-            text: bulkText,
-            route: localRoute,
-            os: String(root.platformProfile.os || ""),
-            apps: _typeOffered("application"),
-            existing: _bulkExisting(),
-            choices: _bulkLiveChoices(),
-            verdicts: _bulkVerdicts,
-            room: root.bulkRuleRoom()
-        })
+        var plan = Rules.planBulkSubmission(bulkPlanInput(), root.rulesModel)
         // A new model scrolls a list back to its top; the reader stays put.
         var y = bulkPreview ? bulkPreview.contentY : 0
         bulkPlan = plan
@@ -856,7 +851,14 @@ Dialog {
                 open()
                 return
             }
-            root.saveBulkRules(bulkPlan)
+            // The rules may have been re-read since the plan on screen.
+            var plan = Rules.planBulkSubmission(bulkPlanInput(), root.rulesModel)
+            if (plan.add + plan.move === 0) {
+                bulkPlan = plan
+                open()
+                return
+            }
+            root.saveBulkRules(plan)
             return
         }
         if (!isMatchValueValid(localRuleType, localValue)) {

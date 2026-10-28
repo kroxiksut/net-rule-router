@@ -274,7 +274,7 @@ GroupBox {
                 ToolTip.delay: 400
                 ToolTip.text: root.tr(
                     "settings.service.action.stop-tooltip",
-                    "Stops the background service. Routing is turned off and traffic returns to the working channel — unless you enabled \"Keep matched routes active when the service stops\". Note: simply closing the app keeps routing active, because the service keeps running.")
+                    "Stops the background service. By default all routes are removed and every connection returns to your main connection; leak-protection blocks are removed. (Turn on \"Keep rule routes on the additional adapter after pause/stop\" in Settings to keep your routed sites on the additional adapter — e.g. a work/corporate adapter.) Note: simply closing the app keeps routing active, because the service keeps running.")
             }
             ThemedButton {
                 theme: root.uiTheme
@@ -326,8 +326,8 @@ GroupBox {
                 wrapMode: Text.WordWrap
                 text: root.tr("settings.service.update.detail",
                         "Registered: %1\nThis application: %2")
-                    .arg(root.serviceRegisteredPath || root.tr("settings.service.status.unknown", "unknown"))
-                    .arg(root.serviceExpectedPath || root.tr("settings.service.status.unknown", "unknown"))
+                    .arg(root.serviceRegisteredPath || root.tr("settings.service.status.unknown", "Unknown"))
+                    .arg(root.serviceExpectedPath || root.tr("settings.service.status.unknown", "Unknown"))
             }
             RowLayout {
                 Layout.fillWidth: true
@@ -646,7 +646,7 @@ GroupBox {
             color: root.mutedTextColor
             wrapMode: Text.WordWrap
             text: root.tr("settings.service.crash-recovery",
-                "Service will auto-restart up to 3 times after failures.")
+                "After a failure the service restarts by itself; if failures repeat, the network returns to normal and the service keeps trying, less often.")
         }
 
         // ── Service logs ─────────────────────────────────────────

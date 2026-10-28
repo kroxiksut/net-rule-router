@@ -25,7 +25,7 @@ use std::process::ExitCode;
 use std::time::{Duration, SystemTime};
 
 use nrr_platform_api::service_control::{
-    ServiceControlError, ServiceControlPort, ServiceInstallSpec, ServiceStartMode,
+    ServiceControlError, ServiceControlPort, ServiceInstallSpec, ServiceRunState, ServiceStartMode,
     ServiceStatusReport, ServiceUninstallReport, ServiceUninstallSpec,
 };
 use nrr_shared::product_identity::{BinaryRole, PRODUCT_NAME};
@@ -73,22 +73,29 @@ fn main() -> ExitCode {
 
     // Before the stop, by the user who asked: their clients read it from their
     // own temp directory, and an elevated re-run would write to the admin's.
-    if stops_service(&invocation.command) {
+    let stops = stops_service(&invocation.command);
+    if stops {
         nrr_shared::user_paths::note_expected_stop();
     }
 
-    let code = run(invocation.command.clone(), &ctx);
-    if code != exit::NEEDS_PRIVILEGE {
-        return ExitCode::from(code);
-    }
+    let mut code = run(invocation.command.clone(), &ctx);
     // Only a verb the table marks as needing administrator rights, refused for
     // exactly that, is worth re-running (the plan is `NotOffered` for any
     // other): asking anyway would train the user to grant rights for failures
     // elevation does not fix.
-    match elevate::retry(ctx.elevation, relaunch.as_deref(), &invocation.command) {
-        Some(elevated) => ExitCode::from(elevated),
-        None => ExitCode::from(code),
+    if code == exit::NEEDS_PRIVILEGE {
+        if let Some(elevated) =
+            elevate::retry(ctx.elevation, relaunch.as_deref(), &invocation.command)
+        {
+            code = elevated;
+        }
     }
+    // A marker left by a stop that never ran would hide a real failure of the
+    // service for the rest of its window.
+    if stops && !stop_was_attempted(code) {
+        nrr_shared::user_paths::withdraw_expected_stop();
+    }
+    ExitCode::from(code)
 }
 
 /// Whether the verb takes the service down on purpose, so the user's clients
@@ -101,10 +108,16 @@ fn stops_service(command: &Command) -> bool {
             | Command::Uninstall { .. }
             | Command::Reinstall
             | Command::ResetNetwork {
+                confirmed: true,
                 stop_service: true,
-                ..
             }
     )
+}
+
+/// Whether a run that ended with `code` may have touched the service: a
+/// refusal for rights, asked for or not, ran nothing.
+fn stop_was_attempted(code: u8) -> bool {
+    !matches!(code, exit::NEEDS_PRIVILEGE | exit::ELEVATION_DECLINED)
 }
 
 /// What every verb needs to know about the invocation it is running under.
@@ -126,7 +139,7 @@ fn run(command: Command, ctx: &Ctx<'_>) -> u8 {
             println!("{exe} {} ({PRODUCT_NAME})", env!("CARGO_PKG_VERSION"));
             exit::SUCCESS
         }
-        Command::Status => with_port(exe, "status", |port| status(port.as_ref())),
+        Command::Status => with_port(exe, "status", |port| status(port.as_ref(), exe)),
         // Unlike every other verb, `diag doctor` runs even when this platform
         // has no service-manager implementation: "there is no implementation"
         // is one of the answers it exists to give.
@@ -155,10 +168,18 @@ fn run(command: Command, ctx: &Ctx<'_>) -> u8 {
             spec.start_mode = start_mode;
             match port.install(&spec) {
                 Ok(report) => {
+                    // What the manager now holds, not what was asked: an install
+                    // over an existing registration may leave its start mode.
+                    let registered_mode = port
+                        .query()
+                        .ok()
+                        .flatten()
+                        .and_then(|registered| registered.start_mode);
+                    let effective_mode = registered_mode.unwrap_or(start_mode);
                     println!("Installed the {PRODUCT_NAME} service.");
                     println!(
                         "  start mode:        {}",
-                        parse::start_mode_word(start_mode)
+                        parse::start_mode_word(effective_mode)
                     );
                     print_registered_binary(port.as_ref(), &spec.binary_path);
                     println!(
@@ -187,10 +208,11 @@ fn run(command: Command, ctx: &Ctx<'_>) -> u8 {
                              show without their description"
                         );
                     }
-                    println!(
-                        "  launcher may start: {}",
-                        yes_no(apply_on_demand_grant(start_mode, &spec.binary_path))
-                    );
+                    print_grant(effective_mode, &spec.binary_path, exe);
+                    if let Some(hint) = start_mode_not_applied(start_mode, registered_mode, exe) {
+                        eprintln!("{hint}");
+                        return exit::FAILED;
+                    }
                     exit::SUCCESS
                 }
                 Err(err) => report_failure("install", &err, ctx, "install"),
@@ -225,16 +247,27 @@ fn run(command: Command, ctx: &Ctx<'_>) -> u8 {
                     print_network_state(&report, exe);
                     exit::SUCCESS
                 }
-                Err(err) => report_failure(
-                    "uninstall",
-                    &err,
-                    ctx,
-                    match (purge, purge_audit) {
+                Err(err) => {
+                    let repeat_as = match (purge, purge_audit) {
                         (true, true) => "uninstall --purge --purge-audit",
                         (true, false) => "uninstall --purge",
                         (false, _) => "uninstall",
-                    },
-                ),
+                    };
+                    let code = report_failure("uninstall", &err, ctx, repeat_as);
+                    // A step after the delete failed (the data, most often): a
+                    // repeat finds nothing registered, so say it now.
+                    if err != ServiceControlError::NotInstalled && matches!(port.query(), Ok(None))
+                    {
+                        eprintln!("The service itself was removed.");
+                        for line in not_installed_lines("uninstall", repeat_as, exe)
+                            .iter()
+                            .skip(1)
+                        {
+                            eprintln!("{line}");
+                        }
+                    }
+                    code
+                }
             }
         }),
         Command::Start => with_port(exe, "start", |port| match port.start(TRANSITION_TIMEOUT) {
@@ -310,10 +343,7 @@ fn run(command: Command, ctx: &Ctx<'_>) -> u8 {
             // The removal took the grant with the old registration, so an
             // on-demand service comes back unstartable by the launcher unless
             // it is re-issued here.
-            println!(
-                "  launcher may start: {}",
-                yes_no(apply_on_demand_grant(spec.start_mode, &spec.binary_path))
-            );
+            print_grant(spec.start_mode, &spec.binary_path, exe);
             match port.start(TRANSITION_TIMEOUT) {
                 Ok(()) => {
                     println!("  service:           started");
@@ -419,10 +449,10 @@ fn with_port(
 
 /// Report registration and run state. Answers without talking to the service:
 /// this is the question people ask precisely when the service is not answering.
-fn status(port: &dyn ServiceControlPort) -> u8 {
+fn status(port: &dyn ServiceControlPort, exe: &str) -> u8 {
     match port.query() {
         Ok(Some(report)) => {
-            print_status(&report);
+            print_status(&report, exe);
             exit::SUCCESS
         }
         Ok(None) => {
@@ -436,15 +466,21 @@ fn status(port: &dyn ServiceControlPort) -> u8 {
     }
 }
 
-fn print_status(report: &ServiceStatusReport) {
+fn print_status(report: &ServiceStatusReport, exe: &str) {
     println!("{PRODUCT_NAME} service: installed");
     println!("  state:             {}", report.run_state.slug());
-    // The console and the service are shipped and replaced together, so this
-    // console's version IS the installed version — with one exception, which
-    // the next line names rather than leaving the operator to assume: replacing
-    // the binary does not restart the process already loaded from it, so the
-    // version that is REGISTERED and the version that is RUNNING can differ.
-    println!("  version:           {}", env!("CARGO_PKG_VERSION"));
+    // This console's version is the service's only while the registered binary
+    // is the one shipped beside it, or a copy of it.
+    let shipped = service_binary_path().ok();
+    match installed_version(
+        report.binary_path.as_deref(),
+        shipped.as_deref(),
+        nrr_platform_api::service_placement::same_contents,
+    ) {
+        Some(version) => println!("  version:           {version}"),
+        None => println!("  version:           unknown - registered from another copy"),
+    }
+    // Replacing the binary does not restart the process loaded from it.
     if running_predates_binary(report) {
         println!("  running build:     older than the installed binary - restart to run it");
     }
@@ -456,6 +492,23 @@ fn print_status(report: &ServiceStatusReport) {
         Some(path) => println!("  binary:            {}", path.display()),
         None => println!("  binary:            unknown"),
     }
+    if report.run_state == ServiceRunState::Stopped {
+        println!("  network cut off?   {exe} reset-network --confirm");
+    }
+}
+
+/// This console's version when the registered binary is the shipped one;
+/// `None` when it is another copy or cannot be told apart.
+fn installed_version(
+    registered: Option<&Path>,
+    shipped: Option<&Path>,
+    same_contents: impl Fn(&Path, &Path) -> bool,
+) -> Option<&'static str> {
+    let (Some(registered), Some(shipped)) = (registered, shipped) else {
+        return None;
+    };
+    (same_file(registered, shipped) || same_contents(registered, shipped))
+        .then_some(env!("CARGO_PKG_VERSION"))
 }
 
 /// Give the interactive user the `SERVICE_START` grant an on-demand service
@@ -468,16 +521,47 @@ fn print_status(report: &ServiceStatusReport) {
 /// console asks it rather than growing a second implementation that can drift
 /// from the one the application uses.
 ///
-/// Returns whether the grant is in place. `true` for start-with-Windows, where
-/// no grant is wanted: the SCM starts it and nothing else needs the right.
-fn apply_on_demand_grant(start_mode: ServiceStartMode, binary: &Path) -> bool {
+/// Returns whether the grant is in place, `true` for start-with-the-system,
+/// where no grant is wanted. `None` where no launcher starts the service, so
+/// there is no grant to issue and nothing to run.
+fn apply_on_demand_grant(
+    start_mode: ServiceStartMode,
+    binary: &Path,
+    grant_verb: Option<&str>,
+) -> Option<bool> {
     if start_mode != ServiceStartMode::OnAppLaunch {
-        return true;
+        return Some(true);
     }
-    std::process::Command::new(binary)
-        .arg("set-start-demand")
-        .status()
-        .is_ok_and(|status| status.success())
+    let verb = grant_verb?;
+    Some(
+        std::process::Command::new(binary)
+            .arg(verb)
+            .status()
+            .is_ok_and(|status| status.success()),
+    )
+}
+
+fn print_grant(start_mode: ServiceStartMode, binary: &Path, exe: &str) {
+    match apply_on_demand_grant(start_mode, binary, platform::on_demand_grant_verb()) {
+        Some(granted) => println!("  launcher may start: {}", yes_no(granted)),
+        None => println!("  started by:        nothing on its own here - run `{exe} start`"),
+    }
+}
+
+/// What to tell the operator when the registration kept a start mode other
+/// than the one asked for; `None` when it runs as asked.
+fn start_mode_not_applied(
+    asked: ServiceStartMode,
+    registered: Option<ServiceStartMode>,
+    exe: &str,
+) -> Option<String> {
+    let registered = registered.filter(|mode| *mode != asked)?;
+    Some(format!(
+        "The service was already installed; its start mode stays {}. To change it, run \
+         `{exe} uninstall`, then `{exe} install --start-mode={}`.",
+        parse::start_mode_word(registered),
+        parse::start_mode_word(asked)
+    ))
 }
 
 /// Whether the running service process was started from an older file than the
@@ -522,8 +606,18 @@ fn report_failure(
             }
         }
         ServiceControlError::NotInstalled => {
-            eprintln!("The {PRODUCT_NAME} service is not installed.");
-            eprintln!("Install it first: {exe} install");
+            for line in not_installed_lines(operation, repeat_as, exe) {
+                eprintln!("{line}");
+            }
+        }
+        // Not "failed" either: a stop that runs long may still finish.
+        ServiceControlError::Timeout {
+            operation: "stop",
+            seconds,
+        } => {
+            eprintln!("{operation}: the service is still stopping after {seconds}s.");
+            eprintln!("Check with: {exe} status");
+            eprintln!("If it hangs, end it and restore the network: {exe} reset-network --confirm --stop-service");
         }
         // Not "failed": the start was accepted and may still finish.
         ServiceControlError::Timeout {
@@ -537,6 +631,26 @@ fn report_failure(
         other => eprintln!("{operation} failed: {other}"),
     }
     exit::for_error(err)
+}
+
+/// What "not installed" means for the verb that met it. Removing something
+/// that is not there is never answered with "install it first", and a purge
+/// that lost the registration on an earlier try still has data to name.
+fn not_installed_lines(operation: &str, repeat_as: &str, exe: &str) -> Vec<String> {
+    let mut lines = vec![format!("The {PRODUCT_NAME} service is not installed.")];
+    if operation != "uninstall" {
+        lines.push(format!("Install it first: {exe} install"));
+    } else if repeat_as.contains("--purge") {
+        match nrr_platform_api::paths::production_data_root() {
+            Some(root) => lines.push(format!(
+                "Service data left behind, if any, is in {}; delete it from an administrator \
+                 console.",
+                root.display()
+            )),
+            None => lines.push("Nothing was removed.".to_string()),
+        }
+    }
+    lines
 }
 
 /// Undo network state a crashed or hard-killed service left behind.
@@ -578,7 +692,7 @@ fn reset_network(confirmed: bool, stop_service: bool, ctx: &Ctx<'_>) -> u8 {
         eprintln!("  {exe} {repeat}");
         return exit::NOT_CONFIRMED;
     }
-    let binary = match service_binary_path() {
+    let binary = match reset_binary(service_binary_path().ok(), registered_service_binary) {
         Ok(path) => path,
         Err(message) => {
             eprintln!("{message}");
@@ -594,12 +708,8 @@ fn reset_network(confirmed: bool, stop_service: bool, ctx: &Ctx<'_>) -> u8 {
     match read_reset_run(&run) {
         ResetRun::Done => exit::SUCCESS,
         ResetRun::NeedsPrivilege => needs_elevation("reset-network", ctx, repeat),
-        // The service binary already said so; the console names its own way.
-        ResetRun::ServiceRunning => {
-            eprintln!("To stop the service and restore the network, run:");
-            eprintln!("  {exe} reset-network --confirm --stop-service");
-            exit::FAILED
-        }
+        // The service binary has already named the stopping variant.
+        ResetRun::ServiceRunning => exit::FAILED,
         ResetRun::Unfinished(how) => {
             eprintln!("The service binary could not finish the reset ({how}).");
             exit::FAILED
@@ -609,6 +719,39 @@ fn reset_network(confirmed: bool, stop_service: bool, ctx: &Ctx<'_>) -> u8 {
             exit::FAILED
         }
     }
+}
+
+/// The binary whose reset verb to run: the one shipped beside this console,
+/// else the one the service manager runs, which applied the state in the
+/// first place. A machine without either is told the offline way back.
+fn reset_binary(
+    shipped: Option<PathBuf>,
+    registered: impl FnOnce() -> Option<PathBuf>,
+) -> Result<PathBuf, String> {
+    if let Some(shipped) = shipped {
+        return Ok(shipped);
+    }
+    if let Some(registered) = registered().filter(|path| path.is_file()) {
+        println!(
+            "Using the registered service binary: {}",
+            registered.display()
+        );
+        return Ok(registered);
+    }
+    Err(format!(
+        "cannot find the service binary `{}` next to this console, and none is registered. \
+         Run {} from an administrator console.",
+        BinaryRole::Service.host_file_name(),
+        platform::reset_script()
+    ))
+}
+
+fn registered_service_binary() -> Option<PathBuf> {
+    platform::service_control()?
+        .query()
+        .ok()
+        .flatten()?
+        .binary_path
 }
 
 /// How the service binary's reset run ended, as this console acts on it.
@@ -722,8 +865,139 @@ mod tests {
             confirmed: true,
             stop_service: false
         }));
+        // Unconfirmed, it only explains itself: nothing stops.
+        assert!(!stops_service(&Command::ResetNetwork {
+            confirmed: false,
+            stop_service: true
+        }));
         assert!(!stops_service(&Command::Start));
         assert!(!stops_service(&Command::Status));
+    }
+
+    /// A refused or declined elevation ran nothing; the marker it left would
+    /// silence a real crash of the service for minutes.
+    #[test]
+    fn a_stop_refused_for_rights_never_happened() {
+        assert!(!stop_was_attempted(exit::NEEDS_PRIVILEGE));
+        assert!(!stop_was_attempted(exit::ELEVATION_DECLINED));
+        assert!(stop_was_attempted(exit::SUCCESS));
+        assert!(stop_was_attempted(exit::NOT_RESPONDING));
+        assert!(stop_was_attempted(exit::FAILED));
+    }
+
+    /// Where no launcher starts the service there is no grant to issue, and
+    /// the service binary is not asked for a verb it may not have.
+    #[test]
+    fn no_grant_verb_means_nothing_is_run_and_nothing_claimed() {
+        let missing = Path::new("no-such-dir").join(BinaryRole::Service.host_file_name());
+        assert_eq!(
+            apply_on_demand_grant(ServiceStartMode::OnAppLaunch, &missing, None),
+            None
+        );
+        assert_eq!(
+            apply_on_demand_grant(ServiceStartMode::WithWindows, &missing, None),
+            Some(true)
+        );
+        assert_eq!(
+            apply_on_demand_grant(
+                ServiceStartMode::OnAppLaunch,
+                &missing,
+                Some("set-start-demand")
+            ),
+            Some(false)
+        );
+    }
+
+    /// An install over an existing registration that kept its start mode must
+    /// say so: a service left on-demand does not start at boot, whatever the
+    /// command line asked for.
+    #[test]
+    fn a_start_mode_the_registration_kept_is_reported_not_claimed() {
+        let hint = start_mode_not_applied(
+            ServiceStartMode::WithWindows,
+            Some(ServiceStartMode::OnAppLaunch),
+            "nrr-cli",
+        )
+        .unwrap_or_default();
+        assert!(hint.contains("on-demand"), "{hint}");
+        assert!(hint.contains("nrr-cli install --start-mode=auto"), "{hint}");
+        assert_eq!(
+            start_mode_not_applied(
+                ServiceStartMode::OnAppLaunch,
+                Some(ServiceStartMode::OnAppLaunch),
+                "nrr-cli"
+            ),
+            None
+        );
+        assert_eq!(
+            start_mode_not_applied(ServiceStartMode::WithWindows, None, "nrr-cli"),
+            None
+        );
+    }
+
+    /// The registered binary may be another copy, of another build; this
+    /// console's version is not its version then.
+    #[test]
+    fn the_console_version_is_the_service_version_only_for_its_own_binary() {
+        let shipped = Path::new("here").join(BinaryRole::Service.host_file_name());
+        let other = Path::new("elsewhere").join(BinaryRole::Service.host_file_name());
+        let never = |_: &Path, _: &Path| false;
+        let always = |_: &Path, _: &Path| true;
+        assert_eq!(installed_version(Some(&other), Some(&shipped), never), None);
+        assert_eq!(installed_version(None, Some(&shipped), always), None);
+        assert!(installed_version(Some(&shipped), Some(&shipped), never).is_some());
+        // The protected copy of the same files.
+        assert!(installed_version(Some(&other), Some(&shipped), always).is_some());
+    }
+
+    /// Removing what is not there never answers "install it first"; a purge
+    /// whose first try removed the registration still names the data.
+    #[test]
+    fn an_uninstall_of_nothing_does_not_send_the_user_to_install() {
+        for repeat in ["uninstall", "uninstall --purge"] {
+            let lines = not_installed_lines("uninstall", repeat, "nrr-cli");
+            assert!(
+                lines
+                    .iter()
+                    .all(|line| !line.contains("install it first")
+                        && !line.contains("Install it first")),
+                "{lines:?}"
+            );
+        }
+        if nrr_platform_api::paths::production_data_root().is_some() {
+            let lines = not_installed_lines("uninstall", "uninstall --purge", "nrr-cli");
+            assert!(
+                lines.iter().any(|line| line.contains("delete it")),
+                "{lines:?}"
+            );
+        }
+        let start = not_installed_lines("start", "start", "nrr-cli");
+        assert!(start.iter().any(|line| line.contains("nrr-cli install")));
+    }
+
+    /// A console run from another folder still restores the network through
+    /// the binary the service manager runs; with neither, the user is given
+    /// the offline script rather than install advice.
+    #[test]
+    fn a_reset_without_a_shipped_binary_falls_back_to_the_registered_one() {
+        let dir = std::env::temp_dir().join(format!("nrr-cli-reset-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let registered = dir.join(BinaryRole::Service.host_file_name());
+        std::fs::write(&registered, b"bin").expect("write");
+
+        assert_eq!(
+            reset_binary(None, || Some(registered.clone())),
+            Ok(registered.clone())
+        );
+        let shipped = PathBuf::from("shipped");
+        assert_eq!(
+            reset_binary(Some(shipped.clone()), || Some(registered.clone())),
+            Ok(shipped)
+        );
+        let neither = reset_binary(None, || Some(dir.join("gone"))).expect_err("no binary");
+        assert!(neither.contains("reset-network"), "{neither}");
+        assert!(!neither.contains("Install from"), "{neither}");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     fn ctx(elevation: elevate::ElevationPlan) -> Ctx<'static> {

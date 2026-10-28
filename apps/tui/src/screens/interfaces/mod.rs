@@ -452,6 +452,7 @@ impl Screen for InterfacesScreen {
             return false;
         };
         match c {
+            'p' | 's' if super::focus_list_first(app) => {}
             'p' | 's' => {
                 let route = if c == 'p' {
                     Route::Primary

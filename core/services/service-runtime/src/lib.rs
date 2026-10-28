@@ -142,6 +142,7 @@ pub mod override_grants;
 pub mod override_recheck;
 pub mod own_flow_resets;
 pub mod own_resolver_watch;
+pub mod panic_reports;
 pub mod pass_inputs;
 pub mod path_probe;
 pub mod per_sid_orchestrator;
@@ -212,6 +213,7 @@ pub mod site_notice;
 pub mod standing_volume;
 pub mod startup_quiet;
 pub mod state;
+pub(crate) mod state_lock;
 pub mod supervised_runtime;
 pub mod tamper_bootstrap;
 pub mod task_liveness;
@@ -248,6 +250,8 @@ pub use service_tasks::{
 };
 
 pub use supervised_runtime::{run_supervised_runtime, SupervisedRuntimeDeps};
+
+pub use panic_reports::install_throttled_panic_reports;
 
 pub use activation_coordinator::{
     ActivationAuditEmitter, ActivationAuditEvent, ActivationCoordinator, ActivationOutcome,

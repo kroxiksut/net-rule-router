@@ -77,9 +77,9 @@ use nrr_storage::repository::CacheRepository;
 ///   address is re-confirmed roughly every 5 minutes. Falling out of a 6 h
 ///   window means ~70 consecutive missed confirmations — a genuinely rotated or
 ///   dead address, never a transient DNS hiccup.
-/// - **Operator reality.** It spans a full working session plus a sleep/travel
-///   gap, so a resumed machine still boots with a populated block set instead of
-///   an empty one.
+/// - **Operator reality.** It spans a full working session, and it counts only
+///   waking time ([`crate::power_resume::SleepLedger`]), so a machine resumed
+///   after a night keeps its block set instead of an empty one.
 /// - **Address rotation.** Front-end pools rotate over hours-to-days, not
 ///   minutes; 6 h is comfortably inside one pool generation and far below the
 ///   day-scale drift that caused the incident.
@@ -209,6 +209,14 @@ pub trait FqdnCacheLookup: Send + Sync {
     /// means "keep asking me directly".
     fn snapshot_for_compute(&self) -> Option<FqdnCacheSnapshot> {
         None
+    }
+
+    /// [`Self::snapshot_for_compute`] cut down to `addresses`, as
+    /// [`FqdnCacheSnapshot::scoped_to`] cuts it. An implementation that can
+    /// read only those rows does: this is asked on the DNS path.
+    fn snapshot_for_addresses(&self, addresses: &[IpAddr]) -> Option<FqdnCacheSnapshot> {
+        self.snapshot_for_compute()
+            .map(|full| full.scoped_to(addresses))
     }
 
     /// The subset of [`Self::shared_direct_ips`] whose direct tenant a MAIN-route
@@ -348,6 +356,10 @@ pub struct SqliteFqdnCacheLookup {
     /// See [`ENFORCEMENT_CONFIRMATION_WINDOW`] — how recently an address must
     /// have been confirmed by a live resolution to reach enforcement.
     confirmation_window: Duration,
+    /// The window counts waking time: nothing re-confirms an address during a
+    /// sleep, and a night's sleep would otherwise empty every rule's set at
+    /// once while the tunnel is still reconnecting.
+    sleeps: Arc<crate::power_resume::SleepLedger>,
 }
 
 impl SqliteFqdnCacheLookup {
@@ -359,7 +371,18 @@ impl SqliteFqdnCacheLookup {
             cache,
             thresholds,
             confirmation_window: ENFORCEMENT_CONFIRMATION_WINDOW,
+            sleeps: crate::power_resume::process_sleeps(),
         }
+    }
+
+    /// Read sleeps from `sleeps` instead of the process ledger.
+    pub fn with_sleep_ledger(mut self, sleeps: Arc<crate::power_resume::SleepLedger>) -> Self {
+        self.sleeps = sleeps;
+        self
+    }
+
+    fn cutoff(&self, now: SystemTime) -> Option<SystemTime> {
+        self.sleeps.awake_cutoff(now, self.confirmation_window)
     }
 
     /// Override the confirmation window. Builder-style; every production call
@@ -401,7 +424,7 @@ impl SqliteFqdnCacheLookup {
                 // One subtraction, then one comparison per row — the entries
                 // and the vector are already being built, so the window costs
                 // no extra allocation and no extra query.
-                let cutoff = now.checked_sub(self.confirmation_window);
+                let cutoff = self.cutoff(now);
                 env.explain_data
                     .extended
                     .all_resolved_ips
@@ -442,8 +465,15 @@ impl FqdnCacheLookup for SqliteFqdnCacheLookup {
     fn snapshot_for_compute(&self) -> Option<FqdnCacheSnapshot> {
         Some(FqdnCacheSnapshot::take(
             self.cache.as_ref(),
-            self.confirmation_window,
-            SystemTime::now(),
+            self.cutoff(SystemTime::now()),
+        ))
+    }
+
+    fn snapshot_for_addresses(&self, addresses: &[IpAddr]) -> Option<FqdnCacheSnapshot> {
+        Some(FqdnCacheSnapshot::take_for_addresses(
+            self.cache.as_ref(),
+            self.cutoff(SystemTime::now()),
+            addresses,
         ))
     }
 
@@ -632,11 +662,9 @@ impl FqdnCacheSnapshot {
     /// Takes the snapshot. A failed read yields an EMPTY snapshot for that
     /// part, which is the same degradation the per-call adapter applies: a cold
     /// cache, never a wrong one.
-    pub fn take(
-        cache: &Mutex<dyn CacheRepository + Send>,
-        confirmation_window: Duration,
-        now: SystemTime,
-    ) -> Self {
+    /// Keeps the addresses confirmed at or after `cutoff`, all of them when
+    /// `None`.
+    pub fn take(cache: &Mutex<dyn CacheRepository + Send>, cutoff: Option<SystemTime>) -> Self {
         let guard = match cache.lock() {
             Ok(g) => g,
             Err(_) => {
@@ -648,7 +676,6 @@ impl FqdnCacheSnapshot {
                 return Self::empty();
             }
         };
-        let cutoff = now.checked_sub(confirmation_window);
         let mut by_hostname: HashMap<String, Vec<IpAddr>> = HashMap::new();
         match guard.snapshot_resolutions() {
             Ok(rows) => {
@@ -686,6 +713,51 @@ impl FqdnCacheSnapshot {
             direct_host_counts,
             shared_direct,
             shared_direct_primary_ruled,
+        }
+    }
+
+    /// What [`Self::take`] followed by [`Self::scoped_to`] gives, read by
+    /// index lookups on `wanted` instead of whole tables.
+    pub fn take_for_addresses(
+        cache: &Mutex<dyn CacheRepository + Send>,
+        cutoff: Option<SystemTime>,
+        wanted: &[IpAddr],
+    ) -> Self {
+        let read = match cache.lock() {
+            Ok(guard) => guard.snapshot_for_addresses(wanted),
+            Err(_) => return Self::empty(),
+        };
+        let rows = match read {
+            Ok(rows) => rows,
+            Err(e) => {
+                tracing::warn!(
+                    target: "nrr::wfp-codegen",
+                    msg_key = "fqdncache-snapshot-failed",
+                    error = %e,
+                    "fqdn cache snapshot failed; treating as cold"
+                );
+                return Self::empty();
+            }
+        };
+        let mut by_hostname: HashMap<String, Vec<IpAddr>> = HashMap::new();
+        for (host, addr, resolved_at) in rows.resolutions {
+            if confirmed_since(Some(resolved_at), cutoff) {
+                by_hostname.entry(host).or_default().push(addr);
+            }
+        }
+        let hostnames_by_recency = rows
+            .hostnames
+            .into_iter()
+            .map(|(host, _)| host)
+            .filter(|host| by_hostname.contains_key(host))
+            .collect();
+        Self {
+            by_hostname,
+            hostnames_by_recency,
+            suffix_index: OnceLock::new(),
+            shared_direct: rows.direct_host_counts.iter().map(|(ip, _)| *ip).collect(),
+            direct_host_counts: rows.direct_host_counts.into_iter().collect(),
+            shared_direct_primary_ruled: rows.primary_ruled.into_iter().collect(),
         }
     }
 
@@ -1362,6 +1434,36 @@ mod tests {
         );
     }
 
+    /// A laptop closed for ten hours: nothing could re-confirm a rule host's
+    /// address while it slept, so the morning's first pass must still pin and
+    /// block it while the tunnel reconnects, not drop every rule's set at once.
+    /// An address already stale when the lid closed stays out.
+    #[test]
+    fn a_night_asleep_does_not_age_the_rule_addresses_out() {
+        let store = confirmation_store();
+        let now = SystemTime::now();
+        let hour = Duration::from_secs(60 * 60);
+        let confirmed = Ipv4Addr::new(203, 0, 113, 21);
+        let stale = Ipv4Addr::new(203, 0, 113, 22);
+        // Confirmed shortly before the lid closed; the other one was already
+        // nearly seven hours old by then.
+        seed(&store, "mail.example", confirmed, now - 11 * hour);
+        seed(&store, "mail.example", stale, now - 17 * hour);
+        let sleeps = Arc::new(crate::power_resume::SleepLedger::default());
+        // Woke ten minutes ago after ten hours asleep.
+        sleeps.record(now - Duration::from_secs(600), 10 * hour);
+
+        let cache: Arc<Mutex<dyn CacheRepository + Send>> = Arc::new(Mutex::new(store));
+        let adapter = SqliteFqdnCacheLookup::new(cache, FreshnessThresholds::default_production())
+            .with_sleep_ledger(sleeps);
+        assert_eq!(
+            adapter.ips_confirmed_at("mail.example", now),
+            vec![confirmed]
+        );
+        let snapshot = adapter.snapshot_for_compute().expect("snapshot");
+        assert_eq!(snapshot.ips_for_hostname("mail.example"), vec![confirmed]);
+    }
+
     /// After the clock steps back, a row stamped in the future must age out of
     /// the window like any other, not stay confirmed for the length of the step.
     #[test]
@@ -1518,6 +1620,83 @@ mod tests {
                 .into_iter()
                 .filter(|ip| *ip == wanted)
                 .collect()
+        );
+    }
+
+    /// The first contact reads only the rows on its addresses; what it plans
+    /// from must still be the whole snapshot cut down, or it routes an
+    /// address the next pass takes back (or misses one it keeps).
+    #[test]
+    fn reading_only_the_wanted_addresses_gives_the_whole_snapshot_cut_down() {
+        use nrr_storage::dto::ResolutionEntry;
+        use nrr_storage::resolution_source::StorageResolutionSource;
+        let store = confirmation_store();
+        let wanted = Ipv4Addr::new(203, 0, 113, 1);
+        let other = Ipv4Addr::new(203, 0, 113, 2);
+        let stale = Ipv4Addr::new(203, 0, 113, 9);
+        let v6: IpAddr = "2001:db8::7".parse().expect("v6");
+        let now = SystemTime::now();
+        let long_ago = now - Duration::from_secs(3_600);
+        for (host, ips, at) in [
+            ("z.cdn.example", vec![IpAddr::V4(wanted), v6], now),
+            (
+                "a.cdn.example",
+                vec![IpAddr::V4(wanted), IpAddr::V4(other)],
+                now,
+            ),
+            ("old.cdn.example", vec![IpAddr::V4(stale)], long_ago),
+            ("m.cdn.example", vec![IpAddr::V4(other)], now),
+        ] {
+            store
+                .upsert_resolution(ResolutionEntry {
+                    canonical_hostname: host.into(),
+                    raw_hostname_sample: None,
+                    resolved_ips: ips,
+                    ttl_seconds: Some(300),
+                    source: StorageResolutionSource::Dns,
+                    resolved_at: at,
+                    active_revision_id: None,
+                })
+                .expect("upsert");
+        }
+        store
+            .record_shared_ip_direct_host(wanted, "direct.example", 1, true)
+            .expect("census");
+        store
+            .record_shared_ip_direct_host(wanted, "www.direct.example", 1, false)
+            .expect("census");
+        store
+            .record_shared_ip_direct_host(other, "other.example", 1, false)
+            .expect("census");
+        let cache: Arc<Mutex<dyn CacheRepository + Send>> = Arc::new(Mutex::new(store));
+        let lookup = SqliteFqdnCacheLookup::new(cache, FreshnessThresholds::default_production())
+            .with_confirmation_window(Duration::from_secs(600));
+        let addresses = [
+            IpAddr::V4(wanted),
+            v6,
+            IpAddr::V4(stale),
+            IpAddr::V4(wanted),
+        ];
+
+        let expected = lookup
+            .snapshot_for_compute()
+            .expect("whole snapshot")
+            .scoped_to(&addresses);
+        let read = lookup
+            .snapshot_for_addresses(&addresses)
+            .expect("scoped read");
+
+        assert_eq!(read.by_hostname, expected.by_hostname);
+        assert_eq!(read.hostnames_by_recency, expected.hostnames_by_recency);
+        assert_eq!(read.direct_host_counts, expected.direct_host_counts);
+        assert_eq!(read.shared_direct, expected.shared_direct);
+        assert_eq!(
+            read.shared_direct_primary_ruled,
+            expected.shared_direct_primary_ruled
+        );
+        assert!(
+            read.ips_for_hostname("old.cdn.example").is_empty(),
+            "an address past the confirmation window is not planned"
         );
     }
 

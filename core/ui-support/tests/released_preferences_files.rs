@@ -12,7 +12,7 @@ use nrr_ui_support::ui_preferences::{UiPreferencesStore, CURRENT_UI_PREFS_SCHEMA
 /// a schema bump removed, and goes.
 const UNKNOWN_KEY: &str = "setting_from_a_newer_build";
 
-const RELEASED_SAMPLES: &[&str] = &["ui_preferences_v12.txt"];
+const RELEASED_SAMPLES: &[&str] = &["ui_preferences_v12.txt", "ui_preferences_v13.txt"];
 
 /// Keys a schema bump retired, with the version that retired them. A sample
 /// older than that version loses exactly these; anything else lost is a defect.
@@ -72,6 +72,14 @@ fn every_released_sample_loads_and_saves_without_losing_a_value() {
 
         let store = UiPreferencesStore::for_path(path.clone());
         let loaded = store.load().expect("load");
+        // A key carried but not read would still be written back, so the file
+        // alone cannot show that this build lost track of a setting.
+        for line in &loaded.forward_compat.unknown_lines {
+            assert!(
+                line.starts_with(&format!("{UNKNOWN_KEY}=")),
+                "{sample}: `{line}` is no longer read"
+            );
+        }
         store.save(&loaded).expect("save");
         let saved = std::fs::read_to_string(&path).expect("read back");
 

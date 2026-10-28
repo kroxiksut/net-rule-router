@@ -67,6 +67,9 @@ pub(super) fn build(inputs: StorageIntegrityInputs<'_>) -> StorageIntegrity {
             now_ms,
         )
     });
+    if let Some(signing) = revision_signing.as_ref() {
+        signing.check_enforced_books();
+    }
 
     let activation_coordinator = match (settings_conn.as_ref(), artifacts.audit_writer.as_ref()) {
         (Some(conn), Some(audit_writer)) => {
@@ -151,18 +154,19 @@ pub(super) fn build(inputs: StorageIntegrityInputs<'_>) -> StorageIntegrity {
     // Confirmed overrides of the protection of system programs, honoured only
     // under the key their rows were signed with. Before any rules read.
     if let Some(conn) = settings_conn.as_ref() {
-        let grants = nrr_service_runtime::override_grants::OverrideGrants::open(
-            Arc::clone(conn),
-            revision_signing
-                .as_ref()
-                .and_then(|signing| signing.signing_key())
-                .map(<[u8]>::to_vec),
-            artifacts
-                .audit_writer
-                .clone()
-                .map(|w| w as Arc<nrr_service_runtime::boot_integrity::AuditTrail>),
-            now_ms,
-        );
+        let audit = artifacts
+            .audit_writer
+            .clone()
+            .map(|w| w as Arc<nrr_service_runtime::boot_integrity::AuditTrail>);
+        let grants = match revision_signing.as_ref() {
+            Some(signing) => signing.open_override_grants(Arc::clone(conn), audit, now_ms),
+            None => nrr_service_runtime::override_grants::OverrideGrants::open(
+                Arc::clone(conn),
+                None,
+                audit,
+                now_ms,
+            ),
+        };
         grants.attach_events(Arc::clone(&event_bus));
         // A service that keeps stopping unexpectedly loses every confirmation
         // before the first pass can honour one.

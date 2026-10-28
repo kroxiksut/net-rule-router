@@ -63,6 +63,9 @@ pub mod transport_unix;
 
 mod push_handover;
 
+mod frame_trace;
+pub use frame_trace::FrameTraceBudget;
+
 /// Set by [`silence_diagnostics`]; read by the client's stderr trace.
 static DIAGNOSTICS_SILENCED: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);

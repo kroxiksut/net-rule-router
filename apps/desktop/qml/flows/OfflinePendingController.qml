@@ -70,7 +70,7 @@ QtObject {
                     "While everything is held, look up site names over the main connection")
             case "include-subdomains":
                 return root.tr("settings.routing-behavior.include-subdomains.label",
-                    "Also cover subdomains for domain rules")
+                    "Also cover subdomains for domain rules (treat “example.com” as “example.com” + “*.example.com”)")
             case "shared-ip-policy":
                 return root.tr("settings.routing-behavior.shared-ip.label",
                     "When a routed domain shares an IP address with other sites")
@@ -117,7 +117,7 @@ QtObject {
                     "Write connection trace to service log")
             case "conn-trace-gui":
                 return root.tr("settings.diagnostics.conn-trace.gui.label",
-                    "Show connection trace in diagnostics (GUI)")
+                    "Show connection trace in Diagnostics")
             case "cache-refresh-interval-secs":
                 return root.tr("settings.diagnostics.cache-refresh.heading",
                     "Address cache refresh")

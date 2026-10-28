@@ -7,9 +7,12 @@ you and what to do about it, and it stays on this page until it is fixed.
 
 ## Right after the computer starts
 
-Until the service has applied your rules — usually a few seconds after the
-system starts — leak protection is not in force yet, and traffic for sites
-routed through the additional connection can go over the main one.
+With leak protection set to **Routed sites**, until the service has applied
+your rules — usually a few seconds after the system starts — the protection is
+not in force yet, and traffic for sites routed through the additional
+connection can go over the main one. With **Everything** this gap is closed:
+the internet waits from the moment the computer starts until the service is
+running.
 
 ## Which VPNs can be the additional connection
 
@@ -47,6 +50,13 @@ A program you block can still talk to other programs on the same computer. If
 a local proxy or VPN client runs there and forwards traffic for it, that
 traffic leaves under the proxy's name, not the blocked program's. Block the
 proxy too, or give it a rule of its own.
+
+## Application rules on Linux
+
+On Linux an application rule follows what the program has been seen
+connecting to. A denied program is stopped on those addresses; a connection it
+makes to a new address before it is recognised can still get through. Deny
+rules for sites, addresses and networks do not depend on this.
 
 ## Leak protection on Windows reaches other users
 

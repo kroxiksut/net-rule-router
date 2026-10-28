@@ -45,6 +45,7 @@ impl ConnectionObservationConsumer {
             app_destination_forget: None,
             routed_apps: None,
             script_launches: None,
+            flow_pid: None,
             trace_ring: None,
             killswitch_drop_check: None,
             killswitch_app_scope_check: None,
@@ -361,6 +362,14 @@ impl ConnectionObservationConsumer {
         launches: Arc<crate::script_launches::ScriptLaunches>,
     ) -> Self {
         self.script_launches = Some(launches);
+        self
+    }
+
+    /// Name the process of an open flow reported without a pid, so a script
+    /// is still counted when only the source without pids is running.
+    #[must_use]
+    pub fn with_flow_pid(mut self, flow_pid: super::FlowPidFn) -> Self {
+        self.flow_pid = Some(flow_pid);
         self
     }
 

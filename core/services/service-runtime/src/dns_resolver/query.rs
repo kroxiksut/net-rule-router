@@ -115,6 +115,29 @@ pub fn handle_a_query(
             };
         }
     };
+    // A stranger's name under a public top-level zone brings no private
+    // address into the tunnel: such addresses are answered as they came,
+    // neither enforced nor virtual. One book walk, then one check per address.
+    let usable = if oracle.held_only_by_public_zone(hostname) {
+        let (kept, outside): (Vec<Ipv4Addr>, Vec<Ipv4Addr>) = usable.into_iter().partition(|ip| {
+            nrr_domain::public_zone::admits_zone_learned_address(hostname, IpAddr::V4(*ip))
+        });
+        if kept.is_empty() {
+            tracing::debug!(
+                target: "nrr::dns-resolver",
+                host = %hostname,
+                addresses = ?outside,
+                "a public zone's name answered with private addresses only — answering them as is, outside the tunnel",
+            );
+            return QueryOutcome::Answer {
+                ips: outside,
+                enforced: false,
+            };
+        }
+        kept
+    } else {
+        usable
+    };
 
     // Rule host: install enforcement BEFORE answering. Answer (and
     // record) a small STABLE subset of the fresh addresses, preferring ones

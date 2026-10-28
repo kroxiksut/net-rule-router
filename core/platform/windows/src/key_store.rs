@@ -497,6 +497,53 @@ mod tests {
         assert_eq!(store.load_resign_marker().expect("load after delete"), None);
     }
 
+    /// A blob DPAPI cannot open on one boot (the master key not yet reachable
+    /// early in start-up) is the only copy of the key every revision is
+    /// signed with. One failure leaves it in place for the next boot; only a
+    /// failure that repeats moves it aside, never deleted, for a new key.
+    #[cfg(windows)]
+    #[test]
+    fn an_undecryptable_key_survives_one_boot_and_is_set_aside_on_the_second() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("db-mac-key.bin");
+        let store = WindowsDpapiKeyStore::at(&path);
+        let garbage = vec![0xA5u8; 64];
+        std::fs::write(&path, &garbage).expect("plant");
+
+        assert!(store.load().is_err(), "the first failure is not 'no key'");
+        assert_eq!(std::fs::read(&path).expect("kept"), garbage);
+
+        assert_eq!(store.load().expect("second failure"), None);
+        assert!(!path.exists());
+        let aside: Vec<Vec<u8>> = std::fs::read_dir(dir.path())
+            .expect("list")
+            .flatten()
+            .filter(|e| e.file_name().to_string_lossy().contains("undecryptable"))
+            .map(|e| std::fs::read(e.path()).expect("read aside"))
+            .collect();
+        assert_eq!(aside, vec![garbage], "the old blob is kept, not destroyed");
+    }
+
+    /// A boot that reads the key again forgets the earlier failure: two
+    /// failures apart from each other are not "the same failure twice".
+    #[cfg(windows)]
+    #[test]
+    fn a_readable_key_clears_the_earlier_failure() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("db-mac-key.bin");
+        let store = WindowsDpapiKeyStore::at(&path);
+        std::fs::write(&path, [0xA5u8; 64]).expect("plant");
+        assert!(store.load().is_err());
+
+        let key = vec![7u8; SIGNING_KEY_BYTE_LEN];
+        store.save(&key).expect("save");
+        assert_eq!(store.load().expect("load"), Some(key));
+
+        std::fs::write(&path, [0xA5u8; 64]).expect("plant again");
+        assert!(store.load().is_err(), "a fresh first failure");
+        assert!(path.exists());
+    }
+
     #[cfg(windows)]
     #[test]
     fn a_planted_plaintext_marker_is_not_a_marker() {

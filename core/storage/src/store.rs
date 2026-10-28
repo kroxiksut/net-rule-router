@@ -23,9 +23,10 @@ use nrr_domain::decision_lookup::{
 use nrr_domain::revision::RevisionId;
 
 use crate::dto::{
-    AddressNames, CacheEntryRow, CacheLookupRequest, CacheLookupResult, CacheResetReason,
-    CacheResetSummary, CacheStats, CachedIpEntry, CleanupPolicy, CleanupSummary, ExpiredHostname,
-    IntegrityCheckResult, NegativeCacheEntry, NegativeCacheReason, RecoveryAction, ResolutionEntry,
+    AddressNames, AddressSnapshot, CacheEntryRow, CacheLookupRequest, CacheLookupResult,
+    CacheResetReason, CacheResetSummary, CacheStats, CachedIpEntry, CleanupPolicy, CleanupSummary,
+    ExpiredHostname, IntegrityCheckResult, NegativeCacheEntry, NegativeCacheReason, RecoveryAction,
+    ResolutionEntry,
 };
 use crate::error::{StorageError, StorageResult};
 use crate::repository::{CacheRepository, RevisionMetadataRepository};
@@ -569,6 +570,80 @@ impl CacheRepository for SqliteCacheStore {
             .into_iter()
             .map(|(packed, hosts)| (Ipv4Addr::from(packed as u32), hosts.len() as u32))
             .collect())
+    }
+
+    fn snapshot_for_addresses(&self, addresses: &[IpAddr]) -> StorageResult<AddressSnapshot> {
+        let conn = self.conn.borrow();
+        let now_ms = system_time_to_ms(SystemTime::now());
+        let mut wanted: Vec<IpAddr> = Vec::with_capacity(addresses.len());
+        for ip in addresses {
+            if !wanted.contains(ip) {
+                wanted.push(*ip);
+            }
+        }
+        let mut out = AddressSnapshot::default();
+        let mut seen: std::collections::HashMap<String, i64> = std::collections::HashMap::new();
+        let mut stmt = conn
+            .prepare_cached(ADDRESS_RESOLUTIONS_SQL)
+            .map_err(db_err)?;
+        for &ip in &wanted {
+            let rows = stmt
+                .query_map(
+                    params![AddressFamily::of(ip).as_str(), ip.to_string(), now_ms],
+                    |r| {
+                        Ok((
+                            r.get::<_, String>(0)?,
+                            r.get::<_, i64>(1)?,
+                            r.get::<_, i64>(2)?,
+                        ))
+                    },
+                )
+                .map_err(db_err)?;
+            for row in rows {
+                let (host, resolved_at_ms, seen_ms) = row.map_err(db_err)?;
+                seen.insert(host.clone(), seen_ms);
+                out.resolutions
+                    .push((host, ip, ms_to_system_time(resolved_at_ms.min(now_ms))));
+            }
+        }
+        out.resolutions
+            .sort_by(|a, b| a.0.cmp(&b.0).then_with(|| b.2.cmp(&a.2)));
+        let bucket = crate::suffix_window::RECENCY_BUCKET_MS;
+        out.hostnames = seen.into_iter().collect();
+        out.hostnames.sort_by(|a, b| {
+            (b.1 / bucket)
+                .cmp(&(a.1 / bucket))
+                .then_with(|| a.0.cmp(&b.0))
+        });
+        let mut census = conn
+            .prepare_cached(
+                "SELECT hostname, primary_ruled FROM shared_ip_direct_hosts WHERE ipv4_packed = ?1",
+            )
+            .map_err(db_err)?;
+        for ip in wanted.iter().filter_map(|ip| match ip {
+            IpAddr::V4(v4) => Some(*v4),
+            IpAddr::V6(_) => None,
+        }) {
+            let mut sites = std::collections::HashSet::new();
+            let mut primary = false;
+            for row in census
+                .query_map(params![ipv4_packed(ip)], |r| {
+                    Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?))
+                })
+                .map_err(db_err)?
+            {
+                let (host, primary_ruled) = row.map_err(db_err)?;
+                sites.insert(census_site(&host));
+                primary |= primary_ruled != 0;
+            }
+            if !sites.is_empty() {
+                out.direct_host_counts.push((ip, sites.len() as u32));
+            }
+            if primary {
+                out.primary_ruled.push(ip);
+            }
+        }
+        Ok(out)
     }
 
     fn direct_host_count_for_ip(&self, ip: Ipv4Addr) -> StorageResult<u32> {
@@ -1486,6 +1561,15 @@ fn escape_like_literal(value: &str) -> String {
 /// Names seen at one address: resolutions plus census tenants. Every branch is
 /// reached through a UNIQUE or primary-key index, so the cost follows the names
 /// on this one address, never the size of the cache.
+/// The resolutions on one address with their host's clamped `last_seen_at`:
+/// the join of `snapshot_resolutions` entered by the address index.
+const ADDRESS_RESOLUTIONS_SQL: &str = "SELECT h.canonical_host, r.resolved_at,
+         MIN(h.last_seen_at, ?3)
+     FROM ip_addresses a
+     JOIN hostname_ip_resolutions r ON r.ip_id = a.id
+     JOIN hostnames h ON h.id = r.hostname_id
+     WHERE a.address_family = ?1 AND a.canonical_ip = ?2";
+
 const NAMES_FOR_ADDRESS_SQL: &str = "WITH seen(host, at) AS (
          SELECT h.canonical_host, r.resolved_at
          FROM ip_addresses a
@@ -1527,9 +1611,7 @@ fn ms_to_system_time(ms: i64) -> SystemTime {
 /// when it has none. A page can point any number of names of its own domain at
 /// an address; they are one tenant there, not a majority.
 fn census_site(hostname: &str) -> String {
-    nrr_domain::companion_affinity::registrable_domain(hostname)
-        .unwrap_or(hostname)
-        .to_ascii_lowercase()
+    nrr_domain::shared_ip::census_site(hostname)
 }
 
 fn ipv4_packed(ip: Ipv4Addr) -> i64 {

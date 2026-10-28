@@ -320,11 +320,28 @@ pub(crate) fn rule_dto_to_row(dto: &nrr_shared::rules_json::RuleDto, route: &str
         .next()
         .unwrap_or(("application", String::new()));
     let rule_type = rule_type.to_string();
-    // The request rides the value as the rules file writes it, so a table or a
-    // file built from these rows keeps it.
-    if rule_type == "application" && dto.app_match.as_ref().is_some_and(|a| a.override_requested) {
-        match_value.push(' ');
-        match_value.push_str(nrr_shared::preset_parser::OVERRIDE_FLAG);
+    // The requests ride the value as the rules file writes them, so a table or
+    // a file built from these rows keeps them.
+    if let Some(app) = dto
+        .app_match
+        .as_ref()
+        .filter(|_| rule_type == "application")
+    {
+        for (asked, flag) in [
+            (
+                app.include_child_processes,
+                nrr_shared::preset_parser::CHILDREN_FLAG,
+            ),
+            (
+                app.override_requested,
+                nrr_shared::preset_parser::OVERRIDE_FLAG,
+            ),
+        ] {
+            if asked {
+                match_value.push(' ');
+                match_value.push_str(flag);
+            }
+        }
     }
     // A Block-action rule displays as the "block" route regardless of which
     // bucket it physically lives in — set membership is enforcement-irrelevant
@@ -383,16 +400,13 @@ pub(crate) fn rule_dto_to_row(dto: &nrr_shared::rules_json::RuleDto, route: &str
     }
 }
 
-/// Annotate exact-FQDN domain rows with the OS `hosts`-file override that
-/// pins the same hostname.
+/// Annotate domain rows with the OS `hosts`-file override that pins their
+/// hostname, or for a `*.x` row a name under it, in either family.
 ///
-/// Only rows whose match value is a bare hostname (`rule_type == "domain"`
-/// and NOT a `*.suffix` wildcard) are considered: the resolver applies
-/// `hosts` entries by exact name before any traffic reaches NRR, so this is
-/// a purely informational badge. Each lookup is O(1) against the pre-read
-/// map, so this scales trivially to huge ad-block `hosts` files — only
-/// matching rows are annotated; the full `hosts` list never crosses the
-/// wire. Rows with no match (or of another type) are left untouched.
+/// The resolver applies `hosts` entries before any traffic reaches NRR, so
+/// this is an informational badge. Only matching rows are annotated; the full
+/// `hosts` list never crosses the wire. Rows with no match (or of another
+/// type) are left untouched.
 fn annotate_hosts_overrides(
     resp: &mut RulesListResponse,
     hosts: &std::collections::HashMap<String, nrr_platform_api::hosts_file::HostsPin>,
@@ -400,22 +414,61 @@ fn annotate_hosts_overrides(
     if hosts.is_empty() {
         return;
     }
-    for row in &mut resp.rows {
-        // Exact-FQDN domain rules only. Suffix-domain rules render as
-        // "*.suffix" (skip — a suffix would need an O(map) scan and is out
-        // of MVP scope); zones/IPs/apps are not resolver hostnames.
-        if row.rule_type != "domain" || row.match_value.trim_start().starts_with("*.") {
+    let dto =
+        |pin: &nrr_platform_api::hosts_file::HostsPin| nrr_shared::ipc_payloads::HostsOverrideDto {
+            ip: pin.ip.to_string(),
+            blocking: pin.blocking,
+        };
+    // `*.x` rows by suffix; zones/IPs/apps are not resolver hostnames.
+    let mut suffixes: std::collections::HashMap<String, Vec<usize>> =
+        std::collections::HashMap::new();
+    for (at, row) in resp.rows.iter_mut().enumerate() {
+        if row.rule_type != "domain" {
             continue;
         }
-        let key = nrr_platform_api::hosts_file::normalize_hostname(&row.match_value);
-        if key.is_empty() {
+        let value = row.match_value.trim_start();
+        if let Some(suffix) = value.strip_prefix("*.") {
+            let key = nrr_platform_api::hosts_file::normalize_hostname(suffix);
+            if !key.is_empty() {
+                suffixes.entry(key).or_default().push(at);
+            }
             continue;
         }
-        if let Some(pin) = hosts.get(&key) {
-            row.hosts_override = Some(nrr_shared::ipc_payloads::HostsOverrideDto {
-                ip: pin.ip.to_string(),
-                blocking: pin.blocking,
-            });
+        let key = nrr_platform_api::hosts_file::normalize_hostname(value);
+        if let Some(pin) = hosts.get(&key).filter(|_| !key.is_empty()) {
+            row.hosts_override = Some(dto(pin));
+        }
+    }
+    if suffixes.is_empty() {
+        return;
+    }
+    // One pass over the file, each name walked up its own labels: a scan per
+    // suffix row would cost the whole file once per rule. The first name in
+    // name order speaks for the rule, so the badge does not change between reads.
+    let mut first: std::collections::HashMap<
+        &str,
+        (&str, &nrr_platform_api::hosts_file::HostsPin),
+    > = std::collections::HashMap::new();
+    for (name, pin) in hosts {
+        let mut tail = name.as_str();
+        loop {
+            if let Some((key, _)) = suffixes.get_key_value(tail) {
+                let slot = first.entry(key.as_str()).or_insert((name.as_str(), pin));
+                if name.as_str() < slot.0 {
+                    *slot = (name.as_str(), pin);
+                }
+            }
+            match tail.split_once('.') {
+                Some((_, rest)) if !rest.is_empty() => tail = rest,
+                _ => break,
+            }
+        }
+    }
+    for (suffix, rows) in &suffixes {
+        if let Some((_, pin)) = first.get(suffix.as_str()) {
+            for &at in rows {
+                resp.rows[at].hosts_override = Some(dto(pin));
+            }
         }
     }
 }
@@ -1942,6 +1995,38 @@ mod hosts_override_tests;
 
 #[cfg(test)]
 mod fail_closed_probe_tests;
+
+#[cfg(test)]
+mod rule_row_flag_tests {
+    use super::*;
+    use nrr_shared::rules_json::{AppMatchDto, AppPatternDto, RuleAction, RuleDto};
+
+    /// `+children` written in a file reaches the book; the row a table and a
+    /// rewritten file are built from must carry it back, or the next apply or
+    /// file write drops the flag the user wrote.
+    #[test]
+    fn a_programs_flags_ride_its_row_as_the_file_writes_them() {
+        let dto = RuleDto {
+            id: "r-0001".into(),
+            enabled: true,
+            address_match: None,
+            app_match: Some(AppMatchDto {
+                pattern: AppPatternDto::Exact {
+                    value: "tool.exe".into(),
+                },
+                include_child_processes: true,
+                override_requested: true,
+            }),
+            comment: String::new(),
+            action: RuleAction::Route,
+            origin: None,
+        };
+        assert_eq!(
+            rule_dto_to_row(&dto, "secondary").match_value,
+            "tool.exe +children +override"
+        );
+    }
+}
 
 #[cfg(test)]
 mod route_binding_dto_tests {

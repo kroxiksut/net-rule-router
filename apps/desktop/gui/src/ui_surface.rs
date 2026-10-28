@@ -480,26 +480,15 @@ pub fn write_qt_context_file_at(
     let mut platform_profile =
         serde_json::to_value(nrr_shared::platform_profile::PlatformProfile::current())
             .unwrap_or(serde_json::Value::Null);
-    // Runtime enrichment: does the hosts file contain any real mapping
-    // entry? On a stock machine it is comments-only and the GUI hides
-    // the hosts affordances entirely. The pure classifier lives in
-    // nrr-shared; the I/O stays here (the profile struct itself is pure).
-    // Unreadable (locked/denied) or oversized (multi-MB ad-block list — which
-    // by definition HAS entries) both default to `true`: when in doubt, show
-    // the affordance rather than hide a live setting.
+    // A stock hosts file is comments only, and the GUI then hides the hosts
+    // affordances. The window asks again when Routing settings opens.
     if let serde_json::Value::Object(profile) = &mut platform_profile {
         let hosts_path = profile
             .get("hostsFilePath")
             .and_then(|v| v.as_str())
             .unwrap_or_default()
             .to_string();
-        let has_entries = match std::fs::metadata(&hosts_path) {
-            Ok(meta) if meta.len() > 4 * 1024 * 1024 => true,
-            Ok(_) => std::fs::read_to_string(&hosts_path)
-                .map(|content| nrr_shared::platform_profile::hosts_content_has_entries(&content))
-                .unwrap_or(true),
-            Err(_) => true,
-        };
+        let has_entries = hosts_file_has_entries(Path::new(&hosts_path));
         profile.insert(
             "hostsFileHasEntries".to_string(),
             serde_json::Value::Bool(has_entries),
@@ -911,6 +900,9 @@ pub fn apply_qt_preferences_payload(
         .map_err(|error| format!("Failed to parse Qt preferences payload: {error}"))?;
     Ok(payload.apply_over(current))
 }
+
+/// One reader for the window and the terminal UI.
+pub use nrr_platform_api::hosts_file::hosts_file_has_entries;
 
 /// `file://` URL for a local path, percent-encoded: a reader parses it with a
 /// URL parser, which would cut `C:\Users\C#dev` at `#` and decode `%XX`.

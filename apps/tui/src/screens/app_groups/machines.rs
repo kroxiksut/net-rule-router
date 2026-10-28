@@ -23,7 +23,7 @@ use crate::view::{Segment, ViewLine};
 /// One adapter of one machine, as the hypervisor names them.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PinKey {
-    machine_id: String,
+    pub(super) machine_id: String,
     slot: u32,
 }
 
@@ -319,6 +319,11 @@ pub(super) fn pinned(app: &mut AppState, key: PinKey, result: Result<(), VmContr
 /// A key while the machines are open; `true` when used.
 pub(super) fn on_key(app: &mut AppState, key: KeyEvent) -> bool {
     let selected = app.app_groups.pin_selected;
+    if matches!(key.code, KeyCode::Char('a' | 'f' | 'p' | 's'))
+        && crate::screens::focus_list_first(app)
+    {
+        return true;
+    }
     match key.code {
         KeyCode::Esc | KeyCode::Char('m') => close(app),
         KeyCode::Up => move_pin(app, selected.saturating_sub(1)),
@@ -342,11 +347,30 @@ pub(super) fn on_line(app: &mut AppState, command: &str, number: &str) -> bool {
         ("m", None) if number.trim().is_empty() => close(app),
         ("p", None) if number.trim().is_empty() => route_open(app, "primary"),
         ("s", None) if number.trim().is_empty() => route_open(app, "secondary"),
-        ("a", Some(n)) => pin(app, n - 1, true),
-        ("f", Some(n)) => pin(app, n - 1, false),
+        ("a" | "f", Some(n)) => {
+            let now = pin_keys(app);
+            match super::super::numbered_now(&app.app_groups.printed_pins, &now, n) {
+                super::super::Numbered::At(at) => pin(app, at, command == "a"),
+                super::super::Numbered::Gone => app.app_groups.note = Some(Note::Gone(n)),
+                super::super::Numbered::NoSuch => app.app_groups.note = Some(Note::NoTarget(n)),
+            }
+        }
         _ => return false,
     }
     true
+}
+
+/// The adapters a pin can be given, as listed, by machine and slot: what a
+/// typed number is checked against after a re-scan.
+pub(super) fn pin_keys(app: &AppState) -> Vec<String> {
+    let Some(inventory) = open_inventory(app) else {
+        return Vec::new();
+    };
+    targets(inventory)
+        .into_iter()
+        .filter_map(|(m, a)| key_of(inventory, m, a))
+        .map(|key| format!("{}\u{1f}{}", key.machine_id, key.slot))
+        .collect()
 }
 
 // ── Text ─────────────────────────────────────────────────────────────────────

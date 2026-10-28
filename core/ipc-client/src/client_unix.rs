@@ -300,6 +300,7 @@ struct ClientInner {
     /// Counter behind the replayed subscription's `request-id`, so a replay
     /// never collides with an in-flight caller request.
     replay_seq: AtomicU64,
+    delivered_trace: crate::FrameTraceBudget,
 }
 
 impl ClientInner {
@@ -322,6 +323,7 @@ impl ClientInner {
             negotiate_info: RwLock::new(None),
             last_subscribe: Mutex::new(None),
             replay_seq: AtomicU64::new(0),
+            delivered_trace: crate::FrameTraceBudget::default(),
         }
     }
 

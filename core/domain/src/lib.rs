@@ -53,6 +53,7 @@ pub mod preset_ux;
 pub mod preset_validation;
 pub mod protected_places;
 pub mod ptr_names;
+pub mod public_zone;
 pub mod review;
 pub mod revision;
 pub mod risk;

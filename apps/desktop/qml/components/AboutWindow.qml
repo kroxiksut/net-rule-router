@@ -95,7 +95,7 @@ Window {
             Layout.fillWidth: true
             ThemedButton {
                 theme: root.uiTheme
-                text: root.tr("action.open-license-window", "License")
+                text: root.tr("action.open-license-window", "Licenses")
                 Accessible.name: text
                 onClicked: root.openChildWindow(root.licenseWindow)
             }

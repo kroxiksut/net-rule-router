@@ -77,6 +77,16 @@ impl FlowOwnerLookup for WindowsFlowOwnerLookup {
     }
 }
 
+/// The pid holding the open IPv4 TCP flow `(local, remote)`, from one read of
+/// the connection table. `None` once the flow closed, and for IPv6.
+#[must_use]
+pub fn tcp_flow_pid(local: SocketAddr, remote: SocketAddr) -> Option<u32> {
+    let (SocketAddr::V4(local), SocketAddr::V4(remote)) = (local, remote) else {
+        return None;
+    };
+    owning_pid_v4((*local.ip(), local.port()), (*remote.ip(), remote.port()))
+}
+
 /// The PID of the UDP socket bound to `local`. A socket bound to the wildcard
 /// address on that port answers when no exact binding does: an unconnected
 /// client socket is listed that way.

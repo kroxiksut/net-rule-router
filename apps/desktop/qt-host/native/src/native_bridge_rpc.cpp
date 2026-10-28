@@ -368,7 +368,9 @@ QString NrrNativeBridge::rpcProductImpactDisable(const QString &reason,
 
 QString NrrNativeBridge::rpcSettingsExportFull(
         const QString &rulesFilePathPrimary,
-        const QString &rulesFilePathSecondary) {
+        const QString &rulesFilePathSecondary,
+        const QJsonObject &passthroughPrimary,
+        const QJsonObject &passthroughSecondary) {
     QJsonObject obj;
     if (!rulesFilePathPrimary.isEmpty()) {
         obj.insert(QStringLiteral("rules-file-path-primary"),
@@ -377,6 +379,14 @@ QString NrrNativeBridge::rpcSettingsExportFull(
     if (!rulesFilePathSecondary.isEmpty()) {
         obj.insert(QStringLiteral("rules-file-path-secondary"),
                    rulesFilePathSecondary);
+    }
+    if (!passthroughPrimary.isEmpty()) {
+        obj.insert(QStringLiteral("passthrough-sections-primary"),
+                   passthroughPrimary);
+    }
+    if (!passthroughSecondary.isEmpty()) {
+        obj.insert(QStringLiteral("passthrough-sections-secondary"),
+                   passthroughSecondary);
     }
     return emitRpcRequest(QStringLiteral("settings.export.full"), obj);
 }

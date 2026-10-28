@@ -97,6 +97,14 @@ pub fn glob_match(pattern: &str, name: &str) -> bool {
     nrr_shared::glob::glob_match(pattern, name)
 }
 
+/// Whether a rule's name or glob names the program file `file_name`, on the
+/// same `.exe`-folded key the connection observer compares, so a glob such as
+/// `*torrent` finds on disk exactly what it counts on the wire.
+pub fn app_name_matches(query: &str, file_name: &str) -> bool {
+    use nrr_shared::app_identity::app_match_key;
+    glob_match(&app_match_key(query), &app_match_key(file_name))
+}
+
 /// Collect the files under `root` that `is_executable` accepts, bounded by
 /// depth and by a shared file budget.
 ///

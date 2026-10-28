@@ -78,6 +78,38 @@ fn the_status_screen_says_what_the_window_still_holds() {
     assert!(!shown(&app).contains("The window holds"), "{}", shown(&app));
 }
 
+/// The service is stopped, so no link change comes; the window parks a change
+/// while the terminal is open, and the Status screen says so on the tick.
+#[test]
+fn work_parked_after_the_terminal_started_is_shown_without_a_reconnect() {
+    let dir = Scratch::new("window-parked-follow");
+    let file = dir
+        .path()
+        .join(nrr_shared::user_settings::USER_SETTINGS_FILE_NAME);
+    let mut app = AppState::new(ScreenId::Status, false);
+    app.rules.settings_file = Some(file.clone());
+    crate::screens::rules::follow_settings_file(&mut app);
+    assert_eq!(app.window_parked, None);
+
+    UserSettingsStore::at(file)
+        .update(|s| {
+            s.window_parked = blob(json!({
+                "stability": { "verbose-logging": true },
+                "parked-at-ms": chrono::Utc::now().timestamp_millis()
+            }));
+        })
+        .expect("the window parks");
+    assert!(crate::screens::rules::follow_settings_file(&mut app));
+    assert_eq!(
+        app.window_parked,
+        Some(WindowParked {
+            routing: 0,
+            service: 1,
+            roles: false
+        })
+    );
+}
+
 #[test]
 fn every_key_is_in_both_locale_files() {
     let missing = missing_from_locales(&[WAITING, ROUTING, SERVICE, ROLES]);

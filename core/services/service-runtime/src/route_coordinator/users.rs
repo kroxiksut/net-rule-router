@@ -152,6 +152,7 @@ impl SecondaryRouteCoordinator {
                 app_rule_dest_claimed_by_main_link = tally.app_rule_dest_claimed_by_main_link,
                 app_rule_dest_used_by_other_process = tally.app_rule_dest_used_by_other_process,
                 address_claimed_by_main_link = tally.address_claimed_by_main_link,
+                private_kept_out_of_tunnel = tally.private_kept_out_of_tunnel,
                 primary_exceptions_unavailable = tally.primary_exceptions_unavailable,
                 network_yields_to_local_network = tally.network_yields_to_local_network,
                 network_routed_around_tunnel_server = tally.network_routed_around_tunnel_server,

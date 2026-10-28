@@ -35,7 +35,8 @@ use std::path::PathBuf;
 // `nrr_platform_windows::app_path_resolver::*` paths keep resolving unchanged. Only
 // the Windows MECHANISM (`WindowsAppPathResolver` + its `ResolveCache`) stays here.
 pub use nrr_platform_api::app_path_resolver::{
-    dedup_paths, glob_match, AppPathResolver, MockAppPathResolver, NoopAppPathResolver,
+    app_name_matches, dedup_paths, glob_match, AppPathResolver, MockAppPathResolver,
+    NoopAppPathResolver,
 };
 
 // ── Resolve cache (neutral logic; only wired by the Windows impl) ─────────────
@@ -166,7 +167,7 @@ fn matching_images(query: &str, images: &[PathBuf]) -> Vec<PathBuf> {
         .iter()
         .filter(|path| {
             path.file_name()
-                .is_some_and(|name| glob_match(query, &name.to_string_lossy()))
+                .is_some_and(|name| app_name_matches(query, &name.to_string_lossy()))
         })
         .cloned()
         .collect()

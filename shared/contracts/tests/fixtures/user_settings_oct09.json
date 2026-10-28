@@ -1,0 +1,21 @@
+{
+  "format": 1,
+  "rules-folder": "D:/My Rule Sets",
+  "rules-files": {
+    "primary": "D:/My Rule Sets/work/rules_primary.txt",
+    "secondary": "D:/My Rule Sets/work/rules_secondary.txt"
+  },
+  "selected-set": "user:work",
+  "service-intent": {
+    "route-policy": {
+      "kill-switch-enabled": true,
+      "kill-switch-fail-closed": true,
+      "mode": "prefer-secondary-when-available",
+      "include-subdomains": true
+    },
+    "notice-mutes": [
+      { "scope-kind": "host", "scope-value": "blocked.example", "until-ms": null }
+    ],
+    "stability": { "fake-ip-enabled": true, "verbose-logging": false }
+  }
+}

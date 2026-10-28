@@ -227,7 +227,7 @@ pub fn tail_log(
         "The {PRODUCT_NAME} service is {why} - reading the log files directly; \
          lines of all users may be shown."
     ));
-    report(disk(), exe, printed)
+    report(disk(), link, exe, printed)
 }
 
 /// Why the service's answer could not be printed.
@@ -310,8 +310,9 @@ fn from_service(client: &dyn IpcClient, tail: usize, exe: &str, printed: &mut Pr
     }
 }
 
-/// Print a file-read outcome and map it onto an exit code.
-pub fn report(outcome: Outcome, exe: &str, printed: &mut Printed) -> u8 {
+/// Print a file-read outcome and map it onto an exit code. `link` is why the
+/// files were read instead of asking the service.
+pub fn report(outcome: Outcome, link: &Link, exe: &str, printed: &mut Printed) -> u8 {
     match outcome {
         Outcome::Lines(lines) => {
             for line in lines {
@@ -331,8 +332,9 @@ pub fn report(outcome: Outcome, exe: &str, printed: &mut Printed) -> u8 {
             printed.out("The service writes one once it has started at least once.");
             exit::SUCCESS
         }
-        // Reached only with the service down, so the way through is to bring
-        // it back: it answers without administrator rights.
+        // The way through is a service that answers: it does so without
+        // administrator rights. One that runs without answering needs a
+        // restart, not a start.
         Outcome::Forbidden { directory, detail } => {
             printed.err(format!(
                 "Could not read the log directory {}.",
@@ -340,10 +342,18 @@ pub fn report(outcome: Outcome, exe: &str, printed: &mut Printed) -> u8 {
             ));
             printed.err(format!("  {detail}"));
             printed.err("Only administrators and the service account may read the files.");
-            printed.err(
-                "Start the service and run this again; it answers without administrator rights:",
-            );
-            printed.err(format!("  {exe} start"));
+            let (advice, verb) = match link {
+                Link::NotAnswering => (
+                    "If the service runs without answering, restart it and run this again:",
+                    "restart",
+                ),
+                _ => (
+                    "Start the service and run this again; it answers without administrator rights:",
+                    "start",
+                ),
+            };
+            printed.err(advice);
+            printed.err(format!("  {exe} {verb}"));
             printed.err("Or run this from an administrator console.");
             exit::NEEDS_PRIVILEGE
         }
@@ -585,12 +595,31 @@ mod tests {
                 directory: PathBuf::from("logs"),
                 detail: "access denied".into(),
             },
+            &Link::NotRunning,
             "nrr-cli",
             &mut printed,
         );
         assert_eq!(code, exit::NEEDS_PRIVILEGE);
         assert!(!printed.err.contains("--elevate"), "{}", printed.err);
         assert!(printed.err.contains("nrr-cli start"), "{}", printed.err);
+    }
+
+    /// A service that runs but does not answer is already started: "start it"
+    /// sends the user round in a circle.
+    #[test]
+    fn a_hung_service_is_restarted_not_started() {
+        let mut printed = Printed::default();
+        report(
+            Outcome::Forbidden {
+                directory: PathBuf::from("logs"),
+                detail: "access denied".into(),
+            },
+            &Link::NotAnswering,
+            "nrr-cli",
+            &mut printed,
+        );
+        assert!(printed.err.contains("nrr-cli restart"), "{}", printed.err);
+        assert!(!printed.err.contains("nrr-cli start"), "{}", printed.err);
     }
 
     #[test]

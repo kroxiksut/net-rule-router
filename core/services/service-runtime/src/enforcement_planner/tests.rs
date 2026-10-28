@@ -2163,6 +2163,135 @@ fn a_lan_address_behind_a_name_is_not_planned_into_the_tunnel() {
     assert!(!tunnelled.contains(&v4(192, 168, 1, 5)), "{tunnelled:?}");
 }
 
+/// What the plan sends into the tunnel for `rb`: host routes, and the
+/// addresses of the additional route's permits — the ones pinned on Linux.
+fn tunnelled_by_plan(rb: &CanonicalRuleBook, cache: &MapCache) -> (Vec<IpAddr>, Vec<IpAddr>) {
+    let routes = plan_routes_with(
+        RouteBehaviorMode::PreferPrimary,
+        rb,
+        false,
+        cache,
+        &MapObs::default(),
+        &std::collections::HashSet::new(),
+        FamilyScope::Both,
+        crate::address_ownership::ZoneVsIpOrder::default(),
+        &[],
+        &crate::route_codegen::network_routes::NetworkRouteFacts::default(),
+        crate::wfp_codegen::current_rule_shape_support(),
+    );
+    let host = |dst: &DstMatch| match dst {
+        DstMatch::HostV4(ip) => Some(IpAddr::V4(*ip)),
+        DstMatch::HostV6(ip) => Some(IpAddr::V6(*ip)),
+        _ => None,
+    };
+    let routed = routes
+        .iter()
+        .filter(|r| r.egress == EgressRef::Secondary)
+        .filter_map(|r| host(&r.dst))
+        .collect();
+    let (resolver, obs) = (MapResolver::default(), MapObs::default());
+    let mut input = planner_input(cache, &resolver, &obs);
+    input.ipv6 = Ipv6Guard::FiltersAndRoutes;
+    let permitted = plan_route_rules(rb, "S-1-5-21-A", &input)
+        .0
+        .iter()
+        .filter(|f| {
+            f.verdict == Verdict::Permit
+                && f.precedence.class == PrecedenceClass::RouteRule(RouteRole::Secondary)
+        })
+        .filter_map(|f| host(&f.flow.dst))
+        .collect();
+    (routed, permitted)
+}
+
+fn zone_book(zone: &str) -> CanonicalRuleBook {
+    book(
+        Vec::new(),
+        vec![rule(
+            "R-zone",
+            CanonicalAddressMatch::Zone(zone.into()),
+            RuleAction::Route,
+        )],
+    )
+}
+
+/// Anybody registers a name under `.ru`; one that answers with a private
+/// address would point the tunnel at the user's network or the tunnel's own.
+#[test]
+fn a_public_zone_name_answering_a_private_address_is_not_routed_or_pinned_into_the_tunnel() {
+    let mut cache = MapCache::default();
+    cache.hosts.insert(
+        "a1.attacker.ru".into(),
+        vec![
+            v4(10, 1, 2, 3),
+            v4(203, 0, 113, 7),
+            "fd00::5".parse().expect("v6"),
+        ],
+    );
+    cache
+        .suffixes
+        .insert("ru".into(), vec!["a1.attacker.ru".into()]);
+    let (routed, permitted) = tunnelled_by_plan(&zone_book("ru"), &cache);
+    for tunnelled in [&routed, &permitted] {
+        assert!(!tunnelled.contains(&v4(10, 1, 2, 3)), "{tunnelled:?}");
+        assert!(
+            !tunnelled.contains(&"fd00::5".parse::<IpAddr>().expect("v6")),
+            "{tunnelled:?}"
+        );
+        assert!(tunnelled.contains(&v4(203, 0, 113, 7)), "{tunnelled:?}");
+    }
+}
+
+/// A zone nobody outside registers under is the company's own: its 10.x hosts
+/// keep going through the corporate tunnel.
+#[test]
+fn an_internal_zone_name_answering_a_private_address_still_rides_the_tunnel() {
+    let mut cache = MapCache::default();
+    cache
+        .hosts
+        .insert("git.corp.intra".into(), vec![v4(10, 1, 2, 3)]);
+    cache
+        .suffixes
+        .insert("intra".into(), vec!["git.corp.intra".into()]);
+    let (routed, permitted) = tunnelled_by_plan(&zone_book("intra"), &cache);
+    assert!(routed.contains(&v4(10, 1, 2, 3)), "{routed:?}");
+    assert!(permitted.contains(&v4(10, 1, 2, 3)), "{permitted:?}");
+}
+
+/// The user named the host: a narrower rule is the user's word, whatever
+/// zone also covers it, and a stranger's name on the same address does not
+/// take it back out of the tunnel.
+#[test]
+fn a_named_host_under_a_public_zone_keeps_its_private_address_in_the_tunnel() {
+    let mut cache = MapCache::default();
+    cache
+        .hosts
+        .insert("git.example.ru".into(), vec![v4(10, 1, 2, 3)]);
+    cache
+        .hosts
+        .insert("a1.attacker.ru".into(), vec![v4(10, 1, 2, 3)]);
+    cache.suffixes.insert(
+        "ru".into(),
+        vec!["a1.attacker.ru".into(), "git.example.ru".into()],
+    );
+    let mut rb = zone_book("ru");
+    rb.secondary = CanonicalRuleSet::from_rules(vec![
+        rule(
+            "R-zone",
+            CanonicalAddressMatch::Zone("ru".into()),
+            RuleAction::Route,
+        ),
+        rule(
+            "R-host",
+            CanonicalAddressMatch::ExactFqdn("git.example.ru".into()),
+            RuleAction::Route,
+        ),
+    ]);
+    let (routed, permitted) = tunnelled_by_plan(&rb, &cache);
+    assert!(routed.contains(&v4(10, 1, 2, 3)), "{routed:?}");
+    assert!(permitted.contains(&v4(10, 1, 2, 3)), "{permitted:?}");
+}
+
 /// A zone or name rule covering a corporate host must not pin its address, which
 /// a foreign tunnel's narrower route carries, into our tunnel.
 #[test]

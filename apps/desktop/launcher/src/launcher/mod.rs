@@ -524,6 +524,13 @@ fn run_primary(
             // Each request runs on its own short-lived worker: the IPC call
             // blocks, and preferences and shutdown must not wait on it.
             child_process::HostMessage::Rpc(request) => {
+                // In line with the preference snapshots, which it must see.
+                if let Some(answer) = prefs_writer.answer_in_loop(request) {
+                    if let Some(stdin) = child_stdin.as_ref() {
+                        crate::rpc_dispatcher::write_response(stdin, &answer);
+                    }
+                    continue;
+                }
                 if let Some(stdin) = child_stdin.as_ref() {
                     let lane = crate::rpc_dispatcher::request_lane(request);
                     let (client, connect_budget) =

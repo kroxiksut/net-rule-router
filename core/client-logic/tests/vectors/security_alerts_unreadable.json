@@ -1,0 +1,17 @@
+{
+  "cases": [
+    { "name": "no answer is not an unreadable store", "input": { "status": null }, "expected": false },
+    { "name": "a stale status says nothing", "input": { "status": { "stale": true } }, "expected": false },
+    {
+      "name": "a stale status with an unreadable flag still says nothing",
+      "input": { "status": { "stale": true, "security_status": { "alerts_readable": false } } },
+      "expected": false
+    },
+    { "name": "a readable store", "input": { "status": { "security_status": { "alerts_readable": true } } }, "expected": false },
+    { "name": "the service says unreadable", "input": { "status": { "security_status": { "alerts_readable": false } } }, "expected": true },
+    { "name": "an answer without the security part", "input": { "status": { "stale": false } }, "expected": true },
+    { "name": "readable only when it says so", "input": { "status": { "security_status": {} } }, "expected": true },
+    { "name": "a truthy string is not true", "input": { "status": { "security_status": { "alerts_readable": "yes" } } }, "expected": true },
+    { "name": "a null security part", "input": { "status": { "security_status": null } }, "expected": true }
+  ]
+}

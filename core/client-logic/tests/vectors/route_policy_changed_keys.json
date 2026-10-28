@@ -3,6 +3,7 @@
   "cases": [
     {
       "name": "nothing changed",
+      "expected": [],
       "input": {
         "base": {
           "mode": "prefer-primary",
@@ -16,6 +17,7 @@
     },
     {
       "name": "one flag flipped",
+      "expected": ["leak-protection"],
       "input": {
         "base": {
           "leak-protection": "off",
@@ -29,6 +31,7 @@
     },
     {
       "name": "a slot unbound",
+      "expected": ["primary"],
       "input": {
         "base": {
           "primary": {
@@ -43,6 +46,7 @@
     },
     {
       "name": "a slot bound",
+      "expected": ["secondary"],
       "input": {
         "base": {
           "mode": "prefer-primary"
@@ -58,6 +62,7 @@
     },
     {
       "name": "provenance is not a change",
+      "expected": [],
       "input": {
         "base": {
           "binding-source": "recovery",
@@ -71,6 +76,7 @@
     },
     {
       "name": "sorted names",
+      "expected": ["auto-rules-mode", "zone-priority-over-ip"],
       "input": {
         "base": {
           "zone-priority-over-ip": false,
@@ -84,6 +90,7 @@
     },
     {
       "name": "an earlier apply-only is not itself a change",
+      "expected": [],
       "input": {
         "base": {
           "mode": "x"
@@ -98,6 +105,7 @@
     },
     {
       "name": "empty base, full request",
+      "expected": ["leak-protection", "mode"],
       "input": {
         "base": {},
         "request": {
@@ -108,6 +116,7 @@
     },
     {
       "name": "a number field changed",
+      "expected": ["kill-switch-protocols"],
       "input": {
         "base": {
           "kill-switch-protocols": 127,
@@ -121,6 +130,7 @@
     },
     {
       "name": "a binding renamed only",
+      "expected": ["primary"],
       "input": {
         "base": {
           "primary": {

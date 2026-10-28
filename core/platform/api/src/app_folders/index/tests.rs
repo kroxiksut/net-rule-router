@@ -18,6 +18,8 @@ struct FakeFolders {
     callbacks: Mutex<Vec<NetworkChangeCallback>>,
     /// Profiles: `(owner, folder prefix)` pairs that belong to that owner.
     profiles: Vec<(&'static str, &'static str)>,
+    /// Which folder object sits at the rule's path; a swap changes it.
+    identity: Mutex<u128>,
 }
 
 impl FakeFolders {
@@ -92,6 +94,10 @@ impl ProgramFolders for FakeFolders {
     ) -> Result<NetworkChangeSubscription, PlatformError> {
         self.callbacks.lock().expect("lock").push(on_change);
         Ok(NetworkChangeSubscription::inert())
+    }
+
+    fn identity(&self, _folder: &Path) -> Option<u128> {
+        Some(*self.identity.lock().expect("lock"))
     }
 }
 
@@ -168,6 +174,37 @@ fn a_burst_of_changes_is_listed_once_and_reported_once() {
     // The pass that follows reads the new set without listing again.
     assert_eq!(index.programs(&rule("/opt/app/*"), OWNER).programs.len(), 3);
     assert_eq!(fake.lists.load(Ordering::SeqCst), 2);
+}
+
+/// An updater renames the folder away and puts a new one in its place. The
+/// watch follows the old folder and stays silent; the new folder's programs
+/// must still be covered without waiting out the long watched refresh.
+#[test]
+fn a_folder_swapped_in_by_rename_is_listed_again_and_watched_anew() {
+    let fake = Arc::new(FakeFolders::holding(2));
+    let index = ProgramFolderIndex::with_timing(
+        Arc::clone(&fake) as Arc<dyn ProgramFolders>,
+        IndexTiming {
+            unwatched_ttl: Duration::ZERO,
+            ..quick()
+        },
+    );
+    assert_eq!(index.programs(&rule("/opt/app/*"), OWNER).programs.len(), 2);
+    assert_eq!(index.programs(&rule("/opt/app/*"), OWNER).programs.len(), 2);
+    assert_eq!(
+        fake.lists.load(Ordering::SeqCst),
+        1,
+        "unchanged: no relisting"
+    );
+
+    fake.set_programs(3);
+    *fake.identity.lock().expect("lock") = 7;
+    assert_eq!(index.programs(&rule("/opt/app/*"), OWNER).programs.len(), 3);
+    assert_eq!(
+        fake.callbacks.lock().expect("lock").len(),
+        2,
+        "the folder now at the path is watched"
+    );
 }
 
 /// A log written beside the programs reaches the watch, but the set did not

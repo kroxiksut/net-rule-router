@@ -238,6 +238,25 @@ impl RuleHostOracle for ActiveRuleHostOracle {
             false
         })
     }
+
+    fn held_only_by_public_zone(&self, hostname: &str) -> bool {
+        self.any_routing(|routing| {
+            let mut held = false;
+            for sid in routing {
+                let Some(set) = self.secondary_of(sid) else {
+                    continue;
+                };
+                if !rule_set_matches(hostname, &set) {
+                    continue;
+                }
+                if !crate::dns_observation_consumer::held_only_by_public_zone(hostname, &set) {
+                    return false;
+                }
+                held = true;
+            }
+            held
+        })
+    }
 }
 
 /// The leak guard as each served user's own: a rule host is withheld while the
@@ -1468,6 +1487,9 @@ pub struct HostsBypassDnsResolver {
     /// Optional DNS-over-secondary policy, handed to each direct query so the
     /// seeder and refresh take the same egress path as the Mode-B resolver.
     egress: Option<Arc<dyn crate::dns_egress::DnsEgressPolicy>>,
+    /// The hosts file, whose real (not black-hole) address for a rule host is
+    /// where programs connect, past the public answer.
+    hosts: Option<Arc<dyn nrr_platform_api::hosts_file::HostsFileReader>>,
 }
 
 impl HostsBypassDnsResolver {
@@ -1483,7 +1505,28 @@ impl HostsBypassDnsResolver {
             upstream,
             timeout,
             egress: None,
+            hosts: None,
         }
+    }
+
+    /// Keep the hosts file's real address for a rule host beside the public
+    /// one. Chain after [`Self::new`].
+    pub fn with_hosts(
+        mut self,
+        hosts: Arc<dyn nrr_platform_api::hosts_file::HostsFileReader>,
+    ) -> Self {
+        self.hosts = Some(hosts);
+        self
+    }
+
+    /// The hosts file's address for `hostname` in `family`, when it is one a
+    /// connection can reach (a black-hole pin is not).
+    fn hosts_address(&self, hostname: &str, family: AddressFamily) -> Option<IpAddr> {
+        self.hosts
+            .as_ref()?
+            .lookup(hostname)?
+            .address_of(matches!(family, AddressFamily::Ipv6))
+            .filter(|ip| !is_non_routable(ip))
     }
 
     /// Attach the DNS-over-secondary policy so the direct (hosts-bypassing)
@@ -1517,18 +1560,32 @@ impl DnsResolverPort for HostsBypassDnsResolver {
         if let Some(policy) = &self.egress {
             direct = direct.with_egress(Arc::clone(policy));
         }
+        let pinned = self.hosts_address(&canonical, family);
         match direct.resolve(&canonical, family) {
             Ok(ResolvedAddresses {
-                addresses,
+                mut addresses,
                 ttl_seconds,
-            }) => Ok(ResolvedRecord {
-                canonical_hostname: canonical,
-                addresses,
-                ttl_seconds: Some(ttl_seconds),
-            }),
-            Err(ResolveError::NoRecords) => Err(DnsResolverError::NxDomain {
-                hostname: canonical,
-            }),
+            }) => {
+                if let Some(ip) = pinned.filter(|ip| !addresses.contains(ip)) {
+                    addresses.push(ip);
+                }
+                Ok(ResolvedRecord {
+                    canonical_hostname: canonical,
+                    addresses,
+                    ttl_seconds: Some(ttl_seconds),
+                })
+            }
+            // A name only the hosts file knows is still where programs go.
+            Err(ResolveError::NoRecords) => match pinned {
+                Some(ip) => Ok(ResolvedRecord {
+                    canonical_hostname: canonical,
+                    addresses: vec![ip],
+                    ttl_seconds: None,
+                }),
+                None => Err(DnsResolverError::NxDomain {
+                    hostname: canonical,
+                }),
+            },
             // Transient direct failure → system fallback. A hosts-poisoned
             // loopback answer is filtered downstream; an unreachable upstream
             // must not zero out general rule seeding.
@@ -2176,6 +2233,10 @@ use crate::fcrdns_learner::{ConfirmedHostSink, ReverseDnsResolver};
 pub struct FcrdnsUpstreamResolver {
     upstream: Arc<dyn Fn() -> Option<std::net::SocketAddr> + Send + Sync>,
     timeout: Duration,
+    tunnel: Option<(
+        Arc<dyn crate::dns_egress::DnsEgressPolicy>,
+        Arc<std::sync::atomic::AtomicBool>,
+    )>,
 }
 
 impl FcrdnsUpstreamResolver {
@@ -2183,27 +2244,79 @@ impl FcrdnsUpstreamResolver {
         upstream: Arc<dyn Fn() -> Option<std::net::SocketAddr> + Send + Sync>,
         timeout: Duration,
     ) -> Self {
-        Self { upstream, timeout }
+        Self {
+            upstream,
+            timeout,
+            tunnel: None,
+        }
+    }
+
+    /// Follow "DNS through the tunnel" (`setting`): while it is on, lookups go
+    /// where `policy` sends them, and nowhere while the tunnel is down.
+    #[must_use]
+    pub fn with_tunnel_policy(
+        mut self,
+        policy: Arc<dyn crate::dns_egress::DnsEgressPolicy>,
+        setting: Arc<std::sync::atomic::AtomicBool>,
+    ) -> Self {
+        self.tunnel = Some((policy, setting));
+        self
+    }
+}
+
+impl FcrdnsUpstreamResolver {
+    /// The resolver one lookup goes through: the tunnel's while "DNS through
+    /// the tunnel" is on (`None` while the tunnel is down: nobody is asked),
+    /// the captured upstream otherwise.
+    fn lookup_resolver(&self) -> Option<DirectUdpUpstreamResolver> {
+        if let Some((policy, setting)) = self.tunnel.as_ref() {
+            if setting.load(std::sync::atomic::Ordering::Relaxed) {
+                let egress = policy.decide(0)?;
+                let pinned = PinnedEgress {
+                    egress,
+                    policy: Arc::clone(policy),
+                };
+                return Some(
+                    DirectUdpUpstreamResolver::new(egress.server, self.timeout, 2)
+                        .with_egress(Arc::new(pinned)),
+                );
+            }
+        }
+        let server = (self.upstream)()?;
+        Some(DirectUdpUpstreamResolver::new(server, self.timeout, 2))
+    }
+}
+
+/// One decision held for every attempt of a lookup, so a retry never falls
+/// back to the captured upstream; outcomes still reach the live policy.
+struct PinnedEgress {
+    egress: crate::dns_egress::DnsEgress,
+    policy: Arc<dyn crate::dns_egress::DnsEgressPolicy>,
+}
+
+impl crate::dns_egress::DnsEgressPolicy for PinnedEgress {
+    fn decide(&self, _attempt: u32) -> Option<crate::dns_egress::DnsEgress> {
+        Some(self.egress)
+    }
+
+    fn note_outcome(&self, via_secondary: bool, ok: bool) {
+        self.policy.note_outcome(via_secondary, ok);
     }
 }
 
 impl ReverseDnsResolver for FcrdnsUpstreamResolver {
     fn resolve_ptr(&self, ip: Ipv4Addr) -> Vec<String> {
-        let Some(server) = (self.upstream)() else {
+        let Some(resolver) = self.lookup_resolver() else {
             return Vec::new();
         };
-        DirectUdpUpstreamResolver::new(server, self.timeout, 2)
-            .resolve_ptr(ip)
-            .unwrap_or_default()
+        resolver.resolve_ptr(ip).unwrap_or_default()
     }
 
     fn resolve_a(&self, hostname: &str) -> Vec<Ipv4Addr> {
-        let Some(server) = (self.upstream)() else {
+        let Some(resolver) = self.lookup_resolver() else {
             return Vec::new();
         };
-        match DirectUdpUpstreamResolver::new(server, self.timeout, 2)
-            .resolve(hostname, AddressFamily::Ipv4)
-        {
+        match resolver.resolve(hostname, AddressFamily::Ipv4) {
             Ok(ResolvedAddresses { addresses, .. }) => crate::dns_wire::only_v4(&addresses),
             Err(_) => Vec::new(),
         }

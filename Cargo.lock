@@ -1396,6 +1396,7 @@ dependencies = [
 name = "nrr-desktop-gui"
 version = "0.1.0-prealpha"
 dependencies = [
+ "boa_engine",
  "nrr-application",
  "nrr-platform-api",
  "nrr-shared",
@@ -1526,6 +1527,7 @@ dependencies = [
  "sha2",
  "tempfile",
  "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]

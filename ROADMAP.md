@@ -24,8 +24,7 @@ priority.
 
 | What | What it gives you | Priority |
 |---|---|---|
-| Checking a site that does not open | One button checks the server over the main and the additional connection and tells you what is going on: the server does not answer at all, only one of your connections lets it through, or everything works now | high |
-| Network recovery when the service stops | If the background service stops, the window, the tray and the terminal interface say so at once and offer to start it again or to restore the network without it | high |
+| Checking a site over both connections | The site check, which today tries a site over the connection your rules choose for it, also tries it over the other one and tells you which connection lets the server through: neither, so the server itself is down; only the other one, so your provider or VPN holds it back, with an offer to move the rule; or the one your rules choose, so it works now | high |
 | Own secure DNS for one program | A program with its own encrypted DNS, such as a corporate client or a game, keeps working while protection stays on for every other program | high |
 | New version notice | The app tells you when a new version is out, on request or on its own every two weeks; the automatic check can be turned off | medium |
 | Updates to imported rule sets | When a new version adds addresses to a rule set you imported (new addresses of `site.com`, say), the app offers the update and shows what changed. Nothing changes without your consent | medium |
@@ -82,6 +81,27 @@ priority.
 | Dropped connections explained on Linux | The diagnostic archive tells a connection the network dropped from one the app closed, on Linux as it already does on Windows, so "was it the app?" has an answer | low |
 | Partly routed programs explained | A program rule's details say how many of the program's addresses go by your address rules instead, so a rule that seems to work only half the time is explained | low |
 | A renamed connection keeps its role on Linux | When a network connection is renamed or recreated on Linux, the app still knows which role you gave it, as it already does on Windows | low |
+| Subnet rules named everywhere | The connection trace and name lookups say which subnet or address-range rule a connection matched, on Windows and Linux, and on Linux a subnet rule can no longer cover the server of your VPN by mistake | low |
+| Told when unknown rules are kept | When rules saved by a newer version of the app are kept as they are while you edit yours, the window tells you which ones and why | low |
+| Traffic history follows a renamed connection | When you rename a network connection, its traffic history stays with it instead of starting over under the new name | low |
+| Servers you reach by address stay on their connection | A zone rule such as `.ru` never moves a server you reach by its address — a remote desktop, an SSH server, a gateway — or a site you opened earlier to the other connection | low |
+| Told when a connection breaks without the app | When connections to one server keep opening and closing early and the app never held them back, the diagnostics say so, so you know to look for the cause elsewhere | low |
+| Settings an administrator locks | An administrator chooses which settings and rules the other users of the computer may change on their own; what is locked shows as managed by the administrator | low |
+| A denied zone stays closed on a shared server | When you deny a zone but route one of its sites, the zone's other sites on the same server stay denied while the routed site keeps working | low |
+| Checking a site in every zone | A `?` rule for a site in every zone (`?bank.*`) checks each zone of the site on its own and offers a rule just for the zones that open over the other connection | low |
+| Detailed logs for one part of the app | While you collect logs for a problem, detailed logging can be turned up for just the part of the app involved, so the lines you need are not lost among the rest | low |
+| Public Wi-Fi sign-in with leak protection on Everything | The app recognises the sign-in page of a public Wi-Fi network and opens a short window to sign in, after which full protection returns | low |
+| Own setting for Docker on Hyper-V and shared connections | The choice of what WSL, containers and virtual machines do while the additional connection is down gets its own line for Docker Desktop on Hyper-V and for Internet Connection Sharing on Windows | low |
+| A program rule that covers the program's whole site | A program rule can also cover future servers under the site domain the program talks to, never a whole public suffix such as `.com` or `.co.uk` | low |
+| Programs that follow another rule's route | The app lists programs without a rule of their own whose connections take the route of one of your rules because they reach the same address as a site in it | low |
+| Choosing which changes to apply | In the review before an import or a rule change is applied, you set individual lines aside to skip them and apply only the rest, in the window and the terminal interface | low |
+| Warning when the window runs under another account | If the window is started under an account other than the one you signed in with, it says so and names whose rules it shows; an administrator prompt for your own account brings no warning | low |
+| A choice when the VPN drops | When the VPN drops, the tray and the terminal interface ask whether to keep the sites it carried blocked or let them use the main connection for this session; until you answer, nothing goes out over the main connection | low |
+| The whole hosts file in the app | The window and the terminal interface show the whole hosts file, not only the entries that touch your rules | low |
+| Local network traffic counted apart | The traffic statistics show how much went to your local network — a NAS, a printer, another computer at home — apart from what went out to the internet over the main connection | low |
+| A stalled site tried at its other addresses | When a site stops opening over the main connection, the app first looks for other working addresses of it on the same connection, and suggests the additional connection only if that does not help | low |
+| Choosing which connections the app may use | In the window you can rule a network connection out of the app's choices and set the order it prefers, without changing the system's own network settings | low |
+| Sites protected from the first second of startup | With leak protection set to Routed sites, the sites your rules protect are held back from the moment the computer starts, as everything is with Everything | low |
 | Running on OpenWrt routers | Not researched yet. If you know how NetRuleRouter would fit on a router — memory, storage, the firewall — we will be glad to hear it | — |
 
 macOS comes after Linux; its own plan will appear here once the port starts.

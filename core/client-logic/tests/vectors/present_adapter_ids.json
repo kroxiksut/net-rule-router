@@ -1,0 +1,48 @@
+{
+  "cases": [
+    { "name": "no snapshot lists nothing", "input": { "snapshot": null }, "expected": [] },
+    { "name": "no adapters section lists nothing", "input": { "snapshot": {} }, "expected": [] },
+    {
+      "name": "entries then rows, each id once",
+      "input": {
+        "snapshot": {
+          "adapters": {
+            "adapters": [{ "persistent-id": "a" }, { "persistent-id": "b" }],
+            "rows": [{ "persistent-id": "b" }, { "persistent-id": "c" }]
+          }
+        }
+      },
+      "expected": ["a", "b", "c"]
+    },
+    {
+      "name": "an empty id is no adapter",
+      "input": { "snapshot": { "adapters": { "adapters": [{ "persistent-id": "" }, { "persistent-id": "a" }] } } },
+      "expected": ["a"]
+    },
+    {
+      "name": "a non-string id is no adapter",
+      "input": { "snapshot": { "adapters": { "rows": [{ "persistent-id": 7 }, { "persistent-id": "r" }] } } },
+      "expected": ["r"]
+    },
+    {
+      "name": "a null entry is skipped",
+      "input": { "snapshot": { "adapters": { "adapters": [null, { "persistent-id": "a" }] } } },
+      "expected": ["a"]
+    },
+    {
+      "name": "a list that is not a list counts as empty",
+      "input": { "snapshot": { "adapters": { "adapters": { "persistent-id": "x" }, "rows": [{ "persistent-id": "r" }] } } },
+      "expected": ["r"]
+    },
+    {
+      "name": "rows alone",
+      "input": { "snapshot": { "adapters": { "rows": [{ "persistent-id": "r1" }, { "persistent-id": "r2" }] } } },
+      "expected": ["r1", "r2"]
+    },
+    {
+      "name": "a repeated entry is listed once",
+      "input": { "snapshot": { "adapters": { "adapters": [{ "persistent-id": "a" }, { "persistent-id": "a" }] } } },
+      "expected": ["a"]
+    }
+  ]
+}

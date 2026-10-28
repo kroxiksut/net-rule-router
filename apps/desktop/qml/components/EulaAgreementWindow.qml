@@ -123,8 +123,9 @@ Window {
             Layout.fillHeight: true
             clip: true
             ScrollBar.vertical.policy: ScrollBar.AsNeeded
-            TextArea {
+            ThemedTextArea {
                 id: agreementArea
+                theme: root.ownerRoot ? root.ownerRoot.uiTheme : null
                 readOnly: true
                 activeFocusOnTab: true
                 wrapMode: TextArea.Wrap

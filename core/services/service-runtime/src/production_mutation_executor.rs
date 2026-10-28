@@ -295,21 +295,30 @@ impl ProductionMutationExecutor {
         rules_json: &str,
         principal: &str,
     ) -> Option<ReviewSummaryResponse> {
+        match self.content_gate(rules_json, principal)? {
+            ContentRefusal::Values(refused) => Some(invalid_rule_value_summary(&refused)),
+            ContentRefusal::Other(error) => Some(refused_summary(&error)),
+        }
+    }
+
+    /// The content gates a book passes before it is put into force, whether
+    /// it arrives as an edit or comes back from history.
+    fn content_gate(&self, rules_json: &str, principal: &str) -> Option<ContentRefusal> {
         // First, as on the execute path: a network that would cut a link is
         // refused whatever else the book holds.
         if let Some(error) = self.network_refusal(rules_json, principal) {
-            return Some(refused_summary(&error));
+            return Some(ContentRefusal::Other(error));
         }
         let carried = self.coordinator.rules_json_in_force_for(principal);
         if let Some((rule_id, reason)) =
             crate::activation_coordinator::unsupported_rule_shape(rules_json, carried.as_deref())
         {
-            return Some(refused_summary(&unsupported_rule_shape_error(
+            return Some(ContentRefusal::Other(unsupported_rule_shape_error(
                 &rule_id, reason,
             )));
         }
         if let Some(hit) = crate::activation_coordinator::control_character_in_rules(rules_json) {
-            return Some(refused_summary(&control_character_error(
+            return Some(ContentRefusal::Other(control_character_error(
                 &hit.rule_id,
                 hit.field,
             )));
@@ -319,15 +328,17 @@ impl ProductionMutationExecutor {
             carried.as_deref(),
         );
         if !refused.is_empty() {
-            return Some(invalid_rule_value_summary(&refused));
+            return Some(ContentRefusal::Values(refused));
         }
         if let Some(network) =
             crate::activation_coordinator::network_on_both_routes(rules_json, carried.as_deref())
         {
-            return Some(refused_summary(&network_on_both_routes_error(&network)));
+            return Some(ContentRefusal::Other(network_on_both_routes_error(
+                &network,
+            )));
         }
         crate::activation_coordinator::folder_on_both_routes(rules_json, carried.as_deref())
-            .map(|folder| refused_summary(&folder_on_both_routes_error(&folder)))
+            .map(|folder| ContentRefusal::Other(folder_on_both_routes_error(&folder)))
     }
 
     /// Defense-in-depth rule caps on every write: the user's own rules up to
@@ -826,6 +837,16 @@ impl MutationExecutor for ProductionMutationExecutor {
             Ok(target) => target,
             Err(error) => return MutationOutcome::Failed(error),
         };
+        // History comes back through the gates an edit passes today.
+        if let Ok(Some(record)) = self.coordinator.rollback_target_for(principal, &target) {
+            match self.content_gate(&record.rules_json, principal) {
+                Some(ContentRefusal::Values(refused)) => {
+                    return MutationOutcome::Failed(invalid_rule_value_error(&refused));
+                }
+                Some(ContentRefusal::Other(error)) => return MutationOutcome::Failed(error),
+                None => {}
+            }
+        }
         match self
             .coordinator
             .rollback_to(principal, target, "ipc-rollback")
@@ -1050,6 +1071,13 @@ fn cross_set_duplicates_of(rules_json: &str, platform: HostPlatform) -> Vec<Cros
 
 /// A preview the execute would refuse with `err`, marked so a client cannot
 /// read its empty diff as "nothing changes".
+/// Why a book does not pass the content gates. Refused values keep their list:
+/// the preview names them.
+enum ContentRefusal {
+    Values(Vec<RefusedRuleValue>),
+    Other(OperationError),
+}
+
 fn refused_summary(err: &OperationError) -> ReviewSummaryResponse {
     let mut summary = malformed_summary(&err.message);
     summary.risk_signals.push(RiskSignalDto::ChangeRefused {

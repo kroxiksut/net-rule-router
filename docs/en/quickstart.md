@@ -334,7 +334,16 @@ raises: how much actually went through it, and how much went the usual way.
 
 Most of the day you will not have the window open at all. The tray icon says
 whether your rules are being applied, and its menu holds the actions you need
-most — including turning the rules off for a moment.
+most — including turning the rules off for a while: *Turn off rules…* stops
+your routing and leak protection for 15 minutes, an hour, 4 hours, until the
+next restart or until you turn them back on, and they come back on their own.
+
+The tray also tells you when something needs you: a site you opened does not
+open over the main connection (on Windows even with the tray closed), the main
+or the additional connection keeps dropping, or the service stopped on its
+own. *Don't show…* on a notice hides that kind of notice for a day, 7 days,
+30 days or for good; Settings → *Notifications* lists what you hid and shows it
+again.
 
 ![The tray menu: the current state and the actions you reach for most](images/tray-menu.png)
 
@@ -350,6 +359,16 @@ most — including turning the rules off for a moment.
 ![Diagnostics: service state, diagnostic archive, audit trail](images/diagnostics.png)
 
 ## If something is not working
+
+**One site does not open?** Type its name into **Check site** in the
+"Diagnostics" section (or choose *Check site…* on its line in the connection
+trace, or on the notice about it). The check tells you whether the network or
+the site is at fault: which route the site, its sign-in and the names seen
+with it take, whether each one answers there, and what to do next — clear the
+browser's cookies for a site that answers, move the sign-in names to the
+site's route, or look at a route that is not working.
+
+For anything else:
 
 1. Check that the service is running: **Settings → Service management** —
    the status should be "Running" (from a terminal: `nrr-cli status`).
@@ -371,10 +390,11 @@ most — including turning the rules off for a moment.
 
 ## Lost internet? How to reset everything
 
-The app makes no permanent changes to your system: all routes and blocking
-filters it creates are **temporary** — they do not survive a reboot. If
-after experimenting with rules (especially with leak protection set to
-**Everything**) you lost network access, proceed step by step:
+A normal stop of the service hands the network back: its routes, blocking
+filters and DNS redirect go with it. With leak protection set to
+**Everything** the protection is meant to outlast a reboot, so restarting the
+computer alone does not lift it. If after experimenting with rules you lost
+network access, proceed step by step:
 
 1. **Set leak protection to Off** in the app settings
    and apply the changes.
@@ -395,10 +415,18 @@ after experimenting with rules (especially with leak protection set to
    starts again a few seconds later, so the protection does not stay off
    by accident.
 
-3. **Reboot your computer** — this guarantees a reset: the app's routes
-   and filters do not persist between reboots. If the service is set to
-   start with Windows and the problem recurs — after reboot stop the
-   service with the command above.
+3. **Still no network — reset it.** From an administrator console:
+
+   ```powershell
+   nrr-cli reset-network --confirm --stop-service
+   ```
+
+   This stops the service and removes the app's filters, routes and DNS
+   redirect at once, so names resolve again without a reboot. In the window
+   the same action is "Stop service and restore network" under Settings →
+   Service management. A reboot is not a substitute: on Windows the DNS redirect
+   survives it while the service is disabled or removed. The details are in
+   [Recovering network access](recovering-network-access.md).
 
 To see the current routing table for diagnostics, use
 `route print -4` (or `Get-NetRoute -AddressFamily IPv4`).

@@ -47,7 +47,8 @@ pub fn secondary_ip_denylist(
     }
 
     // Expand every enabled, routable, NAME-based secondary rule into
-    // `ip → {owning rule hostnames}`, and the global set of rule hostnames.
+    // `ip → {owning rule sites}`, and the global set of rule sites — the unit
+    // the direct side is counted in (`census_site`).
     let mut ip_rule_hosts: HashMap<Ipv4Addr, HashSet<String>> = HashMap::new();
     let mut rule_hosts: HashSet<String> = HashSet::new();
     for rule in secondary.rules().iter().filter(|r| r.enabled) {
@@ -72,17 +73,18 @@ pub fn secondary_ip_denylist(
             // Carried by its `*.site.<zone>` twins (`any_zone_sites`).
             Some(CanonicalAddressMatch::AnyZoneDomain(_)) => {}
             Some(CanonicalAddressMatch::ExactFqdn(host)) => {
-                rule_hosts.insert(host.clone());
-                // The shared-IP census is an IPv4 ledger.
-                for ip in crate::dns_wire::only_v4(&cache.ips_for_hostname(host)) {
-                    ip_rule_hosts.entry(ip).or_default().insert(host.clone());
-                }
+                collect_rule_hosts(
+                    std::slice::from_ref(host),
+                    cache,
+                    &mut ip_rule_hosts,
+                    &mut rule_hosts,
+                );
             }
             // `*.suffix` covers its apex, a zone does not — the census must see
             // the same host set the codegens enforce, or a shared-IP decision
             // would be taken on a different population than it is applied to.
             Some(CanonicalAddressMatch::SuffixDomain(s)) => {
-                collect_suffix_hosts(
+                collect_rule_hosts(
                     &cache.hostnames_for_suffix_domain(s, SUFFIX_FANOUT_LIMIT),
                     cache,
                     &mut ip_rule_hosts,
@@ -90,7 +92,7 @@ pub fn secondary_ip_denylist(
                 );
             }
             Some(CanonicalAddressMatch::Zone(z)) => {
-                collect_suffix_hosts(
+                collect_rule_hosts(
                     &cache.hostnames_under_suffix(z, SUFFIX_FANOUT_LIMIT),
                     cache,
                     &mut ip_rule_hosts,
@@ -145,18 +147,21 @@ impl DeclinedAddresses {
     }
 }
 
-/// Record a suffix/zone rule's expanded host list into the census maps.
-fn collect_suffix_hosts(
+/// Record a rule's hosts into the census maps by site: a page under a zone
+/// rule names as many of its own hosts as it likes, and they still weigh one.
+fn collect_rule_hosts(
     hosts: &[String],
     cache: &dyn FqdnCacheLookup,
     ip_rule_hosts: &mut HashMap<Ipv4Addr, HashSet<String>>,
     rule_hosts: &mut HashSet<String>,
 ) {
     for h in hosts {
+        let site = nrr_domain::shared_ip::census_site(h);
+        // The shared-IP census is an IPv4 ledger.
         for ip in crate::dns_wire::only_v4(&cache.ips_for_hostname(h)) {
-            ip_rule_hosts.entry(ip).or_default().insert(h.clone());
+            ip_rule_hosts.entry(ip).or_default().insert(site.clone());
         }
-        rule_hosts.insert(h.clone());
+        rule_hosts.insert(site);
     }
 }
 
@@ -323,6 +328,48 @@ mod tests {
                 .len(),
             3
         );
+    }
+
+    fn zone_rule(id: &str, zone: &str) -> CanonicalRule {
+        CanonicalRule {
+            address_match: Some(CanonicalAddressMatch::Zone(zone.into())),
+            ..fqdn_rule(id, "unused")
+        }
+    }
+
+    /// A page under the user's zone rule mints as many names as it likes on
+    /// the address of a site the user reaches directly. They are one site, and
+    /// one site does not outvote the direct one: the address stays off the
+    /// tunnel, and the direct site does not start riding it.
+    #[test]
+    fn names_minted_under_a_zone_do_not_outvote_the_direct_site_on_their_address() {
+        let inner = MockFqdnCacheLookup::new();
+        let target = Ipv4Addr::new(192, 0, 2, 9);
+        for i in 0..8 {
+            inner.set_ips(&format!("a{i}.attacker.example"), vec![target]);
+        }
+        let mut direct = HashMap::new();
+        direct.insert(target, 1);
+        let cache = CensusMock { inner, direct };
+        let secondary = CanonicalRuleSet::from_rules(vec![zone_rule("r-zone", "example")]);
+        let denied = secondary_ip_denylist(&secondary, &cache, SharedIpPolicy::MajorityOfIp);
+        assert!(denied.contains(&target));
+    }
+
+    /// The other side of the same unit: two sites of the user's own outvote
+    /// one direct site, however few names each has.
+    #[test]
+    fn two_rule_sites_still_outvote_one_direct_site() {
+        let inner = MockFqdnCacheLookup::new();
+        let shared = Ipv4Addr::new(192, 0, 2, 10);
+        inner.set_ips("mail.first.example", vec![shared]);
+        inner.set_ips("www.second.example", vec![shared]);
+        let mut direct = HashMap::new();
+        direct.insert(shared, 1);
+        let cache = CensusMock { inner, direct };
+        let secondary = CanonicalRuleSet::from_rules(vec![zone_rule("r-zone", "example")]);
+        let denied = secondary_ip_denylist(&secondary, &cache, SharedIpPolicy::MajorityOfIp);
+        assert!(!denied.contains(&shared));
     }
 
     #[test]

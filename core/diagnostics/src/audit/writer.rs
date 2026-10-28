@@ -33,7 +33,7 @@ use super::anchor::{check_tail, AuditChainAnchor, AuditChainAnchorStore, AuditTa
 use std::fs::File;
 use std::io::{Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::{Mutex, MutexGuard};
 use std::time::{Duration, SystemTime};
 
 use sha2::{Digest, Sha256};
@@ -144,10 +144,12 @@ struct AuditWriterInner {
     chain_lock: Option<File>,
     /// Whether the first append's wait for the lock has been spent.
     lock_wait_spent: bool,
+    /// How many next writes fail as on a full disk.
+    #[cfg(test)]
+    refuse_writes: usize,
 }
 
-// `expect()`s here are invariants (file open right after `ensure_open`) and
-// lock-poisoning propagation — both panic-worthy, not recoverable errors.
+// The `expect()` is an invariant: `ensure_open` sets `current` or fails.
 #[allow(clippy::expect_used)]
 impl AuditWriterInner {
     fn new(config: AuditWriterConfig) -> Self {
@@ -160,6 +162,8 @@ impl AuditWriterInner {
             anchor: None,
             chain_lock: None,
             lock_wait_spent: false,
+            #[cfg(test)]
+            refuse_writes: 0,
         }
     }
 
@@ -306,12 +310,24 @@ impl AuditWriterInner {
 
         let start = self.current_size;
         let (file, _path) = self.current.as_mut().expect("file open after ensure_open");
-        if let Err(e) = commit_line(file, start, line.as_bytes()) {
-            // Whether or not the rollback held, the next event starts a fresh
-            // file rather than landing after a fragment.
-            self.current = None;
+        #[cfg(test)]
+        let committed = if self.refuse_writes > 0 {
+            self.refuse_writes -= 1;
+            commit_line(&mut tests::FullDisk(file), start, line.as_bytes())
+        } else {
+            commit_line(file, start, line.as_bytes())
+        };
+        #[cfg(not(test))]
+        let committed = commit_line(file, start, line.as_bytes());
+        if let Err(failure) = committed {
+            // A file taken back to its last whole line takes the next event; a
+            // new file per failure would litter a full disk with empty ones.
+            // Only a fragment that could not be taken back retires the file.
+            if !failure.rolled_back {
+                self.current = None;
+            }
             return Err(DiagnosticsError::AuditWriteFailed {
-                reason: format!("write audit line: {e}"),
+                reason: format!("write audit line: {}", failure.error),
             });
         }
 
@@ -392,12 +408,26 @@ impl AuditWriter {
 
     /// [`AuditSink::append`], also saying where the event landed, so a record
     /// that refers to it can point at the line.
-    #[allow(clippy::expect_used)] // lock poisoning propagates a prior panic
     pub fn append_located(&self, input: AuditEventInput) -> DiagnosticsResult<AuditEventLocation> {
-        self.inner
-            .lock()
-            .expect("AuditWriter mutex")
-            .append_inner(input)
+        self.lock_inner().append_inner(input)
+    }
+
+    /// A panic under the lock must not make every audited request panic in
+    /// turn. Its state may be half-updated, so the chain is resumed from what
+    /// is on disk, which this writer alone appends to while it holds the lock.
+    fn lock_inner(&self) -> MutexGuard<'_, AuditWriterInner> {
+        self.inner.lock().unwrap_or_else(|poisoned| {
+            self.inner.clear_poison();
+            let mut inner = poisoned.into_inner();
+            inner.current = None;
+            if inner.chain_lock.is_some() {
+                let (prev_hash, next_seq) =
+                    resume_anchored(&inner.config.audit_dir, inner.anchor.as_deref());
+                inner.prev_hash = prev_hash;
+                inner.next_seq = next_seq;
+            }
+            inner
+        })
     }
 
     /// What the anchor said about the tail when this writer opened.
@@ -420,22 +450,16 @@ impl AuditWriter {
     /// chain is intact or the breaks have changed since.
     ///
     /// Only a holder of `key` can write a restart the verifier honours.
-    #[allow(clippy::expect_used)] // lock poisoning propagates a prior panic
     pub fn restart_chain(
         &self,
         key: &AuditRestartKey,
         shown_digest: &str,
         request: AuditChainRestartRequest,
     ) -> Result<AuditChainVerification, AuditChainRestartError> {
-        self.inner
-            .lock()
-            .expect("AuditWriter mutex")
-            .restart_inner(key, shown_digest, request)
+        self.lock_inner().restart_inner(key, shown_digest, request)
     }
 }
 
-// Lock-poisoning `expect()` propagates a prior panic — not recoverable.
-#[allow(clippy::expect_used)]
 impl AuditSink for AuditWriter {
     type Event = AuditEventInput;
 
@@ -577,14 +601,22 @@ impl AuditFile for File {
 /// outlives its event after a power loss reads as a truncated trail. Rolled
 /// back on failure because a half line reads as a corrupt one. Both are the
 /// tamper alarm nobody caused.
-fn commit_line<F: AuditFile>(file: &mut F, start: u64, line: &[u8]) -> std::io::Result<()> {
-    let result = file.write_all(line).and_then(|()| file.make_durable());
-    if result.is_err() {
-        let _ = file
-            .truncate_to(start)
-            .and_then(|()| file.seek(SeekFrom::Start(start)));
-    }
-    result
+fn commit_line<F: AuditFile>(file: &mut F, start: u64, line: &[u8]) -> Result<(), CommitFailure> {
+    let Err(error) = file.write_all(line).and_then(|()| file.make_durable()) else {
+        return Ok(());
+    };
+    let rolled_back = file
+        .truncate_to(start)
+        .and_then(|()| file.seek(SeekFrom::Start(start)))
+        .is_ok();
+    Err(CommitFailure { error, rolled_back })
+}
+
+#[derive(Debug)]
+struct CommitFailure {
+    error: std::io::Error,
+    /// Whether the file is back to its last whole line.
+    rolled_back: bool,
 }
 
 // ── Chain resume ─────────────────────────────────────────────────────────────
@@ -738,6 +770,31 @@ mod tests {
             reason_code: reason::review::APPROVED,
             payload_summary_json: None,
         }
+    }
+
+    /// A panic under the writer's lock, left mid-update, must neither turn
+    /// every later audited request into a panic nor fork the chain.
+    #[test]
+    fn a_panic_under_the_writer_lock_leaves_the_trail_writable_and_intact() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let writer = AuditWriter::open(AuditWriterConfig::new(dir.path()));
+        writer.append(sample_input("adt-001")).expect("first");
+        let poisoned = std::thread::scope(|s| {
+            s.spawn(|| {
+                let mut inner = writer.inner.lock().expect("unpoisoned yet");
+                inner.prev_hash = "half-updated".to_string();
+                panic!("simulated panic under the audit lock");
+            })
+            .join()
+        });
+        assert!(poisoned.is_err(), "the lock must be poisoned for the test");
+
+        writer
+            .append(sample_input("adt-002"))
+            .expect("a poisoned lock still takes the next event");
+        let verdict = writer.verify_chain(None);
+        assert!(verdict.chain_ok, "chain forked after recovery: {verdict:?}");
+        assert_eq!(verdict.events_verified, 2);
     }
 
     #[test]
@@ -1147,6 +1204,62 @@ mod tests {
             events[1].prev_hash.as_deref(),
             Some(events[0].event_hash.as_str())
         );
+    }
+
+    /// The open audit file on a full disk: nothing more can be written, and
+    /// taking a fragment back still works.
+    pub(super) struct FullDisk<'a>(pub(super) &'a mut File);
+
+    impl Write for FullDisk<'_> {
+        fn write(&mut self, _buf: &[u8]) -> std::io::Result<usize> {
+            Err(std::io::Error::other(
+                "There is not enough space on the disk.",
+            ))
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl Seek for FullDisk<'_> {
+        fn seek(&mut self, pos: SeekFrom) -> std::io::Result<u64> {
+            self.0.seek(pos)
+        }
+    }
+
+    impl AuditFile for FullDisk<'_> {
+        fn truncate_to(&mut self, len: u64) -> std::io::Result<()> {
+            self.0.set_len(len)
+        }
+
+        fn make_durable(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// Every audited request on a full disk used to open a new, empty audit
+    /// file and list the whole directory; the trail then held thousands of
+    /// them. Failed writes keep to the file they were taken back in.
+    #[test]
+    fn writes_failing_on_a_full_disk_do_not_create_a_file_each() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let writer = AuditWriter::open(AuditWriterConfig::new(dir.path()));
+        writer.append(sample_input("adt-001")).expect("first");
+        writer.lock_inner().refuse_writes = 20;
+        for n in 0..20 {
+            assert!(writer.append(sample_input(&format!("full-{n}"))).is_err());
+        }
+        writer.append(sample_input("adt-002")).expect("space again");
+
+        assert_eq!(
+            sorted_audit_files(dir.path()).len(),
+            1,
+            "one file, no litter"
+        );
+        let verdict = writer.verify_chain(None);
+        assert!(verdict.chain_ok, "{verdict:?}");
+        assert_eq!(verdict.events_verified, 2);
     }
 
     /// A file that accepts `room` bytes and then fails, or fails at fsync.

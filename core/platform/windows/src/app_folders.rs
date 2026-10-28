@@ -89,6 +89,10 @@ impl ProgramFolders for WindowsProgramFolders {
         PathStyle::Windows
     }
 
+    fn identity(&self, folder: &Path) -> Option<u128> {
+        folder_identity(folder)
+    }
+
     fn place(&self, path: &Path) -> PlaceOnDisk {
         place_of(path)
     }
@@ -161,6 +165,31 @@ impl ProgramFolders for WindowsProgramFolders {
         let watch = DirectoryWatch::start(folder, subfolders, on_change)?;
         Ok(NetworkChangeSubscription::new(Box::new(watch)))
     }
+}
+
+/// Volume serial and file index of the folder at `folder`: stays with the
+/// folder through a rename, so another folder moved into its place differs.
+fn folder_identity(folder: &Path) -> Option<u128> {
+    use std::os::windows::fs::OpenOptionsExt;
+    use std::os::windows::io::AsRawHandle;
+    use windows::Win32::Storage::FileSystem::{
+        GetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION, FILE_READ_ATTRIBUTES,
+    };
+    let file = std::fs::OpenOptions::new()
+        .access_mode(FILE_READ_ATTRIBUTES.0)
+        .share_mode((FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE).0)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS.0)
+        .open(folder)
+        .ok()?;
+    let mut info = BY_HANDLE_FILE_INFORMATION::default();
+    // SAFETY: the handle is live for the borrow of `file`; `info` is a
+    // properly sized out-param.
+    unsafe { GetFileInformationByHandle(HANDLE(file.as_raw_handle().cast()), &mut info) }.ok()?;
+    Some(
+        (u128::from(info.dwVolumeSerialNumber) << 64)
+            | (u128::from(info.nFileIndexHigh) << 32)
+            | u128::from(info.nFileIndexLow),
+    )
 }
 
 /// The profile folders of the people who sign in to this machine. Service
@@ -385,6 +414,29 @@ fn watch_until_stopped(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// An updater's swap: the old folder renamed away, a new one renamed in.
+    /// The path now names another folder, and the identity must say so.
+    #[test]
+    fn a_folder_renamed_into_the_rules_place_has_another_identity() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let app = dir.path().join("App");
+        std::fs::create_dir(&app).expect("mkdir");
+        let before = folder_identity(&app).expect("identity");
+        assert_eq!(
+            folder_identity(&app),
+            Some(before),
+            "stable while unchanged"
+        );
+
+        std::fs::rename(&app, dir.path().join("App.old")).expect("rename away");
+        let fresh = dir.path().join("App.new");
+        std::fs::create_dir(&fresh).expect("mkdir");
+        std::fs::rename(&fresh, &app).expect("rename in");
+
+        assert_ne!(folder_identity(&app), Some(before));
+        assert_eq!(folder_identity(&dir.path().join("App.old")), Some(before));
+    }
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
 

@@ -287,11 +287,17 @@ pub struct DnsResolverService {
     redirect: Arc<dyn SystemDnsRedirectPort>,
     listen_addr: SocketAddr,
     guard_interval: Duration,
+    lift_after_dark: Duration,
     claims: NamespaceClaims,
     short_names: ShortNameUpkeep,
     /// Where the serve loop and its guard report their liveness.
     liveness: Option<Arc<TaskLiveness>>,
 }
+
+/// How long no upstream may answer before the redirect is lifted. A router
+/// that drops out for a moment and comes back is ridden out: lifting and
+/// returning costs a rewrite and a cache flush each way.
+const LIFT_AFTER_DARK: Duration = Duration::from_secs(15);
 
 /// The serve loop touches its pulse at least once per socket timeout; this
 /// much silence means the thread is stuck, not idle.
@@ -308,6 +314,7 @@ impl DnsResolverService {
             redirect,
             listen_addr,
             guard_interval: REDIRECT_GUARD_INTERVAL,
+            lift_after_dark: LIFT_AFTER_DARK,
             claims: NamespaceClaims::default(),
             short_names: ShortNameUpkeep::default(),
             liveness: None,
@@ -406,6 +413,12 @@ impl DnsResolverService {
         self
     }
 
+    /// [`LIFT_AFTER_DARK`] override for tests.
+    pub fn with_lift_after_dark(mut self, hold: Duration) -> Self {
+        self.lift_after_dark = hold;
+        self
+    }
+
     /// Sleep `interval` in `slice` steps. `true` when the feed was raised,
     /// which cuts the wait short: the namespaces a new link may claim are the
     /// whole reason the guard exists.
@@ -453,8 +466,12 @@ impl DnsResolverService {
         let mut missing_streak = false;
         let mut last_reinstall_error: Option<String> = None;
         let mut lifted = false;
+        // The OS refused the last install; it is tried again each interval.
+        let mut refused = false;
+        // Since when no upstream answers, while the redirect still stands.
+        let mut dark_since: Option<BootInstant> = None;
         loop {
-            let tick = if lifted {
+            let tick = if lifted || dark_since.is_some() {
                 interval.min(LIFTED_RECHECK)
             } else {
                 interval
@@ -468,6 +485,10 @@ impl DnsResolverService {
                 return;
             }
             let _tick = lease.as_ref().map(ThreadLease::work);
+            if links.latch.refused.swap(false, Ordering::SeqCst) {
+                refused = true;
+                applied.clear();
+            }
             // A connection that appeared may claim a namespace of its own, and
             // one that went away stops claiming it. Checked before the redirect
             // itself: re-installing the catch-all without the exemptions beside
@@ -496,10 +517,18 @@ impl DnsResolverService {
                 match redirect.redirect_to(handle.listener) {
                     Ok(_) => {
                         lifted = false;
+                        refused = false;
+                        let generation = links.latch.next_generation();
                         links.say_upstream(None);
                         Self::apply_exemptions(&redirect, &claims, &current, &mut applied);
                         short_names.keep(&redirect, &current);
                         let _ = redirect.flush_cache();
+                        confirm_in_background(
+                            Arc::clone(&redirect),
+                            handle.clone(),
+                            Arc::clone(&links.latch),
+                            generation,
+                        );
                         tracing::info!(
                             target: "nrr::dns-resolver",
                             msg_key = "dns-resolver-redirect-back-upstream-answers",
@@ -516,6 +545,33 @@ impl DnsResolverService {
                 }
                 continue;
             }
+            if refused {
+                let _held = links.latch.hold();
+                if links.latch.is_restored() {
+                    continue;
+                }
+                match redirect.redirect_to(handle.listener) {
+                    Ok(_) => {
+                        refused = false;
+                        let generation = links.latch.next_generation();
+                        Self::apply_exemptions(&redirect, &claims, &current, &mut applied);
+                        short_names.keep(&redirect, &current);
+                        let _ = redirect.flush_cache();
+                        confirm_in_background(
+                            Arc::clone(&redirect),
+                            handle.clone(),
+                            Arc::clone(&links.latch),
+                            generation,
+                        );
+                    }
+                    Err(error) => tracing::debug!(
+                        target: "nrr::dns-resolver",
+                        error = %error,
+                        "Mode B: trying the refused redirect again failed",
+                    ),
+                }
+                continue;
+            }
             // Unchanged claims cost a comparison; a write that failed is
             // retried with what was read, without reading again. A changed set
             // flushes the OS cache: a "no such name" asked through us before a
@@ -527,10 +583,19 @@ impl DnsResolverService {
             if due || short_names.failing() {
                 short_names.keep(&redirect, &current);
             }
-            // Nothing answers: lift, under the latch, so it cannot undo the
-            // restore at stop.
+            // Nothing answers, a fresh probe included, for the whole hold: lift,
+            // under the latch, so it cannot undo the restore at stop. An idle
+            // machine has no query to clear the flag when its network returns.
             if let Some(pool) = links.pool.as_ref() {
-                if pool.upstream_dark() {
+                let dark = pool.upstream_dark() && pool.reprobe().is_none();
+                let held_for = if dark {
+                    dark_since.get_or_insert_with(BootInstant::now).elapsed()
+                } else {
+                    dark_since = None;
+                    Duration::ZERO
+                };
+                if dark && held_for >= links.lift_after_dark {
+                    dark_since = None;
                     links.say_upstream(pool.upstream_dark_cause());
                     let _held = links.latch.hold();
                     if links.latch.is_restored() {
@@ -539,6 +604,7 @@ impl DnsResolverService {
                     match redirect.restore(&handle) {
                         Ok(()) => {
                             let _ = redirect.flush_cache();
+                            links.latch.next_generation();
                             lifted = true;
                             applied.clear();
                             if pool.upstream_dark_cause()
@@ -599,8 +665,15 @@ impl DnsResolverService {
                             // must be put back beside it, and the remembered set
                             // no longer describes the table.
                             applied.clear();
+                            let generation = links.latch.next_generation();
                             Self::apply_exemptions(&redirect, &claims, &current, &mut applied);
                             let _ = redirect.flush_cache();
+                            confirm_in_background(
+                                Arc::clone(&redirect),
+                                handle.clone(),
+                                Arc::clone(&links.latch),
+                                generation,
+                            );
                             last_reinstall_error = None;
                             if !repeat {
                                 tracing::info!(
@@ -758,6 +831,13 @@ impl DnsResolverService {
         };
         // From here on the restore is owed, whatever happens.
         let latch = Arc::new(RedirectLatch::default());
+        let generation = latch.next_generation();
+        confirm_in_background(
+            Arc::clone(&self.redirect),
+            handle.clone(),
+            Arc::clone(&latch),
+            generation,
+        );
         let restore = RestoreGuard {
             redirect: Arc::clone(&self.redirect),
             handle: handle.clone(),
@@ -816,6 +896,7 @@ impl DnsResolverService {
                     latch: Arc::clone(&latch),
                     pool: Some(Arc::clone(self.listener.upstream_pool())),
                     liveness: self.liveness.clone(),
+                    lift_after_dark: self.lift_after_dark,
                 };
                 move || {
                     Self::guard(
@@ -912,6 +993,13 @@ const LIFTED_RECHECK: Duration = Duration::from_secs(5);
 struct RedirectLatch {
     turn: Mutex<()>,
     restored: AtomicBool,
+    /// Bumped, under the turn, by every install and lift: a verdict asked
+    /// about one install never withdraws the next.
+    generation: std::sync::atomic::AtomicU64,
+    /// The OS refused an install and it was withdrawn; the guard tries again.
+    refused: AtomicBool,
+    /// The refusal was said; again only after an install is honoured.
+    refusal_told: AtomicBool,
 }
 
 impl RedirectLatch {
@@ -922,6 +1010,66 @@ impl RedirectLatch {
     fn is_restored(&self) -> bool {
         self.restored.load(Ordering::SeqCst)
     }
+
+    /// Call with the turn held, after an install or a lift.
+    fn next_generation(&self) -> u64 {
+        self.generation.fetch_add(1, Ordering::SeqCst) + 1
+    }
+}
+
+/// Ask whether the OS honours the install of `generation`, on a thread of its
+/// own: the answer can cost a process, and neither the listener nor a stop
+/// waits on it. A refused install is withdrawn — left in place it buys
+/// nothing while the resolver reads as armed — unless the run moved on.
+fn confirm_in_background(
+    redirect: Arc<dyn SystemDnsRedirectPort>,
+    handle: RedirectHandle,
+    latch: Arc<RedirectLatch>,
+    generation: u64,
+) {
+    let ask = move || {
+        match redirect.confirm(&handle) {
+            Ok(RedirectState::Active) => {
+                latch.refusal_told.store(false, Ordering::SeqCst);
+                return;
+            }
+            Ok(RedirectState::Inactive) => {}
+            Err(error) => {
+                tracing::debug!(target: "nrr::dns-resolver", error = %error, "redirect verdict unavailable");
+                return;
+            }
+        }
+        let _held = latch.hold();
+        if latch.is_restored() || latch.generation.load(Ordering::SeqCst) != generation {
+            return;
+        }
+        match redirect.restore(&handle) {
+            Ok(()) => {
+                let _ = redirect.flush_cache();
+                latch.next_generation();
+                latch.refused.store(true, Ordering::SeqCst);
+                if !latch.refusal_told.swap(true, Ordering::SeqCst) {
+                    tracing::warn!(
+                        target: "nrr::dns-resolver",
+                        msg_key = "dns-resolver-redirect-refused",
+                        "Mode B: the system took the DNS redirect and then refused it; it was withdrawn, names resolve past the resolver, and it is tried again",
+                    );
+                }
+            }
+            Err(error) => tracing::warn!(
+                target: "nrr::dns-resolver",
+                msg_key = "dns-resolver-restore-failed",
+                error = %error,
+                "Mode B: the system refused the DNS redirect and it could not be withdrawn",
+            ),
+        }
+    };
+    if let Err(error) = std::thread::Builder::new()
+        .name("nrr-dns-redirect-confirm".to_string())
+        .spawn(ask)
+    {
+        tracing::debug!(target: "nrr::dns-resolver", error = %error, "could not ask for the redirect verdict");
+    }
 }
 
 /// What the guard shares with the rest of the run. The default is a guard on
@@ -931,6 +1079,8 @@ struct GuardLinks {
     latch: Arc<RedirectLatch>,
     pool: Option<Arc<crate::dns_upstream::UpstreamDnsPool>>,
     liveness: Option<Arc<TaskLiveness>>,
+    /// [`LIFT_AFTER_DARK`]; zero lifts at the first dark check.
+    lift_after_dark: Duration,
 }
 
 impl GuardLinks {
@@ -1450,8 +1600,25 @@ mod tests {
         short_name_claims: Mutex<Vec<Vec<String>>>,
         /// How many keep-short-names calls fail before one holds.
         short_names_fail: std::sync::atomic::AtomicUsize,
+        /// How many confirmations answer that the OS refused the redirect.
+        refusals: std::sync::atomic::AtomicUsize,
+        /// A confirmation waits here until the test lets it answer.
+        confirm_gate: Mutex<Option<std::sync::mpsc::Receiver<()>>>,
     }
     impl SystemDnsRedirectPort for RecordingRedirect {
+        fn confirm(&self, _handle: &RedirectHandle) -> Result<RedirectState, PlatformError> {
+            self.calls.lock().unwrap().push("confirm");
+            let gate = self.confirm_gate.lock().unwrap().take();
+            if let Some(gate) = gate {
+                let _ = gate.recv();
+            }
+            let left = self.refusals.load(Ordering::SeqCst);
+            if left > 0 {
+                self.refusals.store(left - 1, Ordering::SeqCst);
+                return Ok(RedirectState::Inactive);
+            }
+            Ok(RedirectState::Active)
+        }
         fn redirect_to(&self, listener: SocketAddr) -> Result<RedirectHandle, PlatformError> {
             *self.bound.lock().unwrap() = Some(listener);
             let mut calls = self.calls.lock().unwrap();
@@ -2813,8 +2980,10 @@ mod tests {
         }
     }
 
+    /// The budget only bounds a hang: a loaded guest stalls the guard thread
+    /// for seconds, and a pass costs no more for it.
     fn wait_for(what: &str, condition: impl Fn() -> bool) {
-        let deadline = Instant::now() + Duration::from_secs(10);
+        let deadline = Instant::now() + Duration::from_secs(60);
         while !condition() {
             assert!(Instant::now() < deadline, "timed out waiting for {what}");
             std::thread::sleep(Duration::from_millis(10));
@@ -2934,6 +3103,7 @@ mod tests {
             "127.0.0.1:0".parse().unwrap(),
         )
         .with_guard_interval(Duration::from_millis(20))
+        .with_lift_after_dark(Duration::from_millis(100))
         .with_namespace_exemptions(Arc::new(|| vec![exemption("branch.corp.example")]));
         let run = std::thread::spawn({
             let stop = Arc::clone(&stop);
@@ -2973,6 +3143,126 @@ mod tests {
             positions.len(),
             4,
             "install, lift, re-install, stop: {calls:?}"
+        );
+    }
+
+    fn count_of(redirect: &RecordingRedirect, name: &str) -> usize {
+        redirect
+            .calls
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|c| **c == name)
+            .count()
+    }
+
+    /// A router that drops out for a moment and comes back: lifting the
+    /// redirect and putting it back costs a rewrite and a cache flush each
+    /// way, and every name the machine asked in between missed the rules.
+    #[test]
+    fn an_upstream_back_within_the_hold_keeps_the_redirect() {
+        let probe = Arc::new(SwitchProbe(Mutex::new(false)));
+        let pool = Arc::new(crate::dns_upstream::UpstreamDnsPool::new(
+            Arc::new(nrr_platform_api::dns::StaticDnsServers::new(vec![
+                "192.0.2.53".parse().expect("ip"),
+            ])),
+            Arc::clone(&probe) as Arc<dyn crate::dns_upstream::UpstreamProbe>,
+        ));
+        assert_eq!(pool.refresh(), None, "nothing answers at arm time");
+        let stop = Arc::new(AtomicBool::new(false));
+        let redirect = Arc::new(RecordingRedirect::default());
+        let service = DnsResolverService::new(
+            listener().with_upstream_pool(pool),
+            redirect.clone(),
+            "127.0.0.1:0".parse().unwrap(),
+        )
+        .with_guard_interval(Duration::from_millis(20))
+        .with_lift_after_dark(Duration::from_millis(4500));
+        let run = std::thread::spawn({
+            let stop = Arc::clone(&stop);
+            move || service.run(&stop)
+        });
+        std::thread::sleep(Duration::from_millis(200));
+        *probe.0.lock().unwrap() = true;
+        std::thread::sleep(Duration::from_millis(5500));
+        stop.store(true, Ordering::SeqCst);
+        run.join().expect("run");
+        let calls = redirect.calls.lock().unwrap().clone();
+        assert_eq!(count_of(&redirect, "redirect_to"), 1, "{calls:?}");
+        assert_eq!(
+            count_of(&redirect, "restore"),
+            1,
+            "only the stop: {calls:?}"
+        );
+    }
+
+    /// The OS sends names to the listener from the moment the redirect is
+    /// written; the verdict on it costs a process. Asked before serving, it
+    /// left every name unanswered for its length, and a stop waited on it.
+    #[test]
+    fn a_slow_verdict_holds_neither_the_answers_nor_the_stop() {
+        let (release, gate) = std::sync::mpsc::channel::<()>();
+        let stop = Arc::new(AtomicBool::new(false));
+        let redirect = Arc::new(RecordingRedirect {
+            confirm_gate: Mutex::new(Some(gate)),
+            ..Default::default()
+        });
+        let service =
+            DnsResolverService::new(listener(), redirect.clone(), "127.0.0.1:0".parse().unwrap());
+        let run = std::thread::spawn({
+            let stop = Arc::clone(&stop);
+            move || service.run(&stop)
+        });
+        // Only a serving loop sees the stop: asked before serving, the
+        // verdict would hold the run until it is released.
+        wait_for("the verdict to be asked", || {
+            count_of(&redirect, "confirm") == 1
+        });
+        let stopped_at = Instant::now();
+        stop.store(true, Ordering::SeqCst);
+        run.join().expect("run");
+        assert!(
+            stopped_at.elapsed() < Duration::from_secs(2),
+            "the stop waited on the verdict: {:?}",
+            stopped_at.elapsed()
+        );
+        drop(release);
+    }
+
+    /// A redirect the OS accepted as written and then refused buys nothing:
+    /// it is taken back while the listener serves, and tried again later.
+    #[test]
+    fn a_redirect_the_os_refuses_is_withdrawn_and_tried_again() {
+        let stop = Arc::new(AtomicBool::new(false));
+        let redirect = Arc::new(RecordingRedirect {
+            refusals: std::sync::atomic::AtomicUsize::new(1),
+            ..Default::default()
+        });
+        let service =
+            DnsResolverService::new(listener(), redirect.clone(), "127.0.0.1:0".parse().unwrap())
+                .with_guard_interval(Duration::from_millis(20));
+        let run = std::thread::spawn({
+            let stop = Arc::clone(&stop);
+            move || service.run(&stop)
+        });
+        wait_for("the refused redirect to be withdrawn", || {
+            count_of(&redirect, "restore") == 1
+        });
+        wait_for("the redirect to be tried again", || {
+            count_of(&redirect, "redirect_to") == 2
+        });
+        wait_for("the second try to be confirmed", || {
+            count_of(&redirect, "confirm") == 2
+        });
+        stop.store(true, Ordering::SeqCst);
+        assert_eq!(
+            run.join().expect("run"),
+            DnsResolverRunOutcome::ServedAndRestored
+        );
+        assert_eq!(
+            count_of(&redirect, "restore"),
+            2,
+            "withdrawn, then the stop"
         );
     }
 }

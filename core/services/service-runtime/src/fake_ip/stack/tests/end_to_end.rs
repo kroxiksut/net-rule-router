@@ -369,3 +369,137 @@ fn an_upstream_that_refuses_the_write_resets_the_client() {
     assert!(sent, "the connection was established and the request sent");
     assert!(reset, "a write the server refused must reset the client");
 }
+
+/// The server closed first, so the relay holds the old connection in
+/// TIME-WAIT. A client that reuses its port then must get its new connection
+/// at once, not after the old one's ten-second linger.
+#[test]
+fn a_client_reusing_its_port_after_a_server_close_connects_at_once() {
+    use nrr_platform_api::fake_ip::{FakeIpAllocator, FakeIpScope};
+
+    const MTU: u16 = 1500;
+    const CLIENT_PORT: u16 = 49700;
+    let client_addr = std::net::Ipv4Addr::new(10, 0, 0, 1);
+    let mut allocator = FakeIpAllocator::default();
+    let fake_v4 = allocator.allocate("reuse.test").expect("allocate").v4;
+    let relay = RelayCore::new(
+        Arc::new(StdMutex::new(allocator)),
+        FakeIpScope::enabled(Vec::<String>::new()),
+        Arc::new(
+            relay::StaticUpstreamResolver::new()
+                .with("reuse.test", &[std::net::IpAddr::V4(fake_v4)]),
+        ),
+        Arc::new(relay::FixedRouteSelector(nrr_shared::RouteRole::Primary)),
+    );
+    let c2s: PacketQueue = Arc::new(StdMutex::new(VecDeque::new()));
+    let s2c: PacketQueue = Arc::new(StdMutex::new(VecDeque::new()));
+    let mut stack = FakeIpStack::new(
+        Box::new(PipeTunDevice {
+            inbound: Arc::clone(&c2s),
+            outbound: Arc::clone(&s2c),
+            mtu: MTU,
+        }),
+        &FakeIpPoolConfig::default(),
+        relay,
+        Arc::new(ScriptedUpstream::new(b"HTTP/1.1 200 OK\r\n\r\nbye")),
+        StackWaker::new(),
+    );
+    let mut client_device = PipeClientDevice {
+        inbound: Arc::clone(&s2c),
+        outbound: Arc::clone(&c2s),
+        mtu: usize::from(MTU),
+    };
+    let mut client = Interface::new(
+        Config::new(HardwareAddress::Ip),
+        &mut client_device,
+        SmolInstant::from_millis(0),
+    );
+    client.update_ip_addrs(|addrs| {
+        let _ = addrs.push(IpCidr::new(IpAddress::Ipv4(client_addr), 24));
+    });
+    let _ = client
+        .routes_mut()
+        .add_default_ipv4_route(std::net::Ipv4Addr::new(10, 0, 0, 2));
+    let mut client_sockets = SocketSet::new(Vec::new());
+    let new_socket = || {
+        tcp::Socket::new(
+            tcp::SocketBuffer::new(vec![0u8; 8192]),
+            tcp::SocketBuffer::new(vec![0u8; 8192]),
+        )
+    };
+    let first = client_sockets.add(new_socket());
+    client_sockets
+        .get_mut::<tcp::Socket>(first)
+        .connect(
+            client.context(),
+            (IpAddress::Ipv4(fake_v4), 443),
+            CLIENT_PORT,
+        )
+        .expect("connect initiates");
+
+    let mut now_ms = 0u64;
+    let mut tick = |now_ms: &mut u64,
+                    client: &mut Interface,
+                    client_sockets: &mut SocketSet<'_>,
+                    stack: &mut FakeIpStack| {
+        *now_ms += 5;
+        let t = SmolInstant::from_millis(i64::try_from(*now_ms).unwrap_or(i64::MAX));
+        client.poll(t, &mut client_device, client_sockets);
+        for _ in 0..4 {
+            stack.step(*now_ms).expect("stack step");
+        }
+        std::thread::sleep(Duration::from_millis(1));
+    };
+
+    // First connection: request, response, the server's close, ours.
+    let mut sent = false;
+    let mut closed = false;
+    for _ in 0..3000 {
+        tick(&mut now_ms, &mut client, &mut client_sockets, &mut stack);
+        let socket = client_sockets.get_mut::<tcp::Socket>(first);
+        if !sent && socket.state() == tcp::State::Established {
+            sent = socket.send_slice(b"GET / HTTP/1.1\r\n\r\n").is_ok();
+        }
+        let mut sink = [0u8; 256];
+        while socket.can_recv() && socket.recv_slice(&mut sink).is_ok_and(|n| n > 0) {}
+        if socket.state() == tcp::State::CloseWait {
+            socket.close();
+        }
+        if sent && socket.state() == tcp::State::Closed {
+            closed = true;
+            break;
+        }
+    }
+    assert!(closed, "the first connection ran to a clean close");
+    let lingering = stack
+        .flows
+        .values()
+        .any(|flow| stack.sockets.get::<tcp::Socket>(flow.handle).state() == tcp::State::TimeWait);
+    assert!(lingering, "the relay closed first and holds TIME-WAIT");
+
+    // Same port again.
+    client_sockets.remove(first);
+    let second = client_sockets.add(new_socket());
+    client_sockets
+        .get_mut::<tcp::Socket>(second)
+        .connect(
+            client.context(),
+            (IpAddress::Ipv4(fake_v4), 443),
+            CLIENT_PORT,
+        )
+        .expect("reconnect initiates");
+    let reconnect_at = now_ms;
+    let mut established_after = None;
+    for _ in 0..6000 {
+        tick(&mut now_ms, &mut client, &mut client_sockets, &mut stack);
+        if client_sockets.get::<tcp::Socket>(second).state() == tcp::State::Established {
+            established_after = Some(now_ms - reconnect_at);
+            break;
+        }
+    }
+    let waited = established_after.expect("the reused port connects at all");
+    assert!(
+        waited < 1_000,
+        "the new connection waited {waited} ms behind the old one's TIME-WAIT"
+    );
+}

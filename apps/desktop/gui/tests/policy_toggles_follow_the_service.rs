@@ -5,9 +5,10 @@
 //! follows a confirmed write, a refused write puts the controls back, and
 //! nothing in the panel writes the policy on its own.
 
-use std::io::Write;
+#[path = "support/js.rs"]
+mod js;
+
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
 
 use serde_json::{json, Value};
 
@@ -32,37 +33,12 @@ fn function_body<'a>(source: &'a str, name: &str) -> &'a str {
     &rest[..end]
 }
 
-/// `pure.js` plus `body`, run by node; `None` when node is not installed.
-fn run_pure(body: &str) -> Option<Value> {
-    let pure = repo_file("apps/desktop/qml/lib/pure.js").replace(".pragma library", "");
-    let mut child = Command::new("node")
-        .arg("-")
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .unwrap_or_else(|e| {
-            panic!("this check runs the QML JavaScript through node; install Node.js ({e})")
-        });
-    let Some(stdin) = child.stdin.as_mut() else {
-        panic!("stdin was piped")
-    };
-    stdin
-        .write_all(format!("{pure}\n{body}\n").as_bytes())
-        .unwrap_or_else(|e| panic!("write the harness to node: {e}"));
-    let out = child
-        .wait_with_output()
-        .unwrap_or_else(|e| panic!("node runs to completion: {e}"));
-    assert!(
-        out.status.success(),
-        "node rejected the harness: {}",
-        String::from_utf8_lossy(&out.stderr)
-    );
-    let text = String::from_utf8_lossy(&out.stdout).into_owned();
-    Some(
-        serde_json::from_str(text.trim())
-            .unwrap_or_else(|e| panic!("harness output is not JSON: {e}; output: {text}")),
-    )
+/// `pure.js` plus `body`, run; what it logged, as JSON.
+fn run_pure(body: &str) -> Value {
+    let pure = repo_file("apps/desktop/qml/lib/pure.js");
+    let text = js::run_js(&format!("{pure}\n{body}\n"));
+    serde_json::from_str(text.trim())
+        .unwrap_or_else(|e| panic!("harness output is not JSON: {e}; output: {text}"))
 }
 
 /// Lines that assign a `route*` preference in place (`root.prefs.routeX = `).
@@ -174,7 +150,7 @@ fn the_restored_notice_went_with_the_reseed() {
 
 #[test]
 fn the_mirror_patch_names_only_mirrored_keys_the_write_changed() {
-    let Some(out) = run_pure(
+    let out = run_pure(
         r#"var req = { "mode": "prefer-secondary", "kill-switch-protocols": 3,
             "doh-lockdown-enabled": true, "include-subdomains": false, "primary": { "stable-id": "a" } };
         console.log(JSON.stringify([
@@ -183,10 +159,7 @@ fn the_mirror_patch_names_only_mirrored_keys_the_write_changed() {
             routePolicyPrefMirrorPatch(req, []),
             routePolicyPrefMirrorPatch({}, ["kill-switch-protocols"])
         ]))"#,
-    ) else {
-        eprintln!("node not available - skipping the mirror-patch check");
-        return;
-    };
+    );
     assert_eq!(
         out,
         json!([

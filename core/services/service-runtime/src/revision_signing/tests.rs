@@ -284,11 +284,32 @@ fn only_another_users_revisions_make_an_acknowledgement_speak_for_them() {
     previous_run(&host, &key_store);
     let reads = other_principals_hold_revisions(Arc::clone(&host.conn));
 
-    assert!(
-        !reads(USER),
-        "the caller's own and the baseline's rows only"
-    );
+    assert!(!reads(USER), "the caller's own rows only");
     assert!(reads("S-1-5-21-0-0-0-3002"));
+}
+
+/// The baseline is the administrator's: an unelevated user clearing an alert
+/// must not re-sign its rows, which every user who has not diverged runs.
+#[test]
+fn the_baselines_revisions_make_an_acknowledgement_speak_for_the_administrator() {
+    let host = host();
+    let key_store = Arc::new(InMemKeyStore::new());
+    previous_run(&host, &key_store);
+    host.conn
+        .lock()
+        .expect("conn")
+        .execute(
+            "INSERT INTO revisions (principal, revision_id, content_hash, rules_json, status,
+                 source, correlation_id, created_at)
+             VALUES (?1, 'rev-base', 'h-base', '{}', 'superseded', 'gui-rules-edit', 'c', 1)",
+            [nrr_storage::BASELINE_PRINCIPAL],
+        )
+        .expect("baseline row");
+    let reads = other_principals_hold_revisions(Arc::clone(&host.conn));
+    assert!(
+        reads(USER),
+        "the baseline's rows are not the caller's to adopt"
+    );
 }
 
 fn gated_executor(host: &Host, coord: &Arc<ActivationCoordinator>) -> ProductionMutationExecutor {
@@ -435,6 +456,38 @@ fn a_tampered_active_revision_caught_live_needs_one_acknowledgement() {
         "names the edited revision"
     );
     assert_one_acknowledgement_settles(&host, &coord);
+}
+
+/// An acknowledgement that adopted nothing (a client that sent no row list)
+/// does not lift the alert: the tampered row would stay in the database with
+/// no alert left to name it, since a raised alert is never raised twice.
+#[test]
+fn an_acknowledgement_that_adopts_nothing_leaves_the_tamper_alert_standing() {
+    let host = host();
+    let key_store = Arc::new(InMemKeyStore::new());
+    let second = previous_run(&host, &key_store);
+    edit_from_outside(&host, &second);
+    let signing = start(&host, Arc::clone(&key_store) as _, BOOT_MS + 1_000);
+    let coord = Arc::new(signing.sign(unsigned_coordinator(&host)));
+    let _watch = signing.enforce_and_watch(Some(&coord));
+    let exec = gated_executor(&host, &coord);
+    let alert_id = only_tamper_alert(&host);
+
+    let _ = exec.execute(
+        StoredMutation {
+            kind: MutationKind::SecurityAlertAck,
+            payload: serde_json::json!({ "alert-id": alert_id }),
+            correlation_id: None,
+            issuer_sid: USER.to_string(),
+            caller_is_elevated: false,
+        },
+        USER,
+    );
+
+    assert_eq!(only_tamper_alert(&host), alert_id, "the alert still stands");
+    assert!(crate::tamper_bootstrap::mutations_blocked_by_alert(
+        host.alerts.as_ref()
+    ));
 }
 
 /// No coordinator means no rollback, and still the alert for every row found.

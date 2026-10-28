@@ -356,39 +356,33 @@ pub struct PresetExportGetResponse {
 /// Read-only export of the full user settings as a YAML
 /// blob conforming to docs/en/rules-file-format.md Settings Export Format
 ///
-/// Includes: adapter bindings (system ID, user label, confirmation
-/// status), rules file paths (paths only — the on-disk content lives in
-/// the txt files separately), behavior settings (route mode).
+/// Includes: adapter bindings, the rules of both routes in force for the
+/// caller (rules-file text), the bound rules-file paths, the default route
+/// and leak protection. Excludes UI preferences, revision metadata and
+/// runtime probe state.
 ///
-/// Excludes: UI preferences (theme, language, accessibility, route
-/// display labels) — device-specific, set again on each device;
-/// internal revision metadata; runtime probe state.
-///
-/// # Client-supplied fields
-///
-/// The service is the source of truth for adapter bindings and route
-/// behavior mode, but NOT for the user's chosen rules-file paths on
-/// disk (those live in `UiPreferences::last_saved_path_<role>` —
-/// device-local). The caller forwards the paths in this request; the
-/// service splices them into the YAML at the `rules_files:` block.
-/// When omitted, the corresponding YAML field is left empty.
-///
-/// # Migration note
-///
-/// `file_change_behavior` and `include_child_processes` (per docs/en/rules-file-format.md Settings Export Format) are GUI preferences that are migrating to per-SID service
-/// storage but are not yet wired. This export emits the YAML without
-/// those keys; they'll be added as a follow-up once that storage settles.
+/// The paths are the caller's: they live in `user-settings.json`, which the
+/// service never reads, so both clients forward its `rules-files` here.
+/// Omitted paths are written empty.
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub struct SettingsExportFullRequest {
-    /// User-chosen path of the primary rules file (from
-    /// `UiPreferences::last_saved_path_primary`). Empty/omitted ⇒ no
-    /// path written to YAML.
+    /// Bound primary rules file (`user-settings.json` `rules-files`).
+    /// Empty/omitted ⇒ no path written to YAML.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rules_file_path_primary: Option<String>,
     /// Same for secondary.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rules_file_path_secondary: Option<String>,
+    /// Sections of the primary rules file this build does not apply (another
+    /// system's programs, a newer build's sections), name to raw body, as for
+    /// [`PresetExportGetRequest::passthrough_sections`]: the service keeps
+    /// none of them, so only the caller can carry them into the export.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub passthrough_sections_primary: std::collections::BTreeMap<String, String>,
+    /// Same for secondary.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub passthrough_sections_secondary: std::collections::BTreeMap<String, String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

@@ -441,12 +441,12 @@ pub(crate) fn rule_host_resolver(
         }
         DnsCapture::Unavailable => Arc::new(|| None),
     };
-    Arc::new(HostsBypassDnsResolver::new(
-        system,
-        bypass_enabled,
-        upstream,
-        HOSTS_BYPASS_QUERY_TIMEOUT,
-    ))
+    Arc::new(
+        HostsBypassDnsResolver::new(system, bypass_enabled, upstream, HOSTS_BYPASS_QUERY_TIMEOUT)
+            .with_hosts(Arc::new(
+                nrr_platform_api::hosts_file::OsHostsFileReader::new(),
+            )),
+    )
 }
 
 /// Same helper and same two feeds as the listener's own `system_dns` cache

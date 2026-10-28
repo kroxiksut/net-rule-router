@@ -272,6 +272,12 @@ const THREADS: &[(&str, &str, usize, Verdict)] = &[
         Verdict::Bounded("one enforcement-mode apply off the IPC thread"),
     ),
     (
+        "service-runtime/src/dns_resolver_service.rs",
+        "nrr-dns-redirect-confirm",
+        1,
+        Verdict::Bounded("asks the OS once whether it honours one redirect install"),
+    ),
+    (
         "service-runtime/src/dns_resolver_ports.rs",
         UNNAMED,
         1,

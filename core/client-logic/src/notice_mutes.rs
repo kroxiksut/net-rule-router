@@ -74,9 +74,30 @@ pub const MUTABLE_NOTICE_KINDS: [MutableNoticeKind; 11] = [
     },
 ];
 
-/// The kind told even while the tray is closed; listed only where the
-/// platform can start the tray to tell it (`siteNoticeWithoutTray`).
+/// The kind told even while the tray is closed where the platform can start
+/// the tray to tell it (`siteNoticeWithoutTray`); elsewhere only the open tray
+/// tells it.
 pub const SITE_NOT_OPENING_KIND: &str = "site-not-opening";
+
+/// Its title where the tray cannot be started to tell it.
+const SITE_NOT_OPENING_TRAY_TITLE: (&str, &str) =
+    ("tray.site-not-opening.title", "A site does not open");
+
+/// The title Settings lists `kind` under, or `None` when it is not listed.
+/// The site notice is listed where the tray can be started to tell it, and
+/// wherever a mute of it holds, which the tray's card sets on any platform and
+/// only this row can lift; there it makes no closed-tray promise.
+pub fn notice_kind_row(
+    kind: &str,
+    site_notice_without_tray: bool,
+    muted: bool,
+) -> Option<(&'static str, &'static str)> {
+    let entry = MUTABLE_NOTICE_KINDS.iter().find(|k| k.slug == kind)?;
+    if kind != SITE_NOT_OPENING_KIND || site_notice_without_tray {
+        return Some((entry.title_key, entry.title_en));
+    }
+    muted.then_some(SITE_NOT_OPENING_TRAY_TITLE)
+}
 
 /// How long each answer of the chooser holds, in milliseconds; 0 is "until
 /// lifted".

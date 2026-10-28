@@ -10,7 +10,7 @@ use windows::Win32::System::Registry::{HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE};
 use nrr_platform_api::app_folders::{AppPath, PathPrograms, ProgramFolderIndex};
 
 use super::{
-    dedup_paths, glob_match, matching_images, BackgroundWalks, ProcessImages, ResolveCache,
+    app_name_matches, dedup_paths, matching_images, BackgroundWalks, ProcessImages, ResolveCache,
 };
 use crate::app_path_resolver::AppPathResolver;
 use crate::win32_ffi::{process, registry};
@@ -420,7 +420,7 @@ fn resolve_from_app_paths(query: &str, is_glob: bool) -> Vec<PathBuf> {
     for hive in [HKEY_LOCAL_MACHINE, HKEY_CURRENT_USER] {
         if is_glob {
             for sub in registry::enum_subkeys(hive, APP_PATHS_SUBKEY) {
-                if glob_match(query, &sub) {
+                if app_name_matches(query, &sub) {
                     let full = format!(r"{APP_PATHS_SUBKEY}\{sub}");
                     if let Some(raw) = registry::read_string(hive, &full, None) {
                         push_registry_path(&mut out, &raw);
@@ -609,7 +609,7 @@ fn walk_dir_bounded(dir: &Path, query: &str, depth: u32, budget: &mut u32, out: 
             *budget = budget.saturating_sub(1);
             if let Some(name) = path.file_name() {
                 let name = name.to_string_lossy();
-                if name.to_ascii_lowercase().ends_with(".exe") && glob_match(query, &name) {
+                if name.to_ascii_lowercase().ends_with(".exe") && app_name_matches(query, &name) {
                     out.push(path);
                 }
             }
@@ -878,6 +878,32 @@ mod tests {
                 .file_name()
                 .is_some_and(|n| n.eq_ignore_ascii_case("target.exe"))),
             "{found:?}"
+        );
+    }
+
+    /// The observer counts `qbittorrent.exe` under `*torrent` (it folds the
+    /// `.exe` spelling away); a resolver that did not would leave the same
+    /// rule with learned addresses but no filter on the program itself.
+    #[test]
+    fn a_glob_without_the_exe_suffix_finds_the_program_the_observer_counts() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let app = dir.path().join("qBittorrent");
+        std::fs::create_dir_all(&app).expect("mkdir");
+        std::fs::write(app.join("qbittorrent.exe"), b"").expect("write");
+        std::fs::write(app.join("updater.exe"), b"").expect("write");
+
+        let found = walk(dir.path(), "*torrent", 4, 100);
+        assert_eq!(found, vec![app.join("qbittorrent.exe")], "disk walk");
+
+        let running = [app.join("qbittorrent.exe"), app.join("updater.exe")];
+        assert_eq!(
+            matching_images("*torrent", &running),
+            vec![app.join("qbittorrent.exe")],
+            "running images"
+        );
+        assert!(
+            matching_images("qbittorrent.exe", &running).len() == 1,
+            "an exact name still matches its own file only"
         );
     }
 

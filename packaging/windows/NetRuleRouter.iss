@@ -157,6 +157,8 @@ var
   { The service binary's code when staging the prepared files failed; 0 otherwise. }
   ProvisionExitCode: Integer;
   RegisterFailed: Boolean;
+  { Setup stopped the service and Register has not taken it over yet. }
+  ServiceStoppedBySetup: Boolean;
 
 const
   { The MSI's UpgradeCode (NetRuleRouter.wxs), and this Setup's uninstall key:
@@ -326,8 +328,19 @@ begin
   end;
   ExtractTemporaryFile('setup-actions.ps1');
   ExtractTemporaryFile('service-paths.ps1');
+  ServiceStoppedBySetup := True;
   if RunAction(ExpandConstant('{tmp}\setup-actions.ps1'), '-Action Stop') <> 0 then
     Result := CustomMessage('ServiceStopFailed');
+end;
+
+{ A Setup that stopped the service and ends without installing (cancelled,
+  refused, failed) starts it again: kept protection with no service behind it
+  holds the network with nothing maintaining it. }
+procedure DeinitializeSetup();
+begin
+  if ServiceStoppedBySetup then
+    if RunAction(ExpandConstant('{tmp}\setup-actions.ps1'), '-Action Resume') <> 0 then
+      Log('the service Setup stopped did not start again');
 end;
 
 procedure CurStepChanged(CurStep: TSetupStep);
@@ -345,6 +358,7 @@ begin
         IntToStr(ProvisionExitCode), ActionLog()]), mbError, MB_OK, IDOK);
   end;
   RegisterFailed := RunAction(ExpandConstant('{app}\scripts\setup-actions.ps1'), '-Action Register') <> 0;
+  ServiceStoppedBySetup := False;
   if RegisterFailed then
     SuppressibleMsgBox(FmtMessage(CustomMessage('ServiceRegisterFailed'), [ActionLog()]),
       mbError, MB_OK, IDOK);

@@ -86,15 +86,26 @@ impl fmt::Display for SharedIpPolicy {
     }
 }
 
+/// The unit both sides of the census count in: the site, not the name. Whoever
+/// owns a domain mints names under it for free, so a count of names under a
+/// zone rule is a count the other side of the page chooses.
+#[must_use]
+pub fn census_site(hostname: &str) -> String {
+    let host = hostname.trim().trim_end_matches('.');
+    crate::companion_affinity::registrable_domain(host)
+        .unwrap_or(host)
+        .to_ascii_lowercase()
+}
+
 /// Decide whether a secondary IP should be committed to the secondary (VPN)
 /// link under `policy`.
 ///
-/// - `rule_on_ip`: distinct secondary-rule hostnames resolving to this IP (≥ 1
-///   by construction — the IP is only a candidate because a secondary rule
-///   resolved to it).
-/// - `direct_on_ip`: distinct NON-secondary (innocent / primary-rule) hostnames
-///   observed sharing this IP. `0` ⇒ the IP is not actually shared.
-/// - `total_rule`: distinct secondary-rule hostnames across ALL IPs.
+/// - `rule_on_ip`: distinct sites ([`census_site`]) among the secondary-rule
+///   hosts resolving to this IP (≥ 1 by construction — the IP is only a
+///   candidate because a secondary rule resolved to it).
+/// - `direct_on_ip`: distinct sites among the NON-secondary (innocent /
+///   primary-rule) hosts observed sharing this IP. `0` ⇒ not actually shared.
+/// - `total_rule`: distinct sites among the secondary-rule hosts across ALL IPs.
 ///
 /// A non-shared IP (`direct_on_ip == 0`) is ALWAYS committed — the policy only
 /// governs genuinely shared addresses, so normal single-tenant routing is
