@@ -1069,8 +1069,8 @@ fn finished(app: &mut AppState, finished: Finished) {
     settle(app);
 }
 
-/// The baseline applies now: the list is read back. The user's rules files
-/// are not rewritten — they are the user's copy of what was dropped.
+/// The baseline applies now: the list is read back and the bound files are
+/// written from it, as the review said; a hand-edited one is asked about.
 fn reset_finished(app: &mut AppState, finished: Finished) {
     let rules = &mut app.rules;
     rules.busy = None;
@@ -1087,6 +1087,7 @@ fn reset_finished(app: &mut AppState, finished: Finished) {
         Finished::Failed(failure) => Note::failed(text::RESET_FAILED, failure),
     });
     if applied {
+        app.rules.verdicts.rewrite_files = true;
         load(app);
     }
 }
@@ -1103,6 +1104,8 @@ fn start_reset(app: &mut AppState) {
         app.rules.note = Some(Note::new(text::APPLY_OFFLINE));
         return;
     }
+    // The review names the files the reset rewrites, as bound right now.
+    refresh_bound_paths(app);
     app.rules.resetting = true;
     app.rules.busy = Some(Busy::Previewing);
     app.rules.note = None;

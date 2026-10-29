@@ -72,6 +72,9 @@ mod windows_impl {
     /// DPAPI binding and DACL.
     const RESIGN_MARKER_FILE_NAME: &str = "db-mac-resign-pending.bin";
 
+    /// The record of the active rules, beside the key like the marker.
+    const RULES_ANCHOR_FILE_NAME: &str = "db-mac-rules-anchor.bin";
+
     /// SDDL granting only `LocalSystem` (`SY`) full file access (`FA`)
     /// on a protected DACL (`P` — block inheritance from the parent).
     /// Administrators are intentionally absent: per the threat model an
@@ -137,6 +140,11 @@ mod windows_impl {
             self.path.with_file_name(RESIGN_MARKER_FILE_NAME)
         }
 
+        /// The active-rules record's path, a sibling of the key blob.
+        pub fn rules_anchor_path(&self) -> PathBuf {
+            self.path.with_file_name(RULES_ANCHOR_FILE_NAME)
+        }
+
         /// Raw ciphertext at `path`; `None` when absent or zero-length (a
         /// truncated write reads as never written).
         fn read_blob(path: &Path) -> Result<Option<Vec<u8>>, PlatformError> {
@@ -177,6 +185,20 @@ mod windows_impl {
             replace_write_through(&tmp, path)?;
             self.tighten_acl(path);
             Ok(())
+        }
+
+        /// Marks that the key blob failed to decrypt once.
+        fn failure_note_path(&self) -> PathBuf {
+            self.path.with_extension("bin.unreadable-once")
+        }
+
+        /// Where a blob that failed twice is kept.
+        fn aside_path(&self) -> PathBuf {
+            let secs = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| d.as_secs());
+            self.path
+                .with_extension(format!("bin.undecryptable-{secs}"))
         }
 
         fn remove(path: &Path) -> Result<(), PlatformError> {
@@ -251,21 +273,39 @@ mod windows_impl {
             let Some(ciphertext) = Self::read_blob(&self.path)? else {
                 return Ok(None);
             };
+            let note = self.failure_note_path();
             match dpapi_unprotect(&ciphertext) {
-                Ok(plaintext) => Ok(Some(plaintext)),
+                Ok(plaintext) => {
+                    let _ = std::fs::remove_file(&note);
+                    Ok(Some(plaintext))
+                }
+                // The master key may not be reachable yet early in a boot,
+                // and this blob is the only copy of the key every revision is
+                // signed with: one failure keeps it for the next boot, and
+                // this boot runs unsigned.
+                Err(e) if !note.exists() => {
+                    let _ = std::fs::write(&note, b"");
+                    tracing::warn!(
+                        target: "nrr::keystore",
+                        error = %e,
+                        path = %self.path.display(),
+                        "DB-MAC key blob is undecryptable; kept for the next start",
+                    );
+                    Err(PlatformError::Transient {
+                        operation: "key_store::load::unprotect",
+                        detail: e.to_string(),
+                    })
+                }
+                // The same failure on a second boot: written under another
+                // account or profile. Set aside, never deleted, so the tamper
+                // bootstrap makes a new key and raises its key-reset alert.
                 Err(e) => {
-                    // The blob exists but can't be decrypted under the
-                    // current DPAPI context — e.g. it was written under a
-                    // different account/profile (common after dev runs)
-                    // or the LocalSystem master key path is unavailable
-                    // (`0x80070003`). The DB-MAC key is rebuildable, so
-                    // report it as ABSENT rather than propagating the
-                    // error: the tamper bootstrap then regenerates it,
-                    // re-saves under the current context (self-healing on
-                    // the next boot), and raises a `KeyReset` alert if
-                    // there is existing data — instead of hard-failing the
-                    // whole integrity scan and running the coordinator
-                    // unsigned.
+                    let aside = self.aside_path();
+                    std::fs::rename(&self.path, &aside).map_err(|io| PlatformError::Transient {
+                        operation: "key_store::load::set_aside",
+                        detail: format!("rename {}: {io}", self.path.display()),
+                    })?;
+                    let _ = std::fs::remove_file(&note);
                     tracing::warn!(
                         target: "nrr::keystore",
                         msg_key = "win-keystore-blob-undecryptable",
@@ -314,6 +354,40 @@ mod windows_impl {
 
         fn delete_resign_marker(&self) -> Result<(), PlatformError> {
             Self::remove(&self.resign_marker_path())
+        }
+
+        fn save_rules_anchor(&self, record: &[u8]) -> Result<(), PlatformError> {
+            self.write_protected(&self.rules_anchor_path(), record)
+        }
+
+        fn load_rules_anchor(&self) -> Result<Option<Vec<u8>>, PlatformError> {
+            let path = self.rules_anchor_path();
+            // Unlike the key, a zero-length record is one cut short, not one
+            // never written.
+            let ciphertext = match std::fs::read(&path) {
+                Ok(bytes) => bytes,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+                Err(e) => {
+                    return Err(PlatformError::Transient {
+                        operation: "key_store::load_rules_anchor::read",
+                        detail: format!("read {}: {e}", path.display()),
+                    })
+                }
+            };
+            // Undecryptable here means written by someone else: present, but
+            // never this service's record.
+            match dpapi_unprotect(&ciphertext) {
+                Ok(plaintext) => Ok(Some(plaintext)),
+                Err(e) => {
+                    tracing::warn!(
+                        target: "nrr::keystore",
+                        error = %e,
+                        path = %path.display(),
+                        "rules record is undecryptable under the current DPAPI context",
+                    );
+                    Ok(Some(Vec::new()))
+                }
+            }
         }
     }
 
@@ -551,5 +625,28 @@ mod tests {
         let store = WindowsDpapiKeyStore::at(dir.path().join("db-mac-key.bin"));
         std::fs::write(store.resign_marker_path(), [0x5Au8; 32]).expect("plant");
         assert_eq!(store.load_resign_marker().expect("load"), None);
+    }
+
+    /// The rules record is encrypted beside the key, and a file planted in
+    /// its place is reported as present: read as "never written", it would
+    /// pass for an upgrade and hide the change it replaced.
+    #[cfg(windows)]
+    #[test]
+    fn the_rules_record_is_kept_encrypted_and_a_planted_one_is_not_absent() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = WindowsDpapiKeyStore::at(dir.path().join("db-mac-key.bin"));
+        assert_eq!(store.load_rules_anchor().expect("load empty"), None);
+
+        let record = b"record bytes".to_vec();
+        store.save_rules_anchor(&record).expect("save");
+        let path = store.rules_anchor_path();
+        assert_eq!(path.parent(), Some(dir.path()), "beside the key");
+        assert_ne!(std::fs::read(&path).expect("read"), record, "encrypted");
+        assert_eq!(store.load_rules_anchor().expect("load"), Some(record));
+
+        std::fs::write(&path, [0x5Au8; 48]).expect("plant");
+        assert_eq!(store.load_rules_anchor().expect("load"), Some(Vec::new()));
+        std::fs::write(&path, []).expect("truncate");
+        assert_eq!(store.load_rules_anchor().expect("load"), Some(Vec::new()));
     }
 }

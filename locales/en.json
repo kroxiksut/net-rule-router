@@ -3369,13 +3369,15 @@
         "untrusted-revision-rejected": "Rule set changed outside the app",
         "integrity-check-unavailable": "Integrity check is not working",
         "provisioning-refused": "Installation files were refused",
-        "integrity-alert-other-principal": "Integrity alert in another user's rules"
+        "integrity-alert-other-principal": "Integrity alert in another user's rules",
+        "rules-store-rolled-back": "Stored rules went back to an earlier state"
       },
       "kind-detail": {
         "provisioning-refused": "The rules or settings files given to the installer could not be read or contain errors, so nothing from them was applied: the shared rules and settings stayed as they were. The service log names the file and the reason. Correct the file and run the installation with it again.",
         "untrusted-revision-rejected": "The rule set was changed outside the app, so this revision was not applied. The service continues running on the last verified rule set. This can happen after restoring the database from a backup or moving the installation to a different machine.",
         "integrity-check-unavailable": "At startup the service could not check its stored rules for changes made outside the app, for example because its integrity key could not be read. Routing continues as before, but such changes are not detected until a start where the check works again. Restart the service; if this alert comes back, export a diagnostics archive.",
-        "integrity-alert-other-principal": "The service found a change made outside the app in another user's stored rules. Rule changes on this computer are paused until an administrator reviews and acknowledges the alert."
+        "integrity-alert-other-principal": "The service found a change made outside the app in another user's stored rules. Rule changes on this computer are paused until an administrator reviews and acknowledges the alert.",
+        "rules-store-rolled-back": "The rules in force are not the ones the service saved last: a rule set was deleted outside the app, or an older copy of the database was restored. Rule changes on this computer are paused. Check the rules; an administrator's acknowledgement accepts them as they are now."
       },
       "review": {
         "title": "Acknowledge security alert",
@@ -4728,6 +4730,7 @@
     "alert-not-found": "The service no longer has this alert.",
     "illegal-state-transition": "This alert has already been handled, so it cannot be changed again.",
     "alert-rows-not-adopted": "The rules this alert lists were not accepted, so it stays open. Open it again and review them.",
+    "rules-record-not-saved": "The service could not save the rules as they are now, so the alert stays open. Try again; if it fails again, export a diagnostics archive.",
     "alerts-storage-failure": "The service could not read or save the security alerts.",
     "alerts-store-unavailable": "Security alerts are not available in the service.",
     "rule-kind-unknown": "One of the rules is of a kind this version cannot read, so nothing was saved. Update the app, or remove that rule.",

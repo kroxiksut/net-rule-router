@@ -205,7 +205,7 @@ impl ActivationCoordinator {
         // commit: a marker left behind describes an attempt that did finish,
         // which recovery can see and settle, whereas a half-written database
         // cannot be reasoned about at all.
-        {
+        self.anchored(&crate::rules_anchor::AnchorScope::one(principal), || {
             let conn = lock_state(&self.conn);
             let tx = conn
                 .unchecked_transaction()
@@ -242,8 +242,8 @@ impl ActivationCoordinator {
             tx.commit().map_err(|e| PolicyError::StorageFailure {
                 operation: "commit_activation_tx",
                 message: e.to_string(),
-            })?;
-        }
+            })
+        })?;
         // Past the commit an error would tell the caller "not applied" about
         // rules that are active, and send it to revert them. A marker left
         // behind names an attempt that did finish; boot recovery settles it.

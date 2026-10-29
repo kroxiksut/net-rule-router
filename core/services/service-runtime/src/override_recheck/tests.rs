@@ -26,7 +26,7 @@ fn on_site(owner: &str) -> LiveConnection {
     };
     LiveConnection {
         process_path: image.into(),
-        remote: std::net::Ipv4Addr::new(203, 0, 113, 9),
+        remote: std::net::Ipv4Addr::new(203, 0, 113, 9).into(),
         owner: Some(owner.into()),
     }
 }

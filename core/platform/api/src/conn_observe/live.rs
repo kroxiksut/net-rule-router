@@ -9,15 +9,16 @@
 //! established lets the store keep exactly those destinations fresh, and no
 //! others.
 
-use std::net::Ipv4Addr;
+use std::net::IpAddr;
 use std::sync::Mutex;
 
-/// One established outbound IPv4 TCP connection.
+/// One established outbound TCP connection, either family.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct LiveConnection {
     /// The owning program, as a path or a file name.
     pub process_path: String,
-    pub remote: Ipv4Addr,
+    /// A dual-stack socket's v4-mapped peer is reported as IPv4.
+    pub remote: IpAddr,
     /// The account the socket belongs to (stored principal form), when the
     /// table names one.
     pub owner: Option<String>,

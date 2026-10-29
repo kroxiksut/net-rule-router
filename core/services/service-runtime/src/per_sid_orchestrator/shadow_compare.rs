@@ -1,7 +1,6 @@
-//! Windows-only: runs the neutral enforcement-plan pipeline alongside the
-//! live WFP one on real input and reports whether they agree. Evidence-only —
-//! nothing here reaches the kernel, and a disagreement never affects what the
-//! live pass installs.
+//! Windows-only: the neutral plan lowered for WFP is what a pass installs for
+//! its rules. `generate_filters` still runs beside it for the destination sets
+//! and diagnostics the pass reads, and is held to the installed filters here.
 
 use super::*;
 
@@ -86,25 +85,193 @@ impl NeutralPlanVerdict {
     }
 }
 
+/// The rule-driven part of a pass, planned neutrally.
+pub(super) struct NeutralRules {
+    pub(super) flows: Vec<nrr_platform_api::enforcement::FlowRule>,
+    pub(super) report: crate::enforcement_planner::PlanReport,
+    /// `flows` lowered for WFP: what the pass installs for the rules.
+    pub(super) filters: Vec<nrr_platform_api::types::WfpFilterSpec>,
+}
+
+impl NeutralRules {
+    /// What the rest of the pass reads about the rules besides their filters,
+    /// written over `out`: the kill switch pins, the main link's networks, the
+    /// programs the additional link carries and the VPN clients it spares. The
+    /// report is handed back for what the pass tells the user.
+    pub(super) fn describe(
+        self,
+        out: &mut crate::wfp_codegen::CodegenOutput,
+        resolver: &dyn nrr_platform_api::AppPathResolver,
+        reference: Option<&crate::wfp_codegen::CodegenOutput>,
+    ) -> crate::enforcement_planner::PlanReport {
+        use crate::enforcement_planner as planner;
+        use nrr_shared::RouteRole::{Primary, Secondary};
+        let secondary_dest_ips = planner::route_destinations(&self.flows, Secondary);
+        let primary_dest_networks = planner::route_networks(&self.flows, Primary);
+        let secondary_app_patterns = planner::route_app_paths(&self.flows, Secondary);
+        let vpn_default_exempt_paths = planner::vpn_default_exempt_paths(resolver);
+        // Every test of the pass doubles as the check that the plan describes
+        // what the codegen described, until the codegen is gone.
+        #[cfg(not(test))]
+        let _ = reference;
+        #[cfg(test)]
+        if let Some(reference) = reference {
+            // Packed into pins sorted, so the order is no one's business.
+            let sorted = |ips: &[std::net::IpAddr]| {
+                let mut ips = ips.to_vec();
+                ips.sort_unstable();
+                ips
+            };
+            assert_eq!(
+                sorted(&secondary_dest_ips),
+                sorted(&reference.secondary_dest_ips),
+                "secondary destinations"
+            );
+            assert_eq!(
+                primary_dest_networks, reference.primary_dest_networks,
+                "main networks"
+            );
+            assert_eq!(
+                secondary_app_patterns, reference.secondary_app_patterns,
+                "programs"
+            );
+            assert_eq!(
+                self.report.app_guarded_additional, reference.app_observed_secondary_ips,
+                "app-guarded destinations"
+            );
+            assert_eq!(
+                vpn_default_exempt_paths, reference.vpn_default_exempt_paths,
+                "VPN clients"
+            );
+        }
+        out.filters = self.filters;
+        out.secondary_dest_ips = secondary_dest_ips;
+        out.primary_dest_networks = primary_dest_networks;
+        out.secondary_app_patterns = secondary_app_patterns;
+        out.app_observed_secondary_ips = self.report.app_guarded_additional.clone();
+        out.vpn_default_exempt_paths = vpn_default_exempt_paths;
+        self.report
+    }
+}
+
+/// What the pass installs and what `generate_filters` would have installed,
+/// compared as WFP sees them.
+pub(super) fn verdict_of(
+    installed: &[nrr_platform_api::types::WfpFilterSpec],
+    previous: &[nrr_platform_api::types::WfpFilterSpec],
+) -> NeutralPlanVerdict {
+    use nrr_platform_api::wfp_behavioral::{
+        arbitration_order_preserved, behavioral_difference, behaviorally_equivalent,
+    };
+    let difference = behavioral_difference(installed, previous);
+    NeutralPlanVerdict {
+        live: installed.len(),
+        neutral: previous.len(),
+        same_set: behaviorally_equivalent(installed, previous),
+        same_order: arbitration_order_preserved(installed, previous),
+        differs_live: render_shapes(&difference.only_in_a),
+        differs_neutral: render_shapes(&difference.only_in_b),
+        only_live: render_difference(&difference.only_in_a),
+        only_neutral: render_difference(&difference.only_in_b),
+    }
+}
+
 impl PerSidApplyOrchestrator {
-    /// Run the neutral pipeline alongside the live one and report whether they
-    /// agree. Compares only — nothing here reaches the kernel.
+    /// The rule-driven part of the pass from the neutral plan: its flows, its
+    /// report and the filters lowered for WFP. `None` for a principal the plan
+    /// cannot name (the baseline sentinel), whose codegen set stands.
     ///
-    /// Returns whether the comparison actually RAN: `false` means the input was
-    /// the one already evidenced and the work was skipped.
-    ///
-    /// This is the evidence step of moving enforcement onto the neutral plan.
-    /// The equivalence is already proven by oracle tests over hand-built rule
-    /// books; what those cannot cover is the shape of a real user's rules, with
-    /// its own cache contents, app resolutions and fan-outs. So the two run
-    /// side by side on live input first, and only a silent log promotes the
-    /// neutral one to the path that enforces.
-    ///
-    /// Deliberately narrow: rule-driven flows only, and only what the planner
-    /// models today. The fake-IP augmentation is folded in by the caller AFTER
-    /// this returns, and the kill-switch classes are compared by their own
-    /// oracle tests — widening this to them before they are modelled would
-    /// report a difference that means nothing.
+    /// Fed the pass's own readings, the cache snapshot and the observations the
+    /// codegen and the arbiter also read, so what the pass derives besides
+    /// these filters describes these filters.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn neutral_route_filters(
+        &self,
+        sid: &str,
+        rule_book: &nrr_domain::canonical::CanonicalRuleBook,
+        fqdn_cache: &dyn crate::fqdn_cache_lookup::FqdnCacheLookup,
+        app_observations: &dyn crate::app_observation_lookup::AppObservationLookup,
+        secondary_ip_denylist: &std::collections::HashSet<std::net::Ipv4Addr>,
+        zone_priority_over_ip: bool,
+        app_takeover: bool,
+        ipv6: crate::enforcement_planner::Ipv6Guard,
+    ) -> Option<NeutralRules> {
+        use nrr_platform_api::enforcement::{EnforcementPlan, UserPrincipal};
+
+        let principal = UserPrincipal::from_windows_sid(sid).ok()?;
+        let input = crate::enforcement_planner::PlannerInput {
+            fqdn_cache,
+            app_resolver: self.app_resolver.as_ref(),
+            app_observations,
+            zone_priority_over_ip,
+            app_rules_take_all_addresses: app_takeover,
+            // The set the pass hid from the tunnel: the routes and the census
+            // decline the same shared addresses.
+            secondary_ip_denylist,
+            ipv6,
+            packet_blocks: super::PACKET_BLOCKS,
+        };
+        let (flows, report) = crate::enforcement_planner::plan_route_rules(rule_book, sid, &input);
+        let plan = EnforcementPlan {
+            principal,
+            flows,
+            routes: Vec::new(),
+            policy_rules: Vec::new(),
+        };
+        let filters = nrr_platform_windows::lower_windows::lower_route_rules(&plan);
+        Some(NeutralRules {
+            flows: plan.flows,
+            report,
+            filters,
+        })
+    }
+
+    /// Whether `fingerprint` is new evidence for `sid`: a different input,
+    /// and the sampling window passed since the last one.
+    pub(super) fn compare_due(&self, sid: &str, fingerprint: u64) -> bool {
+        let mut seen = self
+            .shadow_compare_seen
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        if let Some((last, at)) = seen.get(sid) {
+            if *last == fingerprint || at.elapsed() < SHADOW_COMPARE_EVERY {
+                return false;
+            }
+        }
+        seen.insert(sid.to_string(), (fingerprint, std::time::Instant::now()));
+        true
+    }
+
+    /// Hold the installed filters against the ones `generate_filters` still
+    /// computes, sampled. The pass reads the codegen's destination sets and
+    /// diagnostics until they move to the planner; a difference means those
+    /// describe other filters than the ones in force. Returns whether it ran.
+    pub(super) fn compare_with_codegen(
+        &self,
+        sid: &str,
+        installed: &[nrr_platform_api::types::WfpFilterSpec],
+        codegen: &[nrr_platform_api::types::WfpFilterSpec],
+    ) -> bool {
+        if !self.compare_due(sid, shadow_compare_fingerprint(codegen)) {
+            return false;
+        }
+        self.report_comparison(sid, installed, codegen);
+        true
+    }
+
+    /// [`Self::compare_with_codegen`] for a caller that sampled already.
+    pub(super) fn report_comparison(
+        &self,
+        sid: &str,
+        installed: &[nrr_platform_api::types::WfpFilterSpec],
+        codegen: &[nrr_platform_api::types::WfpFilterSpec],
+    ) {
+        report(sid, &verdict_of(installed, codegen));
+    }
+
+    /// The neutral plan held against `live`, built from the orchestrator's own
+    /// readings; sampled like [`Self::compare_with_codegen`].
+    #[cfg(test)]
     #[allow(clippy::too_many_arguments)]
     pub(super) fn shadow_compare_neutral_plan(
         &self,
@@ -117,23 +284,8 @@ impl PerSidApplyOrchestrator {
         ipv6: crate::enforcement_planner::Ipv6Guard,
         live: &[nrr_platform_api::types::WfpFilterSpec],
     ) -> bool {
-        // Same input, same verdict — and the verdict is already in the log.
-        // Re-deriving it costs a full plan plus a lowering on a path that also
-        // carries DNS answers and the GUI's own requests.
-        let fingerprint = shadow_compare_fingerprint(live);
-        {
-            let mut seen = self
-                .shadow_compare_seen
-                .lock()
-                .unwrap_or_else(|p| p.into_inner());
-            if let Some((last, at)) = seen.get(sid) {
-                // The filter set changes with every learned address; evidence
-                // sampled every few minutes says as much as evidence per change.
-                if *last == fingerprint || at.elapsed() < SHADOW_COMPARE_EVERY {
-                    return false;
-                }
-            }
-            seen.insert(sid.to_string(), (fingerprint, std::time::Instant::now()));
+        if !self.compare_due(sid, shadow_compare_fingerprint(live)) {
+            return false;
         }
         let Some(verdict) = self.neutral_plan_verdict(
             sid,
@@ -147,41 +299,13 @@ impl PerSidApplyOrchestrator {
         ) else {
             return false;
         };
-        if verdict.agrees() {
-            tracing::debug!(
-                target: "nrr::enforcement-plan",
-                sid,
-                filters = verdict.live,
-                "neutral plan matches the filters actually installed",
-            );
-            return true;
-        }
-        // A difference is the whole reason this runs on live input. WARN, not
-        // debug: it is the one signal that says the neutral path is not ready
-        // to take over, and it must not be discoverable only by someone
-        // grepping for it.
-        tracing::warn!(
-            target: "nrr::enforcement-plan",
-            msg_key = "persid-shadow-plan-differs",
-            sid,
-            live = verdict.live,
-            neutral = verdict.neutral,
-            same_set = verdict.same_set,
-            same_order = verdict.same_order,
-            differs_live = %verdict.differs_live,
-            differs_neutral = %verdict.differs_neutral,
-            only_live = %verdict.only_live,
-            only_neutral = %verdict.only_neutral,
-            "neutral plan DIFFERS from the filters actually installed — enforcement is unaffected (the live path applied), but the neutral path cannot take over until this is explained",
-        );
+        report(sid, &verdict);
         true
     }
 
-    /// The comparison itself, separated from the logging so a test can assert
-    /// the outcome. A verdict that only ever reaches a log line is a verdict
-    /// nothing can hold to account.
-    ///
-    /// `None` when the SID is not a principal this build can model.
+    /// The comparison itself, for a test to assert on. `None` when the SID is
+    /// not a principal the plan can name.
+    #[cfg(test)]
     #[allow(clippy::too_many_arguments)]
     pub(super) fn neutral_plan_verdict(
         &self,
@@ -194,63 +318,47 @@ impl PerSidApplyOrchestrator {
         ipv6: crate::enforcement_planner::Ipv6Guard,
         live: &[nrr_platform_api::types::WfpFilterSpec],
     ) -> Option<NeutralPlanVerdict> {
-        use nrr_platform_api::enforcement::{EnforcementPlan, UserPrincipal};
-        use nrr_platform_api::wfp_behavioral::{
-            arbitration_order_preserved, behaviorally_equivalent,
-        };
-
-        let principal = UserPrincipal::from_windows_sid(sid).ok()?;
-        // The SAME cache reading the live path used — not a fresh look at the
-        // live cache. The pass takes one snapshot precisely because the DNS
-        // observer keeps writing; comparing a plan built from the snapshot with
-        // one built from the cache as it stands milliseconds later reports the
-        // clock, not the pipelines. It is why `only_neutral` was never empty
-        // and `only_live` always was: the second reader simply saw more.
-        let input = crate::enforcement_planner::PlannerInput {
+        let neutral = self.neutral_route_filters(
+            sid,
+            rule_book,
             fqdn_cache,
-            app_resolver: self.app_resolver.as_ref(),
-            app_observations: self.app_observations.as_ref(),
-            // The live codegen read the stored order; another one compares two policies.
-            zone_priority_over_ip,
-            app_rules_take_all_addresses: app_takeover,
-            // The set the live pass hid from the tunnel. Comparing against a
-            // plan that never saw it was comparing a pipeline WITH the
-            // shared-IP policy to one without: every secondary rule then
-            // carried different addresses, and with them different ordinals,
-            // so the two plans could not agree on anything downstream.
+            self.app_observations.as_ref(),
             secondary_ip_denylist,
-            // The family setting the live pass resolved: another one would
-            // compare two different questions.
+            zone_priority_over_ip,
+            app_takeover,
             ipv6,
-            // The live pass asked the same question.
-            packet_blocks: super::PACKET_BLOCKS,
-        };
-        let plan = EnforcementPlan {
-            principal,
-            // The report is the GUI's business, and this is the shadow
-            // comparison — it looks at filters only.
-            flows: crate::enforcement_planner::plan_route_rules(rule_book, sid, &input).0,
-            routes: Vec::new(),
-            policy_rules: Vec::new(),
-        };
-        let lowered = nrr_platform_windows::lower_windows::lower_route_rules(&plan);
-
-        // `live` is exactly `generate_filters`' output: rule-driven only. The
-        // leak-guard and kill-switch classes are appended by the caller further
-        // down, after this returns, so no filtering is needed here — and doing
-        // any would silently narrow what the comparison covers.
-        let difference = nrr_platform_api::wfp_behavioral::behavioral_difference(live, &lowered);
-        Some(NeutralPlanVerdict {
-            live: live.len(),
-            neutral: lowered.len(),
-            same_set: behaviorally_equivalent(live, &lowered),
-            same_order: arbitration_order_preserved(live, &lowered),
-            differs_live: render_shapes(&difference.only_in_a),
-            differs_neutral: render_shapes(&difference.only_in_b),
-            only_live: render_difference(&difference.only_in_a),
-            only_neutral: render_difference(&difference.only_in_b),
-        })
+        )?;
+        Some(verdict_of(live, &neutral.filters))
     }
+}
+
+/// One log line per comparison: debug when the two agree, WARN when they do
+/// not, the one signal that the codegen's side outputs drifted from the
+/// filters in force.
+fn report(sid: &str, verdict: &NeutralPlanVerdict) {
+    if verdict.agrees() {
+        tracing::debug!(
+            target: "nrr::enforcement-plan",
+            sid,
+            filters = verdict.live,
+            "installed filters match the codegen's",
+        );
+        return;
+    }
+    tracing::warn!(
+        target: "nrr::enforcement-plan",
+        msg_key = "persid-shadow-plan-differs",
+        sid,
+        live = verdict.live,
+        neutral = verdict.neutral,
+        same_set = verdict.same_set,
+        same_order = verdict.same_order,
+        differs_live = %verdict.differs_live,
+        differs_neutral = %verdict.differs_neutral,
+        only_live = %verdict.only_live,
+        only_neutral = %verdict.only_neutral,
+        "installed filters (neutral plan) DIFFER from the codegen's, whose destination sets this pass still reads",
+    );
 }
 
 /// What the shadow compare would run on, as one number.
@@ -260,7 +368,7 @@ impl PerSidApplyOrchestrator {
 /// unchanged set means unchanged inputs. Ids are content-addressed, which is
 /// what makes them safe to fold; the weight goes in too, because arbitration
 /// order is half of what the comparison checks.
-fn shadow_compare_fingerprint(live: &[nrr_platform_api::types::WfpFilterSpec]) -> u64 {
+pub(super) fn shadow_compare_fingerprint(live: &[nrr_platform_api::types::WfpFilterSpec]) -> u64 {
     // FNV-1a, the same hash the filter ids themselves are built with.
     const OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
     const PRIME: u64 = 0x0000_0100_0000_01b3;

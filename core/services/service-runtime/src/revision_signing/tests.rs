@@ -165,6 +165,12 @@ impl KeyStore for UnreadableKeyStore {
     fn delete_resign_marker(&self) -> Result<(), PlatformError> {
         Ok(())
     }
+    fn save_rules_anchor(&self, _: &[u8]) -> Result<(), PlatformError> {
+        Ok(())
+    }
+    fn load_rules_anchor(&self) -> Result<Option<Vec<u8>>, PlatformError> {
+        Ok(None)
+    }
 }
 
 #[test]
@@ -530,4 +536,255 @@ fn a_recheck_that_failed_still_alerts_the_active_row() {
 
     assert_eq!(active(&coord), Some(second.clone()), "nothing rolled back");
     assert!(only_tamper_alert(&host).contains(&second));
+}
+
+// ── The record of the active rules beside the key ───────────────────────────
+
+/// A start on `key_store` with the boot sweep run, as a service starts.
+fn boot(
+    host: &Host,
+    key_store: &Arc<InMemKeyStore>,
+    now_ms: i64,
+) -> (Arc<ActivationCoordinator>, Option<RevisionWatch>) {
+    let signing = start(host, Arc::clone(key_store) as _, now_ms);
+    let coord = Arc::new(signing.sign(unsigned_coordinator(host)));
+    let watch = signing.enforce_and_watch(Some(&coord));
+    (coord, watch)
+}
+
+fn rules_store_alerts(host: &Host) -> Vec<String> {
+    host.alerts
+        .list_by_state(SecurityAlertState::Active)
+        .expect("alerts")
+        .into_iter()
+        .filter(|a| a.kind == AuditEventKind::RulesStoreRolledBack.as_str())
+        .map(|a| a.alert_id)
+        .collect()
+}
+
+fn outside(host: &Host) -> Connection {
+    open_connection(&host.path).expect("outside connection")
+}
+
+fn delete_from_outside(host: &Host, id: &str) {
+    let conn = outside(host);
+    conn.execute(
+        "DELETE FROM active_revision_pointer WHERE revision_id = ?1",
+        [id],
+    )
+    .expect("delete pointer");
+    conn.execute("DELETE FROM revisions WHERE revision_id = ?1", [id])
+        .expect("delete row");
+}
+
+/// Copies the rules tables as they are now, signatures and all.
+fn copy_rules(host: &Host, to: &std::path::Path) {
+    outside(host)
+        .execute("VACUUM INTO ?1", [to.to_string_lossy()])
+        .expect("copy the database");
+}
+
+/// Puts back the rules tables of an earlier copy, as a restored backup does.
+fn restore_rules(host: &Host, from: &std::path::Path) {
+    let conn = outside(host);
+    conn.execute("ATTACH DATABASE ?1 AS old", [from.to_string_lossy()])
+        .expect("attach");
+    conn.execute_batch(
+        "DELETE FROM main.active_revision_pointer;
+         DELETE FROM main.revisions;
+         INSERT INTO main.revisions SELECT * FROM old.revisions;
+         INSERT INTO main.active_revision_pointer SELECT * FROM old.active_revision_pointer;",
+    )
+    .expect("restore");
+}
+
+fn acknowledge_as_administrator(
+    exec: &ProductionMutationExecutor,
+    alert_id: &str,
+) -> MutationOutcome {
+    exec.execute(
+        StoredMutation {
+            kind: MutationKind::SecurityAlertAck,
+            payload: serde_json::json!({ "alert-id": alert_id }),
+            correlation_id: None,
+            issuer_sid: USER.to_string(),
+            caller_is_elevated: true,
+        },
+        USER,
+    )
+}
+
+#[test]
+fn an_active_rule_set_deleted_while_stopped_raises_a_blocking_alert() {
+    let host = host();
+    let key_store = Arc::new(InMemKeyStore::new());
+    let second = previous_run(&host, &key_store);
+    delete_from_outside(&host, &second);
+
+    let (coord, _watch) = boot(&host, &key_store, BOOT_MS + 1_000);
+
+    assert_eq!(
+        rules_store_alerts(&host).len(),
+        1,
+        "the deletion went unnoticed"
+    );
+    assert!(crate::tamper_bootstrap::mutations_blocked_by_alert(
+        host.alerts.as_ref()
+    ));
+    assert!(matches!(
+        rules_update(&gated_executor(&host, &coord), &coord, "h-blocked"),
+        MutationOutcome::Failed(_)
+    ));
+}
+
+#[test]
+fn an_older_copy_of_the_database_raises_a_blocking_alert() {
+    let host = host();
+    let key_store = Arc::new(InMemKeyStore::new());
+    let copy = host._dir.path().join("older-copy.db");
+    {
+        let (coord, _watch) = boot(&host, &key_store, BOOT_MS);
+        activate(&coord, "h-1");
+        copy_rules(&host, &copy);
+        activate(&coord, "h-2");
+    }
+    restore_rules(&host, &copy);
+
+    boot(&host, &key_store, BOOT_MS + 1_000);
+
+    assert_eq!(
+        rules_store_alerts(&host).len(),
+        1,
+        "the restore went unnoticed"
+    );
+    assert_eq!(
+        active_alerts(&host, AuditEventKind::DbTamperDetected),
+        0,
+        "every row of the copy verifies on its own"
+    );
+}
+
+#[test]
+fn an_install_from_before_the_record_raises_nothing_and_starts_one() {
+    let host = host();
+    let old_store = Arc::new(InMemKeyStore::new());
+    previous_run(&host, &old_store);
+    let key = old_store.load().expect("load").expect("key");
+    let upgraded = Arc::new(InMemKeyStore::with_key(key));
+
+    boot(&host, &upgraded, BOOT_MS + 1_000);
+    assert!(rules_store_alerts(&host).is_empty());
+    assert!(upgraded.load_rules_anchor().expect("load").is_some());
+
+    boot(&host, &upgraded, BOOT_MS + 2_000);
+    assert!(rules_store_alerts(&host).is_empty());
+}
+
+#[test]
+fn activation_rollback_and_reset_keep_the_record_in_step() {
+    let host = host();
+    let key_store = Arc::new(InMemKeyStore::new());
+    previous_run(&host, &key_store);
+
+    let (coord, _watch) = boot(&host, &key_store, BOOT_MS + 1_000);
+    activate(&coord, "h-3");
+    let (coord, _watch) = boot(&host, &key_store, BOOT_MS + 2_000);
+    assert!(rules_store_alerts(&host).is_empty(), "after an activation");
+
+    // Going back to an earlier rule set re-activates it from history.
+    let back = activate(&coord, "h-1");
+    let (coord, _watch) = boot(&host, &key_store, BOOT_MS + 3_000);
+    assert_eq!(active(&coord), Some(back));
+    assert!(rules_store_alerts(&host).is_empty(), "after a rollback");
+
+    let reset = ProductionMutationExecutor::new(Arc::clone(&coord)).execute(
+        StoredMutation {
+            kind: MutationKind::RulesResetToBaseline,
+            payload: serde_json::json!({}),
+            correlation_id: None,
+            issuer_sid: USER.to_string(),
+            caller_is_elevated: false,
+        },
+        USER,
+    );
+    assert!(matches!(reset, MutationOutcome::Completed(_)), "{reset:?}");
+    assert_eq!(active(&coord), None);
+    boot(&host, &key_store, BOOT_MS + 4_000);
+    assert!(rules_store_alerts(&host).is_empty(), "after a reset");
+}
+
+#[test]
+fn the_alert_holds_rule_changes_until_an_administrator_accepts_the_rules() {
+    let host = host();
+    let key_store = Arc::new(InMemKeyStore::new());
+    let second = previous_run(&host, &key_store);
+    delete_from_outside(&host, &second);
+    let (coord, _watch) = boot(&host, &key_store, BOOT_MS + 1_000);
+    let exec = gated_executor(&host, &coord);
+    let alert = rules_store_alerts(&host).pop().expect("alert");
+
+    assert!(matches!(
+        rules_update(&exec, &coord, "h-blocked"),
+        MutationOutcome::Failed(_)
+    ));
+    assert!(matches!(
+        acknowledge_as_administrator(&exec, &alert),
+        MutationOutcome::Completed(_)
+    ));
+    assert!(!crate::tamper_bootstrap::mutations_blocked_by_alert(
+        host.alerts.as_ref()
+    ));
+    // Judged on the record itself: the dedup of an acknowledged alert would
+    // hide a record left disagreeing.
+    let found = crate::rules_anchor::active_set(&host.conn.lock().expect("conn")).expect("read");
+    let key = key_store.load().expect("load").expect("key");
+    let stored = key_store.load_rules_anchor().expect("load");
+    assert_eq!(
+        crate::rules_anchor::check_at_boot(&found, stored.as_deref(), &key).alert,
+        None,
+        "the acknowledgement recorded the rules as they are now"
+    );
+
+    let (coord, _watch) = boot(&host, &key_store, BOOT_MS + 2_000);
+    assert!(
+        rules_store_alerts(&host).is_empty(),
+        "the accepted rules are the recorded ones from here"
+    );
+    assert!(matches!(
+        rules_update(&gated_executor(&host, &coord), &coord, "h-after"),
+        MutationOutcome::Completed(_)
+    ));
+}
+
+#[test]
+fn a_record_not_signed_by_the_key_is_an_alert_not_a_fresh_start() {
+    let host = host();
+    let key_store = Arc::new(InMemKeyStore::new());
+    previous_run(&host, &key_store);
+    let forged = crate::rules_anchor::AnchorRecord::of(Default::default()).encode(&[0x11; 32]);
+    key_store.save_rules_anchor(&forged).expect("plant");
+
+    boot(&host, &key_store, BOOT_MS + 1_000);
+
+    assert_eq!(rules_store_alerts(&host).len(), 1);
+    assert_eq!(
+        key_store.load_rules_anchor().expect("load"),
+        Some(forged),
+        "the planted record is kept as found, never overwritten as trusted"
+    );
+}
+
+#[test]
+fn the_watch_catches_an_active_rule_set_deleted_while_running() {
+    let host = host();
+    let key_store = Arc::new(InMemKeyStore::new());
+    let second = previous_run(&host, &key_store);
+    let (_coord, watch) = boot(&host, &key_store, BOOT_MS + 1_000);
+    let mut watch = watch.expect("watch");
+    watch.tick(BOOT_MS + 2_000);
+
+    delete_from_outside(&host, &second);
+    watch.tick(BOOT_MS + 3_000);
+
+    assert_eq!(rules_store_alerts(&host).len(), 1);
 }

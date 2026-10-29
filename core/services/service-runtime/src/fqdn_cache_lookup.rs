@@ -207,7 +207,7 @@ pub trait FqdnCacheLookup: Send + Sync {
     /// that can hand over the whole table at once says so here, and the compute
     /// runs against memory. `None` (the default, and what every mock keeps)
     /// means "keep asking me directly".
-    fn snapshot_for_compute(&self) -> Option<FqdnCacheSnapshot> {
+    fn snapshot_for_compute(&self) -> Option<Arc<FqdnCacheSnapshot>> {
         None
     }
 
@@ -360,7 +360,22 @@ pub struct SqliteFqdnCacheLookup {
     /// sleep, and a night's sleep would otherwise empty every rule's set at
     /// once while the tunnel is still reconnecting.
     sleeps: Arc<crate::power_resume::SleepLedger>,
+    /// The last whole-cache snapshot, handed out again while no news reached
+    /// the cache: a pass over N users asked for 1 + 2N of them, each five
+    /// table reads under the lock the DNS answer path also needs.
+    last_snapshot: Mutex<Option<KeptSnapshot>>,
 }
+
+/// A snapshot and the cache state it was read at.
+struct KeptSnapshot {
+    generation: u64,
+    taken: std::time::Instant,
+    snapshot: Arc<FqdnCacheSnapshot>,
+}
+
+/// How long a snapshot is handed out again: the confirmation cutoff it was
+/// read with must not drift.
+const SNAPSHOT_REUSE: Duration = Duration::from_secs(1);
 
 impl SqliteFqdnCacheLookup {
     pub fn new(
@@ -372,6 +387,7 @@ impl SqliteFqdnCacheLookup {
             thresholds,
             confirmation_window: ENFORCEMENT_CONFIRMATION_WINDOW,
             sleeps: crate::power_resume::process_sleeps(),
+            last_snapshot: Mutex::new(None),
         }
     }
 
@@ -462,11 +478,30 @@ fn confirmed_since(resolved_at: Option<SystemTime>, cutoff: Option<SystemTime>) 
 }
 
 impl FqdnCacheLookup for SqliteFqdnCacheLookup {
-    fn snapshot_for_compute(&self) -> Option<FqdnCacheSnapshot> {
-        Some(FqdnCacheSnapshot::take(
+    fn snapshot_for_compute(&self) -> Option<Arc<FqdnCacheSnapshot>> {
+        // Read before the snapshot: a write in between leaves the kept one
+        // fresher than its generation, never staler.
+        let generation = self
+            .cache
+            .lock()
+            .ok()
+            .and_then(|guard| guard.change_generation());
+        let mut kept = self.last_snapshot.lock().unwrap_or_else(|p| p.into_inner());
+        if let (Some(generation), Some(last)) = (generation, kept.as_ref()) {
+            if last.generation == generation && last.taken.elapsed() < SNAPSHOT_REUSE {
+                return Some(Arc::clone(&last.snapshot));
+            }
+        }
+        let snapshot = Arc::new(FqdnCacheSnapshot::take(
             self.cache.as_ref(),
             self.cutoff(SystemTime::now()),
-        ))
+        ));
+        *kept = generation.map(|generation| KeptSnapshot {
+            generation,
+            taken: std::time::Instant::now(),
+            snapshot: Arc::clone(&snapshot),
+        });
+        Some(snapshot)
     }
 
     fn snapshot_for_addresses(&self, addresses: &[IpAddr]) -> Option<FqdnCacheSnapshot> {
@@ -1170,7 +1205,7 @@ mod tests {
         let live = SqliteFqdnCacheLookup::new(cache, thresholds);
         let snapshot = live.snapshot_for_compute().expect("snapshot");
 
-        for view in [&live as &dyn FqdnCacheLookup, &snapshot] {
+        for view in [&live as &dyn FqdnCacheLookup, &*snapshot] {
             assert_eq!(
                 view.hostnames_under_suffix("example.com", 16),
                 vec!["api.example.com".to_string(), "www.example.com".to_string()]
@@ -1373,6 +1408,43 @@ mod tests {
     // ── Confirmation window ──────────────────────────────────────────────────
 
     /// A migrated in-memory cache store, ready to seed.
+    /// A pass over N users asks for the whole cache 1 + 2N times, each ask
+    /// five table reads under the lock the DNS answer path needs too: while no
+    /// new address arrived they share one reading, and news is read at once.
+    #[test]
+    fn a_pass_reads_the_cache_once_until_news_arrives() {
+        let now = SystemTime::now();
+        let concrete = Arc::new(Mutex::new(confirmation_store()));
+        seed(
+            &concrete.lock().expect("store"),
+            "mail.example",
+            Ipv4Addr::new(203, 0, 113, 21),
+            now,
+        );
+        let cache: Arc<Mutex<dyn CacheRepository + Send>> = concrete.clone();
+        let lookup = SqliteFqdnCacheLookup::new(cache, FreshnessThresholds::default_production());
+
+        let first = lookup.snapshot_for_compute().expect("snapshot");
+        let again = lookup.snapshot_for_compute().expect("snapshot");
+        assert!(
+            Arc::ptr_eq(&first, &again),
+            "the second ask read the cache again"
+        );
+
+        seed(
+            &concrete.lock().expect("store"),
+            "mail.example",
+            Ipv4Addr::new(203, 0, 113, 22),
+            now,
+        );
+        let after_news = lookup.snapshot_for_compute().expect("snapshot");
+        assert!(
+            !Arc::ptr_eq(&first, &after_news),
+            "a new address waited for a later ask"
+        );
+        assert_eq!(after_news.ips_for_hostname("mail.example").len(), 2);
+    }
+
     fn confirmation_store() -> nrr_storage::store::SqliteCacheStore {
         use nrr_storage::migration::SqliteMigrationRunner;
         use nrr_storage::repository::MigrationRunner;

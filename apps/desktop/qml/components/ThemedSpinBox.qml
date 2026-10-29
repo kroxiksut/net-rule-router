@@ -52,7 +52,8 @@ SpinBox {
         color: !root.enabled
                    ? theme.stateDisabledFill
                    : theme.colorBase
-        border.width: root.inputOutOfRange ? Math.max(2, theme.borderWidth) : theme.borderWidth
+        border.width: root.inputOutOfRange ? Math.max(2, theme.borderWidth)
+            : root.activeFocus ? theme.focusBorderWidth : theme.borderWidth
         border.color: root.inputOutOfRange
                           ? theme.colorDanger
                           : root.activeFocus

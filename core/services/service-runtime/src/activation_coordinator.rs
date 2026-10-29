@@ -111,6 +111,8 @@ pub struct ActivationCoordinator {
     /// Where `signing_key` came from; holds the re-sign marker that an
     /// acknowledged key reset clears.
     key_store: Option<Arc<dyn nrr_platform_api::key_store::KeyStore>>,
+    /// The record of the active rules beside the key, `None` without a key.
+    rules_anchor: Option<Arc<crate::rules_anchor::RulesAnchor>>,
     /// The no-tray routing-user fallback (console session under
     /// service-driven scope). Without it, an activation with a dead tray
     /// subscription dispatches to NOBODY: `active_sids()` is empty, the
@@ -154,6 +156,7 @@ impl ActivationCoordinator {
             failure_policy: Mutex::new(failure_policy),
             signing_key: None,
             key_store: None,
+            rules_anchor: None,
             fallback_routing_sid: None,
             served_sids: None,
             activation_gate: gate::ActivationGate::default(),
@@ -250,6 +253,50 @@ impl ActivationCoordinator {
         self
     }
 
+    /// The record of the active rules kept beside the key; every commit of
+    /// rules below goes through [`Self::anchored`].
+    #[must_use]
+    pub fn with_rules_anchor(mut self, anchor: Arc<crate::rules_anchor::RulesAnchor>) -> Self {
+        self.rules_anchor = Some(anchor);
+        self
+    }
+
+    /// Runs a commit of rules with the record kept in step with it.
+    pub(crate) fn anchored<T>(
+        &self,
+        scope: &crate::rules_anchor::AnchorScope,
+        commit: impl FnOnce() -> T,
+    ) -> T {
+        match &self.rules_anchor {
+            Some(anchor) => anchor.change(&self.conn, scope, commit),
+            None => commit(),
+        }
+    }
+
+    /// Records the active rules as the database holds them now: what an
+    /// administrator's acknowledgement accepts. A no-op without a record.
+    pub(crate) fn re_record_rules_anchor(&self) -> Result<(), PolicyError> {
+        match &self.rules_anchor {
+            Some(anchor) => {
+                anchor
+                    .re_record(&self.conn)
+                    .map_err(|message| PolicyError::StorageFailure {
+                        operation: "re_record_rules_anchor",
+                        message,
+                    })
+            }
+            None => Ok(()),
+        }
+    }
+
+    /// Principals whose active rules moved past this coordinator.
+    pub(crate) fn rules_anchor_disagreements(&self) -> Vec<crate::rules_anchor::Disagreement> {
+        self.rules_anchor
+            .as_ref()
+            .map(|anchor| anchor.disagreements_now(&self.conn))
+            .unwrap_or_default()
+    }
+
     /// Build a `RevisionsRepository` over `conn`, carrying the signing
     /// key when one is configured. Centralises the
     /// signed-vs-unsigned choice so no call site can forget it.
@@ -283,13 +330,19 @@ impl ActivationCoordinator {
         &self,
         requests: &[nrr_storage::revisions::AdoptionRequest<'_>],
     ) -> Result<Vec<nrr_storage::revisions::AdoptionOutcome>, PolicyError> {
-        let conn = lock_state(&self.conn);
-        self.revisions_repo(&conn)
-            .adopt_rows(requests)
-            .map_err(|e| PolicyError::StorageFailure {
-                operation: "adopt_rows",
-                message: e.to_string(),
-            })
+        // An adopted row's content becomes the trusted one, its record too.
+        let principals: std::collections::BTreeSet<String> =
+            requests.iter().map(|r| r.principal.to_owned()).collect();
+        let scope = crate::rules_anchor::AnchorScope::Of(principals.into_iter().collect());
+        self.anchored(&scope, || {
+            let conn = lock_state(&self.conn);
+            self.revisions_repo(&conn)
+                .adopt_rows(requests)
+                .map_err(|e| PolicyError::StorageFailure {
+                    operation: "adopt_rows",
+                    message: e.to_string(),
+                })
+        })
     }
 
     /// Whether the key store holds the re-sign marker written for the current
@@ -841,15 +894,15 @@ impl ActivationCoordinator {
             .activation_gate
             .enter(self.activation_wait)
             .ok_or(PolicyError::ActivationBusy)?;
-        let deleted = {
+        let deleted = self.anchored(&crate::rules_anchor::AnchorScope::one(principal), || {
             let conn = lock_state(&self.conn);
             self.revisions_repo(&conn)
                 .delete_all_revisions_for(principal)
                 .map_err(|e| PolicyError::StorageFailure {
                     operation: "delete_all_revisions(reset)",
                     message: e.to_string(),
-                })?
-        };
+                })
+        })?;
 
         self.audit.emit(ActivationAuditEvent::ResetToBaseline {
             principal: principal.to_string(),
@@ -858,6 +911,49 @@ impl ActivationCoordinator {
         });
 
         Ok(deleted)
+    }
+
+    /// Runs `erase`, which deletes every user's rules history, with no
+    /// activation in flight. Each user it left on the baseline is recorded as
+    /// reset to it, so their clients re-read the rules; those are returned.
+    pub(crate) fn erase_every_users_rules(
+        &self,
+        erase: &mut dyn FnMut(),
+        correlation_id: &str,
+    ) -> Result<Vec<String>, PolicyError> {
+        let _pass = self
+            .activation_gate
+            .enter(self.activation_wait)
+            .ok_or(PolicyError::ActivationBusy)?;
+        let counts = || {
+            let conn = lock_state(&self.conn);
+            self.revisions_repo(&conn)
+                .revision_counts()
+                .map_err(|e| PolicyError::StorageFailure {
+                    operation: "revision_counts(erase)",
+                    message: e.to_string(),
+                })
+        };
+        let before = counts()?;
+        self.anchored(&crate::rules_anchor::AnchorScope::Every, erase);
+        // Judged by what is left, so a half-finished erase still reports the
+        // users it did reset.
+        let after = counts().unwrap_or_default();
+        let mut reset = Vec::new();
+        for (principal, deleted) in before {
+            if principal == nrr_storage::BASELINE_PRINCIPAL
+                || after.iter().any(|(p, _)| *p == principal)
+            {
+                continue;
+            }
+            self.audit.emit(ActivationAuditEvent::ResetToBaseline {
+                principal: principal.clone(),
+                deleted_revisions: deleted,
+                correlation_id: correlation_id.to_string(),
+            });
+            reset.push(principal);
+        }
+        Ok(reset)
     }
 
     // ── readers ──────────────────────────────────────────────────────────────

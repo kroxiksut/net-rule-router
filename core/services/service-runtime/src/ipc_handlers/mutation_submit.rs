@@ -42,6 +42,7 @@ use crate::ipc_handlers::mutation_token_store::{
 use crate::ipc_handlers::operation_status_store::OperationStatusStore;
 use crate::ipc_handlers::payloads::{
     MutationConfirmResponse, MutationDryRunResponse, MutationKind, MutationSubmitRequest,
+    ReviewRiskLevel, ReviewSummaryResponse,
 };
 use crate::ipc_handlers::providers::{
     review_risk_level, rule_edits_allowed_for, MutationExecutor, MutationOutcome,
@@ -52,14 +53,15 @@ use crate::tamper_bootstrap::{
     SECURITY_ALERT_GATE_MESSAGE,
 };
 use nrr_diagnostics::audit::alert::SecurityAlertsRepository;
+use nrr_diagnostics::audit::kind::AuditEventKind;
 use nrr_shared::ipc::IpcOperationName;
 
-/// Answers whether any principal OTHER than the caller (and the shared
-/// baseline) holds revisions.
+/// Answers whether any principal OTHER than the caller holds revisions; the
+/// shared baseline counts as another, since it is the administrator's.
 ///
 /// A closure over the state DB at the composition root, so this module never
 /// learns what a revision table looks like. `None` (tests, degraded boot) reads
-/// as "nobody else", which keeps the pre-existing behaviour.
+/// as "nobody else".
 pub type OtherPrincipalsHoldRevisionsFn = Arc<dyn Fn(&str) -> bool + Send + Sync>;
 
 pub struct MutationSubmitHandler {
@@ -236,6 +238,21 @@ impl MutationSubmitHandler {
                     .and_then(|id| repo.find_by_id(id).ok().flatten())
                     .is_some_and(|a| is_blocking_alert_kind(&a.kind))
             };
+            // Accepting rules that went back records every user's rules as they
+            // are now, whoever else holds any.
+            let targets_rules_store_alert = || {
+                body.payload
+                    .get("alert-id")
+                    .and_then(serde_json::Value::as_str)
+                    .and_then(|id| repo.find_by_id(id).ok().flatten())
+                    .is_some_and(|a| a.kind == AuditEventKind::RulesStoreRolledBack.as_str())
+            };
+            if is_alert_mutation && !ctx.caller_is_elevated && targets_rules_store_alert() {
+                return Err(IpcError::needs_administrator(
+                    "Accepting the rules as they are now speaks for every user — administrator \
+                     rights required",
+                ));
+            }
             if is_alert_mutation
                 && !ctx.caller_is_elevated
                 && (mutations_blocked_by_alert(repo.as_ref()) || targets_blocking_alert())
@@ -315,6 +332,37 @@ fn preview_principal(caller_sid: &str) -> String {
     }
 }
 
+/// A baseline preview as a caller without rights may read it: the difference
+/// of the two rule books. The plan behind it is per user — who inherits the
+/// baseline, whose programs or links are missing — and that is other people's.
+fn book_difference_only(mut summary: ReviewSummaryResponse) -> ReviewSummaryResponse {
+    use nrr_shared::ipc_payloads::RiskSignalDto;
+    summary
+        .changed_fields
+        .retain(|field| !field.starts_with("sid:"));
+    summary.risk_signals.retain(|signal| {
+        !matches!(
+            signal,
+            RiskSignalDto::AppRuleUnenforceable { .. }
+                | RiskSignalDto::AdditionalAdapterUnresolved
+                | RiskSignalDto::ApplyWillBeRefused
+                | RiskSignalDto::ApplyInSeveralBatches
+        )
+    });
+    // The plan's counters keep their shape, which clients read as "count the
+    // rules instead".
+    if summary.diff_summary.contains(" SID(s);") {
+        summary.diff_summary = "0 SID(s); +0 / -0 filters; 0 pre-flight warning(s)".into();
+    }
+    summary.requires_review = !summary.rules_added.is_empty()
+        || !summary.rules_removed.is_empty()
+        || !summary.rules_modified.is_empty()
+        || !summary.rules_retargeted.is_empty()
+        || !summary.changed_fields.is_empty()
+        || !matches!(summary.risk_level, ReviewRiskLevel::Low);
+    summary
+}
+
 /// Whether a kind-specific payload names the shared admin baseline; the same
 /// flag the wire classifier reads to pick the confirm's class.
 fn names_admin_baseline(payload: &serde_json::Value) -> bool {
@@ -362,9 +410,12 @@ impl MutationSubmitHandler {
         } else {
             preview_principal(ctx.caller_stored())
         };
-        let summary = self
+        let mut summary = self
             .executor
             .preview(body.mutation_kind, &body.payload, &principal);
+        if principal == nrr_storage::BASELINE_PRINCIPAL && !ctx.caller_is_elevated {
+            summary = book_difference_only(summary);
+        }
         let unverified_rows = match body.mutation_kind {
             MutationKind::SecurityAlertAck | MutationKind::SecurityAlertResolve => self
                 .executor
@@ -1011,6 +1062,48 @@ mod tests {
         );
     }
 
+    /// Accepting rules that went back records every user's rules as found, so
+    /// it needs an administrator even where the caller is the only user.
+    #[test]
+    fn accepting_rules_that_went_back_needs_an_administrator() {
+        use nrr_diagnostics::audit::alert::{
+            InMemorySecurityAlertsRepository, SecurityAlert, SecurityAlertState,
+        };
+        let repo = InMemorySecurityAlertsRepository::new();
+        repo.insert(&SecurityAlert {
+            alert_id: "alt-rules-store-1".into(),
+            kind: "rules_store_rolled_back".into(),
+            state: SecurityAlertState::Active,
+            raised_event_seq: 0,
+            raised_file: "scan".into(),
+            ack_event_seq: None,
+            ack_file: None,
+            resolved_event_seq: None,
+            resolved_file: None,
+            created_at: 1,
+            updated_at: 1,
+            reason_code: "integrity.rules_store_rolled_back".into(),
+        })
+        .expect("seed alert");
+        let (h, _t, _o, _e) = make_handler();
+        let h = h
+            .with_alerts_repo(Arc::new(repo))
+            .with_other_principals_reader(Arc::new(|_caller: &str| false));
+        let ack = |ctx: &IpcRequestContext| {
+            h.handle(
+                &dry_run_envelope(serde_json::json!({
+                    "mutation-kind": "security-alert-ack",
+                    "payload": { "alert-id": "alt-rules-store-1" },
+                    "dry-run": true,
+                })),
+                ctx,
+            )
+        };
+        let err = ack(&ctx_sid("S-1-5-21-1-2-3-1001")).expect_err("needs an administrator");
+        assert_eq!(err.code, IpcErrorCode::Forbidden);
+        assert!(ack(&ctx()).is_ok(), "an administrator may accept them");
+    }
+
     /// The entry standing in for another user's alerts names no stored alert;
     /// acknowledging it says who can, rather than "not found".
     #[test]
@@ -1169,6 +1262,114 @@ mod tests {
             rules.unverified_rows.is_empty(),
             "a rules preview is not an integrity review"
         );
+    }
+
+    const BOB: &str = "S-1-5-21-1-2-3-2002";
+
+    /// Previews like a real baseline plan: one entry per user who inherits it,
+    /// with what is missing on their side.
+    struct PlanExecutor(FakeMutationExecutor);
+
+    impl MutationExecutor for PlanExecutor {
+        fn preview(
+            &self,
+            _kind: MutationKind,
+            _payload: &serde_json::Value,
+            _principal: &str,
+        ) -> ReviewSummaryResponse {
+            use nrr_shared::ipc_payloads::{RiskSignalDto, RuleSummaryEntryDto};
+            ReviewSummaryResponse {
+                diff_summary: "1 SID(s); +3 / -0 filters; 1 pre-flight warning(s)".into(),
+                provenance: "service".into(),
+                risk_level: ReviewRiskLevel::Medium,
+                requires_review: true,
+                changed_fields: vec![format!("sid:{BOB}")],
+                risk_signals: vec![
+                    RiskSignalDto::BroadSuffixScope {
+                        label: "com".into(),
+                    },
+                    RiskSignalDto::AppRuleUnenforceable {
+                        executables: vec![r"C:\Users\bob\AppData\secret-tool.exe".into()],
+                    },
+                    RiskSignalDto::AdditionalAdapterUnresolved,
+                ],
+                rules_added: vec![RuleSummaryEntryDto {
+                    id: "r-1".into(),
+                    display: "*.com".into(),
+                    route: "secondary".into(),
+                    verify: false,
+                    enabled: true,
+                }],
+                ..self
+                    .0
+                    .preview(MutationKind::RulesUpdate, &serde_json::Value::Null, "")
+            }
+        }
+        fn execute(&self, payload: StoredMutation, principal: &str) -> MutationOutcome {
+            self.0.execute(payload, principal)
+        }
+        fn rollback(&self, principal: &str, target: Option<&str>) -> MutationOutcome {
+            self.0.rollback(principal, target)
+        }
+        fn rollback_target(
+            &self,
+            principal: &str,
+            target: Option<&str>,
+        ) -> Result<
+            Option<nrr_shared::ipc_payloads::RollbackTargetDto>,
+            crate::ipc_handlers::operation_status_store::OperationError,
+        > {
+            self.0.rollback_target(principal, target)
+        }
+        fn safe_disable(
+            &self,
+            principal: &str,
+            reason: &str,
+            term: nrr_shared::ipc_payloads::SafeDisableTerm,
+        ) -> MutationOutcome {
+            self.0.safe_disable(principal, reason, term)
+        }
+    }
+
+    /// Anyone may preview a baseline edit before asking for rights, and what
+    /// they see is the rule books' difference: not which other users inherit
+    /// the baseline, nor which of their programs or links are missing.
+    #[test]
+    fn a_baseline_preview_without_rights_names_no_other_user() {
+        let h = MutationSubmitHandler::new(
+            Arc::new(PlanExecutor(FakeMutationExecutor::default())),
+            Arc::new(MutationTokenStore::new()),
+            Arc::new(OperationStatusStore::new()),
+        );
+        let preview = |ctx: &IpcRequestContext| {
+            h.handle(
+                &dry_run_envelope(serde_json::json!({
+                    "mutation-kind": "rules-update",
+                    "payload": { "admin-baseline": true },
+                    "dry-run": true,
+                })),
+                ctx,
+            )
+            .expect("a preview is a read")
+        };
+
+        let unelevated = preview(&ctx_sid("S-1-5-21-1-2-3-1001"));
+        let wire = unelevated.to_string();
+        assert!(!wire.contains(BOB), "{wire}");
+        assert!(!wire.contains("secret-tool"), "{wire}");
+        assert!(!wire.contains("additional-adapter-unresolved"), "{wire}");
+        assert!(!wire.contains("1 SID(s)"), "{wire}");
+        let shown: MutationDryRunResponse = serde_json::from_value(unelevated).unwrap();
+        assert_eq!(shown.review_summary.rules_added.len(), 1, "the edit itself");
+        assert!(wire.contains("broad-suffix-scope"), "{wire}");
+        assert!(shown.review_summary.requires_review);
+
+        let admin = preview(&ctx()).to_string();
+        assert!(
+            admin.contains(BOB),
+            "the administrator sees the plan: {admin}"
+        );
+        assert!(admin.contains("secret-tool"), "{admin}");
     }
 
     #[test]

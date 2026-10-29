@@ -308,7 +308,8 @@ impl super::stack::FlowObserver for CompositeFlowObserver {
 /// routing-active principal's book; one no rule names takes the primary. A
 /// rule enforcement skips for its shape is left out, as the filters leave it.
 pub struct RuleBookRouteSelector {
-    rules_provider: Arc<dyn RulesProvider>,
+    /// Read on every relayed flow, so remembered as the DNS answer's are.
+    books: crate::dns_resolver_ports::RememberedBooks,
     active_sid: Arc<dyn Fn() -> Option<String> + Send + Sync>,
     routing_user: RoutingUserStamp,
     paused: Option<Arc<crate::routing_pause::PausedPrincipals>>,
@@ -321,11 +322,18 @@ impl RuleBookRouteSelector {
         active_sid: Arc<dyn Fn() -> Option<String> + Send + Sync>,
     ) -> Self {
         Self {
-            rules_provider,
+            books: crate::dns_resolver_ports::RememberedBooks::new(rules_provider),
             active_sid,
             routing_user: RoutingUserStamp::new(ROUTING_USER_REREAD),
             paused: None,
         }
+    }
+
+    /// The stamp the remembered books are checked against.
+    #[must_use]
+    pub fn with_books_stamp(mut self, stamp: Arc<dyn Fn() -> u64 + Send + Sync>) -> Self {
+        self.books.set_books_stamp(stamp);
+        self
     }
 
     /// A paused user's flows take the primary with no rule of theirs applied,
@@ -339,11 +347,11 @@ impl RuleBookRouteSelector {
     fn active_book_for(
         &self,
         principal: &str,
-    ) -> Option<crate::per_sid_orchestrator::ActiveRulesSnapshot> {
+    ) -> Option<Arc<crate::dns_resolver_ports::RememberedBook>> {
         if self.paused.as_ref().is_some_and(|p| p.contains(principal)) {
             return None;
         }
-        self.rules_provider.active_rules_for(principal)
+        self.books.book_of(principal)
     }
 }
 
@@ -466,12 +474,8 @@ impl RouteSelector for RuleBookRouteSelector {
     }
 
     fn held_only_by_public_zone_for(&self, principal: &str, hostname: &str) -> bool {
-        self.active_book_for(principal).is_some_and(|s| {
-            crate::dns_observation_consumer::held_only_by_public_zone(
-                hostname,
-                &s.rule_book.secondary,
-            )
-        })
+        self.active_book_for(principal)
+            .is_some_and(|book| book.held_only_by_public_zone(hostname))
     }
 
     /// Every input the enforcement book is read with: an activation publishes
@@ -568,6 +572,10 @@ impl FlowOwners for ServedFlowOwners {
         } else {
             FlowOwner::Principal(principal)
         }
+    }
+
+    fn several_served(&self) -> bool {
+        (self.served)().len() >= 2
     }
 }
 
@@ -693,6 +701,79 @@ mod tests {
             action: nrr_domain::RuleAction::Route,
             origin: None,
         }
+    }
+
+    /// The book it holds now, counting every read of it.
+    struct CountingBook {
+        book: Mutex<CanonicalRuleBook>,
+        reads: std::sync::atomic::AtomicUsize,
+    }
+    impl CountingBook {
+        fn routing(secondary_host: &str) -> CanonicalRuleBook {
+            CanonicalRuleBook {
+                primary: CanonicalRuleSet::from_rules(Vec::new()),
+                secondary: CanonicalRuleSet::from_rules(vec![exact_rule("r-s", secondary_host)]),
+            }
+        }
+        fn reads(&self) -> usize {
+            self.reads.load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+    impl RulesProvider for CountingBook {
+        fn active_rules(&self) -> Option<ActiveRulesSnapshot> {
+            None
+        }
+        fn active_rules_for(&self, _principal: &str) -> Option<ActiveRulesSnapshot> {
+            self.reads.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Some(ActiveRulesSnapshot {
+                rule_book: self.book.lock().unwrap_or_else(|p| p.into_inner()).clone(),
+            })
+        }
+    }
+
+    /// A relayed flow costs no read of the rule store while the books hold:
+    /// the store sits behind the lock every writer takes, and a flow waiting
+    /// on it is a stalled connection. A rule change reaches the next flow.
+    #[test]
+    fn a_relayed_flow_reads_the_rule_store_only_when_the_books_moved() {
+        let rules = Arc::new(CountingBook {
+            book: Mutex::new(CountingBook::routing("tunnel.example")),
+            reads: Default::default(),
+        });
+        let stamp = Arc::new(AtomicU64::new(1));
+        let seen = Arc::clone(&stamp);
+        let selector = RuleBookRouteSelector::new(
+            Arc::clone(&rules) as Arc<dyn RulesProvider>,
+            Arc::new(|| Some("S-1-5-21-1".to_owned())),
+        )
+        .with_books_stamp(Arc::new(move || seen.load(Ordering::SeqCst)));
+
+        for _ in 0..20 {
+            assert_eq!(
+                selector.route_for("tunnel.example"),
+                Some(RouteRole::Secondary)
+            );
+            assert_eq!(
+                selector.route_for_principal("S-1-5-21-1", "other.example"),
+                Some(RouteRole::Primary)
+            );
+            assert!(!selector.held_only_by_public_zone("tunnel.example"));
+            assert_eq!(
+                selector.book_for(None)("tunnel.example"),
+                Some(RouteRole::Secondary)
+            );
+        }
+        assert_eq!(rules.reads(), 1, "one read for 80 flows");
+
+        *rules.book.lock().unwrap_or_else(|p| p.into_inner()) =
+            CountingBook::routing("elsewhere.example");
+        stamp.store(2, Ordering::SeqCst);
+        assert_eq!(
+            selector.route_for("tunnel.example"),
+            Some(RouteRole::Primary),
+            "the changed book is the one a flow takes"
+        );
+        assert_eq!(rules.reads(), 2);
     }
 
     fn selector_for(secondary_host: &str, sid: Option<&'static str>) -> RuleBookRouteSelector {
@@ -929,6 +1010,7 @@ mod tests {
         lookup.set_principal(svc, FlowTransport::Tcp, "S-1-5-18");
         lookup.set_principal(stranger, FlowTransport::Tcp, "S-1-5-21-9");
         let owners = owners(&["S-1-5-21-1", "S-1-5-21-2"], lookup);
+        assert!(owners.several_served(), "each user then has a share");
 
         let tcp = Some(FlowTransport::Tcp);
         assert_eq!(owners.owner_of(a, fake, tcp), FlowOwner::RoutingUser);
@@ -959,6 +1041,7 @@ mod tests {
         let any: SocketAddr = "10.0.0.2:50001".parse().expect("addr");
         assert_eq!(owners.owner_of(any, any, None), FlowOwner::RoutingUser);
         assert_eq!(lookup.call_count(), 0);
+        assert!(!owners.several_served(), "a sole user has the whole relay");
     }
 
     /// A new routing user brings another book for every `RoutingUser` flow,

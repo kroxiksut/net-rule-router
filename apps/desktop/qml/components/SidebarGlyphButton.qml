@@ -23,6 +23,7 @@ ThemedButton {
         theme: control.theme
         cornerRadius: control.theme.radiusSm
         color: control.hovered ? control.theme.stateHoverFill : control.shell.panelColor
+        border.width: control.activeFocus ? control.theme.focusBorderWidth : control.theme.borderWidth
         border.color: control.activeFocus ? control.theme.stateFocusedBorder : control.theme.stateDefaultBorder
     }
     contentItem: Label {

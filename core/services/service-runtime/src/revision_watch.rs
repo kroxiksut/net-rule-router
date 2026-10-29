@@ -103,6 +103,13 @@ impl RevisionWatch {
                 report.raise_after_recheck(&self.coordinator, None);
             }
         }
+        // A row deleted or swapped for an older one verifies on its own; only
+        // the record says it moved.
+        crate::tamper_bootstrap::raise_rules_anchor_alert(
+            &self.alerts,
+            self.coordinator.rules_anchor_disagreements(),
+            now_ms,
+        );
     }
 }
 

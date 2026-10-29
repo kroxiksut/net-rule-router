@@ -490,9 +490,6 @@ pub(crate) fn build_supervised_runtime_deps(
                     None => reg.active_sids().first().cloned(),
                 })
             };
-            let refresh_egress = route_coordinator
-                .as_ref()
-                .map(|coord| build_dns_egress_policy(coord, Arc::clone(&refresh_active_sid)));
             let refresh_served: nrr_service_runtime::dns_resolver_ports::ResolverPrincipalsFn = {
                 let reg = Arc::clone(&sid_registry);
                 let coord = route_coordinator.clone();
@@ -501,6 +498,20 @@ pub(crate) fn build_supervised_runtime_deps(
                     None => reg.active_sids(),
                 })
             };
+            let refresh_egress = route_coordinator.as_ref().map(|coord| {
+                build_dns_egress_policy(
+                    coord,
+                    Arc::clone(&refresh_active_sid),
+                    settings_conn.as_ref().map(|conn| {
+                        nrr_service_runtime::dns_stack::egress_rule_hosts(
+                            Arc::clone(conn),
+                            Arc::clone(&refresh_active_sid),
+                            Some(Arc::clone(&refresh_served)),
+                            pause_coordinator.as_ref().map(|c| c.paused_view()),
+                        )
+                    }),
+                )
+            });
             let resolver: Arc<dyn nrr_platform_windows::dns::DnsResolverPort> =
                 build_hosts_bypass_resolver(
                     settings_conn.as_ref().map(Arc::clone),
@@ -1292,7 +1303,7 @@ pub(crate) fn build_supervised_runtime_deps(
             reverse_dns_learner_tx: fcrdns_hook,
             app_destination_forget: settings_conn.as_ref().map(|conn| {
             let conn = Arc::clone(conn);
-            Arc::new(move |owner: Option<&str>, app: &str, ip: std::net::Ipv4Addr| {
+            Arc::new(move |owner: Option<&str>, app: &str, ip: std::net::IpAddr| {
                 let guard = conn.lock().unwrap_or_else(|p| p.into_inner());
                 if let Err(e) =
                     nrr_storage::app_destinations::AppDestinationsRepository::new(&guard)
@@ -1366,8 +1377,9 @@ pub(crate) fn build_supervised_runtime_deps(
             }),
             _ => None,
         };
+        // Reverse lookups name no rule host: the setting alone decides them.
         let fcrdns_egress = match (route_coordinator.as_ref(), active_routing_sid.as_ref()) {
-            (Some(coord), Some(sid)) => Some(build_dns_egress_policy(coord, Arc::clone(sid))),
+            (Some(coord), Some(sid)) => Some(build_dns_egress_policy(coord, Arc::clone(sid), None)),
             _ => None,
         };
         spawn_fcrdns_learner_worker(
@@ -1648,7 +1660,18 @@ pub(crate) fn build_supervised_runtime_deps(
         }
     }
     let dns_egress_policy = match (route_coordinator.as_ref(), active_routing_sid.as_ref()) {
-        (Some(coord), Some(sid)) => Some(build_dns_egress_policy(coord, Arc::clone(sid))),
+        (Some(coord), Some(sid)) => Some(build_dns_egress_policy(
+            coord,
+            Arc::clone(sid),
+            settings_conn.as_ref().map(|conn| {
+                nrr_service_runtime::dns_stack::egress_rule_hosts(
+                    Arc::clone(conn),
+                    Arc::clone(sid),
+                    Some(Arc::clone(&served_principals)),
+                    pause_coordinator.as_ref().map(|c| c.paused_view()),
+                )
+            }),
+        )),
         _ => None,
     };
     // Forwarded queries should leave over the link the policy routes traffic

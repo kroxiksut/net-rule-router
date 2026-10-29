@@ -1956,11 +1956,31 @@ old.example
         fake
     }
 
+    /// A reset whose review was confirmed and applied: the service now holds
+    /// `baseline.example` alone, and the list is read back from it.
+    fn reset_applied(app: &mut AppState, fake: &FakeService) {
+        fake.answer(
+            IpcOperationName::RulesList,
+            json!({
+                "rows": [rule("9", "suffix-domain", "baseline.example", "primary")],
+                "supported-rule-types": ["zone", "domain", "exact-ip", "application"]
+            }),
+        );
+        app.rules.mode = super::super::Mode::List;
+        super::super::finished(app, super::super::apply::Finished::Applied { base: None });
+        assert!(
+            matches!(app.rules.busy, Some(super::super::Busy::Loading)),
+            "the list was not read again"
+        );
+        drain(app, fake);
+    }
+
     /// Back to the baseline: the service is asked for the reset itself, never
-    /// for a rules write; once it is in force the list is read again, and the
-    /// user's bound file keeps the rules they had.
+    /// for a rules write; the review names the bound file before the user
+    /// agrees, and once the reset is in force that file holds the baseline,
+    /// or the tray would put the dropped rules back from it.
     #[test]
-    fn a_reset_to_the_baseline_is_reviewed_and_leaves_the_users_file_alone() {
+    fn a_reset_to_the_baseline_is_reviewed_and_rewrites_the_bound_file() {
         let dir = Scratch::new("reset-baseline");
         let (mut app, sets) = rules_with_settings(&dir, one_rule());
         super::super::on_texts(&mut app, &texts_en());
@@ -1968,6 +1988,9 @@ old.example
         std::fs::write(&file, "--- Domains\nmine.example\n").expect("rules file");
         let bound = path_text(&file);
         seed(&app, |s| s.set_primary_file(&bound));
+        let settings_file = app.rules.settings_file.clone().expect("settings file");
+        super::super::own_settings::note_written(&settings_file, std::slice::from_ref(&file))
+            .expect("note");
         let fake = reset_service(true);
 
         answer(&mut app, &["Z"]);
@@ -1980,20 +2003,53 @@ old.example
             matches!(app.rules.mode, super::super::Mode::Review(_)),
             "the reset was not shown first"
         );
+        let review = super::screen_text(&app, ScreenId::Rules);
+        assert!(
+            review.contains("rewritten with the baseline rules")
+                && review.contains("rules_primary.txt"),
+            "the review does not say the file is rewritten: {review}"
+        );
 
-        app.rules.mode = super::super::Mode::List;
-        super::super::finished(
-            &mut app,
-            super::super::apply::Finished::Applied { base: None },
+        reset_applied(&mut app, &fake);
+        let written = std::fs::read_to_string(&file).expect("rules file");
+        assert!(written.contains("baseline.example"), "{written}");
+        assert!(
+            !written.contains("mine.example"),
+            "the dropped rules stay in the bound file: {written}"
+        );
+    }
+
+    /// The bound file was edited by hand since the program wrote it: the reset
+    /// asks about it instead of overwriting the user's edit.
+    #[test]
+    fn a_reset_asks_before_rewriting_a_hand_edited_bound_file() {
+        let dir = Scratch::new("reset-baseline-hand-edited");
+        let (mut app, sets) = rules_with_settings(&dir, one_rule());
+        super::super::on_texts(&mut app, &texts_en());
+        let file = sets.join("rules_primary.txt");
+        let users = "--- Domains\nmine.example\n";
+        std::fs::write(&file, users).expect("the user's own file");
+        let bound = path_text(&file);
+        seed(&app, |s| s.set_primary_file(&bound));
+        let fake = reset_service(true);
+
+        answer(&mut app, &["Z"]);
+        drain(&mut app, &fake);
+        reset_applied(&mut app, &fake);
+        assert_eq!(
+            std::fs::read_to_string(&file).expect("rules file"),
+            users,
+            "the user's edit was overwritten"
         );
         assert!(
-            matches!(app.rules.busy, Some(super::super::Busy::Loading)),
-            "the list was not read again"
-        );
-        let kept = std::fs::read_to_string(&file).expect("rules file");
-        assert!(
-            kept.contains("mine.example"),
-            "the user's file was rewritten: {kept}"
+            matches!(
+                &app.rules.mode,
+                super::super::Mode::Choice(super::super::Choice {
+                    purpose: super::super::ChoicePurpose::HandEdited(_),
+                    ..
+                })
+            ),
+            "the user is not asked"
         );
     }
 
@@ -3170,11 +3226,68 @@ mod file_merge {
         } })
     }
 
+    /// The program's own copy of the file, as it last wrote it.
+    fn recorded(app: &AppState, dir: &Scratch) {
+        let file = app.rules.settings_file.clone().expect("settings file");
+        let primary = dir.path().join("rules_primary.txt");
+        super::super::own_settings::note_written(&file, std::slice::from_ref(&primary))
+            .expect("note");
+    }
+
+    /// A file this program has no record of writing is the user's: "nothing
+    /// to merge" asks about it, as the window does, instead of rewriting it.
+    #[test]
+    fn a_users_own_file_is_asked_about_when_there_is_nothing_to_merge() {
+        let dir = Scratch::new("file-merge-converge-users");
+        let fake = rules();
+        let mut app = bound(&dir, &fake);
+        fake.answer(IpcOperationName::RulesMergePreview, nothing_to_show());
+        answer(&mut app, &["F"]);
+        drain(&mut app, &fake);
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("rules_primary.txt")).expect("file"),
+            FILE_TEXT,
+            "the user's file was rewritten unasked"
+        );
+        assert!(
+            matches!(
+                &app.rules.mode,
+                Mode::Choice(super::super::Choice {
+                    purpose: super::super::ChoicePurpose::HandEdited(_),
+                    ..
+                })
+            ),
+            "the user is not asked"
+        );
+    }
+
+    /// The window wrote a section this build does not apply into the bound
+    /// file after this screen read it: bringing the file up to date keeps it.
+    #[test]
+    fn a_section_written_since_the_read_survives_when_there_is_nothing_to_merge() {
+        let dir = Scratch::new("file-merge-converge-passthrough");
+        let fake = rules();
+        let mut app = bound(&dir, &fake);
+        let primary = dir.path().join("rules_primary.txt");
+        std::fs::write(&primary, format!("{FILE_TEXT}--- Ports\n443\n")).expect("file");
+        recorded(&app, &dir);
+        fake.answer(IpcOperationName::RulesMergePreview, nothing_to_show());
+        answer(&mut app, &["F"]);
+        drain(&mut app, &fake);
+        let written = std::fs::read_to_string(&primary).expect("file");
+        assert!(!written.contains("only-file.example"), "{written}");
+        assert!(
+            written.contains("--- Ports\n443\n"),
+            "a section of the file was lost: {written}"
+        );
+    }
+
     #[test]
     fn a_file_spelled_otherwise_is_rewritten_when_there_is_nothing_to_merge() {
         let dir = Scratch::new("file-merge-converge");
         let fake = rules();
         let mut app = bound(&dir, &fake);
+        recorded(&app, &dir);
         fake.answer(IpcOperationName::RulesMergePreview, nothing_to_show());
         answer(&mut app, &["F"]);
         drain(&mut app, &fake);
@@ -3190,6 +3303,7 @@ mod file_merge {
         let dir = Scratch::new("file-merge-equal");
         let fake = rules();
         let mut app = bound(&dir, &fake);
+        recorded(&app, &dir);
         let own = super::super::apply::pending_from(&app.rules.table, false, None)
             .expect("book")
             .rules_json;
@@ -3212,6 +3326,7 @@ mod file_merge {
         let dir = Scratch::new("file-merge-missing");
         let fake = rules();
         let mut app = bound(&dir, &fake);
+        recorded(&app, &dir);
         super::super::on_texts(&mut app, &crate::testing::texts_en());
         let own = super::super::apply::pending_from(&app.rules.table, false, None)
             .expect("book")

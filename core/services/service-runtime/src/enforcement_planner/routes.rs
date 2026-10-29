@@ -552,6 +552,17 @@ pub struct PlanReport {
     /// Where the user's rules contradict each other, unsupported shapes
     /// included, in rule order — what the Overlaps screen lists.
     pub conflicts: Vec<crate::rule_conflicts::RuleConflict>,
+    /// Destinations of the additional link's application rules that the
+    /// program's own permit/block pair already guards: observed for a program
+    /// that resolved, and not taught by a script an interpreter elsewhere ran.
+    /// The kill switch pins none of them per destination.
+    pub app_guarded_additional: Vec<Ipv4Addr>,
+    /// `(app, address)` an application rule left alone because other programs
+    /// use the address too.
+    pub used_by_others: Vec<(String, Ipv4Addr)>,
+    /// `(folder, covered)` for rules by folder that hold more programs than
+    /// the fan-out takes.
+    pub over_capped_folders: Vec<(String, usize)>,
 }
 
 impl PlanReport {

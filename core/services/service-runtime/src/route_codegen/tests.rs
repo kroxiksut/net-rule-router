@@ -63,6 +63,41 @@ fn app_only_rule_routes_every_observed_destination() {
     assert!(out.diagnostics.is_empty());
 }
 
+/// While shared addresses and foreign tunnels are judged on IPv4 only, a
+/// program's IPv6 destination gets no route into the tunnel even where the
+/// tunnel carries IPv6: the census that keeps another program's address out
+/// cannot see it. Its IPv4 destinations are routed as ever.
+#[test]
+fn app_only_rule_routes_no_ipv6_destination_while_the_census_sees_only_ipv4() {
+    let cache = MockFqdnCacheLookup::new();
+    let apps = MockAppObservationLookup::new();
+    let v6: Ipv6Addr = "2001:db8::153".parse().expect("v6");
+    apps.set_ips("messenger.exe", vec![ip(203, 0, 113, 153)]);
+    apps.set_ips_v6("messenger.exe", vec![v6]);
+    let rs = ruleset(vec![app_rule("R-app", "messenger.exe")]);
+    let routes_via = |target: &SecondaryRouteTarget| {
+        generate_secondary_routes(
+            &rs,
+            target,
+            &cache,
+            &apps,
+            &HashSet::new(),
+            &crate::address_ownership::AddressOwnership::default(),
+            crate::address_ownership::Link::Additional,
+        )
+        .routes
+    };
+
+    let routes = routes_via(&v6_capable_target());
+    assert!(
+        routes.iter().all(|r| r.destination != IpAddr::V6(v6)),
+        "a program's v6 destination was routed past the census: {routes:?}"
+    );
+    assert!(routes
+        .iter()
+        .any(|r| r.destination == IpAddr::V4(ip(203, 0, 113, 153))));
+}
+
 /// The case the census exists for: the browser reached the address an hour
 /// before the routed application ever touched it. Pinning it would have
 /// taken the browser's traffic into the tunnel with it.

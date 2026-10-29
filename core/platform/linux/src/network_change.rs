@@ -23,6 +23,7 @@ use nrr_platform_api::error::PlatformError;
 use nrr_platform_api::network_change::{
     NetworkChangeCallback, NetworkChangeObserver, NetworkChangeSubscription,
 };
+use nrr_platform_api::own_route_writes::RouteChangeKey;
 
 /// Production observer over the kernel's rtnetlink change feed.
 #[derive(Debug, Default, Clone, Copy)]
@@ -34,7 +35,16 @@ impl NetworkChangeObserver for LinuxNetworkChangeObserver {
         &self,
         on_change: NetworkChangeCallback,
     ) -> Result<NetworkChangeSubscription, PlatformError> {
-        let watcher = NetlinkWatcher::start(on_change)?;
+        let watcher = NetlinkWatcher::start(on_change, false)?;
+        Ok(NetworkChangeSubscription::new(Box::new(watcher)))
+    }
+
+    #[cfg(target_os = "linux")]
+    fn subscribe_foreign(
+        &self,
+        on_change: NetworkChangeCallback,
+    ) -> Result<NetworkChangeSubscription, PlatformError> {
+        let watcher = NetlinkWatcher::start(on_change, true)?;
         Ok(NetworkChangeSubscription::new(Box::new(watcher)))
     }
 
@@ -92,6 +102,15 @@ fn is_topology_change(message_type: u16) -> bool {
 /// second one. A malformed or truncated length ends the walk rather than
 /// looping: a bad frame must cost the rest of that datagram, not the thread.
 fn carries_topology_change(datagram: &[u8]) -> bool {
+    carries_foreign_change(datagram, |_| false)
+}
+
+/// [`carries_topology_change`], leaving out the route messages `is_echo`
+/// recognises as changes this process made.
+fn carries_foreign_change(
+    datagram: &[u8],
+    mut is_echo: impl FnMut(RouteChangeKey) -> bool,
+) -> bool {
     let mut offset = 0usize;
     while offset + NLMSG_HEADER_LEN <= datagram.len() {
         let length = u32::from_ne_bytes([
@@ -105,7 +124,16 @@ fn carries_topology_change(datagram: &[u8]) -> bool {
         }
         let message_type = u16::from_ne_bytes([datagram[offset + 4], datagram[offset + 5]]);
         if is_topology_change(message_type) {
-            return true;
+            let echo = matches!(message_type, RTM_NEWROUTE | RTM_DELROUTE)
+                && crate::route_table::parse_route_message(
+                    &datagram[offset + NLMSG_HEADER_LEN..offset + length],
+                )
+                .is_some_and(|entry| {
+                    is_echo(RouteChangeKey::of(&entry, message_type == RTM_DELROUTE))
+                });
+            if !echo {
+                return true;
+            }
         }
         // Round up to the alignment; a length that is already aligned stays put.
         offset += length.div_ceil(NLMSG_ALIGNMENT) * NLMSG_ALIGNMENT;
@@ -124,7 +152,10 @@ struct NetlinkWatcher {
 
 #[cfg(target_os = "linux")]
 impl NetlinkWatcher {
-    fn start(on_change: NetworkChangeCallback) -> Result<Self, PlatformError> {
+    fn start(
+        on_change: NetworkChangeCallback,
+        skip_own_routes: bool,
+    ) -> Result<Self, PlatformError> {
         let netlink = open_netlink_socket()?;
         let (wake_reader, wake_writer) = match open_wake_pipe() {
             Ok(pair) => pair,
@@ -137,7 +168,7 @@ impl NetlinkWatcher {
         let reader = std::thread::Builder::new()
             .name("nrr-netlink-watch".to_string())
             .spawn(move || {
-                read_until_woken(netlink, wake_reader, on_change);
+                read_until_woken(netlink, wake_reader, on_change, skip_own_routes);
                 close_fd(netlink);
                 close_fd(wake_reader);
             })
@@ -287,6 +318,7 @@ fn read_until_woken(
     netlink: libc::c_int,
     wake_reader: libc::c_int,
     on_change: NetworkChangeCallback,
+    skip_own_routes: bool,
 ) {
     // One datagram at a time, but a netlink message carrying a full route dump
     // is larger than the 8 KiB this used to allow, and a short buffer truncates
@@ -366,7 +398,15 @@ fn read_until_woken(
             );
             return;
         }
-        if carries_topology_change(&buffer[..read as usize]) {
+        let datagram = &buffer[..read as usize];
+        let changed = if skip_own_routes {
+            let writes = nrr_platform_api::own_route_writes::process_route_writes();
+            let now = std::time::Instant::now();
+            carries_foreign_change(datagram, |key| writes.take_echo(key, now))
+        } else {
+            carries_topology_change(datagram)
+        };
+        if changed {
             on_change();
         }
     }
@@ -399,6 +439,47 @@ mod tests {
             bytes.push(0);
         }
         bytes
+    }
+
+    /// The kernel's notice of a route we added is our echo; the same route
+    /// deleted by someone else, and anything else in the datagram, is news.
+    #[test]
+    fn the_notice_of_our_own_route_write_is_not_a_change() {
+        use nrr_platform_api::own_route_writes::OwnRouteWrites;
+        use nrr_platform_api::types::RouteEntry;
+        use std::net::{IpAddr, Ipv4Addr};
+        let ours = RouteEntry {
+            destination: IpAddr::V4(Ipv4Addr::new(203, 0, 113, 7)),
+            prefix_length: 32,
+            next_hop: IpAddr::V4(Ipv4Addr::new(10, 88, 0, 1)),
+            interface_index: 12,
+            metric: 5,
+            is_ours: true,
+            table: nrr_platform_api::RouteTableRef::Main,
+        };
+        let added =
+            crate::route_table::encode_route_mutation(RTM_NEWROUTE, &ours, 0).expect("encodes");
+        let deleted =
+            crate::route_table::encode_route_mutation(RTM_DELROUTE, &ours, 0).expect("encodes");
+        let writes = OwnRouteWrites::default();
+        let now = std::time::Instant::now();
+        let echo = |key| writes.take_echo(key, now);
+
+        writes.expect(RouteChangeKey::of(&ours, false), now);
+        assert!(
+            carries_foreign_change(&deleted, echo),
+            "someone removed our route"
+        );
+        assert!(!carries_foreign_change(&added, echo));
+        assert!(carries_foreign_change(&added, echo), "one write, one echo");
+
+        writes.expect(RouteChangeKey::of(&ours, false), now);
+        let mut mixed = added.clone();
+        mixed.extend(message(RTM_NEWLINK, b"payload"));
+        assert!(
+            carries_foreign_change(&mixed, echo),
+            "a link change rides along"
+        );
     }
 
     #[test]

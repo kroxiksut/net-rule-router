@@ -98,6 +98,52 @@ pub struct DnsStackInputs {
     pub paused: Option<Arc<crate::routing_pause::PausedPrincipals>>,
 }
 
+/// Which names an additional-link rule names, for the egress policy: the
+/// remembered books, so a query costs no store read.
+pub fn egress_rule_hosts(
+    settings_conn: Arc<Mutex<Connection>>,
+    active_sid: crate::supervised_runtime::ActiveRoutingSidFn,
+    served: Option<crate::dns_resolver_ports::ResolverPrincipalsFn>,
+    paused: Option<Arc<crate::routing_pause::PausedPrincipals>>,
+) -> Arc<dyn crate::dns_resolver::RuleHostOracle> {
+    let mut oracle = crate::dns_resolver_ports::ActiveRuleHostOracle::new(
+        Arc::new(ProductionRulesProvider::new(settings_conn)),
+        active_sid,
+    );
+    if let Some(served) = served {
+        oracle = oracle.with_served(served);
+    }
+    if let Some(paused) = paused {
+        oracle = oracle.with_paused(paused);
+    }
+    Arc::new(oracle)
+}
+
+/// How long one reading of the tunnel's address serves the queries after it.
+const TUNNEL_SOURCE_TTL: Duration = Duration::from_secs(3);
+
+/// The egress policy where no route coordinator names the tunnel's address:
+/// the routing user's bound additional link, from `links`.
+pub fn stored_binding_egress_policy(
+    settings_conn: Arc<Mutex<Connection>>,
+    active_sid: crate::supervised_runtime::ActiveRoutingSidFn,
+    served: Option<crate::dns_resolver_ports::ResolverPrincipalsFn>,
+    paused: Option<Arc<crate::routing_pause::PausedPrincipals>>,
+    links: Arc<dyn crate::production_auto_rule_probe::EgressSources>,
+) -> Arc<dyn crate::dns_egress::DnsEgressPolicy> {
+    let rule_hosts = egress_rule_hosts(settings_conn, Arc::clone(&active_sid), served, paused);
+    let source = crate::dns_egress::MemoizedSecondarySource::new(TUNNEL_SOURCE_TTL, move || {
+        active_sid().and_then(|sid| links.egress_source_ips(&sid).1)
+    });
+    Arc::new(
+        crate::dns_egress::SecondaryPreferredEgress::new(
+            crate::dns_egress::global_dns_via_secondary(),
+            Arc::new(source),
+        )
+        .with_rule_hosts(rule_hosts),
+    )
+}
+
 /// The factory the [`DnsResolverController`] calls on each start. The
 /// enforcement-mode gate lives in the controller: the factory always tries to
 /// build when asked.
@@ -114,6 +160,10 @@ pub fn build_dns_resolver_factory(
         namespace_recheck(),
     );
     let fed = watch.is_some();
+    let sockets_closed_on_change = close_upstream_sockets_on_change(
+        platform.network_changes.as_ref(),
+        &platform.upstream_pool,
+    );
     // Only a foreign tunnel's claim is honoured by itself; the main link's is
     // offered, the administrator's list is left to the main link's resolvers,
     // and a rule host under either stays with the listener.
@@ -132,7 +182,7 @@ pub fn build_dns_resolver_factory(
         Arc::new(move || namespaces.exemptions());
     Arc::new(move || {
         // Subscribed for as long as a resolver can be built on it.
-        let _subscribed = &watch;
+        let _subscribed = (&watch, &sockets_closed_on_change);
         build_dns_resolver_instance(&inputs, &platform, fed, Arc::clone(&exemptions))
     })
 }
@@ -215,6 +265,21 @@ pub(crate) fn watch_dns_changes(
             None
         }
     }
+}
+
+/// Close the upstream sockets kept for reuse on every link or route change,
+/// before any pass notices it: each was connected from an address the change
+/// may have taken away, and a query on it waits out its timeout. Our own
+/// route writes are no news to them. A feed that cannot be watched is
+/// reported by [`watch_dns_changes`]; the sockets then retire by age.
+pub(crate) fn close_upstream_sockets_on_change(
+    network: &dyn NetworkChangeObserver,
+    pool: &Arc<UpstreamDnsPool>,
+) -> Option<NetworkChangeSubscription> {
+    let pool = Arc::clone(pool);
+    let close: nrr_platform_api::network_change::NetworkChangeCallback =
+        Arc::new(move || pool.close_idle_sockets());
+    network.subscribe_foreign(close).ok()
 }
 
 /// Adapts the auto-rules engine to the resolver's companion-candidate port.
@@ -384,6 +449,7 @@ fn build_dns_resolver_instance(
         )
         .with_served(Arc::clone(&principals)),
     );
+    secondary_owned.prime();
 
     let private_resolvers = private_resolvers_from(Arc::clone(&platform.system_dns));
     let mut listener = DnsInterceptListener::new(
@@ -893,6 +959,34 @@ mod tests {
         assert!(flag.swap(false, Ordering::SeqCst), "a link change");
         dns_config.fire();
         assert!(flag.swap(false, Ordering::SeqCst), "a DNS settings change");
+    }
+
+    /// A link or route change closes the upstream sockets kept for reuse the
+    /// moment the OS reports it. No other caller tells the pool on every OS,
+    /// and a socket from the old network costs its query a full timeout.
+    #[test]
+    fn a_network_change_event_closes_the_idle_upstream_sockets() {
+        use crate::dns_upstream_sockets::{UpstreamKey, UpstreamSockets};
+        let sockets: &'static UpstreamSockets = Box::leak(Box::new(UpstreamSockets::new()));
+        let server: SocketAddr = "127.0.0.1:53".parse().expect("addr");
+        let pool = Arc::new(UpstreamDnsPool::fixed(server).with_sockets(sockets));
+        let network = ManualObserver::default();
+        let watch = close_upstream_sockets_on_change(&network, &pool);
+        assert!(watch.is_some());
+        sockets
+            .checkout(UpstreamKey { bind: None, server }, || {
+                std::net::UdpSocket::bind("127.0.0.1:0")
+            })
+            .expect("open")
+            .release();
+        assert_eq!(sockets.idle_count(), 1);
+
+        network.fire();
+        assert_eq!(
+            sockets.idle_count(),
+            0,
+            "a socket from the old network was kept"
+        );
     }
 
     /// With either feed missing nothing could say what changed, so the

@@ -87,7 +87,7 @@ pub fn collect_exemptions(
     let tunnel = secondary.map_or(0, |s| s.index);
 
     CatchAllExemptions {
-        server_ips: bootstrap_server_ips(routes, tunnel, Some(primary_gateway)),
+        server_ips: bootstrap_server_ips(routes, tunnel, primary_gateway),
         local_subnets,
         server_ips_v6: bootstrap_server_ips_v6(
             routes,
@@ -202,7 +202,7 @@ impl TooWideLocalNetworkNotices {
 }
 
 /// Whether [`collect_exemptions`] can read anything for these bindings: the
-/// primary present with a gateway and a tunnel bound, present or not — the LAN
+/// primary present and a tunnel bound, present or not — the LAN
 /// is read off the primary alone.
 #[must_use]
 pub fn links_resolve(
@@ -213,18 +213,18 @@ pub fn links_resolve(
     resolve_links(adapters, primary_name, secondary_name).is_some()
 }
 
-/// The bound links and the primary's gateway. A primary with no gateway is a
-/// machine with no way out, and a bootstrap route cannot be recognised
-/// without one.
+/// The bound links and the primary's gateway. A primary without an IPv4 next
+/// hop still carries traffic (a PPP link routes on-link, OpenVPN without `def1`
+/// moves the default onto the tunnel), so it resolves; only the bootstrap
+/// routes, which are recognised by that next hop, go unread.
 fn resolve_links<'a>(
     adapters: &'a [AdapterInfo],
     primary_name: Option<&str>,
     secondary_name: Option<&str>,
-) -> Option<(&'a AdapterInfo, Option<&'a AdapterInfo>, Ipv4Addr)> {
+) -> Option<(&'a AdapterInfo, Option<&'a AdapterInfo>, Option<Ipv4Addr>)> {
     let primary = primary_name.and_then(|n| adapter_by_name(adapters, n))?;
     let secondary = adapter_by_name(adapters, secondary_name?);
-    let gateway = primary.gateways.first().copied()?;
-    Some((primary, secondary, gateway))
+    Some((primary, secondary, primary.gateways.first().copied()))
 }
 
 /// The adapter a bound display name refers to, matched the way the route
@@ -302,8 +302,6 @@ mod tests {
         assert_eq!(ex.local_subnets, vec![(Ipv4Addr::new(192, 168, 1, 0), 24)]);
     }
 
-    /// The failure that matters: with no server address the guard would seal the
-    /// tunnel's own reconnect, so it must refuse to arm rather than arm blind.
     /// libvirt, Podman, LXD and Docker Compose bridges carry no driver name on
     /// Linux, only the link name. Under "everything" the user's own virtual
     /// machines and containers stay reachable, as on Windows.
@@ -518,16 +516,16 @@ mod tests {
     }
 
     /// A primary with no gateway cannot produce a bootstrap route, and calling
-    /// anything a server on that machine would be a guess.
+    /// anything a server on that machine would be a guess. Its LAN is still
+    /// read, so the guard that arms there does not cut it.
     #[test]
-    fn a_primary_without_a_gateway_yields_nothing() {
+    fn a_primary_without_a_gateway_names_no_server_but_keeps_its_lan() {
         let (routes, mut adapters) = machine();
         adapters[0].gateways.clear();
 
-        assert!(
-            collect_exemptions(&routes, &adapters, Some("eth0"), Some("tun0"))
-                .server_ips
-                .is_empty()
-        );
+        let ex = collect_exemptions(&routes, &adapters, Some("eth0"), Some("tun0"));
+        assert!(ex.server_ips.is_empty());
+        assert_eq!(ex.local_subnets, vec![(Ipv4Addr::new(192, 168, 1, 0), 24)]);
+        assert!(links_resolve(&adapters, Some("eth0"), Some("tun0")));
     }
 }

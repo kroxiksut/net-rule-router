@@ -313,6 +313,13 @@ pub struct RouteCodegenOutput {
     pub diagnostics: Vec<RouteCodegenDiagnostic>,
 }
 
+/// Whether a program's IPv6 destinations get a host route into the tunnel.
+/// Off until the shared-address census and foreign-tunnel detection judge
+/// IPv6 too: without them a `/128` can carry another program's or a corporate
+/// tunnel's address. Off, the program's v6 connections meet its own block on
+/// the main link and it falls back to IPv4, as before it learnt IPv6.
+pub(crate) const APP_IPV6_ROUTES: bool = false;
+
 /// Build the secondary route set for `secondary_rules` (the rules bound
 /// to the secondary route role). Pure: no I/O beyond the injected FQDN
 /// cache reader. Routes are de-duplicated by destination across rules.
@@ -386,7 +393,10 @@ pub fn generate_secondary_routes(
                 CanonicalAppPattern::Path(path) => path.as_str(),
             };
             let destinations = gate.admit(pattern, link);
-            if destinations.admitted.is_empty() && destinations.refused.is_empty() {
+            if destinations.admitted.is_empty()
+                && destinations.admitted_v6.is_empty()
+                && destinations.refused.is_empty()
+            {
                 out.diagnostics
                     .push(RouteCodegenDiagnostic::AppRuleUnobserved {
                         rule_id: rule.id.as_str().to_string(),
@@ -427,10 +437,15 @@ pub fn generate_secondary_routes(
                 });
             }
             let mut per_rule = 0usize;
-            for ip in destinations.admitted {
-                // App observations are IPv4: nothing records a v6 destination
-                // for a process yet.
-                if !push_route(IpAddr::V4(ip), target, &mut seen, &mut out, &mut per_rule) {
+            // `push_route` drops a v6 one where the link has no v6 next hop.
+            let admitted = destinations.admitted.into_iter().map(IpAddr::V4);
+            let admitted_v6 = destinations
+                .admitted_v6
+                .into_iter()
+                .filter(|_| APP_IPV6_ROUTES)
+                .map(IpAddr::V6);
+            for ip in admitted.chain(admitted_v6) {
+                if !push_route(ip, target, &mut seen, &mut out, &mut per_rule) {
                     break;
                 }
             }
@@ -786,7 +801,7 @@ fn push_network_plan(
 }
 
 /// `/32` routes that send the service's own DNS queries out the secondary link
-/// (the route half of the DNS-over-secondary setting).
+/// (the route half of `dns_egress::query_egress`).
 ///
 /// Source-binding a query socket to the tunnel address is not enough on its
 /// own: the route table still picks the outgoing interface by DESTINATION, so

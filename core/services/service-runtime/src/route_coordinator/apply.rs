@@ -46,7 +46,7 @@ impl SecondaryRouteCoordinator {
             .map(|t| self.stamped_with_ownership(t));
         let adapters = adapters.unwrap_or_else(|| self.adapters_for_facts());
         let snapshot = self.fqdn_cache.snapshot_for_compute();
-        let cache = snapshot_or_live(snapshot.as_ref(), self.fqdn_cache.as_ref());
+        let cache = snapshot_or_live(snapshot.as_deref(), self.fqdn_cache.as_ref());
         let policy = self.route_source.load_for_sid(sid);
         let plan =
             self.plan_user_routes(sid, resolution, policy.as_ref(), &table, &adapters, cache);

@@ -60,6 +60,7 @@ struct FaultyKeyStore {
     fail_load: bool,
     fail_save: bool,
     fail_marker: bool,
+    fail_anchor_load: bool,
 }
 
 impl KeyStore for FaultyKeyStore {
@@ -90,6 +91,34 @@ impl KeyStore for FaultyKeyStore {
     fn delete_resign_marker(&self) -> Result<(), PlatformError> {
         self.inner.delete_resign_marker()
     }
+    fn save_rules_anchor(&self, record: &[u8]) -> Result<(), PlatformError> {
+        self.inner.save_rules_anchor(record)
+    }
+    fn load_rules_anchor(&self) -> Result<Option<Vec<u8>>, PlatformError> {
+        if self.fail_anchor_load {
+            return Err(failure("load_rules_anchor"));
+        }
+        self.inner.load_rules_anchor()
+    }
+}
+
+/// A disk fault on the record of the active rules leaves this start unable to
+/// see a deleted row or an old copy of the database put back. The key loaded,
+/// so the service stays signed, and the missing check is on record where the
+/// user can see it, not only in the log.
+#[test]
+fn an_unreadable_record_of_the_rules_is_an_integrity_outage() {
+    let (_dir, conn) = open_state();
+    seed_signed_row(&conn);
+    let key_store = FaultyKeyStore {
+        inner: InMemKeyStore::with_key(vec![0x11; 32]),
+        fail_anchor_load: true,
+        ..Default::default()
+    };
+    let h = Harness::new(Arc::new(InMemorySecurityAlertsRepository::new()));
+    let outcome = h.boot(NOW).bootstrap(&conn, &key_store);
+    assert!(outcome.is_some(), "the key loaded: the start stays signed");
+    assert_reported(&h, "key-store");
 }
 
 /// The alert store is itself what failed.

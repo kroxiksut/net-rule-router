@@ -299,6 +299,9 @@ pub struct SecondaryRouteCoordinator {
     /// The resolution each principal's last full recompute used. A first
     /// contact plans from it instead of re-reading the adapters on the DNS path.
     last_resolution: Mutex<HashMap<String, RouteResolution>>,
+    /// The book and policy each principal's last pass planned from, so a
+    /// first contact reads neither store on the DNS path.
+    pass_inputs: crate::last_pass_inputs::LastPassInputs<liveness::PlanInputs>,
     /// Principals whose last pass read the machine, so their kept-direct
     /// segments stand. A first contact for anyone else would plan blind.
     machine_read: Mutex<std::collections::HashSet<String>>,

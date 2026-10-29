@@ -505,18 +505,27 @@ pub(super) fn build(inputs: PerSidApplyInputs<'_>) -> PerSidApplyStack {
                 let coord = Arc::clone(&route_coord);
                 Arc::new(move || coord.effective_routing_sid(&reg.active_sids()))
             };
+            let seeder_served: nrr_service_runtime::dns_resolver_ports::ResolverPrincipalsFn = {
+                let reg = Arc::clone(&sid_registry);
+                let coord = Arc::clone(&route_coord);
+                Arc::new(move || coord.served_sids(&reg.active_sids()))
+            };
             let route_seeder = Arc::new(
                 nrr_service_runtime::rule_hostname_seeder::RuleHostnameSeeder::new(
                     build_hosts_bypass_resolver(
                         Some(Arc::clone(state_conn)),
-                        Some({
-                            let reg = Arc::clone(&sid_registry);
-                            let coord = Arc::clone(&route_coord);
-                            Arc::new(move || coord.served_sids(&reg.active_sids()))
-                        }),
+                        Some(Arc::clone(&seeder_served)),
                         Some(build_dns_egress_policy(
                             &route_coord,
                             Arc::clone(&seeder_active_sid),
+                            // The pause registry is built later: a paused
+                            // user's host still asks through the tunnel here.
+                            Some(nrr_service_runtime::dns_stack::egress_rule_hosts(
+                                Arc::clone(state_conn),
+                                Arc::clone(&seeder_active_sid),
+                                Some(seeder_served),
+                                None,
+                            )),
                         )),
                     ),
                     Arc::clone(cache_arc),

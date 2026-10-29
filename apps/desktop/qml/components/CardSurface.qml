@@ -11,13 +11,27 @@ Rectangle {
     // When true, the border is drawn 2px instead of theme.borderWidth so
     // the danger/warning state is visually distinct.
     property bool emphasizedBorder: false
+    // Keyboard focus on this card. A selected card already wears the focus
+    // colour, so focus draws the filled-control ring pair instead.
+    property bool focused: false
 
     radius: cornerRadius
     color: overrideFill !== "transparent"
         ? overrideFill
         : (selected ? theme.stateFocusedFill : theme.colorBase)
-    border.width: emphasizedBorder ? 2 : theme.borderWidth
-    border.color: overrideBorder !== "transparent"
+    border.width: focused ? theme.focusBorderWidth : emphasizedBorder ? 2 : theme.borderWidth
+    border.color: focused
+        ? theme.stateFocusedBorderOnFill
+        : overrideBorder !== "transparent"
         ? overrideBorder
         : (selected ? theme.stateFocusedBorder : theme.stateDefaultBorder)
+    Rectangle {
+        visible: parent.focused
+        anchors.fill: parent
+        anchors.margins: parent.theme.focusBorderWidth
+        radius: Math.max(0, parent.radius - parent.theme.focusBorderWidth)
+        color: "transparent"
+        border.width: parent.theme.borderWidth
+        border.color: parent.theme.stateFocusedInnerOnFill
+    }
 }

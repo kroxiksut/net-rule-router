@@ -133,7 +133,7 @@ impl SecondaryRouteCoordinator {
                     let rules = self.rules_provider.active_rules_for(sid)?;
                     let snapshot = self.fqdn_cache.snapshot_for_compute();
                     let cache = super::liveness::snapshot_or_live(
-                        snapshot.as_ref(),
+                        snapshot.as_deref(),
                         self.fqdn_cache.as_ref(),
                     );
                     Some(crate::address_ownership::AddressOwnership::resolve(

@@ -64,7 +64,7 @@
 //! store — including every row written before rows had owners — and ages out.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::net::Ipv4Addr;
+use std::net::IpAddr;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
@@ -84,7 +84,7 @@ pub use nrr_storage::app_destinations::RememberedDestination;
 /// production impl writes
 /// `nrr_storage::app_destinations::AppDestinationsRepository::upsert`.
 pub type AppDestinationPersistFn =
-    Arc<dyn Fn(Option<&str>, &str, &[Ipv4Addr], SystemTime) + Send + Sync>;
+    Arc<dyn Fn(Option<&str>, &str, &[IpAddr], SystemTime) + Send + Sync>;
 
 /// Load every remembered destination confirmed at or after the given instant,
 /// with its owner, newest first. The production impl reads
@@ -200,13 +200,13 @@ impl AppDestinationMemory {
     /// today. With nobody's rules readable yet there is nothing to hold them
     /// to; codegen still gates them by the rules.
     fn seed_machine_wide(&self, rows: Vec<RememberedDestination>) -> usize {
-        let pairs: Vec<(String, Ipv4Addr)> = rows
+        let pairs: Vec<(String, IpAddr)> = rows
             .into_iter()
             .filter(|row| row.owner.is_none())
             .map(|row| (row.app_key, row.ip))
             .collect();
         let books = self.present_books();
-        let pairs: Vec<(String, Ipv4Addr)> = if books.is_empty() {
+        let pairs: Vec<(String, IpAddr)> = if books.is_empty() {
             pairs
         } else {
             pairs
@@ -225,7 +225,7 @@ impl AppDestinationMemory {
     /// to that owner's rules where they are readable. A row with no owner
     /// seeds nobody.
     fn seed_each_owner(&self, rows: Vec<RememberedDestination>) -> usize {
-        let mut by_owner: BTreeMap<String, Vec<(String, Ipv4Addr)>> = BTreeMap::new();
+        let mut by_owner: BTreeMap<String, Vec<(String, IpAddr)>> = BTreeMap::new();
         for row in rows {
             if let Some(owner) = row.owner {
                 by_owner
@@ -239,7 +239,7 @@ impl AppDestinationMemory {
             let Some(store) = self.observations.scope_for(Some(&owner)) else {
                 continue;
             };
-            let pairs: Vec<(String, Ipv4Addr)> = match self.rules.active_rules_for(&owner) {
+            let pairs: Vec<(String, IpAddr)> = match self.rules.active_rules_for(&owner) {
                 Some(snapshot) => {
                     let gate = self.gate(&owner, &snapshot.rule_book);
                     pairs
@@ -337,12 +337,24 @@ impl AppDestinationMemory {
                 continue;
             }
             // The slice the filters carry: the most recently used, capped
-            // identically, so a restart brings back the current servers.
-            let ips = observations.ips_for_app(&pattern);
-            if ips.is_empty() {
+            // identically per family, so a restart brings back the current
+            // servers of both.
+            let v4 = observations.ips_for_app(&pattern);
+            let v6 = observations.ips_v6_for_app(&pattern);
+            if v4.is_empty() && v6.is_empty() {
                 continue;
             }
-            let ips = observations.latest_of(&pattern, &ips, PER_HOSTNAME_IP_CAP);
+            let ips: Vec<IpAddr> = observations
+                .latest_among(&pattern, &v4, PER_HOSTNAME_IP_CAP)
+                .into_iter()
+                .map(IpAddr::V4)
+                .chain(
+                    observations
+                        .latest_among(&pattern, &v6, PER_HOSTNAME_IP_CAP)
+                        .into_iter()
+                        .map(IpAddr::V6),
+                )
+                .collect();
             // Only what was actually seen since the last pass. The store also
             // holds addresses re-seeded from earlier sessions and ones last
             // used hours ago; writing those with `now` re-confirms them on
@@ -351,7 +363,7 @@ impl AppDestinationMemory {
             // the `learned_at` they earned — the upsert only moves it forward
             // for the addresses named here.
             let seen = observations.take_seen_since_flush(&pattern);
-            let confirmed: Vec<Ipv4Addr> = ips
+            let confirmed: Vec<IpAddr> = ips
                 .iter()
                 .copied()
                 .filter(|ip| seen.contains(ip))
@@ -376,17 +388,17 @@ enum ProgramAddresses {
 }
 
 impl ProgramAddresses {
-    fn keeps(&self, book: &CanonicalRuleBook, ip: Ipv4Addr) -> bool {
+    fn keeps(&self, book: &CanonicalRuleBook, ip: IpAddr) -> bool {
         match self {
             Self::Unnamed => !named_by_address_rule(book, ip),
-            Self::AllBut(vetoes) => !vetoes.contains(&std::net::IpAddr::V4(ip)),
+            Self::AllBut(vetoes) => !vetoes.contains(&ip),
         }
     }
 }
 
 /// Whether `book` would let `flush` write `ip` for the application keyed `key`.
 /// Keys are compared normalised: earlier builds stored the rule spelling.
-fn admits(book: &CanonicalRuleBook, gate: &ProgramAddresses, key: &str, ip: Ipv4Addr) -> bool {
+fn admits(book: &CanonicalRuleBook, gate: &ProgramAddresses, key: &str, ip: IpAddr) -> bool {
     let key = crate::app_observation_lookup::observation_key(key);
     routed_app_patterns(&book.secondary)
         .iter()
@@ -397,12 +409,12 @@ fn admits(book: &CanonicalRuleBook, gate: &ProgramAddresses, key: &str, ip: Ipv4
 /// Whether an address rule — an exact address, or a subnet or range holding it
 /// — names `ip` for every process. Asked of the engine, so "names" means what
 /// the matcher says, not a second reading of the rule kinds.
-fn named_by_address_rule(book: &CanonicalRuleBook, ip: Ipv4Addr) -> bool {
+fn named_by_address_rule(book: &CanonicalRuleBook, ip: IpAddr) -> bool {
     matches!(
         nrr_domain::decision_engine_input::match_sample(
             book,
             None,
-            Some(std::net::IpAddr::V4(ip)),
+            Some(ip),
             None,
             ZonePriorityPolicy::default(),
             RouteBehaviorMode::PreferPrimary,
@@ -444,11 +456,15 @@ mod tests {
     };
     use nrr_domain::RuleId;
     use std::collections::HashSet;
-    use std::net::IpAddr;
+    use std::net::{Ipv4Addr, Ipv6Addr};
     use std::sync::Mutex;
 
     fn ip(d: u8) -> Ipv4Addr {
         Ipv4Addr::new(203, 0, 113, d)
+    }
+
+    fn at(d: u8) -> IpAddr {
+        IpAddr::V4(ip(d))
     }
 
     fn app_rule(id: &str, pattern: &str) -> CanonicalRule {
@@ -490,7 +506,7 @@ mod tests {
 
     /// Persisted rows shared between the fake persist + load closures, so one
     /// fixture exercises a full session hand-off.
-    type PersistedRow = (Option<String>, String, Ipv4Addr, SystemTime);
+    type PersistedRow = (Option<String>, String, IpAddr, SystemTime);
 
     #[derive(Default)]
     struct FakeTable {
@@ -501,7 +517,7 @@ mod tests {
         fn persist_fn(table: &Arc<FakeTable>) -> AppDestinationPersistFn {
             let table = Arc::clone(table);
             Arc::new(
-                move |owner: Option<&str>, app: &str, ips: &[Ipv4Addr], now: SystemTime| {
+                move |owner: Option<&str>, app: &str, ips: &[IpAddr], now: SystemTime| {
                     let mut g = table.rows.lock().unwrap_or_else(|p| p.into_inner());
                     for ip in ips {
                         g.retain(|(o, a, i, _)| !(o.as_deref() == owner && a == app && i == ip));
@@ -640,7 +656,7 @@ mod tests {
         // from an earlier session is not loaded at all.
         let table = Arc::new(FakeTable::default());
         let rules = book(vec![app_rule("r1", "messenger.exe")]);
-        FakeTable::persist_fn(&table)(None, "chrome.exe", &[ip(9)], SystemTime::now());
+        FakeTable::persist_fn(&table)(None, "chrome.exe", &[at(9)], SystemTime::now());
 
         let store = Arc::new(AppObservationStore::new());
         let mem = memory(&store, rules.clone(), &table);
@@ -655,7 +671,7 @@ mod tests {
     fn a_remembered_address_a_rule_now_names_is_not_loaded() {
         let table = Arc::new(FakeTable::default());
         let now = SystemTime::now();
-        FakeTable::persist_fn(&table)(None, "messenger", &[ip(5), ip(50), ip(60)], now);
+        FakeTable::persist_fn(&table)(None, "messenger", &[at(5), at(50), at(60)], now);
         let mut rules = book(vec![app_rule("r1", "messenger.exe")]);
         let address = |id: &str, ip: Ipv4Addr| CanonicalRule {
             address_match: Some(CanonicalAddressMatch::ExactIp(IpAddr::V4(ip))),
@@ -852,7 +868,7 @@ mod tests {
 
         let mem = memory(&store, rules, &table).with_app_takeover(Arc::new(|sid| sid == "S-A"));
         mem.flush(SystemTime::now());
-        let mut rows: Vec<Ipv4Addr> = table
+        let mut rows: Vec<IpAddr> = table
             .rows
             .lock()
             .unwrap_or_else(|p| p.into_inner())
@@ -860,7 +876,7 @@ mod tests {
             .map(|r| r.2)
             .collect();
         rows.sort();
-        assert_eq!(rows, vec![in_network, ip(5), ip(50)]);
+        assert_eq!(rows, vec![IpAddr::V4(in_network), at(5), at(50)]);
     }
 
     /// The same rows, read back at start-up under the setting.
@@ -868,7 +884,7 @@ mod tests {
     fn under_the_takeover_setting_a_remembered_named_address_is_loaded() {
         let table = Arc::new(FakeTable::default());
         let now = SystemTime::now();
-        FakeTable::persist_fn(&table)(None, "messenger", &[ip(5), ip(50), ip(60)], now);
+        FakeTable::persist_fn(&table)(None, "messenger", &[at(5), at(50), at(60)], now);
         let mut rules = book(vec![app_rule("r1", "messenger.exe")]);
         named_and_blocked(&mut rules);
 
@@ -878,6 +894,33 @@ mod tests {
         let mut loaded = store.ips_for_app("messenger.exe");
         loaded.sort();
         assert_eq!(loaded, vec![ip(5), ip(50)]);
+    }
+
+    /// A program's IPv6 server is remembered like its IPv4 one: forgotten at
+    /// a restart, its first v6 connection of every session is held again.
+    #[test]
+    fn an_ipv6_destination_is_remembered_across_a_restart() {
+        let table = Arc::new(FakeTable::default());
+        let rules = book(vec![app_rule("r1", "messenger.exe")]);
+        let v6: Ipv6Addr = "2001:db8::7".parse().expect("v6");
+        let first = Arc::new(AppObservationStore::new());
+        first.record("messenger.exe", ip(7));
+        first.record("messenger.exe", v6);
+        assert_eq!(
+            memory(&first, rules.clone(), &table).flush(SystemTime::now()),
+            FlushSummary {
+                apps: 1,
+                destinations: 2
+            }
+        );
+
+        let second = Arc::new(AppObservationStore::new());
+        assert_eq!(
+            memory(&second, rules, &table).warm_load(SystemTime::now()),
+            2
+        );
+        assert_eq!(second.ips_v6_for_app("messenger.exe"), vec![v6]);
+        assert_eq!(second.ips_for_app("messenger.exe"), vec![ip(7)]);
     }
 
     /// A messenger that moved to new servers kept its lowest-numbered old ones
@@ -910,8 +953,8 @@ mod tests {
         let earlier = now
             .checked_sub(Duration::from_secs(60))
             .expect("clock past the epoch");
-        FakeTable::persist_fn(&table)(None, "messenger.exe", &[ip(1)], earlier);
-        FakeTable::persist_fn(&table)(None, "messenger.exe", &[ip(2)], now);
+        FakeTable::persist_fn(&table)(None, "messenger.exe", &[at(1)], earlier);
+        FakeTable::persist_fn(&table)(None, "messenger.exe", &[at(2)], now);
 
         let store = Arc::new(AppObservationStore::with_cap(2));
         assert_eq!(memory(&store, rules, &table).warm_load(now), 2);
@@ -927,8 +970,8 @@ mod tests {
         let stale = now
             .checked_sub(ENFORCEMENT_CONFIRMATION_WINDOW + Duration::from_secs(60))
             .expect("clock past the epoch");
-        FakeTable::persist_fn(&table)(None, "messenger.exe", &[ip(1)], stale);
-        FakeTable::persist_fn(&table)(None, "messenger.exe", &[ip(2)], now);
+        FakeTable::persist_fn(&table)(None, "messenger.exe", &[at(1)], stale);
+        FakeTable::persist_fn(&table)(None, "messenger.exe", &[at(2)], now);
 
         let store = Arc::new(AppObservationStore::new());
         let mem = memory(&store, rules.clone(), &table);
@@ -1063,9 +1106,9 @@ mod tests {
         let table = Arc::new(FakeTable::default());
         let now = SystemTime::now();
         let persist = FakeTable::persist_fn(&table);
-        persist(Some("uid:1000"), "firefox", &[ip(1)], now);
-        persist(Some("uid:1001"), "firefox", &[ip(2)], now);
-        persist(None, "firefox", &[ip(3)], now);
+        persist(Some("uid:1000"), "firefox", &[at(1)], now);
+        persist(Some("uid:1001"), "firefox", &[at(2)], now);
+        persist(None, "firefox", &[at(3)], now);
 
         let store = Arc::new(AppObservationStore::per_principal());
         let mem = memory(&store, book(vec![app_rule("r1", "firefox")]), &table);
@@ -1107,9 +1150,9 @@ mod tests {
         );
         {
             let rows = table.rows.lock().unwrap_or_else(|p| p.into_inner());
-            let written: Vec<(Option<&str>, Ipv4Addr)> =
+            let written: Vec<(Option<&str>, IpAddr)> =
                 rows.iter().map(|r| (r.0.as_deref(), r.2)).collect();
-            assert_eq!(written, vec![(Some("uid:1000"), ip(7))]);
+            assert_eq!(written, vec![(Some("uid:1000"), at(7))]);
         }
 
         let next = Arc::new(AppObservationStore::per_principal());
@@ -1126,8 +1169,8 @@ mod tests {
         let table = Arc::new(FakeTable::default());
         let now = SystemTime::now();
         let persist = FakeTable::persist_fn(&table);
-        persist(None, "messenger", &[ip(1)], now);
-        persist(Some("S-A"), "messenger", &[ip(2)], now);
+        persist(None, "messenger", &[at(1)], now);
+        persist(Some("S-A"), "messenger", &[at(2)], now);
 
         let store = Arc::new(AppObservationStore::new());
         let mem = memory(&store, book(vec![app_rule("r1", "messenger.exe")]), &table);

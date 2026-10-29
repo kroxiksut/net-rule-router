@@ -345,31 +345,34 @@ impl ActivationCoordinator {
             }
             None => {
                 let now = self.clock.now_secs();
-                let conn = lock_state(&self.conn);
-                // Same pair, same reason as the activation commit: a rollback
-                // that marks the revision and does not clear the pointer leaves
-                // the pointer naming a revision that is no longer active.
-                let tx = conn
-                    .unchecked_transaction()
-                    .map_err(|e| PolicyError::StorageFailure {
-                        operation: "begin_integrity_tx",
-                        message: e.to_string(),
+                let scope = crate::rules_anchor::AnchorScope::one(principal);
+                self.anchored(&scope, || {
+                    let conn = lock_state(&self.conn);
+                    // Same pair, same reason as the activation commit: a rollback
+                    // that marks the revision and does not clear the pointer leaves
+                    // the pointer naming a revision that is no longer active.
+                    let tx =
+                        conn.unchecked_transaction()
+                            .map_err(|e| PolicyError::StorageFailure {
+                                operation: "begin_integrity_tx",
+                                message: e.to_string(),
+                            })?;
+                    let repo = self.revisions_repo(&conn);
+                    repo.mark_rolled_back_for(principal, &rejected_revision_id, now)
+                        .map_err(|e| PolicyError::StorageFailure {
+                            operation: "mark_rolled_back(integrity)",
+                            message: e.to_string(),
+                        })?;
+                    repo.clear_active_pointer_for(principal).map_err(|e| {
+                        PolicyError::StorageFailure {
+                            operation: "clear_active_pointer(integrity)",
+                            message: e.to_string(),
+                        }
                     })?;
-                let repo = self.revisions_repo(&conn);
-                repo.mark_rolled_back_for(principal, &rejected_revision_id, now)
-                    .map_err(|e| PolicyError::StorageFailure {
-                        operation: "mark_rolled_back(integrity)",
+                    tx.commit().map_err(|e| PolicyError::StorageFailure {
+                        operation: "commit_integrity_tx",
                         message: e.to_string(),
-                    })?;
-                repo.clear_active_pointer_for(principal).map_err(|e| {
-                    PolicyError::StorageFailure {
-                        operation: "clear_active_pointer(integrity)",
-                        message: e.to_string(),
-                    }
-                })?;
-                tx.commit().map_err(|e| PolicyError::StorageFailure {
-                    operation: "commit_integrity_tx",
-                    message: e.to_string(),
+                    })
                 })?;
                 ActiveIntegrityOutcome::ClearedNoTrustedFallback {
                     rejected_revision_id: rejected_revision_id.clone(),

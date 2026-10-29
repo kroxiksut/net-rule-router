@@ -15,6 +15,10 @@ This setting sends NetRuleRouter's own name lookups through the additional
 connection instead, so your main provider neither sees which names you look
 up nor gets to decide what the answer is.
 
+Even with this setting off, the names in your rules for the additional
+connection are always looked up through it, so your main provider cannot
+change their answers.
+
 ## What you get
 
 - **Sites that a provider tampers with start working.** If a name was being
@@ -54,11 +58,10 @@ Through the additional connection the lookups go to public resolvers: 1.1.1.1
 (Cloudflare), 8.8.8.8 (Google) and 9.9.9.9 (Quad9). Those services see the
 names, instead of your main provider.
 
-A lookup the additional connection does not answer in time is repeated over
-the main connection, so that names keep resolving. For that name your main
-provider can see the lookup and may answer it dishonestly. Sending such
-repeats through the additional connection too is planned for a later
-version.
+A lookup the additional connection does not answer in time is tried again
+through it, at another of these services. Only when the additional connection
+stops answering altogether do lookups return to the main connection, so that
+names keep resolving; those lookups your main provider can see.
 
 ## What it does not do
 

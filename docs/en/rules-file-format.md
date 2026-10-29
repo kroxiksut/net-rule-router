@@ -298,9 +298,12 @@ both files are evaluated together:
    add an exact rule for the apex — it is a higher tier and wins.
 3. **Site in every zone** — `example.*` matches `example.com`, `example.net`,
    `example.co.uk` and any of their subdomains: for each host it is the rule
-   `*.example.<zone>`. A rule that names the zone (`example.by`,
-   `*.example.by`) beats it on any route; between two such rules the longer
-   name wins, so `mail.example.*` beats `example.*`.
+   `*.example.<zone>`. A rule that names the zone beats it on any route, for
+   the hosts it covers: `*.example.by` for all of `example.by`, a bare
+   `example.by` only for that host itself, so `www.example.by` still follows
+   `example.*`. With "Also cover subdomains for domain rules" on, the bare
+   name covers all of `example.by` too. Between two site-in-every-zone rules
+   the longer name wins, so `mail.example.*` beats `example.*`.
 4. **IP** — `203.0.113.7`, one exact address. It beats any network that
    contains it.
 5. **CIDR and Ranges** — `10.1.0.0/16` or `192.0.2.10-192.0.2.40`. Between

@@ -29,9 +29,15 @@ const FIRE_DEADLINE: Duration = Duration::from_secs(120);
 /// Wi-Fi-roam / VPN-reconnect flaps without adding perceptible re-arm latency.
 pub const NETWORK_CHANGE_DEBOUNCE: Duration = Duration::from_millis(500);
 
+/// Longest pause, in windows from the first poke: a change stream that never
+/// goes quiet is acted on at this pace.
+pub const MAX_PAUSE_IN_WINDOWS: u32 = 4;
+
 struct DebounceState {
     pending: bool,
     stop: bool,
+    /// Pokes since the last fire, for the debug line that tunes the cap.
+    pokes: u32,
 }
 
 struct DebounceInner {
@@ -39,6 +45,7 @@ struct DebounceInner {
     cv: Condvar,
     target: Arc<dyn Fn() + Send + Sync>,
     window: Duration,
+    label: &'static str,
 }
 
 impl DebounceInner {
@@ -48,9 +55,9 @@ impl DebounceInner {
 }
 
 /// Owns a worker thread that coalesces `poke()`s into calls to `target`. A poke
-/// arms a fire that happens after the window; further pokes during the wait are
-/// coalesced into the same (or the next) fire. Dropping stops and joins the
-/// thread.
+/// arms a fire that happens once the pokes have been quiet for the window, or
+/// [`MAX_PAUSE_IN_WINDOWS`] windows after the first. Dropping stops and joins
+/// the thread.
 pub struct DebouncedTrigger {
     inner: Arc<DebounceInner>,
     join: Option<JoinHandle<()>>,
@@ -58,7 +65,7 @@ pub struct DebouncedTrigger {
 
 impl DebouncedTrigger {
     /// Spawn the coalescing worker. `target` is invoked (off the poking thread)
-    /// at most once per `window` after a burst of pokes.
+    /// once per burst of pokes, `window` after the last.
     pub fn new(target: Arc<dyn Fn() + Send + Sync>, window: Duration) -> Self {
         Self::new_observed(target, window, None)
     }
@@ -73,10 +80,12 @@ impl DebouncedTrigger {
             state: Mutex::new(DebounceState {
                 pending: false,
                 stop: false,
+                pokes: 0,
             }),
             cv: Condvar::new(),
             target,
             window,
+            label: observed.as_ref().map_or("unlabelled", |(_, label)| *label),
         });
         let worker = Arc::clone(&inner);
         let join = std::thread::Builder::new()
@@ -111,24 +120,26 @@ impl DebouncedTrigger {
                 }
                 st.pending = false;
             }
-            // Coalesce the burst over a FIXED window measured from the first
-            // poke. `poker()` and `Drop` share this Condvar, so a naive single
-            // `wait_timeout(window)` would be cut short by every intervening
-            // poke — firing ~once per poke instead of once per window during a
-            // sustained flap (VPN reconnect / Wi-Fi roam emit pokes tens of ms
-            // apart). Loop against an absolute deadline so poke wake-ups are
-            // ignored; only `stop` cuts it short. Pokes during the window set
-            // `pending` again and fire on the NEXT iteration (trailing flush).
-            let deadline = Instant::now() + inner.window;
-            {
+            // Fire once the burst has been quiet for a window, so the pass
+            // sees the network settled; a burst that never goes quiet fires
+            // at the cap. A poke during the wait joins this burst; one during
+            // the fire starts the next.
+            let first = Instant::now();
+            let cap = first + inner.window * MAX_PAUSE_IN_WINDOWS;
+            let mut quiet_from = first;
+            let events = {
                 let mut st = inner.lock();
                 loop {
                     if st.stop {
                         return;
                     }
                     let now = Instant::now();
+                    if std::mem::take(&mut st.pending) {
+                        quiet_from = now;
+                    }
+                    let deadline = (quiet_from + inner.window).min(cap);
                     if now >= deadline {
-                        break;
+                        break std::mem::take(&mut st.pokes);
                     }
                     let (guard, _timeout) = inner
                         .cv
@@ -136,7 +147,16 @@ impl DebouncedTrigger {
                         .unwrap_or_else(|p| p.into_inner());
                     st = guard;
                 }
-            }
+            };
+            // How long bursts run on real machines, to tune the cap by.
+            tracing::debug!(
+                target: "nrr::route-coordinator",
+                trigger = inner.label,
+                events,
+                waited_ms = u64::try_from(first.elapsed().as_millis()).unwrap_or(u64::MAX),
+                capped = Instant::now() >= cap,
+                "change burst settled",
+            );
             let _fire = lease.map(ThreadLease::work);
             (inner.target)();
         }
@@ -150,6 +170,7 @@ impl DebouncedTrigger {
             {
                 let mut st = inner.lock();
                 st.pending = true;
+                st.pokes = st.pokes.saturating_add(1);
             }
             inner.cv.notify_all();
         })
@@ -205,7 +226,9 @@ impl NetworkChangeRearm {
             window,
             liveness.map(|liveness| (liveness, "network")),
         );
-        let subscription = observer.subscribe(trigger.poker())?;
+        // Our own route writes would otherwise start the pause after every
+        // pass that writes, and hold a real change behind them.
+        let subscription = observer.subscribe_foreign(trigger.poker())?;
         Ok(Self {
             _subscription: subscription,
             _trigger: trigger,
@@ -271,6 +294,89 @@ mod tests {
             "spread pokes must coalesce to a few fires (not ~10 per-poke), got {n}",
         );
         drop(trigger);
+    }
+
+    fn counting_trigger(window: Duration) -> (Arc<AtomicUsize>, DebouncedTrigger) {
+        let fires = Arc::new(AtomicUsize::new(0));
+        let f = Arc::clone(&fires);
+        let trigger = DebouncedTrigger::new(
+            Arc::new(move || {
+                f.fetch_add(1, Ordering::SeqCst);
+            }),
+            window,
+        );
+        (fires, trigger)
+    }
+
+    /// A tunnel coming up reports its changes over a second or so; a pass
+    /// started in the middle judges a half-built network and runs again.
+    /// The pause counts from the last change.
+    #[test]
+    fn the_pause_runs_from_the_last_change_not_the_first() {
+        let (fires, trigger) = counting_trigger(Duration::from_millis(400));
+        let poke = trigger.poker();
+        poke();
+        std::thread::sleep(Duration::from_millis(300));
+        poke();
+        std::thread::sleep(Duration::from_millis(250));
+        assert_eq!(
+            fires.load(Ordering::SeqCst),
+            0,
+            "the pass ran while the network was still changing"
+        );
+        std::thread::sleep(Duration::from_millis(550));
+        assert_eq!(fires.load(Ordering::SeqCst), 1);
+        drop(trigger);
+    }
+
+    /// A link that never stops flapping still gets its pass: quiet that never
+    /// comes does not hold it back for good.
+    #[test]
+    fn a_change_stream_without_quiet_still_fires() {
+        let window = Duration::from_millis(200);
+        let (fires, trigger) = counting_trigger(window);
+        let poke = trigger.poker();
+        let until = Instant::now() + window * (MAX_PAUSE_IN_WINDOWS + 2);
+        while Instant::now() < until {
+            poke();
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        assert!(
+            fires.load(Ordering::SeqCst) >= 1,
+            "a steady stream of changes was never acted on"
+        );
+        drop(trigger);
+    }
+
+    /// The notices of our own route writes leave the pause alone: the
+    /// re-arm subscribes to the changes made by others only.
+    #[test]
+    fn the_rearm_does_not_listen_to_our_own_route_writes() {
+        #[derive(Default)]
+        struct Recording {
+            foreign: std::sync::atomic::AtomicBool,
+        }
+        impl NetworkChangeObserver for Recording {
+            fn subscribe(
+                &self,
+                _on_change: NetworkChangeCallback,
+            ) -> Result<NetworkChangeSubscription, PlatformError> {
+                Ok(NetworkChangeSubscription::inert())
+            }
+            fn subscribe_foreign(
+                &self,
+                _on_change: NetworkChangeCallback,
+            ) -> Result<NetworkChangeSubscription, PlatformError> {
+                self.foreign.store(true, Ordering::SeqCst);
+                Ok(NetworkChangeSubscription::inert())
+            }
+        }
+        let observer = Recording::default();
+        let rearm =
+            NetworkChangeRearm::start(&observer, Arc::new(|| {}), Duration::from_millis(50))
+                .expect("subscribes");
+        assert!(observer.foreign.load(Ordering::SeqCst));
+        drop(rearm);
     }
 
     #[test]

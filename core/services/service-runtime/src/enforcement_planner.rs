@@ -376,6 +376,9 @@ pub fn plan_route_rules_with_shapes(
                             continue;
                         }
                         if targets.over_cap {
+                            report
+                                .over_capped_folders
+                                .push((targets.key.clone(), targets.programs.len()));
                             report.conflicts.push(
                                 crate::rule_conflicts::RuleConflict::FolderOverCap {
                                     rule_id: rule.id.as_str().to_string(),
@@ -447,12 +450,26 @@ pub fn plan_route_rules_with_shapes(
                     {
                         report.claimed_by_main.push((pattern.to_string(), *ip));
                     }
+                    if *refusal
+                        == crate::address_ownership::AppDestinationRefusal::UsedByOtherProcess
+                    {
+                        report.used_by_others.push((pattern.to_string(), *ip));
+                    }
                 }
+                // The program's pair covers only a resolved route rule's
+                // destinations; a script's interpreter is outside it.
+                let pair_covers = found && link == crate::address_ownership::Link::Additional;
                 for (i, ip) in gate
                     .mirrored(pattern, &destinations.admitted)
                     .into_iter()
                     .enumerate()
                 {
+                    if pair_covers
+                        && !gate.learnt_from_scripts(pattern, ip)
+                        && !report.app_guarded_additional.contains(&ip)
+                    {
+                        report.app_guarded_additional.push(ip);
+                    }
                     flows.push(FlowRule {
                         observed_by_program: true,
                         ..host_flow(APP_PATH_FANOUT_CAP as u32 + 1 + i as u32, IpAddr::V4(ip))

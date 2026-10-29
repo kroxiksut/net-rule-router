@@ -173,6 +173,32 @@ pub fn verify_grant(row: &GrantFields<'_>, stored_hmac: &[u8], key: &[u8]) -> Hm
     verify_tag(stored_hmac, key, |mac| feed_grant(mac, row))
 }
 
+/// Keeps a tag over the active-rules record from equalling any row tag.
+const RULES_ANCHOR_DOMAIN: &str = "rules-anchor-v1";
+
+/// HMAC over the record of which rules are active, kept outside the database.
+#[must_use]
+pub fn compute_rules_anchor_hmac(record: &[u8], key: &[u8]) -> [u8; HMAC_BYTE_LEN] {
+    let mut mac = <HmacSha256 as Mac>::new_from_slice(key)
+        .unwrap_or_else(|_| unreachable!("HMAC accepts a key of any length"));
+    feed_label(&mut mac, RULES_ANCHOR_DOMAIN.as_bytes());
+    feed_label(&mut mac, record);
+    let out = mac.finalize().into_bytes();
+    let mut tag = [0u8; HMAC_BYTE_LEN];
+    tag.copy_from_slice(&out);
+    tag
+}
+
+/// Whether `stored` is the tag of `record` under `key`. An empty tag is
+/// [`HmacVerification::Unsigned`]; the record has no unsigned form.
+#[must_use]
+pub fn verify_rules_anchor(record: &[u8], stored: &[u8], key: &[u8]) -> HmacVerification {
+    verify_tag(stored, key, |mac| {
+        feed_label(mac, RULES_ANCHOR_DOMAIN.as_bytes());
+        feed_label(mac, record);
+    })
+}
+
 /// Outcome of comparing a stored HMAC with one we just recomputed.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum HmacVerification {

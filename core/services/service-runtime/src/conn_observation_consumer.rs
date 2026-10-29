@@ -802,7 +802,7 @@ pub type EgressIfindexesFn = Arc<dyn Fn(&str) -> (Option<u32>, Option<u32>) + Se
 /// Delete one `(owner, app, destination)` row from the cross-session store, so
 /// a withdrawal survives the restart that would otherwise re-seed it. The owner
 /// is the user whose store held the pair, `None` for a machine-wide store.
-pub type AppDestinationForgetFn = Arc<dyn Fn(Option<&str>, &str, std::net::Ipv4Addr) + Send + Sync>;
+pub type AppDestinationForgetFn = Arc<dyn Fn(Option<&str>, &str, std::net::IpAddr) + Send + Sync>;
 
 /// The application patterns the rule book currently routes over the additional
 /// link. Read per batch: a rule edit must take effect without a restart.
@@ -840,7 +840,7 @@ fn collateral_pin_owners(
     own_process_key: &str,
     routed: &[String],
     role: EgressRole,
-    ip: std::net::Ipv4Addr,
+    ip: std::net::IpAddr,
 ) -> Vec<String> {
     use crate::app_observation_lookup::{app_key, pattern_matches};
     // Both sides through the same key: the census holds keys, callers may hold

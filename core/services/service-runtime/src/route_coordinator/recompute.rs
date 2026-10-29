@@ -29,6 +29,8 @@ impl SecondaryRouteCoordinator {
         active_sids: &[String],
     ) -> Result<RouteReconcileDelta, PlatformError> {
         let _pass = self.pass_lock.lock().unwrap_or_else(|p| p.into_inner());
+        // A user this pass does not plan leaves no book for first contacts.
+        let _inputs = self.pass_inputs.pass();
         // The pass's one reading of the links: everything below, and the
         // enforcement apply that follows, reads it back.
         let adapters = self.adapters_for_pass();

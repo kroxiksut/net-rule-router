@@ -32,6 +32,8 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use nrr_platform_api::dns::AddressFamily;
 use nrr_platform_api::enforcement::RouteTableRef;
 use nrr_platform_api::error::PlatformError;
+#[cfg(target_os = "linux")]
+use nrr_platform_api::own_route_writes::{process_route_writes, RouteChangeKey};
 use nrr_platform_api::types::RouteEntry;
 
 // ── Wire constants (uapi: linux/netlink.h, linux/rtnetlink.h) ────────────────
@@ -131,7 +133,7 @@ fn push_attr(buffer: &mut Vec<u8>, attr_type: u16, payload: &[u8]) {
 ///
 /// `sequence` is echoed by the kernel in its `NLMSG_ERROR` reply, which is how
 /// the round-trip below knows the acknowledgement belongs to this request.
-fn encode_route_mutation(
+pub(crate) fn encode_route_mutation(
     message_type: u16,
     entry: &RouteEntry,
     sequence: u32,
@@ -309,7 +311,7 @@ fn walk_datagram(datagram: &[u8], mut on_message: impl FnMut(u16, &[u8])) -> (bo
 ///
 /// `None` for anything that is not an ordinary IPv4 unicast route we could act
 /// on — a v6 row, a truncated body, or a route with no output interface.
-fn parse_route_message(body: &[u8]) -> Option<RouteEntry> {
+pub(crate) fn parse_route_message(body: &[u8]) -> Option<RouteEntry> {
     let family = match body.first() {
         Some(&AF_INET_U8) => AddressFamily::Ipv4,
         Some(&AF_INET6_U8) => AddressFamily::Ipv6,
@@ -680,12 +682,11 @@ pub fn get_ipv4_routes() -> Result<Vec<RouteEntry>, PlatformError> {
 #[cfg(target_os = "linux")]
 pub fn add_ipv4_route(entry: &RouteEntry) -> Result<(), PlatformError> {
     let socket = NetlinkRequestSocket::open()?;
-    socket.send(&encode_route_mutation(
-        RTM_NEWROUTE,
-        entry,
-        socket.sequence,
-    )?)?;
-    socket.expect_ack("add an IPv4 route")
+    let message = encode_route_mutation(RTM_NEWROUTE, entry, socket.sequence)?;
+    process_route_writes().noted(RouteChangeKey::of(entry, false), || {
+        socket.send(&message)?;
+        socket.expect_ack("add an IPv4 route")
+    })
 }
 
 /// Delete one IPv4 route. A route that is already gone comes back as `ENOENT`,
@@ -694,12 +695,11 @@ pub fn add_ipv4_route(entry: &RouteEntry) -> Result<(), PlatformError> {
 #[cfg(target_os = "linux")]
 pub fn delete_ipv4_route(entry: &RouteEntry) -> Result<(), PlatformError> {
     let socket = NetlinkRequestSocket::open()?;
-    socket.send(&encode_route_mutation(
-        RTM_DELROUTE,
-        entry,
-        socket.sequence,
-    )?)?;
-    socket.expect_ack("delete an IPv4 route")
+    let message = encode_route_mutation(RTM_DELROUTE, entry, socket.sequence)?;
+    process_route_writes().noted(RouteChangeKey::of(entry, true), || {
+        socket.send(&message)?;
+        socket.expect_ack("delete an IPv4 route")
+    })
 }
 
 /// Read every policy-routing rule, both families.

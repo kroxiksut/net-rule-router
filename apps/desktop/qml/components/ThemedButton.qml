@@ -107,5 +107,14 @@ Button {
                                   : root.highlighted
                                       ? theme.stateSelectedBorder
                                       : theme.stateDefaultBorder
+        Rectangle {
+            visible: root.activeFocus && root.enabled && (root.highlighted || root.danger)
+            anchors.fill: parent
+            anchors.margins: root.theme.focusBorderWidth
+            radius: Math.max(0, parent.radius - root.theme.focusBorderWidth)
+            color: "transparent"
+            border.width: root.theme.borderWidth
+            border.color: root.theme.stateFocusedInnerOnFill
+        }
     }
 }

@@ -39,7 +39,7 @@ use crate::bounded_set::BoundedRecentSet;
 use nrr_platform_api::conn_observe::live::LiveConnection;
 use nrr_platform_api::process_launch::Launched;
 use nrr_shared::app_path::{AppPath, PathStyle};
-use std::net::Ipv4Addr;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
@@ -125,6 +125,12 @@ pub trait AppObservationLookup: Send + Sync {
     /// has been observed yet (cold start / observer off).
     fn ips_for_app(&self, app: &str) -> Vec<Ipv4Addr>;
 
+    /// [`Self::ips_for_app`] for IPv6: a program on a dual-stack network uses
+    /// both families, and the v6 half needs its own host routes.
+    fn ips_v6_for_app(&self, _app: &str) -> Vec<Ipv6Addr> {
+        Vec::new()
+    }
+
     /// The `n` of `candidates` (addresses of `app`) seen most recently, in
     /// address order so a filter keeps its slot while the set holds. A lookup
     /// that keeps no sighting order answers with the first `n`.
@@ -138,7 +144,7 @@ pub trait AppObservationLookup: Send + Sync {
     /// application rule may only claim a destination nobody else is using.
     /// The default answers "nobody else" — an implementation without a census
     /// behaves exactly as before one existed.
-    fn destination_used_outside(&self, _friendly: &[String], _ip: Ipv4Addr) -> bool {
+    fn destination_used_outside(&self, _friendly: &[String], _ip: IpAddr) -> bool {
         false
     }
 
@@ -157,7 +163,7 @@ pub trait AppObservationLookup: Send + Sync {
     /// Whether the rule by path `pattern` learnt `ip` from a script an
     /// interpreter installed elsewhere ran: no per-program filter covers that
     /// interpreter, so only a per-destination guard holds such an address.
-    fn learnt_from_scripts(&self, _pattern: &str, _ip: Ipv4Addr) -> bool {
+    fn learnt_from_scripts(&self, _pattern: &str, _ip: IpAddr) -> bool {
         false
     }
 }
@@ -215,7 +221,9 @@ pub fn observation_key(pattern: &str) -> String {
 /// consumer writes through [`record`](Self::record); the codegen reads
 /// through the [`AppObservationLookup`] impl.
 pub struct AppObservationStore {
-    inner: Mutex<HashMap<String, BoundedRecentSet<Ipv4Addr>>>,
+    /// Both families in one set per program, so the per-program cap and the
+    /// recency order span all of its destinations.
+    inner: Mutex<HashMap<String, BoundedRecentSet<IpAddr>>>,
     /// Who has been seen using each destination — the evidence a pin is
     /// weighed against before it is emitted.
     census: Mutex<CensusIndex>,
@@ -224,13 +232,13 @@ pub struct AppObservationStore {
     /// the app would touch the address again within seconds, the pair would
     /// be relearned immediately, and the two processes would take the address
     /// from each other in a loop.
-    retracted: Mutex<BoundedRecentSet<(String, Ipv4Addr)>>,
+    retracted: Mutex<BoundedRecentSet<(String, IpAddr)>>,
     /// `(app, ip)` pairs actually seen since the last persistence pass. The
     /// store also holds addresses re-seeded from previous sessions and ones
     /// last used hours ago; persisting those again would stamp them as
     /// confirmed now, and the freshness window they are supposed to age out of
     /// would never expire.
-    seen_since_flush: Mutex<BoundedRecentSet<(String, Ipv4Addr)>>,
+    seen_since_flush: Mutex<BoundedRecentSet<(String, IpAddr)>>,
     /// Last sighting per `(app, ip)` — what [`APP_PIN_FRESHNESS_WINDOW`] is
     /// measured against. Maintained alongside `inner`; a missing stamp is
     /// treated as fresh (unknown age fails toward protection) and restamped.
@@ -267,7 +275,7 @@ pub struct AppObservationStore {
     image_normalizer: OnceLock<ImageNormalizer>,
     /// `(rule path, ip)` pairs a rule's script taught, as opposed to its own
     /// programs.
-    script_pairs: Mutex<BoundedRecentSet<(String, Ipv4Addr)>>,
+    script_pairs: Mutex<BoundedRecentSet<(String, IpAddr)>>,
 }
 
 /// Last sighting of every `(app, ip)` pair, and their order across the whole
@@ -275,14 +283,14 @@ pub struct AppObservationStore {
 /// Each program's name is held once, shared by its stamps and the order index.
 #[derive(Default)]
 struct PairClock {
-    by_app: HashMap<Arc<str>, HashMap<Ipv4Addr, (Instant, u64)>>,
-    order: BTreeMap<u64, (Arc<str>, Ipv4Addr)>,
+    by_app: HashMap<Arc<str>, HashMap<IpAddr, (Instant, u64)>>,
+    order: BTreeMap<u64, (Arc<str>, IpAddr)>,
     tick: u64,
     len: usize,
 }
 
 impl PairClock {
-    fn get(&self, pair: &(String, Ipv4Addr)) -> Option<Instant> {
+    fn get(&self, pair: &(String, IpAddr)) -> Option<Instant> {
         self.by_app
             .get(pair.0.as_str())?
             .get(&pair.1)
@@ -290,14 +298,14 @@ impl PairClock {
     }
 
     /// The pair's place in sighting order; higher is more recent.
-    fn rank(&self, pair: &(String, Ipv4Addr)) -> Option<u64> {
+    fn rank(&self, pair: &(String, IpAddr)) -> Option<u64> {
         self.by_app
             .get(pair.0.as_str())?
             .get(&pair.1)
             .map(|(_, tick)| *tick)
     }
 
-    fn stamp(&mut self, pair: (String, Ipv4Addr), at: Instant) {
+    fn stamp(&mut self, pair: (String, IpAddr), at: Instant) {
         self.tick += 1;
         let app: Arc<str> = match self.by_app.get_key_value(pair.0.as_str()) {
             Some((name, _)) => Arc::clone(name),
@@ -313,20 +321,20 @@ impl PairClock {
         self.order.insert(self.tick, (app, pair.1));
     }
 
-    fn remove(&mut self, pair: &(String, Ipv4Addr)) {
+    fn remove(&mut self, pair: &(String, IpAddr)) {
         if let Some(tick) = self.take(pair.0.as_str(), pair.1) {
             self.order.remove(&tick);
         }
     }
 
-    fn pop_oldest(&mut self) -> Option<(String, Ipv4Addr)> {
+    fn pop_oldest(&mut self) -> Option<(String, IpAddr)> {
         let (_, (app, ip)) = self.order.pop_first()?;
         self.take(&app, ip);
         Some((app.to_string(), ip))
     }
 
     /// Drop a pair's stamp, and the program with its last one.
-    fn take(&mut self, app: &str, ip: Ipv4Addr) -> Option<u64> {
+    fn take(&mut self, app: &str, ip: IpAddr) -> Option<u64> {
         let stamps = self.by_app.get_mut(app)?;
         let (_, tick) = stamps.remove(&ip)?;
         if stamps.is_empty() {
@@ -460,8 +468,12 @@ impl AppObservationStore {
 
     /// An address no application rule learns: unroutable in itself, private,
     /// or carried by a corporate tunnel.
-    fn is_off_limits(&self, ip: Ipv4Addr) -> bool {
-        is_unroutable(ip) || self.foreign_tunnels.carries(ip)
+    fn is_off_limits(&self, ip: IpAddr) -> bool {
+        is_unroutable(ip)
+            || match ip {
+                IpAddr::V4(v4) => self.foreign_tunnels.carries(v4),
+                IpAddr::V6(_) => false,
+            }
     }
 
     /// The store a connection owned by `owner` is recorded in: this one, or,
@@ -526,7 +538,7 @@ impl AppObservationStore {
     /// Take the destinations of `app_pattern` seen since the previous call.
     /// Draining is the point: a destination reported once must not be reported
     /// as freshly confirmed on every later pass.
-    pub fn take_seen_since_flush(&self, app_pattern: &str) -> std::collections::HashSet<Ipv4Addr> {
+    pub fn take_seen_since_flush(&self, app_pattern: &str) -> std::collections::HashSet<IpAddr> {
         if observation_key(app_pattern).is_empty() {
             return std::collections::HashSet::new();
         }
@@ -536,7 +548,7 @@ impl AppObservationStore {
             .unwrap_or_else(|p| p.into_inner());
         // `pattern_matches`, not string equality: a glob rule covers every
         // process it names, exactly as `ips_for_app` unions them.
-        let mine: Vec<(String, Ipv4Addr)> = ledger
+        let mine: Vec<(String, IpAddr)> = ledger
             .iter()
             .filter(|(app, _)| pattern_matches(app_pattern, app))
             .cloned()
@@ -547,7 +559,8 @@ impl AppObservationStore {
         mine.into_iter().map(|(_, ip)| ip).collect()
     }
 
-    pub fn record(&self, process_path: &str, ip: Ipv4Addr) -> bool {
+    pub fn record(&self, process_path: &str, ip: impl Into<IpAddr>) -> bool {
+        let ip = ip.into().to_canonical();
         // Kept per user, an address is recorded through `scope_for`, never here.
         if self.per_principal.is_some() || self.is_off_limits(ip) {
             return false;
@@ -565,7 +578,7 @@ impl AppObservationStore {
     }
 
     /// Record `ip` under the bucket `key`: a program's name, or a rule path.
-    fn record_key(&self, key: String, ip: Ipv4Addr) -> bool {
+    fn record_key(&self, key: String, ip: IpAddr) -> bool {
         if self
             .retracted
             .lock()
@@ -668,18 +681,19 @@ impl AppObservationStore {
     /// Kept per user, remembered destinations are seeded into their owner's
     /// store through [`scope_for`](Self::scope_for); here they have no owner
     /// and teach nothing.
-    pub fn seed_many(&self, pairs: &[(String, Ipv4Addr)]) -> usize {
+    pub fn seed_many(&self, pairs: &[(String, IpAddr)]) -> usize {
         if self.per_principal.is_some() {
             return 0;
         }
         pairs
             .iter()
             .filter(|(app, ip)| {
+                let ip = ip.to_canonical();
                 // A remembered path rule's key is its bucket, not a process.
                 if is_path_pattern(app) {
-                    !self.is_off_limits(*ip) && self.record_key(observation_key(app), *ip)
+                    !self.is_off_limits(ip) && self.record_key(observation_key(app), ip)
                 } else {
-                    self.record(app, *ip)
+                    self.record(app, ip)
                 }
             })
             .count()
@@ -698,7 +712,7 @@ impl AppObservationStore {
             return stores.refresh_live(live);
         }
         let now = (self.clock)();
-        let mut refreshed: HashSet<(String, Ipv4Addr)> = HashSet::new();
+        let mut refreshed: HashSet<(String, IpAddr)> = HashSet::new();
         // Asked before `inner` is taken: the path memory is never held under it.
         let buckets: Vec<Vec<String>> = live
             .iter()
@@ -712,16 +726,17 @@ impl AppObservationStore {
                 if key.is_empty() {
                     continue;
                 }
+                let remote = connection.remote.to_canonical();
                 for (name, set) in g.iter_mut() {
                     let covers = if is_path_pattern(name) {
                         paths.contains(name)
                     } else {
                         pattern_matches(name, &key)
                     };
-                    if covers && set.contains(&connection.remote) {
-                        set.observe(connection.remote);
-                        stamps.stamp((name.clone(), connection.remote), now);
-                        refreshed.insert((name.clone(), connection.remote));
+                    if covers && set.contains(&remote) {
+                        set.observe(remote);
+                        stamps.stamp((name.clone(), remote), now);
+                        refreshed.insert((name.clone(), remote));
                     }
                 }
             }
@@ -749,7 +764,8 @@ impl AppObservationStore {
     /// it, the owner has to be named before the pin can be withdrawn. Cheap —
     /// the map holds one entry per application a rule names.
     #[must_use]
-    pub fn apps_for_ip(&self, ip: Ipv4Addr) -> Vec<String> {
+    pub fn apps_for_ip(&self, ip: impl Into<IpAddr>) -> Vec<String> {
+        let ip = ip.into().to_canonical();
         self.inner
             .lock()
             .unwrap_or_else(|p| p.into_inner())
@@ -767,7 +783,8 @@ impl AppObservationStore {
     /// rule is worth. The application loses the destination — its own traffic
     /// there falls back to the main link — which is the lesser cost: an
     /// application rule may not quietly overrule where everything else goes.
-    pub fn retract(&self, app: &str, ip: Ipv4Addr) -> bool {
+    pub fn retract(&self, app: &str, ip: impl Into<IpAddr>) -> bool {
+        let ip = ip.into().to_canonical();
         let key = observation_key(app);
         if key.is_empty() {
             return false;
@@ -816,14 +833,14 @@ impl AppObservationStore {
         let Some(facts) = facts else {
             return 0;
         };
-        let mut shed: Vec<(String, Vec<Ipv4Addr>)> = Vec::new();
+        let mut shed: Vec<(String, Vec<IpAddr>)> = Vec::new();
         {
             let mut g = self.inner.lock().unwrap_or_else(|p| p.into_inner());
             for (app, set) in g.iter_mut() {
-                let gone: Vec<Ipv4Addr> = set
+                let gone: Vec<IpAddr> = set
                     .iter()
                     .copied()
-                    .filter(|ip| facts.carries(*ip))
+                    .filter(|ip| matches!(ip, IpAddr::V4(v4) if facts.carries(*v4)))
                     .collect();
                 for ip in &gone {
                     set.remove(ip);
@@ -868,7 +885,7 @@ impl AppObservationStore {
     /// live observation: `record` is also called by the cross-session warm load
     /// with RULE PATTERNS as keys, and a pattern is not a process — letting one
     /// into the census would have a rule vouching for itself.
-    pub fn note_process_destination(&self, process_path: &str, ip: Ipv4Addr) {
+    pub fn note_process_destination(&self, process_path: &str, ip: impl Into<IpAddr>) {
         self.note_process_destination_running(process_path, 0, &[], ip);
     }
 
@@ -881,8 +898,9 @@ impl AppObservationStore {
         process_path: &str,
         pid: u32,
         rule_paths: &[String],
-        ip: Ipv4Addr,
+        ip: impl Into<IpAddr>,
     ) {
+        let ip = ip.into().to_canonical();
         if self.is_off_limits(ip) {
             return;
         }
@@ -964,7 +982,8 @@ impl AppObservationStore {
     /// is not evidence of exclusivity — it is the absence of evidence, and the
     /// withdrawal path covers the case where the other process shows up later.
     #[must_use]
-    pub fn destination_used_outside(&self, friendly: &[String], ip: Ipv4Addr) -> bool {
+    pub fn destination_used_outside(&self, friendly: &[String], ip: impl Into<IpAddr>) -> bool {
+        let ip = ip.into().to_canonical();
         let g = self.census.lock().unwrap_or_else(|p| p.into_inner());
         let Some(keys) = g.seen.get(&ip) else {
             return false;
@@ -1021,7 +1040,8 @@ impl AppObservationStore {
     /// connected to `ip`, in those rules' buckets only: the interpreter's own
     /// name keeps what [`Self::record`] gives it. Returns `true` when `ip` is
     /// new to one of them.
-    pub fn record_for_rule_paths(&self, rule_paths: &[String], ip: Ipv4Addr) -> bool {
+    pub fn record_for_rule_paths(&self, rule_paths: &[String], ip: impl Into<IpAddr>) -> bool {
+        let ip = ip.into().to_canonical();
         if self.per_principal.is_some() || self.is_off_limits(ip) {
             return false;
         }
@@ -1155,7 +1175,7 @@ impl AppObservationStore {
     /// window. An entry with no stamp is restamped now — unknown age fails
     /// toward protection, mirroring the FQDN cache's rule. Lock order is
     /// `inner` → `last_seen`, the only place both are held together.
-    fn prune_stale(&self, g: &mut HashMap<String, BoundedRecentSet<Ipv4Addr>>, name: &str) {
+    fn prune_stale(&self, g: &mut HashMap<String, BoundedRecentSet<IpAddr>>, name: &str) {
         let now = (self.clock)();
         let Some(cutoff) = now.checked_sub(self.pin_ttl) else {
             return;
@@ -1164,7 +1184,7 @@ impl AppObservationStore {
             return;
         };
         let mut stamps = self.last_seen.lock().unwrap_or_else(|p| p.into_inner());
-        let mut stale: Vec<Ipv4Addr> = Vec::new();
+        let mut stale: Vec<IpAddr> = Vec::new();
         for ip in set.iter() {
             match stamps.get(&(name.to_string(), *ip)) {
                 Some(t) if t < cutoff => stale.push(*ip),
@@ -1216,14 +1236,15 @@ impl CensusEntry {
 /// Destinations mapped to the processes seen using them, FIFO-bounded.
 #[derive(Default)]
 struct CensusIndex {
-    seen: HashMap<Ipv4Addr, Vec<CensusEntry>>,
+    seen: HashMap<IpAddr, Vec<CensusEntry>>,
     /// Insertion order, so the bound evicts the oldest destination in O(1)
     /// instead of scanning for a victim.
-    order: VecDeque<Ipv4Addr>,
+    order: VecDeque<IpAddr>,
 }
 
-impl AppObservationLookup for AppObservationStore {
-    fn ips_for_app(&self, app: &str) -> Vec<Ipv4Addr> {
+impl AppObservationStore {
+    /// Every fresh destination of `app`, both families, in address order.
+    fn destinations_of(&self, app: &str) -> Vec<IpAddr> {
         // A plan is about to read: nothing a tunnel now carries goes into it.
         self.shed_foreign();
         if is_path_pattern(app) {
@@ -1232,7 +1253,7 @@ impl AppObservationLookup for AppObservationStore {
             self.watch_path(&key);
             let mut g = self.inner.lock().unwrap_or_else(|p| p.into_inner());
             self.prune_stale(&mut g, &key);
-            let mut v: Vec<Ipv4Addr> = g
+            let mut v: Vec<IpAddr> = g
                 .get(&key)
                 .map(|set| set.iter().copied().collect())
                 .unwrap_or_default();
@@ -1249,7 +1270,7 @@ impl AppObservationLookup for AppObservationStore {
         // process whose name matches; exact name → a single lookup. Stale
         // sightings are pruned first, so what enforcement reads is only what
         // was seen inside the freshness window.
-        let mut v: Vec<Ipv4Addr> = if key.contains('*') {
+        let mut v: Vec<IpAddr> = if key.contains('*') {
             let names: Vec<String> = g
                 .keys()
                 // A rule path's bucket repeats its programs' own; a mask over
@@ -1257,7 +1278,7 @@ impl AppObservationLookup for AppObservationStore {
                 .filter(|name| !is_path_pattern(name) && glob_match(&key, name))
                 .cloned()
                 .collect();
-            let mut set: HashSet<Ipv4Addr> = HashSet::new();
+            let mut set: HashSet<IpAddr> = HashSet::new();
             for name in names {
                 self.prune_stale(&mut g, &name);
                 if let Some(ips) = g.get(&name) {
@@ -1278,7 +1299,11 @@ impl AppObservationLookup for AppObservationStore {
         v
     }
 
-    fn latest_of(&self, app: &str, candidates: &[Ipv4Addr], n: usize) -> Vec<Ipv4Addr> {
+    /// [`AppObservationLookup::latest_of`] for either family.
+    pub fn latest_among<T>(&self, app: &str, candidates: &[T], n: usize) -> Vec<T>
+    where
+        T: Copy + Ord + Into<IpAddr>,
+    {
         if candidates.len() <= n {
             return candidates.to_vec();
         }
@@ -1299,14 +1324,15 @@ impl AppObservationLookup for AppObservationStore {
                 vec![key]
             }
         };
-        let mut ranked: Vec<(u64, Ipv4Addr)> = {
+        let mut ranked: Vec<(u64, T)> = {
             let clock = self.last_seen.lock().unwrap_or_else(|p| p.into_inner());
             candidates
                 .iter()
                 .map(|ip| {
+                    let at: IpAddr = (*ip).into();
                     let rank = keys
                         .iter()
-                        .filter_map(|key| clock.rank(&(key.clone(), *ip)))
+                        .filter_map(|key| clock.rank(&(key.clone(), at)))
                         .max()
                         .unwrap_or(0);
                     (rank, *ip)
@@ -1314,12 +1340,38 @@ impl AppObservationLookup for AppObservationStore {
                 .collect()
         };
         ranked.sort_unstable_by(|a, b| b.cmp(a));
-        let mut latest: Vec<Ipv4Addr> = ranked.into_iter().take(n).map(|(_, ip)| ip).collect();
+        let mut latest: Vec<T> = ranked.into_iter().take(n).map(|(_, ip)| ip).collect();
         latest.sort_unstable();
         latest
     }
+}
 
-    fn destination_used_outside(&self, friendly: &[String], ip: Ipv4Addr) -> bool {
+impl AppObservationLookup for AppObservationStore {
+    fn ips_for_app(&self, app: &str) -> Vec<Ipv4Addr> {
+        self.destinations_of(app)
+            .into_iter()
+            .filter_map(|ip| match ip {
+                IpAddr::V4(v4) => Some(v4),
+                IpAddr::V6(_) => None,
+            })
+            .collect()
+    }
+
+    fn ips_v6_for_app(&self, app: &str) -> Vec<Ipv6Addr> {
+        self.destinations_of(app)
+            .into_iter()
+            .filter_map(|ip| match ip {
+                IpAddr::V6(v6) => Some(v6),
+                IpAddr::V4(_) => None,
+            })
+            .collect()
+    }
+
+    fn latest_of(&self, app: &str, candidates: &[Ipv4Addr], n: usize) -> Vec<Ipv4Addr> {
+        self.latest_among(app, candidates, n)
+    }
+
+    fn destination_used_outside(&self, friendly: &[String], ip: IpAddr) -> bool {
         AppObservationStore::destination_used_outside(self, friendly, ip)
     }
 
@@ -1332,13 +1384,13 @@ impl AppObservationLookup for AppObservationStore {
         self.set_path_places(key, places);
     }
 
-    fn learnt_from_scripts(&self, pattern: &str, ip: Ipv4Addr) -> bool {
+    fn learnt_from_scripts(&self, pattern: &str, ip: IpAddr) -> bool {
         is_path_pattern(pattern)
             && self
                 .script_pairs
                 .lock()
                 .unwrap_or_else(|p| p.into_inner())
-                .contains(&(pattern.trim().to_string(), ip))
+                .contains(&(pattern.trim().to_string(), ip.to_canonical()))
     }
 }
 
@@ -1399,17 +1451,28 @@ pub fn global_app_observations() -> Arc<AppObservationStore> {
 /// the corporate network onto the additional link). The fake-IP
 /// pool is equally out: a virtual address observed as an app's destination is
 /// our own TUN terminating the flow, and mirroring it as a per-IP route/filter
-/// would steer pool traffic onto a physical adapter, away from the TUN.
-fn is_unroutable(ip: Ipv4Addr) -> bool {
-    ip.is_loopback()
-        || ip.is_unspecified()
-        || ip.is_link_local()
-        || ip.is_broadcast()
-        || ip.is_multicast()
-        || ip.is_private()
-        || nrr_platform_api::fake_ip::FakeIpPoolConfig::is_default_pool_addr(std::net::IpAddr::V4(
-            ip,
-        ))
+/// would steer pool traffic onto a physical adapter, away from the TUN. For
+/// IPv6 the same scopes: link-local, multicast and unique-local (`fc00::/7`,
+/// the private space, which also holds the pool's v6 half).
+fn is_unroutable(ip: IpAddr) -> bool {
+    let scoped = match ip {
+        IpAddr::V4(v4) => {
+            v4.is_loopback()
+                || v4.is_unspecified()
+                || v4.is_link_local()
+                || v4.is_broadcast()
+                || v4.is_multicast()
+                || v4.is_private()
+        }
+        IpAddr::V6(v6) => {
+            v6.is_loopback()
+                || v6.is_unspecified()
+                || v6.is_multicast()
+                || nrr_domain::address_class::is_v6_link_local(v6)
+                || (v6.segments()[0] & 0xfe00) == 0xfc00
+        }
+    };
+    scoped || nrr_platform_api::fake_ip::FakeIpPoolConfig::is_default_pool_addr(ip)
 }
 
 /// Most users a machine keeps separate observations for; past it the least
@@ -1491,9 +1554,10 @@ impl PrincipalAppObservations {
 #[derive(Default)]
 pub struct MockAppObservationLookup {
     inner: Mutex<HashMap<String, Vec<Ipv4Addr>>>,
+    inner_v6: Mutex<HashMap<String, Vec<Ipv6Addr>>>,
     /// Destinations the test declares to be in use by somebody the rule set
     /// does not name.
-    used_outside: Mutex<HashSet<Ipv4Addr>>,
+    used_outside: Mutex<HashSet<IpAddr>>,
 }
 
 #[allow(clippy::unwrap_used)]
@@ -1507,9 +1571,17 @@ impl MockAppObservationLookup {
         self.inner.lock().unwrap().insert(observation_key(app), ips);
     }
 
+    /// Register `ips` as the observed IPv6 set for `app`. Last write wins.
+    pub fn set_ips_v6(&self, app: &str, ips: Vec<Ipv6Addr>) {
+        self.inner_v6
+            .lock()
+            .unwrap()
+            .insert(observation_key(app), ips);
+    }
+
     /// Declare `ip` to be in use by a process no application rule names.
-    pub fn set_used_outside(&self, ip: Ipv4Addr) {
-        self.used_outside.lock().unwrap().insert(ip);
+    pub fn set_used_outside(&self, ip: impl Into<IpAddr>) {
+        self.used_outside.lock().unwrap().insert(ip.into());
     }
 }
 
@@ -1524,8 +1596,109 @@ impl AppObservationLookup for MockAppObservationLookup {
             .unwrap_or_default()
     }
 
-    fn destination_used_outside(&self, _friendly: &[String], ip: Ipv4Addr) -> bool {
+    fn ips_v6_for_app(&self, app: &str) -> Vec<Ipv6Addr> {
+        self.inner_v6
+            .lock()
+            .unwrap()
+            .get(&observation_key(app))
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    fn destination_used_outside(&self, _friendly: &[String], ip: IpAddr) -> bool {
         self.used_outside.lock().unwrap().contains(&ip)
+    }
+}
+
+/// A [`AppObservationLookup::latest_of`] question: app, candidates, how many.
+type LatestOf = (String, Vec<Ipv4Addr>, usize);
+
+/// One pass's view of the observations: each question is answered once and
+/// that answer is given again, so the filters, the address arbiter and the
+/// kill-switch pins of a pass rest on one state while the observer keeps
+/// writing.
+pub struct PassObservations {
+    live: Arc<dyn AppObservationLookup>,
+    ips: Mutex<HashMap<String, Vec<Ipv4Addr>>>,
+    ips_v6: Mutex<HashMap<String, Vec<Ipv6Addr>>>,
+    latest: Mutex<HashMap<LatestOf, Vec<Ipv4Addr>>>,
+    outside: Mutex<HashMap<(Vec<String>, IpAddr), bool>>,
+    scripts: Mutex<HashMap<(String, IpAddr), bool>>,
+    principals: Mutex<HashMap<String, Option<Arc<dyn AppObservationLookup>>>>,
+}
+
+impl PassObservations {
+    pub fn over(live: Arc<dyn AppObservationLookup>) -> Self {
+        Self {
+            live,
+            ips: Mutex::default(),
+            ips_v6: Mutex::default(),
+            latest: Mutex::default(),
+            outside: Mutex::default(),
+            scripts: Mutex::default(),
+            principals: Mutex::default(),
+        }
+    }
+}
+
+fn answered<K: std::hash::Hash + Eq, V: Clone>(
+    memo: &Mutex<HashMap<K, V>>,
+    key: K,
+    ask: impl FnOnce() -> V,
+) -> V {
+    if let Some(known) = memo.lock().unwrap_or_else(|p| p.into_inner()).get(&key) {
+        return known.clone();
+    }
+    // Asked outside the lock: the live store takes its own.
+    let fresh = ask();
+    memo.lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .entry(key)
+        .or_insert(fresh)
+        .clone()
+}
+
+impl AppObservationLookup for PassObservations {
+    fn ips_for_app(&self, app: &str) -> Vec<Ipv4Addr> {
+        answered(&self.ips, app.to_string(), || self.live.ips_for_app(app))
+    }
+
+    fn ips_v6_for_app(&self, app: &str) -> Vec<Ipv6Addr> {
+        answered(&self.ips_v6, app.to_string(), || {
+            self.live.ips_v6_for_app(app)
+        })
+    }
+
+    fn latest_of(&self, app: &str, candidates: &[Ipv4Addr], n: usize) -> Vec<Ipv4Addr> {
+        answered(
+            &self.latest,
+            (app.to_string(), candidates.to_vec(), n),
+            || self.live.latest_of(app, candidates, n),
+        )
+    }
+
+    fn destination_used_outside(&self, friendly: &[String], ip: IpAddr) -> bool {
+        answered(&self.outside, (friendly.to_vec(), ip), || {
+            self.live.destination_used_outside(friendly, ip)
+        })
+    }
+
+    fn for_principal(&self, principal: &str) -> Option<Arc<dyn AppObservationLookup>> {
+        answered(&self.principals, principal.to_string(), || {
+            self.live
+                .for_principal(principal)
+                .map(|own| Arc::new(PassObservations::over(own)) as Arc<dyn AppObservationLookup>)
+        })
+    }
+
+    fn note_path_places(&self, key: &str, places: &[AppPath]) {
+        self.live.note_path_places(key, places);
+    }
+
+    fn learnt_from_scripts(&self, pattern: &str, ip: IpAddr) -> bool {
+        answered(&self.scripts, (pattern.to_string(), ip), || {
+            self.live.learnt_from_scripts(pattern, ip)
+        })
     }
 }
 
@@ -1535,6 +1708,26 @@ mod tests {
 
     fn addr(last: u8) -> Ipv4Addr {
         Ipv4Addr::new(203, 0, 113, last)
+    }
+
+    /// The observer records a new destination while a pass is between its
+    /// filters and its kill-switch pins: both halves still read one state, or
+    /// the pins guard an address the filters never routed.
+    #[test]
+    fn a_pass_reads_one_state_while_the_observer_writes() {
+        use super::{AppObservationLookup, AppObservationStore, PassObservations};
+        use std::sync::Arc;
+
+        let store = Arc::new(AppObservationStore::new());
+        assert!(store.record("/opt/apps/tool", addr(10)));
+        let pass = PassObservations::over(Arc::clone(&store) as Arc<dyn AppObservationLookup>);
+        let first = pass.ips_for_app("tool");
+        assert!(store.record("/opt/apps/tool", addr(11)));
+        assert_eq!(pass.ips_for_app("tool"), first);
+        assert_eq!(first, vec![addr(10)]);
+        // The next pass sees the new destination.
+        let next = PassObservations::over(store as Arc<dyn AppObservationLookup>);
+        assert_eq!(next.ips_for_app("tool").len(), 2);
     }
 
     /// Kept per user, Alice's browser teaches Alice's plan only: Bob's rule
@@ -1565,7 +1758,7 @@ mod tests {
         // A held connection refreshes its owner's destinations only.
         let held = LiveConnection {
             process_path: "/usr/bin/firefox".into(),
-            remote: addr(10),
+            remote: addr(10).into(),
             owner: Some("uid:1001".into()),
         };
         assert_eq!(store.refresh_live(&[held]), 0);
@@ -1579,7 +1772,10 @@ mod tests {
         use std::sync::Arc;
         let store = Arc::new(AppObservationStore::per_principal());
         assert!(store.keeps_per_principal());
-        assert_eq!(store.seed_many(&[("firefox".to_string(), addr(10))]), 0);
+        assert_eq!(
+            store.seed_many(&[("firefox".to_string(), addr(10).into())]),
+            0
+        );
         let later = store.scope_for(Some("uid:1000")).expect("owner known");
         assert!(later.ips_for_app("firefox").is_empty());
         assert!(!later.keeps_per_principal());
@@ -1736,7 +1932,10 @@ mod tests {
         assert!(!store.record("alpha.exe", addr(10)));
         assert_eq!(store.ips_for_app("alpha.exe"), vec![addr(11)]);
         // Nor may the cross-session warm load reintroduce it.
-        assert_eq!(store.seed_many(&[("alpha.exe".to_string(), addr(10))]), 0);
+        assert_eq!(
+            store.seed_many(&[("alpha.exe".to_string(), addr(10).into())]),
+            0
+        );
     }
 
     #[test]
@@ -1982,10 +2181,10 @@ mod tests {
         );
     }
 
-    fn live(process_path: &str, remote: Ipv4Addr) -> LiveConnection {
+    fn live(process_path: &str, remote: impl Into<std::net::IpAddr>) -> LiveConnection {
         LiveConnection {
             process_path: process_path.to_string(),
-            remote,
+            remote: remote.into(),
             owner: None,
         }
     }
@@ -2013,6 +2212,42 @@ mod tests {
             vec![ip(203, 0, 113, 7)],
             "the held destination stays; the one nobody holds ages out as before"
         );
+    }
+
+    /// The same messenger over IPv6: its v6 route must not lapse under the
+    /// connection it holds, and a v4-mapped peer keeps the IPv4 one.
+    #[allow(clippy::unwrap_used)]
+    #[test]
+    fn a_held_ipv6_connection_keeps_its_destination_past_the_window() {
+        let (offset, clock) = test_clock();
+        let store = AppObservationStore::new().with_clock(clock);
+        let v6: std::net::Ipv6Addr = "2001:db8::7".parse().unwrap();
+        store.record("messenger.exe", v6);
+        store.record("messenger.exe", ip(203, 0, 113, 7));
+
+        *offset.lock().unwrap() = APP_PIN_FRESHNESS_WINDOW - Duration::from_secs(60);
+        let mapped: std::net::IpAddr = "::ffff:203.0.113.7".parse().unwrap();
+        assert_eq!(
+            store.refresh_live(&[live("messenger.exe", v6), live("messenger.exe", mapped)]),
+            2
+        );
+        *offset.lock().unwrap() = APP_PIN_FRESHNESS_WINDOW + Duration::from_secs(60);
+
+        assert_eq!(store.ips_v6_for_app("messenger.exe"), vec![v6]);
+        assert_eq!(store.ips_for_app("messenger.exe"), vec![ip(203, 0, 113, 7)]);
+    }
+
+    /// Private and link-local IPv6 space teaches an application rule nothing,
+    /// as RFC 1918 does not: a program's first contact must not pin the
+    /// local network onto the tunnel.
+    #[test]
+    fn local_ipv6_space_is_never_learnt() {
+        let store = AppObservationStore::new();
+        for local in ["fd12::1", "fe80::1", "::1", "ff02::fb", "::"] {
+            let at: std::net::IpAddr = local.parse().expect("ip");
+            assert!(!store.record("app.exe", at), "{local}");
+        }
+        assert!(store.ips_v6_for_app("app.exe").is_empty());
     }
 
     #[test]
@@ -2047,7 +2282,7 @@ mod tests {
     fn a_glob_rule_keeps_the_live_destination_of_a_process_it_names() {
         let (offset, clock) = test_clock();
         let store = AppObservationStore::new().with_clock(clock);
-        store.seed_many(&[("*vpn*.exe".to_string(), ip(203, 0, 113, 1))]);
+        store.seed_many(&[("*vpn*.exe".to_string(), ip(203, 0, 113, 1).into())]);
         *offset.lock().unwrap() = APP_PIN_FRESHNESS_WINDOW - Duration::from_secs(60);
         assert_eq!(
             store.refresh_live(&[live("myvpnclient.exe", ip(203, 0, 113, 1))]),
@@ -2268,7 +2503,10 @@ mod tests {
     fn a_remembered_folder_rule_destination_is_seeded_into_its_bucket() {
         let store = windows_store();
         let folder = r"c:\apps\tool\*".to_string();
-        assert_eq!(store.seed_many(&[(folder.clone(), ip(203, 0, 113, 40))]), 1);
+        assert_eq!(
+            store.seed_many(&[(folder.clone(), ip(203, 0, 113, 40).into())]),
+            1
+        );
         assert_eq!(store.ips_for_app(&folder), vec![ip(203, 0, 113, 40)]);
         assert!(store.ips_for_app("*").is_empty());
     }
@@ -2295,7 +2533,7 @@ mod tests {
         assert!(!store.record("app.exe", Ipv4Addr::new(10, 1, 0, 5)));
         assert!(!store.record("app.exe", Ipv4Addr::new(100, 64, 8, 5)));
         assert_eq!(
-            store.seed_many(&[("app.exe".to_string(), Ipv4Addr::new(100, 64, 8, 6))]),
+            store.seed_many(&[("app.exe".to_string(), Ipv4Addr::new(100, 64, 8, 6).into())]),
             0
         );
         assert!(store.record("app.exe", addr(5)));

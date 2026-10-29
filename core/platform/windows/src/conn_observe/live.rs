@@ -1,11 +1,12 @@
-//! Windows [`LiveConnectionSource`]: the IPv4 TCP connection table with owning
-//! process ids, read the same way the flow owner and the stale-flow reset read
-//! it, so there is one notion of "an established connection".
+//! Windows [`LiveConnectionSource`]: the IPv4 and IPv6 TCP connection tables
+//! with owning process ids, read the same way the flow owner and the
+//! stale-flow reset read them, so there is one notion of "an established
+//! connection".
 
 #![allow(unsafe_code)]
 
 use std::collections::HashMap;
-use std::net::Ipv4Addr;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
 use nrr_platform_api::conn_observe::live::{LiveConnection, LiveConnectionSource};
 use windows::Win32::NetworkManagement::IpHelper::MIB_TCP_STATE_ESTAB;
@@ -24,16 +25,25 @@ impl WindowsLiveConnections {
 
 impl LiveConnectionSource for WindowsLiveConnections {
     fn established(&self) -> Vec<LiveConnection> {
-        let Some(buffer) = read_tcp_owner_pid_table() else {
-            return Vec::new();
-        };
-        let mut rows: Vec<(u32, Ipv4Addr)> = Vec::new();
-        for row in crate::flow_owner::tcp_rows(&buffer) {
-            if row.dwState == MIB_TCP_STATE_ESTAB.0 as u32 {
-                rows.push((
-                    row.dwOwningPid,
-                    Ipv4Addr::from(u32::from_be(row.dwRemoteAddr)),
-                ));
+        let mut rows: Vec<(u32, IpAddr)> = Vec::new();
+        if let Some(buffer) = read_tcp_owner_pid_table() {
+            for row in crate::flow_owner::tcp_rows(&buffer) {
+                if row.dwState == MIB_TCP_STATE_ESTAB.0 as u32 {
+                    rows.push((
+                        row.dwOwningPid,
+                        IpAddr::V4(Ipv4Addr::from(u32::from_be(row.dwRemoteAddr))),
+                    ));
+                }
+            }
+        }
+        if let Some(buffer) = crate::flow_owner::read_tcp6_owner_pid_table() {
+            for row in crate::flow_owner::tcp6_rows(&buffer) {
+                if row.dwState == MIB_TCP_STATE_ESTAB.0 as u32 {
+                    rows.push((
+                        row.dwOwningPid,
+                        IpAddr::V6(Ipv6Addr::from(row.ucRemoteAddr)),
+                    ));
+                }
             }
         }
         connections_of(
@@ -48,12 +58,13 @@ impl LiveConnectionSource for WindowsLiveConnections {
 /// in this pass. A protected process whose token cannot be read has no owner;
 /// its connection is still listed.
 fn connections_of(
-    rows: Vec<(u32, Ipv4Addr)>,
+    rows: Vec<(u32, IpAddr)>,
     name_of: impl Fn(u32) -> Option<String>,
     owner_of: impl Fn(u32) -> Option<String>,
 ) -> Vec<LiveConnection> {
     let mut seen: HashMap<u32, Option<(String, Option<String>)>> = HashMap::new();
     rows.into_iter()
+        .map(|(pid, remote)| (pid, remote.to_canonical()))
         .filter(|(_, remote)| !remote.is_loopback() && !remote.is_unspecified())
         .filter_map(|(pid, remote)| {
             let (process_path, owner) = seen
@@ -79,7 +90,7 @@ mod tests {
     fn each_connection_carries_its_processes_owner_looked_up_once() {
         use std::cell::Cell;
         let owner_calls = Cell::new(0);
-        let remote = |d| Ipv4Addr::new(203, 0, 113, d);
+        let remote = |d| IpAddr::V4(Ipv4Addr::new(203, 0, 113, d));
         let rows = vec![
             (10, remote(1)),
             (10, remote(2)),
@@ -107,6 +118,24 @@ mod tests {
             2,
             "one token read per named process, none for an unnamed one"
         );
+    }
+
+    /// A program's IPv6 connection is listed like its IPv4 one, and a
+    /// dual-stack socket's v4-mapped peer as the IPv4 address the store keeps;
+    /// a loopback peer in either spelling is not.
+    #[test]
+    fn an_ipv6_peer_is_listed_and_a_mapped_one_reads_as_ipv4() {
+        let v6: IpAddr = "2001:db8::7".parse().expect("v6");
+        let mapped: IpAddr = "::ffff:203.0.113.9".parse().expect("mapped");
+        let rows = vec![
+            (10, v6),
+            (10, mapped),
+            (10, IpAddr::V6(Ipv6Addr::LOCALHOST)),
+            (10, "::ffff:127.0.0.1".parse().expect("mapped loopback")),
+        ];
+        let out = connections_of(rows, |_| Some("p.exe".to_string()), |_| None);
+        let remotes: Vec<IpAddr> = out.iter().map(|c| c.remote).collect();
+        assert_eq!(remotes, vec![v6, IpAddr::V4(Ipv4Addr::new(203, 0, 113, 9))]);
     }
 
     /// A connection this test process holds must be listed under its own

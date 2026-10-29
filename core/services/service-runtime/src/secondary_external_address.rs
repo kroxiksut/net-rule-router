@@ -63,9 +63,13 @@
 //! told about it hear that it no longer holds, so no client keeps showing the
 //! exit of a tunnel that is gone. A reconnect inside the quiet period refills
 //! the value without announcing it.
+//!
+//! A wake, or another network behind the same link, asks again without
+//! withdrawing; only an exit that changed is announced.
 
 use std::collections::HashMap;
 use std::net::Ipv4Addr;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -73,6 +77,7 @@ use std::time::{Duration, Instant};
 use nrr_shared::ipc_payloads::StatusUpdateEvent;
 
 use crate::ipc_handlers::event_bus::EventBus;
+use crate::power_resume::{process_sleeps, SleepLedger};
 
 // ── Tunables ─────────────────────────────────────────────────────────────────
 
@@ -132,6 +137,9 @@ pub struct SecondaryLink {
     pub source_ipv4: Ipv4Addr,
     /// Human-readable adapter description, carried into the notice.
     pub adapter_name: String,
+    /// The link's own next hops: a different set under the same identity is
+    /// a move to another network, whose exit may differ.
+    pub gateways: Vec<Ipv4Addr>,
 }
 
 impl SecondaryLink {
@@ -215,6 +223,7 @@ pub fn bound_secondary_link(
         interface_index: adapter.index,
         source_ipv4: adapter.ipv4_addresses.first().copied()?,
         adapter_name: name.clone(),
+        gateways: adapter.gateways.clone(),
     })
 }
 
@@ -227,6 +236,8 @@ pub enum AnnounceOutcome {
     NoAddress,
     /// The previous notice is still too recent — a flapping link.
     SuppressedTooSoon,
+    /// A check after a wake or a move found the exit the user already holds.
+    Unchanged,
     /// The user has no tracked link any more (unbound mid-probe).
     Stale,
 }
@@ -253,6 +264,12 @@ struct LinkState {
     touched: Instant,
     /// The user holds an address for the current incarnation.
     told: bool,
+    /// The address they hold.
+    told_address: Option<Ipv4Addr>,
+    /// The link's next hops, sorted, as last seen.
+    path: Vec<Ipv4Addr>,
+    /// The probe due confirms the held address rather than announcing one.
+    recheck: bool,
 }
 
 impl LinkState {
@@ -266,14 +283,33 @@ impl LinkState {
             announced_at: None,
             touched: now,
             told: false,
+            told_address: None,
+            path: Vec::new(),
+            recheck: false,
         }
     }
 
     /// The incarnation the user was told about has ended. `true` when they
     /// hold an address that must now be withdrawn.
     fn end_incarnation(&mut self) -> bool {
+        self.told_address = None;
+        self.recheck = false;
         std::mem::take(&mut self.told)
     }
+
+    /// Probe again after the settle window, attempts counted afresh.
+    fn rearm(&mut self, now: Instant) {
+        self.since = now;
+        self.probed = false;
+        self.attempts = 0;
+    }
+}
+
+fn path_of(link: &SecondaryLink) -> Vec<Ipv4Addr> {
+    let mut path = link.gateways.clone();
+    path.sort_unstable();
+    path.dedup();
+    path
 }
 
 /// Turns "the additional link connected" into at most one tray notice carrying
@@ -282,15 +318,15 @@ pub struct ExternalAddressAnnouncer {
     events: Option<Arc<EventBus>>,
     probe: ExternalAddressProbeFn,
     state: Mutex<HashMap<String, LinkState>>,
+    /// Where wakes are counted: an exit learned before a sleep is checked
+    /// again after it.
+    sleeps: Arc<SleepLedger>,
+    wakes_seen: AtomicU64,
 }
 
 impl ExternalAddressAnnouncer {
     pub fn new(events: Arc<EventBus>, probe: ExternalAddressProbeFn) -> Self {
-        Self {
-            events: Some(events),
-            probe,
-            state: Mutex::new(HashMap::new()),
-        }
+        Self::with_events(Some(events), probe)
     }
 
     /// Announcer without a push channel: it still runs the whole decision path
@@ -298,11 +334,26 @@ impl ExternalAddressAnnouncer {
     /// where no event bus is wired.
     #[must_use]
     pub fn without_events(probe: ExternalAddressProbeFn) -> Self {
+        Self::with_events(None, probe)
+    }
+
+    fn with_events(events: Option<Arc<EventBus>>, probe: ExternalAddressProbeFn) -> Self {
+        let sleeps = process_sleeps();
         Self {
-            events: None,
+            events,
             probe,
             state: Mutex::new(HashMap::new()),
+            wakes_seen: AtomicU64::new(sleeps.wakes()),
+            sleeps,
         }
+    }
+
+    /// Count wakes in `sleeps` instead of the process's own ledger.
+    #[must_use]
+    pub fn with_sleeps(mut self, sleeps: Arc<SleepLedger>) -> Self {
+        self.wakes_seen = AtomicU64::new(sleeps.wakes());
+        self.sleeps = sleeps;
+        self
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<String, LinkState>> {
@@ -333,6 +384,8 @@ impl ExternalAddressAnnouncer {
         let mut state = self.lock();
         let mut due = Vec::new();
         let mut withdrawn = Vec::new();
+        let wakes = self.sleeps.wakes();
+        let woke = self.wakes_seen.swap(wakes, Ordering::AcqRel) != wakes;
 
         for link in links {
             let entry = state
@@ -340,6 +393,7 @@ impl ExternalAddressAnnouncer {
                 .or_insert_with(|| LinkState::new(now));
             entry.touched = now;
             let identity = link.identity();
+            let path = path_of(link);
             if entry.identity != Some(identity) {
                 // A new incarnation: a fresh connection, a re-IP, or a move to
                 // a different adapter. The announcement time survives — it is
@@ -348,14 +402,21 @@ impl ExternalAddressAnnouncer {
                     withdrawn.push(link.sid.clone());
                 }
                 entry.identity = Some(identity);
-                entry.since = now;
-                entry.probed = false;
-                entry.attempts = 0;
+                entry.path = path;
+                entry.rearm(now);
                 // Whatever probe is still in the air belongs to the previous
                 // incarnation and will be discarded on arrival; leaving the
                 // flag set would keep this one from ever being probed.
                 entry.in_flight = false;
                 continue;
+            }
+            // Same link, but a sleep or another network behind it: the exit
+            // the user holds may no longer be theirs. Not a reconnection, so
+            // nothing is withdrawn while it is asked again.
+            if woke || entry.path != path {
+                entry.path = path;
+                entry.recheck = entry.told;
+                entry.rearm(now);
             }
             if entry.probed || entry.in_flight || entry.attempts >= MAX_PROBE_ATTEMPTS {
                 continue;
@@ -453,11 +514,15 @@ impl ExternalAddressAnnouncer {
             );
             return AnnounceOutcome::NoAddress;
         };
+        if std::mem::take(&mut entry.recheck) && entry.told_address == Some(address) {
+            return AnnounceOutcome::Unchanged;
+        }
 
         let too_soon = entry
             .announced_at
             .is_some_and(|at| now.saturating_duration_since(at) < ANNOUNCE_MIN_INTERVAL);
         entry.told = true;
+        entry.told_address = Some(address);
         if too_soon {
             drop(state);
             tracing::debug!(
@@ -559,11 +624,13 @@ mod tests {
             interface_index: index,
             source_ipv4: Ipv4Addr::from(source),
             adapter_name: "Test VPN Adapter".to_string(),
+            gateways: Vec::new(),
         }
     }
 
+    /// Wakes other tests record into the process's ledger stay out of these.
     fn announcer() -> ExternalAddressAnnouncer {
-        ExternalAddressAnnouncer::without_events(Arc::new(|_| None))
+        ExternalAddressAnnouncer::without_events(Arc::new(|_| None)).with_sleeps(Arc::default())
     }
 
     fn addr(last: u8) -> Ipv4Addr {
@@ -843,7 +910,8 @@ mod tests {
     fn announcer_on_bus() -> (ExternalAddressAnnouncer, Arc<EventBus>) {
         let bus = Arc::new(EventBus::new());
         (
-            ExternalAddressAnnouncer::new(Arc::clone(&bus), Arc::new(|_| None)),
+            ExternalAddressAnnouncer::new(Arc::clone(&bus), Arc::new(|_| None))
+                .with_sleeps(Arc::default()),
             bus,
         )
     }
@@ -1012,15 +1080,119 @@ mod tests {
         assert_eq!(withdrawals(&bus), 2);
     }
 
+    /// `l` settles and its exit `address` is announced at `t0 + LINK_SETTLE`.
+    fn told(a: &ExternalAddressAnnouncer, l: &SecondaryLink, t0: Instant, address: Ipv4Addr) {
+        a.observe(std::slice::from_ref(l), t0);
+        a.observe(std::slice::from_ref(l), t0 + LINK_SETTLE);
+        assert_eq!(
+            a.on_probe_result(l, Some(address), t0 + LINK_SETTLE),
+            AnnounceOutcome::Announced
+        );
+    }
+
+    /// The lid was closed overnight and the tunnel came back with the same
+    /// adapter and inner address, possibly through another exit: the exit is
+    /// asked again, and the user hears only of a change.
+    #[test]
+    fn a_wake_checks_the_exit_again_and_tells_only_a_change() {
+        let sleeps = Arc::new(SleepLedger::default());
+        let bus = Arc::new(EventBus::new());
+        let a = ExternalAddressAnnouncer::new(Arc::clone(&bus), Arc::new(|_| None))
+            .with_sleeps(Arc::clone(&sleeps));
+        let t0 = Instant::now();
+        let l = link(7, [10, 88, 1, 41]);
+        told(&a, &l, t0, addr(10));
+
+        let woke = t0 + ANNOUNCE_MIN_INTERVAL * 2;
+        let wall = std::time::SystemTime::now();
+        sleeps.record(wall, Duration::from_secs(8 * 3600));
+        assert!(a.observe(std::slice::from_ref(&l), woke).is_empty());
+        assert_eq!(
+            a.observe(std::slice::from_ref(&l), woke + LINK_SETTLE),
+            vec![l.clone()],
+            "the exit learned before the sleep is not checked again"
+        );
+        assert_eq!(
+            a.on_probe_result(&l, Some(addr(10)), woke + LINK_SETTLE),
+            AnnounceOutcome::Unchanged
+        );
+        assert!(
+            a.observe(std::slice::from_ref(&l), woke + LINK_SETTLE * 3)
+                .is_empty(),
+            "one check per wake"
+        );
+        assert_eq!(withdrawals(&bus), 0, "the address held through the sleep");
+
+        let next = woke + ANNOUNCE_MIN_INTERVAL * 2;
+        sleeps.record(
+            wall + Duration::from_secs(24 * 3600),
+            Duration::from_secs(3600),
+        );
+        a.observe(std::slice::from_ref(&l), next);
+        assert_eq!(
+            a.observe(std::slice::from_ref(&l), next + LINK_SETTLE),
+            vec![l.clone()]
+        );
+        assert_eq!(
+            a.on_probe_result(&l, Some(addr(11)), next + LINK_SETTLE),
+            AnnounceOutcome::Announced
+        );
+        let notices: Vec<String> = published(&bus)
+            .into_iter()
+            .filter_map(|event| match event {
+                StatusUpdateEvent::SecondaryExternalAddressObserved {
+                    external_address, ..
+                } => Some(external_address),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(notices, ["203.0.113.10", "203.0.113.11"]);
+    }
+
+    /// The additional link moved to another network and kept its adapter and
+    /// address, as a Wi-Fi link handed the same lease often does: its exit is
+    /// asked again.
+    #[test]
+    fn a_move_to_another_network_under_the_same_link_checks_the_exit_again() {
+        let a = announcer();
+        let t0 = Instant::now();
+        let home = SecondaryLink {
+            gateways: vec![Ipv4Addr::new(192, 168, 1, 1)],
+            ..link(7, [192, 168, 1, 20])
+        };
+        told(&a, &home, t0, addr(10));
+        assert!(
+            a.observe(std::slice::from_ref(&home), t0 + LINK_SETTLE * 3)
+                .is_empty(),
+            "a link that stays put is not probed again"
+        );
+
+        let office = SecondaryLink {
+            gateways: vec![Ipv4Addr::new(192, 168, 1, 254)],
+            ..home.clone()
+        };
+        let moved = t0 + ANNOUNCE_MIN_INTERVAL * 2;
+        assert!(a.observe(std::slice::from_ref(&office), moved).is_empty());
+        assert_eq!(
+            a.observe(std::slice::from_ref(&office), moved + LINK_SETTLE),
+            vec![office.clone()],
+            "the exit of the previous network is still shown as this one's"
+        );
+        assert_eq!(
+            a.on_probe_result(&office, Some(addr(12)), moved + LINK_SETTLE),
+            AnnounceOutcome::Announced
+        );
+    }
+
     #[test]
     fn switching_the_check_off_withdraws_nothing() {
         use std::sync::atomic::Ordering;
         let rig = opt_in_rig(true);
         let bus = Arc::new(EventBus::new());
-        let announcer = Arc::new(ExternalAddressAnnouncer::new(
-            Arc::clone(&bus),
-            Arc::new(|_| Some(addr(10))),
-        ));
+        let announcer = Arc::new(
+            ExternalAddressAnnouncer::new(Arc::clone(&bus), Arc::new(|_| Some(addr(10))))
+                .with_sleeps(Arc::default()),
+        );
         let opted_in = Arc::new(std::sync::atomic::AtomicBool::new(true));
         let wiring = ExternalAddressWiring {
             announcer: Arc::clone(&announcer),
@@ -1062,12 +1234,13 @@ mod tests {
         let resolved = Arc::new(AtomicUsize::new(0));
         let connected = Arc::new(AtomicBool::new(true));
         let counter = Arc::clone(&probes);
-        let announcer = Arc::new(ExternalAddressAnnouncer::without_events(Arc::new(
-            move |_| {
+        let announcer = Arc::new(
+            ExternalAddressAnnouncer::without_events(Arc::new(move |_| {
                 counter.fetch_add(1, Ordering::SeqCst);
                 Some(addr(10))
-            },
-        )));
+            }))
+            .with_sleeps(Arc::default()),
+        );
         let link_of: SecondaryLinkOfFn = {
             let resolved = Arc::clone(&resolved);
             let connected = Arc::clone(&connected);

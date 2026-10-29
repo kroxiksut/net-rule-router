@@ -30,6 +30,7 @@ impl ProgramFolders for Machine {
             "/opt/tool",
             "/usr/bin",
             "/srv/bob",
+            "/srv/team",
         ];
         if known.iter().any(|folder| path == Path::new(folder)) {
             PlaceOnDisk::Folder
@@ -48,6 +49,13 @@ impl ProgramFolders for Machine {
 
     fn list(&self, folder: &Path, _subfolders: bool) -> FolderListing {
         self.looked.fetch_add(1, Ordering::SeqCst);
+        if folder == Path::new("/srv/team") {
+            // One program at the top, one in a subfolder only Bob may open.
+            return FolderListing {
+                programs: vec![folder.join("run0"), folder.join("bob").join("run1")],
+                truncated: false,
+            };
+        }
         FolderListing {
             programs: (0..3).map(|i| folder.join(format!("run{i}"))).collect(),
             truncated: false,
@@ -72,7 +80,7 @@ impl ProgramFolders for Machine {
     }
 
     fn owner_may_list(&self, place: &Path, owner: &str) -> bool {
-        !place.starts_with("/srv/bob") || owner == BOB
+        !(place.starts_with("/srv/bob") || place.starts_with("/srv/team/bob")) || owner == BOB
     }
 }
 
@@ -136,6 +144,18 @@ fn a_folder_closed_to_the_asker_is_refused_unlisted() {
         ask(&machine, "/srv/bob/*", "primary", BOB).outcome,
         APP_PATH_COVERAGE_FOUND
     );
+}
+
+/// A subfolder closed to the asker adds nothing to the count: the service
+/// walks the tree with its own rights, and the number would tell the asker
+/// what is inside a folder they cannot open.
+#[test]
+fn a_subfolder_closed_to_the_asker_is_left_out_of_the_count() {
+    let machine = Arc::new(Machine::default());
+    let alices = ask(&machine, "/srv/team/*", "primary", ALICE);
+    assert_eq!(alices.outcome, APP_PATH_COVERAGE_FOUND);
+    assert_eq!(alices.programs, 1);
+    assert_eq!(ask(&machine, "/srv/team/*", "primary", BOB).programs, 2);
 }
 
 #[test]

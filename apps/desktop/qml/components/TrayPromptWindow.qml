@@ -629,10 +629,26 @@ Window {
                             color: rowCheck.checked
                                 ? (promptWindow.theme ? promptWindow.theme.colorAccent : "#4c8dff")
                                 : "transparent"
-                            border.width: promptWindow.theme ? promptWindow.theme.borderWidth : 1
+                            border.width: rowCheck.activeFocus
+                                ? (promptWindow.theme ? promptWindow.theme.focusBorderWidth : 2)
+                                : (promptWindow.theme ? promptWindow.theme.borderWidth : 1)
+                            // A ticked box is the accent itself: its ring is the filled pair.
                             border.color: rowCheck.activeFocus
-                                ? (promptWindow.theme ? promptWindow.theme.colorAccent : "#4c8dff")
+                                ? (promptWindow.theme
+                                    ? (rowCheck.checked ? promptWindow.theme.stateFocusedBorderOnFill
+                                                        : promptWindow.theme.stateFocusedBorder)
+                                    : "#4c8dff")
                                 : promptWindow._borderColor
+                            Rectangle {
+                                visible: rowCheck.activeFocus && rowCheck.checked && !!promptWindow.theme
+                                anchors.fill: parent
+                                anchors.margins: promptWindow.theme ? promptWindow.theme.focusBorderWidth : 2
+                                radius: Math.max(0, parent.radius - anchors.margins)
+                                color: "transparent"
+                                border.width: promptWindow.theme ? promptWindow.theme.borderWidth : 1
+                                border.color: promptWindow.theme
+                                    ? promptWindow.theme.stateFocusedInnerOnFill : "transparent"
+                            }
                             Text {
                                 anchors.centerIn: parent
                                 visible: rowCheck.checked

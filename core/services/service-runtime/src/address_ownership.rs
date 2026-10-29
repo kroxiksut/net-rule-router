@@ -50,7 +50,7 @@
 //!    expanded into addresses: every answer about one is a lookup.
 
 use std::collections::{HashMap, HashSet};
-use std::net::{IpAddr, Ipv4Addr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::sync::OnceLock;
 
 use nrr_domain::canonical::{CanonicalAddressMatch, CanonicalRuleBook, CanonicalRuleSet};
@@ -380,8 +380,15 @@ impl AddressOwnership {
             (&rule_book.secondary, Link::Additional),
         ] {
             for pattern in crate::app_destination_memory::routed_app_patterns(set) {
-                for ip in observations.ips_for_app(&pattern) {
-                    let ip = IpAddr::V4(ip);
+                let v4 = observations
+                    .ips_for_app(&pattern)
+                    .into_iter()
+                    .map(IpAddr::V4);
+                let v6 = observations
+                    .ips_v6_for_app(&pattern)
+                    .into_iter()
+                    .map(IpAddr::V6);
+                for ip in v4.chain(v6) {
                     if !self.literal_blocks.contains_key(&ip) {
                         self.app_taken.entry(ip).or_insert(link);
                     }
@@ -1275,6 +1282,10 @@ pub enum AppDestinationRefusal {
 pub struct AppDestinations {
     pub admitted: Vec<Ipv4Addr>,
     pub refused: Vec<(Ipv4Addr, AppDestinationRefusal)>,
+    /// IPv6 destinations admitted by the same checks; each wants a `/128`.
+    /// A refused one is only left out: the program's v6 traffic is held by
+    /// its own filter pair whatever the route.
+    pub admitted_v6: Vec<Ipv6Addr>,
 }
 
 /// Why an application rule whose program is found carries none of its traffic.
@@ -1305,7 +1316,7 @@ impl AppDestinations {
     /// are named first: that is the reason they can act on.
     #[must_use]
     pub fn none_taken(&self) -> Option<AppTrafficElsewhere> {
-        if !self.admitted.is_empty() || self.refused.is_empty() {
+        if !self.admitted.is_empty() || !self.admitted_v6.is_empty() || self.refused.is_empty() {
             return None;
         }
         let named = self
@@ -1387,7 +1398,8 @@ impl<'a> AppDestinationGate<'a> {
     /// (see [`AppObservationLookup::learnt_from_scripts`]).
     #[must_use]
     pub fn learnt_from_scripts(&self, pattern: &str, ip: Ipv4Addr) -> bool {
-        self.observations.learnt_from_scripts(pattern, ip)
+        self.observations
+            .learnt_from_scripts(pattern, IpAddr::V4(ip))
     }
 
     /// Destinations `pattern`'s rule on `for_link` may take, in observation
@@ -1413,12 +1425,25 @@ impl<'a> AppDestinationGate<'a> {
             } else if !self.ownership.app_takeover
                 && self
                     .observations
-                    .destination_used_outside(&self.friendly, ip)
+                    .destination_used_outside(&self.friendly, IpAddr::V4(ip))
             {
                 out.refused
                     .push((ip, AppDestinationRefusal::UsedByOtherProcess));
             } else {
                 out.admitted.push(ip);
+            }
+        }
+        // The same order of checks; the shared-address policy has no IPv6
+        // view, so nothing is declined on that ground.
+        for ip in self.observations.ips_v6_for_app(pattern) {
+            let at = IpAddr::V6(ip);
+            let admitted = self.ownership.app_rule_may_claim(at, for_link)
+                && (self.ownership.app_takeover
+                    || !self
+                        .observations
+                        .destination_used_outside(&self.friendly, at));
+            if admitted {
+                out.admitted_v6.push(ip);
             }
         }
         out
@@ -1441,6 +1466,7 @@ mod tests {
         let refused = |why: &[AppDestinationRefusal]| AppDestinations {
             admitted: Vec::new(),
             refused: why.iter().map(|w| (a, *w)).collect(),
+            admitted_v6: Vec::new(),
         };
         assert_eq!(AppDestinations::default().none_taken(), None, "never seen");
         assert_eq!(
@@ -2050,6 +2076,41 @@ mod tests {
             assert_eq!(
                 gate.admit("helper.exe", Link::Additional).admitted,
                 vec![OTHER]
+            );
+        }
+
+        /// A program's IPv6 destinations pass the checks its IPv4 ones do: a
+        /// `/128` moves every process on the address just as a `/32` does, and
+        /// an address the main link's rule names stays the main link's.
+        #[test]
+        fn ipv6_destinations_face_the_same_owner_and_census() {
+            let clean: Ipv6Addr = "2001:db8::1".parse().expect("v6");
+            let named: Ipv6Addr = "2001:db8::2".parse().expect("v6");
+            let shared: Ipv6Addr = "2001:db8::3".parse().expect("v6");
+            let book = book(
+                vec![address_rule(
+                    "p1",
+                    CanonicalAddressMatch::ExactIp(IpAddr::V6(named)),
+                    RuleAction::Route,
+                )],
+                vec![app_rule("s1")],
+            );
+            let obs = MockAppObservationLookup::new();
+            obs.set_ips_v6("helper.exe", vec![clean, named, shared]);
+            obs.set_used_outside(shared);
+
+            let off = resolve(&book, &obs, false);
+            let gate = AppDestinationGate::for_rule_set(&off, &obs, &book.secondary);
+            let taken = gate.admit("helper.exe", Link::Additional);
+            assert_eq!(taken.admitted_v6, vec![clean]);
+            assert_eq!(taken.none_taken(), None);
+
+            let on = resolve(&book, &obs, true);
+            let gate = AppDestinationGate::for_rule_set(&on, &obs, &book.secondary);
+            assert_eq!(
+                gate.admit("helper.exe", Link::Additional).admitted_v6,
+                vec![clean, named, shared],
+                "under the takeover the program keeps what it uses"
             );
         }
     }

@@ -25,6 +25,10 @@ use crate::integrity_review;
 /// unadopted.
 const ALERT_ROWS_NOT_ADOPTED: &str = "alert-rows-not-adopted";
 
+/// The refusal of an acknowledgement whose record of the rules could not be
+/// written.
+const RULES_RECORD_NOT_SAVED: &str = "rules-record-not-saved";
+
 /// What an acknowledgement adopted, and what it was shown but left alone.
 #[derive(Clone, Copy, Debug, Default)]
 struct AdoptionSummary {
@@ -115,11 +119,13 @@ impl ProductionMutationExecutor {
             .unwrap_or(alert.updated_at);
         // Acknowledging a DB tamper / key-reset alert adopts exactly the rows
         // the dialog listed, and only those still holding the content shown.
-        let adoption = if crate::tamper_bootstrap::is_blocking_alert_kind(&alert.kind) {
-            self.adopt_acknowledged_rows(&alert, parsed.adopt_rows.as_deref(), repo, now_ms)
-        } else {
-            AdoptionSummary::default()
-        };
+        let rules_store = alert.kind == AuditEventKind::RulesStoreRolledBack.as_str();
+        let adoption =
+            if crate::tamper_bootstrap::is_blocking_alert_kind(&alert.kind) && !rules_store {
+                self.adopt_acknowledged_rows(&alert, parsed.adopt_rows.as_deref(), repo, now_ms)
+            } else {
+                AdoptionSummary::default()
+            };
         // A tamper alert is raised once per row content: lifted with its row
         // still unadopted, nothing would ever name that row again.
         if alert.kind == AuditEventKind::DbTamperDetected.as_str()
@@ -135,6 +141,17 @@ impl ProductionMutationExecutor {
                     parsed.alert_id
                 ),
             });
+        }
+        // Accepting rules that went back means recording them as they are now;
+        // left unrecorded, the next start would raise the same alert again.
+        if rules_store {
+            if let Err(e) = self.coordinator.re_record_rules_anchor() {
+                return MutationOutcome::Failed(OperationError {
+                    args: Default::default(),
+                    code: RULES_RECORD_NOT_SAVED.into(),
+                    message: format!("alert {} stays open: {e}", parsed.alert_id),
+                });
+            }
         }
         // Recorded before the state moves: an acknowledgement the trail cannot
         // show did not happen.
@@ -319,6 +336,13 @@ impl ProductionMutationExecutor {
                                 error = %e,
                                 "rows re-signed but the key-reset marker could not be cleared; \
                                  the next boot will skip the integrity sweep again",
+                            );
+                        } else if let Err(e) = self.coordinator.re_record_rules_anchor() {
+                            tracing::warn!(
+                                target: "nrr::tamper",
+                                alert_id = %alert.alert_id,
+                                error = %e,
+                                "key reset acknowledged but the active rules could not be recorded",
                             );
                         }
                     }

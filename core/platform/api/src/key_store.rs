@@ -49,6 +49,16 @@ pub trait KeyStore: Send + Sync {
 
     /// Removes the marker. Succeeds (no-op) when nothing is stored.
     fn delete_resign_marker(&self) -> Result<(), PlatformError>;
+
+    /// Persists the record of which rules are active, beside the key under the
+    /// same protection. Opaque bytes, signed by the caller.
+    fn save_rules_anchor(&self, record: &[u8]) -> Result<(), PlatformError>;
+
+    /// The stored record, `None` when none was ever written. Bytes this store
+    /// cannot open come back as an empty `Some`: something is there, and the
+    /// caller must not take it for "never written". `Err` only for an I/O
+    /// fault reaching it.
+    fn load_rules_anchor(&self) -> Result<Option<Vec<u8>>, PlatformError>;
 }
 
 /// Generate a fresh signing key from the OS CSPRNG.
@@ -73,6 +83,7 @@ pub fn generate_signing_key() -> Result<Vec<u8>, PlatformError> {
 pub struct InMemKeyStore {
     inner: std::sync::Mutex<Option<Vec<u8>>>,
     resign_marker: std::sync::Mutex<Option<Vec<u8>>>,
+    rules_anchor: std::sync::Mutex<Option<Vec<u8>>>,
 }
 
 impl InMemKeyStore {
@@ -126,6 +137,15 @@ impl KeyStore for InMemKeyStore {
     fn delete_resign_marker(&self) -> Result<(), PlatformError> {
         *lock_slot(&self.resign_marker)? = None;
         Ok(())
+    }
+
+    fn save_rules_anchor(&self, record: &[u8]) -> Result<(), PlatformError> {
+        *lock_slot(&self.rules_anchor)? = Some(record.to_vec());
+        Ok(())
+    }
+
+    fn load_rules_anchor(&self) -> Result<Option<Vec<u8>>, PlatformError> {
+        Ok(lock_slot(&self.rules_anchor)?.clone())
     }
 }
 

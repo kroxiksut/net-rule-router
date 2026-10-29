@@ -222,6 +222,12 @@ pub mod integrity {
     /// A confirmed override reached the end of its term.
     pub const PROTECTION_OVERRIDE_EXPIRED: ReasonCode =
         ReasonCode("integrity.protection_override_expired");
+    /// The active rules in the database are not the ones last recorded beside
+    /// the key: an active rule set deleted or an earlier copy restored.
+    pub const RULES_STORE_ROLLED_BACK: ReasonCode = ReasonCode("integrity.rules_store_rolled_back");
+    /// The record of the active rules beside the key does not verify.
+    pub const RULES_RECORD_UNVERIFIABLE: ReasonCode =
+        ReasonCode("integrity.rules_record_unverifiable");
 }
 
 /// Reason codes for Windows Service lifecycle events (`service.*`).
@@ -542,6 +548,18 @@ pub fn reason_code_meta(code: ReasonCode) -> Option<ReasonCodeMeta> {
             "diag.integrity.protection_override_expired.summary",
             true,
         ),
+        "integrity.rules_store_rolled_back" => (
+            Lvl::Error,
+            Cat::Security,
+            "diag.integrity.rules_store_rolled_back.summary",
+            true,
+        ),
+        "integrity.rules_record_unverifiable" => (
+            Lvl::Error,
+            Cat::Security,
+            "diag.integrity.rules_record_unverifiable.summary",
+            true,
+        ),
         // service.*
         "service.started" => (
             Lvl::Info,
@@ -689,6 +707,8 @@ pub const ALL_REASON_CODES: &[ReasonCode] = &[
     integrity::PROTECTION_OVERRIDE_GRANTED,
     integrity::PROTECTION_OVERRIDE_REVOKED,
     integrity::PROTECTION_OVERRIDE_EXPIRED,
+    integrity::RULES_STORE_ROLLED_BACK,
+    integrity::RULES_RECORD_UNVERIFIABLE,
     service::STARTED,
     service::STOPPED,
     service::DEGRADED_MODE,

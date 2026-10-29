@@ -111,6 +111,11 @@ impl BootIntegrity<'_> {
                         "DB-MAC tamper bootstrap clean",
                     );
                 }
+                // The key loaded, so the start stays signed; the check that
+                // did not run is still owed to the user.
+                if let Some(e) = outcome.rules_anchor_unchecked.as_ref() {
+                    self.report_outage(OutageSource::from(e), &e.to_string());
+                }
                 Some(outcome)
             }
             Err(e) => {

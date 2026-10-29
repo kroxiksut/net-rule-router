@@ -516,6 +516,118 @@ fn one_site_cannot_take_the_whole_relay() {
     assert_eq!(stack.flows.len(), 7, "another site still gets a flow");
 }
 
+/// Clients below port 50 000 are the routing user's, the rest a second
+/// user's; `several` says whether both are served.
+struct TwoUsers {
+    several: bool,
+}
+
+impl super::super::relay::FlowOwners for TwoUsers {
+    fn owner_of(
+        &self,
+        client: SocketAddr,
+        _: SocketAddr,
+        _: Option<nrr_platform_api::fake_ip::FlowTransport>,
+    ) -> super::super::relay::FlowOwner {
+        if client.port() >= 50_000 {
+            super::super::relay::FlowOwner::Principal("S-1-5-21-2".into())
+        } else {
+            super::super::relay::FlowOwner::RoutingUser
+        }
+    }
+
+    fn several_served(&self) -> bool {
+        self.several
+    }
+}
+
+/// A stack of `cap` flows over `hosts`, each a site of its own.
+fn stack_shared_by(
+    owners: TwoUsers,
+    hosts: &[&str],
+    cap: usize,
+) -> (
+    FakeIpStack,
+    Vec<std::net::Ipv4Addr>,
+    Arc<super::super::health::FakeIpHealth>,
+) {
+    use nrr_platform_api::fake_ip::{FakeIpAllocator, FakeIpScope};
+    let health = Arc::new(super::super::health::FakeIpHealth::new());
+    let mut allocator = FakeIpAllocator::default();
+    let upstream = std::net::IpAddr::V4(std::net::Ipv4Addr::new(203, 0, 113, 9));
+    let mut resolver = super::super::relay::StaticUpstreamResolver::new();
+    let mut fakes = Vec::new();
+    for host in hosts {
+        fakes.push(allocator.allocate(host).expect("allocate").v4);
+        resolver = resolver.with(host, &[upstream]);
+    }
+    let mut relay = RelayCore::new(
+        Arc::new(std::sync::Mutex::new(allocator)),
+        FakeIpScope::enabled(Vec::<String>::new()),
+        Arc::new(resolver),
+        Arc::new(super::super::relay::FixedRouteSelector(
+            nrr_shared::RouteRole::Primary,
+        )),
+    );
+    relay.set_flow_owners(Arc::new(owners));
+    let (device, _state) = open_mock_device();
+    let stack = FakeIpStack::new(
+        device,
+        &FakeIpPoolConfig::default(),
+        relay,
+        Arc::new(super::super::dialer::MockRelayDialer::new()),
+        StackWaker::new(),
+    )
+    .with_health(Arc::clone(&health))
+    .with_socket_buffer_bytes(1024)
+    .with_max_flows(cap);
+    (stack, fakes, health)
+}
+
+fn tcp_syn(to: std::net::Ipv4Addr, port: u16) -> ParsedPacket {
+    ParsedPacket {
+        key: FlowKey {
+            protocol: FlowProtocol::Tcp,
+            source: SocketAddr::from((std::net::Ipv4Addr::new(10, 0, 0, 1), port)),
+            destination: SocketAddr::from((to, 443)),
+        },
+        is_connection_open: true,
+        payload_offset: 0,
+    }
+}
+
+const MANY_SITES: [&str; 9] = [
+    "a.test", "b.test", "c.test", "d.test", "e.test", "f.test", "g.test", "h.test", "i.test",
+];
+
+/// Two users signed in: one opening connections to site after site cannot
+/// take the whole relay, so the other's next connection is not reset.
+#[test]
+fn one_user_cannot_take_the_whole_relay_from_another() {
+    const CAP: usize = 8;
+    let (mut stack, fakes, health) = stack_shared_by(TwoUsers { several: true }, &MANY_SITES, CAP);
+    for (i, fake) in fakes.iter().take(CAP).enumerate() {
+        stack.maybe_open_flow(&tcp_syn(*fake, 40_000 + i as u16), 0);
+    }
+    assert_eq!(stack.flows.len(), 6, "one user holds three quarters");
+    assert!(health.tcp_flows_refused_at_capacity() >= 1);
+    stack.maybe_open_flow(&tcp_syn(fakes[CAP], 50_001), 1_000);
+    assert_eq!(stack.flows.len(), 7, "the other user still gets a flow");
+}
+
+/// The share costs a sole user nothing: with nobody else served, all of the
+/// relay is theirs.
+#[test]
+fn a_sole_user_keeps_the_whole_relay() {
+    const CAP: usize = 8;
+    let (mut stack, fakes, health) = stack_shared_by(TwoUsers { several: false }, &MANY_SITES, CAP);
+    for (i, fake) in fakes.iter().take(CAP).enumerate() {
+        stack.maybe_open_flow(&tcp_syn(*fake, 40_000 + i as u16), 0);
+    }
+    assert_eq!(stack.flows.len(), CAP);
+    assert_eq!(health.tcp_flows_refused_at_capacity(), 0);
+}
+
 #[test]
 fn a_reader_parks_while_the_client_bound_queue_is_full() {
     // Unbounded, this queue grew to whatever the upstream could deliver

@@ -90,6 +90,7 @@ impl SecondaryRouteCoordinator {
             interface_index: target.interface_index,
             source_ipv4: info.ipv4_addresses.first().copied()?,
             adapter_name: info.description.clone(),
+            gateways: info.gateways.clone(),
         })
     }
 

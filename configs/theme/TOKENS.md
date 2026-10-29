@@ -49,6 +49,7 @@ This document fixes the foundation token set for GUI v1.
 
 - fill: `stateDefaultFill`, `stateHoverFill`, `statePressedFill`, `stateFocusedFill`, `stateDisabledFill`, `stateSelectedFill`
 - border: `stateDefaultBorder`, `stateFocusedBorder`, `stateDisabledBorder`, `stateSelectedBorder`
+- focus on a filled control: `stateFocusedBorderOnFill` (outer ring, shows against the surround), `stateFocusedInnerOnFill` (inner ring, shows against the fill)
 
 ## Required Rule For New UI
 

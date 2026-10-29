@@ -275,7 +275,8 @@ pub fn fold_batch(wiring: &AppObservationWiring) -> Fold {
         let Some(path) = observation.process_path.as_deref() else {
             continue;
         };
-        if let std::net::IpAddr::V4(ip) = observation.remote.ip() {
+        {
+            let ip = observation.remote.ip().to_canonical();
             let Some(store) = wiring.store.scope_for(observation.user_sid.as_deref()) else {
                 continue;
             };

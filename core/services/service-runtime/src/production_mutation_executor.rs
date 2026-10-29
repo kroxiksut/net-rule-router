@@ -732,6 +732,20 @@ impl MutationExecutor for ProductionMutationExecutor {
         self.refusal_at_gate(kind, caller_is_elevated)
     }
 
+    fn erase_every_users_rules(&self, erase: &mut dyn FnMut()) -> Result<(), OperationError> {
+        let reset = self
+            .coordinator
+            .erase_every_users_rules(erase, "full-reset")
+            .map_err(|e| policy_error(&e))?;
+        // As after one user's reset: their filters follow the baseline now.
+        if let Some(trigger) = self.apply_trigger.as_ref() {
+            for principal in &reset {
+                trigger.on_policy_changed(principal);
+            }
+        }
+        Ok(())
+    }
+
     fn execute(&self, stored: StoredMutation, principal: &str) -> MutationOutcome {
         tracing::info!(
             target: "nrr::mutation::execute",

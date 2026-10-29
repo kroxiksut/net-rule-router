@@ -63,7 +63,7 @@ pub fn view(app: &AppState, texts: &Texts) -> ScreenView {
         },
         Mode::Review(review) => Panel {
             title: texts.get(text::REVIEW_TITLE),
-            lines: review_lines(review, texts),
+            lines: review_lines(review, &rules.bound_paths, texts),
             feed: false,
         },
         Mode::Gateway(stage) => Panel {
@@ -1257,7 +1257,7 @@ fn entry_lines(sign: &str, entries: &[&RuleSummaryEntryDto], texts: &Texts) -> V
         .collect()
 }
 
-fn review_lines(review: &Review, texts: &Texts) -> Vec<ViewLine> {
+fn review_lines(review: &Review, bound: &[String], texts: &Texts) -> Vec<ViewLine> {
     let summary = &review.summary;
     let mut lines = Vec::new();
     match summary.provenance.as_str() {
@@ -1268,6 +1268,14 @@ fn review_lines(review: &Review, texts: &Texts) -> Vec<ViewLine> {
     lines.push(ViewLine::new(vec![Segment::strong(summary_text(
         summary, texts,
     ))]));
+    // The bound files follow the baseline afterwards: said before the user
+    // agrees, not found out from the files.
+    if review.pending.reset_to_baseline && !bound.is_empty() {
+        let files: Vec<String> = bound.iter().map(|p| display_text(p).into_owned()).collect();
+        lines.push(ViewLine::text(
+            texts.fill(text::REVIEW_RESET_FILES, &[("files", files.join(", "))]),
+        ));
+    }
 
     let level = serde_json::to_value(summary.risk_level)
         .ok()

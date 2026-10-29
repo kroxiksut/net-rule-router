@@ -123,6 +123,7 @@ pub const CLIENT_ERROR_CODES: &[&str] = &[
     "alert-not-found",
     "illegal-state-transition",
     "alert-rows-not-adopted",
+    "rules-record-not-saved",
     "alerts-storage-failure",
     "alerts-store-unavailable",
     "audit-unavailable",

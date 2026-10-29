@@ -105,14 +105,20 @@ impl RevisionSigning {
         }
     }
 
-    /// Makes `coordinator` sign every row it writes and lets an acknowledged
-    /// key reset clear its marker. Without a key it is returned unchanged.
+    /// Makes `coordinator` sign every row it writes, keep the record of the
+    /// active rules in step with its commits, and lets an acknowledged key
+    /// reset clear its marker. Without a key it is returned unchanged.
     #[must_use]
     pub fn sign(&self, coordinator: ActivationCoordinator) -> ActivationCoordinator {
         match self.bootstrap.as_ref() {
             Some(outcome) => coordinator
                 .with_signing_key(outcome.signing_key.clone())
-                .with_key_store(Arc::clone(&self.key_store)),
+                .with_key_store(Arc::clone(&self.key_store))
+                .with_rules_anchor(Arc::new(crate::rules_anchor::RulesAnchor::new(
+                    Arc::clone(&self.key_store),
+                    outcome.signing_key.clone(),
+                    outcome.rules_anchor_start.clone(),
+                ))),
             None => coordinator,
         }
     }

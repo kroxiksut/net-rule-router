@@ -39,6 +39,7 @@ impl SecondaryRouteCoordinator {
             no_secondary_logged: Mutex::new(std::collections::HashSet::new()),
             probed_ifindex: Mutex::new(HashMap::new()),
             last_resolution: Mutex::new(HashMap::new()),
+            pass_inputs: Default::default(),
             machine_read: Mutex::new(std::collections::HashSet::new()),
             served_ranks: Mutex::new(super::served::ServedRanks::default()),
             session_cache: Mutex::new(None),

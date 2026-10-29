@@ -165,11 +165,13 @@ impl nrr_service_runtime::dns_egress::SecondarySourceAddr for CoordinatorRelaySo
 
 /// Build the live DNS-egress policy: public resolvers over the secondary link
 /// while the toggle is on and the tunnel has a source address, the caller's own
-/// captured upstream otherwise. Reads the SAME process flag the route
-/// coordinator uses to install the resolver `/32` routes.
+/// captured upstream otherwise; with the toggle off, the additional link's
+/// rule hosts (`rule_hosts`) still go through the tunnel. Reads the SAME
+/// process flag the route coordinator uses to install the resolver `/32` routes.
 pub(super) fn build_dns_egress_policy(
     coordinator: &Arc<nrr_service_runtime::route_coordinator::SecondaryRouteCoordinator>,
     active_sid: nrr_service_runtime::supervised_runtime::ActiveRoutingSidFn,
+    rule_hosts: Option<Arc<dyn nrr_service_runtime::dns_resolver::RuleHostOracle>>,
 ) -> Arc<dyn nrr_service_runtime::dns_egress::DnsEgressPolicy> {
     let source = Arc::new(CoordinatorRelaySourceAddrs {
         coordinator: Arc::clone(coordinator),
@@ -177,12 +179,14 @@ pub(super) fn build_dns_egress_policy(
         cache: Mutex::new(None),
         owner_cache: Mutex::default(),
     });
-    Arc::new(
-        nrr_service_runtime::dns_egress::SecondaryPreferredEgress::new(
-            nrr_service_runtime::dns_egress::global_dns_via_secondary(),
-            source,
-        ),
-    )
+    let mut policy = nrr_service_runtime::dns_egress::SecondaryPreferredEgress::new(
+        nrr_service_runtime::dns_egress::global_dns_via_secondary(),
+        source,
+    );
+    if let Some(oracle) = rule_hosts {
+        policy = policy.with_rule_hosts(oracle);
+    }
+    Arc::new(policy)
 }
 
 impl nrr_service_runtime::fake_ip::RelaySourceAddrs for CoordinatorRelaySourceAddrs {
@@ -336,9 +340,18 @@ pub(super) fn build_fake_ip_stack_factory(
             build_hosts_bypass_resolver(
                 Some(Arc::clone(&settings_conn)),
                 Some(Arc::clone(&served_principals)),
-                route_coordinator
-                    .as_ref()
-                    .map(|coord| build_dns_egress_policy(coord, Arc::clone(&active_sid))),
+                route_coordinator.as_ref().map(|coord| {
+                    build_dns_egress_policy(
+                        coord,
+                        Arc::clone(&active_sid),
+                        Some(nrr_service_runtime::dns_stack::egress_rule_hosts(
+                            Arc::clone(&settings_conn),
+                            Arc::clone(&active_sid),
+                            Some(Arc::clone(&served_principals)),
+                            paused.clone(),
+                        )),
+                    )
+                }),
             ),
             Arc::clone(&cache),
         ));

@@ -168,7 +168,7 @@ impl nrr_platform_api::conn_observe::live::LiveConnectionSource for ProcfsLiveCo
                 sockets.extend(parse_socket_table(&text, v6));
             }
         }
-        let live = established_ipv4(&sockets);
+        let live = established(&sockets);
         if live.is_empty() {
             return Vec::new();
         }
@@ -191,17 +191,14 @@ impl nrr_platform_api::conn_observe::live::LiveConnectionSource for ProcfsLiveCo
     }
 }
 
-/// Established rows with an IPv4 peer, including a dual-stack socket's
-/// v4-mapped one. Pure, so it is tested on every host.
-fn established_ipv4(sockets: &[ProcSocket]) -> Vec<(&ProcSocket, Ipv4Addr)> {
+/// Established rows with a real peer of either family, a dual-stack socket's
+/// v4-mapped one as IPv4. Pure, so it is tested on every host.
+fn established(sockets: &[ProcSocket]) -> Vec<(&ProcSocket, IpAddr)> {
     sockets
         .iter()
         .filter(|socket| socket.state == TCP_ESTABLISHED)
         .filter_map(|socket| {
-            let remote = match socket.remote.ip() {
-                IpAddr::V4(v4) => v4,
-                IpAddr::V6(v6) => v6.to_ipv4_mapped()?,
-            };
+            let remote = socket.remote.ip().to_canonical();
             (!remote.is_loopback() && !remote.is_unspecified()).then_some((socket, remote))
         })
         .collect()
@@ -502,8 +499,10 @@ mod tests {
     /// A truncated or unexpected row is skipped, never guessed at: procfs
     /// formats differ between kernels, and inventing a destination from a
     /// half-read line would put a wrong address in a routing decision.
+    /// An IPv6 peer is live too: left out, a program's v6 destination would
+    /// lose its route under a connection it still holds.
     #[test]
-    fn only_established_rows_with_a_real_ipv4_peer_are_live() {
+    fn only_established_rows_with_a_real_peer_are_live() {
         let row = |remote: &str, state: u8| ProcSocket {
             local: addr("192.0.2.10:40000"),
             remote: addr(remote),
@@ -517,16 +516,18 @@ mod tests {
             row("127.0.0.1:8080", TCP_ESTABLISHED),
             row("[::ffff:203.0.113.5]:443", TCP_ESTABLISHED),
             row("[2001:db8::1]:443", TCP_ESTABLISHED),
+            row("[::1]:443", TCP_ESTABLISHED),
         ];
-        let remotes: Vec<Ipv4Addr> = established_ipv4(&sockets)
+        let remotes: Vec<IpAddr> = established(&sockets)
             .into_iter()
             .map(|(_, ip)| ip)
             .collect();
         assert_eq!(
             remotes,
             vec![
-                Ipv4Addr::new(198, 51, 100, 1),
-                Ipv4Addr::new(203, 0, 113, 5)
+                IpAddr::V4(Ipv4Addr::new(198, 51, 100, 1)),
+                IpAddr::V4(Ipv4Addr::new(203, 0, 113, 5)),
+                "2001:db8::1".parse::<IpAddr>().expect("v6"),
             ]
         );
     }

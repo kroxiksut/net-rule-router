@@ -429,6 +429,7 @@ pub(crate) fn rule_host_resolver(
     capture: &DnsCapture,
     servers: Arc<nrr_platform_linux::dns_resolver::LinuxDnsResolver>,
     bypass_enabled: Arc<dyn Fn() -> bool + Send + Sync>,
+    egress: Arc<dyn nrr_service_runtime::dns_egress::DnsEgressPolicy>,
 ) -> Arc<dyn DnsResolverPort> {
     use nrr_platform_linux::dns_resolver::HostsFileFirstResolver;
     use nrr_service_runtime::dns_resolver_ports::HostsBypassDnsResolver;
@@ -445,7 +446,8 @@ pub(crate) fn rule_host_resolver(
         HostsBypassDnsResolver::new(system, bypass_enabled, upstream, HOSTS_BYPASS_QUERY_TIMEOUT)
             .with_hosts(Arc::new(
                 nrr_platform_api::hosts_file::OsHostsFileReader::new(),
-            )),
+            ))
+            .with_egress(egress),
     )
 }
 

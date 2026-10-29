@@ -23,11 +23,14 @@ use std::sync::Mutex;
 /// the coordinator's purposes).
 struct FakeRules {
     by_sid: Mutex<std::collections::HashMap<String, CanonicalRuleSet>>,
+    /// How many times a book was read, to keep the answer path off the store.
+    reads: std::sync::atomic::AtomicUsize,
 }
 impl FakeRules {
     fn new() -> Self {
         Self {
             by_sid: Mutex::new(std::collections::HashMap::new()),
+            reads: std::sync::atomic::AtomicUsize::new(0),
         }
     }
     fn set_secondary(&self, sid: &str, secondary: CanonicalRuleSet) {
@@ -36,12 +39,20 @@ impl FakeRules {
             .unwrap()
             .insert(sid.to_string(), secondary);
     }
+    /// `sid` has no book any more.
+    fn forget(&self, sid: &str) {
+        self.by_sid.lock().unwrap().remove(sid);
+    }
+    fn reads(&self) -> usize {
+        self.reads.load(std::sync::atomic::Ordering::SeqCst)
+    }
 }
 impl RulesProvider for FakeRules {
     fn active_rules(&self) -> Option<ActiveRulesSnapshot> {
         self.active_rules_for("__baseline__")
     }
     fn active_rules_for(&self, principal: &str) -> Option<ActiveRulesSnapshot> {
+        self.reads.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         let g = self.by_sid.lock().unwrap();
         let secondary = g
             .get(principal)

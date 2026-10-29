@@ -75,14 +75,17 @@ impl FakeIpStack {
                 return;
             }
         };
-        // One site past its share is refused alone: the others keep theirs.
+        // One site, or one of several served users, past its share is refused
+        // alone: the others keep theirs.
         let site = site_of(&hostname);
-        let held = self
-            .flows
-            .values()
-            .filter(|f| f.policy.site == site)
-            .count();
-        if held >= site_flow_share(self.max_flows) {
+        let share = holder_flow_share(self.max_flows);
+        let (by_site, by_owner) = self.flows.values().fold((0, 0), |(s, o), f| {
+            (
+                s + usize::from(f.policy.site == site),
+                o + usize::from(f.policy.owner == target.owner),
+            )
+        });
+        if by_site >= share || (by_owner >= share && self.relay.several_users_served()) {
             self.health.record_tcp_flow_refused_at_capacity();
             self.warn_at_flow_capacity();
             return;

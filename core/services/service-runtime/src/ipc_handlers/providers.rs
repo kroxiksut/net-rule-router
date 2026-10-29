@@ -185,6 +185,14 @@ pub trait MutationExecutor: Send + Sync {
         None
     }
 
+    /// Runs `erase`, which deletes every user's rules history, the way a reset
+    /// to the baseline runs: with no activation in flight, audited, and each
+    /// user's clients told. Without rules storage `erase` just runs.
+    fn erase_every_users_rules(&self, erase: &mut dyn FnMut()) -> Result<(), OperationError> {
+        erase();
+        Ok(())
+    }
+
     /// Execute a rollback of `principal`'s active revision to
     /// `target_revision_id` (or LKG when `None`). Rollback is scoped
     /// per-principal.

@@ -86,11 +86,11 @@ pub const DEFAULT_SOCKET_BUFFER_BYTES: usize = 64 * 1024;
 /// a connection that may be a port scan.
 const MAX_ACTIVE_TCP_FLOWS: usize = 512;
 
-/// The most of the flow cap one site may hold: a quarter of it always stays
-/// for every other site. A page that opened hundreds of connections to
-/// subdomains of one name took the whole relay, and every site carried by name
-/// was reset until the tab closed.
-fn site_flow_share(max_flows: usize) -> usize {
+/// The most of the flow cap one site, or one user while others are served,
+/// may hold: a quarter of it always stays for the rest. A page that opened
+/// hundreds of connections to subdomains of one name took the whole relay,
+/// and every site carried by name was reset until the tab closed.
+fn holder_flow_share(max_flows: usize) -> usize {
     max_flows - max_flows / 4
 }
 

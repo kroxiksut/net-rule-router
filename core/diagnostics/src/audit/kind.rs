@@ -72,6 +72,11 @@ pub enum AuditEventKind {
     ProtectionOverrideGranted,
     /// A confirmed override ended: revoked, expired, or taken by a reset.
     ProtectionOverrideRevoked,
+    /// The rules active in the state database are not the ones the service
+    /// last recorded beside its key: an active rule set deleted, or an earlier
+    /// copy of the database restored. Blocks mutations until an administrator
+    /// acknowledges.
+    RulesStoreRolledBack,
 }
 
 impl AuditEventKind {
@@ -99,6 +104,7 @@ impl AuditEventKind {
             Self::ProvisioningRefused => "provisioning_refused",
             Self::ProtectionOverrideGranted => "protection_override_granted",
             Self::ProtectionOverrideRevoked => "protection_override_revoked",
+            Self::RulesStoreRolledBack => "rules_store_rolled_back",
         }
     }
 
@@ -126,6 +132,7 @@ impl AuditEventKind {
             "provisioning_refused" => Some(Self::ProvisioningRefused),
             "protection_override_granted" => Some(Self::ProtectionOverrideGranted),
             "protection_override_revoked" => Some(Self::ProtectionOverrideRevoked),
+            "rules_store_rolled_back" => Some(Self::RulesStoreRolledBack),
             _ => None,
         }
     }
@@ -142,6 +149,7 @@ impl AuditEventKind {
                 | Self::UntrustedRevisionRejected
                 | Self::IntegrityCheckUnavailable
                 | Self::ProvisioningRefused
+                | Self::RulesStoreRolledBack
         )
     }
 }
@@ -228,6 +236,7 @@ mod tests {
             AuditEventKind::ProvisioningRefused,
             AuditEventKind::ProtectionOverrideGranted,
             AuditEventKind::ProtectionOverrideRevoked,
+            AuditEventKind::RulesStoreRolledBack,
         ] {
             let s = kind.as_str();
             let back = AuditEventKind::from_str(s).expect("round trip");

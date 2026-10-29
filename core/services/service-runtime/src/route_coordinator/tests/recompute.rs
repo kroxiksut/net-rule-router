@@ -298,3 +298,93 @@ fn a_wedged_pass_does_not_keep_the_stop_from_removing_our_routes() {
         .collect();
     assert_eq!(left, vec![(foreign.destination, 1)]);
 }
+
+fn name_rule(id: &str, host: &str) -> CanonicalRule {
+    CanonicalRule {
+        address_match: Some(CanonicalAddressMatch::ExactFqdn(host.into())),
+        ..ip_rule(id, 0, 0, 0, 0)
+    }
+}
+
+fn coordinator_with_dns_setting(
+    api: Arc<MockWindowsApi>,
+    rules: Arc<FakeRules>,
+    setting_on: bool,
+) -> SecondaryRouteCoordinator {
+    coordinator(api, rules)
+        .with_dns_via_secondary(Arc::new(std::sync::atomic::AtomicBool::new(setting_on)))
+}
+
+/// With "DNS through the tunnel" off the service still asks the additional
+/// link's rule hosts through the tunnel, which needs exactly one resolver's
+/// route there: a wider set would move other programs' lookups into it.
+#[test]
+fn with_the_dns_setting_off_one_resolver_rides_the_tunnel_while_a_rule_names_a_host() {
+    let api = Arc::new(MockWindowsApi::new());
+    let rules = Arc::new(FakeRules::new());
+    rules.set_secondary(
+        "S-IVANOV",
+        CanonicalRuleSet::from_rules(vec![
+            name_rule("r1", "tunnel.example"),
+            ip_rule("r2", 198, 51, 100, 1),
+        ]),
+    );
+    let coord = coordinator_with_dns_setting(Arc::clone(&api), Arc::clone(&rules), false);
+
+    coord
+        .recompute_for("S-IVANOV", &res(Some(target())))
+        .unwrap();
+    assert_eq!(
+        table_dests(&api),
+        HashSet::from([
+            Ipv4Addr::new(198, 51, 100, 1),
+            crate::dns_egress::RULE_HOST_RESOLVER
+        ])
+    );
+    let resolver_route = api
+        .get_ip_forward_table()
+        .unwrap()
+        .into_iter()
+        .find(|r| r.destination == IpAddr::V4(crate::dns_egress::RULE_HOST_RESOLVER))
+        .expect("the resolver route");
+    assert_eq!(
+        (resolver_route.prefix_length, resolver_route.interface_index),
+        (32, target().interface_index),
+        "via the additional link"
+    );
+
+    // The last name rule goes: nothing is asked there any more.
+    rules.set_secondary(
+        "S-IVANOV",
+        CanonicalRuleSet::from_rules(vec![ip_rule("r2", 198, 51, 100, 1)]),
+    );
+    coord
+        .recompute_for("S-IVANOV", &res(Some(target())))
+        .unwrap();
+    assert_eq!(
+        table_dests(&api),
+        HashSet::from([Ipv4Addr::new(198, 51, 100, 1)])
+    );
+}
+
+#[test]
+fn with_the_dns_setting_on_the_public_resolvers_ride_the_tunnel_instead() {
+    let api = Arc::new(MockWindowsApi::new());
+    let rules = Arc::new(FakeRules::new());
+    rules.set_secondary(
+        "S-IVANOV",
+        CanonicalRuleSet::from_rules(vec![name_rule("r1", "tunnel.example")]),
+    );
+    let coord = coordinator_with_dns_setting(Arc::clone(&api), Arc::clone(&rules), true);
+
+    coord
+        .recompute_for("S-IVANOV", &res(Some(target())))
+        .unwrap();
+    assert_eq!(
+        table_dests(&api),
+        crate::dns_egress::PUBLIC_DNS_SERVERS
+            .iter()
+            .copied()
+            .collect::<HashSet<_>>()
+    );
+}

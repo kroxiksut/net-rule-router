@@ -99,6 +99,7 @@ pub mod net_change;
 pub mod network_change;
 pub mod service_set_change;
 // The service's own sockets, tagged so machine-scope filters let them through.
+pub mod own_route_writes;
 pub mod own_traffic;
 // A probe held to the adapter its source address belongs to.
 pub mod source_link;

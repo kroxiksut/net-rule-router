@@ -76,7 +76,7 @@ impl PerSidApplyOrchestrator {
         timings.mark("policy");
         let cache_snapshot = self.fqdn_cache.snapshot_for_compute();
         let fqdn_cache: &dyn crate::fqdn_cache_lookup::FqdnCacheLookup = match &cache_snapshot {
-            Some(snapshot) => snapshot,
+            Some(snapshot) => snapshot.as_ref(),
             None => self.fqdn_cache.as_ref(),
         };
         // an activation dispatch runs BEFORE the
@@ -216,140 +216,110 @@ impl PerSidApplyOrchestrator {
         if intent.publishes() {
             crate::ipv6_disposition::global_ipv6_dispositions().set(sid, ipv6);
         }
-        let mut codegen_out = generate_filters(CodegenInput {
-            sid,
-            rule_book: &rules.rule_book,
-            fqdn_cache,
-            app_observations: self.app_observations.as_ref(),
-            app_resolver: self.app_resolver.as_ref(),
-            secondary_ip_denylist: &secondary_ip_denylist,
-            // The routes and the address arbiter read the stored flag; the
-            // filters must answer the same question.
-            zone_priority_over_ip: policy.zone_priority_over_ip,
-            app_rules_take_all_addresses: policy.app_rules_take_all_addresses,
-            families: ipv6.families(),
-            packet_blocks: super::PACKET_BLOCKS,
-        });
-        // Shadow-compare the neutral pipeline against the live one, BEFORE the
-        // fake-IP augmentation is folded in — not because the planner cannot
-        // model it (`plan_fake_ip_pool` does), but because at this point the
-        // live set does not carry it either, and both sides must be read at the
-        // same moment.
-        // Compares only, never applies: the point of this step is to learn on
-        // real traffic whether the two agree, while the path that actually
-        // enforces stays exactly as it was.
-        //
-        // Guarded rather than stubbed off-Windows: there is no WFP filter set to
-        // compare against there, and a no-op body would read as "checked, agreed".
+        // One answer per question about program destinations for the whole
+        // pass, as for the cache: the filters, the arbiter and the pins below
+        // must describe the same destinations while the observer writes.
+        let observations = crate::app_observation_lookup::PassObservations::over(
+            std::sync::Arc::clone(&self.app_observations),
+        );
+        // The rule filters installed, what the pass reads about them and what
+        // it reports are the neutral plan's, taken before the fake-IP filters
+        // join.
         #[cfg(windows)]
-        let _ = self.shadow_compare_neutral_plan(
+        let neutral = self.neutral_route_filters(
             sid,
             &rules.rule_book,
             fqdn_cache,
+            &observations,
             &secondary_ip_denylist,
             policy.zone_priority_over_ip,
             policy.app_rules_take_all_addresses,
             ipv6,
-            &codegen_out.filters,
+        );
+        // The codegen runs only where something still reads it: a principal the
+        // plan cannot name, the sampled comparison, and every test pass. Every
+        // pass running both doubled the cost of an apply.
+        #[cfg(windows)]
+        let compare = neutral.as_ref().is_some_and(|n| {
+            self.compare_due(
+                sid,
+                super::shadow_compare::shadow_compare_fingerprint(&n.filters),
+            )
+        });
+        #[cfg(windows)]
+        let codegen_wanted = neutral.is_none() || compare || cfg!(test);
+        #[cfg(not(windows))]
+        let codegen_wanted = true;
+        let codegen = codegen_wanted.then(|| {
+            generate_filters(CodegenInput {
+                sid,
+                rule_book: &rules.rule_book,
+                fqdn_cache,
+                app_observations: &observations,
+                app_resolver: self.app_resolver.as_ref(),
+                secondary_ip_denylist: &secondary_ip_denylist,
+                // The routes and the address arbiter read the stored flag; the
+                // filters must answer the same question.
+                zone_priority_over_ip: policy.zone_priority_over_ip,
+                app_rules_take_all_addresses: policy.app_rules_take_all_addresses,
+                families: ipv6.families(),
+                packet_blocks: super::PACKET_BLOCKS,
+            })
+        });
+        // With a plan, the pass reads only what the plan wrote, starting from
+        // nothing: a test pass then runs the same code as a live one, and the
+        // codegen is no more than the reference it is held to.
+        #[cfg(windows)]
+        let (mut codegen_out, neutral_findings) = match neutral {
+            Some(neutral) => {
+                if let (true, Some(reference)) = (compare, codegen.as_ref()) {
+                    self.report_comparison(sid, &neutral.filters, &reference.filters);
+                }
+                let mut out = crate::wfp_codegen::CodegenOutput::default();
+                let report =
+                    neutral.describe(&mut out, self.app_resolver.as_ref(), codegen.as_ref());
+                let findings = super::findings::PassFindings::from_plan(&report);
+                #[cfg(test)]
+                if let Some(reference) = codegen.as_ref() {
+                    assert_eq!(
+                        super::findings::PassFindings::from_plan(&report).normalized(),
+                        super::findings::PassFindings::from_codegen(&reference.diagnostics)
+                            .normalized(),
+                        "the plan reports what the codegen reported"
+                    );
+                }
+                (out, Some(findings))
+            }
+            None => (codegen.unwrap_or_default(), None),
+        };
+        #[cfg(not(windows))]
+        let (mut codegen_out, neutral_findings) = (
+            codegen.unwrap_or_default(),
+            None::<super::findings::PassFindings>,
         );
         // Before the fake-IP blocks join: only what the rules compiled to.
         let rule_blocks = rule_block_ids(&codegen_out.filters);
         if let Some(aug) = fake_ip_augmentation {
             codegen_out.filters.extend(aug.extra_filters);
         }
-        // surface app rules whose exe could not be resolved to
-        // a path (app not installed / not running / not in App Paths) so they are
-        // not silently unenforced. The rule's observation /32 mirrors (if any)
-        // still apply; only the direct per-process ALE_APP_ID filter is absent.
-        // Besides the WARN log we publish the set into the shared
-        // `AppEnforcementStatus` (when wired) so the SnapshotInitial handler
-        // can drive a GUI banner. WARN (not INFO): a rule that silently
-        // enforces nothing is worth a look, not just a diagnostic trail.
-        let mut unresolved_apps: Vec<String> = Vec::new();
-        let mut over_capped: Vec<String> = Vec::new();
-        // Rule hosts enforcement could not act on because the cache holds no
-        // confirmed address for them. Handed to the DNS side so a rule the user
-        // just added stops depending on the browser happening to re-resolve.
-        let mut unresolved_hosts: Vec<String> = Vec::new();
-        // suffix/zone rules whose cached-hostname fan-out
-        // hit `SUFFIX_FANOUT_BACKSTOP`, meaning the cache holds at least as many
-        // subdomains as the cap and some were silently dropped from enforcement.
-        let mut truncated_suffixes: Vec<(String, String, usize)> = Vec::new();
-        // Destinations an app rule wanted but a main-route rule already names.
-        // The user wrote two rules that disagree about one address; they must
-        // hear which one won, or the app will look mis-routed for no visible
-        // reason.
-        let mut claimed_by_main: Vec<(String, std::net::Ipv4Addr)> = Vec::new();
-        // Destinations an app rule left alone because other programs use them
-        // too: they go direct, or nowhere for the app while its guard is on.
-        let mut shared_with_others: Vec<(String, std::net::Ipv4Addr)> = Vec::new();
-        let mut unrouted_apps = Vec::new();
-        let mut unsupported_shapes: Vec<String> = Vec::new();
-        let mut networks_over_cap: Vec<crate::rule_conflicts::RuleConflict> = Vec::new();
-        for diag in &codegen_out.diagnostics {
-            match diag {
-                crate::wfp_codegen::CodegenDiagnostic::AppUnresolved { app, .. } => {
-                    unresolved_apps.push(app.clone());
-                }
-                crate::wfp_codegen::CodegenDiagnostic::HostnameUnresolved { hostname, .. } => {
-                    unresolved_hosts.push(hostname.clone());
-                }
-                // A suffix/zone with nothing cached under it: the apex is the
-                // one name worth asking about — every subdomain the user
-                // actually visits arrives through ordinary observation.
-                crate::wfp_codegen::CodegenDiagnostic::SuffixEmpty { suffix, .. } => {
-                    unresolved_hosts.push(suffix.clone());
-                }
-                crate::wfp_codegen::CodegenDiagnostic::ZoneEmpty { zone, .. } => {
-                    unresolved_hosts.push(zone.clone());
-                }
-                crate::wfp_codegen::CodegenDiagnostic::AppOverCapped {
-                    app, resolved, cap, ..
-                } => {
-                    over_capped.push(format!("{app} ({cap}/{resolved})"));
-                }
-                crate::wfp_codegen::CodegenDiagnostic::AppFolderOverCap {
-                    folder, covered, ..
-                } => {
-                    over_capped.push(format!("{folder} ({covered}/{covered}+)"));
-                }
-                crate::wfp_codegen::CodegenDiagnostic::AppDestinationClaimedByPrimary {
-                    app,
-                    ip,
-                    ..
-                } => {
-                    claimed_by_main.push((app.clone(), *ip));
-                }
-                crate::wfp_codegen::CodegenDiagnostic::AppDestinationUsedByOtherProcess {
-                    app,
-                    ip,
-                    ..
-                } => {
-                    shared_with_others.push((app.clone(), *ip));
-                }
-                crate::wfp_codegen::CodegenDiagnostic::AppTrafficTakenElsewhere {
-                    app,
-                    reason,
-                    ..
-                } => {
-                    unrouted_apps.push((app.clone(), *reason));
-                }
-                crate::wfp_codegen::CodegenDiagnostic::SuffixTruncated {
-                    rule_id,
-                    suffix,
-                    cap,
-                } => {
-                    truncated_suffixes.push((rule_id.clone(), suffix.clone(), *cap));
-                }
-                crate::wfp_codegen::CodegenDiagnostic::UnsupportedRuleShape { rule_id, reason } => {
-                    unsupported_shapes.push(format!("{rule_id} ({reason})"));
-                }
-                crate::wfp_codegen::CodegenDiagnostic::NetworkCarvingOverCap { .. } => {
-                    networks_over_cap.extend(diag.rule_conflict());
-                }
-                _ => {}
-            }
-        }
+        // What the rules report besides their filters: rules that enforce
+        // nothing yet (logged, published for the GUI banner, their hosts asked
+        // of DNS), contradictions, caps reached. WARN, not INFO: a rule that
+        // silently enforces nothing is worth a look.
+        let super::findings::PassFindings {
+            unresolved_apps,
+            over_capped,
+            mut unresolved_hosts,
+            truncated_suffixes,
+            mut claimed_by_main,
+            mut shared_with_others,
+            unrouted_apps,
+            unsupported_shapes,
+            networks_over_cap,
+            conflicts: rule_conflicts,
+        } = neutral_findings.unwrap_or_else(|| {
+            super::findings::PassFindings::from_codegen(&codegen_out.diagnostics)
+        });
         // log app-enforcement diagnostics ONLY on a real
         // (re)apply (`install_for_sid`, `log_unresolved = true`), NEVER on the
         // background reconcile / leak-guard tick (`reconcile_secondary_coverage`),
@@ -458,10 +428,8 @@ impl PerSidApplyOrchestrator {
         {
             status.set_unresolved(sid, unresolved_apps.clone());
             status.set_unrouted(sid, &unrouted_apps);
-            let mut conflicts = crate::app_enforcement_status::rule_conflicts_from(
-                &codegen_out.diagnostics,
-                &rules.rule_book,
-            );
+            let mut conflicts =
+                crate::rule_conflicts::rule_conflict_dtos(&rule_conflicts, &rules.rule_book);
             conflicts.extend(crate::rule_conflicts::protected_rule_dtos(
                 &self.rules_provider.withheld_rules_for(sid),
             ));
@@ -593,7 +561,7 @@ impl PerSidApplyOrchestrator {
                     policy.app_rules_take_all_addresses,
                 ),
                 crate::wfp_codegen::current_rule_shape_support(),
-                self.app_observations.as_ref(),
+                &observations,
             );
             // The machine's OWN local networks are never pinned to the tunnel.
             // An application rule learns its destinations by watching, and a

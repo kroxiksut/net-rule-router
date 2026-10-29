@@ -223,6 +223,10 @@ pub const REVIEW_CHANGED: Key = key(
     "Modified or retargeted",
 );
 pub const REVIEW_NONE: Key = key("dialog.review-diff.column-empty", "(none)");
+pub const REVIEW_RESET_FILES: Key = key(
+    "dialog.review-diff.reset-files",
+    "Your linked rules files will be rewritten with the baseline rules: {files}.",
+);
 pub const RISK_HEADING: Key = key("dialog.review-diff.risk-heading", "Risk assessment");
 pub const SIGNALS_HEADING: Key = key("dialog.review-diff.signals-heading", "Detected signals");
 pub const DUPLICATES_HEADING: Key = key(
@@ -1634,6 +1638,7 @@ pub const ALL: &[Key] = &[
     REVIEW_REMOVED,
     REVIEW_CHANGED,
     REVIEW_NONE,
+    REVIEW_RESET_FILES,
     RISK_HEADING,
     SIGNALS_HEADING,
     DUPLICATES_HEADING,

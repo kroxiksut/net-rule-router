@@ -30,6 +30,11 @@
 //!                                  no rollback until acknowledged
 //! ```
 //!
+//! With the key loaded and no reset pending, the active rules are also
+//! compared with their record beside the key ([`crate::rules_anchor`]): a
+//! deleted or older active row, or a record that does not verify, raises a
+//! blocking `RulesStoreRolledBack`.
+//!
 //! The tamper alert waits for the sweep because rolling a revision back
 //! rewrites its row: an alert keyed by the content before the rollback would
 //! list nothing to acknowledge, and the row would need a second one. The
@@ -68,6 +73,7 @@ use nrr_storage::revisions::{RevisionsRepository, ScannedContent, ScannedRow};
 
 use crate::integrity_review::{row_label, row_ref, same_row, tamper_alert_id};
 use crate::ipc_handlers::payloads::MutationKind;
+use crate::rules_anchor::{self, AnchorAlert, AnchorRecord};
 use rusqlite::Connection;
 
 /// Synthetic NDJSON pointer for bootstrap-raised alerts. The audit
@@ -145,6 +151,12 @@ pub struct TamperBootstrapOutcome {
     /// even if writing its alert row failed. Informational — the live mutation
     /// gate recomputes from the alerts repo (see [`mutations_blocked_by_alert`]).
     pub raised_blocking_alert: bool,
+    /// The trusted record of the active rules to keep from here. `None` while
+    /// a key reset or a record that does not verify awaits acknowledgement.
+    pub rules_anchor_start: Option<AnchorRecord>,
+    /// The active rules could not be compared with their record this start:
+    /// reported as an integrity outage, not passed over as a log line.
+    pub rules_anchor_unchecked: Option<TamperBootstrapError>,
 }
 
 /// Whether `kind` is a slug that, while in the `Active` state, must
@@ -153,6 +165,7 @@ pub struct TamperBootstrapOutcome {
 pub fn is_blocking_alert_kind(kind: &str) -> bool {
     kind == AuditEventKind::DbTamperDetected.as_str()
         || kind == AuditEventKind::KeyResetWithExistingData.as_str()
+        || kind == AuditEventKind::RulesStoreRolledBack.as_str()
 }
 
 /// Refusal code of [`mutation_refused_by_alert`], passed through to whoever
@@ -257,6 +270,15 @@ pub fn run_tamper_bootstrap(
         if count == 0 {
             // Fresh install — nothing signed yet, no alert. Future
             // inserts sign with the new key.
+            let record = AnchorRecord::of(rules_anchor::ActiveSet::new());
+            match key_store.save_rules_anchor(&record.encode(&outcome.signing_key)) {
+                Ok(()) => outcome.rules_anchor_start = Some(record),
+                Err(e) => tracing::warn!(
+                    target: "nrr::tamper",
+                    error = %e,
+                    "could not save the first record of the active rules",
+                ),
+            }
             tracing::info!(
                 target: "nrr::tamper",
                 msg_key = "tamper-fresh-install-key-generated",
@@ -330,6 +352,25 @@ pub fn run_tamper_bootstrap(
         }
     }
 
+    // Under a pending reset the record was signed by the lost key; the
+    // acknowledgement records the rules afresh.
+    if !outcome.key_reset_unacknowledged {
+        match check_rules_anchor(conn, key_store, &signing_key, alerts_repo, now_ms) {
+            Ok((start, alerted)) => {
+                outcome.rules_anchor_start = start;
+                outcome.raised_blocking_alert |= alerted;
+            }
+            Err(e) => {
+                tracing::error!(
+                    target: "nrr::tamper",
+                    error = %e,
+                    "could not compare the active rules with their record; not recorded this start",
+                );
+                outcome.rules_anchor_unchecked = Some(e);
+            }
+        }
+    }
+
     // Lazy backfill of rows written before signing existed (the v10→v11
     // migration added the column with an empty default). Safe to re-sign:
     // these predate signing and are not tampered. See module-level residual
@@ -368,8 +409,96 @@ impl TamperBootstrapOutcome {
             pending_tamper_alerts: Vec::new(),
             backfilled_rows: 0,
             raised_blocking_alert: false,
+            rules_anchor_start: None,
+            rules_anchor_unchecked: None,
         }
     }
+}
+
+/// Compares the active rules with the record beside the key, raises the alert
+/// a disagreement owes and returns the record to keep. Read as found, before
+/// any sweep rewrites a row.
+fn check_rules_anchor(
+    conn: &Arc<Mutex<Connection>>,
+    key_store: &dyn KeyStore,
+    key: &[u8],
+    alerts_repo: &Arc<dyn SecurityAlertsRepository>,
+    now_ms: i64,
+) -> Result<(Option<AnchorRecord>, bool), TamperBootstrapError> {
+    let found = {
+        let guard = lock_state(conn)?;
+        rules_anchor::active_set(&guard)
+            .map_err(|e| TamperBootstrapError::Storage(e.to_string()))?
+    };
+    let stored = key_store
+        .load_rules_anchor()
+        .map_err(|e| TamperBootstrapError::KeyStore(e.to_string()))?;
+    let check = rules_anchor::check_at_boot(&found, stored.as_deref(), key);
+    if check.rewrite {
+        if let Some(record) = check.start.as_ref() {
+            key_store
+                .save_rules_anchor(&record.encode(key))
+                .map_err(|e| TamperBootstrapError::KeyStore(e.to_string()))?;
+        }
+    }
+    let Some(alert) = check.alert else {
+        return Ok((check.start, false));
+    };
+    let reason = match &alert {
+        AnchorAlert::Disagrees(found) => {
+            tracing::warn!(
+                target: "nrr::tamper",
+                principals = found.len(),
+                "the active rules are not the ones last recorded; blocking mutations until acknowledged",
+            );
+            integrity::RULES_STORE_ROLLED_BACK
+        }
+        AnchorAlert::Unverifiable { .. } => {
+            tracing::warn!(
+                target: "nrr::tamper",
+                "the record of the active rules does not verify; blocking mutations until acknowledged",
+            );
+            integrity::RULES_RECORD_UNVERIFIABLE
+        }
+    };
+    log_unrecorded_alert(
+        AuditEventKind::RulesStoreRolledBack.as_str(),
+        emit_alert(
+            alerts_repo,
+            alert.alert_id(),
+            AuditEventKind::RulesStoreRolledBack.as_str(),
+            reason.as_str(),
+            now_ms,
+        ),
+    );
+    Ok((check.start, true))
+}
+
+/// Raises the alert for principals whose active rules moved past the service
+/// while it runs. Deduped like the boot's.
+pub fn raise_rules_anchor_alert(
+    alerts_repo: &Arc<dyn SecurityAlertsRepository>,
+    found: Vec<rules_anchor::Disagreement>,
+    now_ms: i64,
+) {
+    if found.is_empty() {
+        return;
+    }
+    tracing::warn!(
+        target: "nrr::tamper",
+        principals = found.len(),
+        "the active rules changed outside the app; blocking mutations until acknowledged",
+    );
+    log_unrecorded_alert(
+        AuditEventKind::RulesStoreRolledBack.as_str(),
+        emit_alert(
+            alerts_repo,
+            AnchorAlert::Disagrees(found).alert_id(),
+            AuditEventKind::RulesStoreRolledBack.as_str(),
+            integrity::RULES_STORE_ROLLED_BACK.as_str(),
+            now_ms,
+        ),
+    );
 }
 
 /// Raises the alert owed to every row in `found`, keyed by the content it holds
@@ -870,6 +999,17 @@ mod tests {
         }
         fn delete_resign_marker(&self) -> Result<(), nrr_platform_api::error::PlatformError> {
             self.0.delete_resign_marker()
+        }
+        fn save_rules_anchor(
+            &self,
+            r: &[u8],
+        ) -> Result<(), nrr_platform_api::error::PlatformError> {
+            self.0.save_rules_anchor(r)
+        }
+        fn load_rules_anchor(
+            &self,
+        ) -> Result<Option<Vec<u8>>, nrr_platform_api::error::PlatformError> {
+            self.0.load_rules_anchor()
         }
     }
 

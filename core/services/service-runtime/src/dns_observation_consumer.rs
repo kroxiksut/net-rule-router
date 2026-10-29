@@ -276,22 +276,48 @@ fn claim_hosts(
     }
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Rules [`rule_covers`] judged on this thread, for tests that hold a
+    /// query to the rules that can match it.
+    pub(crate) static RULES_JUDGED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 /// `true` when `hostname` matches an enabled rule in `set` (exact FQDN, or a
 /// suffix/zone match). Reused by the resolver's `RuleHostOracle` (Mode B) so
 /// name→rule matching has a single source of truth.
 pub(crate) fn rule_set_matches(hostname: &str, set: &CanonicalRuleSet) -> bool {
-    set.rules()
-        .iter()
+    any_rule_covers(hostname, set.rules().iter())
+}
+
+/// [`rule_set_matches`] over `rules` only: a caller that knows the others
+/// cannot cover `hostname` judges just these.
+pub(crate) fn any_rule_covers<'r>(
+    hostname: &str,
+    rules: impl Iterator<Item = &'r nrr_domain::canonical::CanonicalRule>,
+) -> bool {
+    rules
         .filter(|r| r.enabled)
         .any(|r| rule_covers(r, hostname))
 }
 
-/// Whether `set` routes `hostname` only through a public top-level zone: a
+/// [`held_only_by_public_zone_among`] over the whole of `set`.
+#[cfg(test)]
+pub(crate) fn held_only_by_public_zone(hostname: &str, set: &CanonicalRuleSet) -> bool {
+    held_only_by_public_zone_among(hostname, set.rules().iter())
+}
+
+/// Whether `rules` route `hostname` only through a public top-level zone: a
 /// name its owner chose, which brings no private address into the tunnel.
 /// The same claims the ownership arbiter counts: Block and app rules none.
-pub(crate) fn held_only_by_public_zone(hostname: &str, set: &CanonicalRuleSet) -> bool {
+/// As [`any_rule_covers`], the rules left out must be ones that cannot cover
+/// `hostname`.
+pub(crate) fn held_only_by_public_zone_among<'r>(
+    hostname: &str,
+    rules: impl Iterator<Item = &'r nrr_domain::canonical::CanonicalRule>,
+) -> bool {
     let mut public_zone = false;
-    for rule in set.rules().iter().filter(|r| {
+    for rule in rules.filter(|r| {
         r.enabled
             && r.app_match.is_none()
             && !matches!(r.action, nrr_domain::RuleAction::Block)
@@ -340,6 +366,8 @@ pub(crate) fn rule_set_match_origin(hostname: &str, set: &CanonicalRuleSet) -> R
 }
 
 pub(crate) fn rule_covers(rule: &nrr_domain::canonical::CanonicalRule, hostname: &str) -> bool {
+    #[cfg(test)]
+    RULES_JUDGED.with(|n| n.set(n.get() + 1));
     match &rule.address_match {
         Some(CanonicalAddressMatch::ExactFqdn(h)) => h == hostname,
         // `*.s` covers the apex `s` and every subdomain; a zone rule covers

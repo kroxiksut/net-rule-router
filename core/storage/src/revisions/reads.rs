@@ -137,6 +137,25 @@ impl<'c> RevisionsRepository<'c> {
             .map_err(|e| StorageError::Internal(format!("revisions active_identity_for: {e}")))
     }
 
+    /// `(principal, revision_id, content_hash)` of every principal's active
+    /// revision, ordered by principal.
+    pub fn active_identities(&self) -> StorageResult<Vec<(String, String, String)>> {
+        let err = |e: rusqlite::Error| StorageError::Internal(format!("active_identities: {e}"));
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT principal, revision_id, content_hash FROM revisions
+                 WHERE status = 'active' ORDER BY principal ASC",
+            )
+            .map_err(err)?;
+        let rows = stmt
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+            .map_err(err)?
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(err)?;
+        Ok(rows)
+    }
+
     /// Returns the most recent superseded revision — the canonical
     /// "last known good" rollback target.
     ///
@@ -343,5 +362,24 @@ impl<'c> RevisionsRepository<'c> {
             .collect::<rusqlite::Result<Vec<_>>>()
             .map_err(|e| StorageError::Internal(format!("distinct_principals collect: {e}")))?;
         Ok(principals)
+    }
+
+    /// How many revisions each principal holds, baseline included.
+    pub fn revision_counts(&self) -> StorageResult<Vec<(String, usize)>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT principal, COUNT(*) FROM revisions GROUP BY principal")
+            .map_err(|e| StorageError::Internal(format!("revision_counts prepare: {e}")))?;
+        let counts = stmt
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+            })
+            .map_err(|e| StorageError::Internal(format!("revision_counts query: {e}")))?
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(|e| StorageError::Internal(format!("revision_counts collect: {e}")))?;
+        Ok(counts
+            .into_iter()
+            .map(|(principal, n)| (principal, usize::try_from(n).unwrap_or(0)))
+            .collect())
     }
 }

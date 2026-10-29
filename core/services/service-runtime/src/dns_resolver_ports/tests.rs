@@ -995,6 +995,74 @@ fn steering_set_stays_armed_so_a_shared_direct_host_is_not_strangled() {
     );
 }
 
+/// Notes which thread read the rule store.
+struct ThreadNotingRules {
+    inner: FakeRules,
+    readers: std::sync::Mutex<Vec<std::thread::ThreadId>>,
+}
+
+impl RulesProvider for ThreadNotingRules {
+    fn active_rules(&self) -> Option<ActiveRulesSnapshot> {
+        self.readers
+            .lock()
+            .expect("readers")
+            .push(std::thread::current().id());
+        self.inner.active_rules()
+    }
+}
+
+/// Every direct answer reads the steering set, and rebuilding it reads the
+/// rule store behind the lock every writer holds, then walks the address
+/// cache. A query that happens to find the set stale must not pay that: it
+/// answers by the set it has, and the rebuild runs beside it.
+#[test]
+fn a_stale_steering_set_is_rebuilt_off_the_query_thread() {
+    use crate::fqdn_cache_lookup::MockFqdnCacheLookup;
+    use std::time::Instant;
+    let (old, new) = (ip(198, 51, 100, 1), ip(198, 51, 100, 2));
+    let fqdn = Arc::new(MockFqdnCacheLookup::new());
+    fqdn.set_ips("tunnel.example", vec![old]);
+    let rules = Arc::new(ThreadNotingRules {
+        inner: FakeRules {
+            primary: CanonicalRuleSet::from_rules(vec![]),
+            secondary: CanonicalRuleSet::from_rules(vec![exact_rule("r-s", "tunnel.example")]),
+        },
+        readers: std::sync::Mutex::new(Vec::new()),
+    });
+    let owned = ActiveSecondaryOwnedIps::new(
+        Arc::clone(&rules) as Arc<dyn RulesProvider>,
+        Arc::new(|| Some("S-1-5-21-1".to_string())),
+        Arc::clone(&fqdn) as Arc<dyn crate::fqdn_cache_lookup::FqdnCacheLookup>,
+    );
+    let t0 = Instant::now();
+    assert!(owned.owned_ips_at(t0).contains(&old));
+    fqdn.set_ips("tunnel.example", vec![new]);
+
+    let t1 = t0 + OWNED_SET_MEMO_TTL + Duration::from_millis(1);
+    assert!(
+        owned.owned_ips_at(t1).contains(&old),
+        "the stale set answers"
+    );
+    let here = std::thread::current().id();
+    let read_here = || {
+        rules
+            .readers
+            .lock()
+            .expect("readers")
+            .iter()
+            .filter(|reader| **reader == here)
+            .count()
+    };
+    assert_eq!(read_here(), 1, "the query thread read the rule store");
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !owned.owned_ips_at(t1).contains(&new) {
+        assert!(Instant::now() < deadline, "the set never caught up");
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert_eq!(read_here(), 1);
+}
+
 /// An address the cache holds but no live resolution has confirmed inside
 /// the enforcement window is not enforced, so it must not be steered away
 /// from either — the steering set and the pin/block set read the same port
@@ -1861,6 +1929,62 @@ fn a_rule_host_answer_reads_the_store_only_when_the_books_moved() {
     );
 }
 
+/// The rule-host check runs on every query: against a large book it judges
+/// only the rules that can name the query, not every rule the user has, and
+/// still answers as the whole book would.
+#[test]
+fn a_rule_host_check_judges_only_the_rules_that_can_name_the_query() {
+    let rule = |id: String, address: CanonicalAddressMatch| CanonicalRule {
+        address_match: Some(address),
+        ..exact_rule(&id, "unused.example")
+    };
+    let mut book: Vec<CanonicalRule> = (0..5000)
+        .map(|i| {
+            rule(
+                format!("e{i}"),
+                CanonicalAddressMatch::ExactFqdn(format!("site{i}.example")),
+            )
+        })
+        .collect();
+    book.push(rule(
+        "s".into(),
+        CanonicalAddressMatch::SuffixDomain("cdn.example".into()),
+    ));
+    book.push(rule(
+        "z".into(),
+        CanonicalAddressMatch::Zone("corp.intra".into()),
+    ));
+    book.push(rule("ru".into(), CanonicalAddressMatch::Zone("ru".into())));
+    let rules = Arc::new(PerUserRules(vec![(ALICE, secondary_book(book))]));
+    let oracle = ActiveRuleHostOracle::new(rules, Arc::new(|| Some(ALICE.to_owned())))
+        .with_books_stamp(Arc::new(|| 1));
+    assert!(oracle.is_rule_host("site1.example"), "the book is read");
+
+    let judged = |ask: &dyn Fn() -> bool| {
+        crate::dns_observation_consumer::RULES_JUDGED.with(|n| n.set(0));
+        let answer = ask();
+        (
+            answer,
+            crate::dns_observation_consumer::RULES_JUDGED.with(std::cell::Cell::get),
+        )
+    };
+    for (host, named) in [
+        ("site4999.example", true),
+        ("a.b.cdn.example", true),
+        ("x.corp.intra", true),
+        ("news.ru", true),
+        ("nobody.example", false),
+        ("site1.example.attacker.net", false),
+    ] {
+        let (answer, count) = judged(&|| oracle.is_rule_host(host));
+        assert_eq!(answer, named, "{host}");
+        assert!(count <= 3, "{host}: {count} of 5003 rules judged");
+    }
+    let (held, count) = judged(&|| oracle.held_only_by_public_zone("news.ru"));
+    assert!(held);
+    assert!(count <= 3, "{count} of 5003 rules judged");
+}
+
 /// Every question a query asks about its users used to lock the session
 /// registry and copy the list again: is it a rule host, does a guard hold,
 /// whose guard. One query asks the source once; the next query asks afresh,
@@ -1931,6 +2055,52 @@ impl crate::dns_egress::DnsEgressPolicy for FixedTunnel {
     fn decide(&self, _attempt: u32) -> Option<crate::dns_egress::DnsEgress> {
         self.0
     }
+}
+
+/// With "DNS through the tunnel" off, the provider still never answers for a
+/// name an additional-link rule names: a stub it handed back would be pinned
+/// into the tunnel. A main-link rule host and any other name ask it as before.
+#[test]
+fn with_the_setting_off_only_additional_link_rule_hosts_skip_the_provider() {
+    let (provider, provider_addr) = listening_dns();
+    let (rule_host_resolver, rule_host_addr) = listening_dns();
+    let rules = Arc::new(FakeRules {
+        primary: CanonicalRuleSet::from_rules(vec![exact_rule("r-p", "main.example")]),
+        secondary: CanonicalRuleSet::from_rules(vec![exact_rule("r-s", "tunnel.example")]),
+    });
+    let oracle = Arc::new(ActiveRuleHostOracle::new(
+        rules,
+        Arc::new(|| Some("S-1-5-21-1".to_string())),
+    ));
+    let policy = crate::dns_egress::SecondaryPreferredEgress::new(
+        Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        Arc::new(|| Some(Ipv4Addr::LOCALHOST)),
+    )
+    .with_rule_hosts(oracle)
+    .with_rule_host_server(rule_host_addr);
+    let resolver = DirectUdpUpstreamResolver::new(provider_addr, Duration::from_millis(50), 1)
+        .with_egress(Arc::new(policy));
+    let asked = |host: &str| {
+        let _ = resolver.resolve(host, AddressFamily::Ipv4);
+        std::thread::sleep(Duration::from_millis(50));
+        (heard_a_query(&provider), heard_a_query(&rule_host_resolver))
+    };
+
+    assert_eq!(
+        asked("tunnel.example"),
+        (false, true),
+        "an additional-link rule host is asked through the tunnel only"
+    );
+    assert_eq!(
+        asked("main.example"),
+        (true, false),
+        "a main-link rule host"
+    );
+    assert_eq!(
+        asked("other.example"),
+        (true, false),
+        "a name no rule names"
+    );
 }
 
 /// With "DNS through the tunnel" on, the reverse lookup of a dropped address

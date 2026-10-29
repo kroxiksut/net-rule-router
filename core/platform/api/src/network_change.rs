@@ -55,6 +55,16 @@ pub trait NetworkChangeObserver: Send + Sync {
         &self,
         on_change: NetworkChangeCallback,
     ) -> Result<NetworkChangeSubscription, PlatformError>;
+
+    /// [`Self::subscribe`] without the echo of route changes this process
+    /// noted in [`crate::own_route_writes`]. A backend that cannot read a
+    /// notice's route reports every change.
+    fn subscribe_foreign(
+        &self,
+        on_change: NetworkChangeCallback,
+    ) -> Result<NetworkChangeSubscription, PlatformError> {
+        self.subscribe(on_change)
+    }
 }
 
 /// No-op observer for platforms without an impl, tests, and the recovery-blocked

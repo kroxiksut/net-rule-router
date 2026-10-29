@@ -565,6 +565,8 @@ fn only_the_arbiter_reads_the_observation_store() {
                     break;
                 }
                 if line.contains(".ips_for_app(")
+                    || line.contains(".ips_v6_for_app(")
+                    || line.contains(".latest_among(")
                     || line.contains(".destination_used_outside(")
                     || line.contains(".latest_of(")
                 {

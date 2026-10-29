@@ -62,7 +62,7 @@ fn owners_for(
         "nrr-service.exe",
         routed_apps,
         role,
-        ip,
+        IpAddr::V4(ip),
     )
 }
 
@@ -2047,7 +2047,7 @@ fn a_folders_script_teaches_the_folder_rule_for_its_owner_only() {
     assert_eq!(store.ips_for_app(folder), vec![script_ip, system_ip]);
     assert_eq!(store.ips_for_app("python.exe"), vec![script_ip]);
     assert!(summary.app_ips_added >= 2);
-    assert!(store.learnt_from_scripts(folder, script_ip));
+    assert!(store.learnt_from_scripts(folder, IpAddr::V4(script_ip)));
     // Its census entry is the folder rule's own program.
     assert!(!store.destination_used_outside(&[folder.to_string()], script_ip));
     // The editor's and the other person's command lines are never read.
@@ -2181,6 +2181,45 @@ fn an_app_reaching_a_foreign_tunnels_network_is_not_learnt() {
     );
     assert_eq!(store.ips_for_app("assistant.exe"), vec![public]);
     assert_eq!(summary.app_ips_added, 1);
+}
+
+/// On a dual-stack network a program reaches its servers over IPv6 as well;
+/// learning only its IPv4 addresses leaves the v6 half with no route over
+/// the additional link. Private, link-local and mapped addresses teach what
+/// they teach for IPv4.
+#[test]
+fn an_app_is_learnt_at_its_ipv6_destinations_too() {
+    use crate::app_observation_lookup::AppObservationLookup;
+    let store = Arc::new(AppObservationStore::new());
+    let consumer = ConnectionObservationConsumer::with_egress(
+        Arc::new(nrr_platform_api::windows_api::MockWindowsApi::new()),
+        Arc::new(|_: &str| (None, None)),
+        Arc::new(|| Some(SCRIPT_OWNER.to_string())),
+        false,
+    )
+    .with_app_observations(Arc::clone(&store));
+    let image = r"C:\Apps\assistant.exe";
+    let over_v6 = |remote: &str| {
+        let mut o = script_observation(7, image, SCRIPT_OWNER, Ipv4Addr::new(203, 0, 113, 1));
+        o.remote = SocketAddr::new(remote.parse().expect("ip"), 443);
+        o
+    };
+    let public: Ipv6Addr = "2001:db8::20".parse().expect("v6");
+    let summary = consumer.consume(
+        &[
+            over_v6("2001:db8::20"),
+            over_v6("fd00::20"),
+            over_v6("fe80::20"),
+            over_v6("::ffff:203.0.113.21"),
+        ],
+        SystemTime::now(),
+    );
+    assert_eq!(store.ips_v6_for_app("assistant.exe"), vec![public]);
+    assert_eq!(
+        store.ips_for_app("assistant.exe"),
+        vec![Ipv4Addr::new(203, 0, 113, 21)]
+    );
+    assert_eq!(summary.app_ips_added, 2);
 }
 
 /// "Other" is not only a foreign link: a main link the binding has not

@@ -75,6 +75,8 @@ fn gate_error(refusal: OperationError) -> IpcError {
         IpcErrorCode::RulesLocked
     } else if refusal.code == crate::tamper_bootstrap::SECURITY_ALERT_GATE_CODE {
         IpcErrorCode::SecurityAlertUnacknowledged
+    } else if refusal.code == IpcErrorCode::BusyConflict.client_slug() {
+        IpcErrorCode::BusyConflict
     } else {
         IpcErrorCode::Forbidden
     };
@@ -133,9 +135,25 @@ impl CheckedIpcHandler for PrincipalDataPurgeHandler {
     ) -> HandlerOutcome {
         let sid = principal(ctx)?;
         let response = if req.all_principals {
-            self.purger
-                .purge_all_principals(req.include_rules_history)
-                .map_err(map_write_error)?
+            match self.rules_reset.as_ref() {
+                Some(executor) if req.include_rules_history => {
+                    let mut purged = None;
+                    executor
+                        .erase_every_users_rules(&mut || {
+                            purged = Some(self.purger.purge_all_principals(true));
+                        })
+                        .map_err(gate_error)?;
+                    purged
+                        .unwrap_or(Err(RoutePolicyWriteError::Storage(
+                            "the erase did not run".into(),
+                        )))
+                        .map_err(map_write_error)?
+                }
+                _ => self
+                    .purger
+                    .purge_all_principals(req.include_rules_history)
+                    .map_err(map_write_error)?,
+            }
         } else {
             if req.include_rules_history {
                 if let Some(executor) = self.rules_reset.as_ref() {
@@ -531,6 +549,116 @@ mod tests {
                         .unwrap_or_else(|p| p.into_inner())
                         .as_deref(),
                     Some("S-A")
+                );
+            }
+        }
+    }
+
+    /// The rules storage with an activation in flight, or idle: the erase runs
+    /// only inside it.
+    struct Erasing {
+        inner: Gated,
+        busy: bool,
+        erased_inside: Mutex<bool>,
+    }
+
+    impl MutationExecutor for Erasing {
+        fn preview(
+            &self,
+            kind: MutationKind,
+            payload: &serde_json::Value,
+            principal: &str,
+        ) -> crate::ipc_handlers::payloads::ReviewSummaryResponse {
+            self.inner.preview(kind, payload, principal)
+        }
+        fn execute(&self, payload: StoredMutation, principal: &str) -> MutationOutcome {
+            self.inner.execute(payload, principal)
+        }
+        fn erase_every_users_rules(
+            &self,
+            erase: &mut dyn FnMut(),
+        ) -> Result<(), crate::ipc_handlers::operation_status_store::OperationError> {
+            if self.busy {
+                return Err(
+                    crate::ipc_handlers::operation_status_store::OperationError {
+                        args: Default::default(),
+                        code: IpcErrorCode::BusyConflict.client_slug().into(),
+                        message: "another rules change is still being applied".into(),
+                    },
+                );
+            }
+            erase();
+            *self.erased_inside.lock().unwrap_or_else(|p| p.into_inner()) = true;
+            Ok(())
+        }
+        fn rollback(&self, principal: &str, target: Option<&str>) -> MutationOutcome {
+            self.inner.rollback(principal, target)
+        }
+        fn rollback_target(
+            &self,
+            principal: &str,
+            target: Option<&str>,
+        ) -> Result<
+            Option<nrr_shared::ipc_payloads::RollbackTargetDto>,
+            crate::ipc_handlers::operation_status_store::OperationError,
+        > {
+            self.inner.rollback_target(principal, target)
+        }
+        fn safe_disable(
+            &self,
+            principal: &str,
+            reason: &str,
+            term: nrr_shared::ipc_payloads::SafeDisableTerm,
+        ) -> MutationOutcome {
+            self.inner.safe_disable(principal, reason, term)
+        }
+    }
+
+    /// An administrator's erase of every user's rules is every user's reset
+    /// to the baseline: it waits out an apply in flight instead of deleting
+    /// under it, and runs where each user's clients are told.
+    #[test]
+    fn erasing_every_users_rules_goes_through_the_rules_storage() {
+        for busy in [true, false] {
+            let purger = Arc::new(RecordingPurger::new(Ok(
+                PrincipalDataPurgeResponse::default(),
+            )));
+            let storage = Arc::new(Erasing {
+                inner: Gated {
+                    inner: crate::ipc_handlers::test_fakes::FakeMutationExecutor::default(),
+                    closed: false,
+                },
+                busy,
+                erased_inside: Mutex::new(false),
+            });
+            let handler =
+                PrincipalDataPurgeHandler::new(Arc::clone(&purger) as Arc<dyn PrincipalDataPurger>)
+                    .with_rules_reset(Arc::clone(&storage) as Arc<dyn MutationExecutor>);
+            let mut envelope = req();
+            envelope.payload = serde_json::json!({
+                "all-principals": true,
+                "include-rules-history": true,
+            });
+            let mut admin = ctx(Some("S-A"));
+            admin.caller_is_elevated = true;
+            let result = handler.handle(&envelope, &admin);
+            let calls = purger
+                .calls
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .clone();
+            if busy {
+                assert_eq!(result.expect_err("busy").code, IpcErrorCode::BusyConflict);
+                assert!(calls.is_empty(), "nothing erased under an apply: {calls:?}");
+            } else {
+                result.expect("erased");
+                assert_eq!(calls, ["*".to_string()]);
+                assert!(
+                    *storage
+                        .erased_inside
+                        .lock()
+                        .unwrap_or_else(|p| p.into_inner()),
+                    "the erase ran inside the rules storage"
                 );
             }
         }

@@ -314,7 +314,24 @@ pub(crate) fn build_runtime_deps(
                 fake_assembly: None,
                 fake_ip_running: None,
                 fake_ip_secondary_ready: None,
-                egress: None,
+                // The additional link's rule hosts are asked through the
+                // tunnel, so the provider cannot shape their answers.
+                egress: Some(nrr_service_runtime::dns_stack::stored_binding_egress_policy(
+                    Arc::clone(conn),
+                    Arc::clone(&routing_principal),
+                    served_principals.clone(),
+                    ipc.routing_pause_terms.as_ref().map(|t| t.paused_view()),
+                    Arc::new(
+                        nrr_service_runtime::production_auto_rule_probe::StoredBindingEgress::new(
+                            Arc::new(
+                                nrr_service_runtime::production_handlers_misc::ProductionRoutePolicySource::new(
+                                    Arc::clone(conn),
+                                ),
+                            ),
+                            Arc::new(nrr_platform_linux::LinuxApi),
+                        ),
+                    ),
+                )),
                 auto_rules: auto_rules.clone(),
                 // And that user has bound a connection: before that the
                 // machine's name resolution stays as it was.
@@ -755,7 +772,7 @@ fn app_destination_memory(
             {
                 let conn = Arc::clone(state_conn);
                 Arc::new(
-                    move |owner: Option<&str>, app: &str, ips: &[std::net::Ipv4Addr], now| {
+                    move |owner: Option<&str>, app: &str, ips: &[std::net::IpAddr], now| {
                         let guard = conn.lock().unwrap_or_else(|p| p.into_inner());
                         if let Err(e) = AppDestinationsRepository::new(&guard).upsert(
                             owner,
@@ -1245,10 +1262,38 @@ pub(crate) fn build_policy_stack(
             nrr_service_runtime::hosts_bypass::stored_bypass_wanted_by_any(&conn, &users)
         })
     };
+    // The additional link's rule hosts are asked through the tunnel, past the
+    // provider, by the seeder and the refresh too.
+    let rule_host_egress = nrr_service_runtime::dns_stack::stored_binding_egress_policy(
+        Arc::clone(&state_conn),
+        {
+            let owner = Arc::clone(&route_owner);
+            Arc::new(move || owner.current().map(|p| p.as_stored().to_owned()))
+                as nrr_service_runtime::supervised_runtime::ActiveRoutingSidFn
+        },
+        Some({
+            let owner = Arc::clone(&route_owner);
+            Arc::new(move || {
+                owner
+                    .served()
+                    .iter()
+                    .map(|p| p.as_stored().to_owned())
+                    .collect::<Vec<_>>()
+            }) as nrr_service_runtime::dns_resolver_ports::ResolverPrincipalsFn
+        }),
+        None,
+        Arc::new(
+            nrr_service_runtime::production_auto_rule_probe::StoredBindingEgress::new(
+                Arc::clone(&policy),
+                Arc::new(nrr_platform_linux::LinuxApi),
+            ),
+        ),
+    );
     let service_resolver = crate::dns_stack::rule_host_resolver(
         &dns_capture,
         crate::dns_stack::service_dns_resolver(&dns_capture),
         hosts_bypass,
+        rule_host_egress,
     );
     let rule_seeder = Arc::new(
         RuleHostnameSeeder::new(
@@ -1462,6 +1507,9 @@ pub(crate) fn build_policy_stack(
             ),
             Arc::clone(&app_observations) as Arc<dyn AppObservationLookup>,
         )
+        // The resolvers the egress policy asks through the tunnel ride it, in
+        // the table the service accounts follow.
+        .with_dns_via_secondary(nrr_service_runtime::dns_egress::global_dns_via_secondary())
         // The blanket block's exemptions: the tunnel-server host routes and the
         // attached subnets, read from the same rtnetlink table the route applier
         // writes to.

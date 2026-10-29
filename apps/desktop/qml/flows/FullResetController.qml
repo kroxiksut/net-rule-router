@@ -18,11 +18,10 @@ QtObject {
     property var root
 
     // GUI prefs + file bindings + first-run flag, clear the local rules
-    // model, then clear the service's active rules to an empty revision
-    // (async two-phase mutation — under a non-admin GUI the confirm is
-    // Forbidden and the launcher's R3 path transparently elevates via UAC).
-    // The completion dialog offers to close the program + tray so the reset
-    // takes effect on the next launch (fresh first-run).
+    // model, then erase the service's copy of the user's rules, which leaves
+    // them on the administrator's baseline like a new user. The completion
+    // dialog offers to close the program + tray so the reset takes effect on
+    // the next launch (fresh first-run).
     function fullReset(allPrincipals) {
         root.statusLine = root.tr("status.full-reset-running", "Performing full reset…")
         if (root.bridgeAvailable && typeof nrrNativeBridge.clearGuiLogs === "function") {

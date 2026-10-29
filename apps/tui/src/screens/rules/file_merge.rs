@@ -183,8 +183,9 @@ fn merges_to_screen(app: &AppState, result: &MergeResultDto) -> bool {
 }
 
 /// The files say what the rules in force say: any bound file whose body is
-/// spelled otherwise is rewritten from them. A file already in line is left
-/// alone and the note says the two match.
+/// spelled otherwise is rewritten from them, keeping the sections it holds
+/// now. A file already in line is left alone and the note says the two match;
+/// one edited by hand is asked about, as the window's write refuses it.
 fn converge(app: &mut AppState, added: &[String]) {
     let Some(settings_file) = app.rules.settings_file.clone() else {
         return;
@@ -196,13 +197,19 @@ fn converge(app: &mut AppState, added: &[String]) {
     let bound = [settings.rules_files.primary, settings.rules_files.secondary];
     let exported_at = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
     let mut written = Vec::new();
+    let mut held = Vec::new();
     for (route, path) in Route::ALL.into_iter().zip(&bound) {
         if path.is_empty() {
             continue;
         }
         let path = Path::new(path);
+        files::take_passthrough_from(&mut app.rules.table, route, path);
         let (table, hint) = (&app.rules.table, &app.rules.file_hint);
         if !files::route_differs(path, route, table, hint) {
+            continue;
+        }
+        if own_settings::hand_edited(&settings_file, path) {
+            held.push((route, path.to_path_buf()));
             continue;
         }
         if let Err((path, error)) = files::write_route(path, route, table, hint, &exported_at) {
@@ -212,6 +219,11 @@ fn converge(app: &mut AppState, added: &[String]) {
             break;
         }
         written.push(path.to_path_buf());
+    }
+    if !held.is_empty() {
+        let _ = own_settings::note_written(&settings_file, &written);
+        super::ask_about_hand_edited(app, held);
+        return;
     }
     if written.is_empty() {
         if app.rules.note.is_none() {

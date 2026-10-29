@@ -3810,3 +3810,31 @@ fn an_accepted_suggestion_keeps_the_rules_that_do_not_work() {
     assert!(stored.contains("cdn.example"), "{stored}");
     assert!(stored.contains("255.255.255.255"), "{stored}");
 }
+
+/// Mid-apply the stored row still names the book being replaced (here none):
+/// the reset review must count the rules the user is under, or it tells them
+/// there is nothing to lose while the reset is about to discard their edit.
+#[test]
+fn the_reset_review_counts_the_rules_being_applied() {
+    use nrr_storage::migration::{open_connection, SqliteMigrationRunner};
+    use nrr_storage::repository::MigrationRunner;
+    let dir = tempfile::tempdir().expect("temp dir");
+    let runner =
+        SqliteMigrationRunner::for_state_db(open_connection(&dir.path().join("state.db")).unwrap());
+    runner.run_pending_migrations().unwrap();
+    let conn = Arc::new(std::sync::Mutex::new(runner.into_connection()));
+    let exec = ProductionMutationExecutor::new(build_test_coordinator(Arc::clone(&conn)))
+        .with_state_conn(Arc::clone(&conn));
+    let _applying = crate::applying_revision_overlay::publish(
+        &conn.lock().unwrap(),
+        UNDIVERGED,
+        &book_of(&["a.example", "b.example"], &[]),
+    );
+    let review = exec.preview(
+        MutationKind::RulesResetToBaseline,
+        &serde_json::json!({}),
+        UNDIVERGED,
+    );
+    assert_eq!(review.diff_summary, "reset-to-baseline; discard 2 rule(s)");
+    assert!(review.requires_review);
+}

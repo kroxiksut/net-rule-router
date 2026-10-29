@@ -1719,6 +1719,66 @@ fn a_reset_to_baseline_waits_for_the_activation_in_flight() {
     );
 }
 
+/// Erasing every user's rules is each user's reset to the baseline at once:
+/// it never deletes under an activation in flight, and every user it put
+/// back on the baseline is recorded so their clients re-read the rules.
+#[test]
+fn erasing_every_users_rules_waits_for_the_activation_and_tells_each_user() {
+    let mut fx = build_fixture(ApplyFailurePolicy::AllOrNothing);
+    fx.coordinator.activation_wait = std::time::Duration::from_millis(20);
+    for (principal, hash) in [("S-1-5-21-A", "h-a"), ("S-1-5-21-B", "h-b")] {
+        submit_for(&fx, principal, hash);
+    }
+    submit(&fx, "h-base");
+    let erase_users = |conn: &Arc<Mutex<Connection>>| {
+        let mut guard = conn.lock().expect("conn");
+        for principal in ["S-1-5-21-A", "S-1-5-21-B"] {
+            nrr_storage::purge_principal_rules(&mut guard, principal).expect("purge");
+        }
+    };
+
+    let held = fx
+        .coordinator
+        .activation_gate
+        .enter(std::time::Duration::ZERO)
+        .expect("free");
+    let mut ran = false;
+    assert_eq!(
+        fx.coordinator
+            .erase_every_users_rules(&mut || ran = true, "c")
+            .unwrap_err(),
+        PolicyError::ActivationBusy
+    );
+    assert!(!ran, "nothing erased under an activation");
+    drop(held);
+
+    let conn = Arc::clone(&fx.conn);
+    let mut reset = fx
+        .coordinator
+        .erase_every_users_rules(&mut || erase_users(&conn), "c")
+        .expect("erased");
+    reset.sort();
+    assert_eq!(reset, ["S-1-5-21-A", "S-1-5-21-B"]);
+    let told: Vec<String> = fx
+        .audit
+        .snapshot()
+        .iter()
+        .filter_map(|e| match e {
+            ActivationAuditEvent::ResetToBaseline {
+                principal,
+                deleted_revisions,
+                ..
+            } if *deleted_revisions > 0 => Some(principal.clone()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(told.len(), 2, "{told:?}");
+    assert!(
+        !told.iter().any(|p| p == nrr_storage::BASELINE_PRINCIPAL),
+        "the baseline is kept"
+    );
+}
+
 /// Records what a reader on its own connection to the state database sees of
 /// the revision being applied, at the moment each dispatch runs.
 struct OverlayProbe {

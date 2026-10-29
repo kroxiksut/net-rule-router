@@ -22,7 +22,7 @@ RadioButton {
         y: (root.height - height) / 2
         radius: width / 2
         color: !root.enabled ? theme.stateDisabledFill : theme.colorBase
-        border.width: theme.borderWidth
+        border.width: root.activeFocus ? theme.focusBorderWidth : theme.borderWidth
         border.color: root.activeFocus
                           ? theme.stateFocusedBorder
                           : !root.enabled

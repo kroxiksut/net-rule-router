@@ -1,6 +1,75 @@
 use super::*;
 use crate::boot_clock::BootInstant;
 
+/// A secondary rule for one host: what a first contact is about, since a new
+/// address of a host the book already names is what a DNS answer brings.
+fn host_rule(id: &str, host: &str) -> CanonicalRule {
+    CanonicalRule {
+        id: RuleId(id.into()),
+        enabled: true,
+        address_match: Some(CanonicalAddressMatch::ExactFqdn(host.into())),
+        app_match: None,
+        comment: String::new(),
+        action: nrr_domain::RuleAction::Route,
+        origin: None,
+    }
+}
+
+type CacheStore = Arc<Mutex<dyn nrr_storage::repository::CacheRepository + Send>>;
+
+/// A real cache, whose pass reading is a snapshot taken when the pass asks.
+fn sqlite_cache() -> (
+    CacheStore,
+    Arc<crate::fqdn_cache_lookup::SqliteFqdnCacheLookup>,
+) {
+    use nrr_storage::migration::SqliteMigrationRunner;
+    use nrr_storage::repository::MigrationRunner;
+    let conn = rusqlite::Connection::open_in_memory().expect("open");
+    let runner = SqliteMigrationRunner::for_cache_db(conn);
+    runner.run_pending_migrations().expect("migrate");
+    let thresholds = nrr_domain::decision_lookup::FreshnessThresholds::default_production();
+    let cache: CacheStore = Arc::new(Mutex::new(nrr_storage::store::SqliteCacheStore::new(
+        runner.into_connection(),
+        thresholds.clone(),
+    )));
+    let lookup = Arc::new(crate::fqdn_cache_lookup::SqliteFqdnCacheLookup::new(
+        Arc::clone(&cache),
+        thresholds,
+    ));
+    (cache, lookup)
+}
+
+/// `host` answered with `ips`, as the resolver records it.
+fn cache_answer(cache: &CacheStore, host: &str, ips: &[Ipv4Addr]) {
+    cache
+        .lock()
+        .expect("cache")
+        .upsert_resolution(nrr_storage::dto::ResolutionEntry {
+            canonical_hostname: host.into(),
+            raw_hostname_sample: None,
+            resolved_ips: ips.iter().copied().map(IpAddr::V4).collect(),
+            ttl_seconds: Some(300),
+            source: nrr_storage::resolution_source::StorageResolutionSource::Dns,
+            resolved_at: std::time::SystemTime::now(),
+            active_revision_id: None,
+        })
+        .expect("upsert");
+}
+
+fn coordinator_over(
+    api: Arc<MockWindowsApi>,
+    rules: Arc<FakeRules>,
+    cache: Arc<dyn FqdnCacheLookup>,
+) -> SecondaryRouteCoordinator {
+    SecondaryRouteCoordinator::new(
+        api as Arc<dyn RouteTablePort>,
+        rules as Arc<dyn RulesProvider>,
+        Arc::new(FakePolicy::new()) as Arc<dyn RoutePolicySource>,
+        cache,
+        Arc::new(|| false) as RuleScopeProvider,
+    )
+}
+
 /// A first contact routes only what the planner would, from the last
 /// recompute's resolution, and the next recompute finds it in place.
 #[test]
@@ -9,9 +78,16 @@ fn a_first_contact_routes_only_what_the_planner_would() {
     let rules = Arc::new(FakeRules::new());
     rules.set_secondary(
         "S-IVANOV",
-        CanonicalRuleSet::from_rules(vec![ip_rule("a", 203, 0, 113, 1)]),
+        CanonicalRuleSet::from_rules(vec![host_rule("a", "site.example")]),
     );
-    let coord = coordinator(Arc::clone(&api), Arc::clone(&rules));
+    let first = Ipv4Addr::new(203, 0, 113, 1);
+    let cache = Arc::new(MockFqdnCacheLookup::new());
+    cache.set_ips("site.example", vec![first]);
+    let coord = coordinator_over(
+        Arc::clone(&api),
+        Arc::clone(&rules),
+        Arc::clone(&cache) as Arc<dyn FqdnCacheLookup>,
+    );
     let second = Ipv4Addr::new(203, 0, 113, 2);
     let unnamed = Ipv4Addr::new(198, 51, 100, 9);
     let second_v4 = IpAddr::V4(second);
@@ -24,13 +100,8 @@ fn a_first_contact_routes_only_what_the_planner_would() {
         .recompute_for("S-IVANOV", &res(Some(target())))
         .expect("recompute");
 
-    rules.set_secondary(
-        "S-IVANOV",
-        CanonicalRuleSet::from_rules(vec![
-            ip_rule("a", 203, 0, 113, 1),
-            ip_rule("b", 203, 0, 113, 2),
-        ]),
-    );
+    // The rule host's answer brings an address the pass has not seen.
+    cache.set_ips("site.example", vec![first, second]);
     assert_eq!(
         coord.route_first_contact("S-IVANOV", &[second_v4, IpAddr::V4(unnamed)]),
         1
@@ -69,7 +140,9 @@ impl FqdnCacheLookup for CountingSnapshots {
     fn hostnames_under_suffix(&self, suffix: &str, limit: usize) -> Vec<String> {
         self.live.hostnames_under_suffix(suffix, limit)
     }
-    fn snapshot_for_compute(&self) -> Option<crate::fqdn_cache_lookup::FqdnCacheSnapshot> {
+    fn snapshot_for_compute(
+        &self,
+    ) -> Option<std::sync::Arc<crate::fqdn_cache_lookup::FqdnCacheSnapshot>> {
         self.whole.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         None
     }
@@ -117,6 +190,66 @@ fn a_first_contact_reads_only_the_rows_on_its_addresses() {
     assert_eq!(cache.scoped.load(std::sync::atomic::Ordering::SeqCst), 1);
 }
 
+/// A first contact answers a DNS reply: it plans from the book and the policy
+/// the last pass read, not from the stores every settings write locks, so a
+/// rule host's answer never waits on a writer.
+#[test]
+fn a_first_contact_plans_from_what_the_last_pass_read() {
+    let api = Arc::new(MockWindowsApi::new());
+    let rules = Arc::new(FakeRules::new());
+    rules.set_secondary(
+        "S-IVANOV",
+        CanonicalRuleSet::from_rules(vec![
+            ip_rule("a", 203, 0, 113, 1),
+            ip_rule("b", 203, 0, 113, 2),
+        ]),
+    );
+    let policy = Arc::new(FakePolicy::new());
+    let coord = coordinator_with_policy(Arc::clone(&api), Arc::clone(&rules), Arc::clone(&policy));
+    coord
+        .recompute_for("S-IVANOV", &res(Some(target())))
+        .expect("recompute");
+    let (books_read, policies_read) = (rules.reads(), policy.loads());
+
+    let routed =
+        coord.route_first_contact("S-IVANOV", &[IpAddr::V4(Ipv4Addr::new(203, 0, 113, 2))]);
+
+    assert_eq!(routed, 1, "the first contact still routes its address");
+    assert_eq!(rules.reads(), books_read, "no book read on the answer path");
+    assert_eq!(
+        policy.loads(),
+        policies_read,
+        "no policy read on the answer path"
+    );
+}
+
+/// The book a first contact plans from is the last pass's: once a pass finds
+/// the user has no rules, a first contact routes nothing by the book before.
+#[test]
+fn a_pass_that_finds_no_rules_leaves_no_book_for_a_first_contact() {
+    let api = Arc::new(MockWindowsApi::new());
+    let vpn = adapter("vpn", 78, true, true, Some([10, 0, 0, 1]));
+    let vpn_id = vpn.stable_id();
+    api.set_adapter_infos(vec![vpn]);
+    let rules = Arc::new(FakeRules::new());
+    rules.set_secondary(
+        "S-IVANOV",
+        CanonicalRuleSet::from_rules(vec![ip_rule("a", 203, 0, 113, 1)]),
+    );
+    let policy = Arc::new(FakePolicy::new());
+    policy.bind_secondary("S-IVANOV", &vpn_id);
+    let coord = coordinator_with_policy(Arc::clone(&api), Arc::clone(&rules), policy);
+    let sids = ["S-IVANOV".to_string()];
+    let routed = [IpAddr::V4(Ipv4Addr::new(203, 0, 113, 1))];
+    coord.recompute_active(&sids).expect("first pass");
+    assert_eq!(coord.route_first_contact("S-IVANOV", &routed), 1);
+
+    rules.forget("S-IVANOV");
+    coord.recompute_active(&sids).expect("second pass");
+
+    assert_eq!(coord.route_first_contact("S-IVANOV", &routed), 0);
+}
+
 /// A rule book whose next read hands out the book as it stood and then, before
 /// returning, moves to `newer` and runs `hook` — a first contact landing after
 /// the pass has read its plan's inputs.
@@ -153,47 +286,49 @@ impl RulesProvider for BookMovesMidRead {
     }
 }
 
-/// A first contact installed while a pass is already planning from the book
-/// without its address must outlive that pass: the plan never saw the address.
-/// The pin installed right after it (route before pin) would otherwise be left
-/// with no route until the next pass. A pass planned later without the address
-/// takes the route out as any of ours.
+/// A first contact installed while a pass is already planning from a cache
+/// reading without its address must outlive that pass: the plan never saw the
+/// address. The pin installed right after it (route before pin) would
+/// otherwise be left with no route until the next pass. A pass planned later
+/// without the address takes the route out as any of ours.
 #[test]
 fn a_first_contact_outlives_the_pass_planned_before_it() {
+    let (cache, lookup) = sqlite_cache();
     let api = Arc::new(MockWindowsApi::new());
-    let only_a = || CanonicalRuleSet::from_rules(vec![ip_rule("a", 203, 0, 113, 1)]);
+    let site = || CanonicalRuleSet::from_rules(vec![host_rule("h", "site.example")]);
     let rules = Arc::new(BookMovesMidRead {
-        book: Mutex::new(only_a()),
+        book: Mutex::new(site()),
         next: Mutex::new(None),
     });
+    let first = Ipv4Addr::new(203, 0, 113, 1);
+    let fresh = Ipv4Addr::new(203, 0, 113, 2);
+    cache_answer(&cache, "site.example", &[first]);
     let coord = Arc::new(SecondaryRouteCoordinator::new(
         Arc::clone(&api) as Arc<dyn RouteTablePort>,
         Arc::clone(&rules) as Arc<dyn RulesProvider>,
         Arc::new(FakePolicy::new()) as Arc<dyn RoutePolicySource>,
-        Arc::new(MockFqdnCacheLookup::new()) as Arc<dyn FqdnCacheLookup>,
+        lookup as Arc<dyn FqdnCacheLookup>,
         Arc::new(|| false) as RuleScopeProvider,
     ));
     coord
         .recompute_for("S-IVANOV", &res(Some(target())))
         .expect("recompute");
 
-    let fresh = Ipv4Addr::new(203, 0, 113, 2);
     let routed = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    // The answer lands after the pass has read the cache.
     let hook = {
         let coord = Arc::downgrade(&coord);
         let routed = Arc::clone(&routed);
+        let cache = Arc::clone(&cache);
         Box::new(move || {
+            cache_answer(&cache, "site.example", &[first, fresh]);
             if let Some(coord) = coord.upgrade() {
                 let n = coord.route_first_contact("S-IVANOV", &[IpAddr::V4(fresh)]);
                 routed.store(n, std::sync::atomic::Ordering::SeqCst);
             }
         }) as Box<dyn FnOnce() + Send>
     };
-    let with_b = CanonicalRuleSet::from_rules(vec![
-        ip_rule("a", 203, 0, 113, 1),
-        ip_rule("b", 203, 0, 113, 2),
-    ]);
-    *rules.next.lock().unwrap_or_else(|p| p.into_inner()) = Some((with_b, hook));
+    *rules.next.lock().unwrap_or_else(|p| p.into_inner()) = Some((site(), hook));
 
     let delta = coord
         .recompute_for("S-IVANOV", &res(Some(target())))
@@ -210,7 +345,9 @@ fn a_first_contact_outlives_the_pass_planned_before_it() {
         "the pass that plans it finds it: {delta:?}"
     );
 
-    rules.set(only_a());
+    rules.set(CanonicalRuleSet::from_rules(vec![ip_rule(
+        "a", 203, 0, 113, 1,
+    )]));
     let delta = coord
         .recompute_for("S-IVANOV", &res(Some(target())))
         .expect("recompute");
@@ -236,7 +373,9 @@ impl FqdnCacheLookup for HookOnSnapshot {
     fn hostnames_for_any_zone(&self, base: &str, limit: usize) -> Vec<String> {
         self.live.hostnames_for_any_zone(base, limit)
     }
-    fn snapshot_for_compute(&self) -> Option<crate::fqdn_cache_lookup::FqdnCacheSnapshot> {
+    fn snapshot_for_compute(
+        &self,
+    ) -> Option<std::sync::Arc<crate::fqdn_cache_lookup::FqdnCacheSnapshot>> {
         let hook = self.hook.lock().unwrap_or_else(|p| p.into_inner()).take();
         if let Some(hook) = hook {
             hook();
@@ -257,11 +396,13 @@ fn a_first_contact_during_a_pass_takes_the_link_that_pass_resolved() {
     let rules = Arc::new(FakeRules::new());
     rules.set_secondary(
         "S-IVANOV",
-        CanonicalRuleSet::from_rules(vec![ip_rule("a", 203, 0, 113, 1)]),
+        CanonicalRuleSet::from_rules(vec![host_rule("h", "site.example")]),
     );
     let policy = Arc::new(FakePolicy::new());
     policy.bind_secondary("S-IVANOV", &vpn_id);
     let cache = Arc::new(HookOnSnapshot::default());
+    let first = Ipv4Addr::new(203, 0, 113, 1);
+    cache.live.set_ips("site.example", vec![first]);
     let coord = Arc::new(SecondaryRouteCoordinator::new(
         Arc::clone(&api) as Arc<dyn RouteTablePort>,
         Arc::clone(&rules) as Arc<dyn RulesProvider>,
@@ -280,15 +421,11 @@ fn a_first_contact_during_a_pass_takes_the_link_that_pass_resolved() {
     let fresh = Ipv4Addr::new(203, 0, 113, 2);
     *cache.hook.lock().unwrap_or_else(|p| p.into_inner()) = Some({
         let coord = Arc::downgrade(&coord);
-        let rules = Arc::clone(&rules);
+        let cache = Arc::downgrade(&cache);
         Box::new(move || {
-            rules.set_secondary(
-                "S-IVANOV",
-                CanonicalRuleSet::from_rules(vec![
-                    ip_rule("a", 203, 0, 113, 1),
-                    ip_rule("b", 203, 0, 113, 2),
-                ]),
-            );
+            if let Some(cache) = cache.upgrade() {
+                cache.live.set_ips("site.example", vec![first, fresh]);
+            }
             if let Some(coord) = coord.upgrade() {
                 coord.route_first_contact("S-IVANOV", &[IpAddr::V4(fresh)]);
             }
@@ -344,17 +481,17 @@ fn a_v6_first_contact_gets_its_slash_128_only_through_a_v6_capable_link() {
     let api = Arc::new(MockWindowsApi::new());
     let rules = Arc::new(FakeRules::new());
     let v6: std::net::Ipv6Addr = "2001:db8::7".parse().expect("literal");
-    let rule = CanonicalRule {
-        id: RuleId("a6".into()),
-        enabled: true,
-        address_match: Some(CanonicalAddressMatch::ExactIp(IpAddr::V6(v6))),
-        app_match: None,
-        comment: String::new(),
-        action: nrr_domain::RuleAction::Route,
-        origin: None,
-    };
-    rules.set_secondary("S-IVANOV", CanonicalRuleSet::from_rules(vec![rule]));
-    let coord = coordinator(Arc::clone(&api), Arc::clone(&rules));
+    rules.set_secondary(
+        "S-IVANOV",
+        CanonicalRuleSet::from_rules(vec![host_rule("h6", "six.example")]),
+    );
+    let cache = Arc::new(MockFqdnCacheLookup::new());
+    cache.set_addresses("six.example", vec![IpAddr::V6(v6)]);
+    let coord = coordinator_over(
+        Arc::clone(&api),
+        Arc::clone(&rules),
+        Arc::clone(&cache) as Arc<dyn FqdnCacheLookup>,
+    );
 
     coord
         .recompute_for("S-IVANOV", &res(Some(target())))
@@ -372,19 +509,10 @@ fn a_v6_first_contact_gets_its_slash_128_only_through_a_v6_capable_link() {
     coord
         .recompute_for("S-IVANOV", &res(Some(v6_link)))
         .expect("recompute over a v6-capable link");
-    // The recompute already routed the rule's own address; a fresh one the
-    // book does not carry yet is what a first contact brings.
+    // The recompute already routed the host's known address; a fresh one the
+    // pass has not seen is what a first contact brings.
     let fresh: std::net::Ipv6Addr = "2001:db8::8".parse().expect("literal");
-    let fresh_rule = CanonicalRule {
-        id: RuleId("b6".into()),
-        enabled: true,
-        address_match: Some(CanonicalAddressMatch::ExactIp(IpAddr::V6(fresh))),
-        app_match: None,
-        comment: String::new(),
-        action: nrr_domain::RuleAction::Route,
-        origin: None,
-    };
-    rules.set_secondary("S-IVANOV", CanonicalRuleSet::from_rules(vec![fresh_rule]));
+    cache.set_addresses("six.example", vec![IpAddr::V6(v6), IpAddr::V6(fresh)]);
     assert_eq!(
         coord.route_first_contact("S-IVANOV", &[IpAddr::V6(fresh)]),
         1,
@@ -762,19 +890,15 @@ fn another_adapter_going_away_keeps_the_first_contact() {
     let rules = Arc::new(FakeRules::new());
     rules.set_secondary(
         "S-IVANOV",
-        CanonicalRuleSet::from_rules(vec![ip_rule("a", 203, 0, 113, 1)]),
-    );
-    let coord = coordinator(Arc::clone(&api), Arc::clone(&rules));
-    coord
-        .recompute_for("S-IVANOV", &res(Some(target())))
-        .expect("recompute");
-    rules.set_secondary(
-        "S-IVANOV",
         CanonicalRuleSet::from_rules(vec![
             ip_rule("a", 203, 0, 113, 1),
             ip_rule("b", 203, 0, 113, 2),
         ]),
     );
+    let coord = coordinator(Arc::clone(&api), Arc::clone(&rules));
+    coord
+        .recompute_for("S-IVANOV", &res(Some(target())))
+        .expect("recompute");
     coord.forget_links(&[target().interface_index + 1]);
     assert_eq!(
         coord.route_first_contact("S-IVANOV", &[IpAddr::V4(Ipv4Addr::new(203, 0, 113, 2))]),

@@ -120,7 +120,6 @@ Window {
                 color: root.textColor
                 selectionColor: root.accentColor
                 selectedTextColor: palette.highlightedText
-                background: CardSurface { theme: root.uiTheme; cornerRadius: root.uiTheme.radiusSm }
                 // Reached by Tab; the tab button's label names what is read here.
                 Accessible.role: Accessible.StaticText
                 Accessible.name: root.tr("label.license", "License")
@@ -152,7 +151,6 @@ Window {
                 color: root.textColor
                 selectionColor: root.accentColor
                 selectedTextColor: palette.highlightedText
-                background: CardSurface { theme: root.uiTheme; cornerRadius: root.uiTheme.radiusSm }
                 Accessible.role: Accessible.StaticText
                 Accessible.name: root.tr("dialog.eula.text-accessible-name",
                     "License agreement text")

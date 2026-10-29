@@ -157,6 +157,15 @@ Pane {
                                                ? root.uiTheme.stateFocusedBorderOnFill
                                                : root.uiTheme.stateFocusedBorder)
                                         : navButton.highlighted ? root.uiTheme.stateSelectedBorder : root.uiTheme.stateDefaultBorder
+                                    Rectangle {
+                                        visible: navButton.activeFocus && navButton.highlighted
+                                        anchors.fill: parent
+                                        anchors.margins: root.uiTheme.focusBorderWidth
+                                        radius: Math.max(0, parent.radius - root.uiTheme.focusBorderWidth)
+                                        color: "transparent"
+                                        border.width: root.uiTheme.borderWidth
+                                        border.color: root.uiTheme.stateFocusedInnerOnFill
+                                    }
                                 }
                                 contentItem: RowLayout {
                                     id: navContent

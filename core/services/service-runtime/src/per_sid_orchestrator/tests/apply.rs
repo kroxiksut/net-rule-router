@@ -278,57 +278,72 @@ fn doh_lockdown_blocks_are_published_in_their_own_band() {
     }
 }
 
-/// The neutral pipeline must describe the same enforcement as the one that
-/// actually installs — measured through the orchestrator's own compute, not
-/// a hand-built plan.
-///
-/// The oracle tests in `enforcement_planner` already compare the two over
-/// rule books written for the purpose. This one asks the question the way it
-/// will be asked in production: whatever the orchestrator just computed for
-/// this SID, does the plan agree with it? That is the check that has to hold
-/// before the neutral path may take over the apply.
-// Windows-only for the same reason the comparison is: it measures against a
-// WFP filter set, and off-Windows there is none to measure against.
+/// The pass installs the neutral plan's rule filters and still reads the
+/// codegen's destination sets: the filters in force are the plan's, and the
+/// codegen describes the same enforcement, measured through the
+/// orchestrator's own compute rather than a hand-built plan.
+// Windows-only: the neutral filters are lowered for WFP.
 #[cfg(windows)]
 #[test]
-fn the_neutral_plan_agrees_with_the_filters_the_orchestrator_computes() {
+fn the_pass_installs_the_neutral_plan_and_the_codegen_agrees_with_it() {
     let (_api, orch, src, rules, _audit) = fixture();
     let sid = "S-1-5-21-NEUTRAL";
     src.set(sid, snap_full("Wi-Fi", "TAP"));
     let book = rules_with_n_primary_ips(3);
     rules.set(book.clone());
+    let no_denylist = std::collections::HashSet::new();
+    let ipv6 = crate::enforcement_planner::Ipv6Guard::Off;
 
-    // Drive the real compute, then compare against what it produced.
-    let computed = orch
+    let installed = match orch
         .compute_filters_for_sid(sid, true, None, ComputeIntent::Preview)
-        .expect("compute succeeds");
-    let live = match computed {
+        .expect("compute succeeds")
+    {
         ComputedFilterSet::Install(plan) => plan.filters,
         _ => unreachable!("the fixture's rule book is installable"),
     };
-
-    let verdict = orch
-        .neutral_plan_verdict(
+    let neutral = orch
+        .neutral_route_filters(
             sid,
             &book.rule_book,
             orch.fqdn_cache.as_ref(),
-            &std::collections::HashSet::new(),
+            orch.app_observations.as_ref(),
+            &no_denylist,
             false,
             false,
-            crate::enforcement_planner::Ipv6Guard::Off,
-            &live,
+            ipv6,
         )
-        .expect("a well-formed SID yields a verdict");
+        .expect("a well-formed SID is planned")
+        .filters;
+    assert!(!neutral.is_empty(), "the book compiles to rule filters");
+    let installed_ids: std::collections::HashSet<u64> =
+        installed.iter().map(|f| f.id.raw).collect();
+    assert!(
+        neutral.iter().all(|f| installed_ids.contains(&f.id.raw)),
+        "the pass did not install the neutral plan's rule filters"
+    );
 
+    let codegen = crate::wfp_codegen::generate_filters(crate::wfp_codegen::CodegenInput {
+        sid,
+        rule_book: &book.rule_book,
+        fqdn_cache: orch.fqdn_cache.as_ref(),
+        app_observations: orch.app_observations.as_ref(),
+        app_resolver: orch.app_resolver.as_ref(),
+        secondary_ip_denylist: &no_denylist,
+        zone_priority_over_ip: false,
+        app_rules_take_all_addresses: false,
+        families: ipv6.families(),
+        packet_blocks: super::super::PACKET_BLOCKS,
+    })
+    .filters;
+    let verdict = super::super::shadow_compare::verdict_of(&neutral, &codegen);
     assert!(
         verdict.same_set,
-        "neutral plan installs a different filter set: live={} neutral={}",
+        "the codegen the pass still reads describes other filters: installed={} codegen={}",
         verdict.live, verdict.neutral
     );
     assert!(
         verdict.same_order,
-        "neutral plan installs the same filters in a different arbitration order — \
-         WFP resolves overlaps by weight, so that is a different policy"
+        "same filters in another arbitration order: WFP resolves overlaps by weight"
     );
 }
 

@@ -67,7 +67,7 @@ fn served_from_site() -> LiveConnection {
     };
     LiveConnection {
         process_path: image.into(),
-        remote: std::net::Ipv4Addr::new(203, 0, 113, 9),
+        remote: std::net::Ipv4Addr::new(203, 0, 113, 9).into(),
         owner: Some("S-1-5-18".into()),
     }
 }

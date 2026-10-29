@@ -71,8 +71,11 @@ QtObject {
     readonly property color stateDefaultBorder: colorBorder
     readonly property color stateFocusedBorder: colorFocusRing
     // On a control filled with the accent (or the danger colour) the accent
-    // ring has nothing to stand out against; the text colour does.
+    // ring has nothing to stand out against: the outer ring in the text colour
+    // shows against the panel, the inner one in the on-accent colour against
+    // the fill (white on the contrast theme's yellow read at 1.4:1).
     readonly property color stateFocusedBorderOnFill: colorText
+    readonly property color stateFocusedInnerOnFill: colorOnAccent
     readonly property color stateDisabledBorder: Qt.rgba(colorBorder.r, colorBorder.g, colorBorder.b, 0.55)
     readonly property color stateSelectedBorder: colorAccent
 

@@ -665,8 +665,8 @@ impl AdapterMonitor {
 
     /// Poll the source and advance the debounce state machine.
     ///
-    /// `now_ms` is a monotonic millisecond counter (wall clock or injected in
-    /// tests). Returns changes whose debounce window has elapsed.
+    /// `now_ms` is a monotonic millisecond counter (injected in tests).
+    /// Returns changes whose debounce window has elapsed.
     pub fn update(&self, now_ms: u64) -> Vec<AdapterAvailabilityChange> {
         self.last_read_ms.store(now_ms, Ordering::Release);
         let infos = match self.source.enumerate_all() {
@@ -723,6 +723,13 @@ impl AdapterMonitor {
                     pending.insert(idx, (*new_avail, now_ms));
                 }
             }
+        }
+
+        // A clock read earlier than a transition's start says nothing about how
+        // long it has held: its window restarts now rather than waiting for
+        // the clock to catch up.
+        for (_, first_ms) in pending.values_mut() {
+            *first_ms = (*first_ms).min(now_ms);
         }
 
         // Emit any pending transitions whose quiet period has elapsed.
@@ -1184,6 +1191,21 @@ mod tests {
         let changes = mon.update(800);
         assert_eq!(changes.len(), 1);
         assert_eq!(changes[0].new, AdapterAvailability::PresentDown);
+    }
+
+    /// The clock the monitor is read with steps back by hours mid-transition:
+    /// the link change still settles one window later, not once the clock has
+    /// caught up again.
+    #[test]
+    fn a_clock_stepped_back_mid_transition_does_not_hold_the_change() {
+        let (src, mon) = monitor(500);
+        src.set(vec![eth_up_with_ip(5)]);
+        let before = 4 * 60 * 60 * 1000;
+        mon.update(before);
+        assert!(mon.update(1_000).is_empty(), "the window restarts");
+        let changes = mon.update(1_600);
+        assert_eq!(changes.len(), 1, "the change waits for the old clock");
+        assert_eq!(changes[0].new, AdapterAvailability::Available);
     }
 
     #[test]

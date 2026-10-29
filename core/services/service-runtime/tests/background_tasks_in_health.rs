@@ -284,6 +284,14 @@ const THREADS: &[(&str, &str, usize, Verdict)] = &[
         Verdict::Leased(ServiceTaskKind::DnsReconcileWorker),
     ),
     (
+        "service-runtime/src/dns_resolver_ports.rs",
+        "nrr-dns-steering-set",
+        1,
+        Verdict::Bounded(
+            "one rebuild of the steering set at a time; the stale set answers meanwhile",
+        ),
+    ),
+    (
         "service-runtime/src/dns_upstream.rs",
         "nrr-dns-upstream-refresh",
         1,

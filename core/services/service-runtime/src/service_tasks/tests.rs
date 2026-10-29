@@ -652,6 +652,46 @@ fn an_observed_connection_becomes_a_destination_the_rule_can_route() {
     assert_eq!(fold_observations(&wiring), 0);
 }
 
+/// The bare fold learns a program's IPv6 destination as the consumer does:
+/// skipped, the v6 half of a dual-stack program gets no route.
+#[test]
+fn the_bare_fold_learns_an_ipv6_destination_too() {
+    use crate::app_observation_lookup::AppObservationLookup;
+    use nrr_platform_api::conn_observe::{
+        ConnectionObservation, ConnectionProgress, ConnectionVerdict,
+        MockConnectionObservationSource, TransportProtocol,
+    };
+    use std::net::{IpAddr, Ipv6Addr, SocketAddr};
+
+    let remote: Ipv6Addr = "2001:db8::154".parse().expect("v6");
+    let source = Arc::new(MockConnectionObservationSource::new());
+    source.push(ConnectionObservation {
+        pid: 42,
+        process_path: Some("/usr/bin/messenger".to_owned()),
+        user_sid: Some("unix:uid:1000".to_owned()),
+        protocol: TransportProtocol::Tcp,
+        local: SocketAddr::new(IpAddr::V6("2001:db8:1::2".parse().expect("v6")), 40000),
+        remote: SocketAddr::new(IpAddr::V6(remote), 443),
+        verdict: ConnectionVerdict::Unknown,
+        drop_filter_id: None,
+        blocked_by_nrr: None,
+        nrr_drop_spec_id: None,
+        observed_unix_ms: None,
+        progress: ConnectionProgress::Attempt,
+    });
+    let store = Arc::new(crate::app_observation_lookup::AppObservationStore::new());
+    let wiring = AppObservationWiring {
+        source: source.clone(),
+        store: Arc::clone(&store),
+        trace: None,
+        consumer: None,
+        scripts: None,
+    };
+
+    assert_eq!(fold_observations(&wiring), 1);
+    assert_eq!(store.ips_v6_for_app("messenger"), vec![remote]);
+}
+
 /// With a consumer wired, it reads the batch in place of the tee and the bare
 /// fold: the destination is still learnt, and an unstamped row gets the drain
 /// time.
@@ -725,12 +765,12 @@ fn the_live_refresh_pass_restamps_held_destinations_only() {
     source.set(vec![
         LiveConnection {
             process_path: "/usr/bin/messenger".to_string(),
-            remote: Ipv4Addr::new(203, 0, 113, 7),
+            remote: Ipv4Addr::new(203, 0, 113, 7).into(),
             owner: None,
         },
         LiveConnection {
             process_path: "/usr/bin/messenger".to_string(),
-            remote: Ipv4Addr::new(203, 0, 113, 99),
+            remote: Ipv4Addr::new(203, 0, 113, 99).into(),
             owner: None,
         },
     ]);

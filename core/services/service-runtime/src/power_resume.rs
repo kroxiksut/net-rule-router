@@ -119,6 +119,7 @@ pub const MAX_CREDITED_SLEEP: Duration = Duration::from_secs(24 * 60 * 60);
 pub struct SleepLedger {
     /// `(fell asleep, woke)`, sorted and never overlapping.
     sleeps: Mutex<Vec<(SystemTime, SystemTime)>>,
+    wakes: AtomicU64,
 }
 
 impl SleepLedger {
@@ -132,6 +133,12 @@ impl SleepLedger {
             return;
         }
         let mut sleeps = self.sleeps.lock().unwrap_or_else(|p| p.into_inner());
+        if !sleeps
+            .iter()
+            .any(|&(start, end)| fell <= end && start <= woke)
+        {
+            self.wakes.fetch_add(1, Ordering::AcqRel);
+        }
         sleeps.push((fell, woke));
         sleeps.sort_unstable();
         let mut merged: Vec<(SystemTime, SystemTime)> = Vec::with_capacity(sleeps.len());
@@ -144,6 +151,12 @@ impl SleepLedger {
         let excess = merged.len().saturating_sub(SLEEP_LEDGER_CAP);
         merged.drain(..excess);
         *sleeps = merged;
+    }
+
+    /// How many distinct sleeps were recorded: one sleep reported by both
+    /// sources counts once.
+    pub fn wakes(&self) -> u64 {
+        self.wakes.load(Ordering::Acquire)
     }
 
     /// The earliest moment from which `awake` of waking time reaches `now`:

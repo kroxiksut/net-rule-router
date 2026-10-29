@@ -19,7 +19,7 @@
 //! address refreshes `learned_at`, which is what the reader's freshness window
 //! keys on.
 
-use std::net::Ipv4Addr;
+use std::net::IpAddr;
 
 use rusqlite::{params, Connection};
 
@@ -46,7 +46,7 @@ pub struct RememberedDestination {
     /// including every row written before rows had owners.
     pub owner: Option<String>,
     pub app_key: String,
-    pub ip: Ipv4Addr,
+    pub ip: IpAddr,
 }
 
 fn stored_owner(owner: Option<&str>) -> &str {
@@ -73,7 +73,7 @@ impl<'c> AppDestinationsRepository<'c> {
         &self,
         owner: Option<&str>,
         app_key: &str,
-        ips: &[Ipv4Addr],
+        ips: &[IpAddr],
         now: i64,
     ) -> StorageResult<()> {
         if app_key.trim().is_empty() || ips.is_empty() {
@@ -118,7 +118,7 @@ impl<'c> AppDestinationsRepository<'c> {
     /// host route it produced. A destination withdrawn because it was moving
     /// somebody ELSE's traffic has to leave immediately, hence this explicit
     /// delete. Idempotent: removing what is not there is not an error.
-    pub fn forget(&self, owner: Option<&str>, app_key: &str, ip: Ipv4Addr) -> StorageResult<bool> {
+    pub fn forget(&self, owner: Option<&str>, app_key: &str, ip: IpAddr) -> StorageResult<bool> {
         let removed = self
             .conn
             .execute(
@@ -139,7 +139,7 @@ impl<'c> AppDestinationsRepository<'c> {
     ///
     /// A row whose `ip` fails to parse is skipped rather than failing the whole
     /// load — a can't-happen guard against a hand-edited database (this module
-    /// only ever writes `Ipv4Addr::to_string`).
+    /// only ever writes `IpAddr::to_string`).
     pub fn load_confirmed_since(
         &self,
         confirmed_since: i64,
@@ -168,7 +168,7 @@ impl<'c> AppDestinationsRepository<'c> {
             let (sid, app_key, raw) = row.map_err(|e| {
                 StorageError::Internal(format!("app_observed_destinations row: {e}"))
             })?;
-            if let Ok(ip) = raw.parse::<Ipv4Addr>() {
+            if let Ok(ip) = raw.parse::<IpAddr>() {
                 out.push(RememberedDestination {
                     owner: (sid != NO_OWNER).then_some(sid),
                     app_key,
@@ -211,11 +211,17 @@ mod tests {
         runner.into_connection()
     }
 
-    fn ip(d: u8) -> Ipv4Addr {
-        Ipv4Addr::new(203, 0, 113, d)
+    use std::net::Ipv4Addr;
+
+    fn ip(d: u8) -> IpAddr {
+        IpAddr::V4(Ipv4Addr::new(203, 0, 113, d))
     }
 
-    fn row(owner: Option<&str>, app: &str, ip: Ipv4Addr) -> RememberedDestination {
+    fn net(d: u8) -> IpAddr {
+        IpAddr::V4(Ipv4Addr::new(198, 51, 100, d))
+    }
+
+    fn row(owner: Option<&str>, app: &str, ip: IpAddr) -> RememberedDestination {
         RememberedDestination {
             owner: owner.map(str::to_owned),
             app_key: app.to_owned(),
@@ -349,22 +355,13 @@ mod tests {
         let repo = AppDestinationsRepository::new(&conn);
         let total = MAX_DESTINATIONS_PER_APP + 4;
         for i in 0..total {
-            repo.upsert(
-                None,
-                "busy.exe",
-                &[Ipv4Addr::new(198, 51, 100, i as u8)],
-                1_000 + i as i64,
-            )
-            .expect("upsert");
+            repo.upsert(None, "busy.exe", &[net(i as u8)], 1_000 + i as i64)
+                .expect("upsert");
         }
         let kept = repo.load_confirmed_since(0).expect("load");
         assert_eq!(kept.len(), MAX_DESTINATIONS_PER_APP);
-        assert!(!kept.contains(&row(None, "busy.exe", Ipv4Addr::new(198, 51, 100, 0))));
-        assert!(kept.contains(&row(
-            None,
-            "busy.exe",
-            Ipv4Addr::new(198, 51, 100, (total - 1) as u8)
-        )));
+        assert!(!kept.contains(&row(None, "busy.exe", net(0))));
+        assert!(kept.contains(&row(None, "busy.exe", net((total - 1) as u8))));
     }
 
     /// One user's busy program cannot evict another user's rows for it: the
@@ -376,13 +373,8 @@ mod tests {
         repo.upsert(BOB, "busy.exe", &[ip(1)], 1)
             .expect("bob, oldest");
         for i in 0..MAX_DESTINATIONS_PER_APP + 4 {
-            repo.upsert(
-                ALICE,
-                "busy.exe",
-                &[Ipv4Addr::new(198, 51, 100, i as u8)],
-                1_000 + i as i64,
-            )
-            .expect("alice");
+            repo.upsert(ALICE, "busy.exe", &[net(i as u8)], 1_000 + i as i64)
+                .expect("alice");
         }
         let kept = repo.load_confirmed_since(0).expect("load");
         let alices = kept.iter().filter(|r| r.owner.as_deref() == ALICE).count();
@@ -445,6 +437,27 @@ mod tests {
         repo.upsert(ALICE, "messenger.exe", &[], 1_000)
             .expect("empty ips");
         assert!(repo.load_confirmed_since(0).expect("load").is_empty());
+    }
+
+    /// A program on a dual-stack network uses IPv6 destinations too; one
+    /// dropped on load starts every session cold on that family again.
+    #[test]
+    fn an_ipv6_destination_survives_a_restart() {
+        let conn = migrated_conn();
+        conn.execute(
+            "INSERT INTO app_observed_destinations (sid, app_key, ip, learned_at)
+             VALUES ('uid:1000', 'messenger.exe', '2001:db8::5', 1000)",
+            [],
+        )
+        .expect("a v6 row as an earlier session wrote it");
+        let repo = AppDestinationsRepository::new(&conn);
+        assert_eq!(repo.load_confirmed_since(0).expect("load").len(), 1);
+        let v6: IpAddr = "2001:db8::5".parse().expect("v6");
+        repo.upsert(ALICE, "messenger.exe", &[v6], 2_000)
+            .expect("re-confirm");
+        assert_eq!(loaded(&repo, 1_500), vec![row(ALICE, "messenger.exe", v6)]);
+        assert!(repo.forget(ALICE, "messenger.exe", v6).expect("forget"));
+        assert!(loaded(&repo, 0).is_empty());
     }
 
     #[test]

@@ -156,11 +156,7 @@ pub fn build_adapter_monitor_task(
         ADAPTER_MONITOR_INTERVAL,
         RECOVERABLE_DEFAULT_MAX_RESTARTS,
         move |_stop| {
-            let now_ms = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .map(|d| d.as_millis() as u64)
-                .unwrap_or(0);
-            let changes = monitor.update_if_due(now_ms);
+            let changes = monitor.update_if_due(adapter_monitor_clock_ms());
             // An adapter coming up/down (the secondary adapter connecting
             // mid-session, or dropping) must PROMPTLY re-drive the route table:
             // secondary traffic should start flowing through the tunnel the
@@ -199,6 +195,15 @@ pub fn build_adapter_monitor_task(
             TaskOutcome::Continue
         },
     )
+}
+
+/// The adapter monitor's clock: monotonic and process-wide, so an NTP step
+/// neither holds a link change back nor cuts its debounce short, and a
+/// restarted task reads on from where the last one stopped.
+fn adapter_monitor_clock_ms() -> u64 {
+    static ORIGIN: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
+    let elapsed = ORIGIN.get_or_init(Instant::now).elapsed();
+    u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX)
 }
 
 /// Interfaces that carried traffic before `changes` and no longer do.

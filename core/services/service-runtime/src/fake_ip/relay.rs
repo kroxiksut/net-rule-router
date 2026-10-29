@@ -100,6 +100,12 @@ pub trait FlowOwners: Send + Sync {
         destination: SocketAddr,
         transport: Option<FlowTransport>,
     ) -> FlowOwner;
+
+    /// Whether more than one user is served now, so the relay's flows are
+    /// shared between them.
+    fn several_served(&self) -> bool {
+        false
+    }
 }
 
 /// Why [`RelayCore::for_owner`] refused a flow.
@@ -464,6 +470,12 @@ impl RelayCore {
         }
         target.owner = Some(principal);
         Ok(target)
+    }
+
+    /// See [`FlowOwners::several_served`].
+    #[must_use]
+    pub fn several_users_served(&self) -> bool {
+        self.owners.several_served()
     }
 
     /// See [`RouteSelector::policy_stamp`].

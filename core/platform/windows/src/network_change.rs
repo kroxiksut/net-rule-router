@@ -27,9 +27,9 @@ use std::ffi::c_void;
 use windows::Win32::Foundation::{HANDLE, NO_ERROR};
 #[cfg(target_os = "windows")]
 use windows::Win32::NetworkManagement::IpHelper::{
-    CancelMibChangeNotify2, NotifyIpInterfaceChange, NotifyRouteChange2,
-    NotifyUnicastIpAddressChange, MIB_IPFORWARD_ROW2, MIB_IPINTERFACE_ROW, MIB_NOTIFICATION_TYPE,
-    MIB_UNICASTIPADDRESS_ROW,
+    CancelMibChangeNotify2, MibAddInstance, MibDeleteInstance, NotifyIpInterfaceChange,
+    NotifyRouteChange2, NotifyUnicastIpAddressChange, MIB_IPFORWARD_ROW2, MIB_IPINTERFACE_ROW,
+    MIB_NOTIFICATION_TYPE, MIB_UNICASTIPADDRESS_ROW,
 };
 #[cfg(target_os = "windows")]
 use windows::Win32::Networking::WinSock::AF_UNSPEC;
@@ -44,6 +44,8 @@ use crate::error::PlatformError;
 #[cfg(target_os = "windows")]
 struct ObserverContext {
     on_change: NetworkChangeCallback,
+    /// Route notices of our own noted writes are not reported.
+    skip_own_routes: bool,
 }
 
 /// Common body for both change callbacks: read the context and poke the caller.
@@ -83,9 +85,36 @@ unsafe extern "system" fn interface_change_callback(
 #[cfg(target_os = "windows")]
 unsafe extern "system" fn route_change_callback(
     caller_context: *const c_void,
-    _row: *const MIB_IPFORWARD_ROW2,
-    _notification_type: MIB_NOTIFICATION_TYPE,
+    row: *const MIB_IPFORWARD_ROW2,
+    notification_type: MIB_NOTIFICATION_TYPE,
 ) {
+    if caller_context.is_null() {
+        return;
+    }
+    // SAFETY: as in `fire`: the context outlives every callback.
+    let ctx = &*(caller_context as *const ObserverContext);
+    if ctx.skip_own_routes && !row.is_null() {
+        let removed = if notification_type == MibAddInstance {
+            Some(false)
+        } else if notification_type == MibDeleteInstance {
+            Some(true)
+        } else {
+            None
+        };
+        // SAFETY: a non-null row is valid for the duration of the callback.
+        let row = &*row;
+        let echo = removed.is_some_and(|removed| {
+            crate::win32_ffi::route_table::is_own_echo(
+                row,
+                removed,
+                nrr_platform_api::own_route_writes::process_route_writes(),
+                std::time::Instant::now(),
+            )
+        });
+        if echo {
+            return;
+        }
+    }
     fire(caller_context);
 }
 
@@ -157,97 +186,115 @@ impl NetworkChangeObserver for WindowsNetworkChangeObserver {
         &self,
         on_change: NetworkChangeCallback,
     ) -> Result<NetworkChangeSubscription, PlatformError> {
-        // Leak the context to a raw pointer; ownership moves into the guard,
-        // which frees it on drop (after cancelling the notifications).
-        let context = Box::into_raw(Box::new(ObserverContext { on_change }));
-        let mut interface_handle = HANDLE::default();
-        let mut route_handle = HANDLE::default();
-        let mut address_handle = HANDLE::default();
-
-        // SAFETY: `context` is a live, non-null Box pointer kept alive in the
-        // returned guard until after cancellation; `interface_change_callback`
-        // is a valid `extern "system"` fn matching the expected signature;
-        // `&mut interface_handle` is a valid out-pointer on this frame.
-        // `false` = no synchronous initial notification.
-        let iface_status = unsafe {
-            NotifyIpInterfaceChange(
-                AF_UNSPEC,
-                Some(interface_change_callback),
-                Some(context as *const c_void),
-                false,
-                &mut interface_handle,
-            )
-        };
-        if iface_status != NO_ERROR {
-            // SAFETY: no notification was registered against `context`, so it is
-            // exclusively owned here; reclaim it.
-            unsafe { drop(Box::from_raw(context)) };
-            return Err(PlatformError::Win32 {
-                operation: "NotifyIpInterfaceChange",
-                code: iface_status.0,
-                message: format!("NotifyIpInterfaceChange → Win32 error {}", iface_status.0),
-            });
-        }
-
-        // SAFETY: same context/callback/out-pointer validity as above.
-        let route_status = unsafe {
-            NotifyRouteChange2(
-                AF_UNSPEC,
-                Some(route_change_callback),
-                context as *const c_void,
-                false,
-                &mut route_handle,
-            )
-        };
-        if route_status != NO_ERROR {
-            // SAFETY: the interface notification IS live against `context`;
-            // cancel it first (quiesces callbacks) THEN free the context.
-            unsafe {
-                let _ = CancelMibChangeNotify2(interface_handle);
-                drop(Box::from_raw(context));
-            }
-            return Err(PlatformError::Win32 {
-                operation: "NotifyRouteChange2",
-                code: route_status.0,
-                message: format!("NotifyRouteChange2 → Win32 error {}", route_status.0),
-            });
-        }
-
-        // SAFETY: same context/callback/out-pointer validity as above.
-        let address_status = unsafe {
-            NotifyUnicastIpAddressChange(
-                AF_UNSPEC,
-                Some(address_change_callback),
-                Some(context as *const c_void),
-                false,
-                &mut address_handle,
-            )
-        };
-        if address_status != NO_ERROR {
-            // SAFETY: both earlier notifications are live against `context`;
-            // cancel them (quiescing callbacks) THEN free the context.
-            unsafe {
-                let _ = CancelMibChangeNotify2(interface_handle);
-                let _ = CancelMibChangeNotify2(route_handle);
-                drop(Box::from_raw(context));
-            }
-            return Err(PlatformError::Win32 {
-                operation: "NotifyUnicastIpAddressChange",
-                code: address_status.0,
-                message: format!(
-                    "NotifyUnicastIpAddressChange → Win32 error {}",
-                    address_status.0
-                ),
-            });
-        }
-
-        Ok(NetworkChangeSubscription::new(Box::new(
-            WindowsSubscriptionGuard {
-                interface_handle,
-                route_handle,
-                address_handle,
-                context,
-            },
-        )))
+        subscribe_with(on_change, false)
     }
+
+    fn subscribe_foreign(
+        &self,
+        on_change: NetworkChangeCallback,
+    ) -> Result<NetworkChangeSubscription, PlatformError> {
+        subscribe_with(on_change, true)
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn subscribe_with(
+    on_change: NetworkChangeCallback,
+    skip_own_routes: bool,
+) -> Result<NetworkChangeSubscription, PlatformError> {
+    // Leak the context to a raw pointer; ownership moves into the guard,
+    // which frees it on drop (after cancelling the notifications).
+    let context = Box::into_raw(Box::new(ObserverContext {
+        on_change,
+        skip_own_routes,
+    }));
+    let mut interface_handle = HANDLE::default();
+    let mut route_handle = HANDLE::default();
+    let mut address_handle = HANDLE::default();
+
+    // SAFETY: `context` is a live, non-null Box pointer kept alive in the
+    // returned guard until after cancellation; `interface_change_callback`
+    // is a valid `extern "system"` fn matching the expected signature;
+    // `&mut interface_handle` is a valid out-pointer on this frame.
+    // `false` = no synchronous initial notification.
+    let iface_status = unsafe {
+        NotifyIpInterfaceChange(
+            AF_UNSPEC,
+            Some(interface_change_callback),
+            Some(context as *const c_void),
+            false,
+            &mut interface_handle,
+        )
+    };
+    if iface_status != NO_ERROR {
+        // SAFETY: no notification was registered against `context`, so it is
+        // exclusively owned here; reclaim it.
+        unsafe { drop(Box::from_raw(context)) };
+        return Err(PlatformError::Win32 {
+            operation: "NotifyIpInterfaceChange",
+            code: iface_status.0,
+            message: format!("NotifyIpInterfaceChange → Win32 error {}", iface_status.0),
+        });
+    }
+
+    // SAFETY: same context/callback/out-pointer validity as above.
+    let route_status = unsafe {
+        NotifyRouteChange2(
+            AF_UNSPEC,
+            Some(route_change_callback),
+            context as *const c_void,
+            false,
+            &mut route_handle,
+        )
+    };
+    if route_status != NO_ERROR {
+        // SAFETY: the interface notification IS live against `context`;
+        // cancel it first (quiesces callbacks) THEN free the context.
+        unsafe {
+            let _ = CancelMibChangeNotify2(interface_handle);
+            drop(Box::from_raw(context));
+        }
+        return Err(PlatformError::Win32 {
+            operation: "NotifyRouteChange2",
+            code: route_status.0,
+            message: format!("NotifyRouteChange2 → Win32 error {}", route_status.0),
+        });
+    }
+
+    // SAFETY: same context/callback/out-pointer validity as above.
+    let address_status = unsafe {
+        NotifyUnicastIpAddressChange(
+            AF_UNSPEC,
+            Some(address_change_callback),
+            Some(context as *const c_void),
+            false,
+            &mut address_handle,
+        )
+    };
+    if address_status != NO_ERROR {
+        // SAFETY: both earlier notifications are live against `context`;
+        // cancel them (quiescing callbacks) THEN free the context.
+        unsafe {
+            let _ = CancelMibChangeNotify2(interface_handle);
+            let _ = CancelMibChangeNotify2(route_handle);
+            drop(Box::from_raw(context));
+        }
+        return Err(PlatformError::Win32 {
+            operation: "NotifyUnicastIpAddressChange",
+            code: address_status.0,
+            message: format!(
+                "NotifyUnicastIpAddressChange → Win32 error {}",
+                address_status.0
+            ),
+        });
+    }
+
+    Ok(NetworkChangeSubscription::new(Box::new(
+        WindowsSubscriptionGuard {
+            interface_handle,
+            route_handle,
+            address_handle,
+            context,
+        },
+    )))
 }

@@ -47,6 +47,8 @@ use windows::Win32::Networking::WinSock::{
     SOCKADDR_IN6, SOCKADDR_IN6_0, SOCKADDR_INET,
 };
 
+use nrr_platform_api::own_route_writes::{process_route_writes, OwnRouteWrites, RouteChangeKey};
+
 use crate::error::PlatformError;
 use crate::types::RouteEntry;
 
@@ -229,18 +231,31 @@ fn read_ipv4_from_inet(addr: &SOCKADDR_INET) -> Option<Ipv4Addr> {
 /// for routes installed by user-mode management code.
 pub fn add_route(entry: &RouteEntry) -> Result<(), PlatformError> {
     let row = build_row(entry, /* with_protocol */ true);
-    // SAFETY: `row` is a `repr(C)` `MIB_IPFORWARD_ROW2` populated with
-    // valid IPv4 SOCKADDR_INET fields and a non-zero `InterfaceIndex`.
-    // Win32 reads it but never retains the pointer past the call.
-    let code = unsafe { CreateIpForwardEntry2(&row).0 };
-    if code == NO_ERROR.0 {
-        return Ok(());
-    }
-    Err(PlatformError::Win32 {
-        operation: CREATE_OP,
-        code,
-        message: format!("Win32 error {code}"),
+    process_route_writes().noted(RouteChangeKey::of(entry, false), || {
+        // SAFETY: `row` is a `repr(C)` `MIB_IPFORWARD_ROW2` populated with
+        // valid IPv4 SOCKADDR_INET fields and a non-zero `InterfaceIndex`.
+        // Win32 reads it but never retains the pointer past the call.
+        let code = unsafe { CreateIpForwardEntry2(&row).0 };
+        if code == NO_ERROR.0 {
+            return Ok(());
+        }
+        Err(PlatformError::Win32 {
+            operation: CREATE_OP,
+            code,
+            message: format!("Win32 error {code}"),
+        })
     })
+}
+
+/// Whether a route notice of `row` is the echo of a change this process noted;
+/// the echo is consumed.
+pub(crate) fn is_own_echo(
+    row: &MIB_IPFORWARD_ROW2,
+    removed: bool,
+    writes: &OwnRouteWrites,
+    now: std::time::Instant,
+) -> bool {
+    decode_row(row).is_some_and(|entry| writes.take_echo(RouteChangeKey::of(&entry, removed), now))
 }
 
 /// Delete a route. Win32 matches the row by destination prefix and
@@ -248,15 +263,17 @@ pub fn add_route(entry: &RouteEntry) -> Result<(), PlatformError> {
 /// `DeleteIpForwardEntry2`, so we fill them too.
 pub fn delete_route(entry: &RouteEntry) -> Result<(), PlatformError> {
     let row = build_row(entry, /* with_protocol */ false);
-    // SAFETY: same as [`add_route`].
-    let code = unsafe { DeleteIpForwardEntry2(&row).0 };
-    if code == NO_ERROR.0 {
-        return Ok(());
-    }
-    Err(PlatformError::Win32 {
-        operation: DELETE_OP,
-        code,
-        message: format!("Win32 error {code}"),
+    process_route_writes().noted(RouteChangeKey::of(entry, true), || {
+        // SAFETY: same as [`add_route`].
+        let code = unsafe { DeleteIpForwardEntry2(&row).0 };
+        if code == NO_ERROR.0 {
+            return Ok(());
+        }
+        Err(PlatformError::Win32 {
+            operation: DELETE_OP,
+            code,
+            message: format!("Win32 error {code}"),
+        })
     })
 }
 
@@ -385,6 +402,35 @@ mod tests {
         for r in &routes {
             assert!(!r.is_ours, "FFI never marks routes as ours");
         }
+    }
+
+    /// The notice of a route we added is our echo; the same route removed by
+    /// someone else, or another route, is news.
+    #[test]
+    fn the_notice_of_our_own_write_is_recognised_by_its_row() {
+        let ours = RouteEntry {
+            destination: IpAddr::V4(Ipv4Addr::new(203, 0, 113, 7)),
+            prefix_length: 32,
+            next_hop: IpAddr::V4(Ipv4Addr::new(10, 88, 0, 1)),
+            interface_index: 12,
+            metric: 5,
+            is_ours: true,
+            table: nrr_platform_api::RouteTableRef::Main,
+        };
+        let other = RouteEntry {
+            destination: IpAddr::V4(Ipv4Addr::new(203, 0, 113, 8)),
+            ..ours.clone()
+        };
+        let writes = OwnRouteWrites::default();
+        let now = std::time::Instant::now();
+        writes.expect(RouteChangeKey::of(&ours, false), now);
+        let row = build_row(&ours, true);
+        assert!(!is_own_echo(&build_row(&other, true), false, &writes, now));
+        assert!(
+            !is_own_echo(&row, true, &writes, now),
+            "a removal we did not make"
+        );
+        assert!(is_own_echo(&row, false, &writes, now));
     }
 
     /// Round-trip: build a row, decode it back, expect the same fields.

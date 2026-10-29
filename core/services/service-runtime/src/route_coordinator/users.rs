@@ -100,15 +100,18 @@ impl SecondaryRouteCoordinator {
             &tunnel_catch_alls,
             &networks,
         );
-        // DNS-over-secondary — the route half of the setting. Emitted here, not
-        // in `generate_routes`, because it is not derived from the rule book:
-        // it is service-owned infrastructure that must ride the same reconcile
-        // (and the same teardown) as everything else we install.
-        if self
-            .dns_via_secondary
-            .as_ref()
-            .is_some_and(|f| f.load(std::sync::atomic::Ordering::Relaxed))
-        {
+        // The route half of where the service's own queries go. Emitted here,
+        // not in `generate_routes`: it is service-owned infrastructure that
+        // must ride the same reconcile (and the same teardown) as everything
+        // else we install.
+        let resolvers = self.dns_via_secondary.as_ref().map_or(&[][..], |flag| {
+            let setting_on = flag.load(std::sync::atomic::Ordering::Relaxed);
+            let names_hosts = !setting_on
+                && crate::rule_host_index::RuleHostIndex::build(&snapshot.rule_book.secondary)
+                    .names_any_host();
+            crate::dns_egress::resolvers_via_tunnel(setting_on, names_hosts)
+        });
+        if !resolvers.is_empty() {
             // One failed probe pulls the resolver routes: for the hysteresis
             // window of the dead verdict these `/32`s would blackhole every
             // direct dial to the public resolvers, a VPN client's own bootstrap
@@ -121,10 +124,8 @@ impl SecondaryRouteCoordinator {
                     "DNS-over-secondary: last tunnel probe failed — leaving the public resolvers on the primary path until the tunnel answers again",
                 );
             } else {
-                let dns_routes = crate::route_codegen::dns_via_secondary_routes(
-                    crate::dns_egress::PUBLIC_DNS_SERVERS,
-                    &secondary,
-                );
+                let dns_routes =
+                    crate::route_codegen::dns_via_secondary_routes(resolvers, &secondary);
                 tracing::debug!(
                     target: "nrr::route-coordinator",
                     sid = %sid,
@@ -186,7 +187,7 @@ impl SecondaryRouteCoordinator {
         // One cache reading for every user's plan: the book walks run in memory,
         // not one SQLite query per host.
         let snapshot = self.fqdn_cache.snapshot_for_compute();
-        let cache = snapshot_or_live(snapshot.as_ref(), self.fqdn_cache.as_ref());
+        let cache = snapshot_or_live(snapshot.as_deref(), self.fqdn_cache.as_ref());
         crate::kept_direct::retain_only(served);
         self.keep_machine_reads(served);
         let mut foreign: Vec<Vec<u32>> = Vec::with_capacity(served.len());

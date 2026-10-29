@@ -275,7 +275,7 @@ impl PolicyLocalNetworkSource {
                     let rules = self.rules.active_rules_for(sid)?;
                     let snapshot = self.fqdn_cache.snapshot_for_compute();
                     let cache = crate::fqdn_cache_lookup::snapshot_or_live(
-                        snapshot.as_ref(),
+                        snapshot.as_deref(),
                         self.fqdn_cache.as_ref(),
                     );
                     Some(crate::address_ownership::AddressOwnership::resolve(

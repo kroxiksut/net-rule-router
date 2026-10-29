@@ -5,6 +5,12 @@ use super::*;
 
 pub(super) use crate::fqdn_cache_lookup::snapshot_or_live;
 
+/// What a pass planned one principal's routes from.
+pub(super) struct PlanInputs {
+    policy: Option<PerSidPolicySnapshot>,
+    rule_book: nrr_domain::canonical::CanonicalRuleBook,
+}
+
 impl SecondaryRouteCoordinator {
     /// active-probe liveness gate on the SECONDARY only
     /// (never the primary — the real link must never be probed / fail-closed).
@@ -121,13 +127,43 @@ impl SecondaryRouteCoordinator {
         }
     }
 
-    /// The routes `sid`'s rule book asks for under `resolution` — the one
-    /// lowering a full recompute and a first-contact install share, so the two
-    /// cannot disagree about an address.
+    /// The routes `sid`'s rule book asks for under `resolution`, for a pass:
+    /// the book and policy are kept for the first contacts until the next.
     #[allow(clippy::too_many_arguments)]
     pub(super) fn planned_routes(
         &self,
-        _sid: &str,
+        sid: &str,
+        resolution: &RouteResolution,
+        stored_policy: Option<&PerSidPolicySnapshot>,
+        secondary: &SecondaryRouteTarget,
+        rule_book: &nrr_domain::canonical::CanonicalRuleBook,
+        cache: &dyn crate::fqdn_cache_lookup::FqdnCacheLookup,
+        tunnel_catch_alls: &[(Ipv4Addr, u8)],
+        networks: &crate::route_codegen::network_routes::NetworkRouteFacts,
+    ) -> crate::route_codegen::RouteCodegenOutput {
+        self.pass_inputs.record(
+            sid,
+            PlanInputs {
+                policy: stored_policy.cloned(),
+                rule_book: rule_book.clone(),
+            },
+        );
+        self.routes_from(
+            resolution,
+            stored_policy,
+            secondary,
+            rule_book,
+            cache,
+            tunnel_catch_alls,
+            networks,
+        )
+    }
+
+    /// The one lowering a full recompute and a first-contact install share,
+    /// so the two cannot disagree about an address.
+    #[allow(clippy::too_many_arguments)]
+    fn routes_from(
+        &self,
         resolution: &RouteResolution,
         stored_policy: Option<&PerSidPolicySnapshot>,
         secondary: &SecondaryRouteTarget,
@@ -217,8 +253,10 @@ impl SecondaryRouteCoordinator {
     /// Routes `addresses` now, the way the next full recompute for `sid` will,
     /// so a rule host's first connect to a new address leaves through the link
     /// its rule names instead of racing that recompute. Plans from the
-    /// resolution the last recompute used — nothing enumerates adapters on the
-    /// DNS path — and installs only the `/32`s the planner asks for these
+    /// resolution, book and policy the last recompute used — nothing
+    /// enumerates adapters or reads the stores on the DNS path; a rule edited
+    /// since waits for the pass the first contact forces — and installs only
+    /// the `/32`s the planner asks for these
     /// addresses: one it declines (a shared address, a main-link claim) stays
     /// unrouted, and so does one another signed-in user already routes through
     /// a different link. An IPv6 address gets its `/128` the same way, or
@@ -255,18 +293,28 @@ impl SecondaryRouteCoordinator {
         {
             return 0;
         }
-        let Some(snapshot) = self.rules_provider.active_rules_for(sid) else {
-            return 0;
+        // The last pass's book and policy: the stores sit behind the lock every
+        // settings write takes. Only before any pass are they read here.
+        let inputs = match self.pass_inputs.last(sid) {
+            Some(inputs) => inputs,
+            None => {
+                let Some(snapshot) = self.rules_provider.active_rules_for(sid) else {
+                    return 0;
+                };
+                std::sync::Arc::new(PlanInputs {
+                    policy: self.route_source.load_for_sid(sid),
+                    rule_book: snapshot.rule_book,
+                })
+            }
         };
         let scoped = self.fqdn_cache.snapshot_for_addresses(addresses);
         let cache = snapshot_or_live(scoped.as_ref(), self.fqdn_cache.as_ref());
         let wanted: Vec<RouteEntry> = self
-            .planned_routes(
-                sid,
+            .routes_from(
                 &resolution,
-                self.route_source.load_for_sid(sid).as_ref(),
+                inputs.policy.as_ref(),
                 &secondary,
-                &snapshot.rule_book,
+                &inputs.rule_book,
                 cache,
                 &[],
                 &crate::kept_direct::published_facts(sid),

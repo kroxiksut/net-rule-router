@@ -55,6 +55,9 @@ pub const KEY_FILE_NAME: &str = "db-mac-key.bin";
 /// The re-sign-pending marker, kept beside the key under the same mode.
 const RESIGN_MARKER_FILE_NAME: &str = "db-mac-resign-pending.bin";
 
+/// The record of the active rules, beside the key like the marker.
+const RULES_ANCHOR_FILE_NAME: &str = "db-mac-rules-anchor.bin";
+
 /// Owner-only directory mode (`rwx------`).
 const DIR_MODE: u32 = 0o700;
 
@@ -104,6 +107,11 @@ impl FileKeyStore {
     /// The re-sign-pending marker's path, a sibling of the key file.
     pub fn resign_marker_path(&self) -> PathBuf {
         self.path.with_file_name(RESIGN_MARKER_FILE_NAME)
+    }
+
+    /// The active-rules record's path, a sibling of the key file.
+    pub fn rules_anchor_path(&self) -> PathBuf {
+        self.path.with_file_name(RULES_ANCHOR_FILE_NAME)
     }
 
     /// Contents at `path`; `None` when absent or zero-length.
@@ -187,6 +195,20 @@ impl KeyStore for FileKeyStore {
 
     fn delete_resign_marker(&self) -> Result<(), PlatformError> {
         Self::remove(&self.resign_marker_path())
+    }
+
+    fn save_rules_anchor(&self, record: &[u8]) -> Result<(), PlatformError> {
+        self.write_owner_only(&self.rules_anchor_path(), record)
+    }
+
+    // A zero-length file is a record cut short, not one never written.
+    fn load_rules_anchor(&self) -> Result<Option<Vec<u8>>, PlatformError> {
+        let path = self.rules_anchor_path();
+        match std::fs::read(&path) {
+            Ok(bytes) => Ok(Some(bytes)),
+            Err(e) if e.kind() == ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(classify("key_store::load_rules_anchor", &path, e)),
+        }
     }
 }
 
@@ -300,6 +322,26 @@ mod tests {
         store.delete().expect("delete");
         assert_eq!(store.load().expect("load"), None);
         store.delete().expect("delete again is ok");
+    }
+
+    /// A truncated record read as "never written" would pass for an upgrade
+    /// and hide the change it replaced.
+    #[test]
+    fn the_rules_record_is_0600_beside_the_key_and_a_truncated_one_is_not_absent() {
+        let dir = temp_dir();
+        let store = store_in(&dir);
+        assert_eq!(store.load_rules_anchor().expect("load empty"), None);
+        store.save_rules_anchor(b"record").expect("save");
+        let path = store.rules_anchor_path();
+        assert_eq!(path.parent(), store.path().parent());
+        let mode = std::fs::metadata(&path).expect("stat").permissions().mode();
+        assert_eq!(mode & 0o777, FILE_MODE);
+        assert_eq!(
+            store.load_rules_anchor().expect("load"),
+            Some(b"record".to_vec())
+        );
+        std::fs::write(&path, []).expect("truncate");
+        assert_eq!(store.load_rules_anchor().expect("load"), Some(Vec::new()));
     }
 
     #[test]

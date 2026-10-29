@@ -5,7 +5,8 @@
 //! service components — all already used by the seeder / observer, so the
 //! resolver reuses the existing enforcement path rather than inventing one:
 //!
-//! - [`ActiveRuleHostOracle`] — rule matching via `rule_set_matches` (SSOT).
+//! - [`ActiveRuleHostOracle`] — rule matching via `rule_covers` (SSOT), over
+//!   the rules a name index says can match.
 //! - [`PortUpstreamResolver`] — upstream via the platform [`DnsResolverPort`].
 //! - [`CacheFactSink`] — FQDN-cache upsert via [`CacheRepository`].
 //!
@@ -23,7 +24,6 @@ use nrr_storage::repository::CacheRepository;
 use nrr_storage::resolution_source::StorageResolutionSource;
 
 use crate::dns_address_sanity::{classify_answer, AnswerSanity};
-use crate::dns_observation_consumer::rule_set_matches;
 use crate::dns_resolver::{
     FactSink, ReconcileOutcome, ResolveError, ResolvedAddresses, RuleHostOracle, SyncReconciler,
     UpstreamResolver,
@@ -109,25 +109,118 @@ pub fn principals_of_routing_user(
 /// so the host's owners are the users whose rules name it. Only secondary rules
 /// are enforced destinations, so a primary-only match is NOT a rule host.
 pub struct ActiveRuleHostOracle {
-    rules_provider: Arc<dyn RulesProvider>,
+    books: RememberedBooks,
     principals: ResolverPrincipalsFn,
     paused: Option<Arc<crate::routing_pause::PausedPrincipals>>,
-    /// Moves whenever an input the books are made of moves.
-    books_stamp: Arc<dyn Fn() -> u64 + Send + Sync>,
-    /// Each served user's secondary rules as last read: a query must not wait
-    /// on the store's lock, which every writer holds.
-    books: Mutex<HashMap<String, SecondaryMemo>>,
 }
 
-struct SecondaryMemo {
+/// Each user's rule book as last read: a DNS answer or a relayed flow must not
+/// wait on the store's lock, which every writer holds.
+pub(crate) struct RememberedBooks {
+    rules_provider: Arc<dyn RulesProvider>,
+    /// Moves whenever an input the books are made of moves.
+    books_stamp: Arc<dyn Fn() -> u64 + Send + Sync>,
+    books: Mutex<HashMap<String, BookMemo>>,
+}
+
+struct BookMemo {
     stamp: u64,
     read_at: Instant,
-    secondary: Option<Arc<nrr_domain::canonical::CanonicalRuleSet>>,
+    book: Option<Arc<RememberedBook>>,
+}
+
+/// One user's book, its secondary rules indexed by name once per change.
+pub(crate) struct RememberedBook {
+    pub(crate) rule_book: nrr_domain::canonical::CanonicalRuleBook,
+    secondary_names: crate::rule_host_index::RuleHostIndex,
+}
+
+impl RememberedBook {
+    fn new(rule_book: nrr_domain::canonical::CanonicalRuleBook) -> Self {
+        let secondary_names = crate::rule_host_index::RuleHostIndex::build(&rule_book.secondary);
+        Self {
+            rule_book,
+            secondary_names,
+        }
+    }
+
+    /// An enabled secondary rule names `hostname`, as `rule_set_matches` says.
+    pub(crate) fn names(&self, hostname: &str) -> bool {
+        crate::dns_observation_consumer::any_rule_covers(
+            hostname,
+            self.secondary_names
+                .candidates(hostname, &self.rule_book.secondary),
+        )
+    }
+
+    /// The secondary rules route `hostname` only through a public zone.
+    pub(crate) fn held_only_by_public_zone(&self, hostname: &str) -> bool {
+        crate::dns_observation_consumer::held_only_by_public_zone_among(
+            hostname,
+            self.secondary_names
+                .candidates(hostname, &self.rule_book.secondary),
+        )
+    }
 }
 
 /// How long a remembered book is trusted with no event: a change that moves
 /// no counter (a setting written beside the books) shows within this.
 const BOOK_MEMO_TTL: Duration = Duration::from_secs(2);
+
+impl RememberedBooks {
+    pub(crate) fn new(rules_provider: Arc<dyn RulesProvider>) -> Self {
+        Self {
+            rules_provider,
+            books_stamp: Arc::new(crate::production_rules_provider::books_stamp),
+            books: Mutex::new(HashMap::new()),
+        }
+    }
+
+    pub(crate) fn set_books_stamp(&mut self, stamp: Arc<dyn Fn() -> u64 + Send + Sync>) {
+        self.books_stamp = stamp;
+        self.books
+            .get_mut()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clear();
+    }
+
+    /// `principal`'s book: remembered while the stamp holds and the memo is
+    /// young, else read once and remembered.
+    pub(crate) fn book_of(&self, principal: &str) -> Option<Arc<RememberedBook>> {
+        let stamp = (self.books_stamp)();
+        let now = Instant::now();
+        if let Some(memo) = self
+            .books
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(principal)
+        {
+            if memo.stamp == stamp && now.duration_since(memo.read_at) < BOOK_MEMO_TTL {
+                return memo.book.clone();
+            }
+        }
+        // Read with the memo unlocked: a hit for another user does not wait
+        // on this read.
+        let book = self
+            .rules_provider
+            .active_rules_for(principal)
+            .map(|s| Arc::new(RememberedBook::new(s.rule_book)));
+        let mut books = self.books.lock().unwrap_or_else(PoisonError::into_inner);
+        // Users who left take their memos with them.
+        if books.len() > 64 {
+            books.clear();
+        }
+        books.insert(
+            principal.to_owned(),
+            BookMemo {
+                stamp,
+                read_at: now,
+                book: book.clone(),
+            },
+        );
+        book
+    }
+}
 
 impl ActiveRuleHostOracle {
     pub fn new(
@@ -135,52 +228,17 @@ impl ActiveRuleHostOracle {
         active_sid: Arc<dyn Fn() -> Option<String> + Send + Sync>,
     ) -> Self {
         Self {
-            rules_provider,
+            books: RememberedBooks::new(rules_provider),
             principals: principals_of_routing_user(active_sid),
             paused: None,
-            books_stamp: Arc::new(crate::production_rules_provider::books_stamp),
-            books: Mutex::new(HashMap::new()),
         }
     }
 
     /// The stamp the remembered books are checked against.
     #[must_use]
     pub fn with_books_stamp(mut self, stamp: Arc<dyn Fn() -> u64 + Send + Sync>) -> Self {
-        self.books_stamp = stamp;
+        self.books.set_books_stamp(stamp);
         self
-    }
-
-    /// `principal`'s secondary rules: remembered while the stamp holds and the
-    /// memo is young, else read once and remembered.
-    fn secondary_of(
-        &self,
-        principal: &str,
-    ) -> Option<Arc<nrr_domain::canonical::CanonicalRuleSet>> {
-        let stamp = (self.books_stamp)();
-        let now = Instant::now();
-        let mut books = self.books.lock().unwrap_or_else(PoisonError::into_inner);
-        if let Some(memo) = books.get(principal) {
-            if memo.stamp == stamp && now.duration_since(memo.read_at) < BOOK_MEMO_TTL {
-                return memo.secondary.clone();
-            }
-        }
-        let secondary = self
-            .rules_provider
-            .active_rules_for(principal)
-            .map(|s| Arc::new(s.rule_book.secondary));
-        // Users who left take their memos with them.
-        if books.len() > 64 {
-            books.clear();
-        }
-        books.insert(
-            principal.to_owned(),
-            SecondaryMemo {
-                stamp,
-                read_at: now,
-                secondary: secondary.clone(),
-            },
-        );
-        secondary
     }
 
     /// Leave paused users out: their rule hosts resolve like any other name.
@@ -222,8 +280,9 @@ impl ActiveRuleHostOracle {
     }
 
     fn names(&self, sid: &str, hostname: &str) -> bool {
-        self.secondary_of(sid)
-            .is_some_and(|set| rule_set_matches(hostname, &set))
+        self.books
+            .book_of(sid)
+            .is_some_and(|book| book.names(hostname))
     }
 }
 
@@ -243,13 +302,13 @@ impl RuleHostOracle for ActiveRuleHostOracle {
         self.any_routing(|routing| {
             let mut held = false;
             for sid in routing {
-                let Some(set) = self.secondary_of(sid) else {
+                let Some(book) = self.books.book_of(sid) else {
                     continue;
                 };
-                if !rule_set_matches(hostname, &set) {
+                if !book.names(hostname) {
                     continue;
                 }
-                if !crate::dns_observation_consumer::held_only_by_public_zone(hostname, &set) {
+                if !book.held_only_by_public_zone(hostname) {
                     return false;
                 }
                 held = true;
@@ -523,6 +582,15 @@ impl DirectUdpUpstreamResolver {
         self.egress
             .as_ref()
             .and_then(|policy| policy.decide(attempt))
+            .unwrap_or_else(|| crate::dns_egress::DnsEgress::primary(self.primary_server()))
+    }
+
+    /// [`Self::egress_for`] for a question about `hostname`: the policy may
+    /// send the additional link's rule hosts elsewhere.
+    fn egress_for_name(&self, hostname: &str, attempt: u32) -> crate::dns_egress::DnsEgress {
+        self.egress
+            .as_ref()
+            .and_then(|policy| policy.decide_for(hostname, attempt))
             .unwrap_or_else(|| crate::dns_egress::DnsEgress::primary(self.primary_server()))
     }
 
@@ -875,7 +943,7 @@ impl DirectUdpUpstreamResolver {
             if window.is_zero() {
                 return Err(ResolveError::Unavailable("budget exhausted".into()));
             }
-            let egress = self.egress_for(attempt);
+            let egress = self.egress_for_name(hostname, attempt);
             if tunnel_only && !egress.via_secondary {
                 last = ResolveError::Unavailable("tunnel not available for the query".into());
                 continue;
@@ -1702,11 +1770,16 @@ impl FactSink for CacheFactSink {
 /// pin/block set. The worst case is over-caution — a direct host is offered a
 /// smaller address set than it strictly needed, and a fully-shared answer falls
 /// through to the unchanged fail-open reply.
+/// The last owned set and when it was built, shared with its rebuild.
+type OwnersMemo = Arc<Mutex<Option<(std::time::Instant, Arc<SecondaryAddressOwners>)>>>;
+
 pub struct ActiveSecondaryOwnedIps {
     rules_provider: Arc<dyn RulesProvider>,
     principals: ResolverPrincipalsFn,
     fqdn: Arc<dyn crate::fqdn_cache_lookup::FqdnCacheLookup>,
-    memo: Mutex<Option<(std::time::Instant, Arc<SecondaryAddressOwners>)>>,
+    memo: OwnersMemo,
+    /// A rebuild runs beside the queries; at most one at a time.
+    rebuilding: Arc<std::sync::atomic::AtomicBool>,
 }
 
 /// How long one computed owned-set snapshot serves steering before a rebuild.
@@ -1724,8 +1797,14 @@ impl ActiveSecondaryOwnedIps {
             rules_provider,
             principals: principals_of_routing_user(active_sid),
             fqdn,
-            memo: Mutex::new(None),
+            memo: Arc::new(Mutex::new(None)),
+            rebuilding: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }
+    }
+
+    /// Build the set now, on the caller's thread, so the first query finds it.
+    pub fn prime(&self) {
+        let _ = self.owned_ips_at(std::time::Instant::now());
     }
 
     /// Steer away from any served user's additional-link addresses: on a
@@ -1736,30 +1815,85 @@ impl ActiveSecondaryOwnedIps {
         self
     }
 
-    fn rebuild(&self) -> SecondaryAddressOwners {
-        let parts = (self.principals)()
+    fn rebuild(
+        rules_provider: &dyn RulesProvider,
+        principals: &ResolverPrincipalsFn,
+        fqdn: &dyn crate::fqdn_cache_lookup::FqdnCacheLookup,
+    ) -> SecondaryAddressOwners {
+        let parts = principals()
             .iter()
-            .filter_map(|sid| self.rules_provider.active_rules_for(sid))
-            .map(|snapshot| SecondaryAddressOwners::build(&snapshot.rule_book, self.fqdn.as_ref()))
+            .filter_map(|sid| rules_provider.active_rules_for(sid))
+            .map(|snapshot| SecondaryAddressOwners::build(&snapshot.rule_book, fqdn))
             .collect();
         SecondaryAddressOwners::union(parts)
     }
 
     /// Memoized read with an injected `now` — the trait impl passes
     /// `Instant::now()`; tests advance `now` to cross the memo TTL without
-    /// sleeping.
+    /// sleeping. Only the very first build runs on the caller's thread: a
+    /// stale set keeps answering while a worker rebuilds it, since a rebuild
+    /// waits on the rule store's lock and walks the address cache.
     fn owned_ips_at(&self, now: std::time::Instant) -> std::sync::Arc<SecondaryAddressOwners> {
         let mut guard = self.memo.lock().unwrap_or_else(|p| p.into_inner());
         if let Some((at, set)) = guard.as_ref() {
-            if now.saturating_duration_since(*at) < OWNED_SET_MEMO_TTL {
-                // An `Arc` clone: every direct answer takes this path, and the
-                // set is the whole pinned address space.
-                return std::sync::Arc::clone(set);
+            // An `Arc` clone: every direct answer takes this path, and the
+            // set is the whole pinned address space.
+            let set = std::sync::Arc::clone(set);
+            if now.saturating_duration_since(*at) >= OWNED_SET_MEMO_TTL {
+                drop(guard);
+                self.rebuild_in_background(now);
             }
+            return set;
         }
-        let set = std::sync::Arc::new(self.rebuild());
+        let set = std::sync::Arc::new(Self::rebuild(
+            self.rules_provider.as_ref(),
+            &self.principals,
+            self.fqdn.as_ref(),
+        ));
         *guard = Some((now, std::sync::Arc::clone(&set)));
         set
+    }
+
+    /// The set as of `asked`, built on a worker; a call while one runs is
+    /// answered by it.
+    fn rebuild_in_background(&self, asked: std::time::Instant) {
+        use std::sync::atomic::Ordering;
+        if self.rebuilding.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        /// Clears the flag however the worker ends: left set, the set would
+        /// never be rebuilt again.
+        struct Done(Arc<std::sync::atomic::AtomicBool>);
+        impl Drop for Done {
+            fn drop(&mut self) {
+                self.0.store(false, Ordering::Release);
+            }
+        }
+        let rules_provider = Arc::clone(&self.rules_provider);
+        let principals = Arc::clone(&self.principals);
+        let fqdn = Arc::clone(&self.fqdn);
+        let memo = Arc::clone(&self.memo);
+        let done = Done(Arc::clone(&self.rebuilding));
+        let spawned = std::thread::Builder::new()
+            .name("nrr-dns-steering-set".into())
+            .spawn(move || {
+                let _done = done;
+                let set = Arc::new(Self::rebuild(
+                    rules_provider.as_ref(),
+                    &principals,
+                    fqdn.as_ref(),
+                ));
+                *memo.lock().unwrap_or_else(|p| p.into_inner()) = Some((asked, set));
+            });
+        // A failed spawn drops the closure and its `Done`: the next query
+        // tries again, answered by the stale set meanwhile.
+        if let Err(e) = spawned {
+            tracing::warn!(
+                target: "nrr::dns-resolver",
+                error = %e,
+                "could not start the steering-set rebuild; the previous set stays in use",
+            );
+        }
     }
 }
 

@@ -134,10 +134,6 @@ Window {
                 color: root.ownerRoot ? root.ownerRoot.textColor : "white"
                 selectionColor: root.ownerRoot ? root.ownerRoot.accentColor : "#3d6fb4"
                 selectedTextColor: root.ownerRoot ? root.ownerRoot.textColor : "white"
-                background: CardSurface {
-                    theme: root.ownerRoot ? root.ownerRoot.uiTheme : null
-                    cornerRadius: root.ownerRoot ? root.ownerRoot.uiTheme.radiusSm : 4
-                }
                 Accessible.role: Accessible.StaticText
                 Accessible.name: root.tr("dialog.eula.text-accessible-name",
                     "License agreement text")

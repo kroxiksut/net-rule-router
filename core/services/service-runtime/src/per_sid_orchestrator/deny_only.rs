@@ -7,8 +7,8 @@ use super::*;
 use crate::enforcement_planner::Ipv6Guard;
 
 impl PerSidApplyOrchestrator {
-    /// The deny filters of a user with no route policy, from the same codegen
-    /// the policy path uses; [`ComputedFilterSet::NoPolicy`] when there are none.
+    /// The deny filters of a user with no route policy, from the same plan the
+    /// policy path installs; [`ComputedFilterSet::NoPolicy`] when there are none.
     pub(super) fn compute_deny_filters_without_policy(
         &self,
         sid: &str,
@@ -31,7 +31,7 @@ impl PerSidApplyOrchestrator {
         }
         let cache_snapshot = self.fqdn_cache.snapshot_for_compute();
         let fqdn_cache = crate::fqdn_cache_lookup::snapshot_or_live(
-            cache_snapshot.as_ref(),
+            cache_snapshot.as_deref(),
             self.fqdn_cache.as_ref(),
         );
         let denylist = crate::secondary_ip_policy::secondary_ip_denylist(
@@ -53,16 +53,39 @@ impl PerSidApplyOrchestrator {
             families: ipv6.families(),
             packet_blocks: super::PACKET_BLOCKS,
         });
-        let unresolved_apps: Vec<String> = out
-            .diagnostics
-            .iter()
-            .filter_map(|d| match d {
-                crate::wfp_codegen::CodegenDiagnostic::AppUnresolved { app, .. } => {
-                    Some(app.clone())
-                }
-                _ => None,
-            })
-            .collect();
+        #[cfg(windows)]
+        let (rule_filters, findings) = match self.neutral_route_filters(
+            sid,
+            &rules.rule_book,
+            fqdn_cache,
+            self.app_observations.as_ref(),
+            &denylist,
+            false,
+            false,
+            ipv6,
+        ) {
+            Some(neutral) => {
+                let _ = self.compare_with_codegen(sid, &neutral.filters, &out.filters);
+                let findings = super::findings::PassFindings::from_plan(&neutral.report);
+                #[cfg(test)]
+                assert_eq!(
+                    super::findings::PassFindings::from_plan(&neutral.report).normalized(),
+                    super::findings::PassFindings::from_codegen(&out.diagnostics).normalized(),
+                    "the plan reports what the codegen reported"
+                );
+                (neutral.filters, findings)
+            }
+            None => (
+                out.filters,
+                super::findings::PassFindings::from_codegen(&out.diagnostics),
+            ),
+        };
+        #[cfg(not(windows))]
+        let (rule_filters, findings) = (
+            out.filters,
+            super::findings::PassFindings::from_codegen(&out.diagnostics),
+        );
+        let unresolved_apps = findings.unresolved_apps;
         if log_unresolved && !unresolved_apps.is_empty() {
             tracing::warn!(
                 target: "nrr::app-resolver",
@@ -81,20 +104,17 @@ impl PerSidApplyOrchestrator {
             status.set_unresolved(sid, unresolved_apps.clone());
             // A deny takes no addresses, so no rule here carries traffic.
             status.set_unrouted(sid, &[]);
-            let mut conflicts = crate::app_enforcement_status::rule_conflicts_from(
-                &out.diagnostics,
-                &rules.rule_book,
-            );
+            let mut conflicts =
+                crate::rule_conflicts::rule_conflict_dtos(&findings.conflicts, &rules.rule_book);
             conflicts.extend(crate::rule_conflicts::protected_rule_dtos(
                 &self.rules_provider.withheld_rules_for(sid),
             ));
             status.set_rule_conflicts(sid, conflicts);
         }
         // Route permits ride a route, and there is none here; a narrower rule
-        // inside a deny is already cut out of it by the codegen. A program
-        // deny's loopback permit is a hole in its own block, so it stays.
-        let filters: Vec<WfpFilterSpec> = out
-            .filters
+        // inside a deny is already cut out of it by the plan. A program deny's
+        // loopback permit is a hole in its own block, so it stays.
+        let filters: Vec<WfpFilterSpec> = rule_filters
             .into_iter()
             .filter(|f| {
                 f.action == WfpAction::Block || crate::wfp_codegen::is_deny_loopback_permit(f)

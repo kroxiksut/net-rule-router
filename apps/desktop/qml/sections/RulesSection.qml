@@ -3105,6 +3105,17 @@ ColumnLayout {
         }
         Keys.onReturnPressed: section._editSelectedRule()
         Keys.onEnterPressed: section._editSelectedRule()
+        // Tab lands here before any row is current: frame the visible table.
+        Rectangle {
+            parent: rulesTableScroll
+            anchors.fill: parent
+            z: 30
+            visible: rulesListView.activeFocus && rulesListView.currentIndex < 0
+            color: "transparent"
+            radius: root.uiTheme.radiusSm
+            border.width: root.uiTheme.focusBorderWidth
+            border.color: root.uiTheme.stateFocusedBorder
+        }
         // Vertical scrollbar pinned to the VIEWPORT's right edge.
         // The ListView width == table contentWidth (wider than the
         // viewport when columns are widened), so the attached bar normally sits
@@ -3158,6 +3169,10 @@ ColumnLayout {
             // the rule id (ids collide across routes → two rows would light up).
             readonly property bool _isSelectedSingle:
                 root.selectedRule >= 0 && root.selectedRule === model.masterIndex
+            Accessible.role: Accessible.ListItem
+            Accessible.name: root.uiRevision >= 0
+                ? root.ruleTypeLabel(model.ruleType) + ": " + Pure.displayText(model.matchValue) : ""
+            Accessible.selected: ruleDelegate._isSelectedSingle
             background: CardSurface {
                 theme: root.uiTheme
                 selected: ruleDelegate._isSelectedSingle || ruleDelegate.isSelectedForBulk
@@ -3171,6 +3186,7 @@ ColumnLayout {
                         ? root.uiTheme.colorWarning
                         : "transparent"
                 emphasizedBorder: ruleDelegate.validationError || ruleDelegate.validationWarning
+                focused: ruleDelegate.ListView.isCurrentItem && rulesListView.activeFocus
             }
             // Тело строки строится ЛЕНИВО. Пока строка скрыта
             // фильтром (visible === false), Loader неактивен и карточка/иконки/

@@ -30,9 +30,21 @@ ThemedButton {
         color: control.highlighted ? control.shell.accentColor
             : !control.enabled ? control.theme.stateDisabledFill
             : (control.hovered ? control.theme.stateHoverFill : control.shell.panelColor)
-        border.color: control.highlighted ? control.theme.stateSelectedBorder
+        border.width: control.activeFocus ? control.theme.focusBorderWidth : control.theme.borderWidth
+        border.color: control.activeFocus
+            ? (control.highlighted ? control.theme.stateFocusedBorderOnFill : control.theme.stateFocusedBorder)
+            : control.highlighted ? control.theme.stateSelectedBorder
             : !control.enabled ? control.theme.stateDisabledBorder
-            : (control.activeFocus ? control.theme.stateFocusedBorder : control.theme.stateDefaultBorder)
+            : control.theme.stateDefaultBorder
+        Rectangle {
+            visible: control.activeFocus && control.highlighted
+            anchors.fill: parent
+            anchors.margins: control.theme.focusBorderWidth
+            radius: Math.max(0, parent.radius - control.theme.focusBorderWidth)
+            color: "transparent"
+            border.width: control.theme.borderWidth
+            border.color: control.theme.stateFocusedInnerOnFill
+        }
     }
     contentItem: RowLayout {
         spacing: control.iconName !== "" ? control.theme.spacingXs : 0

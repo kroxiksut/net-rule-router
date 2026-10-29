@@ -179,11 +179,8 @@ esac
 case "$version" in
   *[!A-Za-z0-9.+-]*) die "version '$version' has characters a package version cannot carry" ;;
 esac
-# A pre-release sorts before its release only after a tilde, in dpkg and rpm alike.
-package_version="$(printf '%s' "$version" | sed 's/-/~/')"
-case "$package_version" in
-  *-*) die "version '$version' has more than one '-'" ;;
-esac
+package_version="$(nrr_package_version "$version")" ||
+  die "version '$version': dpkg and rpm cannot order its pre-release; use dev, prealpha, alpha[.N], beta[.N] or rc[.N]"
 deb_version="$package_version-$release"
 
 commit="unknown"

@@ -29,6 +29,18 @@ const FAILURES_BEFORE_ROTATE: u32 = 3;
 /// of failures (or a flapping link) would otherwise hammer it.
 const MIN_REFRESH_GAP: Duration = Duration::from_secs(10);
 
+/// Where a followed network change hands its selection.
+type ChangeAnswer = Box<dyn FnOnce(Option<SocketAddr>) + Send>;
+
+/// For a worker whose waiting changes carry their own answers. One function,
+/// not a closure: a closure inside the generic worker would name a new
+/// worker type at every level.
+fn no_answer(_: Option<SocketAddr>) {}
+
+/// Changes waiting at once; past it the oldest go unanswered, the newer ones
+/// carry the same selection.
+const WAITING_CHANGES_CAP: usize = 16;
+
 /// Floor between probe sweeps that found nothing. [`MIN_REFRESH_GAP`] only gates
 /// re-enumeration; without a floor here an offline machine pays the whole
 /// candidate list at [`PROBE_TIMEOUT`] each on every failed forward, in every
@@ -209,6 +221,11 @@ pub struct UpstreamDnsPool {
     /// A background re-selection is under way; see
     /// [`Self::note_network_change_in_background`].
     background_refresh: AtomicBool,
+    /// Network changes not yet followed, each with where its selection goes;
+    /// one re-selection answers all of them.
+    waiting_change: Mutex<Vec<ChangeAnswer>>,
+    /// [`MIN_REFRESH_GAP`] for network changes; shorter only in tests.
+    network_change_gap: Duration,
     /// The last sweep found no server answering and nothing has answered
     /// since. Read by the resolver service, which lifts the redirect while it
     /// holds: every forward would wait out its timeout and fail.
@@ -241,6 +258,8 @@ impl UpstreamDnsPool {
                 last_exclusion_check: None,
             }),
             background_refresh: AtomicBool::new(false),
+            waiting_change: Mutex::new(Vec::new()),
+            network_change_gap: MIN_REFRESH_GAP,
             dark: AtomicBool::new(false),
             dark_foreign_only: AtomicBool::new(false),
             sockets: crate::dns_upstream_sockets::shared(),
@@ -360,6 +379,8 @@ impl UpstreamDnsPool {
                 last_exclusion_check: None,
             }),
             background_refresh: AtomicBool::new(false),
+            waiting_change: Mutex::new(Vec::new()),
+            network_change_gap: MIN_REFRESH_GAP,
             dark: AtomicBool::new(false),
             dark_foreign_only: AtomicBool::new(false),
             sockets: crate::dns_upstream_sockets::shared(),
@@ -554,16 +575,82 @@ impl UpstreamDnsPool {
         self.refresh()
     }
 
-    /// [`Self::note_network_change`] on a worker thread, handing the selection
-    /// to `then`. Probing dead servers costs up to a probe timeout each, and the
-    /// enforcement pass that notices a network change must not wait on it.
-    /// While one background re-selection runs, another request is dropped:
-    /// that one already answers for the current network.
+    /// A network change followed on a worker thread, its selection handed to
+    /// `then`. Probing dead servers costs up to a probe timeout each, and the
+    /// enforcement pass that notices a change must not wait on it.
+    ///
+    /// A Wi-Fi switch reports the old link going and the new one coming a few
+    /// seconds apart, and only the second names the new network's resolver: a
+    /// change inside the refresh floor, or one reported while a re-selection
+    /// runs, is followed once the floor has passed, never dropped.
     pub fn note_network_change_in_background<F>(self: &Arc<Self>, then: F)
     where
         F: FnOnce(Option<SocketAddr>) + Send + 'static,
     {
-        self.in_background(Self::note_network_change, then);
+        // Now, not after the floor: until then every query would leave from
+        // the old network's address.
+        self.close_idle_sockets();
+        {
+            let mut waiting = self
+                .waiting_change
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            if waiting.len() >= WAITING_CHANGES_CAP {
+                drop(waiting.remove(0));
+            }
+            waiting.push(Box::new(then));
+        }
+        self.in_background(Self::follow_network_changes, no_answer);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_sockets(
+        self,
+        sockets: &'static crate::dns_upstream_sockets::UpstreamSockets,
+    ) -> Self {
+        Self { sockets, ..self }
+    }
+
+    /// Close the idle sockets queries reuse: each was connected from the
+    /// source address of a network that may be gone. Cheap enough for the
+    /// OS change callback; selects nothing.
+    pub fn close_idle_sockets(&self) {
+        self.sockets.drain();
+    }
+
+    fn take_waiting_changes(&self) -> Vec<ChangeAnswer> {
+        std::mem::take(
+            &mut *self
+                .waiting_change
+                .lock()
+                .unwrap_or_else(|p| p.into_inner()),
+        )
+    }
+
+    /// Follows waiting changes until none is left: each waits out the floor
+    /// since the last refresh, then re-selects past it.
+    fn follow_network_changes(&self) -> Option<SocketAddr> {
+        let mut selected = None;
+        loop {
+            let waiting = self.take_waiting_changes();
+            if waiting.is_empty() {
+                break;
+            }
+            let since = self.lock().last_refresh.map(|at| at.elapsed());
+            if let Some(left) = since.and_then(|since| self.network_change_gap.checked_sub(since)) {
+                std::thread::sleep(left);
+            }
+            self.sockets.drain();
+            *self
+                .preferred_cache
+                .lock()
+                .unwrap_or_else(|p| p.into_inner()) = None;
+            selected = self.refresh();
+            for then in waiting {
+                then(selected);
+            }
+        }
+        selected
     }
 
     /// A routing pass may have moved the excluded set. When it did, re-select
@@ -620,8 +707,18 @@ impl UpstreamDnsPool {
             .spawn(move || {
                 let done = RefreshDone(pool);
                 let selected = work(&done.0);
+                let pool = Arc::clone(&done.0);
                 drop(done);
                 then(selected);
+                // Handed over while this was busy, after its last look.
+                let waiting = pool
+                    .waiting_change
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .is_empty();
+                if !waiting {
+                    pool.in_background(Self::follow_network_changes, no_answer);
+                }
             });
         if let Err(e) = spawned {
             self.background_refresh.store(false, Ordering::SeqCst);
@@ -1515,8 +1612,93 @@ mod tests {
                 .expect("selection"),
             Some(SocketAddr::from((ip(7), 53)))
         );
-        std::thread::sleep(Duration::from_millis(700));
-        assert!(!second_ran.load(Ordering::SeqCst));
+    }
+
+    /// The servers the machine lists now; a test switches them.
+    struct SwitchingServers(Mutex<Ipv4Addr>);
+
+    impl SystemDnsServersPort for SwitchingServers {
+        fn upstream_candidates_v4(&self) -> Vec<nrr_platform_api::dns::UpstreamDnsCandidate> {
+            let ip = *self.0.lock().unwrap_or_else(|p| p.into_inner());
+            vec![nrr_platform_api::dns::UpstreamDnsCandidate::new(None, ip)]
+        }
+    }
+
+    fn switching_pool(
+        probe: Arc<dyn UpstreamProbe>,
+    ) -> (Arc<UpstreamDnsPool>, Arc<SwitchingServers>) {
+        let servers = Arc::new(SwitchingServers(Mutex::new(ip(1))));
+        let pool = Arc::new(UpstreamDnsPool {
+            network_change_gap: Duration::from_millis(300),
+            ..UpstreamDnsPool::new(Arc::clone(&servers) as Arc<dyn SystemDnsServersPort>, probe)
+        });
+        (pool, servers)
+    }
+
+    fn answer_to(
+        sender: std::sync::mpsc::Sender<Option<SocketAddr>>,
+    ) -> impl FnOnce(Option<SocketAddr>) + Send {
+        move |selected| {
+            let _ = sender.send(selected);
+        }
+    }
+
+    /// Wi-Fi switch: the old link goes, and seconds later the new one comes
+    /// with its own resolver. The second change falls inside the refresh
+    /// floor, and still ends on the new network's server.
+    #[test]
+    fn the_second_change_of_a_wifi_switch_reaches_the_new_resolver() {
+        struct Answers;
+        impl UpstreamProbe for Answers {
+            fn responds(&self, _server: SocketAddr) -> bool {
+                true
+            }
+        }
+        let (pool, servers) = switching_pool(Arc::new(Answers));
+        let (sender, receiver) = std::sync::mpsc::channel();
+        pool.note_network_change_in_background(answer_to(sender.clone()));
+        assert_eq!(
+            receiver
+                .recv_timeout(Duration::from_secs(5))
+                .expect("first"),
+            Some(SocketAddr::from((ip(1), 53)))
+        );
+        *servers.0.lock().unwrap_or_else(|p| p.into_inner()) = ip(2);
+        pool.note_network_change_in_background(answer_to(sender));
+        assert_eq!(
+            receiver
+                .recv_timeout(Duration::from_secs(5))
+                .expect("second"),
+            Some(SocketAddr::from((ip(2), 53))),
+            "the change inside the floor kept the old network's resolver"
+        );
+    }
+
+    /// The new network is reported while the re-selection for the old one is
+    /// still probing: that request is followed after it, not dropped.
+    #[test]
+    fn a_change_reported_during_a_reselection_is_followed_after_it() {
+        let probe = ParkingProbe::new();
+        let (pool, servers) = switching_pool(Arc::clone(&probe) as Arc<dyn UpstreamProbe>);
+        let (sender, receiver) = std::sync::mpsc::channel();
+        pool.note_network_change_in_background(answer_to(sender.clone()));
+        probe.wait_until_inside();
+        *servers.0.lock().unwrap_or_else(|p| p.into_inner()) = ip(2);
+        pool.note_network_change_in_background(answer_to(sender));
+        probe.release();
+        assert_eq!(
+            receiver
+                .recv_timeout(Duration::from_secs(5))
+                .expect("first"),
+            Some(SocketAddr::from((ip(1), 53)))
+        );
+        assert_eq!(
+            receiver
+                .recv_timeout(Duration::from_secs(5))
+                .expect("second"),
+            Some(SocketAddr::from((ip(2), 53))),
+            "the change reported during the sweep was dropped"
+        );
     }
 
     /// A live server that answers past 512 bytes is still live: on Windows a
@@ -1565,6 +1747,35 @@ mod tests {
             sockets.idle_count(),
             0,
             "a socket from the old network was kept"
+        );
+    }
+
+    /// The service follows a change in the background, and a change inside
+    /// the refresh floor waits it out before re-selecting. The sockets must
+    /// not wait with it: until they close, every query asks from an address
+    /// the machine may no longer have.
+    #[test]
+    fn a_change_followed_in_the_background_closes_the_idle_sockets_at_once() {
+        let sockets: &'static crate::dns_upstream_sockets::UpstreamSockets =
+            Box::leak(Box::new(crate::dns_upstream_sockets::UpstreamSockets::new()));
+        let server: SocketAddr = "127.0.0.1:53".parse().expect("addr");
+        sockets
+            .checkout(
+                crate::dns_upstream_sockets::UpstreamKey { bind: None, server },
+                || std::net::UdpSocket::bind("127.0.0.1:0"),
+            )
+            .expect("open")
+            .release();
+        // Just refreshed: the re-selection waits out the whole floor.
+        let pool = Arc::new(UpstreamDnsPool {
+            sockets,
+            ..UpstreamDnsPool::fixed(server)
+        });
+        pool.note_network_change_in_background(|_| {});
+        assert_eq!(
+            sockets.idle_count(),
+            0,
+            "the old network's socket stays in use until the floor passes"
         );
     }
 }

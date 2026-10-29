@@ -362,9 +362,10 @@ impl ConnectionObservationConsumer {
                 .as_ref()
                 .and_then(|store| store.scope_for(rec.user_sid.as_deref()))
             {
-                if let (Some(path), IpAddr::V4(rip)) =
-                    (rec.process_path.as_deref(), rec.remote.ip())
-                {
+                if let Some(path) = rec.process_path.as_deref() {
+                    // Both families: on a dual-stack network the v6 half of a
+                    // program's traffic needs routes of its own.
+                    let rip = rec.remote.ip().to_canonical();
                     let this_app = crate::app_observation_lookup::app_key(path);
                     // Who the remembered rows of this store belong to.
                     let per_user = self
