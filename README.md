@@ -1,8 +1,9 @@
 <div align="center">
 
-<img src="assets/icons/app/icon-128.png" alt="NetRuleRouter" width="96" height="96" />
-
-# NetRuleRouter
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/images/logo-lockup-en-dark.png" />
+  <img src="docs/images/logo-lockup-en.png" alt="NetRuleRouter — rule-based traffic routing" width="480" />
+</picture>
 
 **Send each site, address, subnet, range or program over the connection you choose, deny what must not go out, and hold traffic back when the VPN drops instead of leaking it.**
 

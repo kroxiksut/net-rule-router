@@ -1,8 +1,9 @@
 <div align="center">
 
-<img src="assets/icons/app/icon-128.png" alt="NetRuleRouter" width="96" height="96" />
-
-# NetRuleRouter
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/images/logo-lockup-ru-dark.png" />
+  <img src="docs/images/logo-lockup-ru.png" alt="NetRuleRouter — маршрутизация по правилам" width="480" />
+</picture>
 
 **Направляйте каждый сайт, адрес, подсеть, диапазон или программу через выбранное подключение, запрещайте то, чему нельзя уходить, а если VPN упал — трафик ждёт, а не утекает в открытую сеть.**
 
