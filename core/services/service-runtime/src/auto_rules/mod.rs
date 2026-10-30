@@ -150,6 +150,9 @@ const UNREACHABLE_NOTICE_CAP: usize = 256;
 /// themselves are capped per session well below this.
 const REVERSE_NAMED_CAP: usize = 1024;
 
+/// Failing hosts refused as pulled in, waiting for a later stall to ask again.
+const PULLED_IN_REFUSALS_CAP: usize = 256;
+
 /// Maximum principals tracked concurrently.
 ///
 /// Free is single-active-user, so in practice this is one. The cap exists so a
@@ -581,6 +584,9 @@ pub struct AutoRulesEngine {
     /// `(sid, host)` for names a reverse lookup produced: the address owner
     /// chose them, so `auto` asks about an offer covering one.
     reverse_named: Mutex<crate::bounded_set::BoundedRecentSet<(String, String)>>,
+    /// `(sid, host)` refused because every sighting read as pulled in (see
+    /// [`Self::recheck_main_link_blocked_host`]).
+    pulled_in_refusals: Mutex<crate::bounded_set::BoundedRecentSet<(String, String)>>,
 }
 
 /// `(sid, host)`: a site `sid` opened fails on the main link and answered the

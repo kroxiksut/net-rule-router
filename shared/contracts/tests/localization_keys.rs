@@ -293,6 +293,85 @@ fn every_service_message_key_is_translated() {
     }
 }
 
+/// The Logs view named a line's category and event type by the service's own
+/// slugs (`service`, `ipc-push`) on a Russian screen. Every area a service line
+/// is written under, and every category, has a name in each language.
+#[test]
+fn every_log_category_and_event_type_is_named() {
+    // Fixtures of the log-call scanners, not call sites.
+    const FIXTURES: [&str; 2] = ["x", "test"];
+    let mut kinds = BTreeSet::new();
+    for content in &log_sources() {
+        let mut rest = content.as_str();
+        while let Some(at) = rest.find("\"nrr::") {
+            rest = &rest[at + "\"nrr::".len()..];
+            let Some(end) = rest.find('"') else { break };
+            let area = &rest[..end];
+            rest = &rest[end..];
+            // `"nrr::"` alone is the prefix the log layer strips, not an area.
+            if !area.is_empty() && !FIXTURES.contains(&area) {
+                kinds.insert(log_slug_key(&area.replace("::", ".")));
+            }
+        }
+    }
+    assert!(
+        kinds.len() >= 40,
+        "the scan sees only {} areas",
+        kinds.len()
+    );
+    let taxonomy = fs::read_to_string(workspace_root().join("core/diagnostics/src/taxonomy.rs"))
+        .expect("taxonomy.rs")
+        .replace("\r\n", "\n");
+    let categories: BTreeSet<String> = taxonomy
+        .split("impl EventCategory {")
+        .nth(1)
+        .and_then(|imp| imp.split("pub fn as_str(self)").nth(1))
+        .expect("EventCategory::as_str")
+        .split("\n    }\n")
+        .next()
+        .expect("its body")
+        .lines()
+        .filter_map(|line| line.split("=> \"").nth(1)?.split('"').next())
+        .map(log_slug_key)
+        .collect();
+    assert!(categories.contains("user-action"), "{categories:?}");
+    for locale in BASELINE_LOCALES {
+        let map = raw_locale_map(locale);
+        let missing: Vec<String> = kinds
+            .iter()
+            .map(|k| format!("diag.logs.kind.{k}"))
+            .chain(categories.iter().map(|c| format!("diag.logs.category.{c}")))
+            .filter(|key| !map.contains_key(key))
+            .collect();
+        assert!(
+            missing.is_empty(),
+            "locale '{locale}' has no name for {missing:?}"
+        );
+    }
+}
+
+/// `logSlugText`'s key form of a slug.
+fn log_slug_key(slug: &str) -> String {
+    let mapped: String = slug
+        .to_ascii_lowercase()
+        .chars()
+        .map(|c| {
+            if c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-' {
+                c
+            } else {
+                '-'
+            }
+        })
+        .collect();
+    let mut key = String::new();
+    for c in mapped.chars() {
+        if !(c == '-' && key.ends_with('-')) {
+            key.push(c);
+        }
+    }
+    key.trim_matches('-').to_owned()
+}
+
 /// The Logs view shows a tagged line's locale text, so a value spliced into the
 /// English text never reaches it: values travel as fields, and an `error` field
 /// has a `{error}` slot to land in.

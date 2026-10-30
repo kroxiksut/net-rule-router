@@ -686,6 +686,20 @@ impl AppState {
                 .about(About::Kind("unassigned-tunnel"));
                 self.post(notice, Some(now))
             }
+            StatusUpdateEvent::AdditionalConnectionMoved { adapter_name, .. } => {
+                if adapter_name.is_empty() {
+                    return Vec::new();
+                }
+                self.notify(
+                    NoticeLevel::Info,
+                    texts.get(keys::ADDITIONAL_MOVED_TITLE),
+                    texts.fill(
+                        keys::ADDITIONAL_MOVED_BODY,
+                        &[("adapter", display_text(&adapter_name))],
+                    ),
+                    now,
+                )
+            }
             StatusUpdateEvent::LocalNetworkTooWide {
                 adapter_name,
                 network,
@@ -774,6 +788,7 @@ impl AppState {
             // What another surface changed is re-read where it is on screen.
             StatusUpdateEvent::SecurityAlertsChanged => {
                 crate::screens::inspect::diagnostics::reload_alerts(self);
+                crate::screens::wizard::alerts_changed(self);
                 Vec::new()
             }
             StatusUpdateEvent::ApplyFailurePolicyChanged { .. } => {
@@ -1511,9 +1526,9 @@ mod tests {
         assert_eq!(app.routing_state(), RoutingState::Active);
         assert_eq!(app.notices.len(), 2, "the return is news too");
         assert!(
-            app.notices[1]
-                .body
-                .ends_with("The list of what was blocked: Blocked while the route was down"),
+            app.notices[1].body.ends_with(
+                "The list of what was blocked: Blocked while the additional connection was down"
+            ),
             "{:?}",
             app.notices[1]
         );
@@ -1637,16 +1652,19 @@ mod tests {
         assert!(app.vpn_trust.pending.is_empty());
         assert_eq!(app.notices.len(), 4, "a withdrawn question is not news");
         assert_eq!(app.notices[0].level, NoticeLevel::Warning);
-        assert_eq!(app.notices[0].title, "The additional route is not assigned");
+        assert_eq!(
+            app.notices[0].title,
+            "The additional connection is not chosen"
+        );
         assert!(
             app.notices[0].body.starts_with("Tunnel is up"),
             "{:?}",
             app.notices[0]
         );
-        assert_eq!(app.notices[1].title, "A rule is set on both routes");
+        assert_eq!(app.notices[1].title, "A rule is set on both connections");
         assert!(
             app.notices[1].body.starts_with(
-                "2 of your rules are enabled on both routes, starting with both.example."
+                "2 of your rules are enabled on both connections, starting with both.example."
             ),
             "{:?}",
             app.notices[1]
@@ -1794,7 +1812,7 @@ mod tests {
         assert_eq!(app.notices[0].level, NoticeLevel::Warning);
         assert_eq!(
             app.notices[0].title,
-            "Some addresses follow another user's route"
+            "Some addresses follow another user's connection"
         );
         assert!(
             app.notices[0].body.contains("Addresses affected: 2")
@@ -1828,7 +1846,7 @@ mod tests {
         assert_eq!(app.notices[1].level, NoticeLevel::Info);
         assert_eq!(
             app.notices[1].body,
-            "Addresses from your rules follow your own route again."
+            "Addresses from your rules follow your own connection again."
         );
         assert!(app.routes_held.is_none());
     }
@@ -1855,12 +1873,10 @@ mod tests {
         assert_eq!(app.notices[0].level, NoticeLevel::Warning);
         assert_eq!(
             app.notices[0].title,
-            "Your traffic goes through another user's tunnel"
+            "Your traffic goes through another user's connection"
         );
         assert!(
-            app.notices[0]
-                .body
-                .contains("through the tunnel \"Office Tunnel\"."),
+            app.notices[0].body.contains("through \"Office Tunnel\"."),
             "{:?}",
             app.notices[0]
         );
@@ -1883,7 +1899,7 @@ mod tests {
         assert_eq!(app.notices[1].level, NoticeLevel::Info);
         assert_eq!(
             app.notices[1].body,
-            "Your traffic no longer goes through another user's tunnel."
+            "Your traffic no longer goes through another user's connection."
         );
         assert!(app.traffic_carried.is_none());
     }
@@ -1907,7 +1923,9 @@ mod tests {
         );
         assert_eq!(app.notices.len(), 1);
         assert!(
-            app.notices[0].body.contains("through their tunnel."),
+            app.notices[0]
+                .body
+                .contains("through their own connection (for example a VPN)."),
             "{:?}",
             app.notices[0]
         );

@@ -112,12 +112,14 @@ Dialog {
     function _routeLabel(role) {
         return String(role) === "secondary"
             ? tr("dialog.drift.row-secondary", "Additional")
-            : tr("dialog.drift.row-primary", "Primary")
+            : tr("dialog.drift.row-primary", "Main")
     }
-    /// A `?` rule names its route with the mark after it.
+    /// A `?` rule says so in words after its route.
     function _itemRouteLabel(item) {
         var label = _routeLabel(item ? item.route : "")
-        return item && String(item.action) === "verify-primary" ? label + " ?" : label
+        return item && String(item.action) === "verify-primary"
+            ? tr("rules.route-checking", "{route} (checking)").replace("{route}", label)
+            : label
     }
 
     function _textColor() {
@@ -271,7 +273,7 @@ Dialog {
                     visible: dialog._normalized().length > 0
                     wrapMode: Text.Wrap
                     text: dialog.tr("dialog.review-diff.duplicates-heading",
-                        "Rules written into both routes")
+                        "Rules set on both connections")
                         + " (" + dialog._normalized().length + ")"
                     font.bold: true
                     color: dialog._textColor()
@@ -280,7 +282,7 @@ Dialog {
                     Layout.fillWidth: true
                     visible: dialog._normalized().length > 0
                     text: dialog.tr("dialog.merge.duplicates-hint",
-                        "Each of these was enabled on both routes, so the merge kept the main route's copy and switched the other one off. Pick a different route if that is not what you meant — the other copy stays in your list, switched off.")
+                        "Each of these was enabled on both connections, so the merge kept the main connection's copy and switched the other one off. Pick a different connection if that is not what you meant — the other copy stays in your list, switched off.")
                     wrapMode: Text.Wrap
                     color: dialog._mutedColor()
                 }
@@ -306,7 +308,7 @@ Dialog {
                             currentIndex: dialog._keptRoute(modelData["identity-key"]) === "secondary" ? 1 : 0
                             displayText: currentText
                             Accessible.name: dialog.tr("dialog.review-diff.duplicates-heading",
-                                "Rules written into both routes")
+                                "Rules set on both connections")
                             onActivated: function(index) {
                                 dialog._setKeptRoute(modelData["identity-key"],
                                     index === 1 ? "secondary" : "primary")

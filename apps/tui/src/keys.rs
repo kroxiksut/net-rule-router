@@ -8,15 +8,15 @@ use crate::i18n::{key, Key, Plural};
 
 pub const SCREEN_STATUS: Key = key("tui.screen.status", "Status");
 pub const SCREEN_WIZARD: Key = key("dialog.first-run.title", "First run");
-pub const SCREEN_INTERFACES: Key = key("section.interfaces-routes", "Interfaces and routes");
+pub const SCREEN_INTERFACES: Key = key("section.interfaces-routes", "Connections");
 pub const SCREEN_RULES: Key = key("section.rules", "Rules");
-pub const SCREEN_APP_GROUPS: Key = key("app-groups.title", "Application and device routes");
+pub const SCREEN_APP_GROUPS: Key = key("app-groups.title", "Connections for programs and devices");
 pub const SCREEN_OVERLAPS: Key = key("rules.overlaps.nav-label", "Overlaps");
 pub const SCREEN_SUGGESTIONS: Key = key("rules.suggestions.inbox.nav-label", "Suggested addresses");
 pub const SCREEN_TRACE: Key = key("diag.conn-trace.title", "Connection trace");
 pub const SCREEN_OUTAGE_BLOCKS: Key = key(
     "diag.outage-blocks.title",
-    "Blocked while the route was down",
+    "Blocked while the additional connection was down",
 );
 pub const SCREEN_CACHE: Key = key("diag.cache.title", "Cache");
 pub const SCREEN_DIAGNOSTICS: Key = key("tui.screen.diagnostics-logs", "Diagnostics and logs");
@@ -135,29 +135,29 @@ pub const FETCH_FAILED: Key = key(
 
 // ── Routing state ────────────────────────────────────────────────────────────
 
-pub const ROUTING_TITLE: Key = key("routing.status.card-title", "Routing state");
-pub const ROUTING_ACTIVE: Key = key("routing.status.active", "Routing active");
-pub const ROUTING_LIMITED: Key = key("routing.status.limited", "Routing limited");
-pub const ROUTING_PAUSED: Key = key("routing.status.paused", "Routing paused");
+pub const ROUTING_TITLE: Key = key("routing.status.card-title", "Rules status");
+pub const ROUTING_ACTIVE: Key = key("routing.status.active", "Rules are working");
+pub const ROUTING_LIMITED: Key = key("routing.status.limited", "Some rules not working");
+pub const ROUTING_PAUSED: Key = key("routing.status.paused", "Rules are off");
 pub const ROUTING_DISCONNECTED: Key = key("routing.status.disconnected", "Service not connected");
-pub const DETAIL_ACTIVE: Key = key(
-    "routing.status.detail-active",
-    "Rules apply on this user session.",
-);
+pub const DETAIL_ACTIVE: Key = key("routing.status.detail-active", "Your rules are working.");
 pub const DETAIL_LIMITED: Key = key(
     "routing.status.detail-limited",
     "Some rules are not being applied right now. The notices say why.",
 );
 pub const DETAIL_PAUSED: Key = key(
     "routing.status.detail-paused",
-    "Rules are disabled for the time chosen; they come back on their own when it is up, or when you turn them back on.",
+    "Rules are off for the time chosen; they come back on their own when it is up, or when you turn them back on.",
 );
 
 // ── Connections (roles) ──────────────────────────────────────────────────────
 
 pub const ROLES_TITLE: Key = key("tui.status.connections-title", "Connections");
 pub const ROLE_PRIMARY: Key = key("interfaces.role.primary", "Main connection");
-pub const ROLE_SECONDARY: Key = key("interfaces.role.secondary", "Additional connection");
+pub const ROLE_SECONDARY: Key = key(
+    "interfaces.role.secondary",
+    "Additional connection (e.g. VPN)",
+);
 pub const NOT_SELECTED: Key = key("interfaces.state.not-selected", "Not selected");
 pub const AVAILABLE: Key = key("interfaces.availability.available", "Available");
 pub const UNAVAILABLE: Key = key("interfaces.availability.unavailable", "Unavailable");
@@ -227,7 +227,7 @@ pub const ENF_NO_POLICY_TITLE: Key = key(
 );
 pub const ENF_NO_POLICY_BODY: Key = key(
     "notifications.enforcement.no-policy.body",
-    "The service has no routing settings for you yet, so nothing is being routed. Choose the main and additional connections.",
+    "Your connections are not chosen yet, so your rules are not working. Choose the main and additional connections.",
 );
 pub const ENF_SUGGEST_TITLE: Key = key(
     "notifications.enforcement.no-policy.suggest-title",
@@ -235,7 +235,7 @@ pub const ENF_SUGGEST_TITLE: Key = key(
 );
 pub const ENF_SUGGEST_BODY: Key = key(
     "notifications.enforcement.no-policy.suggest-body",
-    "Nothing is routed until you confirm it. Rules for the additional connection wait until you choose one.",
+    "Your rules do not work until you confirm it. Rules for the additional connection wait until you choose one.",
 );
 pub const ENF_PRIMARY_DOWN_TITLE: Key = key(
     "notifications.enforcement.primary-down.title",
@@ -275,7 +275,7 @@ pub const ENF_UNKNOWN_TITLE: Key = key(
 );
 pub const ENF_UNKNOWN_BODY: Key = key(
     "notifications.enforcement.unknown.body",
-    "The service reported a state this version does not recognise. Open interfaces and routes to check the setup.",
+    "The service reported a state this version does not recognise. Open Connections to check the setup.",
 );
 pub const LINK_DROPPING_TITLE_PRIMARY: Key = key(
     "notifications.link-keeps-dropping.title-primary",
@@ -291,11 +291,11 @@ pub const LINK_DROPPING_BODY: Key = key(
 );
 pub const ENF_RESTORED_TITLE: Key = key(
     "notifications.enforcement.restored.title",
-    "Routing is working again",
+    "Rules are working again",
 );
 pub const ENF_RESTORED_BODY: Key = key(
     "notifications.enforcement.restored.body",
-    "Your rules are being applied again. Pages that were refused while the connection was down keep showing the error until you reload them — press F5 on those tabs.",
+    "Your rules work again. Reload the pages that did not open while the connection was down — press F5 on those tabs.",
 );
 pub const ENF_RESTORED_WHERE: Key = key(
     "tui.outage-blocks.where",
@@ -308,7 +308,7 @@ pub const APP_UNRESOLVED_TITLE: Key = key(
 );
 pub const APP_UNRESOLVED_BODY: Key = key(
     "notifications.app-unresolved.body",
-    "NetRuleRouter couldn't find these programs (they may not be installed in a standard location, or aren't running), so their traffic isn't routed by your rules: {apps}. Launch the app, or check the program name in Rules.",
+    "NetRuleRouter could not find these programs: {apps}. They may be installed outside the usual folder or not running, so the rules do not reach them yet. Start the program, or check its name in Rules.",
 );
 pub const APP_UNRESOLVED_MORE: Key = key("status.app-unresolved-more", "+{n} more");
 pub const APP_UNROUTED_TITLE: Key = key(
@@ -342,7 +342,7 @@ pub const VPN_TRUST_HINT_BUNDLE: Key = key(
 );
 pub const VPN_TRUST_DONE: Key = key(
     "notifications.vpn-client-trust.tui-done",
-    "{count} program(s) confirmed as your VPN; leak protection keeps them working over the main link.",
+    "{count} program(s) confirmed as your VPN; leak protection keeps them working over the main connection.",
 );
 pub const VPN_TRUST_FAILED: Key = key(
     "notifications.vpn-client-trust.tui-failed",
@@ -384,6 +384,10 @@ pub const SEE_DIAGNOSTICS_HINT: Key = key(
     "tui.see-diagnostics",
     "Details are on the Diagnostics and logs screen (9).",
 );
+pub const ALERT_GATE_HINT: Key = key(
+    "tui.alert-gate-hint",
+    "The alert is on the Diagnostics and logs screen (9): choose it and press a to acknowledge it.",
+);
 pub const DNS_FOREIGN_TITLE: Key = key(
     "notifications.dns-foreign-only.title",
     "Name handling is paused by your VPN",
@@ -398,22 +402,22 @@ pub const HOST_UNREACHABLE_TITLE: Key = key(
 );
 pub const HOST_UNREACHABLE_BODY: Key = key(
     "notifications.host-unreachable.body",
-    "{host} did not answer through the main link or through the additional one, so moving it would not help and nothing was offered. The problem is most likely on the site's side.",
+    "{host} did not answer through the main connection or through the additional one, so moving it would not help and nothing was offered. The problem is most likely on the site's side.",
 );
 pub const EXTERNAL_ADDRESS_TITLE: Key =
-    key("tray.external-address.title", "Additional route connected");
+    key("tray.external-address.title", "Additional connection is up");
 pub const EXTERNAL_ADDRESS_BODY: Key = key(
     "tray.external-address.body",
-    "External address of the additional route: {address}",
+    "External address of the additional connection: {address}",
 );
 pub const EXTERNAL_ADDRESS_ADAPTER: Key = key("tray.external-address.adapter", "Adapter: {name}");
 pub const ROUTES_HELD_TITLE: Key = key(
     "notifications.routes-held.title",
-    "Some addresses follow another user's route",
+    "Some addresses follow another user's connection",
 );
 pub const ROUTES_HELD_BODY: Key = key(
     "notifications.routes-held.body",
-    "Another user signed in to this computer already routes some addresses from your rules through a different connection. Addresses affected: {count}. While that user stays signed in, these addresses follow their route, or are blocked for you if leak protection is on. Among them: {list}.",
+    "Another user signed in to this computer already routes some addresses from your rules through a different connection. Addresses affected: {count}. While that user stays signed in, these addresses follow their connection, or are blocked for you if leak protection is on. Among them: {list}.",
 );
 pub const BLOCK_NOTICE_TITLE: Key = key("notifications.block-notice.title", "Connection blocked");
 pub const BLOCK_NOTICE_BODY: Key = key(
@@ -441,17 +445,17 @@ pub const LOCAL_NETWORK_TITLE: Key = key(
 );
 pub const LOCAL_NETWORK_OFFER: Key = key(
     "status.local-network-offer",
-    "Found a local network on this computer: {cidr} ({adapter}). Keep it reachable while routed traffic is blocked?",
+    "Found a local network on this computer: {cidr} ({adapter}). Keep it reachable while leak protection blocks traffic?",
 );
 pub const LOCAL_NETWORK_OFFER_OPEN: Key = key(
     "status.local-network-offer-open",
-    "Found your home network's IPv6 addresses: {cidr} ({adapter}). Open them to devices on this network while routed traffic is blocked?",
+    "Found your home network's IPv6 addresses: {cidr} ({adapter}). Open them to devices on this network while leak protection blocks traffic?",
 );
 pub const LOCAL_NETWORK_OFFER_MORE: Key =
     key("status.local-network-offer-more", "{count} more found.");
 pub const ANSWER_IN_ROUTING_HINT: Key = key(
     "tui.answer-in-routing-settings",
-    "Answer in Settings, Routing section (c2).",
+    "Answer in Settings, Routing behavior section (c2).",
 );
 pub const FORWARDED_TITLE: Key = key(
     "notifications.forwarded-traffic.title",
@@ -459,7 +463,7 @@ pub const FORWARDED_TITLE: Key = key(
 );
 pub const FORWARDED_BODY: Key = key(
     "notifications.forwarded-traffic.body",
-    "Choose what WSL, containers and virtual machines get when the additional route goes down. Until you choose, they are protected like this computer.",
+    "Choose what WSL, containers and virtual machines get when the additional connection goes down. Until you choose, they are protected like this computer.",
 );
 pub const BLOCK_NOTICE_BACKLOG_TITLE: Key = key(
     "notifications.block-notice.backlog.title",
@@ -520,11 +524,19 @@ pub const DELIVERY_LOCALES: Key = key(
 );
 pub const UNASSIGNED_TUNNEL_TITLE: Key = key(
     "notifications.unassigned-tunnel.title",
-    "The additional route is not assigned",
+    "The additional connection is not chosen",
 );
 pub const UNASSIGNED_TUNNEL_BODY: Key = key(
     "notifications.unassigned-tunnel.body",
-    "{adapter} is up, but no connection is assigned to the additional route — so the sites your rules send there will not open.",
+    "{adapter} is up, but no additional connection is chosen — so the sites your rules send there will not open.",
+);
+pub const ADDITIONAL_MOVED_TITLE: Key = key(
+    "notifications.additional-moved.title",
+    "The additional connection moved",
+);
+pub const ADDITIONAL_MOVED_BODY: Key = key(
+    "notifications.additional-moved.body",
+    "Your VPN came up on {adapter}, so the additional connection now uses it and your rules go through it. The choice is saved.",
 );
 pub const LOCAL_NETWORK_TOO_WIDE_TITLE: Key = key(
     "notifications.local-network-too-wide.title",
@@ -536,11 +548,11 @@ pub const LOCAL_NETWORK_TOO_WIDE_BODY: Key = key(
 );
 pub const RULE_DUPLICATES_TITLE: Key = key(
     "notifications.rule-duplicates.title",
-    "A rule is set on both routes",
+    "A rule is set on both connections",
 );
 pub const RULE_DUPLICATES_BODY: Key = key(
     "notifications.rule-duplicates.body",
-    "{count} of your rules are enabled on both routes, starting with {sample}. Which one carries the traffic is decided by evaluation order.",
+    "{count} of your rules are enabled on both connections, starting with {sample}. Which one carries the traffic is decided by evaluation order.",
 );
 pub const APP_RULE_LEARNING_TITLE: Key = key(
     "notifications.app-rule-learning.title",
@@ -585,15 +597,15 @@ pub const VPN_SPLIT_COUNTED: Plural = Plural {
 };
 pub const RULES_EMPTY: Key = key(
     "status.empty-rules-banner",
-    "No rules are active — the service isn't routing anything. The rule set is empty (it may have been reset). Add rules or import a preset.",
+    "There are no rules — nothing is being sent anywhere special. Add rules or load a ready-made set.",
 );
 pub const POLICY_INACTIVE_NO_ADAPTER: Key = key(
     "status.policy-inactive-no-adapter",
-    "The service is running, but your rules are not being applied: no additional adapter is assigned to them yet, so there is nowhere to route them. Assign one in Interfaces and routes.",
+    "The service is running, but your rules are not working: no additional connection is chosen yet, so there is nowhere to send them. Choose one in Connections.",
 );
 pub const POLICY_INACTIVE_BLOCKING: Key = key(
     "status.policy-inactive-kill-switch-blocking",
-    "Leak protection is on and no additional adapter is assigned, so everything your rules send that way is being blocked. Assign an adapter in Interfaces and routes, or turn leak protection off.",
+    "Leak protection is on and no additional connection is chosen, so everything your rules send there is being blocked. Choose one in Connections, or turn leak protection off.",
 );
 pub const PROTECTION_MACHINE_WIDE_CUT: Key = key(
     "status.protection.machine-wide-cut-by-another-user",
@@ -601,23 +613,23 @@ pub const PROTECTION_MACHINE_WIDE_CUT: Key = key(
 );
 pub const ROUTES_HELD_CLEARED: Key = key(
     "notifications.routes-held.cleared",
-    "Addresses from your rules follow your own route again.",
+    "Addresses from your rules follow your own connection again.",
 );
 pub const TRAFFIC_CARRIED_TITLE: Key = key(
     "notifications.traffic-carried.title",
-    "Your traffic goes through another user's tunnel",
+    "Your traffic goes through another user's connection",
 );
 pub const TRAFFIC_CARRIED_BODY: Key = key(
     "notifications.traffic-carried.body",
-    "Another user of this computer signed in earlier and sends all their traffic through the tunnel \"{link}\". This computer has one route table for everyone, so whatever your rules do not send to your additional connection goes through that tunnel too. To avoid this, sign in before that user, or ask them to send only chosen sites through their tunnel.",
+    "Another user of this computer signed in before you and sends all their traffic through \"{link}\". On this computer that applies to everyone, so whatever your rules do not send through your additional connection goes through \"{link}\" too. To avoid this, sign in before that user, or ask them to send only chosen sites there.",
 );
 pub const TRAFFIC_CARRIED_BODY_UNNAMED: Key = key(
     "notifications.traffic-carried.body-unnamed",
-    "Another user of this computer signed in earlier and sends all their traffic through their tunnel. This computer has one route table for everyone, so whatever your rules do not send to your additional connection goes through that tunnel too. To avoid this, sign in before that user, or ask them to send only chosen sites through their tunnel.",
+    "Another user of this computer signed in before you and sends all their traffic through their own connection (for example a VPN). On this computer that applies to everyone, so whatever your rules do not send through your additional connection goes through it too. To avoid this, sign in before that user, or ask them to send only chosen sites there.",
 );
 pub const TRAFFIC_CARRIED_CLEARED: Key = key(
     "notifications.traffic-carried.cleared",
-    "Your traffic no longer goes through another user's tunnel.",
+    "Your traffic no longer goes through another user's connection.",
 );
 
 // ── Keys and help ────────────────────────────────────────────────────────────
@@ -832,6 +844,8 @@ pub const ALL: &[Key] = &[
     DELIVERY_LOCALES,
     UNASSIGNED_TUNNEL_TITLE,
     UNASSIGNED_TUNNEL_BODY,
+    ADDITIONAL_MOVED_TITLE,
+    ADDITIONAL_MOVED_BODY,
     LOCAL_NETWORK_TOO_WIDE_TITLE,
     LOCAL_NETWORK_TOO_WIDE_BODY,
     RULE_DUPLICATES_TITLE,

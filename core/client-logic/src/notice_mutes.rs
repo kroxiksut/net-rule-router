@@ -35,7 +35,7 @@ pub const MUTABLE_NOTICE_KINDS: [MutableNoticeKind; 11] = [
     MutableNoticeKind {
         slug: "unassigned-tunnel",
         title_key: "notifications.unassigned-tunnel.title",
-        title_en: "The additional route is not assigned",
+        title_en: "The additional connection is not chosen",
     },
     MutableNoticeKind {
         slug: "local-networks",
@@ -55,7 +55,7 @@ pub const MUTABLE_NOTICE_KINDS: [MutableNoticeKind; 11] = [
     MutableNoticeKind {
         slug: "routes-held",
         title_key: "notifications.routes-held.title",
-        title_en: "Some addresses follow another user's route",
+        title_en: "Some addresses follow another user's connection",
     },
     MutableNoticeKind {
         slug: "traffic-carried",

@@ -214,6 +214,64 @@ fn focus_on_a_filled_button_shows_in_every_theme() {
     assert!(faults.is_empty(), "{}", faults.join("\n"));
 }
 
+/// The owner's call: a main button is the app's blue everywhere, the
+/// first-run window's included; the logo's purple is only the ring round a
+/// focused button. Its words read at 4.5:1 on the blue in every theme.
+fn brand_fill_faults(tokens: &str, files: &[(String, String)]) -> Vec<String> {
+    let mut faults = Vec::new();
+    let fill = token(tokens, "colorAccent");
+    let text = token(tokens, "colorOnAccent");
+    for (i, theme) in THEMES.iter().enumerate() {
+        let ratio = contrast(&text[i], &fill[i]);
+        if ratio < 4.5 {
+            faults.push(format!(
+                "{theme}: {} on {} reads at {ratio:.2}:1",
+                text[i], fill[i]
+            ));
+        }
+    }
+    for (file, source) in files {
+        if draws(source, "colorBrand") {
+            faults.push(format!("{file}: paints with the brand purple"));
+        }
+    }
+    faults
+}
+
+#[test]
+fn main_buttons_are_the_apps_blue_and_purple_is_only_the_ring() {
+    let mut files = Vec::new();
+    let mut stack = vec![qml_dir()];
+    while let Some(dir) = stack.pop() {
+        let entries = std::fs::read_dir(&dir).unwrap_or_else(|e| panic!("{}: {e}", dir.display()));
+        for path in entries.flatten().map(|e| e.path()) {
+            if path.is_dir() {
+                stack.push(path);
+            } else if path.extension().is_some_and(|e| e == "qml")
+                && !path.ends_with("ThemeTokens.qml")
+            {
+                let source = std::fs::read_to_string(&path)
+                    .unwrap_or_else(|e| panic!("read {}: {e}", path.display()))
+                    .replace("\r\n", "\n");
+                files.push((path.display().to_string(), source));
+            }
+        }
+    }
+    let faults = brand_fill_faults(&read("theme/ThemeTokens.qml"), &files);
+    assert!(faults.is_empty(), "{}", faults.join("\n"));
+}
+
+#[test]
+fn a_purple_main_button_is_caught() {
+    let tokens = "readonly property color colorAccent: isHighContrast ? \"#ffd24d\" : isDark ? \"#6c9bff\" : \"#2f6feb\"\n\
+                  readonly property color colorOnAccent: isHighContrast ? \"#000000\" : isDark ? \"#0b0b0b\" : \"#ffffff\"\n";
+    let wizard = (
+        "Wizard.qml".to_owned(),
+        "ThemedButton {\n    accentFill: root.uiTheme.colorBrand\n}\n".to_owned(),
+    );
+    assert_eq!(brand_fill_faults(tokens, &[wizard]).len(), 1);
+}
+
 /// A one-pixel change of border colour is the whole focus cue a section
 /// button gave; the ring is the theme's focus width on every one of them.
 fn ring_width_fault(source: &str) -> Option<&'static str> {
@@ -229,7 +287,9 @@ fn ring_width_fault(source: &str) -> Option<&'static str> {
             }
             expr.push_str(next);
         }
-        expr.contains("activeFocus") && expr.contains("focusBorderWidth")
+        // `focusShown`: the sidebar draws the ring for keyboard focus only.
+        (expr.contains("activeFocus") || expr.contains("focusShown"))
+            && expr.contains("focusBorderWidth")
     });
     (!widens).then_some("focus does not widen the border to focusBorderWidth")
 }
@@ -250,6 +310,13 @@ fn every_section_button_draws_the_focus_ring() {
     assert!(faults.is_empty(), "{}", faults.join("\n"));
 }
 
+/// Whether `source` reads the theme token `name` itself, not one it prefixes.
+fn draws(source: &str, name: &str) -> bool {
+    source
+        .match_indices(&format!(".{name}"))
+        .any(|(at, m)| !source[at + m.len()..].starts_with(|c: char| c.is_ascii_alphanumeric()))
+}
+
 /// The focus ring of a control that is not filled, against the control's own
 /// background and the surfaces it sits on.
 fn input_focus_faults(tokens: &str, file: &str, source: &str, background: &str) -> Vec<String> {
@@ -258,10 +325,7 @@ fn input_focus_faults(tokens: &str, file: &str, source: &str, background: &str) 
         .into_iter()
         .collect();
     let ring = "stateFocusedBorder";
-    let draws = source
-        .match_indices(&format!(".{ring}"))
-        .any(|(at, m)| !source[at + m.len()..].starts_with(|c: char| c.is_ascii_alphanumeric()));
-    if !draws {
+    if !draws(source, ring) {
         faults.push(format!("{file}: focus is not drawn in the theme's {ring}"));
         return faults;
     }
@@ -282,8 +346,8 @@ fn input_focus_faults(tokens: &str, file: &str, source: &str, background: &str) 
 }
 
 /// Typing into the wrong field because its focus was a one-pixel recolour:
-/// every input, the help button and the tray prompt's tick boxes draw the
-/// theme's focus ring at its full width, readable on what is behind it.
+/// every input and the tray prompt's tick boxes draw the theme's focus ring
+/// at its full width, readable on what is behind it.
 #[test]
 fn every_input_draws_a_focus_ring_that_shows_in_every_theme() {
     let tokens = read("theme/ThemeTokens.qml");
@@ -291,16 +355,104 @@ fn every_input_draws_a_focus_ring_that_shows_in_every_theme() {
     for (file, background) in [
         ("components/ThemedTextField.qml", "colorBase"),
         ("components/ThemedTextArea.qml", "colorBase"),
-        ("components/ThemedComboBox.qml", "colorBase"),
         ("components/ThemedSpinBox.qml", "colorBase"),
         ("components/ThemedRadioButton.qml", "colorBase"),
-        ("components/HelpButton.qml", "colorPanel"),
         // An unticked box is transparent over the prompt window.
         ("components/TrayPromptWindow.qml", "colorWindow"),
     ] {
         faults.extend(input_focus_faults(&tokens, file, &read(file), background));
     }
     assert!(faults.is_empty(), "{}", faults.join("\n"));
+}
+
+/// Everything the user presses, the footer chips (`Main.qml`) and the
+/// closed lists included.
+const BUTTONS: [&str; 8] = [
+    "components/ThemedButton.qml",
+    // A closed list is pressed like a button and rings like one.
+    "components/ThemedComboBox.qml",
+    "components/HelpButton.qml",
+    "components/SidebarGlyphButton.qml",
+    "components/SidebarSubNavButton.qml",
+    "components/NavigationSidebar.qml",
+    "components/RoutingStatusChip.qml",
+    "Main.qml",
+];
+
+/// A black frame round a dialog's OK, a blue one round the next button:
+/// focus on a button wears the logo's purple in the light and dark themes,
+/// readable on what is behind it, and the contrast theme keeps its own rings.
+fn button_outline_faults(tokens: &str, buttons: &[(&str, String)]) -> Vec<String> {
+    let mut faults = Vec::new();
+    let brand = token(tokens, "colorBrand");
+    for (ring, contrast_theme) in [
+        ("colorButtonOutline", "colorFocusRing"),
+        ("stateFocusedBorderOnFill", "colorText"),
+    ] {
+        let colours = token(tokens, ring);
+        let kept = token(tokens, contrast_theme);
+        if !colours[0].eq_ignore_ascii_case(&kept[0]) {
+            faults.push(format!(
+                "high contrast: {ring} {} is not {contrast_theme} {}",
+                colours[0], kept[0]
+            ));
+        }
+        for i in 1..THEMES.len() {
+            if !colours[i].eq_ignore_ascii_case(&brand[i]) {
+                faults.push(format!(
+                    "{}: {ring} {} is not the brand {}",
+                    THEMES[i], colours[i], brand[i]
+                ));
+            }
+            for against in ["colorPanel", "colorWindow", "colorBase"] {
+                let bg = token(tokens, against)[i].clone();
+                let ratio = contrast(&colours[i], &bg);
+                if ratio < 3.0 {
+                    faults.push(format!(
+                        "{}: {ring} {} against {against} {bg} at {ratio:.2}:1",
+                        THEMES[i], colours[i]
+                    ));
+                }
+            }
+        }
+    }
+    for (file, source) in buttons {
+        if !draws(source, "colorButtonOutline") {
+            faults.push(format!(
+                "{file}: focus is not outlined in colorButtonOutline"
+            ));
+        }
+        if draws(source, "stateFocusedBorder") {
+            faults.push(format!("{file}: a button still takes the field focus ring"));
+        }
+    }
+    faults
+}
+
+#[test]
+fn button_focus_is_outlined_in_the_brand_purple() {
+    let buttons: Vec<(&str, String)> = BUTTONS.iter().map(|f| (*f, read(f))).collect();
+    let faults = button_outline_faults(&read("theme/ThemeTokens.qml"), &buttons);
+    assert!(faults.is_empty(), "{}", faults.join("\n"));
+}
+
+#[test]
+fn a_dark_ring_or_a_blue_button_frame_is_caught() {
+    let tokens = "readonly property color colorText: isHighContrast ? \"#ffffff\" : isDark ? \"#f5f7fa\" : \"#1f2933\"\n\
+                  readonly property color colorPanel: isHighContrast ? \"#1a1a1a\" : isDark ? \"#2a3038\" : \"#ffffff\"\n\
+                  readonly property color colorWindow: isHighContrast ? \"#111111\" : isDark ? \"#1f2328\" : \"#f4f6f8\"\n\
+                  readonly property color colorBase: isHighContrast ? \"#0b0b0b\" : isDark ? \"#171b21\" : \"#eef2f6\"\n\
+                  readonly property color colorBrand: isHighContrast ? \"#ffd24d\" : isDark ? \"#9b6cf0\" : \"#783ade\"\n\
+                  readonly property color colorFocusRing: isHighContrast ? \"#ffd24d\" : isDark ? \"#6c9bff\" : \"#2f6feb\"\n\
+                  readonly property color colorButtonOutline: colorBrand\n\
+                  readonly property color stateFocusedBorderOnFill: colorText\n";
+    let button = (
+        "Button.qml",
+        "border.color: activeFocus ? theme.stateFocusedBorder : theme.colorButtonOutlineX"
+            .to_owned(),
+    );
+    let faults = button_outline_faults(tokens, &[button]);
+    assert_eq!(faults.len(), 4, "{faults:#?}");
 }
 
 const RINGED_INPUTS: [&str; 6] = [

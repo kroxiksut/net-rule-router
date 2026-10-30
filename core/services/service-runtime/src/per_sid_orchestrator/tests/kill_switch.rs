@@ -1284,6 +1284,20 @@ fn filters_for(
     resolution: KillSwitchResolution,
     book: CanonicalRuleBook,
 ) -> Vec<WfpFilterSpec> {
+    filters_observing(
+        snap,
+        resolution,
+        book,
+        Arc::new(crate::app_observation_lookup::AppObservationStore::new()),
+    )
+}
+
+fn filters_observing(
+    snap: PerSidPolicySnapshot,
+    resolution: KillSwitchResolution,
+    book: CanonicalRuleBook,
+    observations: Arc<crate::app_observation_lookup::AppObservationStore>,
+) -> Vec<WfpFilterSpec> {
     let api = Arc::new(MockWindowsApi::new());
     let session = Arc::new(WfpSession::open(Arc::clone(&api) as Arc<dyn WindowsApiPort>).unwrap());
     let source = Arc::new(ScriptedSource::default());
@@ -1291,7 +1305,8 @@ fn filters_for(
     let cache: Arc<dyn FqdnCacheLookup> = Arc::new(MockFqdnCacheLookup::new());
     let audit = Arc::new(CollectAudit::default());
     let resolver = nrr_platform_api::MockAppPathResolver::new()
-        .with("tg.exe", vec![std::path::PathBuf::from(PINNED_APP)]);
+        .with("tg.exe", vec![std::path::PathBuf::from(PINNED_APP)])
+        .with("mail.exe", vec![std::path::PathBuf::from(OTHER_PINNED_APP)]);
     let orch = PerSidApplyOrchestrator::new(
         session,
         Arc::clone(&source) as Arc<dyn RoutePolicySource>,
@@ -1300,6 +1315,7 @@ fn filters_for(
         Arc::clone(&audit) as Arc<dyn PerSidApplyAudit>,
     )
     .with_app_resolver(Arc::new(resolver))
+    .with_app_observations(observations)
     .with_kill_switch_resolver(Arc::new(move |_, _| Some(resolution.clone())));
     rules.set(ActiveRulesSnapshot { rule_book: book });
     source.set("S-1-5-21-A", snap);
@@ -1320,22 +1336,138 @@ fn in_subnet(ip: Ipv4Addr, (net, prefix): (Ipv4Addr, u8)) -> bool {
 /// The ALE connect verdict for a TCP connect by the pinned app to `ip` leaving
 /// through `egress`: the highest-weight matching filter wins, none means allow.
 fn app_may_connect(filters: &[WfpFilterSpec], ip: Ipv4Addr, egress: u64) -> bool {
+    program_may_connect(filters, PINNED_APP, ip, egress)
+}
+
+/// [`app_may_connect`] for any program; a tie in weight goes to the block.
+fn program_may_connect(
+    filters: &[WfpFilterSpec],
+    program: &str,
+    ip: Ipv4Addr,
+    egress: u64,
+) -> bool {
     filters
         .iter()
         .filter(|f| f.layer == WfpLayerKey::AleAuthConnectV4)
-        .filter(|f| f.app_pattern.as_deref().is_none_or(|a| a == PINNED_APP))
+        .filter(|f| f.app_pattern.as_deref().is_none_or(|a| a == program))
         .filter(|f| f.local_interface_luid.is_none_or(|l| l == egress))
         .filter(|f| f.remote_port.is_none() && f.ip_protocol.is_none_or(|p| p == 6))
         .filter(|f| {
             let names_one = f.remote_ip.is_some() || !f.remote_ip_set.is_empty();
-            match f.remote_subnet {
-                Some(subnet) => in_subnet(ip, subnet),
-                None if names_one => f.covers_v4(ip),
-                None => true,
-            }
+            let in_set = f.remote_subnet_set.is_empty()
+                || f.remote_subnet_set.iter().any(|(net, prefix)| match net {
+                    IpAddr::V4(v4) => in_subnet(ip, (*v4, *prefix)),
+                    IpAddr::V6(_) => false,
+                });
+            in_set
+                && match f.remote_subnet {
+                    Some(subnet) => in_subnet(ip, subnet),
+                    None if names_one => f.covers_v4(ip),
+                    None => true,
+                }
         })
-        .max_by_key(|f| f.weight)
+        .max_by_key(|f| (f.weight, f.action == WfpAction::Block))
         .is_none_or(|f| f.action == WfpAction::Permit)
+}
+
+const OTHER_PINNED_APP: &str = r"C:\Apps\mail.exe";
+
+/// Telegram on the owner's PC: another program rode the tunnel to an address
+/// the app rule had pinned, so the pin was withdrawn and may not be relearnt
+/// this session. The app's own traffic there must take the main link, as the
+/// withdrawal promises; the per-app block dropped it for good instead.
+#[test]
+fn a_withdrawn_app_destination_reaches_the_main_link_under_leak_protection() {
+    const WITHDRAWN: Ipv4Addr = Ipv4Addr::new(149, 154, 167, 51);
+    const STILL_PINNED: Ipv4Addr = Ipv4Addr::new(149, 154, 175, 50);
+    let mut rules = rules_with_one_app("tg.exe")
+        .rule_book
+        .primary
+        .rules()
+        .to_vec();
+    let mut mail = rules_with_one_app("mail.exe")
+        .rule_book
+        .primary
+        .rules()
+        .to_vec();
+    mail[0].id = RuleId("app-2".into());
+    rules.extend(mail);
+    let book = CanonicalRuleBook {
+        primary: CanonicalRuleSet::default(),
+        secondary: CanonicalRuleSet::from_rules(rules),
+    };
+    for takeover in [false, true] {
+        let observations = Arc::new(crate::app_observation_lookup::AppObservationStore::new());
+        for program in [PINNED_APP, OTHER_PINNED_APP] {
+            observations.record(program, WITHDRAWN);
+            observations.record(program, STILL_PINNED);
+        }
+        assert!(observations.retract("tg.exe", WITHDRAWN));
+        let snap = PerSidPolicySnapshot {
+            app_rules_take_all_addresses: takeover,
+            ..snap_block("Wi-Fi", "TAP")
+        };
+        let filters = filters_observing(snap, full_ks_resolution(), book.clone(), observations);
+
+        assert!(
+            program_may_connect(&filters, PINNED_APP, WITHDRAWN, PRIMARY_LUID),
+            "takeover {takeover}: the withdrawn destination is black-holed for its app"
+        );
+        // Only that app, only that address: everything else it pinned, and the
+        // other routed app on the same address, stay held to the tunnel.
+        assert!(
+            !program_may_connect(&filters, PINNED_APP, STILL_PINNED, PRIMARY_LUID),
+            "takeover {takeover}: the app's other destinations leak off the tunnel"
+        );
+        assert!(
+            !program_may_connect(&filters, OTHER_PINNED_APP, WITHDRAWN, PRIMARY_LUID),
+            "takeover {takeover}: another routed app leaks through the withdrawal"
+        );
+        assert!(program_may_connect(
+            &filters, PINNED_APP, WITHDRAWN, KS_LUID
+        ));
+    }
+}
+
+/// A withdrawn address the user's own additional-link rule names is the rule's
+/// to hold: the fallback must not open it on the main link when the tunnel goes.
+#[test]
+fn a_withdrawn_destination_an_additional_rule_names_stays_held() {
+    const NAMED: Ipv4Addr = Ipv4Addr::new(149, 154, 167, 99);
+    let mut rules = rules_with_one_app("tg.exe")
+        .rule_book
+        .primary
+        .rules()
+        .to_vec();
+    rules.push(CanonicalRule {
+        id: RuleId("ip-1".into()),
+        enabled: true,
+        address_match: Some(CanonicalAddressMatch::ExactIp(IpAddr::V4(NAMED))),
+        app_match: None,
+        comment: String::new(),
+        action: nrr_domain::RuleAction::Route,
+        origin: None,
+    });
+    let book = CanonicalRuleBook {
+        primary: CanonicalRuleSet::default(),
+        secondary: CanonicalRuleSet::from_rules(rules),
+    };
+    let observations = Arc::new(crate::app_observation_lookup::AppObservationStore::new());
+    observations.record(PINNED_APP, NAMED);
+    observations.retract("tg.exe", NAMED);
+    let filters = filters_observing(
+        snap_block("Wi-Fi", "TAP"),
+        full_ks_resolution(),
+        book,
+        observations,
+    );
+    assert!(!program_may_connect(
+        &filters,
+        PINNED_APP,
+        NAMED,
+        PRIMARY_LUID
+    ));
+    assert!(program_may_connect(&filters, PINNED_APP, NAMED, KS_LUID));
 }
 
 #[test]

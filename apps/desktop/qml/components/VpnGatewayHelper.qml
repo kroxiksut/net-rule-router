@@ -189,7 +189,7 @@ ColumnLayout {
         font.pixelSize: root.uiTheme.baseFontSizePx - 1
         text: root.uiRevision >= 0
             ? root.tr("settings.routing.vpn-gateway.note",
-                "For a VPN that connects only from one network, such as a work VPN allowed only from abroad: its gateway gets a rule for the channel you choose, so it always connects through that channel. If that channel is down, the VPN does not connect over the other one.")
+                "For a VPN that connects only from one network, such as a work VPN allowed only from abroad: its gateway gets a rule for the connection you choose, so it always goes out over that connection. If that connection is down, the VPN does not connect over the other one.")
             : ""
     }
 

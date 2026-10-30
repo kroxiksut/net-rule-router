@@ -4,7 +4,7 @@
 
 `scripts/package-linux.sh` turns a release build into packages that install on
 a machine with no Rust toolchain and no repository: `.deb` for Debian, Ubuntu
-and Astra Linux, `.rpm` for the Red Hat family (RHEL, AlmaLinux, Rocky, Fedora,
+and Astra Linux, `.rpm` for the Red Hat family (Fedora, RHEL, AlmaLinux, Rocky,
 RED OS), and `.tar.gz` archives for everything else. How to build the programs
 themselves is on [Building from source (Linux)](building-linux.md).
 
@@ -122,6 +122,12 @@ sudo apt install ./netrulerouter_*.deb ./netrulerouter-gui_*.deb
 # RHEL family, RED OS
 sudo dnf install ./netrulerouter-*.rpm ./netrulerouter-gui-*.rpm
 ```
+
+On Fedora, `dnf` may stop with *Cannot download … openh264 … All mirrors were
+tried*: the window's Qt pulls in Fedora's video codecs, and their separate
+repository is not reachable from every network. Install with that repository
+switched off — nothing of NetRuleRouter needs it:
+`sudo dnf install --disablerepo=fedora-cisco-openh264 ./netrulerouter-*.rpm ./netrulerouter-gui-*.rpm`.
 
 The service starts right away and then with every boot. `nrr-cli`, `nrr-tui`
 and, with the GUI, `netrulerouter` are available by name from any shell, and

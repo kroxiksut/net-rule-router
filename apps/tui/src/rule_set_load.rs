@@ -46,7 +46,7 @@ pub const REFUSED: Key = key(
 );
 pub const PROTECTION_NOT_SAVED: Key = key(
     "tui.rule-set.not-applied-protection",
-    "«{name}»: these rules are not in use, because the leak protection chosen with them could not be saved. Set it in Interfaces and routes, then load the set again from the Rules screen.",
+    "«{name}»: these rules are not in use, because the leak protection chosen with them could not be saved. Set it in Connections, then load the set again from the Rules screen.",
 );
 
 #[cfg(test)]

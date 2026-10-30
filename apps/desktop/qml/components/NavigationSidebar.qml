@@ -157,6 +157,9 @@ Pane {
                                 implicitWidth: contentItem.implicitWidth + leftPadding + rightPadding
                                 implicitHeight: contentItem.implicitHeight + topPadding + bottomPadding
                                 highlighted: root.section === modelData
+                                // The ring follows the keyboard, as on the submenu entries.
+                                readonly property bool focusShown: visualFocus
+                                    || (activeFocus && root.prefs.enhancedFocus === true)
                                 // The header always opens the section (unchanged
                                 // behaviour); for Rules it also reveals the submenu
                                 // below so the newly opened list, check, and
@@ -175,15 +178,15 @@ Pane {
                                     theme: root.uiTheme
                                     cornerRadius: root.uiTheme.radiusSm
                                     color: navButton.highlighted ? root.accentColor : root.panelColor
-                                    border.width: navButton.activeFocus
+                                    border.width: navButton.focusShown
                                         ? root.uiTheme.focusBorderWidth : root.uiTheme.borderWidth
-                                    border.color: navButton.activeFocus
+                                    border.color: navButton.focusShown
                                         ? (navButton.highlighted
                                                ? root.uiTheme.stateFocusedBorderOnFill
-                                               : root.uiTheme.stateFocusedBorder)
+                                               : root.uiTheme.colorButtonOutline)
                                         : navButton.highlighted ? root.uiTheme.stateSelectedBorder : root.uiTheme.stateDefaultBorder
                                     Rectangle {
-                                        visible: navButton.activeFocus && navButton.highlighted
+                                        visible: navButton.focusShown && navButton.highlighted
                                         anchors.fill: parent
                                         anchors.margins: root.uiTheme.focusBorderWidth
                                         radius: Math.max(0, parent.radius - root.uiTheme.focusBorderWidth)

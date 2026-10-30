@@ -233,7 +233,9 @@ fn a_bound_adapter_that_no_longer_exists_asks_the_user_instead_of_going_quiet() 
     // so no amount of token matching can tie it to the binding. A vendor
     // that keeps its brand (`acme_VPN`) is healed automatically instead —
     // see the control test below.
-    let mut tun = adapter("wg", 64, true, true, Some([10, 88, 0, 191]));
+    // No way out yet (its client has installed no route), so it cannot be
+    // followed by itself and the choice goes back to the user.
+    let mut tun = adapter("wg", 64, true, true, None);
     tun.description = "WireGuard Tunnel".into();
     tun.friendly_name = "Tunnel 1".into();
     // Our own fake-IP adapter is up too and must never be offered.

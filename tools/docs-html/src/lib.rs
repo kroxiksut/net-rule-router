@@ -18,6 +18,11 @@ use pulldown_cmark::{html, CowStr, Event, LinkType, Options, Parser, Tag, TagEnd
 
 const STYLE: &str = include_str!("style.css");
 const STYLE_FILE: &str = "style.css";
+/// Pictures of `docs/images/` the header shows: the Markdown keeps its own
+/// copy of the logo for GitHub, which the offline body leaves out.
+const IMAGES_DIR: &str = "images";
+const LOGO_NAME: &str = "logo";
+const LOCKUP_PREFIX: &str = "logo-lockup-";
 
 #[derive(Debug)]
 pub struct Error(String);
@@ -59,6 +64,38 @@ struct Site<'a> {
     pages: Vec<Page>,
     by_source: HashMap<String, usize>,
     by_output: HashMap<String, usize>,
+    lockups: HashMap<String, Lockup>,
+}
+
+/// The logo with the product name in one language, output-relative.
+#[derive(Clone)]
+struct Lockup {
+    light: String,
+    dark: Option<String>,
+}
+
+/// `docs/images/logo-lockup-<language>.png` and its `-dark` twin, if any.
+fn lockup(repo: &Path, language: &str) -> Option<Lockup> {
+    let file = |suffix: &str| {
+        let output = format!("{IMAGES_DIR}/{LOCKUP_PREFIX}{language}{suffix}.png");
+        join(repo, &format!("docs/{output}"))
+            .is_file()
+            .then_some(output)
+    };
+    Some(Lockup {
+        light: file("")?,
+        dark: file("-dark"),
+    })
+}
+
+/// A repository path the page shows as its logo: the app icon or a lockup.
+fn is_logo(joined: &str) -> bool {
+    joined
+        .strip_prefix("docs/")
+        .and_then(|rest| rest.strip_prefix(IMAGES_DIR))
+        .and_then(|rest| rest.strip_prefix('/'))
+        .and_then(|name| name.strip_suffix(".png"))
+        .is_some_and(|stem| stem == LOGO_NAME || stem.starts_with(LOCKUP_PREFIX))
 }
 
 /// Converts `<repo>/docs` into `out`, which must be absent or empty: a page
@@ -89,12 +126,24 @@ pub fn build(repo: &Path, out: &Path, repo_url: &str) -> Result<Built, Error> {
     if by_output.len() != pages.len() {
         return Err(fail("two Markdown files map to one HTML page"));
     }
+    let english = lockup(repo, DOCS_CANONICAL_LANGUAGE);
+    let lockups = pages
+        .iter()
+        .map(|p| p.language.as_str())
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .filter_map(|language| {
+            let found = lockup(repo, language).or_else(|| english.clone())?;
+            Some((language.to_owned(), found))
+        })
+        .collect();
     let site = Site {
         repo,
         repo_url: repo_url.trim_end_matches('/'),
         pages,
         by_source,
         by_output,
+        lockups,
     };
     if !site
         .by_output
@@ -104,6 +153,11 @@ pub fn build(repo: &Path, out: &Path, repo_url: &str) -> Result<Built, Error> {
     }
 
     let mut images = BTreeMap::new();
+    for lockup in site.lockups.values() {
+        for output in std::iter::once(&lockup.light).chain(&lockup.dark) {
+            images.insert(output.clone(), format!("docs/{output}"));
+        }
+    }
     let mut rendered = Vec::with_capacity(site.pages.len());
     for at in 0..site.pages.len() {
         rendered.push(site.render(at, &mut images)?);
@@ -448,6 +502,113 @@ impl Site<'_> {
             .unwrap_or_default()
     }
 
+    /// The repository path `path`, as written on page `at`, names.
+    fn repo_parts(&self, at: usize, path: &str) -> Result<Vec<String>, String> {
+        let mut parts: Vec<String> = if path.starts_with('/') {
+            Vec::new()
+        } else {
+            let mut dir: Vec<String> = self.pages[at]
+                .source
+                .split('/')
+                .map(str::to_owned)
+                .collect();
+            dir.pop();
+            dir
+        };
+        for part in path.split('/') {
+            match part {
+                "" | "." => {}
+                ".." => {
+                    if parts.pop().is_none() {
+                        return Err("outside the repository".to_owned());
+                    }
+                }
+                part => parts.push(part.to_owned()),
+            }
+        }
+        Ok(parts)
+    }
+
+    /// The repository file a link of page `at` names, if it names one.
+    fn target_file(&self, at: usize, target: &str) -> Option<String> {
+        if is_external(target) {
+            return None;
+        }
+        let path = percent_decoded(target.split(['#', '?']).next().unwrap_or_default());
+        if path.is_empty() {
+            return None;
+        }
+        self.repo_parts(at, &path).ok().map(|parts| parts.join("/"))
+    }
+
+    /// Whether a link of page `at` opens the same page in another language.
+    fn is_twin(&self, at: usize, target: &str) -> bool {
+        let page = &self.pages[at];
+        let rest = |p: &Page| p.output.split_once('/').map(|(_, rest)| rest.to_owned());
+        self.target_file(at, target)
+            .and_then(|joined| self.by_source.get(&joined))
+            .map(|&found| &self.pages[found])
+            .is_some_and(|twin| twin.language != page.language && rest(twin) == rest(page))
+    }
+
+    /// Whether a paragraph of page `at` is one the header already shows: the
+    /// language switch (links to this page's twins, the current language in
+    /// bold, separators between) or the logo picture alone.
+    fn shown_in_header(&self, at: usize, inner: &[Event]) -> bool {
+        let (mut links, mut logos, mut nested) = (0usize, 0usize, 0usize);
+        for event in inner {
+            match event {
+                Event::Start(Tag::Link { dest_url, .. }) if self.is_twin(at, dest_url) => {
+                    links += 1;
+                    nested += 1;
+                }
+                Event::Start(Tag::Image { dest_url, .. })
+                    if self.target_file(at, dest_url).is_some_and(|f| is_logo(&f)) =>
+                {
+                    logos += 1;
+                    nested += 1;
+                }
+                Event::Start(Tag::Strong | Tag::Emphasis) => nested += 1,
+                Event::End(TagEnd::Link | TagEnd::Image | TagEnd::Strong | TagEnd::Emphasis) => {
+                    nested = nested.saturating_sub(1);
+                }
+                Event::Text(text) if nested > 0 || !text.chars().any(char::is_alphanumeric) => {}
+                Event::SoftBreak => {}
+                _ => return false,
+            }
+        }
+        (links, logos) == (0, 1) || (links > 0 && logos == 0)
+    }
+
+    /// Which events of a page fall in a top-level paragraph `shown_in_header`.
+    fn header_duplicates(&self, at: usize, events: &[Event]) -> Vec<bool> {
+        let mut skip = vec![false; events.len()];
+        let mut depth = 0usize;
+        let mut i = 0;
+        while i < events.len() {
+            match &events[i] {
+                Event::Start(Tag::Paragraph) if depth == 0 => {
+                    let Some(end) = events[i..]
+                        .iter()
+                        .position(|e| matches!(e, Event::End(TagEnd::Paragraph)))
+                        .map(|n| i + n)
+                    else {
+                        break;
+                    };
+                    if self.shown_in_header(at, &events[i + 1..end]) {
+                        skip[i..=end].fill(true);
+                    }
+                    i = end;
+                }
+                Event::Start(_) => depth += 1,
+                Event::End(_) => depth = depth.saturating_sub(1),
+                _ => {}
+            }
+            i += 1;
+        }
+        skip
+    }
+
     /// The URL a link of page `at` gets, or why it reaches nothing.
     fn resolve(
         &self,
@@ -471,24 +632,7 @@ impl Site<'_> {
                 Err("no such heading".to_owned())
             };
         }
-        let mut parts: Vec<String> = if path.starts_with('/') {
-            Vec::new()
-        } else {
-            let mut dir: Vec<String> = page.source.split('/').map(str::to_owned).collect();
-            dir.pop();
-            dir
-        };
-        for part in path.split('/') {
-            match part {
-                "" | "." => {}
-                ".." => {
-                    if parts.pop().is_none() {
-                        return Err("outside the repository".to_owned());
-                    }
-                }
-                part => parts.push(part.to_owned()),
-            }
-        }
+        let parts = self.repo_parts(at, &path)?;
         let joined = parts.join("/");
         let with_fragment = |url: String| {
             if fragment.is_empty() {
@@ -554,8 +698,13 @@ impl Site<'_> {
             ))
         };
         let mut ids = page.ids.iter();
-        let mut events = Vec::new();
-        for event in Parser::new_ext(&page.text, options()) {
+        let source: Vec<Event> = Parser::new_ext(&page.text, options()).collect();
+        let skip = self.header_duplicates(at, &source);
+        let mut events = Vec::with_capacity(source.len());
+        for (event, skipped) in source.into_iter().zip(skip) {
+            if skipped {
+                continue;
+            }
             let event = match event {
                 Event::Start(Tag::Heading {
                     level,
@@ -644,14 +793,33 @@ impl Site<'_> {
              <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\n\
              <meta name=\"color-scheme\" content=\"light dark\">\n<title>{title}</title>\n\
              <link rel=\"stylesheet\" href=\"{style}\">\n</head>\n<body>\n\
-             <header class=\"site\"><a class=\"home\" href=\"{home_url}\">{home_title}</a>\
+             <header class=\"site\"><a class=\"home\" href=\"{home_url}\">{home_label}</a>\
              <nav class=\"languages\">{switch}</nav></header>\n\
              <main>\n{body}</main>\n</body>\n</html>\n",
             lang = page.language,
             title = escape(&page.title),
             style = relative_url(&page.output, STYLE_FILE),
             home_url = relative_url(&page.output, &home.output),
-            home_title = escape(&home.title),
+            home_label = self.home_label(at, &escape(&home.title)),
+        )
+    }
+
+    /// The header's way home: the logo in the page's language, with a version
+    /// for a dark page when there is one, or else the home page's title.
+    fn home_label(&self, at: usize, title: &str) -> String {
+        let page = &self.pages[at];
+        let Some(lockup) = self.lockups.get(&page.language) else {
+            return title.to_owned();
+        };
+        let dark = lockup.dark.as_ref().map_or(String::new(), |dark| {
+            format!(
+                "<source media=\"(prefers-color-scheme: dark)\" srcset=\"{}\">",
+                relative_url(&page.output, dark)
+            )
+        });
+        format!(
+            "<picture>{dark}<img class=\"lockup\" src=\"{}\" alt=\"{title}\"></picture>",
+            relative_url(&page.output, &lockup.light)
         )
     }
 }

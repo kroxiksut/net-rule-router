@@ -1,7 +1,7 @@
 Screens:
   1. Status
   2. First run
-  3. Interfaces and routes
+  3. Connections
   4. Rules
   5. Overlaps
   6. Suggested addresses
@@ -12,23 +12,23 @@ Screens:
 
 Screen: Status
 Service: OK
-Routing state:
-  Routing active
-  Rules apply on this user session.
+Rules status:
+  Rules are working
+  Your rules are working.
 Connections:
   Main connection: Ethernet — Example Network Adapter — Available — Rules applied
-  Additional connection: Example Tunnel — Example Network Adapter — Available — Rules applied
+  Additional connection (e.g. VPN): Example Tunnel — Example Network Adapter — Available — Rules applied
 Notifications:
   No notifications.
 Commands on this screen:
   r: restore your settings to a service that lost them
   t: confirm the first listed program as your VPN (T: with the programs it ships with), so leak protection keeps it working
   a: allow the first listed VPN to reach its server, so leak protection lets it connect
-  p: confirm the suggested main connection; another one is chosen under Interfaces and routes
-  v: send the blocked site named under the state over the additional route; you are asked first
+  p: confirm the suggested main connection; another one is chosen under Connections
+  v: send the blocked site named under the state over the additional connection; you are asked first
   x N: dismiss notification N   X: dismiss all
   m N: stop showing notifications like N   H: hide or show addresses in block notifications
-  For a blocked connection N: v N: send it over the additional route   s N: snooze   w N: why it was blocked
+  For a blocked connection N: v N: send it over the additional connection   s N: snooze   w N: why it was blocked
   For a site that does not open in notification N: c N: check whether the network or the site is at fault
 Type a screen number, h for help or q to quit, then press Enter.
 
@@ -36,7 +36,7 @@ Screen: Cache
 Service: OK
 Cache:
   Loading cache entries...
-  Shown: All sources · Any freshness · All routes
+  Shown: All sources · Any freshness · All connections
   c: Clear app cache   o: Clear OS DNS cache
 Cache entries:
 Selected entry:
@@ -45,7 +45,7 @@ Commands on this screen:
   d and a row number: show that entry, for example d 3
   / and text: search the cache on the service, for example /example.com; / on its own clears the search
   c: clear the app cache   o: flush the operating system's DNS cache (each asks first)
-  f: freshness, t: source, w: route; each press shows the next choice of that filter
+  f: freshness, t: source, w: connection; each press shows the next choice of that filter
   b: seed the cache from browser history (only names that match your rules)
   r: read again from the service. Lists do not refresh by themselves, so nothing moves while you read.
 Type a screen number, h for help or q to quit, then press Enter.
@@ -63,7 +63,7 @@ Cache entries: 10. host9.example.com → 192.0.2.29 · — · Fresh
 Cache entries: Rows 1–10 of 12.
 Selected entry: Host: host0.example.com
 Selected entry: IP: 192.0.2.20
-Selected entry: Route: Additional (VPN)
+Selected entry: Connection: Additional (VPN)
 Selected entry: Freshness: Fresh
 Selected entry: Source: DNS
 Selected entry: resolved: 2026-10-06 12:00 · expires: 2026-10-06 13:00
@@ -72,7 +72,7 @@ Screen: Cache
 Service: OK
 Cache:
   Entries on the service: 12.
-  Shown: All sources · Any freshness · All routes
+  Shown: All sources · Any freshness · All connections
   Clear the app cache? Names are resolved again as programs use them.
   y: yes   n: no
 Cache entries:
@@ -90,7 +90,7 @@ Cache entries:
 Selected entry:
   Host: host0.example.com
   IP: 192.0.2.20
-  Route: Additional (VPN)
+  Connection: Additional (VPN)
   Freshness: Fresh
   Source: DNS
   resolved: 2026-10-06 12:00 · expires: 2026-10-06 13:00
@@ -99,7 +99,7 @@ Commands on this screen:
   d and a row number: show that entry, for example d 3
   / and text: search the cache on the service, for example /example.com; / on its own clears the search
   c: clear the app cache   o: flush the operating system's DNS cache (each asks first)
-  f: freshness, t: source, w: route; each press shows the next choice of that filter
+  f: freshness, t: source, w: connection; each press shows the next choice of that filter
   b: seed the cache from browser history (only names that match your rules)
   r: read again from the service. Lists do not refresh by themselves, so nothing moves while you read.
 Type a screen number, h for help or q to quit, then press Enter.
@@ -110,7 +110,7 @@ Screen: Cache
 Service: OK
 Cache:
   Entries on the service: 12.
-  Shown: All sources · Any freshness · All routes
+  Shown: All sources · Any freshness · All connections
   c: Clear app cache   o: Clear OS DNS cache
 Cache entries:
   > 1. host0.example.com → 192.0.2.20 · Additional (VPN) · Fresh
@@ -127,7 +127,7 @@ Cache entries:
 Selected entry:
   Host: host0.example.com
   IP: 192.0.2.20
-  Route: Additional (VPN)
+  Connection: Additional (VPN)
   Freshness: Fresh
   Source: DNS
   resolved: 2026-10-06 12:00 · expires: 2026-10-06 13:00
@@ -136,7 +136,7 @@ Commands on this screen:
   d and a row number: show that entry, for example d 3
   / and text: search the cache on the service, for example /example.com; / on its own clears the search
   c: clear the app cache   o: flush the operating system's DNS cache (each asks first)
-  f: freshness, t: source, w: route; each press shows the next choice of that filter
+  f: freshness, t: source, w: connection; each press shows the next choice of that filter
   b: seed the cache from browser history (only names that match your rules)
   r: read again from the service. Lists do not refresh by themselves, so nothing moves while you read.
 Type a screen number, h for help or q to quit, then press Enter.
@@ -145,7 +145,7 @@ Screen: Cache
 Service: OK
 Cache:
   Entries on the service: 12.
-  Shown: All sources · Any freshness · All routes
+  Shown: All sources · Any freshness · All connections
   Flush the operating system's DNS cache?
   y: yes   n: no
 Cache entries:
@@ -163,7 +163,7 @@ Cache entries:
 Selected entry:
   Host: host0.example.com
   IP: 192.0.2.20
-  Route: Additional (VPN)
+  Connection: Additional (VPN)
   Freshness: Fresh
   Source: DNS
   resolved: 2026-10-06 12:00 · expires: 2026-10-06 13:00
@@ -172,7 +172,7 @@ Commands on this screen:
   d and a row number: show that entry, for example d 3
   / and text: search the cache on the service, for example /example.com; / on its own clears the search
   c: clear the app cache   o: flush the operating system's DNS cache (each asks first)
-  f: freshness, t: source, w: route; each press shows the next choice of that filter
+  f: freshness, t: source, w: connection; each press shows the next choice of that filter
   b: seed the cache from browser history (only names that match your rules)
   r: read again from the service. Lists do not refresh by themselves, so nothing moves while you read.
 Type a screen number, h for help or q to quit, then press Enter.
@@ -181,7 +181,7 @@ Screen: Cache
 Service: OK
 Cache:
   Entries on the service: 12.
-  Shown: All sources · Any freshness · All routes
+  Shown: All sources · Any freshness · All connections
   Clearing…
 Cache entries:
   > 1. host0.example.com → 192.0.2.20 · Additional (VPN) · Fresh
@@ -198,7 +198,7 @@ Cache entries:
 Selected entry:
   Host: host0.example.com
   IP: 192.0.2.20
-  Route: Additional (VPN)
+  Connection: Additional (VPN)
   Freshness: Fresh
   Source: DNS
   resolved: 2026-10-06 12:00 · expires: 2026-10-06 13:00
@@ -207,7 +207,7 @@ Commands on this screen:
   d and a row number: show that entry, for example d 3
   / and text: search the cache on the service, for example /example.com; / on its own clears the search
   c: clear the app cache   o: flush the operating system's DNS cache (each asks first)
-  f: freshness, t: source, w: route; each press shows the next choice of that filter
+  f: freshness, t: source, w: connection; each press shows the next choice of that filter
   b: seed the cache from browser history (only names that match your rules)
   r: read again from the service. Lists do not refresh by themselves, so nothing moves while you read.
 Type a screen number, h for help or q to quit, then press Enter.

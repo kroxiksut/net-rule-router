@@ -173,6 +173,72 @@ function sidecarRuleSignatureString(row) {
     return p.type + "|" + p.value.toLowerCase() + "|" + p.route
 }
 
+// The rows whose comment differs from the one `stored` (the sidecar's
+// signature -> comment map) holds for their rule; null stored: every row.
+function commentRowsThatDiffer(rows, stored) {
+    if (stored === null || stored === undefined) return rows.slice()
+    var out = []
+    for (var i = 0; i < rows.length; i += 1) {
+        var sig = sidecarRuleSignatureString(rows[i])
+        var had = Object.prototype.hasOwnProperty.call(stored, sig) ? String(stored[sig] || "") : ""
+        if (had !== String(rows[i].comment || "")) out.push(rows[i])
+    }
+    return out
+}
+
+// The `mergeKey`s of a model's rows, as a set.
+function mergeKeysOf(model) {
+    var keys = {}
+    for (var i = 0; model && i < model.count; i += 1) keys[mergeKey(model.get(i))] = true
+    return keys
+}
+
+// A set merged into the user's rules (`import_merge_plan`): every own row
+// stays, and an imported row is added unless one with its `mergeKey` is there.
+// `?x` and `x` on one route are one rule and the plain one wins, as in the
+// service's own dedup. `add` and `plainAdded` index `imported`, `plain` indexes
+// `existing`.
+function importMergePlan(existing, imported) {
+    var own = existing || []
+    var rows = imported || []
+    var seen = {}
+    for (var k = 0; k < own.length; k += 1) seen[mergeKey(own[k])] = { own: k }
+    var plan = { add: [], plain: [], plainAdded: [] }
+    for (var i = 0; i < rows.length; i += 1) {
+        var key = mergeKey(rows[i])
+        var prior = seen[key]
+        if (!prior) {
+            plan.add.push(i)
+            seen[key] = { added: i }
+        } else if (!rowIsVerify(rows[i])) {
+            if (prior.own !== undefined) {
+                if (rowIsVerify(own[prior.own]) && plan.plain.indexOf(prior.own) < 0)
+                    plan.plain.push(prior.own)
+            } else if (rowIsVerify(rows[prior.added]) && plan.plainAdded.indexOf(prior.added) < 0) {
+                plan.plainAdded.push(prior.added)
+            }
+        }
+    }
+    return plan
+}
+
+// The imported rows whose comment goes to the sidecar. A replace writes every
+// one, a blank comment included, so the file's note replaces the stored one; a
+// merge keeps the rules it already had, so it writes only the ones it adds.
+function importedCommentRows(parsedRowsByRoute, mode, keysBefore) {
+    var out = []
+    var routes = ["primary", "secondary"]
+    for (var r = 0; r < routes.length; r += 1) {
+        var rows = (parsedRowsByRoute && parsedRowsByRoute[routes[r]]) || []
+        for (var i = 0; i < rows.length; i += 1) {
+            if (mode === "merge" && (keysBefore[mergeKey(rows[i])]
+                    || String(rows[i].comment || "") === "")) continue
+            out.push(rows[i])
+        }
+    }
+    return out
+}
+
 // ---- canonical rules-file (docs/en/rules-file-format.md) text ----
 
 // The application section of `os` (`PlatformProfile.os`): the only one the
@@ -216,7 +282,7 @@ var RULES_FILE_HINT_KEYS = [
     ["rules.file-hint.section",
         "--- Name         section header: rule type below     --- Domains"],
     ["rules.file-hint.value",
-        "value            rule: goes over this file's route   example.com"],
+        "value            rule: uses this file's connection   example.com"],
     ["rules.file-hint.subdomains",
         "*.value          the site and all its subdomains     *.example.com"],
     ["rules.file-hint.any-zone",
@@ -224,7 +290,7 @@ var RULES_FILE_HINT_KEYS = [
     ["rules.file-hint.deny",
         "!value           deny: through no connection at all  !ads.example.net"],
     ["rules.file-hint.verify",
-        "?value           this route while the site opens     ?mail.example.com"],
+        "?value           this connection, while it works     ?mail.example.com"],
     ["rules.file-hint.disabled",
         "# value          rule kept but turned off            # example.com"],
     ["rules.file-hint.note",
@@ -1023,9 +1089,17 @@ function offeredRuleTypes(types, appRoutingSupported) {
 // What the user calls a route: their own name for an adapter route, else the
 // stock one. A deny is a fixed meaning, never renamed.
 function routeDisplayLabel(role, primaryLabel, secondaryLabel, tr) {
-    if (role === "primary") return String(primaryLabel || "") || tr("label.primary", "Primary")
+    if (role === "primary") return String(primaryLabel || "") || tr("label.primary", "Main")
     if (role === "block") return tr("label.block", "Denied")
     return String(secondaryLabel || "") || tr("label.secondary", "Additional")
+}
+
+// A route as a choice reads: the stock name of the additional route says what
+// it usually is; a name the user gave is shown as given.
+function routeChoiceLabel(role, primaryLabel, secondaryLabel, tr) {
+    if (role === "secondary" && String(secondaryLabel || "") === "")
+        return tr("label.secondary-choice", "Additional (e.g. VPN)")
+    return routeDisplayLabel(role, primaryLabel, secondaryLabel, tr)
 }
 
 // The form's route choices. The deny option names the action, not the row

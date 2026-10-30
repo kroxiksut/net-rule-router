@@ -38,6 +38,12 @@ QtObject {
         return label
     }
 
+    /// The type as a picker offers it: its name with a plain explanation.
+    function ruleTypeChoiceLabel(id) {
+        var slug = String(id)
+        return host.tr("rules.type-explained." + slug, ruleTypeLabel(slug))
+    }
+
     /// Lowercase ACE form kept beside a row's value, so the table search
     /// matches either spelling without a bridge call per keystroke.
     function aceLowerForSearch(value) {
@@ -98,17 +104,24 @@ QtObject {
 
     /// Best-effort write of one row's comment into the sidecar; an empty one
     /// deletes it. Comments are decoration: a failure is logged, never shown.
-    function writeComment(row) {
+    /// `answered`, when given, runs once the write has answered or was skipped.
+    function writeComment(row, answered) {
+        var done = (typeof answered === "function") ? answered : function() {}
         if (!_bridgeReady || !rpc
                 || typeof nrrNativeBridge.rpcSidecarCommentWrite !== "function") {
+            done()
             return
         }
         var p = Rules.sidecarRuleSignatureParts(row)
-        if (p.type === "" || p.value === "" || p.route === "") return
+        if (p.type === "" || p.value === "" || p.route === "") {
+            done()
+            return
+        }
         var corr = nrrNativeBridge.rpcSidecarCommentWrite(
             p.type, p.value, p.route, String((row && row.comment) || ""))
         rpc.registerRpcCallback(corr, function(ok, payload, code, msg) {
             if (!ok) console.log("sidecar.comment.write failed:", code, msg)
+            done()
         })
     }
 }

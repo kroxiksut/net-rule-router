@@ -285,14 +285,25 @@ pub(super) fn type_label(rule_type: &RuleType, texts: &Texts) -> String {
     texts.dynamic(&format!("rules.type.{slug}"), &slug)
 }
 
+/// A type as the form offers it: its name with a plain explanation.
+fn type_choice_label(rule_type: &RuleType, texts: &Texts) -> String {
+    let slug = rule_type.canonical_slug();
+    texts.dynamic(
+        &format!("rules.type-explained.{slug}"),
+        &type_label(rule_type, texts),
+    )
+}
+
 pub(super) fn route_text(route: &TargetRoute, texts: &Texts) -> String {
     route_label(route).map_or_else(|| route.as_str().to_owned(), |k| texts.get(k))
 }
 
-/// A route as the form offers it: a deny names the action, not the row mark.
+/// A route as the form offers it: a deny names the action, not the row mark,
+/// and the additional route says what it usually is.
 fn form_route_text(route: &TargetRoute, texts: &Texts) -> String {
     match route {
         TargetRoute::Block => texts.get(text::ROUTE_DENY),
+        TargetRoute::Secondary => texts.get(text::ROUTE_SECONDARY_CHOICE),
         other => route_text(other, texts),
     }
 }
@@ -301,6 +312,7 @@ fn form_route_text(route: &TargetRoute, texts: &Texts) -> String {
 fn route_option_text(route: &TargetRoute, texts: &Texts) -> String {
     match route {
         TargetRoute::Block => texts.get(text::ROUTE_DENY_DESCRIPTION),
+        TargetRoute::Secondary => texts.get(text::ROUTE_SECONDARY_CHOICE),
         other => route_text(other, texts),
     }
 }
@@ -352,13 +364,14 @@ fn row_lines(
         type_label(&rule.rule_type, texts),
         display_text(&rule.match_value),
     );
+    // A `?` rule says so in words after its route, then the rest of the row.
     let route = route_text(&rule.target_route, texts);
-    // The route's `?` mark, then the rest of the row.
-    let mut tail = if rule.is_verify() {
-        " ?".to_owned()
+    let route = if rule.is_verify() {
+        texts.fill(text::ROUTE_CHECKING, &[("route", route)])
     } else {
-        String::new()
+        route
     };
+    let mut tail = String::new();
     let cell = if with_main_route {
         main_route::cell(row)
     } else {
@@ -650,7 +663,7 @@ fn form_lines(app: &AppState, form: &Form, texts: &Texts) -> Vec<ViewLine> {
     for field in Field::ALL {
         let current = form.field == field;
         let (label, value) = match field {
-            Field::Type => (text::FIELD_TYPE, type_label(&form.rule_type, texts)),
+            Field::Type => (text::FIELD_TYPE, type_choice_label(&form.rule_type, texts)),
             Field::Value => (text::FIELD_VALUE, form.value.clone()),
             Field::Route => (text::FIELD_ROUTE, form_route_text(&form.route, texts)),
             Field::Comment => (text::FIELD_COMMENT, form.comment.clone()),
@@ -740,7 +753,8 @@ fn form_lines(app: &AppState, form: &Form, texts: &Texts) -> Vec<ViewLine> {
             Field::Type => {
                 if current {
                     let types = offered_types();
-                    let labels: Vec<String> = types.iter().map(|t| type_label(t, texts)).collect();
+                    let labels: Vec<String> =
+                        types.iter().map(|t| type_choice_label(t, texts)).collect();
                     let chosen = types.iter().position(|t| *t == form.rule_type);
                     lines.extend(options(&labels, chosen, texts));
                     if form.editing.is_none() {
@@ -1238,6 +1252,30 @@ fn signal_text(signal: &nrr_shared::ipc_payloads::RiskSignalDto, texts: &Texts) 
     fill_placeholders(&template, values)
 }
 
+/// A review row's rule with the service's English markers in the session language.
+pub(super) fn entry_text(display: &str, texts: &Texts) -> String {
+    let parts = nrr_client_logic::review::review_entry_parts(display);
+    let mut shown = if parts.invalid {
+        texts.get(text::REVIEW_ENTRY_INVALID)
+    } else {
+        parts.rule
+    };
+    if parts.app {
+        shown = texts.fill(text::REVIEW_ENTRY_APP, &[("rule", shown)]);
+    }
+    if let Some((from, to)) = parts.moved {
+        shown = texts.fill(
+            text::REVIEW_ENTRY_MOVED,
+            &[
+                ("rule", shown),
+                ("from", route_text(&TargetRoute::from_slug(&from), texts)),
+                ("to", route_text(&TargetRoute::from_slug(&to), texts)),
+            ],
+        );
+    }
+    shown
+}
+
 fn entry_lines(sign: &str, entries: &[&RuleSummaryEntryDto], texts: &Texts) -> Vec<ViewLine> {
     if entries.is_empty() {
         return vec![ViewLine::text(format!(
@@ -1248,11 +1286,15 @@ fn entry_lines(sign: &str, entries: &[&RuleSummaryEntryDto], texts: &Texts) -> V
     entries
         .iter()
         .map(|entry| {
-            let mut line = format!("  {sign} {}", entry.display);
+            let mut line = format!("  {sign} {}", entry_text(&entry.display, texts));
             if !entry.route.is_empty() {
                 let route = route_text(&TargetRoute::from_slug(&entry.route), texts);
-                let mark = if entry.verify { " ?" } else { "" };
-                line.push_str(&format!("  [{route}{mark}]"));
+                let route = if entry.verify {
+                    texts.fill(text::ROUTE_CHECKING, &[("route", route)])
+                } else {
+                    route
+                };
+                line.push_str(&format!("  [{route}]"));
             }
             if !entry.enabled {
                 line.push_str(&format!("  · {}", texts.get(text::DISABLED)));

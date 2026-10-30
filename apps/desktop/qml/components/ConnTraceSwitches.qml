@@ -88,7 +88,7 @@ ColumnLayout {
             ToolTip.delay: 400
             ToolTip.text: block.root.tr(
                 "settings.diagnostics.conn-trace.ndjson.tooltip",
-                "Each observed connection is written to the service log: process, remote IP:port and egress interface (primary or additional adapter). Switches itself off when the chosen time runs out, even across a service restart; the \"until the service restarts\" choice ends at the next restart. Applies immediately.")
+                "Each observed connection is written to the service log: process, remote IP:port and the connection it left through (main or additional). Switches itself off when the chosen time runs out, even across a service restart; the \"until the service restarts\" choice ends at the next restart. Applies immediately.")
         }
     }
     Label {

@@ -8,7 +8,7 @@
     { "name": "absent snapshot", "input": { "key": "doh-lockdown-scope" } },
     { "name": "value present", "input": { "snapshot": { "mode": "prefer-secondary" }, "key": "mode" } },
     { "name": "bool present false", "input": { "snapshot": { "include-subdomains": false }, "key": "include-subdomains" } },
-    { "name": "empty snapshot leak protection", "input": { "snapshot": {}, "key": "leak-protection" }, "expected": "off" },
+    { "name": "empty snapshot leak protection is the default, routed sites", "input": { "snapshot": {}, "key": "leak-protection" }, "expected": "sites" },
     { "name": "leak protection present", "input": { "snapshot": { "leak-protection": "everything" }, "key": "leak-protection" }, "expected": "everything" },
     { "name": "invalid protocols", "input": { "snapshot": { "kill-switch-protocols": 0 }, "key": "kill-switch-protocols" } },
     { "name": "unknown key", "input": { "snapshot": { "future-field": 1 }, "key": "future-field" } },

@@ -1016,7 +1016,7 @@ ColumnLayout {
                 panel.fakeIpInstantRst = v
                 root.statusLine = v
                     ? root.tr("status.fake-ip-instant-rst-on",
-                        "Instant reset for the additional route is on.")
+                        "Instant reset for the additional connection is on.")
                     : root.tr("status.fake-ip-instant-rst-off",
                         "Instant reset is off — connections are held briefly instead of resetting.")
                 return
@@ -1516,7 +1516,7 @@ ColumnLayout {
 
     GroupBox {
         id: pauseGroup
-        title: root.tr("settings.routing.pause.title", "Apply rules")
+        title: root.tr("settings.routing.pause.title", "Turning rules on and off")
         Layout.fillWidth: true
 
         readonly property bool paused: (root.uiRevision >= 0)
@@ -1566,9 +1566,9 @@ ColumnLayout {
                     Layout.fillWidth: true
                     color: root.textColor
                     text: pauseGroup.paused
-                        ? root.tr("settings.routing.pause.status-paused", "Rules are disabled")
+                        ? root.tr("settings.routing.pause.status-paused", "Rules are off")
                             + (pauseGroup.leftText !== "" ? " · " + pauseGroup.leftText : "")
-                        : root.tr("settings.routing.pause.status-active", "Rules are active")
+                        : root.tr("settings.routing.pause.status-active", "Rules are on")
                 }
                 ThemedComboBox {
                     id: pauseTermCombo
@@ -1590,8 +1590,8 @@ ColumnLayout {
                 ThemedButton {
                     theme: root.uiTheme
                     text: pauseGroup.paused
-                        ? root.tr("settings.routing.pause.action-enable", "Enable rules")
-                        : root.tr("settings.routing.pause.action-disable", "Disable rules")
+                        ? root.tr("settings.routing.pause.action-enable", "Turn rules on")
+                        : root.tr("settings.routing.pause.action-disable", "Turn off rules")
                     onClicked: pauseGroup.paused
                         ? root.setRoutingPauseEnabled(false, "")
                         : root.pauseRoutingFor(pauseTermCombo.terms[pauseTermCombo.currentIndex], "")
@@ -1604,7 +1604,7 @@ ColumnLayout {
                 color: root.mutedTextColor
                 font.pixelSize: root.uiTheme.baseFontSizePx - 1
                 text: root.tr("settings.routing.pause.paused-since",
-                    "Paused since {timestamp}")
+                    "Off since {timestamp}")
                     .replace("{timestamp}", Pure.formatTimestamp(Date.parse(pauseGroup.pausedAt)))
             }
 
@@ -1616,7 +1616,7 @@ ColumnLayout {
                 wrapMode: Text.WordWrap
                 font.pixelSize: root.uiTheme.baseFontSizePx - 1
                 text: root.tr("settings.routing.pause.no-tray-warning",
-                    "Tray is not running. Rules apply only while the tray is active.")
+                    "The tray icon is not running. Rules work only while it is running.")
             }
 
             Label {
@@ -1626,7 +1626,7 @@ ColumnLayout {
                 wrapMode: Text.WordWrap
                 font.pixelSize: root.uiTheme.baseFontSizePx - 1
                 text: root.tr("settings.routing.pause.persistence-hint",
-                    "Disabling stops applying rules for the time chosen under “Turn rules back on”: they come back on their own when it is up, and with “When I turn them back on” only when you do.")
+                    "Rules are turned off for the time chosen under “Turn rules back on”, then they come back on their own. With “When I turn them back on” they stay off until you turn them on.")
             }
         }
     }
@@ -1637,7 +1637,7 @@ ColumnLayout {
     GroupBox {
         id: defaultRouteGroup
         title: root.tr("settings.routing.default-route.title",
-            "Default route")
+            "Where everything else goes")
         Layout.fillWidth: true
         visible: root.behaviorModeModel && root.behaviorModeModel.count > 0
         ColumnLayout {
@@ -1654,10 +1654,13 @@ ColumnLayout {
             }
             ThemedComboBox {
                 id: defaultRouteCombo
-                accessibleLabel: root.uiRevision >= 0 ? root.tr("settings.routing.default-route.title", "Default route") : ""
+                accessibleLabel: root.uiRevision >= 0 ? root.tr("settings.routing.default-route.title", "Where everything else goes") : ""
                 theme: root.uiTheme
-                Layout.fillWidth: true
-                Layout.maximumWidth: 380
+                Layout.preferredWidth: root.uiRevision >= 0
+                    ? root.comboFitWidth(defaultRouteCombo, root.behaviorModeModel, "id",
+                        function(item) { return root.behaviorModeLabel(item.id) }, 380)
+                    : 380
+                Layout.maximumWidth: parent.width
                 model: root.behaviorModeModel
                 textRole: "id"
                 labelResolver: function(item) {
@@ -1789,7 +1792,7 @@ ColumnLayout {
                 wrapMode: Text.WordWrap
                 font.pixelSize: root.uiTheme.baseFontSizePx - 1
                 text: root.tr("settings.routing-behavior.include-subdomains.note",
-                    "On by default: a rule for a site also covers that site's subdomains, so images and scripts from “cdn.example.com” take the same route as “example.com”. Applies to all your domain rules at once. It only catches subdomains of the SAME site — an IP-check served from a different provider (a third-party domain) still won't be covered — and it sends more traffic through the additional adapter. Turn it off to match the exact domain only.")
+                    "On by default: a rule for a site also covers that site's subdomains, so images and scripts from “cdn.example.com” go over the same connection as “example.com”. Applies to all your domain rules at once. It only catches subdomains of the SAME site — an IP-check served from a different provider (a third-party domain) still won't be covered — and it sends more traffic through the additional adapter. Turn it off to match the exact domain only.")
             }
 
             // Programs over sites: an application rule takes every address its
@@ -1839,7 +1842,7 @@ ColumnLayout {
                 font.pixelSize: root.uiTheme.baseFontSizePx - 1
                 text: root.uiRevision >= 0
                     ? root.tr("settings.routing-behavior.app-rules-take-all.description",
-                        "A program you named in a rule sends everything it connects to over that rule's route, even to sites another rule sends the other way. Routing works per address, so those sites then go that route for every program on this computer.")
+                        "A program you named in a rule sends everything it connects to over that rule's connection, even to sites another rule sends over the other one. The connection is chosen per address, so those sites then go over it for every program on this computer.")
                     : ""
             }
         }
@@ -1880,7 +1883,7 @@ ColumnLayout {
                 wrapMode: Text.WordWrap
                 font.pixelSize: root.uiTheme.baseFontSizePx - 1
                 text: root.tr("settings.routing.vpn-client.note",
-                    "Point NetRuleRouter at the program you use as your VPN so its traffic keeps flowing over your main link while leak protection is on.")
+                    "Point NetRuleRouter at the program you use as your VPN so its traffic keeps flowing over your main connection while leak protection is on.")
             }
             RowLayout {
                 Layout.fillWidth: true
@@ -1923,7 +1926,7 @@ ColumnLayout {
                 checked: panel.externalAddressAutoCheck
                 text: root.uiRevision >= 0
                     ? root.tr("settings.routing.vpn-client.external-address-auto",
-                        "Check the external address each time the additional route connects")
+                        "Check the external address each time the additional connection comes up")
                     : ""
                 Accessible.role: Accessible.CheckBox
                 Accessible.name: text
@@ -1960,7 +1963,7 @@ ColumnLayout {
                 font.pixelSize: root.uiTheme.baseFontSizePx - 1
                 text: root.uiRevision >= 0
                     ? root.tr("settings.routing.vpn-client.external-address-auto-note",
-                        "Once per connection, asks a public address server through the additional route which address the internet sees, and shows it in a notice and under Interfaces and routes. On by default: it costs a couple of tiny requests through your VPN. The “Check external address” button works either way.")
+                        "Once per connection, asks a public address server through the additional connection which address the internet sees, and shows it in a notice and under Connections. On by default: it costs a couple of tiny requests through your VPN. The “Check external address” button works either way.")
                     : ""
             }
         }
@@ -2048,7 +2051,7 @@ ColumnLayout {
                     : ""
                 whenSafe: root.uiRevision >= 0
                     ? root.tr("settings.routing.focus.leak-protection.when-safe",
-                        "Turning leak protection off opens IPv6 again, but it also stops blocking your routed traffic when the additional route goes down. That is safe only if nothing you route needs to stay hidden, for example on a network you trust.")
+                        "Turning leak protection off opens IPv6 again, but it also stops blocking your routed traffic when the additional connection goes down. That is safe only if nothing you route needs to stay hidden, for example on a network you trust.")
                     : ""
                 onDismissed: panel._focusId = ""
             }
@@ -2120,7 +2123,7 @@ ColumnLayout {
                     font.pixelSize: root.uiTheme.baseFontSizePx - 1
                     text: root.uiRevision >= 0
                         ? root.tr("settings.routing.leak-protection.note-sites",
-                            "What your rules send through the additional connection never goes out the main one while strict blocking of shared addresses is on, as it is by default. Everything else keeps working, except sites that share an address with a routed one.")
+                            "What your rules send through the additional connection never goes out the main one while strict protection is on, as it is by default. Everything else keeps working, though a few ordinary sites may not open until the additional connection is back.")
                         : ""
                 }
                 ThemedRadioButton {
@@ -2496,7 +2499,7 @@ ColumnLayout {
                 wrapMode: Text.WordWrap
                 font.pixelSize: root.uiTheme.baseFontSizePx - 1
                 text: root.tr("settings.routing.enforcement-mode.note",
-                    "The resolver answers site-name lookups itself and sets up the route before the answer reaches the program, so even the first connection takes the right route. It takes over system DNS while the service runs. Changes apply immediately — no service restart needed.")
+                    "The resolver answers site-name lookups itself and sets up the route before the answer reaches the program, so even the first connection goes out the right way. It takes over system DNS while the service runs. Changes apply immediately — no service restart needed.")
             }
 
             Item {
@@ -2734,7 +2737,7 @@ ColumnLayout {
                     && panel.detailedModeOn
                 checked: panel.fakeIpInstantRst
                 text: root.tr("settings.routing.fake-ip-instant-rst.label",
-                    "Instant reset when the additional route is unavailable")
+                    "Instant reset when the additional connection is unavailable")
                 contentItem: Label {
                     text: fakeIpInstantRstCheck.text
                     leftPadding: fakeIpInstantRstCheck.indicator.width + fakeIpInstantRstCheck.spacing
@@ -2760,7 +2763,7 @@ ColumnLayout {
                 wrapMode: Text.WordWrap
                 font.pixelSize: root.uiTheme.baseFontSizePx - 1
                 text: root.tr("settings.routing.fake-ip-instant-rst.note",
-                    "On (default): apps get an immediate connection reset when the additional route can't be resolved, so they can retry or fail over right away. Off: connections are held for up to 10 seconds while the route comes back, instead of resetting immediately.")
+                    "On (default): when the additional connection is unavailable, apps are refused right away and can retry. Off: connections wait up to 10 seconds for the connection to come back.")
             }
 
             // Shared addresses — one frame for the two settings that answer "a
@@ -2903,7 +2906,7 @@ ColumnLayout {
                         visible: panel.offered.indexOf("kill-switch-strict-shared-ips") >= 0
                         checked: panel.ksStrictSharedIps
                         text: root.tr("settings.routing.kill-switch.shared-strict-label",
-                            "Strict: also block addresses shared with regular sites (may break them)")
+                            "Strict: no exceptions while the additional connection is down (some ordinary sites may stop opening)")
                         contentItem: Label {
                             text: ksStrictSharedCheck.text
                             leftPadding: ksStrictSharedCheck.indicator.width + ksStrictSharedCheck.spacing
@@ -2937,7 +2940,7 @@ ColumnLayout {
                         wrapMode: Text.WordWrap
                         font.pixelSize: root.uiTheme.baseFontSizePx - 1
                         text: root.tr("settings.routing.kill-switch.shared-strict-note",
-                            "On (the default): safer. No traffic of routed sites goes out through the main connection, but some ordinary sites that share an address with them may stop opening until the additional adapter is back. Off: more convenient. Ordinary sites keep opening while the additional adapter is down, but some traffic of routed sites may go out through the main connection.")
+                            "On (the default): safer. No traffic of routed sites goes out through the main connection, but some ordinary sites may stop opening until the additional connection is back. Off: more convenient. Ordinary sites keep opening while the additional connection is down, but some traffic of routed sites may go out through the main connection.")
                     }
                     Label {
                         Layout.fillWidth: true
@@ -2952,7 +2955,7 @@ ColumnLayout {
                         wrapMode: Text.WordWrap
                         font.pixelSize: root.uiTheme.baseFontSizePx - 1
                         text: root.tr("settings.routing.kill-switch.shared-smart-warning",
-                            "Leak protection strictness is reduced: shared addresses excluded from blocking — ")
+                            "Leak protection is less strict, addresses left unblocked: ")
                             + (root.uiRevision >= 0
                                 ? Number(root.routingState.killSwitchSharedIpExemptions || 0) : 0)
                     }
@@ -2989,7 +2992,7 @@ ColumnLayout {
                         wrapMode: Text.WordWrap
                         font.pixelSize: root.uiTheme.baseFontSizePx - 1
                         text: root.tr("settings.routing.kill-switch.shared-smart-list-unavailable",
-                            "The running service reports how many addresses were excluded, but not which ones.")
+                            "The running service reports how many addresses are left unblocked, but not which ones.")
                     }
                     RowLayout {
                         Layout.fillWidth: true
@@ -3006,7 +3009,7 @@ ColumnLayout {
                             wrapMode: Text.WordWrap
                             font.pixelSize: root.uiTheme.baseFontSizePx - 1
                             text: root.tr("settings.routing.kill-switch.shared-smart-list-title",
-                                "Excluded addresses")
+                                "Unblocked addresses")
                         }
                         ThemedButton {
                             theme: root.uiTheme
@@ -3228,7 +3231,7 @@ ColumnLayout {
                 wrapMode: Text.WordWrap
                 text: root.uiRevision >= 0
                     ? root.tr("settings.routing.forwarded-traffic.description",
-                        "Programs in WSL, containers and virtual machines reach the internet through this computer, yet leak protection does not see them on its own. Choose what they get while the additional route is down.")
+                        "Programs in WSL, containers and virtual machines reach the internet through this computer, yet leak protection does not see them on its own. Choose what they get while the additional connection is down.")
                     : ""
             }
             Label {
@@ -3268,7 +3271,7 @@ ColumnLayout {
                 font.pixelSize: root.uiTheme.baseFontSizePx - 1
                 text: root.uiRevision >= 0
                     ? root.tr("settings.routing.forwarded-traffic.as-computer.note",
-                        "Addresses your rules send through the additional route reach them only through it, as they do your programs; while that route is down those stay closed, and when this computer blocks everything, so is their traffic. Works while leak protection is on.")
+                        "Addresses your rules send through the additional connection reach them only through it, as they do your programs; while it is down those stay closed, and when this computer blocks everything, so is their traffic. Works while leak protection is on.")
                     : ""
             }
             ThemedRadioButton {
@@ -3292,7 +3295,7 @@ ColumnLayout {
                 font.pixelSize: root.uiTheme.baseFontSizePx - 1
                 text: root.uiRevision >= 0
                     ? root.tr("settings.routing.forwarded-traffic.unprotected.note",
-                        "While the additional route is down, they reach everything over the main route, including addresses your rules send through the additional one.")
+                        "While the additional connection is down, they reach everything over the main connection, including addresses your rules send through the additional one.")
                     : ""
             }
         }
@@ -3586,7 +3589,7 @@ ColumnLayout {
                 color: root.mutedTextColor
                 wrapMode: Text.WordWrap
                 text: root.tr("settings.routing.local-suffixes.description",
-                    "Names under these suffixes belong to the network you are on (a printer, a router, a NAS) and are resolved by that network, never sent down a route. One list for every user of this computer; changing it needs an administrator.")
+                    "Names under these suffixes belong to the network you are on (a printer, a router, a NAS) and are resolved by that network; routing rules never touch them. One list for every user of this computer; changing it needs an administrator.")
             }
             Label {
                 Layout.fillWidth: true
@@ -3805,7 +3808,7 @@ ColumnLayout {
                 id: primaryProbeAutoCheck
                 Layout.fillWidth: true
                 text: root.tr("settings.routing.primary-probe.auto",
-                    "Check the main route for new suggestions automatically")
+                    "Check the main connection for new suggestions automatically")
                 checked: panel.primaryProbeAuto
                 onToggled: {
                     panel.primaryProbeAuto = checked
@@ -3928,11 +3931,11 @@ ColumnLayout {
                 color: root.textColor
                 wrapMode: Text.WordWrap
                 text: root.tr("settings.routing.auto-rules.label",
-                    "Missing companion domains")
+                    "Suggested addresses")
             }
             ThemedComboBox {
                 id: autoRulesModeCombo
-                accessibleLabel: root.uiRevision >= 0 ? root.tr("settings.routing.auto-rules.label", "Missing companion domains") : ""
+                accessibleLabel: root.uiRevision >= 0 ? root.tr("settings.routing.auto-rules.label", "Suggested addresses") : ""
                 theme: root.uiTheme
                 Layout.fillWidth: true
                 Layout.maximumWidth: 460
@@ -4010,7 +4013,7 @@ ColumnLayout {
                 wrapMode: Text.WordWrap
                 font.pixelSize: root.uiTheme.baseFontSizePx - 1
                 text: root.tr("settings.routing.auto-rules.note",
-                    "A routed site often loads its images and video from other domains your rules do not list, so the page opens but its content does not. By default NetRuleRouter collects these missing domains and offers them in the tray — nothing is added to your rules without your confirmation. “Apply automatically” adds them for you; “Off” stops collecting them altogether.")
+                    "A routed site often loads its images and video from other addresses your rules do not list, so the page opens but its content does not. By default NetRuleRouter finds these addresses and offers them in the tray — nothing is added to your rules without your confirmation. “Apply automatically” adds them for you; “Off” stops looking for them altogether.")
             }
 
             // Offer delivery-shaped names on first sight instead of waiting for
@@ -4072,7 +4075,7 @@ ColumnLayout {
                 wrapMode: Text.WordWrap
                 font.pixelSize: root.uiTheme.baseFontSizePx - 1
                 text: root.tr("settings.routing.auto-rules.auto-save-note",
-                    "Added addresses are written straight into the rules files your routes are linked to.")
+                    "Added addresses are written straight into the rules files your connections are linked to.")
             }
         }
     }
@@ -4727,7 +4730,7 @@ ColumnLayout {
                     ToolTip.visible: hovered
                     ToolTip.delay: 400
                     ToolTip.text: root.tr("settings.routing.rule-lock.allow.tooltip",
-                        "On (default): anyone signed in to this computer can add, edit and apply their own routing rules. Turn it off on company laptops so only an administrator changes the rules. Pausing routing and the route settings (connections, default route, leak protection) stay with each user.")
+                        "On (default): anyone signed in to this computer can add, edit and apply their own routing rules. Turn it off on company laptops so only an administrator changes the rules. Pausing routing and the connection settings (which connections are used, where everything else goes, leak protection) stay with each user.")
                 }
                 Label {
                     Layout.fillWidth: true

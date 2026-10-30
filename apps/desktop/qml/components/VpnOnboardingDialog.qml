@@ -272,7 +272,7 @@ Window {
         var name = Pure.displayText(c.displayName)
         if (c.running === true && String(c.interfaceName || "") !== "") {
             return root.tr("vpn-onboarding.kernel-tunnel-assign",
-                "Kernel tunnel {name} — assign adapter {interface} as the additional link")
+                "Kernel tunnel {name} — assign adapter {interface} as the additional connection")
                 .replace("{name}", name)
                 .replace("{interface}", Pure.displayText(c.interfaceName))
         }
@@ -331,7 +331,7 @@ Window {
             text: root.tr("vpn-onboarding.multi-hint",
                 "Tick every program that's part of your VPN — for example a "
                 + "client together with its background service or command-line "
-                + "helper. All of them will keep working over your main link.")
+                + "helper. All of them will keep working over your main connection.")
         }
 
         RowLayout {
@@ -591,7 +591,7 @@ Window {
                                     enabled: modelData.running === true
                                         && String(modelData.interfaceName || "") !== ""
                                     text: root.tr("status.secondary-unresolved-button",
-                                        "Open Interfaces and routes")
+                                        "Open Connections")
                                     Accessible.description: root._kernelTunnelTitle(modelData)
                                     onClicked: {
                                         var link = String(modelData.interfaceName || "")

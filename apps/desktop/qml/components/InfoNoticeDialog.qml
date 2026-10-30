@@ -17,6 +17,9 @@ Dialog {
     property string noticeTitle: ""
     /// Body text (already localized by the caller).
     property string noticeBody: ""
+    /// The notice says a change was refused until a security alert is
+    /// acknowledged: it offers the way there.
+    property bool offerOpenAlert: false
 
     function tr(key, fallback) {
         if (ownerRoot && typeof ownerRoot.tr === "function") {
@@ -53,9 +56,21 @@ Dialog {
             spacing: 8
             Item { Layout.fillWidth: true }
             ThemedButton {
+                visible: root.offerOpenAlert
+                theme: root.ownerRoot ? root.ownerRoot.uiTheme : null
+                text: root.tr("action.open-security-alert", "Open the alert")
+                highlighted: true
+                Accessible.role: Accessible.Button
+                Accessible.name: text
+                onClicked: {
+                    root.close()
+                    if (root.ownerRoot) root.ownerRoot.openSecurityAlerts()
+                }
+            }
+            ThemedButton {
                 theme: root.ownerRoot ? root.ownerRoot.uiTheme : null
                 text: root.tr("dialog.notice.ok", "OK")
-                highlighted: true
+                highlighted: !root.offerOpenAlert
                 Accessible.role: Accessible.Button
                 Accessible.name: text
                 onClicked: root.close()

@@ -99,7 +99,7 @@ fn result(app: &AppState) -> &crate::state::Notice {
     app.notices
         .iter()
         .rev()
-        .find(|n| n.title == "To additional route")
+        .find(|n| n.title == "Through additional")
         .expect("the result is in the feed")
 }
 
@@ -132,7 +132,7 @@ fn a_routeable_block_is_routed_after_a_yes_and_the_bound_file_follows() {
     );
     let shown = status_text(&app);
     assert!(
-        shown.contains("news.example was blocked. v: send it over the additional route."),
+        shown.contains("news.example was blocked. v: send it over the additional connection."),
         "{shown}"
     );
 
@@ -144,7 +144,7 @@ fn a_routeable_block_is_routed_after_a_yes_and_the_bound_file_follows() {
     );
     let asked = status_text(&app);
     assert!(
-        asked.contains("Route news.example via the additional link?"),
+        asked.contains("Send news.example through the additional connection (e.g. VPN)?"),
         "{asked}"
     );
     assert!(asked.contains("y: yes   n: no"), "{asked}");
@@ -160,10 +160,10 @@ fn a_routeable_block_is_routed_after_a_yes_and_the_bound_file_follows() {
     assert!(written.contains(SITE), "{written}");
     let told = result(&app);
     assert_eq!(told.level, NoticeLevel::Info);
-    assert_eq!(told.title, "To additional route");
+    assert_eq!(told.title, "Through additional");
     assert_eq!(
         told.body,
-        "news.example now goes over the additional route. You can undo it in Rules."
+        "news.example now goes over the additional connection. You can undo it in Rules."
     );
     assert!(app.block_route.offered.is_empty(), "the offer is answered");
     assert!(!status_text(&app).contains("v: send it"));
@@ -267,7 +267,7 @@ fn a_site_already_routed_is_said_and_nothing_is_reread() {
     drain(&mut app, &fake);
     assert_eq!(
         result(&app).body,
-        "news.example already goes over the additional route; nothing was added."
+        "news.example already goes over the additional connection; nothing was added."
     );
     assert!(!fake.operations().contains(&IpcOperationName::RulesList));
 }
@@ -289,7 +289,7 @@ fn a_refused_write_is_a_warning_in_the_feed() {
     assert_eq!(told.level, NoticeLevel::Warning);
     assert!(
         told.body
-            .starts_with("Could not send news.example over the additional route: "),
+            .starts_with("Could not send news.example over the additional connection: "),
         "{}",
         told.body
     );

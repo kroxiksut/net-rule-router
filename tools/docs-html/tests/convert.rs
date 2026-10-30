@@ -161,6 +161,118 @@ fn pictures_travel_with_the_pages() {
     assert_eq!(read(out.path(), "en/images/rules.png"), "png");
 }
 
+fn header(html: &str) -> &str {
+    &html[html.find("<header").expect("header")..html.find("</header>").expect("end")]
+}
+
+fn body(html: &str) -> &str {
+    &html[html.find("<main>").expect("main")..html.find("</main>").expect("end")]
+}
+
+fn write_lockups(root: &Path, languages: &[&str]) {
+    for language in languages {
+        for suffix in ["", "-dark"] {
+            let name = format!("docs/images/logo-lockup-{language}{suffix}.png");
+            write(root, &name, &name);
+        }
+    }
+}
+
+/// Every page, the nested ones too, opens with the logo in its own language,
+/// readable on a dark page as well, leading home.
+#[test]
+fn every_page_header_shows_the_logo_of_its_language_leading_home() {
+    let repo = site();
+    write_lockups(repo.path(), &["en", "ru"]);
+    let out = built(repo.path());
+    for (page, language, title) in [
+        ("en/index.html", "en", "Docs"),
+        ("en/quickstart.html", "en", "Docs"),
+        ("ru/quickstart.html", "ru", "Документация"),
+    ] {
+        let html = read(out.path(), page);
+        let header = header(&html);
+        for expected in [
+            format!(r#"src="../images/logo-lockup-{language}.png""#),
+            format!(
+                r#"<source media="(prefers-color-scheme: dark)" srcset="../images/logo-lockup-{language}-dark.png">"#
+            ),
+            format!(r#"alt="{title}""#),
+            r#"href="index.html""#.to_owned(),
+        ] {
+            assert!(header.contains(&expected), "{page}: {expected} in {header}");
+        }
+    }
+    for language in ["en", "ru"] {
+        for suffix in ["", "-dark"] {
+            let name = format!("images/logo-lockup-{language}{suffix}.png");
+            assert_eq!(read(out.path(), &name), format!("docs/{name}"));
+        }
+    }
+}
+
+#[test]
+fn a_language_without_its_own_logo_shows_the_english_one() {
+    let repo = site();
+    write_lockups(repo.path(), &["en"]);
+    let out = built(repo.path());
+    let html = read(out.path(), "ru/quickstart.html");
+    let header = header(&html);
+    assert!(
+        header.contains(r#"src="../images/logo-lockup-en.png""#)
+            && header.contains(r#"srcset="../images/logo-lockup-en-dark.png""#)
+            && header.contains(r#"alt="Документация""#),
+        "{header}"
+    );
+}
+
+/// The language switch and the logo the Markdown carries for GitHub are in
+/// the header already; the page body does not show them a second time.
+#[test]
+fn the_body_does_not_repeat_the_language_switch_or_the_logo() {
+    let repo = site();
+    write_lockups(repo.path(), &["en", "ru"]);
+    write(
+        repo.path(),
+        "docs/en/quickstart.md",
+        "# Quick start\n\n**English** · [Русский](../ru/quickstart.md)\n\n\
+         ![NetRuleRouter](../images/logo-lockup-en.png)\n\n## First steps\n\n\
+         ![Rules](images/rules.png)\n\nRead it [in Russian](../ru/quickstart.md) too.\n\n\
+         [Priority](priority.md#zones)\n",
+    );
+    write(
+        repo.path(),
+        "docs/ru/quickstart.md",
+        "# Быстрый старт\n\n[English](../en/quickstart.md) | **Русский**\n\n\
+         ![NetRuleRouter](../images/logo.png)\n\n[Приоритет](priority.md)\n",
+    );
+    write(repo.path(), "docs/images/logo.png", "logo");
+    let out = built(repo.path());
+    for (page, twin) in [
+        ("en/index.html", "../ru/index.html"),
+        ("ru/index.html", "../en/index.html"),
+        ("en/quickstart.html", "../ru/quickstart.html"),
+        ("ru/quickstart.html", "../en/quickstart.html"),
+    ] {
+        let html = read(out.path(), page);
+        let main = body(&html);
+        assert!(!main.contains("logo"), "{page}: {main}");
+        let switch = format!(r#"href="{twin}""#);
+        assert!(header(&html).contains(&switch), "{page}: {html}");
+        if page == "en/quickstart.html" {
+            // A sentence that only mentions the twin is not the switch.
+            assert!(
+                main.contains("in Russian") && main.contains(&switch),
+                "{main}"
+            );
+            assert!(main.contains(r#"src="images/rules.png""#), "{main}");
+        } else {
+            assert!(!main.contains(&switch), "{page}: {main}");
+        }
+    }
+    assert!(!out.path().join("images/logo.png").exists());
+}
+
 #[test]
 fn a_link_outside_the_documentation_goes_to_the_project_online() {
     let repo = site();

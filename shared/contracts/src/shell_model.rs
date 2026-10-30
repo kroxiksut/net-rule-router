@@ -417,10 +417,56 @@ const SETTINGS_CONTRACT: SettingsContract = SettingsContract {
         "Policy-affecting state belongs to service-owned storage and is not sourced from editable user config files.",
 };
 
+/// The channel a build of `version` belongs to: `development` for a debug
+/// build, else the pre-release's first label (`alpha`, `beta`, `rc`),
+/// `stable` without one, `pre-release` for any other label.
+pub const fn build_channel_of(version: &str, debug: bool) -> &'static str {
+    if debug {
+        return "development";
+    }
+    let bytes = version.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() && bytes[i] != b'-' && bytes[i] != b'+' {
+        i += 1;
+    }
+    if i == bytes.len() || bytes[i] == b'+' {
+        return "stable";
+    }
+    let start = i + 1;
+    let mut end = start;
+    while end < bytes.len() && bytes[end] != b'.' && bytes[end] != b'+' {
+        end += 1;
+    }
+    let label = bytes.split_at(end).0.split_at(start).1;
+    if label_is(label, b"alpha") {
+        "alpha"
+    } else if label_is(label, b"beta") {
+        "beta"
+    } else if label_is(label, b"rc") {
+        "rc"
+    } else {
+        "pre-release"
+    }
+}
+
+const fn label_is(label: &[u8], name: &[u8]) -> bool {
+    if label.len() != name.len() {
+        return false;
+    }
+    let mut i = 0;
+    while i < label.len() {
+        if label[i] != name[i] {
+            return false;
+        }
+        i += 1;
+    }
+    true
+}
+
 const ABOUT_CONTRACT: AboutContract = AboutContract {
     project_url: "https://github.com/kroxiksut/net-rule-router",
     community_url: "https://t.me/netrulerouter",
-    build_channel: "development",
+    build_channel: build_channel_of(env!("CARGO_PKG_VERSION"), cfg!(debug_assertions)),
     author: "Fyodor Malkov (kroxiksut)",
     author_email: "fmalkov91@gmail.com",
 };

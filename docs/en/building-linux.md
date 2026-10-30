@@ -6,10 +6,9 @@ This guide is for those who want to build NetRuleRouter themselves on Linux.
 The Windows guide is [a separate page](building-windows.md); macOS is later in
 the plan.
 
-Linux support is younger than the Windows one. The workspace builds, the test
-suite runs, and the service applies policy on real hardware — but there is no
-packaged release yet, so everything below starts from a checkout. To turn your
-build into `.deb`, `.rpm` and `.tar.gz` packages, see
+Ready packages (`.deb`, `.rpm`, `.tar.gz`) come with every release; see
+[Supported systems](supported-systems.md). Everything below starts from a
+checkout. To turn your own build into packages, see
 [Packaging for Linux](packaging-linux.md).
 
 ## What to install
@@ -30,7 +29,7 @@ sudo apt install build-essential cmake nftables \
      qt6-base-dev qt6-declarative-dev
 ```
 
-On RED OS, Fedora and other systems of the Red Hat family:
+On Fedora, RHEL and other systems of the Red Hat family (RED OS among them):
 
 ```bash
 sudo dnf install gcc gcc-c++ cmake nftables \
@@ -97,8 +96,8 @@ The service normally runs as a systemd unit rather than from a terminal:
 
 The unit is staged into `/usr/libexec/netrulerouter` before it is registered:
 a service running as root is never started from `/home`, where the user who
-owns the folder could replace it. `libexec` is where systems with SELinux enforcing (RED OS,
-Fedora and their relatives) expect a service's programs, so the service can
+owns the folder could replace it. `libexec` is where systems with SELinux enforcing (Fedora,
+RHEL and their relatives) expect a service's programs, so the service can
 manage the firewall and routes there without a policy change. Only the staging
 copy and the registration step use `sudo` — the build stays unprivileged, so
 nothing in `target/` ends up owned by root.

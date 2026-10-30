@@ -49,6 +49,9 @@ impl AutoRulesEngine {
             site_not_opening: OnceLock::new(),
             main_link_blocked_parked: OnceLock::new(),
             reverse_named: Mutex::new(crate::bounded_set::BoundedRecentSet::new(REVERSE_NAMED_CAP)),
+            pulled_in_refusals: Mutex::new(crate::bounded_set::BoundedRecentSet::new(
+                PULLED_IN_REFUSALS_CAP,
+            )),
         }
     }
 

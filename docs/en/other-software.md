@@ -20,7 +20,7 @@ have not watched it happen.
 | Tailscale, wg-quick and similar on Linux | Their own routing rules may take traffic before NetRuleRouter's. | Check that the connection you route through is not captured by them. | Not checked yet |
 | Docker, libvirt, LXC on Linux | Traffic forwarded for containers and virtual machines follows the rules and leak protection of the user who signed in first. | Choose in Settings whether they get the same leak protection as the computer; see [Several users](several-users.md#containers-and-virtual-machines). | Not checked yet |
 | A firewall service that reloads or flushes its rules (firewalld, ufw, nftables service) on Linux | A reload by that service can remove NetRuleRouter's rules until its next check. | Avoid reloading it while leak protection matters; restart the NetRuleRouter service afterwards. | Not checked yet |
-| Strict reverse-path filtering on Linux (RED OS, RHEL family) | A second signed-in user may get no replies. | See [Known limitations](known-limitations.md). | Not checked yet |
+| Strict reverse-path filtering on Linux (RHEL family, RED OS) | A second signed-in user may get no replies. | See [Known limitations](known-limitations.md). | Not checked yet |
 | Browser with its own encrypted DNS | It hides names from the rules. | Keep the setting that blocks it, or give the browser a rule of its own. See [Known limitations](known-limitations.md). | Checked |
 
 Found a combination that misbehaves? Open an issue with the name and version of

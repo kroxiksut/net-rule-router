@@ -42,9 +42,10 @@ pub(super) fn process_basename_lower(process_path: &str) -> String {
 /// and both other answers name a cause the user cannot act on here — the
 /// lockdown has a switch of its own and no rule behind it.
 ///
-/// An identified filter in none of those bands is an explicit rule Block
-/// action — the only remaining source of an OUR drop in production codegen —
-/// so it falls to [`BlockReason::BlockedByRule`].
+/// An identified filter in none of those bands falls to
+/// [`BlockReason::BlockedByRule`] only when the caller has no deny classifier;
+/// with one, the caller passes no `spec_id` for a filter it did not recognise,
+/// since other filters of ours (the fake-address pool's) block too.
 ///
 /// Without a spec id nothing is identified at all: the filter lookup can fail,
 /// and a filter retired between the drop and the lookup is gone by the time we

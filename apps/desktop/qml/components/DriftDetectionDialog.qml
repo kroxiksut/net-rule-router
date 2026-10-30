@@ -126,7 +126,7 @@ Dialog {
 
             // Header row
             Label {
-                text: dialog.tr("dialog.drift.col-route", "Route")
+                text: dialog.tr("dialog.drift.col-route", "Connection")
                 font.bold: true
                 color: dialog.ownerRoot ? dialog.ownerRoot.mutedTextColor : palette.text
             }
@@ -148,7 +148,7 @@ Dialog {
 
             // Primary row
             Label {
-                text: dialog.tr("dialog.drift.row-primary", "Primary")
+                text: dialog.tr("dialog.drift.row-primary", "Main")
                 color: dialog.ownerRoot ? dialog.ownerRoot.textColor : palette.text
             }
             Label {
@@ -202,7 +202,7 @@ Dialog {
                 Layout.fillWidth: true
                 visible: dialog.primaryDetails.mismatch !== "none"
                 text: dialog.tr("dialog.drift.summary-primary",
-                    "Primary route: {kind}")
+                    "Main connection: {kind}")
                     .replace("{kind}",
                         dialog._mismatchLabel(dialog.primaryDetails.mismatch))
                 wrapMode: Text.Wrap
@@ -212,7 +212,7 @@ Dialog {
                 Layout.fillWidth: true
                 visible: dialog.secondaryDetails.mismatch !== "none"
                 text: dialog.tr("dialog.drift.summary-secondary",
-                    "Additional route: {kind}")
+                    "Additional connection: {kind}")
                     .replace("{kind}",
                         dialog._mismatchLabel(dialog.secondaryDetails.mismatch))
                 wrapMode: Text.Wrap

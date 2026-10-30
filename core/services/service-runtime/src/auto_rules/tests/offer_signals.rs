@@ -810,6 +810,137 @@ fn a_host_only_ever_pulled_in_by_other_pages_is_not_offered() {
     assert_eq!(f.engine.candidates(SID).len(), 1);
 }
 
+/// Field case: the first verdict came while every sighting still read as pulled
+/// in, and the verdict then held — so the user's own retries, measured later,
+/// never reached the offer. A later stall asks again with what is known now.
+#[test]
+fn a_host_refused_as_pulled_in_is_offered_once_a_later_stall_shows_the_user_went_there() {
+    let verdicts = Arc::new(Mutex::new(HashMap::new()));
+    let f = fixture_with_main_link_verdicts(Arc::clone(&verdicts));
+    set_verdict(&verdicts, "photos.example", PrimaryBehavior::Stalls);
+    let pulled_in = HostCounts {
+        companions: 4,
+        ..HostCounts::default()
+    };
+    assert!(!f
+        .engine
+        .note_main_link_blocked_host(SID, "photos.example", pulled_in, wall_clock()));
+    assert!(f.engine.awaits_main_link_recheck(SID, "photos.example"));
+    assert!(
+        !f.engine
+            .recheck_main_link_blocked_host(SID, "photos.example", pulled_in, wall_clock()),
+        "the same evidence gives the same answer"
+    );
+
+    let went_there = HostCounts {
+        companions: 4,
+        solo: 1,
+        ..HostCounts::default()
+    };
+    assert!(f.engine.recheck_main_link_blocked_host(
+        SID,
+        "photos.example",
+        went_there,
+        wall_clock()
+    ));
+    assert_eq!(f.engine.candidates(SID).len(), 1);
+    assert!(!f.engine.awaits_main_link_recheck(SID, "photos.example"));
+}
+
+/// The re-ask is only for a host still failing and only for one refused that
+/// way: a stall of any other host is the verdict path's business.
+#[test]
+fn a_recheck_never_offers_a_host_that_now_works_or_was_never_refused() {
+    let verdicts = Arc::new(Mutex::new(HashMap::new()));
+    let f = fixture_with_main_link_verdicts(Arc::clone(&verdicts));
+    set_verdict(&verdicts, "photos.example", PrimaryBehavior::Stalls);
+    let pulled_in = HostCounts {
+        companions: 2,
+        ..HostCounts::default()
+    };
+    let went_there = HostCounts {
+        solo: 1,
+        ..HostCounts::default()
+    };
+    assert!(!f
+        .engine
+        .note_main_link_blocked_host(SID, "photos.example", pulled_in, wall_clock()));
+    set_verdict(&verdicts, "photos.example", PrimaryBehavior::Responds);
+    assert!(!f.engine.recheck_main_link_blocked_host(
+        SID,
+        "photos.example",
+        went_there,
+        wall_clock()
+    ));
+    assert!(!f.engine.recheck_main_link_blocked_host(
+        SID,
+        "never.refused.example",
+        went_there,
+        wall_clock()
+    ));
+    assert!(f.engine.candidates(SID).is_empty());
+}
+
+/// The field log replayed on production timings: a quiet browser, the
+/// address bar's own request, then the typed site's sockets, the stall verdict
+/// read before the window closes. The site is offered; an ad inside a page
+/// that loaded is not.
+#[test]
+fn a_typed_site_that_does_not_open_is_offered_and_an_ad_inside_a_page_is_not() {
+    use crate::navigation_registry::NavigationRegistry;
+    const BROWSER: &str = "C:/browser/browser.exe";
+    let owner = Some(SID);
+    let verdicts = Arc::new(Mutex::new(HashMap::new()));
+    let f = fixture_with_main_link_verdicts(Arc::clone(&verdicts));
+    let reg = NavigationRegistry::new();
+
+    // Background traffic a few seconds apart, as in the archive's ticks.
+    for at in [0_u64, 4_000, 9_000, 13_000] {
+        reg.note_attempt(owner, Some(BROWSER), Some("sync.vendor.example"), at);
+    }
+    reg.note_attempt(owner, Some(BROWSER), Some("suggest.vendor.example"), 20_000);
+    for at in [20_600, 20_850, 21_900] {
+        reg.note_attempt(owner, Some(BROWSER), Some("photos.example"), at);
+    }
+    set_verdict(&verdicts, "photos.example", PrimaryBehavior::Stalls);
+    reg.sweep(22_500);
+    assert!(
+        f.engine.note_main_link_blocked_host(
+            SID,
+            "photos.example",
+            reg.counts_of(owner, "photos.example"),
+            wall_clock()
+        ),
+        "{:?}",
+        reg.counts_of(owner, "photos.example")
+    );
+
+    // A page that loads, with its ad host stalling on several sockets.
+    reg.note_attempt(owner, Some(BROWSER), Some("news.example"), 60_000);
+    for (i, host) in [
+        "static.news.example",
+        "ads.tracker.example",
+        "cdn.example",
+        "ads.tracker.example",
+        "img.news.example",
+        "ads.tracker.example",
+    ]
+    .iter()
+    .enumerate()
+    {
+        reg.note_attempt(owner, Some(BROWSER), Some(host), 60_100 + i as u64 * 150);
+    }
+    set_verdict(&verdicts, "ads.tracker.example", PrimaryBehavior::Stalls);
+    reg.sweep(62_000);
+    assert!(!f.engine.note_main_link_blocked_host(
+        SID,
+        "ads.tracker.example",
+        reg.counts_of(owner, "ads.tracker.example"),
+        wall_clock()
+    ));
+    assert_eq!(f.engine.candidates(SID).len(), 1, "only the typed site");
+}
+
 /// A process the measure cannot read proves nothing either way, so the hosts it
 /// reached keep their offer.
 #[test]

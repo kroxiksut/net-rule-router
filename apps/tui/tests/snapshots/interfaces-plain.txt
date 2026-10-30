@@ -1,7 +1,7 @@
 Screens:
   1. Status
   2. First run
-  3. Interfaces and routes
+  3. Connections
   4. Rules
   5. Overlaps
   6. Suggested addresses
@@ -10,15 +10,15 @@ Screens:
   9. Diagnostics and logs
   0. Settings
 
-Screen: Interfaces and routes
+Screen: Connections
 Service: OK
 Connections:
-  The primary route uses the default interface; the additional route carries the traffic your rules send to it.
+  The main connection is your usual internet. The additional connection (e.g. VPN) carries what your rules send to it.
   Main connection: Ethernet — Example Network Adapter — Available
-  Additional connection: Example Tunnel — Example Network Adapter — Available
+  Additional connection (e.g. VPN): Example Tunnel — Example Network Adapter — Available
 Adapters:
   > 1. Ethernet — Example Network Adapter — Wired (Ethernet) — Available — Main connection
-    2. Example Tunnel — Example Network Adapter — Wired (Ethernet) — Available — Additional connection
+    2. Example Tunnel — Example Network Adapter — Wired (Ethernet) — Available — Additional connection (e.g. VPN)
     3. Wi-Fi — Wi-Fi — Available
     4. Host-only Network — Virtual (VM, container) — Available
 Chosen adapter: Ethernet — Example Network Adapter:
@@ -27,8 +27,8 @@ Chosen adapter: Ethernet — Example Network Adapter:
   Type: Wired (Ethernet) | IP: 192.0.2.10 | Gateway: 192.0.2.1
   DNS: 192.0.2.53 | Default route: Yes
   internet • unknown • Regular interface 90%
-  Recommended as primary
-  One adapter cannot carry both routes: to use it for the other one, unassign its current role first.
+  Recommended as main
+  One connection cannot be both main and additional: to use it for the other role, unassign its current one first.
 Commands on this screen:
   a: give an adapter a role or take it away (asks for the adapter's number)
   x: check each adapter's external address (sends one small packet per adapter)
@@ -40,12 +40,12 @@ Commands on this screen:
   e: send the remembered adapter to the service again
 Type a screen number, h for help or q to quit, then press Enter.
 
-Screen: Interfaces and routes
+Screen: Connections
 Service: OK
 Connections:
-  The primary route uses the default interface; the additional route carries the traffic your rules send to it.
+  The main connection is your usual internet. The additional connection (e.g. VPN) carries what your rules send to it.
   Main connection: Ethernet — Example Network Adapter — Available
-  Additional connection: Example Tunnel — Example Network Adapter — Available
+  Additional connection (e.g. VPN): Example Tunnel — Example Network Adapter — Available
 Which adapter?:
   > 1. Ethernet — Example Network Adapter
     2. Example Tunnel — Example Network Adapter
@@ -54,7 +54,7 @@ Which adapter?:
   Answer with the number, or with Up, Down and Enter. Esc or an empty answer cancels.
 Adapters:
   > 1. Ethernet — Example Network Adapter — Wired (Ethernet) — Available — Main connection
-    2. Example Tunnel — Example Network Adapter — Wired (Ethernet) — Available — Additional connection
+    2. Example Tunnel — Example Network Adapter — Wired (Ethernet) — Available — Additional connection (e.g. VPN)
     3. Wi-Fi — Wi-Fi — Available
     4. Host-only Network — Virtual (VM, container) — Available
 Chosen adapter: Ethernet — Example Network Adapter:
@@ -63,8 +63,8 @@ Chosen adapter: Ethernet — Example Network Adapter:
   Type: Wired (Ethernet) | IP: 192.0.2.10 | Gateway: 192.0.2.1
   DNS: 192.0.2.53 | Default route: Yes
   internet • unknown • Regular interface 90%
-  Recommended as primary
-  One adapter cannot carry both routes: to use it for the other one, unassign its current role first.
+  Recommended as main
+  One connection cannot be both main and additional: to use it for the other role, unassign its current one first.
 Commands on this screen:
   a: give an adapter a role or take it away (asks for the adapter's number)
   x: check each adapter's external address (sends one small packet per adapter)
@@ -76,20 +76,20 @@ Commands on this screen:
   e: send the remembered adapter to the service again
 Type the number of your answer and press Enter; an empty line cancels.
 
-Screen: Interfaces and routes
+Screen: Connections
 Service: OK
 Connections:
-  The primary route uses the default interface; the additional route carries the traffic your rules send to it.
+  The main connection is your usual internet. The additional connection (e.g. VPN) carries what your rules send to it.
   Main connection: Ethernet — Example Network Adapter — Available
-  Additional connection: Example Tunnel — Example Network Adapter — Available
+  Additional connection (e.g. VPN): Example Tunnel — Example Network Adapter — Available
 What should Wi-Fi carry?:
   > 1. Main connection
-    2. Additional connection
+    2. Additional connection (e.g. VPN)
     3. Cancel
   Answer with the number, or with Up, Down and Enter. Esc or an empty answer cancels.
 Adapters:
     1. Ethernet — Example Network Adapter — Wired (Ethernet) — Available — Main connection
-    2. Example Tunnel — Example Network Adapter — Wired (Ethernet) — Available — Additional connection
+    2. Example Tunnel — Example Network Adapter — Wired (Ethernet) — Available — Additional connection (e.g. VPN)
   > 3. Wi-Fi — Wi-Fi — Available
     4. Host-only Network — Virtual (VM, container) — Available
 Chosen adapter: Wi-Fi:
@@ -97,7 +97,7 @@ Chosen adapter: Wi-Fi:
   Type: Wi-Fi | IP: 192.0.2.10 | Gateway: 192.0.2.1
   DNS: 192.0.2.53 | Default route: Yes
   internet • unknown • Regular interface 90%
-  Recommended as primary
+  Recommended as main
 Commands on this screen:
   a: give an adapter a role or take it away (asks for the adapter's number)
   x: check each adapter's external address (sends one small packet per adapter)
@@ -109,17 +109,17 @@ Commands on this screen:
   e: send the remembered adapter to the service again
 Type the number of your answer and press Enter; an empty line cancels.
 
-Screen: Interfaces and routes
+Screen: Connections
 Service: OK
 Connections:
-  The primary route uses the default interface; the additional route carries the traffic your rules send to it.
+  The main connection is your usual internet. The additional connection (e.g. VPN) carries what your rules send to it.
   Main connection: Ethernet — Example Network Adapter — Available
-  Additional connection: Example Tunnel — Example Network Adapter — Available
+  Additional connection (e.g. VPN): Example Tunnel — Example Network Adapter — Available
 Last action:
   Saving…
 Adapters:
     1. Ethernet — Example Network Adapter — Wired (Ethernet) — Available — Main connection
-    2. Example Tunnel — Example Network Adapter — Wired (Ethernet) — Available — Additional connection
+    2. Example Tunnel — Example Network Adapter — Wired (Ethernet) — Available — Additional connection (e.g. VPN)
   > 3. Wi-Fi — Wi-Fi — Available
     4. Host-only Network — Virtual (VM, container) — Available
 Chosen adapter: Wi-Fi:
@@ -127,7 +127,7 @@ Chosen adapter: Wi-Fi:
   Type: Wi-Fi | IP: 192.0.2.10 | Gateway: 192.0.2.1
   DNS: 192.0.2.53 | Default route: Yes
   internet • unknown • Regular interface 90%
-  Recommended as primary
+  Recommended as main
 Commands on this screen:
   a: give an adapter a role or take it away (asks for the adapter's number)
   x: check each adapter's external address (sends one small packet per adapter)
@@ -138,4 +138,4 @@ Commands on this screen:
   u: show or hide unavailable adapters
   e: send the remembered adapter to the service again
 Type a screen number, h for help or q to quit, then press Enter.
-Last action: Additional connection: Wi-Fi.
+Last action: Additional connection (e.g. VPN): Wi-Fi.

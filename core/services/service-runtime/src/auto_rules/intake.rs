@@ -185,7 +185,12 @@ impl AutoRulesEngine {
         reached: HostCounts,
         now: SystemTime,
     ) -> bool {
+        let key = (sid.to_string(), normalized_host(hostname));
         if reached.only_pulled_in() {
+            self.pulled_in_refusals
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .observe(key);
             tracing::info!(
                 target: "nrr::auto-rules",
                 msg_key = "autorules-intake-not-offered-companion-burst",
@@ -196,7 +201,49 @@ impl AutoRulesEngine {
             );
             return false;
         }
+        self.pulled_in_refusals
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .remove(&key);
         self.park_self_signed(sid, hostname, AUTO_RULE_SIGNAL_MAIN_LINK_BLOCKED, now)
+    }
+
+    /// Whether a stall of `hostname` should ask again: it was refused as
+    /// pulled in. Cheap enough for every stalled connection.
+    #[must_use]
+    pub fn awaits_main_link_recheck(&self, sid: &str, hostname: &str) -> bool {
+        let refusals = self
+            .pulled_in_refusals
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        !refusals.is_empty() && refusals.contains(&(sid.to_string(), normalized_host(hostname)))
+    }
+
+    /// Another stall of a host refused as pulled in. The verdict that refused
+    /// it holds while the host keeps failing, so without this the user's own
+    /// retries, measured after that first answer, never reach the offer.
+    pub fn recheck_main_link_blocked_host(
+        &self,
+        sid: &str,
+        hostname: &str,
+        reached: HostCounts,
+        now: SystemTime,
+    ) -> bool {
+        if !self.awaits_main_link_recheck(sid, hostname) {
+            return false;
+        }
+        let host = normalized_host(hostname);
+        if self.main_link_behavior(sid, &host) != PrimaryBehavior::Stalls {
+            self.pulled_in_refusals
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .remove(&(sid.to_string(), host));
+            return false;
+        }
+        if reached.only_pulled_in() {
+            return false;
+        }
+        self.note_main_link_blocked_host(sid, hostname, reached, now)
     }
 
     /// Parks an offer to move a whole program onto the additional route: none
@@ -713,4 +760,9 @@ fn names_sites(set: &nrr_domain::canonical::CanonicalRuleSet) -> bool {
                 )
             )
     })
+}
+
+/// A host name as offers are keyed: lower case, no trailing dot.
+fn normalized_host(hostname: &str) -> String {
+    hostname.trim().trim_end_matches('.').to_ascii_lowercase()
 }

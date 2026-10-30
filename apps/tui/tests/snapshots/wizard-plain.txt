@@ -1,7 +1,7 @@
 Screens:
   1. Status
   2. First run
-  3. Interfaces and routes
+  3. Connections
   4. Rules
   5. Overlaps
   6. Suggested addresses

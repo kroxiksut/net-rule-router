@@ -133,17 +133,17 @@ QtObject {
     }
     function mainStaysText() {
         return root.tr("rules.overlaps.main-stays",
-            "Addresses of the main link inside this network stay on the main link even when the additional link is down. Leak protection does not block them.")
+            "Addresses of the main connection inside this network stay on the main connection even when the additional connection is down. Leak protection does not block them.")
     }
     /// One pair as a sentence: the overlaps table reads it to a screen reader,
     /// the rule dialog shows it before the rule is saved.
     function explain(overlap, candidate) {
         var sentence = overlap["block-wins-tie"] === true
             ? root.tr("rules.overlaps.block-tie",
-                "{winner} names the same sites as {loser} on {loser-route}. They are denied: on a tie a deny wins over a route.")
+                "{winner} names the same sites as {loser} on {loser-route}. They are denied: on a tie a deny wins over a choice of connection.")
             : String(overlap.kind) === "duplicate"
             ? root.tr("rules.overlaps.duplicate",
-                "{winner} is set on both routes. It goes over {winner-route}: on a tie the main route wins.")
+                "{winner} is set on both connections. It goes over {winner-route}: on a tie the main connection wins.")
             : String(overlap.kind) === "intersecting"
             ? root.tr("rules.overlaps.intersecting",
                 "{winner} and {loser} on {loser-route} share some addresses. Each shared address takes the narrower rule; most of them go over {winner-route}.")

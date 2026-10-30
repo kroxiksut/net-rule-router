@@ -19,7 +19,7 @@ a box; the arrow keys move within a list and change the choice of a drop-down.
 
 | Keys | What they do |
 |------|--------------|
-| `Ctrl+1` | Interfaces and routes |
+| `Ctrl+1` | Connections |
 | `Ctrl+2` | Rules |
 | `Ctrl+3` | Diagnostics |
 | `Ctrl+4` | Logs |

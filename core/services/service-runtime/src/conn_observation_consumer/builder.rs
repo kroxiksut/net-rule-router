@@ -53,6 +53,7 @@ impl ConnectionObservationConsumer {
             dns_lockdown_drop_check: None,
             service_account_drop_check: None,
             rule_block_drop_check: None,
+            fake_ip_pool: nrr_platform_api::fake_ip::FakeIpPoolConfig::default(),
             vpn_client_app_learner: None,
             vpn_gateway_drop: None,
             reverse_dns_learner: None,
@@ -280,6 +281,13 @@ impl ConnectionObservationConsumer {
     /// denied costs no lookup of its address.
     pub fn with_rule_block_drop_check(mut self, check: KillswitchDropCheckFn) -> Self {
         self.rule_block_drop_check = Some(check);
+        self
+    }
+
+    /// The pool fake addresses are dealt from, when it is not the default one.
+    #[must_use]
+    pub fn with_fake_ip_pool(mut self, pool: nrr_platform_api::fake_ip::FakeIpPoolConfig) -> Self {
+        self.fake_ip_pool = pool;
         self
     }
 

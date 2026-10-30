@@ -14,7 +14,7 @@ pub const FAILURE_POLICY: Key = key(
     "Apply failure policy",
 );
 pub const SERVICE: Key = key("settings.service.title", "Service management");
-pub const PRESETS: Key = key("settings.category.presets", "Presets and settings");
+pub const PRESETS: Key = key("settings.category.presets", "Rules and settings files");
 pub const LOGS: Key = key("settings.group.logs-diagnostics", "Logs and diagnostics");
 pub const TRAFFIC: Key = key("settings.traffic.category", "Traffic statistics");
 pub const ABOUT: Key = key("tui.settings.about.title", "About and updates");
@@ -74,7 +74,7 @@ pub const LEAK_HOLDS_EFFECT: Key = key(
 );
 pub const LEAK_UNROUTABLE_BODY: Key = key(
     "dialog.unroutable-secondary.body-kill-switch",
-    "It is currently assigned as your additional route.",
+    "It is currently chosen as your additional connection.",
 );
 pub const LEAK_UNROUTABLE_EFFECT: Key = key(
     "dialog.unroutable-secondary.effect-kill-switch-arming",
@@ -211,10 +211,13 @@ pub const UNSUPPORTED: Key = key(
 
 // ── Routing behaviour ────────────────────────────────────────────────────────
 
-pub const DEFAULT_ROUTE: Key = key("settings.routing.default-route.title", "Default route");
+pub const DEFAULT_ROUTE: Key = key(
+    "settings.routing.default-route.title",
+    "Where everything else goes",
+);
 pub const DEFAULT_ROUTE_NOTE: Key = key(
     "settings.routing.default-route.description",
-    "Where traffic that matches no rule is sent. Rules always take priority. Default: primary route.",
+    "Where traffic that matches no rule goes. Rules always take priority.",
 );
 pub const MODE_PREFER_PRIMARY: Key = key(
     "interfaces.mode.prefer-primary",
@@ -253,7 +256,7 @@ pub const LEAK_OFF_NOTE: Key = key(
 );
 pub const LEAK_SITES_NOTE: Key = key(
     "settings.routing.leak-protection.note-sites",
-    "What your rules send through the additional connection never goes out the main one while strict blocking of shared addresses is on, as it is by default. Everything else keeps working, except sites that share an address with a routed one.",
+    "What your rules send through the additional connection never goes out the main one while strict protection is on, as it is by default. Everything else keeps working, though a few ordinary sites may not open until the additional connection is back.",
 );
 pub const LEAK_EVERYTHING_NOTE: Key = key(
     "settings.routing.leak-protection.note-everything",
@@ -280,20 +283,20 @@ pub const ALLOW_DNS: Key = key(
 pub const ALLOW_DNS_NOTE: Key = key("settings.routing.kill-switch.allow-dns-note", "");
 pub const SHARED_STRICT: Key = key(
     "settings.routing.kill-switch.shared-strict-label",
-    "Strict: also block addresses shared with regular sites (may break them)",
+    "Strict: no exceptions while the additional connection is down (some ordinary sites may stop opening)",
 );
-pub const SHARED_STRICT_NOTE: Key = key("settings.routing.kill-switch.shared-strict-note", "");
+pub const SHARED_STRICT_NOTE: Key = key("settings.routing.kill-switch.shared-strict-note", "On (the default): safer. No traffic of routed sites goes out through the main connection, but some ordinary sites may stop opening until the additional connection is back. Off: more convenient. Ordinary sites keep opening while the additional connection is down, but some traffic of routed sites may go out through the main connection.");
 pub const SHARED_SMART_WARNING: Key = key(
     "settings.routing.kill-switch.shared-smart-warning",
-    "Leak protection strictness is reduced: shared addresses excluded from blocking — ",
+    "Leak protection is less strict, addresses left unblocked: ",
 );
 pub const SHARED_SMART_UNAVAILABLE: Key = key(
     "settings.routing.kill-switch.shared-smart-list-unavailable",
-    "The running service reports how many addresses were excluded, but not which ones.",
+    "The running service reports how many addresses are left unblocked, but not which ones.",
 );
 pub const SHARED_SMART_LIST: Key = key(
     "settings.routing.kill-switch.shared-smart-list-title",
-    "Excluded addresses",
+    "Unblocked addresses",
 );
 pub const SHOW_DETAILS: Key = key("action.show-details", "Show details");
 pub const HIDE_DETAILS: Key = key("action.hide-details", "Hide details");
@@ -353,7 +356,7 @@ pub const FAKE_IP_UDP: Key = key(
 );
 pub const FAKE_IP_RST: Key = key(
     "settings.routing.fake-ip-instant-rst.label",
-    "Instant reset when the additional route is unavailable",
+    "Instant reset when the additional connection is unavailable",
 );
 pub const LIVENESS: Key = key(
     "settings.routing.liveness-window.label",
@@ -404,7 +407,7 @@ pub const SUFFIX_TITLE: Key = key(
 );
 pub const SUFFIX_DESCRIPTION: Key = key(
     "settings.routing.local-suffixes.description",
-    "Names under these suffixes belong to the network you are on (a printer, a router, a NAS) and are resolved by that network, never sent down a route. One list for every user of this computer; changing it needs an administrator.",
+    "Names under these suffixes belong to the network you are on (a printer, a router, a NAS) and are resolved by that network; routing rules never touch them. One list for every user of this computer; changing it needs an administrator.",
 );
 pub const SUFFIX_EMPTY: Key = key(
     "settings.routing.local-suffixes.empty",
@@ -444,11 +447,11 @@ pub const FWD_TITLE: Key = key(
 );
 pub const FWD_CHOICE: Key = key(
     "settings.routing.forwarded-traffic.choice",
-    "When the additional route is down",
+    "When the additional connection is down",
 );
 pub const FWD_NOTE: Key = key(
     "settings.routing.forwarded-traffic.description",
-    "Programs in WSL, containers and virtual machines reach the internet through this computer, yet leak protection does not see them on its own. Choose what they get while the additional route is down.",
+    "Programs in WSL, containers and virtual machines reach the internet through this computer, yet leak protection does not see them on its own. Choose what they get while the additional connection is down.",
 );
 pub const FWD_AS_COMPUTER: Key = key(
     "settings.routing.forwarded-traffic.as-computer.label",
@@ -544,14 +547,14 @@ pub const SHORT_ENABLE: Key = key(
 pub const SHORT_FIELD: Key = key("settings.routing.short-names.field", "Network domain");
 pub const EXTERNAL_CHECK: Key = key(
     "settings.routing.vpn-client.external-address-auto",
-    "Check the external address each time the additional route connects",
+    "Check the external address each time the additional connection comes up",
 );
 pub const EXTERNAL_CHECK_NOTE: Key =
     key("settings.routing.vpn-client.external-address-auto-note", "");
 pub const AUTO_TITLE: Key = key("settings.routing.auto-rules.title", "Auto-rules");
 pub const PROBE_AUTO: Key = key(
     "settings.routing.primary-probe.auto",
-    "Check the main route for new suggestions automatically",
+    "Check the main connection for new suggestions automatically",
 );
 pub const PROBE_TIMEOUT: Key = key(
     "settings.routing.primary-probe.timeout",
@@ -566,10 +569,7 @@ pub const PROBE_REPEAT: Key = key(
     "Do not re-check the same address for, s",
 );
 pub const PROBE_RESET: Key = key("settings.routing.primary-probe.reset", "Reset to defaults");
-pub const AUTO_MODE: Key = key(
-    "settings.routing.auto-rules.label",
-    "Missing companion domains",
-);
+pub const AUTO_MODE: Key = key("settings.routing.auto-rules.label", "Suggested addresses");
 pub const AUTO_OFF: Key = key("settings.routing.auto-rules.mode-off", "Off");
 pub const AUTO_SUGGEST: Key = key(
     "settings.routing.auto-rules.mode-suggest",
@@ -593,7 +593,7 @@ pub const RULE_LOCK: Key = key(
 );
 pub const RULE_LOCK_NOTE: Key = key(
     "settings.routing.rule-lock.allow.tooltip",
-    "On (default): anyone signed in to this computer can add, edit and apply their own routing rules. Turn it off on company laptops so only an administrator changes the rules. Pausing routing and the route settings (connections, default route, leak protection) stay with each user.",
+    "On (default): anyone signed in to this computer can add, edit and apply their own routing rules. Turn it off on company laptops so only an administrator changes the rules. Pausing routing and the connection settings (which connections are used, where everything else goes, leak protection) stay with each user.",
 );
 pub const SERVICE_DRIVEN: Key = key(
     "settings.diagnostics.rule-scope.service-driven.label",
@@ -672,10 +672,10 @@ pub const SERVICE_FIX_MODE: Key = key(
     "tui.settings.service.fix-mode",
     "To change when it starts, remove it with {uninstall}, then install it again with {install}",
 );
-pub const RULES_PAUSE_TITLE: Key = key("settings.routing.pause.title", "Apply rules");
+pub const RULES_PAUSE_TITLE: Key = key("settings.routing.pause.title", "Turning rules on and off");
 pub const RULES_PAUSE_HINT: Key = key(
     "settings.routing.pause.persistence-hint",
-    "Disabling stops applying rules for the time chosen under “Turn rules back on”: they come back on their own when it is up, and with “When I turn them back on” only when you do.",
+    "Rules are turned off for the time chosen under “Turn rules back on”, then they come back on their own. With “When I turn them back on” they stay off until you turn them on.",
 );
 pub const ROLLBACK_TITLE: Key = key("action.safe-rollback", "Safe rollback");
 pub const ROLLBACK_LOOKUP: Key = key(
@@ -705,10 +705,10 @@ pub const ROLLBACK_SUBMITTED: Key = key(
 );
 pub const SAFE_DISABLE_NOTE: Key = key(
     "dialog.safe-disable.body",
-    "Temporarily disable your routing and leak protection: the routes and filters NetRuleRouter keeps for you are removed. Other users of this computer keep theirs. The service stays running; you can re-enable at any time. This action is audited.",
+    "Your rules and leak protection stop for the time you choose, then come back on their own. Other users of this computer are not affected. You can turn the rules back on earlier. This action is recorded in the log.",
 );
 pub const SAFE_DISABLE_REASON: Key = key("dialog.safe-disable.reason-label", "Reason (required)");
-pub const SAFE_DISABLE_RUN: Key = key("dialog.safe-disable.confirm", "Disable now");
+pub const SAFE_DISABLE_RUN: Key = key("dialog.safe-disable.confirm", "Turn off now");
 pub const SAFE_DISABLE_TERM: Key = key("dialog.safe-disable.term-label", "Turn rules back on");
 pub const SAFE_DISABLE_TERM_15M: Key =
     key("dialog.safe-disable.term.fifteen-minutes", "In 15 minutes");
@@ -724,7 +724,7 @@ pub const SAFE_DISABLE_TERM_RESTART: Key = key(
 );
 pub const SAFE_DISABLE_NEED_REASON: Key = key(
     "dialog.safe-disable.reason-required",
-    "Please describe the reason — it is recorded in the audit trail.",
+    "Please give a reason — it is recorded in the log.",
 );
 pub const SAFE_DISABLE_DONE: Key = key("status.safe-disable.completed", "Safe disable applied");
 pub const SERVICE_NOTE: Key = key(
@@ -773,7 +773,7 @@ pub const MERGE_POLICY_NO_FILE: Key = key(
 );
 pub const EXPORT_DESCRIPTION: Key = key(
     "settings.presets.full-settings-description",
-    "Export adapter bindings, your rules for both routes (those for other operating systems included), the paths of your rules files, the default route and leak protection as a single YAML file. Useful for backing up or transferring your settings.",
+    "Export adapter bindings, your rules for both connections (those for other operating systems included), the paths of your rules files, where everything else goes, and leak protection as a single YAML file. Useful for backing up or transferring your settings.",
 );
 pub const EXPORT_PATH: Key = key("tui.settings.presets.export-path", "File to write");
 pub const EXPORT_RUN: Key = key("tui.settings.presets.export", "Export full settings");
@@ -856,7 +856,7 @@ pub const LOGS_CLEARED: Key = key(
 pub const HISTORY_TITLE: Key = key("settings.conn-history.title", "Connection history");
 pub const HISTORY_NOTE: Key = key(
     "settings.conn-history.help",
-    "Which of your programs connected where, and over which route, kept on this computer for the days you choose. Only you can read your history; it is never part of the diagnostic archive.",
+    "Which of your programs connected where, and over which connection, kept on this computer for the days you choose. Only you can read your history; it is never part of the diagnostic archive.",
 );
 pub const HISTORY_KEEP: Key = key("settings.conn-history.keep", "Keep connection history");
 pub const HISTORY_DAYS: Key = key("settings.conn-history.retention-label", "Keep for");
@@ -1023,7 +1023,7 @@ pub const TRAFFIC_THROUGH_SECONDARY: Key = key(
 );
 pub const TRAFFIC_THROUGH_PRIMARY: Key = key(
     "settings.traffic.through-primary",
-    "Through primary adapter",
+    "Through the main adapter",
 );
 pub const TRAFFIC_ROLE_LOOPBACK: Key = key("settings.traffic.role-loopback", "Local (localhost)");
 pub const TRAFFIC_ROLE_VIRTUAL: Key = key("settings.traffic.role-virtual", "Virtual (VM)");
@@ -1118,7 +1118,7 @@ pub const PREF_SAVE_FAILED: Key = key(
 // ── Service errors (the GUI's `errors.<slug>` wording) ───────────────────────
 
 pub const ERRORS: &[(&str, Key)] = &[
-    ("unauthorized", key("errors.unauthorized", "Authentication required")),
+    ("unauthorized", key("errors.unauthorized", "You are not allowed to do this")),
     ("forbidden", key("errors.forbidden", "Permission denied")),
     (
         "rules-locked",
@@ -1141,8 +1141,8 @@ pub const ERRORS: &[(&str, Key)] = &[
             "The service is from a different version of NetRuleRouter. Restart the service or update the app.",
         ),
     ),
-    ("malformed-request", key("errors.malformed-request", "Request was rejected as malformed")),
-    ("busy-conflict", key("errors.busy-conflict", "Service is busy with another operation")),
+    ("malformed-request", key("errors.malformed-request", "The service did not accept the request. Try again.")),
+    ("busy-conflict", key("errors.busy-conflict", "The service is busy with something else — try again in a moment")),
     (
         "precondition-failed",
         key(
@@ -1193,7 +1193,7 @@ pub const ERRORS: &[(&str, Key)] = &[
             "Your rules are too many to fit in one settings export. Nothing was written; save your rules as rules files instead.",
         ),
     ),
-    ("internal", key("errors.internal", "Internal service error")),
+    ("internal", key("errors.internal", "Something went wrong in the service")),
     ("transport-disconnected", key("errors.transport-disconnected", "Service is offline")),
     (
         "timeout",
@@ -1257,11 +1257,10 @@ pub const NEEDS_ELEVATION_UNIX: Key = key(
 
 // ── Status lines the window shows beside its settings ────────────────────────
 
-pub const PAUSE_STATUS_PAUSED: Key =
-    key("settings.routing.pause.status-paused", "Rules are disabled");
+pub const PAUSE_STATUS_PAUSED: Key = key("settings.routing.pause.status-paused", "Rules are off");
 pub const PAUSED_SINCE: Key = key(
     "settings.routing.pause.paused-since",
-    "Paused since {timestamp}",
+    "Off since {timestamp}",
 );
 pub const PAUSE_UNTIL_RESTART: Key = key("routing.pause.until-restart", "until restart");
 pub const LEFT_MINUTES: Key = key("rules.override.left.minutes", "{count} min left");

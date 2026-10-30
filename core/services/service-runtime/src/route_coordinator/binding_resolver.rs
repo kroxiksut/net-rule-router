@@ -427,6 +427,36 @@ pub(super) fn sole_live_driver_sibling<'a>(
     siblings.next().is_none().then_some(only)
 }
 
+/// Where a dead additional binding's VPN may have come up: the live tunnels
+/// that are nobody else's (`foreign`: not ours, not a link the machine leaves
+/// by), less the other route's link (`excluded`), corporate clients, and
+/// links with no way out of their own. A VPN client may bring its tunnel up
+/// on an adapter of another driver than the one bound — its vendor's own
+/// beside a pool of stock copies — so the driver does not decide here.
+pub(super) fn adoptable_tunnels<'a>(
+    infos: &'a [AdapterInfo],
+    foreign: &[u32],
+    routes: &[RouteEntry],
+    excluded: impl Fn(&AdapterInfo) -> bool,
+) -> Vec<&'a AdapterInfo> {
+    use nrr_platform_api::vpn_discovery::{vpn_client_class, VpnClientClass};
+    infos
+        .iter()
+        .filter(|info| foreign.contains(&info.index))
+        .filter(|info| info.friendly_name != nrr_shared::product_identity::TUN_ADAPTER_NAME)
+        .filter(|info| classify_availability(info) == Some(AdapterAvailability::Available))
+        .filter(|info| !excluded(info))
+        .filter(|info| {
+            [info.friendly_name.as_str(), info.description.as_str()]
+                .iter()
+                .all(|name| vpn_client_class(name) != Some(VpnClientClass::Corporate))
+        })
+        .filter(|info| {
+            !info.gateways.is_empty() || derive_secondary_next_hop(routes, info.index).is_some()
+        })
+        .collect()
+}
+
 /// Live connections worth offering when the bound one is gone; tunnels first
 /// for the additional route. One definition, shared with the other platform.
 pub(super) fn replacement_candidates(infos: &[AdapterInfo], role: &str) -> Vec<String> {

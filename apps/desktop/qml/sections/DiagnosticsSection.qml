@@ -293,6 +293,7 @@ ScrollView {
     Component.onCompleted: {
         _refreshServiceHealth()
         _consumePendingExplainHost()
+        _consumeAlertsFocus()
         root.refreshDiagnosticsOnPageOpen()
     }
     // A block notice deep-links the host to probe, consumed once: coming back
@@ -301,6 +302,7 @@ ScrollView {
         if (visible) {
             section._consumePendingExplainHost()
             section._consumePendingSiteCheck()
+            section._consumeAlertsFocus()
             root.refreshDiagnosticsOnPageOpen()
         }
     }
@@ -348,6 +350,31 @@ ScrollView {
             flick.contentY = Math.max(0,
                 Math.min(explainPanel.y, flick.contentHeight - flick.height))
             explainPanel.focusInput()
+        })
+    }
+    Connections {
+        target: root
+        function onSecurityAlertsFocusPendingChanged() {
+            if (section.visible) Qt.callLater(section._consumeAlertsFocus)
+        }
+    }
+    // A refused change sent the user here: the alerts in view, the first one
+    // that can be acknowledged under the keyboard.
+    function _consumeAlertsFocus() {
+        if (!root.securityAlertsFocusPending) return
+        root.securityAlertsFocusPending = false
+        root.refreshDiagnosticsSnapshot()
+        Qt.callLater(function() {
+            var flick = section.contentItem
+            flick.contentY = Math.max(0,
+                Math.min(securityCard.y, flick.contentHeight - flick.height))
+            for (var i = 0; i < alertRepeater.count; i++) {
+                var card = alertRepeater.itemAt(i)
+                if (card && card.ackButton.visible) {
+                    card.ackButton.forceActiveFocus(Qt.TabFocusReason)
+                    return
+                }
+            }
         })
     }
     function _consumePendingSiteCheck() {
@@ -912,6 +939,7 @@ ScrollView {
 
         // Security Status card
         Frame {
+            id: securityCard
             Layout.fillWidth: true
             padding: root.uiTheme.spacingMd - root.uiTheme.spacingXxs
             background: CardSurface { theme: root.uiTheme; cornerRadius: root.uiTheme.radiusSm }
@@ -993,8 +1021,10 @@ ScrollView {
                 }
 
                 Repeater {
+                    id: alertRepeater
                     model: section.alertItems
                     delegate: Frame {
+                        property alias ackButton: ackButton
                         Layout.fillWidth: true
                         padding: root.uiTheme.spacingSm - root.uiTheme.spacingXxs
                         background: CardSurface { theme: root.uiTheme; cornerRadius: root.uiTheme.radiusSm }
@@ -1013,6 +1043,7 @@ ScrollView {
                                     wrapMode: Text.WordWrap
                                 }
                                 ThemedButton {
+                                    id: ackButton
                                     theme: root.uiTheme
                                     visible: modelData.state === "active"
                                         && modelData.alertId !== section.otherPrincipalAlertId

@@ -308,7 +308,7 @@ const LINK_TIE_SEPARATORS: &[char] = &[
 /// The distinctive words of an adapter name or a program path: ASCII-lowered,
 /// split on separators, dots kept inside a word (`hidemy.name`), versions,
 /// short words and the generic ones dropped.
-fn link_tie_words(raw: &str) -> Vec<String> {
+pub(crate) fn link_tie_words(raw: &str) -> Vec<String> {
     let lowered = raw.to_ascii_lowercase();
     let lowered = lowered.strip_suffix(".exe").unwrap_or(&lowered);
     let mut words: Vec<String> = Vec::new();
@@ -326,7 +326,7 @@ fn link_tie_words(raw: &str) -> Vec<String> {
     words
 }
 
-fn shares_a_word(words: &[String], raw: &str) -> bool {
+pub(crate) fn shares_a_word(words: &[String], raw: &str) -> bool {
     link_tie_words(raw).iter().any(|w| words.contains(w))
 }
 
@@ -375,7 +375,7 @@ pub fn picker_link_offer(rows: &[PickerRow], link_name: &str) -> LinkClientOffer
     LinkClientOffer { name, exe_paths }
 }
 
-fn strip_exe(name: &str) -> &str {
+pub(crate) fn strip_exe(name: &str) -> &str {
     let lowered = name.to_ascii_lowercase();
     if lowered.ends_with(".exe") {
         &name[..name.len() - 4]

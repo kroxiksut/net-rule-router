@@ -172,15 +172,17 @@ pub fn title(merge: &Merge) -> Key {
 
 /// The rule as the lists show it, in one line.
 fn item(rule: &RuleRow, texts: &Texts) -> String {
+    let route = route_text(&rule.target_route, texts);
+    let route = if rule.verify {
+        texts.fill(super::text::ROUTE_CHECKING, &[("route", route)])
+    } else {
+        route
+    };
     let mut line = format!(
-        "{} {} \u{2192} {}",
+        "{} {} \u{2192} {route}",
         type_label(&rule.rule_type, texts),
         display_text(&rule.match_value),
-        route_text(&rule.target_route, texts)
     );
-    if rule.verify {
-        line.push_str(" ?");
-    }
     if !rule.enabled {
         line.push_str(&format!(" ({})", texts.get(text::DISABLED)));
     }

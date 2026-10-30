@@ -1,24 +1,24 @@
 Service: OK
-╭> Screens─────────────────╮╭Routing state─────────────────────────────────────╮
-│> 1 Status                ││Routing limited                                   │
-│  2 First run             ││Some rules are not being applied right now. The   │
-│  3 Interfaces and routes ││notices say why.                                  │
-│  4 Rules                 ││                                                  │
-│  5 Overlaps              │╰──────────────────────────────────────────────────╯
-│  6 Suggested addresses   │╭Connections───────────────────────────────────────╮
-│  7 Connection trace      ││Main connection: Ethernet — Example Network       │
-│  8 Cache                 ││Adapter — Available — Rules applied               │
-│  9 Diagnostics and logs  ││Additional connection: Example Tunnel — Example   │
-│  0 Settings              ││Network Adapter — Available — Rules not applied   │
-│                          ││  The additional connection is not up             │
-│                          ││                                                  │
-│                          ││                                                  │
-│                          │╰──────────────────────────────────────────────────╯
-│                          │╭Notifications─────────────────────────────────────╮
-│                          ││1. Warning: The additional connection is not up   │
-│                          ││Sites your rules send there go over the main      │
-│                          ││connection until it comes back: leak protection is│
-│                          ││off. Start the connection, or turn leak protection│
-╰──────────────────────────╯╰──────────────────────────────────────────────────╯
+╭> Screens────────────────╮╭Rules status───────────────────────────────────────╮
+│> 1 Status               ││Some rules not working                             │
+│  2 First run            ││Some rules are not being applied right now. The    │
+│  3 Connections          ││notices say why.                                   │
+│  4 Rules                ││                                                   │
+│  5 Overlaps             │╰───────────────────────────────────────────────────╯
+│  6 Suggested addresses  │╭Connections────────────────────────────────────────╮
+│  7 Connection trace     ││Main connection: Ethernet — Example Network Adapter│
+│  8 Cache                ││— Available — Rules applied                        │
+│  9 Diagnostics and logs ││Additional connection (e.g. VPN): Example Tunnel — │
+│  0 Settings             ││Example Network Adapter — Available — Rules not    │
+│                         ││applied                                            │
+│                         ││  The additional connection is not up              │
+│                         ││                                                   │
+│                         ││                                                   │
+│                         │╰───────────────────────────────────────────────────╯
+│                         │╭Notifications──────────────────────────────────────╮
+│                         ││1. Warning: The additional connection is not up    │
+│                         ││Sites your rules send there go over the main       │
+│                         ││connection until it comes back: leak protection is │
+╰─────────────────────────╯╰───────────────────────────────────────────────────╯
 Warning: The additional connection is not up
 F1: help   q: quit

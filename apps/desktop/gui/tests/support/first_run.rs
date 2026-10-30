@@ -38,6 +38,26 @@ const FUNCTIONS: &[&str] = &[
     "_whenProtectionSettled",
     "_holdChosenRules",
     "_siblingWarning",
+    "_assignFromPage",
+    "_afterAssign",
+    "_changeChoice",
+    "_keepChoice",
+    "_watchAdapters",
+    "_assignJustConnected",
+    "_fitIn",
+    "_centerIn",
+    "_choose",
+    "_startEmpty",
+    "_chooseFailed",
+    "_pulseTarget",
+    "_nextAllowed",
+    "_offeredFor",
+    "_idleVpnOffer",
+    "_idleVpnProgram",
+    "_pickIsIdleVpn",
+    "_startVpnFirstHint",
+    "_pooledDown",
+    "_adapterLabel",
 ];
 
 /// The stand-in window. `wire(id, name, patch)` makes an adapter row as the
@@ -94,6 +114,8 @@ var root = {
     },
     interfacesRolesController: {
         assignRole: function(i, role) {
+            // One holder per role, as the Interfaces controller keeps it.
+            for (var j = 0; j < rows.length; j += 1) if (rows[j].selectedRole === role) rows[j].selectedRole = "";
             rows[i].selectedRole = role;
             say("assign " + role + " " + rows[i].persistentId);
         },
@@ -143,6 +165,17 @@ var _protectionWritten = null, _protectionWritePending = false;
 var _optionsApplied = false, _stabilityWritePending = false;
 var _protectionWrite = "", _protectionFailure = "", _protectionSending = null, _afterProtection = [];
 var defaultRoute = "prefer-primary", leakFloor = "off";
+var changingPrimary = false, changingSecondary = false;
+var _awaitPrimaryKey = "", _awaitSecondaryKey = "";
+var _adaptersSeen = null, justConnectedKey = "";
+var _vpnPrograms = [];
+var _wantWidth = 640, _wantHeight = 640;
+function _scanInstalledVpns() {}
+function _focusStep() {}
+Object.defineProperty(globalThis, "choosingPrimary", { get: function() {
+    return !primaryAssigned || changingPrimary } });
+Object.defineProperty(globalThis, "choosingSecondary", { get: function() {
+    return (!secondaryAssigned && !secondaryDeferred) || changingSecondary } });
 Object.defineProperty(globalThis, "leakProtectionChoice", { get: function() {
     return Pure.raiseLeakProtection(defaultRoute, wantLeakProtection, leakFloor) } });
 Object.defineProperty(globalThis, "servicePolicyKnown", { get: function() {

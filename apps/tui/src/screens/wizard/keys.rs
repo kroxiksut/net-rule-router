@@ -34,11 +34,11 @@ pub const PRIMARY_DESCRIPTION: Key = key(
 );
 pub const PRIMARY_ASSIGNED: Key = key(
     "dialog.first-run-wizard.primary-adapter-assigned",
-    "Main connection: {name}. You can change it later in Interfaces and routes.",
+    "Main connection: {name}. You can change it later in Connections.",
 );
 pub const NO_ADAPTERS: Key = key(
     "dialog.first-run-wizard.primary-adapter-unavailable",
-    "No connections to choose from yet — the background service reports them once it is running. You can set this later in Interfaces and routes.",
+    "No connections to choose from yet — the background service reports them once it is running. You can set this later in Connections.",
 );
 pub const SECONDARY_DESCRIPTION: Key = key(
     "dialog.first-run-wizard.secondary-adapter-description",
@@ -46,11 +46,11 @@ pub const SECONDARY_DESCRIPTION: Key = key(
 );
 pub const SECONDARY_ASSIGNED: Key = key(
     "dialog.first-run-wizard.secondary-adapter-assigned",
-    "Additional connection: {name}. You can change it later in Interfaces and routes.",
+    "Additional connection: {name}. You can change it later in Connections.",
 );
 pub const SECONDARY_ASSIGNED_DOWN: Key = key(
     "dialog.first-run-wizard.secondary-adapter-assigned-down",
-    "Additional connection: {name} — chosen, not connected yet. Your rules use it as soon as it connects. You can change it later in Interfaces and routes.",
+    "Additional connection: {name} — chosen, not connected yet. Your rules use it as soon as it connects. You can change it later in Connections.",
 );
 pub const SECONDARY_LATER: Key = key(
     "dialog.first-run-wizard.secondary-adapter-later",
@@ -58,17 +58,54 @@ pub const SECONDARY_LATER: Key = key(
 );
 pub const SECONDARY_DEFERRED: Key = key(
     "dialog.first-run-wizard.secondary-adapter-deferred",
-    "You can assign it any time in Interfaces and routes. Until then, with leak protection on, the traffic your rules send that way is blocked instead of leaking to the main connection.",
+    "You can assign it any time in Connections. Until then, with leak protection on, the traffic your rules send that way is blocked instead of leaking to the main connection.",
 );
 pub const VPN_HINT: Key = key(
     "dialog.first-run-wizard.secondary-adapter-vpn-hint",
-    "{name} looks like a VPN connection. We recommend it as the additional route: choose it above and press \"Set as additional\".",
+    "{name} looks like your VPN. We recommend making it the additional connection: choose it above and press \"Set as additional\".",
 );
 pub const VPN_NONE: Key = key(
     "dialog.first-run-wizard.secondary-adapter-vpn-none",
-    "No VPN connection found yet. Start your VPN and connect first: its connection then shows up in the list above as connected and is easy to pick. Then press \"Refresh interfaces\".",
+    "Not sure which connection is your VPN? Start your VPN and connect: the program notices the new connection by itself.",
 );
-pub const REFRESH: Key = key("action.refresh-interfaces", "Refresh interfaces");
+pub const VPN_INSTALLED: Key = key(
+    "dialog.first-run-wizard.secondary-adapter-vpn-installed",
+    "VPN found on this computer: {names}. Not sure which connection is your VPN? Start it and connect: the program notices the new connection by itself.",
+);
+pub const IDLE_VPN: Key = key(
+    "dialog.first-run-wizard.secondary-adapter-idle-vpn",
+    "{name} (VPN, not connected now)",
+);
+pub const IDLE_VPN_PROGRAM: Key = key(
+    "dialog.first-run-wizard.secondary-adapter-idle-vpn-program",
+    "{name} (VPN {program}, not connected now)",
+);
+pub const IDLE_VPN_LATER: Key = key(
+    "dialog.first-run-wizard.secondary-adapter-idle-vpn-later",
+    "Connect the VPN later: the program starts sending sites through it as soon as it is on.",
+);
+pub const START_VPN_FIRST: Key = key(
+    "dialog.first-run-wizard.secondary-adapter-start-vpn-first",
+    "Your VPN may use any of several connections on this computer, and while it is off there is no telling which one. Turn the VPN on — the wizard will see it and pick it.",
+);
+pub const START_VPN_FIRST_PROGRAM: Key = key(
+    "dialog.first-run-wizard.secondary-adapter-start-vpn-first-program",
+    "{program} may use any of several connections on this computer, and while the VPN is off there is no telling which one. Turn the VPN on — the wizard will see it and pick it.",
+);
+pub const JUST_CONNECTED: Key = key(
+    "dialog.first-run-wizard.secondary-adapter-just-connected",
+    "Just connected: {name} — probably your VPN.",
+);
+pub const CHANGE: Key = key("action.change", "Change...");
+pub const RULES_WAIT_FOR_ALERT_TITLE: Key = key(
+    "dialog.rules-wait-for-alert.title",
+    "The rules are not loaded yet",
+);
+pub const RULES_WAIT_FOR_ALERT: Key = key(
+    "status.rule-set-waits-for-alert",
+    "The rule set «{name}» is not loaded yet: a security alert needs your confirmation first, then it loads by itself.",
+);
+pub const REFRESH: Key = key("action.refresh-interfaces", "Refresh connections");
 pub const SHOW_ALL_ADAPTERS: Key = key(
     "interfaces.toggle.show-unavailable-adapters",
     "Show unavailable adapters",
@@ -94,7 +131,7 @@ pub const LEAK_OFF_NOTE: Key = key(
 );
 pub const LEAK_SITES_NOTE: Key = key(
     "settings.routing.leak-protection.note-sites",
-    "What your rules send through the additional connection never goes out the main one while strict blocking of shared addresses is on, as it is by default. Everything else keeps working, except sites that share an address with a routed one.",
+    "What your rules send through the additional connection never goes out the main one while strict protection is on, as it is by default. Everything else keeps working, though a few ordinary sites may not open until the additional connection is back.",
 );
 pub const LEAK_EVERYTHING_NOTE: Key = key(
     "settings.routing.leak-protection.note-everything",
@@ -182,7 +219,7 @@ pub const REVIEW_PRIMARY: Key = key(
 );
 pub const REVIEW_NO_PRIMARY: Key = key(
     "dialog.first-run-wizard.review-no-primary",
-    "Your rules are not applied until a main connection is chosen. You can choose it later in Interfaces and routes.",
+    "Your rules are not applied until a main connection is chosen. You can choose it later in Connections.",
 );
 pub const REVIEW_SECONDARY: Key = key(
     "dialog.first-run-wizard.review-secondary",
@@ -212,34 +249,49 @@ pub const REVIEW_LATER: Key = key("dialog.first-run-wizard.review-later", "later
 pub const REVIEW_NOT_CHOSEN: Key = key("dialog.first-run-wizard.review-not-chosen", "not chosen");
 pub const RULES_DESCRIPTION: Key = key(
     "dialog.first-run-wizard.description",
-    "Choose how to populate your initial rule set. You can change it later from the Rules toolbar or in Settings → Presets and settings.",
+    "Choose which rules to start with. You can change this later in Rules or in Settings → Rules and settings files.",
 );
 pub const COUNTRY_PRESET: Key = key(
     "dialog.first-run-wizard.option-country-preset",
-    "Use the preset for your region ({country})",
+    "Use the rule set for your region ({country})",
 );
 pub const COUNTRY_PRESET_ABROAD: Key = key(
     "dialog.first-run-wizard.option-country-preset-abroad",
-    "Use the access preset ({country})",
+    "Use the access rule set ({country})",
 );
 pub const NO_COUNTRY_PRESET: Key = key(
     "dialog.first-run-wizard.option-country-not-available",
-    "No country preset is bundled for your region — pick a different option.",
+    "No ready-made rule set is bundled for your region — pick a different option.",
 );
 pub const OTHER_COUNTRY: Key = key("tui.wizard.other-country", "Another country's preset");
+pub const COUNTRY_PRESET_HINT: Key = key(
+    "dialog.first-run-wizard.option-country-preset-description",
+    "Recommended for {country}: the ready-made rule set for your region, taken from the system's region setting. You can change it afterwards.",
+);
+pub const OTHER_COUNTRIES_HINT: Key = key(
+    "dialog.first-run-wizard.other-countries-description",
+    "When the region was detected wrong, or you need the sites of another country to take the additional connection.",
+);
+pub const RULE_SET_NONE: Key = key(
+    "dialog.first-run-wizard.rule-set-none",
+    "Choose a rule set, or \"Start empty\", to go on.",
+);
 pub const OPEN_FILES: Key = key(
     "dialog.first-run-wizard.option-open-file",
     "Open my rules...",
 );
 pub const OPEN_FILES_DESCRIPTION: Key = key(
     "dialog.first-run-wizard.option-open-file-description",
-    "Choose one or two preset .txt files — one for each route. Leave a route empty to start it blank.",
+    "Choose one or two rules files (.txt) — one for each connection. One of them can stay without a file.",
 );
 pub const START_EMPTY: Key = key("dialog.first-run-wizard.option-start-empty", "Start empty");
-pub const PRIMARY_FILE: Key = key("dialog.first-run-wizard.primary-file-label", "Main route:");
+pub const PRIMARY_FILE: Key = key(
+    "dialog.first-run-wizard.primary-file-label",
+    "Main connection:",
+);
 pub const SECONDARY_FILE: Key = key(
     "dialog.first-run-wizard.secondary-file-label",
-    "Additional route:",
+    "Additional connection:",
 );
 pub const NO_FILE: Key = key(
     "dialog.first-run-wizard.no-file-selected",
@@ -251,7 +303,7 @@ pub const IMPORT_FILES: Key = key(
 );
 pub const PATH_PROMPT: Key = key(
     "tui.wizard.path-prompt",
-    "Type the full path to the file, then press Enter. An empty line leaves this route without a file.",
+    "Type the full path to the file, then press Enter. An empty line leaves this connection without a file.",
 );
 pub const TYPING: Key = key(
     "tui.wizard.typing",
@@ -274,14 +326,14 @@ pub const REVIEW_COUNTS: Key = key(
 );
 pub const NOTHING_TO_APPLY: Key = key(
     "dialog.nothing-to-apply.body",
-    "There are no changes to apply — the current rules already match what is active.",
+    "Nothing to apply: the rules on screen are already in use.",
 );
 pub const PREVIEWING: Key = key(
     "tui.wizard.previewing",
     "Asking the service what these rules would change…",
 );
 pub const SAVING: Key = key("tui.interfaces.saving", "Saving…");
-pub const IMPORT_FAILED: Key = key("status.preset-import-failed", "Failed to import preset: ");
+pub const IMPORT_FAILED: Key = key("status.preset-import-failed", "Could not load the rules: ");
 pub const NEEDS_SERVICE: Key = key(
     "tui.wizard.needs-service",
     "The background service is not connected, so this cannot be saved yet. The setup can continue once it is.",
@@ -336,6 +388,19 @@ pub const ALL: &[Key] = &[
     SECONDARY_DEFERRED,
     VPN_HINT,
     VPN_NONE,
+    VPN_INSTALLED,
+    IDLE_VPN,
+    IDLE_VPN_PROGRAM,
+    IDLE_VPN_LATER,
+    START_VPN_FIRST,
+    START_VPN_FIRST_PROGRAM,
+    JUST_CONNECTED,
+    CHANGE,
+    RULES_WAIT_FOR_ALERT_TITLE,
+    RULES_WAIT_FOR_ALERT,
+    COUNTRY_PRESET_HINT,
+    OTHER_COUNTRIES_HINT,
+    RULE_SET_NONE,
     REFRESH,
     SHOW_ALL_ADAPTERS,
     PROTECTION_DESCRIPTION,

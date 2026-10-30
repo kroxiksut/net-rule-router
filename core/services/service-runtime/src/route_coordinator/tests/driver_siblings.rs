@@ -24,7 +24,20 @@ fn nic() -> nrr_platform_api::AdapterInfo {
     info
 }
 
-/// Status and candidates of each notice about the additional route.
+/// The VPN vendor's own adapter, on a driver of its own.
+fn vendor(seed: &str, idx: u32, up: bool) -> nrr_platform_api::AdapterInfo {
+    let mut info = if up {
+        adapter(seed, idx, true, true, Some([10, 91, 0, 1]))
+    } else {
+        adapter(seed, idx, false, false, None)
+    };
+    info.friendly_name = "Example VPN OpenVPN Adapter".into();
+    info.description = "Example VPN 3.0 OpenVPN Adapter".into();
+    info
+}
+
+/// Status and candidates of each notice about the additional route; a move
+/// of the route reads as `additional-connection-moved` with the new name.
 type Notices = Vec<(String, Vec<String>)>;
 
 /// What the additional route's notices said over two passes, every heal
@@ -65,6 +78,10 @@ fn secondary_notices(
                 candidates,
                 ..
             } if role == "secondary" => Some((status.clone(), candidates.clone())),
+            StatusUpdateEvent::AdditionalConnectionMoved { adapter_name, .. } => Some((
+                "additional-connection-moved".to_string(),
+                vec![adapter_name.clone()],
+            )),
             _ => None,
         })
         .collect();
@@ -77,23 +94,41 @@ fn bound_to_tap3(policy: &FakePolicy) {
 }
 
 #[test]
-fn a_dead_tap_with_one_live_copy_of_its_driver_asks_the_user_to_pick_that_copy() {
+fn a_vpn_that_came_up_on_another_copy_of_the_bound_tap_is_followed_there() {
     let (notices, healed, routed) = secondary_notices(
         vec![tap("tap3", 3, false, 3), nic(), tap("tap5", 5, true, 5)],
         bound_to_tap3,
     );
+    assert!(routed, "the rules go through the copy the VPN brought up");
     assert_eq!(
-        notices,
-        vec![(
-            "adapter-choice-needed".to_string(),
-            vec!["Ethernet 5".to_string()]
-        )],
-        "the user is told once, naming the copy the VPN brought up",
+        healed,
+        vec!["secondary|win-adapter:tap5".to_string()],
+        "the move is saved once, so the next start binds the live copy",
     );
-    assert!(!routed, "nothing is routed through an adapter nobody chose");
-    assert!(healed.is_empty(), "the binding is never moved silently");
+    assert!(
+        notices
+            .iter()
+            .all(|(status, _)| status != "adapter-choice-needed" && status != "secondary-down"),
+        "nothing is left for the user to fix: {notices:?}",
+    );
 }
 
+/// Forty idle copies of one driver, the VPN up on one of them: the same answer
+/// however many dead copies surround the live one.
+#[test]
+fn a_bound_copy_among_many_dead_ones_follows_the_one_the_vpn_uses() {
+    let mut infos: Vec<_> = (2..=40)
+        .map(|n| tap(&format!("tap{n}"), n, false, n))
+        .collect();
+    infos[20] = tap("tap22", 22, true, 22);
+    infos.push(nic());
+    let (_, healed, routed) = secondary_notices(infos, bound_to_tap3);
+    assert!(routed);
+    assert_eq!(healed, vec!["secondary|win-adapter:tap22".to_string()]);
+}
+
+/// Two live copies: which of them is the user's is not ours to guess, so the
+/// user is asked between the two by name.
 #[test]
 fn two_live_copies_of_the_driver_are_not_guessed_between() {
     let (notices, healed, routed) = secondary_notices(
@@ -104,30 +139,115 @@ fn two_live_copies_of_the_driver_are_not_guessed_between() {
         ],
         bound_to_tap3,
     );
-    assert_eq!(
-        notices,
-        vec![("secondary-down".to_string(), Vec::new())],
-        "with two candidates the service says only what it knows",
+    let asked = (
+        "adapter-choice-needed".to_string(),
+        vec!["Ethernet 5".to_string(), "Ethernet 7".to_string()],
+    );
+    assert!(notices.contains(&asked), "{notices:?}");
+    assert!(
+        notices
+            .iter()
+            .all(|(status, _)| status != "additional-connection-moved"),
+        "{notices:?}"
     );
     assert!(!routed);
     assert!(healed.is_empty());
 }
 
+/// The field machine: forty dead copies of the stock driver, the route bound
+/// to one of them, and the VPN up on its vendor's own adapter — another
+/// driver. The additional connection follows the VPN there, the move is
+/// saved, and the user is told where it went.
 #[test]
-fn an_adapter_of_another_driver_is_never_proposed() {
-    let mut other = adapter("wg", 9, true, true, Some([10, 9, 0, 1]));
-    other.friendly_name = "Ethernet 9".into();
-    other.description = "WireGuard Tunnel #9".into();
-    let (notices, _, _) = secondary_notices(
+fn a_vpn_that_came_up_on_its_own_adapter_is_followed_from_a_dead_tap() {
+    let mut infos: Vec<_> = (2..=40)
+        .map(|n| tap(&format!("tap{n}"), n, false, n))
+        .collect();
+    infos.push(nic());
+    infos.push(vendor("vendor", 52, true));
+    let (notices, healed, routed) = secondary_notices(infos, bound_to_tap3);
+    assert!(
+        routed,
+        "the rules go through the adapter the VPN came up on"
+    );
+    assert_eq!(healed, vec!["secondary|win-adapter:vendor".to_string()]);
+    let moved = (
+        "additional-connection-moved".to_string(),
+        vec!["Example VPN OpenVPN Adapter".to_string()],
+    );
+    assert!(notices.contains(&moved), "{notices:?}");
+    assert!(
+        notices
+            .iter()
+            .all(|(status, _)| status != "adapter-choice-needed" && status != "secondary-down"),
+        "nothing is left for the user to fix: {notices:?}",
+    );
+}
+
+/// The bound adapter is not merely down but gone from the machine, and the
+/// VPN is up on another: the route follows it rather than wait out the grace
+/// for a replacement nobody can name.
+#[test]
+fn a_vpn_up_elsewhere_is_followed_from_a_binding_that_is_gone() {
+    let (notices, healed, routed) =
+        secondary_notices(vec![nic(), vendor("vendor", 52, true)], |policy| {
+            policy.bind_secondary_named("S-TAP", "win-adapter:{gone}", "Ethernet 3");
+        });
+    assert!(routed);
+    assert_eq!(healed, vec!["secondary|win-adapter:vendor".to_string()]);
+    assert!(
+        notices
+            .iter()
+            .any(|(status, _)| status == "additional-connection-moved"),
+        "{notices:?}"
+    );
+}
+
+#[test]
+fn two_live_tunnels_are_not_guessed_between() {
+    let mut wg = adapter("wg", 9, true, true, Some([10, 9, 0, 1]));
+    wg.friendly_name = "wg-home".into();
+    wg.description = "WireGuard Tunnel".into();
+    let (notices, healed, routed) = secondary_notices(
         vec![
             tap("tap3", 3, false, 3),
             nic(),
-            other,
-            tap("tap4", 4, false, 4),
+            wg,
+            vendor("vendor", 52, true),
         ],
         bound_to_tap3,
     );
+    assert_eq!(
+        notices,
+        vec![(
+            "adapter-choice-needed".to_string(),
+            vec![
+                "wg-home".to_string(),
+                "Example VPN OpenVPN Adapter".to_string()
+            ]
+        )],
+    );
+    assert!(!routed);
+    assert!(healed.is_empty());
+}
+
+/// An employer's tunnel is up beside the user's VPN that is off: the route
+/// is not moved onto it, the VPN being off is all that is said.
+#[test]
+fn a_corporate_tunnel_is_never_taken_for_the_additional_connection() {
+    let mut corporate = adapter("corp", 9, true, true, Some([10, 9, 0, 1]));
+    corporate.friendly_name = "Ethernet 9".into();
+    corporate.description = "FortiClient SSL VPN Virtual Ethernet Adapter".into();
+    let (notices, healed, routed) = secondary_notices(
+        vec![tap("tap3", 3, false, 3), nic(), corporate],
+        bound_to_tap3,
+    );
     assert_eq!(notices, vec![("secondary-down".to_string(), Vec::new())]);
+    assert!(!routed);
+    assert!(
+        healed.iter().all(|h| !h.starts_with("secondary|")),
+        "{healed:?}"
+    );
 }
 
 #[test]
@@ -140,6 +260,27 @@ fn the_main_link_is_never_proposed_for_the_additional_route() {
         },
     );
     assert_eq!(notices, vec![("secondary-down".to_string(), Vec::new())]);
+}
+
+/// A user whose main connection is itself a tunnel-named link: the dead
+/// additional binding never moves onto their uplink, whatever it is called.
+#[test]
+fn the_main_link_is_never_taken_for_the_additional_connection() {
+    let mut uplink = adapter("pppoe", 7, true, true, Some([203, 0, 113, 1]));
+    uplink.friendly_name = "Provider VPN".into();
+    uplink.description = "WAN Miniport (PPPOE)".into();
+    let (notices, healed, routed) =
+        secondary_notices(vec![tap("tap3", 3, false, 3), uplink], |policy| {
+            bound_to_tap3(policy);
+            policy.bind_primary("S-TAP", "win-adapter:pppoe");
+        });
+    assert_eq!(notices, vec![("secondary-down".to_string(), Vec::new())]);
+    assert!(!routed);
+    // The main binding may learn its connection name; the additional one stays.
+    assert!(
+        healed.iter().all(|h| !h.starts_with("secondary|")),
+        "{healed:?}"
+    );
 }
 
 /// The bound copy is down and two live adapters answer to its saved name:
@@ -207,9 +348,10 @@ fn connection_names_windows_made_up_never_answer_to_each_other() {
 
 #[test]
 fn a_stale_binding_never_heals_to_another_numbered_local_connection() {
+    // A plain network card, so only the name could tie it to the binding.
     let mut other = adapter("{other}", 25, true, true, Some([10, 0, 0, 25]));
     other.friendly_name = "Подключение по локальной сети 25".into();
-    other.description = "Example VPN Miniport #2".into();
+    other.description = "Example PCIe GbE Controller #2".into();
     let (notices, healed, routed) = secondary_notices(vec![other], |policy| {
         policy.bind_secondary_named(
             "S-TAP",

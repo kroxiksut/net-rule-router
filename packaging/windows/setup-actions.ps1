@@ -14,8 +14,9 @@
 #   Register    files in place: give this folder a protected DACL (SYSTEM and
 #               Administrators full, Users read and execute), so the service
 #               and the steps run elevated from here stay out of ordinary
-#               accounts' reach whatever it inherited; then register the
-#               service from this folder and start it
+#               accounts' reach whatever it inherited; with no state database
+#               yet, drop the record a complete removal left beside the key;
+#               then register the service from this folder and start it
 #   Unregister  removal: stop and unregister the service, restore the network,
 #               and remove the service copy a portable install left under
 #               Program Files once nothing is registered; start again a service
@@ -445,6 +446,8 @@ switch ($Action) {
             $exitCode = 1
             break
         }
+        # A failure here leaves the service to raise its alert, not the install to fail.
+        $null = Clear-NrrOrphanedKeyCompanions
         # Registers the service beside the console, takes over a registration
         # another copy left, keeps the start mode chosen before, and starts it.
         Write-Host '==> nrr-cli reinstall'

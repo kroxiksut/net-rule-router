@@ -227,11 +227,11 @@ QtObject {
         if (slug === "") return
         _applyRoutePolicyKey("mode", slug, {
             ok: root.tr("status.route-mode-applied",
-                "Default route for unmatched traffic updated."),
+                "\"Where everything else goes\" is saved."),
             uac: root.tr("status.route-mode-uac-declined",
-                "Administrator approval was declined; the default route was not changed."),
+                "Administrator approval was declined; \"Where everything else goes\" was not changed."),
             failPrefix: root.tr("status.route-mode-failed",
-                "Could not update the default route: ")
+                "Could not save \"Where everything else goes\":")
         })
     }
     /// Leak protection: `off` | `sites` | `everything`. A level the current
@@ -249,7 +249,7 @@ QtObject {
                     "Leak protection: everything. If the additional connection drops, the internet waits until it returns.")
                 : level === "sites"
                     ? root.tr("status.leak-protection-sites",
-                        "Leak protection: routed sites. What your rules send through the additional connection never goes out the main one while strict blocking of shared addresses is on.")
+                        "Leak protection: routed sites. What your rules send through the additional connection never goes out the main one while strict protection is on.")
                     : root.tr("status.leak-protection-off",
                         "Leak protection is off. If the additional connection drops, traffic continues over your main connection."),
             uac: root.tr("status.kill-switch-uac-declined",
@@ -308,7 +308,7 @@ QtObject {
             onFailed: onFailed,
             ok: slug === "unprotected"
                 ? root.tr("status.forwarded-traffic-unprotected",
-                    "WSL, containers and virtual machines are no longer protected while the additional route is down.")
+                    "WSL, containers and virtual machines are no longer protected while the additional connection is down.")
                 : root.tr("status.forwarded-traffic-as-computer",
                     "WSL, containers and virtual machines are now protected like this computer."),
             uac: root.tr("status.route-policy-uac-declined",
@@ -385,13 +385,13 @@ QtObject {
             onApplied: function(v) { root.updateRoutingState({ killSwitchStrictSharedIps: v }) },
             ok: want
                 ? root.tr("status.kill-switch-shared-strict-on",
-                    "Strict leak protection: addresses shared with regular sites are blocked too.")
+                    "Strict leak protection: no exceptions; some ordinary sites may not open while the additional connection is down.")
                 : root.tr("status.kill-switch-shared-strict-off",
-                    "Smart leak protection: addresses shared with regular sites are not blocked."),
+                    "Smart leak protection: ordinary sites keep opening, but some traffic of routed sites may go out through the main connection."),
             uac: root.tr("status.route-policy-uac-declined",
                 "Administrator approval was declined; the setting was not changed."),
             failPrefix: root.tr("status.kill-switch-shared-strict-failed",
-                "Could not update the leak protection shared-address mode: ")
+                "Could not switch strict leak protection: ")
         })
     }
     /// Auto-rules mode: what happens to the companion domains found for a routed
@@ -406,12 +406,12 @@ QtObject {
             onApplied: function(v) { root.updateRoutingState({ autoRulesMode: v }) },
             ok: (want === "auto")
                 ? root.tr("status.auto-rules-auto",
-                    "Missing companion domains will be added to your rules automatically.")
+                    "Suggested addresses will be added to your rules automatically.")
                 : ((want === "suggest")
                     ? root.tr("status.auto-rules-suggest",
-                        "Missing companion domains will be offered for your confirmation.")
+                        "Suggested addresses will wait for your confirmation.")
                     : root.tr("status.auto-rules-off",
-                        "Missing companion domains will no longer be collected.")),
+                        "Addresses will no longer be suggested.")),
             uac: root.tr("status.route-policy-uac-declined",
                 "Administrator approval was declined; the setting was not changed."),
             failPrefix: root.tr("status.auto-rules-failed",
@@ -456,13 +456,13 @@ QtObject {
             },
             ok: want
                 ? root.tr("status.primary-probe-auto-on",
-                    "The service will check the main route for new suggestions itself.")
+                    "The service will check the main connection for new suggestions itself.")
                 : root.tr("status.primary-probe-auto-off",
-                    "The main route will only be checked when you ask."),
+                    "The main connection will only be checked when you ask."),
             uac: root.tr("status.route-policy-uac-declined",
                 "Administrator approval was declined; the setting was not changed."),
             failPrefix: root.tr("status.primary-probe-failed",
-                "Could not change the main-route check: ")
+                "Could not change the main connection check: ")
         })
     }
 
@@ -477,7 +477,7 @@ QtObject {
             onFailed: onFailed,
             ok: want
                 ? root.tr("status.external-address-auto-on",
-                    "The external address will be checked each time the additional route connects.")
+                    "The external address will be checked each time the additional connection comes up.")
                 : root.tr("status.external-address-auto-off",
                     "The external address will only be checked when you ask."),
             uac: root.tr("status.route-policy-uac-declined",
@@ -497,7 +497,7 @@ QtObject {
             uac: root.tr("status.route-policy-uac-declined",
                 "Administrator approval was declined; the setting was not changed."),
             failPrefix: root.tr("status.primary-probe-failed",
-                "Could not change the main-route check: ")
+                "Could not change the main connection check: ")
         })
     }
 
@@ -517,7 +517,7 @@ QtObject {
             uac: root.tr("status.route-policy-uac-declined",
                 "Administrator approval was declined; the setting was not changed."),
             failPrefix: root.tr("status.primary-probe-failed",
-                "Could not change the main-route check: ")
+                "Could not change the main connection check: ")
         })
     }
 

@@ -21,7 +21,7 @@ fn the_pages_come_in_the_setup_order() {
         pages,
         [
             "Main connection",
-            "Additional connection",
+            "Additional connection (e.g. VPN)",
             "Starting rules",
             "Protection and options",
             "Ready to finish",

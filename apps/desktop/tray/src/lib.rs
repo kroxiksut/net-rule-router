@@ -213,6 +213,7 @@ pub const WINDOW_WORDS: &[&str] = &[
     "rules.suggestions.inbox.less-certain",
     "rules.suggestions.less-certain.",
     "rules.type.",
+    "rules.type-explained.",
     // Whole: the add-rule form shows verdict keys the launcher and the
     // service name at run time, which no scan of the QML sees.
     "rules.validation.",

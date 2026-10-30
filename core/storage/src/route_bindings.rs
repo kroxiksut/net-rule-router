@@ -125,8 +125,8 @@ pub struct RoutePolicyRecord {
     pub secondary: Option<RouteBindingRecord>,
     pub mode: BehaviorMode,
     /// What may leave over the main connection when the additional one is
-    /// meant to carry it. Default [`LeakProtection::default`]: protection is
-    /// the user's opt-in.
+    /// meant to carry it. Default [`LeakProtection::default`] (routed sites);
+    /// a stored value, "off" included, is the user's and is never rewritten.
     pub leak_protection: LeakProtection,
     /// Which IP protocols leak protection cuts while it is on, as a bitmask
     /// ([`KILL_SWITCH_PROTOCOLS_ALL`] = all).

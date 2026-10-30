@@ -316,18 +316,34 @@ QtObject {
     // Called once per route after a successful import. Last-wins on
     // duplicate section_name within the same file — duplicates will
     // be surfaced to the user via the review dialog.
-    function _writeImportedPassthrough(route, blocks) {
+    // `keepOwn`: a merge, whose set goes beside the user's sections; the user's
+    // copy of a section is read first, so it comes first.
+    function _writeImportedPassthrough(route, blocks, keepOwn) {
         if (typeof nrrNativeBridge === "undefined" || !nrrNativeBridge
                 || typeof nrrNativeBridge.rpcSidecarPassthroughWrite !== "function") {
+            return
+        }
+        if (keepOwn) {
+            if (typeof nrrNativeBridge.rpcSidecarPassthroughRead !== "function") return
+            var readCorr = nrrNativeBridge.rpcSidecarPassthroughRead(route)
+            root.rpc.registerRpcCallback(readCorr, function(ok, payload) {
+                // An unreadable store is not an empty one: writing would erase it.
+                if (!ok) return
+                var held = (payload && payload.sections) || {}
+                var own = []
+                for (var name in held) {
+                    if (held.hasOwnProperty(name))
+                        own.push({ "section-name": name, "raw-text": String(held[name] || "") })
+                }
+                _writeImportedPassthrough(route, own.concat(blocks || []), false)
+            })
             return
         }
         // A section written twice is kept whole ("merge"): the second copy
         // must not erase the first.
         var sections = Pure.mergePassthroughBlocks(blocks)
-        // Atomic replace via the sidecar handler: even an empty map
-        // clears any previously-recorded passthrough for this route,
-        // which is the right behaviour when the user re-imports a
-        // preset that no longer has foreign-OS sections.
+        // Atomic replace via the sidecar handler: even an empty map clears
+        // what a replaced set left for this route.
         var corr = nrrNativeBridge.rpcSidecarPassthroughWrite(route, sections)
         root.rpc.registerRpcCallback(corr, function(ok, payload) {
             if (ok) root.passthroughRevision += 1
@@ -514,31 +530,31 @@ QtObject {
         var parsedRowsByRoute = {}
         var passthroughByRoute = {}
         var duplicatesByRoute = {}
+        // Taken now: the activated revision may replace the table before the
+        // parse answers, and a merge writes comments only for rules it adds.
+        var keysBefore = Rules.mergeKeysOf(root.rulesModel)
         var pending = (target === "both") ? 2 : 1
         // Inner "do the work" closure — invoked either immediately
         // from finalise() (no review needed) or after the user
         // confirms PresetImportReviewDialog.
         var applyAndPersist = function() {
+            var added = 0
             if (!skipApply) {
                 if (mode === "merge") {
-                    _applyImportMerge(parsedRowsByRoute)
+                    added = _applyImportMerge(parsedRowsByRoute)
                 } else {
                     _applyImportReplace(target, parsedRowsByRoute)
                 }
             }
-            // Persist passthrough sections
-            // captured by the parser. Per-route atomic replace, fire
-            // and forget (write completes in milliseconds, well before
-            // the user could pick Export in the file dialog).
-            // Duplicates are not yet surfaced to the user in the review
-            // dialog; for now last-wins on section_name collision
-            // inside one file matches the QML pre-migration behaviour.
+            _writeImportedComments(Rules.importedCommentRows(parsedRowsByRoute, mode, keysBefore))
+            // Sections for other systems, fire and forget: a replace takes the
+            // set's, a merge keeps the user's beside them.
             var passthroughRoutes = (target === "both")
                 ? ["primary", "secondary"]
                 : [target]
             for (var pi = 0; pi < passthroughRoutes.length; pi += 1) {
                 var pr = passthroughRoutes[pi]
-                _writeImportedPassthrough(pr, passthroughByRoute[pr] || [])
+                _writeImportedPassthrough(pr, passthroughByRoute[pr] || [], mode === "merge")
             }
             // Surface the summary back to the
             // caller so it can compose the status-banner text with
@@ -555,6 +571,7 @@ QtObject {
                 }
                 onComplete({
                     rulesCount: rulesCount,
+                    addedCount: added,
                     passthroughByRoute: passthroughByRoute,
                     duplicatesByRoute: duplicatesByRoute,
                     target: target,
@@ -662,6 +679,33 @@ QtObject {
         }
     }
 
+    // The comments a file brings replace the stored ones; only the ones that
+    // differ are written. The table re-reads the store once every write has
+    // answered: the activated revision may have been shown with the old ones.
+    function _writeImportedComments(rows) {
+        if (rows.length === 0) return
+        var write = function(stored) {
+            var changed = Rules.commentRowsThatDiffer(rows, stored)
+            var left = changed.length
+            if (left === 0) return
+            var answered = function() {
+                left -= 1
+                if (left === 0) root._overlaySidecarCommentsOntoRulesModel()
+            }
+            for (var i = 0; i < changed.length; i += 1)
+                root._sidecarWriteCommentForRow(changed[i], answered)
+        }
+        if (typeof nrrNativeBridge === "undefined" || !nrrNativeBridge
+                || typeof nrrNativeBridge.rpcSidecarCommentReadAll !== "function") {
+            write(null)
+            return
+        }
+        var corr = nrrNativeBridge.rpcSidecarCommentReadAll()
+        root.rpc.registerRpcCallback(corr, function(ok, payload) {
+            write(ok && payload ? (payload.comments || {}) : null)
+        })
+    }
+
     function _applyImportReplace(target, parsedRowsByRoute) {
         console.time("[perf] _applyImportReplace")
         if (target === "both") {
@@ -685,13 +729,6 @@ QtObject {
                 row.id = "R-" + ("0000" + String(nextId)).slice(-4)
                 row.aceMatchValue = root._aceLowerForSearch(row.matchValue)
                 batch.push(row)
-                // Preset comments persist via sidecar.
-                // Import in Replace mode OVERWRITES any prior comment
-                // for the same signature (spec'd behaviour — no merge
-                // for the simpler mental model).
-                if (String(row.comment || "") !== "") {
-                    root._sidecarWriteCommentForRow(row)
-                }
                 nextId += 1
             }
             // One append for the whole route — see `_appendRowsChunked`.
@@ -700,48 +737,29 @@ QtObject {
         console.timeEnd("[perf] _applyImportReplace")
     }
 
+    // The one merge both clients make (`Rules.importMergePlan`): every own row
+    // stays, the set's new rows are appended. Returns how many were added.
     function _applyImportMerge(parsedRowsByRoute) {
-        // Existing (ruleType, matchValue, targetRoute) triples, so duplicates
-        // are skipped in O(n+m). `?x` and `x` on one route are one rule and
-        // the plain one wins, as in the service's own dedup.
-        var seen = {}
-        for (var k = 0; k < root.rulesModel.count; k += 1) {
-            var r = root.rulesModel.get(k)
-            seen[Rules.mergeKey(r)] = { index: k, row: null }
-        }
+        var own = []
+        for (var k = 0; k < root.rulesModel.count; k += 1) own.push(root.rulesModel.get(k))
+        var imported = (parsedRowsByRoute.primary || []).concat(parsedRowsByRoute.secondary || [])
+        var plan = Rules.importMergePlan(own, imported)
+        for (var p = 0; p < plan.plain.length; p += 1)
+            root.rulesModel.setProperty(plan.plain[p], "verify", false)
+        for (var q = 0; q < plan.plainAdded.length; q += 1)
+            imported[plan.plainAdded[q]].verify = false
         var nextId = root._maxRuleNumericId() + 1
-        var routes = ["primary", "secondary"]
-        for (var i = 0; i < routes.length; i += 1) {
-            var rows = parsedRowsByRoute[routes[i]] || []
-            var batch = []
-            for (var j = 0; j < rows.length; j += 1) {
-                var row = rows[j]
-                var key = Rules.mergeKey(row)
-                var prior = seen[key]
-                if (prior) {
-                    if (!Rules.rowIsVerify(row)) {
-                        if (prior.row) prior.row.verify = false
-                        else if (Rules.rowIsVerify(root.rulesModel.get(prior.index)))
-                            root.rulesModel.setProperty(prior.index, "verify", false)
-                    }
-                    continue
-                }
-                row.id = "R-" + ("0000" + String(nextId)).slice(-4)
-                row.aceMatchValue = root._aceLowerForSearch(row.matchValue)
-                batch.push(row)
-                // Merge mode: only NEW rules are
-                // appended (existing ones with the same signature stay
-                // untouched, comment and all). Write the new row's
-                // comment so the next snapshot bind can recover it.
-                if (String(row.comment || "") !== "") {
-                    root._sidecarWriteCommentForRow(row)
-                }
-                seen[key] = { index: -1, row: row }
-                nextId += 1
-            }
-            // One append for the whole route — see `_appendRowsChunked`.
-            if (batch.length > 0) root.rulesModel.append(batch)
+        var batch = []
+        for (var i = 0; i < plan.add.length; i += 1) {
+            var row = imported[plan.add[i]]
+            row.id = "R-" + ("0000" + String(nextId)).slice(-4)
+            row.aceMatchValue = root._aceLowerForSearch(row.matchValue)
+            batch.push(row)
+            nextId += 1
         }
+        // One append for the whole set — see `_appendRowsChunked`.
+        if (batch.length > 0) root.rulesModel.append(batch)
+        return batch.length
     }
 
 
@@ -796,7 +814,7 @@ QtObject {
                         "The service is not running, so these {count} rule(s) are what your files hold. They will be compared with what the service applies once it starts.")
                         .replace("{count}", String(summary.rulesCount))
                     : root.tr("status.preset-import-offline",
-                        "Imported {count} rules into the GUI. Service is unreachable — start the service and use 'Save and review...' to push them.")
+                        "Loaded {count} rules. The service is not reachable — start it and press Apply.")
                         .replace("{count}", String(summary.rulesCount))
                 root.statusLine = base
                     + _formatImportPassthroughSuffix(summary.passthroughByRoute)
@@ -848,7 +866,7 @@ QtObject {
     function _announcePreviewRefusal(summary, options) {
         var refusal = Pure.previewRefusal(summary)
         if (!refusal) return false
-        _reportImportFailure(root.tr("status.preset-import-failed", "Failed to import preset: ")
+        _reportImportFailure(root.tr("status.preset-import-failed", "Could not load the rules: ")
             + root.previewRefusalText(refusal), options)
         return true
     }
@@ -859,6 +877,51 @@ QtObject {
         root.statusLine = text
         if (!(options && options.hydration === true)) {
             root.showNotice(root.tr("dialog.rules-not-imported.title", "The rules were not imported"), text)
+        }
+    }
+
+    /// A load the alert gate refused, run again once no alert holds changes:
+    /// the user who picked a set does not pick it twice. A newer one replaces it.
+    property var _afterAlertAck: null
+
+    /// True when `code` is the alert gate and the load waits for it.
+    function _holdForAlert(code, options, again) {
+        if (String(code || "") !== root.rpc.securityAlertGateCode
+                || (options && options.hydration === true)) return false
+        _afterAlertAck = again
+        var name = _ruleSetName(root.pendingPresetImportState)
+        // What happened, then what to press.
+        var text = (name !== ""
+            ? root.tr("status.rule-set-waits-for-alert",
+                "The rule set «{name}» is not loaded yet: a security alert needs your confirmation first, then it loads by itself.")
+                .replace("{name}", name)
+            : root.tr("status.rules-wait-for-alert",
+                "The rules are not loaded yet: a security alert needs your confirmation first, then they load by themselves."))
+            + "\n\n" + root.tr("status.alert-how-to-acknowledge",
+                "Press \"Open the alert\", then \"Acknowledge\".")
+        root.statusLine = text
+        root.showNotice(root.tr("dialog.rules-wait-for-alert.title", "The rules are not loaded yet"), text)
+        return true
+    }
+
+    function _resumeAfterAlertAck() {
+        if (typeof _afterAlertAck !== "function" || !root.securityAlertsKnown
+                || root.securityAlertsUnreadable) return
+        var items = root.securityAlertItems || []
+        for (var i = 0; i < items.length; i++) {
+            if (items[i] && items[i].state === "active") return
+        }
+        var again = _afterAlertAck
+        _afterAlertAck = null
+        again()
+        if (typeof root.returnFromSecurityAlerts === "function") root.returnFromSecurityAlerts()
+    }
+
+    property Connections _alertWatch: Connections {
+        target: presetImportController.root
+        ignoreUnknownSignals: true
+        function onSecurityAlertItemsChanged() {
+            Qt.callLater(presetImportController._resumeAfterAlertAck)
         }
     }
 
@@ -907,6 +970,34 @@ QtObject {
         return true
     }
 
+    /// A merge is the table's, as in the terminal UI: the set is added to the
+    /// rules on screen and the table goes through the ordinary review. The set
+    /// import replaces the routes it covers, so a merge never goes there, and
+    /// the user's own files stay the ones the rules are saved to.
+    function _startMergeLoad(state, options) {
+        _whenServiceUp(options, function() {
+            _refreshRulesAfterPresetImport(state, {
+                skipApply: false,
+                onComplete: function(summary) {
+                    root.setUnsavedChanges("rules", true)
+                    root.reviewFlowController._guardApplyRules(function(ok) {
+                        if (ok) _announceMergeApplied(state, summary.addedCount || 0)
+                    }, "rule-set-merge")
+                }
+            })
+        })
+    }
+
+    function _announceMergeApplied(st, added) {
+        var name = _ruleSetName(st)
+        if (name === "") return
+        root.showNotice(root.tr("dialog.rule-set-applied.title", "Rule set applied"),
+            Plurals.counted(root.tr, "dialog.rule-set-merged.body.", added,
+                "«{name}»: {count} new rule added to yours.",
+                "«{name}»: {count} new rules added to yours.")
+                .replace("{name}", name))
+    }
+
     function startPresetImportReviewFlow(targetRoute, bytesB64, sourcePath, mode, options) {
         if (!root.bridgeAvailable) {
             console.log("preset-import: bridge unavailable, aborting")
@@ -938,6 +1029,10 @@ QtObject {
             hydration: !!(options && options.hydration),
             label: String((options && options.label) || "")
         }
+        if (root.pendingPresetImportState.mode === "merge" && !root.pendingPresetImportState.hydration) {
+            _startMergeLoad(root.pendingPresetImportState, options)
+            return
+        }
         root._activeReviewKind = "preset-import"
         var loadState = root.pendingPresetImportState
         var retried = false
@@ -948,6 +1043,9 @@ QtObject {
         root.rpc.registerLongRpcCallback(rpcCorr, function(ok, p, code, msg) {
             if (!ok) {
                 console.log("preset-import: dry-run failed:", code, msg)
+                if (_holdForAlert(code, options, function() {
+                    presetImportController.startPresetImportReviewFlow(targetRoute, bytesB64, sourcePath, mode, options)
+                })) return
                 if (String(code) === "transport-disconnected") {
                     if (!retried) {
                         retried = true
@@ -960,7 +1058,7 @@ QtObject {
                     ? root.ipcErrorLabel(String(code || "unknown"))
                     : String(code || "unknown")
                 _reportImportFailure(root.tr("status.preset-import-dry-run-failed",
-                    "Preset import dry-run failed: ") + label, options)
+                    "Could not check the rules being loaded: ") + label, options)
                 return
             }
             var summary = (p && p["review-summary"]) || p || {}
@@ -979,25 +1077,10 @@ QtObject {
                 root.showNotice(
                     root.tr("dialog.nothing-to-apply.title", "Nothing to apply"),
                     root.tr("dialog.nothing-to-apply.body",
-                        "There are no changes to apply — the current rules already "
-                        + "match what is active."))
+                        "Nothing to apply: the rules on screen are already in use."))
                 return
             }
-            root.pendingPresetImportState = Object.assign({}, root.pendingPresetImportState, {
-                summary: summary,
-                confirmationToken: token
-            })
-            root.reviewDiffDialog.summary = summary
-            // Preset import is per-principal (user-scoped,
-            // non-elevated): the service scopes it to the caller SID, so
-            // there's no administrator banner for a normal user's import.
-            root.reviewDiffDialog.lacksElevation = false
-            root.reviewDiffDialog.sessionElevated = false
-            // Clear any stale `readOnly: true` left by a
-            // prior `_openPendingApplyPreview` (drift "show differences"),
-            // otherwise the import review opens without an Apply button.
-            root.reviewDiffDialog.readOnly = false
-            root.reviewDiffDialog.open()
+            _reviewOrApply(summary, token, options)
         })
         })
     }
@@ -1054,6 +1137,10 @@ QtObject {
             hydration: !!(options && options.hydration),
             label: String((options && options.label) || "")
         }
+        if (root.pendingPresetImportState.mode === "merge" && !root.pendingPresetImportState.hydration) {
+            _startMergeLoad(root.pendingPresetImportState, options)
+            return
+        }
         root._activeReviewKind = "preset-import"
         var startedAtMs = Date.now()
         var loadState = root.pendingPresetImportState
@@ -1065,6 +1152,10 @@ QtObject {
         root.rpc.registerLongRpcCallback(rpcCorr, function(ok, p, code, msg) {
             if (!ok) {
                 console.log("preset-import-both: dry-run failed:", code, msg)
+                if (_holdForAlert(code, options, function() {
+                    presetImportController.startBothRoutesPresetImportReviewFlow(primaryBytesB64,
+                        secondaryBytesB64, primaryPath, secondaryPath, options)
+                })) return
                 if (String(code) === "transport-disconnected") {
                     if (!retried) {
                         retried = true
@@ -1074,7 +1165,7 @@ QtObject {
                     return
                 }
                 _reportImportFailure(root.tr("status.preset-import-dry-run-failed",
-                    "Preset import dry-run failed: ") +
+                    "Could not check the rules being loaded: ") +
                     ((typeof root.ipcErrorLabel === "function")
                         ? root.ipcErrorLabel(String(code || "unknown"))
                         : String(code || "unknown")), options)
@@ -1096,27 +1187,34 @@ QtObject {
                 root.showNotice(
                     root.tr("dialog.nothing-to-apply.title", "Nothing to apply"),
                     root.tr("dialog.nothing-to-apply.body",
-                        "There are no changes to apply — the current rules already "
-                        + "match what is active."))
+                        "Nothing to apply: the rules on screen are already in use."))
                 return
             }
-            root.pendingPresetImportState = Object.assign({}, root.pendingPresetImportState, {
-                summary: summary,
-                confirmationToken: token
-            })
-            root.reviewDiffDialog.summary = summary
-            // Preset import is per-principal (user-scoped,
-            // non-elevated): the service scopes it to the caller SID, so
-            // there's no administrator banner for a normal user's import.
-            root.reviewDiffDialog.lacksElevation = false
-            root.reviewDiffDialog.sessionElevated = false
-            // Clear any stale `readOnly: true` left by a
-            // prior `_openPendingApplyPreview` (drift "show differences"),
-            // otherwise the import review opens without an Apply button.
-            root.reviewDiffDialog.readOnly = false
-            root.reviewDiffDialog.open()
+            _reviewOrApply(summary, token, options)
         })
         })
+    }
+
+    /// A set the user already chose by name (`options.confirmed`: the welcome
+    /// window, the "no rules yet" offer) goes on to the service at once: the
+    /// dry run above still checked it and a refusal is told, only the review
+    /// window is not shown a second time. Any other load opens the review.
+    function _reviewOrApply(summary, token, options) {
+        root.pendingPresetImportState = Object.assign({}, root.pendingPresetImportState, {
+            summary: summary,
+            confirmationToken: token
+        })
+        if (options && options.confirmed === true) {
+            _executePresetImportActivation(token)
+            return
+        }
+        root.reviewDiffDialog.summary = summary
+        // Per-principal and non-elevated: no administrator banner.
+        root.reviewDiffDialog.lacksElevation = false
+        root.reviewDiffDialog.sessionElevated = false
+        // A drift preview may have left the dialog read-only.
+        root.reviewDiffDialog.readOnly = false
+        root.reviewDiffDialog.open()
     }
 
     /// Execute path for PresetImport. Driven by the
@@ -1190,7 +1288,7 @@ QtObject {
     // alert), not missing rights.
     function _announcePresetImportFailed(code, args) {
         var text = root.tr("status.preset-import-failed",
-            "Failed to import preset: ") +
+            "Could not load the rules: ") +
             ((typeof root.ipcErrorLabel === "function")
                 ? root.ipcErrorLabel(String(code || "unknown"), args || null)
                 : String(code || "unknown"))
@@ -1207,7 +1305,7 @@ QtObject {
             skipApply: true,
             onComplete: function(summary) {
                 var base = root.tr("status.preset-import-completed",
-                    "Preset imported and activated ({count} rules).")
+                    "Rules loaded from the file and applied ({count} rules).")
                     .replace("{count}", String(summary.rulesCount))
                 root.statusLine = base
                     + _formatImportPassthroughSuffix(summary.passthroughByRoute)

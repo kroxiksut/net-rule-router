@@ -88,7 +88,7 @@ fn secondary_no_ip_playbook() -> TroubleshootingPlaybook {
                 title: "Check that the adapter you picked is the one the client raised",
                 description: "Some clients create a new adapter when they update, so the \
                               one chosen earlier can still exist while sitting idle. \
-                              Interfaces and routes lists every adapter with its current \
+                              The Connections section lists every adapter with its current \
                               address — pick the one holding the address.",
             },
         ],
@@ -185,7 +185,7 @@ fn import_pending_playbook() -> TroubleshootingPlaybook {
             TroubleshootingStep {
                 title: "An import is a proposal until you apply it",
                 description: "The table shows what the file holds; the service keeps \
-                              enforcing what it already had. Use Save and review to see \
+                              enforcing what it already had. Press Apply to see \
                               what would change, then confirm it.",
             },
             TroubleshootingStep {

@@ -166,6 +166,14 @@ pub trait AppObservationLookup: Send + Sync {
     fn learnt_from_scripts(&self, _pattern: &str, _ip: IpAddr) -> bool {
         false
     }
+
+    /// Destinations withdrawn this session from the rules naming `program` (an
+    /// image path): they belong to the main link, this program included, and
+    /// its per-app block must not hold them to a tunnel it may never use for
+    /// them again. Sorted; bounded by [`RETRACTED_CAP`].
+    fn withdrawn_from(&self, _program: &str) -> Vec<IpAddr> {
+        Vec::new()
+    }
 }
 
 /// File name of the running executable, lower-cased.
@@ -781,8 +789,10 @@ impl AppObservationStore {
     /// The route this address produced is machine-wide; the moment it is seen
     /// moving a process the rule never named, it is doing more harm than the
     /// rule is worth. The application loses the destination — its own traffic
-    /// there falls back to the main link — which is the lesser cost: an
-    /// application rule may not quietly overrule where everything else goes.
+    /// there falls back to the main link, through the permit the kill switch
+    /// builds from [`AppObservationLookup::withdrawn_from`] — which is the
+    /// lesser cost: an application rule may not quietly overrule where
+    /// everything else goes.
     pub fn retract(&self, app: &str, ip: impl Into<IpAddr>) -> bool {
         let ip = ip.into().to_canonical();
         let key = observation_key(app);
@@ -1392,6 +1402,31 @@ impl AppObservationLookup for AppObservationStore {
                 .unwrap_or_else(|p| p.into_inner())
                 .contains(&(pattern.trim().to_string(), ip.to_canonical()))
     }
+
+    fn withdrawn_from(&self, program: &str) -> Vec<IpAddr> {
+        let name = app_key(program);
+        if name.is_empty() {
+            return Vec::new();
+        }
+        // Copied out first: matching a rule path takes another lock of this store.
+        let pairs: Vec<(String, IpAddr)> = self
+            .retracted
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .iter()
+            .cloned()
+            .collect();
+        let mut out: Vec<IpAddr> = pairs
+            .into_iter()
+            .filter(|(key, _)| {
+                *key == name || (is_path_pattern(key) && self.names_process(key, program))
+            })
+            .map(|(_, ip)| ip)
+            .collect();
+        out.sort_unstable();
+        out.dedup();
+        out
+    }
 }
 
 /// Does the rule pattern `pattern` name the observed process `key`?
@@ -1625,6 +1660,7 @@ pub struct PassObservations {
     outside: Mutex<HashMap<(Vec<String>, IpAddr), bool>>,
     scripts: Mutex<HashMap<(String, IpAddr), bool>>,
     principals: Mutex<HashMap<String, Option<Arc<dyn AppObservationLookup>>>>,
+    withdrawn: Mutex<HashMap<String, Vec<IpAddr>>>,
 }
 
 impl PassObservations {
@@ -1637,6 +1673,7 @@ impl PassObservations {
             outside: Mutex::default(),
             scripts: Mutex::default(),
             principals: Mutex::default(),
+            withdrawn: Mutex::default(),
         }
     }
 }
@@ -1698,6 +1735,12 @@ impl AppObservationLookup for PassObservations {
     fn learnt_from_scripts(&self, pattern: &str, ip: IpAddr) -> bool {
         answered(&self.scripts, (pattern.to_string(), ip), || {
             self.live.learnt_from_scripts(pattern, ip)
+        })
+    }
+
+    fn withdrawn_from(&self, program: &str) -> Vec<IpAddr> {
+        answered(&self.withdrawn, program.to_string(), || {
+            self.live.withdrawn_from(program)
         })
     }
 }
@@ -2447,6 +2490,35 @@ mod tests {
         assert!(store.ips_for_app(flat).is_empty());
         store.record(r"C:\Apps\Tool\v2\tool.exe", ip(203, 0, 113, 3));
         assert!(store.ips_for_app(flat).is_empty());
+    }
+
+    /// The kill switch asks by the program's path what was withdrawn from the
+    /// rules naming it, by name or by folder; another program's withdrawals
+    /// are not its own.
+    #[test]
+    fn a_program_is_told_what_was_withdrawn_from_the_rules_naming_it() {
+        let store = windows_store();
+        let program = r"C:\Apps\Tool\tool.exe";
+        store.retract("tool.exe", ip(203, 0, 113, 1));
+        store.retract(r"c:\apps\tool\*", ip(203, 0, 113, 2));
+        store.retract("other.exe", ip(203, 0, 113, 3));
+        assert_eq!(
+            store.withdrawn_from(program),
+            vec![
+                IpAddr::V4(ip(203, 0, 113, 1)),
+                IpAddr::V4(ip(203, 0, 113, 2))
+            ]
+        );
+        assert_eq!(
+            store.withdrawn_from(r"C:\Elsewhere\tool.exe"),
+            vec![IpAddr::V4(ip(203, 0, 113, 1))]
+        );
+        // The folder's withdrawal holds for every program inside it.
+        assert_eq!(
+            store.withdrawn_from(r"C:\Apps\Tool\new.exe"),
+            vec![IpAddr::V4(ip(203, 0, 113, 2))]
+        );
+        assert!(store.withdrawn_from(r"C:\Other\new.exe").is_empty());
     }
 
     /// A mask over names never reaches programs through a folder's spelling:

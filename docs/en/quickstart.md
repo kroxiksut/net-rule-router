@@ -2,15 +2,17 @@
 
 **English** · [Русский](../ru/quickstart.md)
 
+![NetRuleRouter](../images/logo-lockup-en.png)
+
 NetRuleRouter controls **which traffic uses which connection** — by domain,
 IP address, or application. It works with connections you already have
 (main internet + VPN, two providers, Wi-Fi + Ethernet), and is not a VPN
 client, proxy, or anonymity tool.
 
-> **This is an alpha.** Leak protection, its **Everything** setting above
-> all, has not yet passed full testing and may work
-> incorrectly — up to a complete loss of network access until it is set
-> back to **Off**. It is available in settings, but turning it on is at your
+> **This is an alpha.** Leak protection is on from the start with **Routed
+> sites**. It has not yet passed full testing, its **Everything** setting
+> above all, and may work incorrectly — up to a complete loss of network
+> access until it is set back to **Off**. Choosing **Everything** is at your
 > own risk.
 
 ## Requirements
@@ -23,11 +25,11 @@ client, proxy, or anonymity tool.
 
 ## Installation
 
-1. Get the archive. Ready-made archives are not published yet:
-   `scripts/package-windows.ps1` builds one that runs on a machine without Qt
-   or Rust (see [Packaging a portable build](packaging-windows.md)).
-2. Unpack it into any folder — for example, on your Desktop or at the root
-   of drive `C:` or `D:`.
+1. Download the installer (`…-setup.exe` or `.msi`) or the portable
+   `…-portable.zip` from [Releases](https://github.com/kroxiksut/net-rule-router/releases). To build one yourself, see
+   [Packaging a portable build](packaging-windows.md).
+2. Run the installer, or unpack the portable archive into any folder — for
+   example, on your Desktop or at the root of drive `C:` or `D:`.
 3. Run `NetRuleRouter.exe`. At first launch the app will show the
    [end-user license agreement](../legal/eula.en.md) — read and accept
    it to continue.
@@ -48,9 +50,10 @@ routing does not apply.
 ## First setup
 
 1. **Pick a starting rule set.** Right after the service dialog, the
-   first-run wizard offers four options: a country preset, a built-in
-   demo set, two `.txt` files of your own, or an empty start. Whatever
-   you pick lands in the rules for review before anything is applied.
+   first-run wizard offers four options: the rule set for your region, an
+   example set, two `.txt` files of your own, or an empty start. Whatever
+   you pick is applied as soon as you click **Finish**; a short message
+   says how many rules now work.
    After an empty start, the next launch offers your country's rule set
    with one click; load it or decline, and it is not offered again.
    It also offers to start the tray icon at sign-in (on by default), so
@@ -60,12 +63,17 @@ routing does not apply.
 
    ![First-run setup: where your first rules come from](images/first-run-rules.png)
 
-2. **Choose two routes.** On the *Interfaces & routes* screen, specify
+2. **Choose two connections.** On the *Connections* screen, specify
    which network adapter is the *main* (primary) one and which is the
    *additional* one (for example, a VPN). Both can be given custom
    names — they will be visible in the rules.
 
-   ![Interfaces & routes: the main and the additional adapter](images/interfaces-routes.png)
+   Some VPN programs install several identical connections and use any
+   of them. If your VPN is off, the wizard cannot tell which one it will
+   use, so on this step it asks you to turn the VPN on. As soon as it
+   connects, the wizard sees it and picks it.
+
+   ![Connections: the main and the additional adapter](images/interfaces-routes.png)
 
 3. **Choose the default route and leak protection.** The *default route*
    decides where traffic that no rule covers goes:
@@ -76,11 +84,12 @@ routing does not apply.
    *Leak protection* decides what may still leave over the main connection
    instead of the additional one:
 
-   - **Off** (the default) — if the additional connection drops, traffic
-     continues over your main connection.
-   - **Routed sites** — what your rules send through the additional
-     connection never goes out the main one while strict blocking of shared
-     addresses is on, as it is by default. Everything else keeps working,
+   - **Off** — if the additional connection drops, traffic continues over
+     your main connection.
+   - **Routed sites** (the default) — what your rules send through the
+     additional connection never goes out the main one while strict
+     blocking of shared addresses is on, as it is by default. Everything
+     else keeps working,
      except sites that share an address with a routed one.
      Offered with the main-connection default route.
    - **Everything** — nothing leaves except through the additional
@@ -92,13 +101,13 @@ routing does not apply.
 
    ![Routing behavior: where traffic that no rule covers goes](images/routing-behavior.png)
 
-4. **Save the set as your own.** Settings → *Presets & settings* → *My rule
+4. **Save the set as your own.** Settings → *Rules and settings files* → *My rule
    sets*: point it at a folder of your own, then *"Save current rules as a
    set"* and give it a name. Rule sets left in the application folder are
    replaced by the next update; a set in your own folder survives it, and
    you can keep several — "home", "work" — and switch between them.
 
-   ![Presets and settings: your own rule sets live in a folder you choose](images/presets-settings.png)
+   ![Rules and settings files: your own rule sets live in a folder you choose](images/presets-settings.png)
 
 5. **Add your own sites and apply** — see the next section.
 
@@ -131,7 +140,7 @@ carried out yet, so the service refuses it.
 The service routes exactly what the rules say and nothing else. Sites that
 used to open for you over the VPN keep going out over the main connection
 until they appear in the rules of the additional route — a
-preset ships someone else's list, not yours.
+ready-made rule set ships someone else's list, not yours.
 
 So right after the first setup, go through the sites you actually use over
 the VPN and add them yourself, either way round:
@@ -271,16 +280,17 @@ far beyond the one machine. When the app knows the full name, such as
 ### If you have no additional connection
 
 You may not have a VPN or a second line — then simply **do not assign** an
-additional route during setup. Rules that direct traffic to the
-additional route will be ignored, and all traffic will go the usual way,
-through the main channel. This is expected behavior, not an error: the
-rules stay in place and will work as soon as you assign an additional
-route (for example, install a VPN).
+additional route during setup. Without rules for the additional route all
+traffic goes the usual way, through the main channel.
 
-If you want traffic from such rules to be **blocked instead of using the
-main channel**, set leak protection to **Routed sites** — but read the
-warning at the beginning of this document: in the alpha leak protection is
-turned on at your own risk.
+Rules that direct traffic to the additional route are **held** while it is
+not assigned: leak protection is on by default with **Routed sites**, so those
+sites wait instead of going out over the main channel, and the window says so.
+This is expected behavior, not an error: the rules stay in place and will work
+as soon as you assign an additional route (for example, install a VPN). If you
+would rather have them open over the main channel meanwhile, set leak
+protection to **Off**:
+[Turn protection on or off](pause-and-protection.md#turn-protection-on-or-off).
 
 If you do use a VPN, tell the app which program it is — its client keeps
 working over your main link while leak protection is on, instead of being cut
@@ -294,16 +304,16 @@ finds that VPN's gateway and adds a rule so the VPN always connects through the
 route you choose. See [A VPN that must connect through the other
 channel](vpn-detection.md#a-vpn-that-must-connect-through-the-other-channel-vpn-over-vpn).
 
-### Ready-made presets
+### Ready-made rule sets
 
 The `presets/` folder contains ready-made rule sets — including
 splits like "home traffic / foreign traffic" for several countries. Two
 ways to load one: the quick-load row above the rules table (Settings →
-*Presets & settings* → *Bundled presets* turns it on and off), or
-Settings → *Presets & settings* → *Import preset for the main / additional
-route*. Either way the app shows what changes before anything is applied.
+*Rules and settings files* → *Ready-made rule sets* turns it on and off), or
+Settings → *Rules and settings files* → *Load main / additional connection
+rules from a file…*. Either way the app shows what changes before anything is applied.
 
-Import a set and adapt it to yourself: presets are a starting point, not
+Import a set and adapt it to yourself: ready-made sets are a starting point, not
 the final truth.
 
 ## Settings and appearance
@@ -490,6 +500,23 @@ for a silent removal are in
    to delete the data the service owns as well). When the service is
    removed, it clears the installed routing rules.
 2. Close the app and delete the program folder.
+
+## What next
+
+Start with the short answers: [Questions and answers](questions.md). Then the
+guides for everyday tasks:
+
+- [Open a site through the VPN](adding-rules.md)
+- [Change, switch off or delete a rule](changing-rules.md)
+- [Save your rules and load them back](rule-sets.md)
+- [Choose your main and additional connection](connections.md)
+- [Suggested addresses](suggested-addresses.md)
+- [A site does not open or is slow](site-does-not-open.md)
+- [Pause everything, and leak protection](pause-and-protection.md)
+- [Start over, reset or remove the program](start-over-or-remove.md)
+
+Technical pages for advanced users and administrators:
+[the advanced list](advanced.md).
 
 ---
 

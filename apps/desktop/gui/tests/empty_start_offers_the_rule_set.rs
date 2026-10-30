@@ -88,7 +88,8 @@ var presetImportController = {{
     startBothRoutesPresetImportReviewFlow: function(primary, secondary, primaryPath, secondaryPath, options) {{
         var o = options || {{}}
         console.log((o.hydration ? "hydration of " : "import of ") + primaryPath
-            + " named " + String(o.label || ""))
+            + " named " + String(o.label || "")
+            + (o.confirmed === true ? " without review" : " through the review"))
     }}
 }};
 var prefs = {{ firstRunCompleted: true, autoLoadRulesOnLaunch: true }};
@@ -171,8 +172,9 @@ fn rules_or_a_bound_file_close_the_offer() {
 }
 
 /// "Load" is the quick-load's Load on the offered set: the import a user asks
-/// for, with the set's name for its outcome, never the silent hydration. It
-/// answers the offer and leaves the set remembered as the user's pick.
+/// for, with the set's name for its outcome, never the silent hydration, and
+/// applied without a second review: the user pressed Load on the named set.
+/// It answers the offer and leaves the set remembered as the user's pick.
 #[test]
 fn load_goes_through_the_import_a_user_asks_for_and_answers_the_offer() {
     let output = run(
@@ -185,9 +187,9 @@ fn load_goes_through_the_import_a_user_asks_for_and_answers_the_offer() {
     assert!(
         output.contains(
             "import of C:/Program Files/NetRuleRouter/presets/ru/osnovnoy/rules_primary.txt \
-             named Russia: local and foreign"
+             named Russia: local and foreign without review"
         ),
-        "{output}"
+        "Load on the named set is the user's choice, no second review:\n{output}"
     );
     assert!(!output.contains("hydration of"), "{output}");
     assert!(output.contains("answered true"), "{output}");

@@ -35,7 +35,7 @@ Button {
             ? root.theme.statePressedFill
             : (root.hovered || root.activeFocus ? root.theme.stateHoverFill : root.theme.stateDefaultFill)
         border.width: root.activeFocus ? root.theme.focusBorderWidth : root.theme.borderWidth
-        border.color: root.activeFocus ? root.theme.stateFocusedBorder : root.theme.stateDefaultBorder
+        border.color: root.activeFocus ? root.theme.colorButtonOutline : root.theme.stateDefaultBorder
     }
     contentItem: Text {
         text: root.text

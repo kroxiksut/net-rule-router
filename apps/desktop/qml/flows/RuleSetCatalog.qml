@@ -177,9 +177,10 @@ QtObject {
 
     /// Load the set at `index` as the quick-load's Load does: remembered as
     /// the user's pick, then the import review a user asks for, which starts
-    /// a stopped service and says what was applied. `false` when nothing was
-    /// read.
-    function loadRuleSetAt(index) {
+    /// a stopped service and says what was applied. `options.confirmed` skips
+    /// the review for a set the user already chose by name. `false` when
+    /// nothing was read.
+    function loadRuleSetAt(index, options) {
         if (index < 0 || index >= _ruleSetEnum().entries.length) return false
         if (typeof nrrNativeBridge === "undefined" || !nrrNativeBridge
                 || typeof nrrNativeBridge.resolvePresetPath !== "function"
@@ -202,11 +203,14 @@ QtObject {
         var secB64 = secAbs ? String(nrrNativeBridge.readFileBytes(secAbs) || "") : ""
         if (!primB64 && !secB64) {
             root.statusLine = root.tr("status.bundled-preset-empty",
-                "Could not read the selected bundled preset.")
+                "Could not read the chosen ready-made set.")
             return false
         }
         root.presetImportController.startBothRoutesPresetImportReviewFlow(
-            primB64, secB64, primAbs, secAbs, { label: ruleSetDisplayName(index) })
+            primB64, secB64, primAbs, secAbs, {
+                label: ruleSetDisplayName(index),
+                confirmed: !!(options && options.confirmed === true)
+            })
         return true
     }
 

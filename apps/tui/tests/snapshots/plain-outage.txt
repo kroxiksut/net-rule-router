@@ -1,7 +1,7 @@
 Screens:
   1. Status
   2. First run
-  3. Interfaces and routes
+  3. Connections
   4. Rules
   5. Overlaps
   6. Suggested addresses
@@ -12,23 +12,23 @@ Screens:
 
 Screen: Status
 Service: OK
-Routing state:
-  Routing active
-  Rules apply on this user session.
+Rules status:
+  Rules are working
+  Your rules are working.
 Connections:
   Main connection: Ethernet — Example Network Adapter — Available — Rules applied
-  Additional connection: Example Tunnel — Example Network Adapter — Available — Rules applied
+  Additional connection (e.g. VPN): Example Tunnel — Example Network Adapter — Available — Rules applied
 Notifications:
   No notifications.
 Commands on this screen:
   r: restore your settings to a service that lost them
   t: confirm the first listed program as your VPN (T: with the programs it ships with), so leak protection keeps it working
   a: allow the first listed VPN to reach its server, so leak protection lets it connect
-  p: confirm the suggested main connection; another one is chosen under Interfaces and routes
-  v: send the blocked site named under the state over the additional route; you are asked first
+  p: confirm the suggested main connection; another one is chosen under Connections
+  v: send the blocked site named under the state over the additional connection; you are asked first
   x N: dismiss notification N   X: dismiss all
   m N: stop showing notifications like N   H: hide or show addresses in block notifications
-  For a blocked connection N: v N: send it over the additional route   s N: snooze   w N: why it was blocked
+  For a blocked connection N: v N: send it over the additional connection   s N: snooze   w N: why it was blocked
   For a site that does not open in notification N: c N: check whether the network or the site is at fault
 Type a screen number, h for help or q to quit, then press Enter.
 
@@ -43,40 +43,40 @@ Selected connection:
 Commands on this screen:
   n: next page (more)   p: previous page (back)
   d and a row number: show that connection, for example d 3
-  e and a row number: why that connection took its route, for example e 3
+  e and a row number: why that connection went where it did, for example e 3
   c and a row number: check that connection's site, for example c 3
   / and text: search all fields, for example /example; / on its own clears the search
   b: show or hide blocked   l: show or hide local connections   v: IPv6 only on or off
   r: read again from the service. Lists do not refresh by themselves, so nothing moves while you read.
-  o: what was blocked while the additional route was down
+  o: what was blocked while the additional connection was down
   h hour, h today or h week: your kept history of that period; h now: back to the latest connections; t: the next period
   g: the next grouping; g none, g program or g folder: that grouping; f and a row number: a rule for that row's folder, for example f 3
   i and a row number: a rule for that connection's address, for example i 3; a and a row number: a rule for its program
 Type a screen number, h for help or q to quit, then press Enter.
 Connection trace: Shown: 12 of 14.
-Connections: > 1. browser.exe → 203.0.113.1:443 · site.example — Primary · Allowed
+Connections: > 1. browser.exe → 203.0.113.1:443 · site.example — Main · Allowed
 Connections: 2. browser.exe → 203.0.113.2:443 · site.example — Additional (VPN) · Allowed
-Connections: 3. browser.exe → 203.0.113.3:443 · site.example — Primary · Allowed
+Connections: 3. browser.exe → 203.0.113.3:443 · site.example — Main · Allowed
 Connections: 4. browser.exe → 203.0.113.4:443 · site.example — Additional (VPN) · Allowed
-Connections: 5. browser.exe → 203.0.113.5:443 · site.example — Primary · Allowed
+Connections: 5. browser.exe → 203.0.113.5:443 · site.example — Main · Allowed
 Connections: 6. browser.exe → 203.0.113.6:443 · site.example — Additional (VPN) · Allowed
-Connections: 7. browser.exe → 203.0.113.7:443 · site.example — Primary · Allowed
+Connections: 7. browser.exe → 203.0.113.7:443 · site.example — Main · Allowed
 Connections: 8. browser.exe → 203.0.113.8:443 · site.example — Additional (VPN) · Allowed
-Connections: 9. browser.exe → 203.0.113.9:443 · site.example — Primary · Allowed
+Connections: 9. browser.exe → 203.0.113.9:443 · site.example — Main · Allowed
 Connections: 10. browser.exe → 203.0.113.10:443 · site.example — Additional (VPN) · Allowed
 Connections: Rows 1–10 of 12.
 Selected connection: Process: browser.exe
 Selected connection: Remote: 203.0.113.1:443 · site.example
 Selected connection: Names this address was answered for (1): site.example
-Selected connection: Egress: Primary
+Selected connection: Egress: Main
 Selected connection: Verdict: Allowed
 Selected connection: TCP · from 192.0.2.10:50000 · 2026-10-06 12:00
-Selected connection: Enter / e: Why this route?
+Selected connection: Enter / e: Why this connection?
 
-Screen: Blocked while the route was down
+Screen: Blocked while the additional connection was down
 Service: OK
-Blocked while the route was down:
-  What leak protection held back while the additional route was down. Your rules send these addresses there, so they were blocked instead of leaving through the main connection.
+Blocked while the additional connection was down:
+  What leak protection held back while the additional connection was down. Your rules send these addresses there, so they were blocked instead of leaving through the main connection.
   Loading...
 Connections:
 Selected connection:
@@ -85,8 +85,8 @@ Commands on this screen:
   d and a row number: show that connection, for example d 3
   r: read again from the service. Lists do not refresh by themselves, so nothing moves while you read.
 Type a screen number, h for help or q to quit, then press Enter.
-Blocked while the route was down: The additional route has been down since 2026-10-06 11:50:00.
-Blocked while the route was down: 3: Open interfaces and routes
+Blocked while the additional connection was down: The additional connection has been down since 2026-10-06 11:50:00.
+Blocked while the additional connection was down: 3: Open Connections
 Connections: Process | Remote | Attempts | First | Last
 Connections: > 1. browser.exe | video.example.com · 203.0.113.5:443 | 12 | 2026-10-06 11:51:00 | 2026-10-06 11:59:00
 Connections: 2. updater.exe | cdn.example.net · [2001:db8::7]:443 | 12 | 2026-10-06 11:51:00 | 2026-10-06 11:59:00
@@ -99,12 +99,12 @@ Selected connection: Attempts: 12
 Selected connection: First: 2026-10-06 11:51:00
 Selected connection: Last: 2026-10-06 11:59:00
 
-Screen: Blocked while the route was down
+Screen: Blocked while the additional connection was down
 Service: OK
-Blocked while the route was down:
-  What leak protection held back while the additional route was down. Your rules send these addresses there, so they were blocked instead of leaving through the main connection.
-  The additional route has been down since 2026-10-06 11:50:00.
-  3: Open interfaces and routes
+Blocked while the additional connection was down:
+  What leak protection held back while the additional connection was down. Your rules send these addresses there, so they were blocked instead of leaving through the main connection.
+  The additional connection has been down since 2026-10-06 11:50:00.
+  3: Open Connections
 Connections:
   Process | Remote | Attempts | First | Last
   > 1. browser.exe | video.example.com · 203.0.113.5:443 | 12 | 2026-10-06 11:51:00 | 2026-10-06 11:59:00
@@ -124,12 +124,12 @@ Commands on this screen:
   r: read again from the service. Lists do not refresh by themselves, so nothing moves while you read.
 Type a screen number, h for help or q to quit, then press Enter.
 
-Screen: Blocked while the route was down
+Screen: Blocked while the additional connection was down
 Service: OK
-Blocked while the route was down:
-  What leak protection held back while the additional route was down. Your rules send these addresses there, so they were blocked instead of leaving through the main connection.
-  The additional route has been down since 2026-10-06 11:50:00.
-  3: Open interfaces and routes
+Blocked while the additional connection was down:
+  What leak protection held back while the additional connection was down. Your rules send these addresses there, so they were blocked instead of leaving through the main connection.
+  The additional connection has been down since 2026-10-06 11:50:00.
+  3: Open Connections
 Connections:
   Process | Remote | Attempts | First | Last
     1. browser.exe | video.example.com · 203.0.113.5:443 | 12 | 2026-10-06 11:51:00 | 2026-10-06 11:59:00

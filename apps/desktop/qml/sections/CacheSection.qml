@@ -255,16 +255,13 @@ ScrollView {
     // additive `cacheTableColumnWidths` UI preference (a compact JSON blob):
     // loaded in Component.onCompleted, saved (debounced) when the user drags a
     // column grip. These defaults apply when the pref is empty/malformed.
-    // The grouped cache table has five columns:
-    //   Host | IP | Source | Route | Freshness (Freshness now merges the old
-    // Freshness + Expires into one compact cell: freshness label + remaining TTL,
-    // with the full resolved/expires timestamps on hover). The IP column carries
-    // the "+N" expansion affordance so it needs a little more room; Freshness is
-    // wider to hold "<label> · <ttl>".
+    // Host | IP | Source | Connection | Freshness. IP needs room for its "+N"
+    // affordance, Freshness for "<label> · <ttl>", Connection for the Russian
+    // "additional (VPN)" label.
     property real _cacheColIpW: 130
     property real _cacheColFreshW: 160
     property real _cacheColSourceW: 150
-    property real _cacheColRouteW: 90
+    property real _cacheColRouteW: 150
     // Host flexes to absorb leftover width but keeps a sane preferred/min so the
     // fixed columns are never starved (it no longer collapses to near-zero).
     property real _cacheColHostW: 200
@@ -960,7 +957,7 @@ ScrollView {
                     }
                     ThemedComboBox {
                         id: cacheRouteFilterCombo
-                        accessibleLabel: root.uiRevision >= 0 ? root.tr("diag.cache.col-route", "Route") : ""
+                        accessibleLabel: root.uiRevision >= 0 ? root.tr("diag.cache.col-route", "Connection") : ""
                         theme: root.uiTheme
                         implicitWidth: 180
                         model: Pure.CACHE_ROUTE_FILTERS
@@ -971,7 +968,7 @@ ScrollView {
                                 return root.connEgressLabel("secondary")
                             if (slug === "none")
                                 return root.tr("diag.cache.route-filter.none", "No rule")
-                            return root.tr("diag.cache.route-filter.all", "All routes")
+                            return root.tr("diag.cache.route-filter.all", "All connections")
                         }
                         labelResolver: function(item) {
                             return cacheRouteFilterCombo.routeFilterLabel(item)
@@ -1241,7 +1238,7 @@ ScrollView {
                             anchors.fill: parent
                             leftPadding: 9
                             verticalAlignment: Text.AlignVCenter
-                            text: root.tr("diag.cache.col-route", "Route")
+                            text: root.tr("diag.cache.col-route", "Connection")
                                 + section._cacheSortArrow("route")
                             color: root.mutedTextColor
                             font.bold: true

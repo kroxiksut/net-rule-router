@@ -176,6 +176,12 @@ const TABLE: &[Row] = &[
         tui: Read,
     },
     Row {
+        slug: "additional-connection-moved",
+        gui: Read,
+        tray: Read,
+        tui: Read,
+    },
+    Row {
         slug: "block-notice-raised",
         gui: Read,
         tray: Read,

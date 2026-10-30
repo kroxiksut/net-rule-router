@@ -8,8 +8,8 @@ import QtQuick.Window 2.15
 //
 // The agreement text arrives in the QML context (`context.eula.text`, built by
 // the Rust `ui_surface` loader from `docs/legal/eula.<lang>.md`), so this file
-// carries no legal text — only the chrome, which is fully localised via
-// `ownerRoot.tr(...)`.
+// carries no legal text — only the chrome, which speaks the window's language
+// until the user switches the agreement, and the agreement's language after.
 //
 // Gate: "Accept" is enabled only after the user ticks the acknowledgement
 // checkbox. Declining — or closing the window — quits the application, matching
@@ -55,16 +55,23 @@ Window {
     signal declined()
 
     function tr(key, fallback) {
-        return ownerRoot && typeof ownerRoot.tr === "function"
-            ? ownerRoot.tr(key, fallback)
-            : (fallback || key)
+        if (!ownerRoot) return fallback || key
+        return selectedLanguage !== "" && typeof ownerRoot.resolveCatalogText === "function"
+            ? ownerRoot.resolveCatalogText(selectedLanguage, key, fallback)
+            : ownerRoot.tr(key, fallback)
     }
 
     // API-compatible with the other modal child windows in Main.qml.
     function open() { _accepted = false; acknowledged = false; visible = true }
 
-    width: 820
-    height: 640
+    // The size the window opens at; `_fitOnScreen` shrinks it to the free area.
+    readonly property int _designWidth: 820
+    readonly property int _designHeight: 640
+    // The title bar and frame the window system draws outside `height`.
+    readonly property int _frameAllowance: 40
+
+    width: _designWidth
+    height: _designHeight
     minimumWidth: 560
     minimumHeight: 420
     visible: false
@@ -73,6 +80,22 @@ Window {
     color: ownerRoot ? ownerRoot.panelColor : "#202020"
     title: tr("dialog.eula.title", "License agreement")
     transientParent: ownerRoot ? ownerRoot : null
+
+    /// Fits the window, frame included, into the part of its screen the taskbar
+    /// leaves free, so the decision buttons are never under the taskbar; the
+    /// agreement text scrolls in what is left.
+    function _fitOnScreen() {
+        var freeHeight = Math.min(Screen.height, Screen.desktopAvailableHeight)
+        var freeWidth = Math.min(Screen.width, Screen.desktopAvailableWidth)
+        height = Math.max(minimumHeight, Math.min(_designHeight, freeHeight - _frameAllowance - 8))
+        width = Math.max(minimumWidth, Math.min(_designWidth, freeWidth - 16))
+        var bottom = Screen.virtualY + freeHeight - 8
+        if (y + height > bottom) y = bottom - height
+        if (y < Screen.virtualY + _frameAllowance) y = Screen.virtualY + _frameAllowance
+        var right = Screen.virtualX + freeWidth - 8
+        if (x + width > right) x = right - width
+        if (x < Screen.virtualX + 8) x = Screen.virtualX + 8
+    }
 
     onVisibleChanged: {
         if (visible) {
@@ -86,7 +109,12 @@ Window {
                 ownerRoot.applyTitleBarTo(root)
             }
         }
+        if (visible) _fitOnScreen()
     }
+    // A taskbar that appears, or a screen that changes, while the window is up.
+    Screen.onDesktopAvailableHeightChanged: if (visible) _fitOnScreen()
+    Screen.onDesktopAvailableWidthChanged: if (visible) _fitOnScreen()
+    onScreenChanged: if (visible) Qt.callLater(_fitOnScreen)
 
     // Closing the window via the title-bar X without accepting is a decline.
     onClosing: function(close) {

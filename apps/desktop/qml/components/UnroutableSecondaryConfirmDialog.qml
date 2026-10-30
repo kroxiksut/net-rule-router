@@ -67,12 +67,12 @@ Dialog {
 
     readonly property string _situationText: contextSlug === "leak-protection"
         ? tr("dialog.unroutable-secondary.body-kill-switch",
-            "It is currently assigned as your additional route.")
+            "It is currently chosen as your additional connection.")
         : (_primary
             ? tr("dialog.unroutable-secondary.body-assign-primary",
                 "You are about to make it your main connection.")
             : tr("dialog.unroutable-secondary.body-assign",
-                "You are about to assign it as your additional route."))
+                "You are about to assign it as your additional connection."))
 
     readonly property string _killSwitchText: contextSlug === "leak-protection"
         ? tr("dialog.unroutable-secondary.effect-kill-switch-arming",
@@ -145,7 +145,7 @@ Dialog {
                 ? root.tr("dialog.unroutable-secondary.effect-routing-primary",
                     "The service will not route through it: traffic your rules do not route keeps going the way the system sends it. Choose the connection that reaches the internet as main.")
                 : root.tr("dialog.unroutable-secondary.effect-routing",
-                    "Rules that point at the additional route will not be routed through it.")
+                    "Rules that point at the additional connection will not be routed through it.")
             Accessible.role: Accessible.StaticText
             Accessible.name: text
         }

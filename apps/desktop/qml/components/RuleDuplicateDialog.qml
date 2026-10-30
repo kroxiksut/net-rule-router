@@ -45,7 +45,7 @@ Dialog {
             wrapMode: Text.WordWrap
             color: root.ownerRoot ? root.ownerRoot.textColor : palette.text
             text: root.tr("dialog.rule.duplicate-body",
-                "A rule with the same type, value, and target route already exists ({id}). Open the existing rule to change it, or cancel to keep editing the new one.")
+                "A rule with the same type, value and connection already exists ({id}). Open it to change it, or cancel to keep editing this one.")
                     .replace("{id}", root.duplicateId)
         }
         RowLayout {

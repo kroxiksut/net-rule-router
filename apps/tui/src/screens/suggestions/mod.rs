@@ -59,7 +59,11 @@ impl CallError {
         } else {
             self.message.as_str()
         };
-        texts.dynamic(&format!("errors.{}", self.code), fallback)
+        crate::screens::binding::with_alert_hint(
+            &self.code,
+            texts.dynamic(&format!("errors.{}", self.code), fallback),
+            texts,
+        )
     }
 }
 

@@ -443,7 +443,7 @@ ColumnLayout {
     function _reachText(host) {
         var scope = host.isApp === true
             ? root.tr("rules.suggestions.inbox.reach-app",
-                "The rule sends every connection of {app} through the additional route.")
+                "The rule sends every connection of {app} through the additional connection.")
                 .replace("{app}", Pure.displayText(host.domain || host.match || ""))
             : root.tr("rules.suggestions.inbox.reach",
                 "The rule covers every name under {domain}.")
@@ -473,13 +473,13 @@ ColumnLayout {
             // exactly wrong here.
             if (host.anchorRefusesMainLink === true) {
                 return root.tr("rules.suggestions.inbox.behavior-responds-refusing",
-                    "the main route reaches it, but the site refuses addresses there")
+                    "the main connection reaches it, but the site refuses addresses there")
             }
-            return root.tr("rules.suggestions.inbox.behavior-responds", "the main route reaches it")
+            return root.tr("rules.suggestions.inbox.behavior-responds", "the main connection reaches it")
         }
         if (slug === "stalls")
-            return root.tr("rules.suggestions.inbox.behavior-stalls", "connections to it stall on the main route")
-        return root.tr("rules.suggestions.inbox.behavior-unknown", "not checked on the main route")
+            return root.tr("rules.suggestions.inbox.behavior-stalls", "connections to it stall on the main connection")
+        return root.tr("rules.suggestions.inbox.behavior-unknown", "not checked on the main connection")
     }
     /// Whose name the offer is: the site's own, or a third party it pulls in.
     ///
@@ -512,7 +512,7 @@ ColumnLayout {
     function _sortLabel(mode) {
         if (mode === "main-route")
             return root.tr("rules.suggestions.inbox.sort-main-route",
-                "What the main route can't reach first")
+                "What the main connection can't reach first")
         if (mode === "consumers") return root.tr("rules.suggestions.inbox.sort-consumers", "By number of sites")
         if (mode === "name") return root.tr("rules.suggestions.inbox.sort-name", "By name")
         return root.tr("rules.suggestions.inbox.sort-newest", "Newest first")
@@ -535,10 +535,7 @@ ColumnLayout {
         // the user is still typing.
         text: section.statusFilteredGroups.length > 0
             ? root.tr("rules.suggestions.table.intro",
-                "Every address below was pulled in by a site you route. Adding one <b>sends it through "
-                + "the additional route together with the site that needs it</b> — <i>anything you leave "
-                + "alone keeps going through the main route</i>. A dismissed address <i>only stops being "
-                + "offered</i>; \"Allow again\" lifts that suppression and nothing else.")
+                "Every address below was pulled in by a site you route. Adding one <b>sends it through the additional connection together with the site that needs it</b> — <i>anything you leave alone keeps going through the main connection</i>. A dismissed address <i>only stops being offered</i>; \"Allow again\" lifts that suppression and nothing else.")
             : (root.autoRuleSuggestionsController.autoRuleLoadFailed
                 ? root.tr("rules.suggestions.inbox.load-failed",
                     "Could not read the suggestions from the service. Try again in a moment.")
@@ -567,7 +564,7 @@ ColumnLayout {
         wrapMode: Text.Wrap
         color: root.mutedTextColor
         text: root.tr("rules.suggestions.inbox.empty-all-inert",
-                "The service saw {count} addresses beside your sites, but each already travels the route it would be sent to — a rule would change nothing. For example: {sample}.")
+                "The service saw {count} addresses beside your sites, but each already goes over the connection it would be sent to — a rule would change nothing. For example: {sample}.")
             .replace("{count}", String(root.autoRuleSuggestionsController.autoRuleInertDropped))
             .replace("{sample}", section._inertSampleText())
         Accessible.role: Accessible.StaticText
@@ -583,7 +580,7 @@ ColumnLayout {
         wrapMode: Text.Wrap
         color: root.mutedTextColor
         text: root.tr("rules.suggestions.accept.reload-page",
-                "The rule is applied. Reload the page you were on (F5) so it picks up the new route.")
+                "The rule is applied. Reload the page you were on (F5) so it takes effect.")
         Accessible.role: Accessible.StaticText
         Accessible.name: text
     }
@@ -761,7 +758,7 @@ ColumnLayout {
                 theme: root.uiTheme
                 text: section.probeBusy
                     ? root.tr("rules.suggestions.inbox.action-check-main-route-busy", "Checking...")
-                    : root.tr("rules.suggestions.inbox.action-check-main-route", "Check the main route")
+                    : root.tr("rules.main-route.action-check", "Check the main connection")
                 enabled: !section.probeBusy && section.mergedGroups.length > 0
                 ToolTip.visible: hovered
                 ToolTip.text: root.tr("rules.suggestions.inbox.action-check-main-route-tooltip",
@@ -946,7 +943,7 @@ ColumnLayout {
                                                     + (section._isPrimaryConsumer(modelData)
                                                         ? " · " + root.tr(
                                                             "rules.suggestions.inbox.consumer-on-primary",
-                                                            "on the main route")
+                                                            "on the main connection")
                                                         : "")
                                                 Accessible.role: Accessible.Button
                                                 Accessible.name: text
@@ -958,7 +955,7 @@ ColumnLayout {
                                                 ToolTip.text: (section._isPrimaryConsumer(modelData)
                                                     ? root.tr(
                                                         "rules.suggestions.inbox.consumer-on-primary-hint",
-                                                        "This site goes through the main route. If you move the address into the tunnel, this site's traffic to it goes there too.")
+                                                        "This site goes through the main connection. If you send the address through the additional connection, this site's traffic to it goes there too.")
                                                         + " "
                                                     : "") + root.tr(
                                                         "rules.suggestions.inbox.consumer-copy-hint",
@@ -1002,7 +999,7 @@ ColumnLayout {
                                     theme: root.uiTheme
                                     highlighted: true
                                     visible: modelData.pendingIds.length > 0
-                                    text: root.tr("rules.action.send-over", "Send over {route}").replace("{route}", root.routeLabel("secondary"))
+                                    text: root.tr("rules.action.send-over", "Send over {route}").replace("{route}", root.routeChoiceLabel("secondary"))
                                     Accessible.role: Accessible.Button
                                     Accessible.name: text
                                     onClicked: section._acceptIds(modelData.pendingIds)
@@ -1250,7 +1247,7 @@ ColumnLayout {
                 id: addSelectedButton
                 theme: root.uiTheme
                 highlighted: true
-                text: root.tr("rules.action.send-over", "Send over {route}").replace("{route}", root.routeLabel("secondary"))
+                text: root.tr("rules.action.send-over", "Send over {route}").replace("{route}", root.routeChoiceLabel("secondary"))
                 Accessible.role: Accessible.Button
                 Accessible.name: text
                 onClicked: section._acceptIds(section._checkedPendingIds())

@@ -171,7 +171,7 @@ impl ConnectionObservationConsumer {
                     .zip(self.service_account_drop_check.as_ref())
                     .is_some_and(|(spec_id, check)| check(spec_id));
             let mut drop_reason = None;
-            if rec.blocked_by_nrr == Some(true) {
+            if rec.blocked_by_nrr == Some(true) && !self.is_fake_pool_drop(&rec) {
                 let reason = self.reason_for_drop(&rec, killswitch_verified);
                 rec.nrr_block_reason = Some(reason.slug());
                 drop_reason = Some(reason);

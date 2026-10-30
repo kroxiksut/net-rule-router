@@ -842,13 +842,15 @@ ColumnLayout {
                 }
                 Label {
                     Layout.preferredWidth: 120
-                    text: String(modelData.category || "")
+                    text: root.uiRevision >= 0
+                        ? Pure.logSlugText(root.tr, "diag.logs.category.", modelData.category) : ""
                     color: root.mutedTextColor
                     elide: Text.ElideRight
                 }
                 Label {
                     Layout.preferredWidth: 180
-                    text: String(modelData.kind || "")
+                    text: root.uiRevision >= 0
+                        ? Pure.logSlugText(root.tr, "diag.logs.kind.", modelData.kind) : ""
                     color: root.textColor
                     elide: Text.ElideRight
                 }

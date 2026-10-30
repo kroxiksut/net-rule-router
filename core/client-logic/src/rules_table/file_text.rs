@@ -29,7 +29,7 @@ pub const RULES_FILE_HINT_KEYS: [(&str, &str); 10] = [
     ),
     (
         "rules.file-hint.value",
-        r"value            rule: goes over this file's route   example.com",
+        r"value            rule: uses this file's connection   example.com",
     ),
     (
         "rules.file-hint.subdomains",
@@ -45,7 +45,7 @@ pub const RULES_FILE_HINT_KEYS: [(&str, &str); 10] = [
     ),
     (
         "rules.file-hint.verify",
-        r"?value           this route while the site opens     ?mail.example.com",
+        r"?value           this connection, while it works     ?mail.example.com",
     ),
     (
         "rules.file-hint.disabled",

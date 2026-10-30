@@ -227,8 +227,7 @@ QtObject {
                 "Another operation is in progress. Wait for it to finish.")
         case "empty":
             return tr("dialog.nothing-to-apply.body",
-                "There are no changes to apply — the current rules already "
-                + "match what is active.")
+                "Nothing to apply: the rules on screen are already in use.")
         case "unexpected-diff":
             return tr("status.rules-apply-unexpected-diff",
                 "Not applied: the change would also affect other rules. "

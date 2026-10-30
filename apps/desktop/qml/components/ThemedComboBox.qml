@@ -105,7 +105,7 @@ ComboBox {
                    : theme.colorBase
         border.width: root.activeFocus ? theme.focusBorderWidth : theme.borderWidth
         border.color: root.activeFocus
-                          ? theme.stateFocusedBorder
+                          ? theme.colorButtonOutline
                           : !root.enabled
                               ? theme.stateDisabledBorder
                               : theme.stateDefaultBorder

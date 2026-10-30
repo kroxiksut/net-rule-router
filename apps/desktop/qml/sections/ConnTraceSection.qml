@@ -540,6 +540,9 @@ ScrollView {
     // The Remote column grows with the window: it now carries the name too.
     readonly property int _connRemoteColWidth:
         Math.max(150, Math.min(400, Math.round(section.availableWidth * 0.36)))
+    // The Verdict column fits its longest label in the current language.
+    readonly property int _connVerdictColWidth:
+        Math.max(180, Math.ceil(connVerdictProbe.implicitWidth) + 8)
 
     // Per-row lowercase search blob (see _cacheRowBlob).
     function _connRowBlob(e) {
@@ -825,7 +828,7 @@ ScrollView {
                     Layout.fillWidth: true
                     visible: !section._connIsHistory
                     text: root.tr("diag.conn-trace.subtitle",
-                        "Recently-observed outbound connections and which interface they actually left through (primary, or the additional adapter). Observation only — it never changes routing. The list refreshes on its own while it is open and is kept in memory only. (Writing connections to the on-disk log stays an opt-in in Settings.) Shows TCP/UDP connections — a ping (ICMP) leaves no connection to observe, so a pinged address will not appear here.")
+                        "Recently-observed outbound connections and which connection they actually left through (main or additional). Observation only — it never changes routing. The list refreshes on its own while it is open and is kept in memory only. (Writing connections to the on-disk log stays an opt-in in Settings.) Shows TCP/UDP connections — a ping (ICMP) leaves no connection to observe, so a pinged address will not appear here.")
                     color: root.mutedTextColor
                     wrapMode: Text.WordWrap
                     font.pixelSize: root.uiTheme.baseFontSizePx - 1
@@ -1182,10 +1185,8 @@ ScrollView {
                     visible: section._connTraceShown && section._connTraceEntries.length > 0
                     spacing: root.uiTheme.spacingSm
                     // Every header is clickable to sort (a `_connSortArrow` suffix
-                    // marks the active column) and keeps its explanatory tooltip.
-                    // Widths are fixed so the Verdict text — "Blocked (another
-                    // program)" is the widest — shows in full by default; each
-                    // header elides rather than overlapping its neighbour.
+                    // marks the active column) and keeps its explanatory tooltip;
+                    // each elides rather than overlapping its neighbour.
                     SortHeader {
                         id: connHdrProcess
                         theme: root.uiTheme
@@ -1241,13 +1242,13 @@ ScrollView {
                         }
                         ToolTip.visible: connHdrEgressHover.hovered
                         ToolTip.text: root.tr("diag.conn-trace.col-egress-tip",
-                            "Which network link the connection actually left through: Primary (your main link), Additional (the additional link, usually a VPN), Loopback (local, never leaves the PC), Other (another adapter), Unknown (couldn't be determined). This is observation only — it never changes routing.")
+                            "Which connection the traffic actually left through: Main (your main connection), Additional (the additional connection, usually a VPN), Loopback (local, never leaves the PC), Other (another adapter), Unknown (couldn't be determined). This is observation only — it never changes routing.")
                     }
                     SortHeader {
                         id: connHdrVerdict
                         theme: root.uiTheme
                         onActivated: section._toggleConnSort("verdict")
-                        Layout.preferredWidth: 180
+                        Layout.preferredWidth: section._connVerdictColWidth
                         text: root.tr("diag.conn-trace.col-verdict", "Verdict")
                             + section._connSortArrow("verdict")
                         color: root.mutedTextColor
@@ -1264,13 +1265,21 @@ ScrollView {
                     }
                 }
 
-                // The verdict feed has no owner attribution, so a "Blocked" row
-                // may be a firewall or antivirus drop; say so explicitly.
+                // Never shown: measures the widest verdict label in the cells' font.
+                Label {
+                    id: connVerdictProbe
+                    visible: false
+                    text: root.tr("diag.conn-trace.verdict.block-by-nrr", "Blocked (NetRuleRouter)")
+                        + "\n" + root.tr("diag.conn-trace.verdict.block-by-other", "Blocked (another program)")
+                }
+
+                // A plain "Blocked" is an unattributed drop, so the note tells
+                // it apart from NetRuleRouter's own blocks.
                 Label {
                     Layout.fillWidth: true
                     visible: section._connTraceShown && section._connTraceEntries.length > 0
                     text: root.tr("diag.conn-trace.verdict-note",
-                        "\"Blocked\" means the connection was dropped by a filter in the system — this can be the system firewall or your antivirus, not necessarily NetRuleRouter. NetRuleRouter never blocks traffic on your primary route.")
+                        "\"Blocked\" means some filter in the system dropped the connection, such as a firewall or an antivirus. \"Blocked (NetRuleRouter)\" means NetRuleRouter stopped it: a deny rule, or leak protection while the additional connection is not working. Apart from that, NetRuleRouter does not block traffic on your main connection.")
                     color: root.mutedTextColor
                     font.pixelSize: Math.max(11, root.uiTheme.baseFontSizePx - 1)
                     wrapMode: Text.WordWrap
@@ -1500,7 +1509,7 @@ ScrollView {
                                 visible: connRowItem._vRuleHost !== ""
                                     || connRowItem._vRemoteHostFirst !== ""
                                     || connRowItem._vRemoteAddr !== ""
-                                text: root.tr("diag.conn-trace.why-this-route", "Why this route?")
+                                text: root.tr("diag.conn-trace.why-this-route", "Why this connection?")
                                 onTriggered: section._explainConnRow(
                                     connRowItem._vRuleHost, connRowItem._vRemoteHostFirst,
                                     connRowItem._vRemoteAddr, connRowItem._vProcess)
@@ -1654,12 +1663,10 @@ ScrollView {
                                 ToolTip.visible: connEgressHover.hovered
                                     && connRowItem._isLeakMismatch
                                 ToolTip.text: root.tr("diag.conn-trace.leak-mismatch-tip",
-                                    "Mismatch: this address belongs to a rule routed to the additional adapter, but the connection was allowed out over the PRIMARY link — a leak indicator.")
+                                    "Mismatch: this address belongs to a rule routed to the additional adapter, but the connection was allowed out over the MAIN connection — a leak indicator.")
                             }
                             Label {
-                                // Matches the widened Verdict header (180) so the
-                                // full "Blocked (another program)" text is visible.
-                                Layout.preferredWidth: 180
+                                Layout.preferredWidth: section._connVerdictColWidth
                                 // A "block" is only shown
                                 // as NetRuleRouter's when the drop's WFP filter is
                                 // actually ours; a foreign drop (firewall/AV) is
@@ -1722,7 +1729,7 @@ ScrollView {
                             visible: heldAtMs > 0
                             text: heldAtMs > 0
                                 ? root.tr("diag.conn-trace.learned-route",
-                                    "First connection held at %1 while the address was being learned, then sent over the additional route")
+                                    "First connection held at %1 while the address was being learned, then sent over the additional connection")
                                     .arg(Pure.formatTimestamp(heldAtMs))
                                 : ""
                             color: root.mutedTextColor

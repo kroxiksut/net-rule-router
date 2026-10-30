@@ -818,14 +818,14 @@ mod tests {
         let mut app = app_at(Link::Connected, Some(&Fixture::healthy()));
         app.snapshot.as_mut().expect("snapshot").active_rule_count = None;
         assert!(
-            !said(&app, "No rules are active"),
+            !said(&app, "There are no rules"),
             "a service that does not count"
         );
         app.snapshot.as_mut().expect("snapshot").active_rule_count = Some(0);
-        assert!(said(&app, "No rules are active"));
+        assert!(said(&app, "There are no rules"));
 
         app.snapshot.as_mut().expect("snapshot").active_rule_count = Some(3);
-        assert!(!said(&app, "No rules are active"));
+        assert!(!said(&app, "There are no rules"));
         assert!(
             !said(&app, "not being applied"),
             "a bound additional adapter tells its own state"
@@ -846,7 +846,7 @@ mod tests {
         );
         app.policy_idle_since = Instant::now().checked_sub(POLICY_IDLE_SETTLE);
         assert!(app.policy_idle_since.is_some(), "the clock reaches back");
-        assert!(said(&app, "your rules are not being applied"));
+        assert!(said(&app, "your rules are not working"));
         let policy = app
             .snapshot
             .as_mut()
@@ -1176,7 +1176,7 @@ mod tests {
     #[test]
     fn traffic_carried_by_another_users_tunnel_stands_under_the_state() {
         let mut app = app_at(Link::Connected, Some(&Fixture::healthy()));
-        let title = "Your traffic goes through another user's tunnel";
+        let title = "Your traffic goes through another user's connection";
         assert!(!shown(&app).iter().any(|l| l == title));
 
         app.traffic_carried = Some("Office\u{202E}Tunnel".into());
@@ -1185,7 +1185,7 @@ mod tests {
         assert!(
             lines
                 .iter()
-                .any(|l| l.contains("through the tunnel \"Office\u{b7}Tunnel\".")),
+                .any(|l| l.contains("through \"Office\u{b7}Tunnel\".")),
             "the name is shown through display_text: {lines:?}"
         );
 
@@ -1193,7 +1193,7 @@ mod tests {
         assert!(
             shown(&app)
                 .iter()
-                .any(|l| l.contains("through their tunnel.")),
+                .any(|l| l.contains("through their own connection (for example a VPN).")),
             "no name: the wording that does without one"
         );
 

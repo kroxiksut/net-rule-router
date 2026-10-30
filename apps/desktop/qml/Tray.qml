@@ -533,10 +533,10 @@ SystemTrayIcon {
         var shown = Pure.displayText(host)
         return reach === "confirmed"
             ? tr("tray.site-not-opening.body-confirmed",
-                "{host} does not open over the main connection, but opens over the additional route.")
+                "{host} does not open over the main connection, but opens over the additional connection.")
                 .replace("{host}", shown)
             : tr("tray.site-not-opening.body-unconfirmed",
-                "{host} does not open over the main connection; the additional route may help.")
+                "{host} does not open over the main connection; the additional connection may help.")
                 .replace("{host}", shown)
     }
 
@@ -790,6 +790,9 @@ SystemTrayIcon {
             case "local-network-too-wide":
                 _onLocalNetworkTooWide(event)
                 break
+            case "additional-connection-moved":
+                _onAdditionalConnectionMoved(event)
+                break
             case "rule-duplicates-detected":
                 _onRuleDuplicatesDetected(event)
                 break
@@ -1008,11 +1011,11 @@ SystemTrayIcon {
     function _routeSentence(routeSlug) {
         if (routeSlug === "secondary") {
             return tr("tray.auto-rules.route-line-secondary",
-                "They will be added to the additional route.")
+                "They will go through the additional connection.")
         }
         if (routeSlug === "primary") {
             return tr("tray.auto-rules.route-line-primary",
-                "They will be added to the main route.")
+                "They will go through the main connection.")
         }
         return ""
     }
@@ -1221,40 +1224,40 @@ SystemTrayIcon {
             : noticeKind === "assorted"
             ? tr("tray.auto-rules.title-assorted", "Suggested rules")
             : noticeKind === "programs-blocked"
-            ? tr("tray.auto-rules.title-app-blocked", "Programs the main route will not carry")
+            ? tr("tray.auto-rules.title-app-blocked", "Programs the main connection will not carry")
             : noticeKind === "mixed-blocked"
-            ? tr("tray.auto-rules.title-mixed-blocked", "Not getting through on the main route")
+            ? tr("tray.auto-rules.title-mixed-blocked", "Not getting through on the main connection")
             : noticeKind === "sites-blocked"
             ? tr("tray.auto-rules.title-blocked",
-                    "Sites the main route will not carry")
+                    "Sites the main connection will not carry")
             : tr("tray.auto-rules.title", "Addresses a site needs")
         var bodyText
         if (noticeKind === "programs-own-resolver") {
             bodyText = tr("tray.auto-rules.body-app-own-resolver",
-                    "{name} looks up site names on its own, so rules by site name do not apply to it. A rule for the program sends all of its connections over the additional route.")
+                    "{name} looks up site names on its own, so rules by site name do not apply to it. A rule for the program sends all of its connections over the additional connection.")
                 .replace("{name}", programNames)
         } else if (noticeKind === "assorted") {
             bodyText = tr("tray.auto-rules.body-assorted",
                     "Each item below says why it is offered.")
         } else if (noticeKind === "programs-blocked") {
             bodyText = tr("tray.auto-rules.body-app-blocked",
-                    "Most connections of {name} fail on the main route.")
+                    "Most connections of {name} fail on the main connection.")
                 .replace("{name}", programNames)
         } else if (noticeKind === "mixed-blocked") {
             bodyText = tr("tray.auto-rules.body-mixed-blocked",
-                    "The programs and sites below keep failing on the main route.")
+                    "The programs and sites below keep failing on the main connection.")
         } else if (noticeKind === "sites-blocked") {
             var oneReach = Pure.siteOfferReach(shownRows[0].signal, shownRows[0]["secondary-reach"])
             bodyText = ids.length > 1
                 ? tr("tray.auto-rules.body-blocked-multi",
-                        "Connections to {count} sites keep failing on the main route.")
+                        "Connections to {count} sites keep failing on the main connection.")
                     .replace("{count}", String(ids.length))
                 // One site: the same words as its card, as sure as the probe
                 // of the additional route made them.
                 : (oneReach === "confirmed" || oneReach === "unconfirmed"
                     ? _siteNoticeBody(String(shownRows[0]["proposed-match"] || ""), oneReach)
                     : tr("tray.auto-rules.body-blocked",
-                        "Connections to {name} keep failing on the main route.")
+                        "Connections to {name} keep failing on the main connection.")
                         .replace("{name}", items[0].primaryText))
         } else {
             // One heading cannot honestly name one site when the rows belong
@@ -1337,7 +1340,7 @@ SystemTrayIcon {
         // A reconnect inside the service's quiet period refreshes the menu only.
         if (event.quiet === true) return
         var line = tr("tray.external-address.body",
-                "External address of the additional route: {address}")
+                "External address of the additional connection: {address}")
             .replace("{address}", observed)
         var adapter = String(event["adapter-name"] || "")
         // One event, one notice: the "routing is working again" notice still
@@ -1358,7 +1361,7 @@ SystemTrayIcon {
             "Adapter: {name}").replace("{name}", Pure.displayText(adapter))
         _offerNotice("external-address", "external-address", function() {
             tray._presentPrompt({
-                titleText: tray.tr("tray.external-address.title", "Additional route connected"),
+                titleText: tray.tr("tray.external-address.title", "Additional connection is up"),
                 bodyText: body,
                 secondaryAction: tray._noticeMuteAction("external-address"),
                 dismissActionId: "external-address-dismiss",
@@ -1479,7 +1482,7 @@ SystemTrayIcon {
                 tray._presentPrompt({
                     titleText: tray.tr("notifications.vpn-client-trust.title", "Is this your VPN?"),
                     bodyText: tray.tr("notifications.vpn-client-offer.body",
-                            "Looks like your VPN is {name}. Use it as your VPN client, so it keeps working over your main link while leak protection is on? Programs: {apps}")
+                            "Looks like your VPN is {name}. Use it as your VPN client, so it keeps working over your main connection while leak protection is on? Programs: {apps}")
                         .replace("{name}", Pure.displayText(offer.name))
                         .replace("{apps}", names.join(", ")),
                     primaryAction: {
@@ -1586,7 +1589,7 @@ SystemTrayIcon {
             })
         }
         var body = tr("notifications.verify-verdicts.body",
-            "They do get through over the other route and use it until the service restarts. “Move” writes them there for good; “Not now” keeps them as written and checks again after the service restarts.")
+            "They do get through over the other connection and use it until the service restarts. “Move” writes them there for good; “Not now” keeps them as written and checks again after the service restarts.")
         if (notice.more > 0) {
             body += "\n" + tr("notifications.block-notice.backlog.more", "and {count} more")
                 .replace("{count}", String(notice.more))
@@ -1600,7 +1603,7 @@ SystemTrayIcon {
             bodyText: body,
             items: items,
             listAccessibleName: tr("notifications.verify-verdicts.list",
-                "Rules and the route they would move to"),
+                "Rules and the connection they would move to"),
             primaryAction: {
                 label: tr("action.move", "Move"),
                 actionId: "verify-verdicts-move",
@@ -1705,7 +1708,7 @@ SystemTrayIcon {
             titleText: tr("tray.rules-drift.title",
                 "Your rule files differ from what is applied"),
             bodyText: tr("tray.rules-drift.body",
-                "The rules saved in your files are not the ones being applied right now. Apply the files, or open the app to see the difference."),
+                "The rules in your files are not the ones in use right now. Apply them, or open the program to see the difference."),
             items: items,
             listAccessibleName: tr("tray.rules-drift.list-accessible-name",
                 "Rule files that differ"),
@@ -2105,7 +2108,7 @@ SystemTrayIcon {
     function _blockNoticeReasonShort(reason) {
         switch (reason) {
             case "route-unavailable":
-                return tr("tray.block-notice.reason-short.route-unavailable", "Route is down")
+                return tr("tray.block-notice.reason-short.route-unavailable", "Connection is down")
             case "blocked-by-rule":
                 return tr("tray.block-notice.reason-short.blocked-by-rule", "Denied by a rule")
             case "ipv6-blocked":
@@ -2113,7 +2116,7 @@ SystemTrayIcon {
             case "dns-lockdown":
                 return tr("tray.block-notice.reason-short.dns-lockdown", "Own encrypted DNS")
             case "unattributed":
-                return tr("tray.block-notice.reason-short.unattributed", "Blocked, filter unknown")
+                return tr("tray.block-notice.reason-short.unattributed", "Blocked, reason unclear")
             default:
                 return tr("tray.block-notice.reason-short.unspecified", "Blocked")
         }
@@ -2123,8 +2126,7 @@ SystemTrayIcon {
         switch (reason) {
             case "route-unavailable":
                 return tr("tray.block-notice.reason.route-unavailable",
-                    "The route these addresses are bound to is down right now, "
-                    + "so none of them open. This is one notice for the whole route.")
+                    "The connection these addresses should go through is down right now, so none of them open. This is one notice for the whole connection.")
             case "blocked-by-rule":
                 return tr("tray.block-notice.reason.blocked-by-rule",
                     "A rule denies this address directly.")
@@ -2136,10 +2138,10 @@ SystemTrayIcon {
                 return tr("tray.block-notice.reason.dns-lockdown",
                     "This app tried to reach a public DNS resolver of its own instead of the one "
                     + "NetRuleRouter provides, and encrypted-DNS blocking closed it. "
-                    + "No rule blocked it — the switch is in Settings, under Routing.")
+                    + "No rule blocked it — the switch is in Settings, under Routing behavior.")
             case "unattributed":
                 return tr("tray.block-notice.reason.unattributed",
-                    "NetRuleRouter blocked this address, but could not identify which filter did it.")
+                    "NetRuleRouter blocked this address, but could not tell what exactly stopped it.")
             default:
                 return tr("tray.block-notice.reason.unspecified",
                     "No further detail available.")
@@ -2169,7 +2171,7 @@ SystemTrayIcon {
 
     function _blockNoticeRouteAction() {
         return {
-            label: tr("tray.block-notice.action.route-to-secondary", "To additional route"),
+            label: tr("tray.block-notice.action.route-to-secondary", "Through additional"),
             actionId: "block-notice-route",
             accent: true,
             // Changes routing — the next screen asks for a real yes/no before
@@ -2237,14 +2239,14 @@ SystemTrayIcon {
             }
             : routeIsDown
             ? {
-                label: tr("tray.block-notice.action.open-routes", "Open routes"),
+                label: tr("tray.block-notice.action.open-routes", "Open Connections"),
                 actionId: "block-notice-open-routes",
                 accent: true
             }
             : _blockNoticeRouteAction()
         var config = _blockNoticeSnoozeMuteActions({
             titleText: routeIsDown
-                ? tr("tray.block-notice.title-route-down", "Additional route is unavailable")
+                ? tr("tray.block-notice.title-route-down", "Additional connection is unavailable")
                 : tr("tray.block-notice.title", "Connection blocked"),
             bodyText: body,
             bodyRichText: true,
@@ -2398,7 +2400,7 @@ SystemTrayIcon {
                 accent: true
             }
             : {
-                label: tr("tray.block-notice.action.open-routes", "Open routes"),
+                label: tr("tray.block-notice.action.open-routes", "Open Connections"),
                 actionId: "block-notice-open-routes",
                 accent: true
             }
@@ -2408,7 +2410,7 @@ SystemTrayIcon {
         if (sharedReason !== "") bodyParts.push(_escapeMarkup(_blockNoticeReasonLine(sharedReason)))
         if (routeable) {
             bodyParts.push(tr("tray.block-notice.merged.body",
-                "Check the addresses to send over the additional route."))
+                "Tick the addresses to send through the additional connection."))
         }
         if (rows.length > listed) {
             bodyParts.push(tr("notifications.block-notice.backlog.more",
@@ -2546,9 +2548,9 @@ SystemTrayIcon {
         _offerNotice("enforcement-restored", "enforcement-restored", function() {
             var config = {
                 titleText: tray.tr("notifications.enforcement.restored.title",
-                    "Routing is working again"),
+                    "Rules are working again"),
                 bodyText: tray.tr("notifications.enforcement.restored.body",
-                    "Your rules are being applied again. Pages that were refused while the connection was down keep showing the error until you reload them — press F5 on those tabs."),
+                    "Your rules work again. Reload the pages that did not open while the connection was down — press F5 on those tabs."),
                 primaryAction: {
                     label: tray.tr("action.outage-blocks", "What was blocked"),
                     actionId: "enforcement-restored-outage-list"
@@ -2667,7 +2669,7 @@ SystemTrayIcon {
             return tr("settings.routing.doh-lockdown.label", "Block browser DoH/DoT")
         if (key === "kill-switch-strict-shared-ips")
             return tr("settings.routing.kill-switch.shared-strict-label",
-                "Strict: also block addresses shared with regular sites (may break them)")
+                "Strict: no exceptions while the additional connection is down (some ordinary sites may stop opening)")
         return tr("notifications.settings-lost.other-setting", "another routing setting")
     }
 
@@ -2797,7 +2799,7 @@ SystemTrayIcon {
             _presentPrompt({
                 titleText: tray.tr("tray.auto-rules.reload.title", "Rule applied"),
                 bodyText: tray.tr("rules.suggestions.accept.reload-page",
-                    "The rule is applied. Reload the page you were on (F5) so it picks up the new route."),
+                    "The rule is applied. Reload the page you were on (F5) so it takes effect."),
                 dismissActionId: "auto-rules-reload-dismiss",
                 autoRetireMs: tray._infoNoticeMs
             })
@@ -2843,9 +2845,9 @@ SystemTrayIcon {
             var first = pending[0] || {}
             var body = (first.allowed === true
                 ? tray.tr("notifications.local-networks.body",
-                    "{cidr} on {adapter} stays reachable while routed traffic is blocked. Keep it that way?")
+                    "{cidr} on {adapter} stays reachable while leak protection blocks traffic. Keep it that way?")
                 : tray.tr("notifications.local-networks.body-open",
-                    "Your home network's IPv6 addresses {cidr} on {adapter} are closed while routed traffic is blocked. Open them to devices on this network?"))
+                    "Your home network's IPv6 addresses {cidr} on {adapter} are closed while leak protection blocks traffic. Open them to devices on this network?"))
                 .replace("{cidr}", String(first.cidr || ""))
                 .replace("{adapter}", Pure.displayText(first.adapter))
             tray._offerNotice("local-networks", "local-networks", function() {
@@ -2872,6 +2874,30 @@ SystemTrayIcon {
         repeat: true
         triggeredOnStart: true
         onTriggered: tray._checkPendingLocalNetworks()
+    }
+
+    /// The service moved the additional connection onto the adapter the VPN
+    /// came up on; the tray names it while the window is not on screen.
+    function _onAdditionalConnectionMoved(event) {
+        var adapter = String(event["adapter-name"] || "")
+        if (adapter === "") return
+        if (!showNotifications) {
+            console.log("tray additional-moved notice: suppressed — notifications are off")
+            return
+        }
+        var presence = guiPresence ? guiPresence.read() : { windowActive: false }
+        if (presence.windowActive) return
+        tray._presentOrQueue("additional-moved", function() {
+            _presentPrompt({
+                titleText: tr("notifications.additional-moved.title",
+                    "The additional connection moved"),
+                bodyText: tr("notifications.additional-moved.body",
+                        "Your VPN came up on {adapter}, so the additional connection now uses it and your rules go through it. The choice is saved.")
+                    .replace("{adapter}", Pure.displayText(adapter)),
+                dismissActionId: "enforcement-dismiss",
+                autoRetireMs: tray._enforcementNoticeMs
+            })
+        })
     }
 
     /// The main link reported a "local" network far wider than any local
@@ -2917,9 +2943,9 @@ SystemTrayIcon {
         _offerNotice("unassigned-tunnel", "unassigned-tunnel", function() {
             _presentPrompt({
                 titleText: tr("notifications.unassigned-tunnel.title",
-                    "The additional route is not assigned"),
+                    "The additional connection is not chosen"),
                 bodyText: tr("notifications.unassigned-tunnel.body",
-                        "{adapter} is up, but no connection is assigned to the additional route — so the sites your rules send there will not open.")
+                        "{adapter} is up, but no additional connection is chosen — so the sites your rules send there will not open.")
                     .replace("{adapter}", Pure.displayText(adapter)),
                 primaryAction: {
                     label: tr("notifications.unassigned-tunnel.action", "Assign it now"),
@@ -3120,7 +3146,7 @@ SystemTrayIcon {
             _presentPrompt({
                 titleText: tr("notifications.forwarded-traffic.title", "WSL or containers are running"),
                 bodyText: tr("notifications.forwarded-traffic.body",
-                    "Choose what WSL, containers and virtual machines get when the additional route goes down. Until you choose, they are protected like this computer."),
+                    "Choose what WSL, containers and virtual machines get when the additional connection goes down. Until you choose, they are protected like this computer."),
                 primaryAction: {
                     label: tr("action.configure", "Configure"),
                     actionId: "forwarded-traffic-open-settings",
@@ -3152,9 +3178,9 @@ SystemTrayIcon {
         _presentOrQueue("rule-duplicates", function() {
             _presentPrompt({
                 titleText: tr("notifications.rule-duplicates.title",
-                    "A rule is set on both routes"),
+                    "A rule is set on both connections"),
                 bodyText: tr("notifications.rule-duplicates.body",
-                        "{count} of your rules are enabled on both routes, starting with {sample}. Which one carries the traffic is decided by evaluation order.")
+                        "{count} of your rules are enabled on both connections, starting with {sample}. Which one carries the traffic is decided by evaluation order.")
                     .replace("{count}", String(count))
                     .replace("{sample}", sample),
                 primaryAction: {
@@ -3253,7 +3279,7 @@ SystemTrayIcon {
             _presentPrompt({
                 titleText: tr("notifications.vpn-client-trust.title", "Is this your VPN?"),
                 bodyText: tr("notifications.vpn-client-trust.tray-body",
-                        "{apps} looks like a VPN client, but it is not installed in a protected program folder. Open NetRuleRouter to confirm it, or leak protection keeps blocking it while the additional route is down.")
+                        "{apps} looks like a VPN client, but it is not installed in a protected program folder. Open NetRuleRouter to confirm it, or leak protection keeps blocking it while the additional connection is down.")
                     .replace("{apps}", names.join(", ")),
                 primaryAction: {
                     label: tr("action.open-main-window", "Open NetRuleRouter"),
@@ -3412,9 +3438,9 @@ SystemTrayIcon {
             }
             _presentPrompt({
                 titleText: tr("notifications.routes-held.title",
-                    "Some addresses follow another user's route"),
+                    "Some addresses follow another user's connection"),
                 bodyText: tr("notifications.routes-held.body",
-                        "Another user signed in to this computer already routes some addresses from your rules through a different connection. Addresses affected: {count}. While that user stays signed in, these addresses follow their route, or are blocked for you if leak protection is on. Among them: {list}.")
+                        "Another user signed in to this computer already routes some addresses from your rules through a different connection. Addresses affected: {count}. While that user stays signed in, these addresses follow their connection, or are blocked for you if leak protection is on. Among them: {list}.")
                     .replace("{count}", String(count))
                     .replace("{list}", sample.join(", ")),
                 secondaryAction: tray._noticeMuteAction("routes-held"),
@@ -3455,13 +3481,13 @@ SystemTrayIcon {
             }
             var body = link !== ""
                 ? tr("notifications.traffic-carried.body",
-                    "Another user of this computer signed in earlier and sends all their traffic through the tunnel \"{link}\". This computer has one route table for everyone, so whatever your rules do not send to your additional connection goes through that tunnel too. To avoid this, sign in before that user, or ask them to send only chosen sites through their tunnel.")
+                    "Another user of this computer signed in before you and sends all their traffic through \"{link}\". On this computer that applies to everyone, so whatever your rules do not send through your additional connection goes through \"{link}\" too. To avoid this, sign in before that user, or ask them to send only chosen sites there.")
                     .replace("{link}", function() { return link })
                 : tr("notifications.traffic-carried.body-unnamed",
-                    "Another user of this computer signed in earlier and sends all their traffic through their tunnel. This computer has one route table for everyone, so whatever your rules do not send to your additional connection goes through that tunnel too. To avoid this, sign in before that user, or ask them to send only chosen sites through their tunnel.")
+                    "Another user of this computer signed in before you and sends all their traffic through their own connection (for example a VPN). On this computer that applies to everyone, so whatever your rules do not send through your additional connection goes through it too. To avoid this, sign in before that user, or ask them to send only chosen sites there.")
             _presentPrompt({
                 titleText: tr("notifications.traffic-carried.title",
-                    "Your traffic goes through another user's tunnel"),
+                    "Your traffic goes through another user's connection"),
                 bodyText: body,
                 secondaryAction: tray._noticeMuteAction("traffic-carried"),
                 dismissActionId: "enforcement-dismiss",
@@ -3490,7 +3516,7 @@ SystemTrayIcon {
                 bodyText: tr("notifications.link-keeps-dropping.body",
                     "It went down and came back several times in the last two minutes. Your rules stayed in force, but pages may have failed to load in between. Check the cable, the Wi-Fi or the VPN."),
                 primaryAction: {
-                    label: tr("notifications.enforcement.action", "Open interfaces"),
+                    label: tr("notifications.enforcement.action", "Open Connections"),
                     actionId: "enforcement-open-interfaces",
                     accent: true
                 },
@@ -3595,12 +3621,12 @@ SystemTrayIcon {
                     "Confirm your main connection: {name}")
                 .replace("{name}", Pure.displayText(suggestedPrimary))
             body = tr("notifications.enforcement.no-policy.suggest-body",
-                "Nothing is routed until you confirm it. Rules for the additional connection wait until you choose one.")
+                "Your rules do not work until you confirm it. Rules for the additional connection wait until you choose one.")
         } else if (status === "no-policy") {
             title = tr("notifications.enforcement.no-policy.title",
                 "Connections are not chosen yet")
             body = tr("notifications.enforcement.no-policy.body",
-                "The service has no routing settings for you yet, so nothing is being routed. Choose the main and additional connections.")
+                "Your connections are not chosen yet, so your rules are not working. Choose the main and additional connections.")
         } else if (status === "secondary-down") {
             // The service reports which role went down; before this the primary
             // going down was announced as "the additional connection is not up".
@@ -3629,14 +3655,14 @@ SystemTrayIcon {
             title = tr("notifications.enforcement.unknown.title",
                 "Your rules are not being applied")
             body = tr("notifications.enforcement.unknown.body",
-                "The service reported a state this version does not recognise. Open interfaces and routes to check the setup.")
+                "The service reported a state this version does not recognise. Open Connections to check the setup.")
         }
         // Keyed by role, not by "enforcement-status" alone: a missing primary
         // and a downed secondary are two questions, and the newer one must not
         // silently replace the older in the queue.
         var queueKind = "enforcement-status:" + role
         var openInterfaces = {
-            label: tr("notifications.enforcement.action", "Open interfaces"),
+            label: tr("notifications.enforcement.action", "Open Connections"),
             actionId: "enforcement-open-interfaces",
             accent: true
         }
@@ -3735,15 +3761,15 @@ SystemTrayIcon {
         _presentPrompt({
             titleText: targets.length === 1
                 ? tr("tray.block-notice.route-confirm.title",
-                    "Route {name} via the additional link?")
+                    "Send {name} through the additional connection (e.g. VPN)?")
                     .replace("{name}", hideBlockNoticeAddresses
                         ? tr("notifications.block-notice.destination-hidden", "a hidden destination")
                         : Pure.displayText(targets[0]))
                 : tr("tray.block-notice.route-confirm.title-many",
-                    "Route {count} addresses via the additional link?")
+                    "Send {count} addresses through the additional connection (e.g. VPN)?")
                     .replace("{count}", String(targets.length)),
             bodyText: tr("tray.block-notice.route-confirm.body",
-                "Adds a rule that sends this address over the additional route from now on. You can undo it later in Rules."),
+                "Adds a rule that sends this address over the additional connection from now on. You can undo it later in Rules."),
             primaryAction: {
                 label: tr("action.confirm", "Confirm"),
                 actionId: "block-notice-route-confirm",
@@ -3890,7 +3916,7 @@ SystemTrayIcon {
     function _blockNoticeMuteReasonLabel(reason) {
         switch (reason) {
             case "route-unavailable":
-                return tr("block-reason.route-unavailable", "Route outages")
+                return tr("block-reason.route-unavailable", "Connection outages")
             case "blocked-by-rule":
                 return tr("block-reason.blocked-by-rule", "Denied by rules")
             case "ipv6-blocked":
@@ -4536,7 +4562,7 @@ SystemTrayIcon {
             titleText: tr("tray.auto-rules-mode-confirm.title",
                 "Turn on “Apply automatically”?"),
             bodyText: tr("tray.auto-rules-mode-confirm.body",
-                "From now on NetRuleRouter will add suggested addresses to your rules files by itself, without asking. You can undo this anytime in Settings → Routing, by switching back to “Suggest only”."),
+                "From now on NetRuleRouter will add suggested addresses to your rules files by itself, without asking. You can undo this anytime in Settings → Routing behavior, by switching back to “Suggest only”."),
             primaryAction: {
                 label: tr("tray.auto-rules-mode-confirm.confirm", "Turn on"),
                 actionId: "auto-rules-mode-confirm",
@@ -4830,7 +4856,7 @@ SystemTrayIcon {
             : tr("dialog.unroutable-secondary.adapter-line", "Adapter: {name}")
                     .replace("{name}", Pure.adapterDisplayName(row || {}))
                 + "\n" + tr("dialog.unroutable-secondary.body-kill-switch",
-                    "It is currently assigned as your additional route.")
+                    "It is currently chosen as your additional connection.")
                 + " " + (Pure.unroutableInterfaceReasonSlug(row) === "virtual-host-only"
                     ? tr("dialog.unroutable-secondary.reason-virtual-host-only",
                         "It looks like a host-only virtual adapter (VirtualBox, VMware or Hyper-V internal) and it has no gateway, so it has no way out to the network.")
@@ -5041,7 +5067,7 @@ SystemTrayIcon {
             _presentPrompt({
                 titleText: tr("tray.pause.title", "Turn off rules"),
                 bodyText: tr("tray.pause.body",
-                    "Your routing and leak protection stop for the time you choose and come back on their own."),
+                    "Your rules and leak protection stop for the time you choose and come back on their own."),
                 primaryAction: {
                     label: tr("dialog.safe-disable.term.fifteen-minutes", "In 15 minutes"),
                     actionId: "pause-term-fifteen-minutes",
@@ -5159,6 +5185,15 @@ SystemTrayIcon {
     function actionEnabled(actionId, fallbackEnabled) {
         var action = actionById(actionId)
         return action ? !!action.enabled : fallbackEnabled
+    }
+
+    /// Diagnostics in the main window, at the security alert that refused a change.
+    function openSecurityAlerts() {
+        if (typeof nrrNativeBridge !== "undefined" && nrrNativeBridge
+                && typeof nrrNativeBridge.openMainGuiFocused === "function")
+            nrrNativeBridge.openMainGuiFocused("diagnostics", "security-alerts", "{}")
+        else
+            triggerAction("diagnostics")
     }
 
     function triggerAction(actionId) {
@@ -5280,7 +5315,7 @@ SystemTrayIcon {
             return tr("tray.tooltip.service-unknown", "Cannot read service status")
         if (_contractSkew !== "")
             return tr("tray.tooltip.contract-skew",
-                "App and service builds differ — changes are off")
+                "Program and service versions differ — rules cannot be changed for now")
         // The service runs. Whether anything is being applied is a separate
         // question, and answering it wrongly is what sent a user looking for a
         // connection problem that did not exist.
@@ -5289,16 +5324,16 @@ SystemTrayIcon {
         // for a second on every launch teaches the user to ignore it.
         if (!_traySubscribed && _lastSubscribeFailureCode !== "")
             return tr("tray.tooltip.no-updates",
-                "The service is running, but this app is not receiving updates from it")
+                "The service is running, but the program is not getting news from it")
         if (routingPaused)
             return tr("routing.status.tray-tooltip-paused",
                 "Rules disabled — click to enable")
         if (_enforcementKnown && !_enforcementActive)
             return tr("tray.tooltip.no-rules-applied",
-                "NetRuleRouter — no rules are being applied yet")
+                "NetRuleRouter — your rules are not working yet")
         if (_enforcementKnown && _enforcementActive)
             return tr("tray.tooltip.rules-applied",
-                "NetRuleRouter — your rules are being applied")
+                "NetRuleRouter — your rules are working")
         return tr("tray.tooltip.service-running", "NetRuleRouter — Service running")
     }
 
@@ -5602,7 +5637,7 @@ SystemTrayIcon {
         MenuItem {
             visible: tray._externalPrimary !== ""
             text: tray._externalRouteLine(
-                tray.tr("tray.external.main-route", "Main route"),
+                tray.tr("tray.external.main-route", "Main connection"),
                 tray._externalPrimary,
                 tray._externalPrimaryCachedAtMs)
             onTriggered: tray._takeExternalAddresses()
@@ -5610,7 +5645,7 @@ SystemTrayIcon {
         MenuItem {
             visible: tray._externalSecondary !== ""
             text: tray._externalRouteLine(
-                tray.tr("tray.external.additional-route", "Additional route"),
+                tray.tr("tray.external.additional-route", "Additional connection"),
                 tray._externalSecondary,
                 tray._externalSecondaryCachedAtMs)
             onTriggered: tray._takeExternalAddresses()
@@ -5681,7 +5716,7 @@ SystemTrayIcon {
         MenuSeparator {}
         MenuItem {
             text: tray.routingPaused
-                ? tr("action.resume-rules", "Enable rules")
+                ? tr("action.resume-rules", "Turn rules on")
                     + (tray._pauseLeftText() !== "" ? " (" + tray._pauseLeftText() + ")" : "")
                 : tr("tray.menu.pause-rules", "Turn off rules…")
             enabled: true

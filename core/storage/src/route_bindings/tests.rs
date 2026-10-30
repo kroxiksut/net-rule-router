@@ -186,7 +186,7 @@ fn sample_record(source: BindingSource) -> RoutePolicyRecord {
             known_stable_ids: vec!["TAP".into()],
         }),
         mode: BehaviorMode::PreferSecondaryWhenAvailable,
-        // Non-default (default is off) — proves the column round-trips.
+        // Non-default (default is routed sites) — proves the column round-trips.
         leak_protection: LeakProtection::Everything,
         // Non-default (default is all = 127) so the round-trip test proves
         // the v16 column persists rather than reading the default.
@@ -838,5 +838,38 @@ fn block_policy_defaults_match_the_gui_declaration() {
         diverged.is_empty(),
         "storage defaults and apps/desktop/qml/lib/pure.js disagree: {}",
         diverged.join("; ")
+    );
+}
+
+/// Leak protection is on for whoever never chose, and an upgrade never turns
+/// it on over a stored "off": that row is the only trace of a user who
+/// switched it off, so it is never rewritten.
+#[test]
+fn an_upgrade_keeps_a_stored_off_and_starts_everyone_else_protected() {
+    let (dir, conn) = fresh_db();
+    let mut chose_off = sample_record(BindingSource::UserAssigned);
+    chose_off.leak_protection = LeakProtection::Off;
+    RouteBindingsRepository::new(&conn)
+        .update_for_sid("S-1-5-21-OFF", &chose_off, 1_700_000_000)
+        .expect("write");
+    drop(conn);
+
+    let path = dir.path().join("nrr_service_state.db");
+    let runner = SqliteMigrationRunner::for_state_db(open_connection(&path).expect("reopen"));
+    runner.run_pending_migrations().expect("upgrade");
+    let conn = runner.into_connection();
+    let repo = RouteBindingsRepository::new(&conn);
+
+    assert_eq!(
+        repo.load_for_sid("S-1-5-21-OFF")
+            .expect("load")
+            .leak_protection,
+        LeakProtection::Off
+    );
+    assert_eq!(
+        repo.load_for_sid("S-1-5-21-NEW")
+            .expect("load")
+            .leak_protection,
+        LeakProtection::Sites
     );
 }

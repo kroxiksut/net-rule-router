@@ -118,6 +118,8 @@ SolidCompression=yes
 CloseApplications=yes
 RestartApplications=no
 SetupLogging=yes
+; A removal that went wrong is diagnosed from its own log in %TEMP%.
+UninstallLogging=yes
 ; {userprograms} is used only when Setup runs as the person who started it:
 ; see SetupRunsAsStarter.
 UsedUserAreasWarning=no
@@ -132,6 +134,13 @@ Name: "russian"; MessagesFile: "compiler:Languages\Russian.isl"; LicenseFile: "{
 [Messages]
 english.ConfirmUninstall=Remove %1 from this computer?
 russian.ConfirmUninstall=Удалить %1 с этого компьютера?
+; Inno's own last words claimed a complete removal after "Remove the program",
+; which keeps the rules. The box cannot tell the two choices apart, so its
+; text holds for both.
+english.UninstalledAll=%1 is removed from this computer. Unless you chose to remove it completely, your rules and settings are kept and come back when you install it again.
+russian.UninstalledAll=%1 удалена с этого компьютера. Если вы не выбрали полное удаление, ваши правила и настройки сохранены и вернутся при следующей установке.
+english.UninstalledMost=%1 is removed, but some of its files could not be deleted; you can delete them yourself. Unless you chose to remove it completely, your rules and settings are kept.
+russian.UninstalledMost=%1 удалена, но часть её файлов удалить не удалось; их можно удалить самостоятельно. Если вы не выбрали полное удаление, ваши правила и настройки сохранены.
 
 [CustomMessages]
 english.LaunchApp=Start NetRuleRouter
@@ -202,6 +211,24 @@ english.InstallForOnlyMeUnavailable=Setup is running under the administrator acc
 russian.InstallForOnlyMeUnavailable=Установка выполняется от имени учётной записи администратора, который её подтвердил, а не от вашей, поэтому ярлык можно добавить только для всех пользователей.
 english.InstallForInvalid=/INSTALL_FOR=%1 is not understood: use all or me. Nothing was installed.
 russian.InstallForInvalid=Значение /INSTALL_FOR=%1 не распознано: укажите all или me. Ничего не установлено.
+english.StatusCheckFiles=Checking the files given to Setup...
+russian.StatusCheckFiles=Проверяем файлы, переданные установке...
+english.StatusCloseApps=Closing the NetRuleRouter window and tray icon...
+russian.StatusCloseApps=Закрываем окно и значок NetRuleRouter в трее...
+english.StatusStopService=Stopping the background service...
+russian.StatusStopService=Останавливаем фоновую службу...
+english.StatusProvision=Handing the given rule files to the background service...
+russian.StatusProvision=Передаём фоновой службе указанные файлы правил...
+english.StatusRegister=Registering and starting the background service...
+russian.StatusRegister=Регистрируем и запускаем фоновую службу...
+english.StatusConsoleLinks=Adding the console tools...
+russian.StatusConsoleLinks=Добавляем консольные инструменты...
+english.UninstallStatusKeep=Removing the background service and restoring the network settings; your rules and settings stay...
+russian.UninstallStatusKeep=Удаляем фоновую службу и возвращаем сетевые настройки; правила и настройки сохраняются...
+english.UninstallStatusComplete=Removing the background service, restoring the network settings and erasing the data...
+russian.UninstallStatusComplete=Удаляем фоновую службу, возвращаем сетевые настройки и стираем данные...
+english.ShowSetupLog=Show the installation &log
+russian.ShowSetupLog=Показать &журнал установки
 
 ; One type, so the page shows only the list.
 [Types]
@@ -383,6 +410,48 @@ begin
     '|settings=' + SetupParam('PROVISION_SETTINGS') + '|secondary-unset=' + SetupParam('SECONDARY_UNSET');
 end;
 
+function ActionLog(): String;
+begin
+  Result := ExpandConstant('{%TEMP}\NetRuleRouter-setup.log');
+end;
+
+{ A line of ours in the steps' log: the uninstaller started as unins000.exe
+  gets no /LOG and writes no log of its own. }
+procedure NoteInActionLog(const Text: String);
+begin
+  Log(Text);
+  SaveStringToFile(ActionLog(), GetDateTimeString('yyyy/mm/dd hh:nn:ss', '-', ':') + ' ' + Text + #13#10, True);
+end;
+
+{ What the next step does, where the person is looking: the preparing page
+  before the files are copied, the progress page after them, the
+  uninstaller's own form. A silent run shows none of them. }
+procedure ShowStatus(const Name: String);
+var
+  Text: String;
+begin
+  Text := CustomMessage(Name);
+  Log('Status: ' + Text);
+  if IsUninstaller() then
+  begin
+    UninstallProgressForm.StatusLabel.Caption := Text;
+    UninstallProgressForm.StatusLabel.Refresh;
+  end
+  else if WizardForm.CurPageID = wpPreparing then
+  begin
+    WizardForm.PreparingLabel.Caption := Text;
+    WizardForm.PreparingLabel.Visible := True;
+    WizardForm.PreparingLabel.Refresh;
+  end
+  else
+  begin
+    WizardForm.StatusLabel.Caption := Text;
+    WizardForm.FilenameLabel.Caption := '';
+    WizardForm.StatusLabel.Refresh;
+    WizardForm.FilenameLabel.Refresh;
+  end;
+end;
+
 { Checked by the service binary itself, before a single file is replaced. }
 function CheckProvisioning(): Integer;
 var
@@ -391,6 +460,7 @@ begin
   Result := 0;
   if not HasProvisioning() then
     Exit;
+  ShowStatus('StatusCheckFiles');
   ExtractTemporaryFile('nrr-service.exe');
   ExtractTemporaryFile('vcruntime140.dll');
 #ifdef HasVcRuntime1
@@ -405,11 +475,6 @@ begin
   end;
   Log(Format('nrr-service provision-check: exit %d', [Code]));
   Result := Code;
-end;
-
-function ActionLog(): String;
-begin
-  Result := ExpandConstant('{%TEMP}\NetRuleRouter-setup.log');
 end;
 
 { Runs setup-actions.ps1 hidden; its exit code, or -1 when it could not start. }
@@ -534,11 +599,18 @@ begin
   ExtractTemporaryFile('service-paths.ps1');
   { Before Restart Manager looks: it cannot close the windowless launchers. }
   if DirExists(ExpandConstant('{app}')) then
+  begin
+    ShowStatus('StatusCloseApps');
     RunAction(ExpandConstant('{tmp}\setup-actions.ps1'),
       '-Action CloseApps -Folder "' + ExpandConstant('{app}') + '"');
+  end;
   ServiceStoppedBySetup := True;
+  ShowStatus('StatusStopService');
   if RunAction(ExpandConstant('{tmp}\setup-actions.ps1'), '-Action Stop') <> 0 then
     Result := CustomMessage('ServiceStopFailed');
+  { A refusal replaces the status with its own text; success leaves the page bare. }
+  if Result = '' then
+    WizardForm.PreparingLabel.Visible := False;
 end;
 
 { A Setup that stopped the service and ends without installing (cancelled,
@@ -558,6 +630,7 @@ begin
   { Staged before the service starts, so its first start applies them. }
   if HasProvisioning() then
   begin
+    ShowStatus('StatusProvision');
     ProvisionExitCode := RunAction(ExpandConstant('{app}\scripts\setup-actions.ps1'),
       '-Action Provision -ProvisionSpec "' + ProvisionSpec() + '"');
     if ProvisionExitCode <> 0 then
@@ -565,6 +638,7 @@ begin
       SuppressibleMsgBox(FmtMessage(CustomMessage('ProvisionNotStaged'), [
         IntToStr(ProvisionExitCode), ActionLog()]), mbError, MB_OK, IDOK);
   end;
+  ShowStatus('StatusRegister');
   RegisterFailed := RunAction(ExpandConstant('{app}\scripts\setup-actions.ps1'), '-Action Register') <> 0;
   ServiceStoppedBySetup := False;
   if RegisterFailed then
@@ -696,7 +770,8 @@ end;
 { Before any file is deleted: the steps need the console and the scripts. }
 procedure CurUninstallStepChanged(CurUninstallStep: TUninstallStep);
 var
-  Arguments: String;
+  Arguments, Status: String;
+  Code: Integer;
 begin
   if CurUninstallStep = usPostUninstall then
   begin
@@ -706,18 +781,32 @@ begin
     { Also when the installation that wrote it was not the last one. }
     RegDeleteKeyIncludingSubkeys(HKLM64, 'SOFTWARE\NetRuleRouter\Agreement');
     RegDeleteKeyIfEmpty(HKLM64, 'SOFTWARE\NetRuleRouter');
+    NoteInActionLog('removal: program files, PATH entries and the agreement record removed; done');
     Exit;
   end;
   if CurUninstallStep <> usUninstall then
     Exit;
+  { A line of [Code] must not start with "[": Inno reads it as a section tag. }
+  NoteInActionLog(Format('removal started by %s (erase data: %d, erase audit trail: %d)', [
+    ExpandConstant('{uninstallexe}'), Ord(RemoveData), Ord(RemoveAudit)]));
+  { Inno's own text comes back once our steps are done. }
+  Status := UninstallProgressForm.StatusLabel.Caption;
   { Every session's window, tray and console tools, before their files go. }
+  ShowStatus('StatusCloseApps');
   RunAction(ExpandConstant('{app}\scripts\setup-actions.ps1'), '-Action CloseApps');
   Arguments := '-Action Unregister';
   if RemoveData then
     Arguments := Arguments + ' -RemoveData';
   if RemoveAudit then
     Arguments := Arguments + ' -RemoveAudit';
-  case RunAction(ExpandConstant('{app}\scripts\setup-actions.ps1'), Arguments) of
+  if RemoveData then
+    ShowStatus('UninstallStatusComplete')
+  else
+    ShowStatus('UninstallStatusKeep');
+  Code := RunAction(ExpandConstant('{app}\scripts\setup-actions.ps1'), Arguments);
+  NoteInActionLog(Format('removal: service and data steps ended with %d; removing the program files', [Code]));
+  UninstallProgressForm.StatusLabel.Caption := Status;
+  case Code of
     0: ;
     2: SuppressibleMsgBox(FmtMessage(CustomMessage('UninstallOthersLeft'), [ActionLog()]),
          mbInformation, MB_OK, IDOK);
@@ -744,28 +833,27 @@ begin
       mbError, MB_OK, IDOK);
 end;
 
-#if Variant == "full"
 const
-  ShortcutFileName = 'NetRuleRouter.lnk';
   StarterProbeKey = 'Software\NetRuleRouter\SetupProbe';
 
 var
-  InstallForPage: TInputOptionWizardPage;
-  { 'all' or 'me', settled when the installation starts. }
-  InstallFor: String;
-  { The per-user shortcuts this installation leaves in place, '' for none. }
-  OwnShortcut, OwnDesktop: String;
-  KeepEarlierShortcut: Boolean;
+  StarterAsked, StarterIsSetupAccount: Boolean;
 
 { Elevated with another account's credentials, Setup runs as that administrator
   and the per-user Programs folder is theirs. A value Setup writes to its own
   HKCU is seen by a process of the person who started Setup only when both share
-  one hive. }
+  one hive. Asked once. }
 function SetupRunsAsStarter(): Boolean;
 var
   Probe: String;
   Code: Integer;
 begin
+  if StarterAsked then
+  begin
+    Result := StarterIsSetupAccount;
+    Exit;
+  end;
+  StarterAsked := True;
   Result := False;
   Probe := 'Probe' + GetDateTimeString('hhnnsszzz', '-', ':') + IntToStr(Random(1000000));
   if not RegWriteStringValue(HKCU, StarterProbeKey, Probe, '') then
@@ -779,8 +867,75 @@ begin
   end;
   RegDeleteKeyIncludingSubkeys(HKCU, StarterProbeKey);
   RegDeleteKeyIfEmpty(HKCU, 'Software\NetRuleRouter');
+  StarterIsSetupAccount := Result;
   Log(Format('Setup runs as the account that started it: %d', [Ord(Result)]));
 end;
+
+var
+  LogButton: TNewButton;
+
+{ As the person who started Setup: an elevated editor's file dialogs would run
+  anything with administrator rights. }
+procedure OpenSetupLogs();
+var
+  Logs: array[0..1] of String;
+  I, Code: Integer;
+begin
+  Logs[0] := ExpandConstant('{log}');
+  Logs[1] := ActionLog();
+  for I := 0 to 1 do
+    if (Logs[I] <> '') and FileExists(Logs[I]) then
+      try
+        if not ShellExecAsOriginalUser('', ExpandConstant('{win}\notepad.exe'), AddQuotes(Logs[I]), '',
+            SW_SHOWNORMAL, ewNoWait, Code) then
+          Log('the log was not opened: ' + SysErrorMessage(Code));
+      except
+        Log('the log was not opened: ' + GetExceptionMessage());
+      end;
+end;
+
+procedure OpenSetupLogsClick(Sender: TObject);
+begin
+  OpenSetupLogs();
+end;
+
+{ Under whatever the finished page shows. Only when Setup runs as the person
+  who started it: the logs lie in that account's %TEMP%, which no other
+  account's editor may read. }
+procedure AddLogButton();
+begin
+  if (LogButton <> nil) or WizardSilent() or not SetupRunsAsStarter() then
+    Exit;
+  LogButton := TNewButton.Create(WizardForm);
+  LogButton.Parent := WizardForm.FinishedPage;
+  LogButton.Caption := CustomMessage('ShowSetupLog');
+  LogButton.Width := WizardForm.CalculateButtonWidth([LogButton.Caption]);
+  LogButton.Height := WizardForm.NextButton.Height;
+  LogButton.Left := WizardForm.FinishedLabel.Left;
+  LogButton.Top := WizardForm.FinishedPage.ClientHeight - LogButton.Height - ScaleY(12);
+  LogButton.OnClick := @OpenSetupLogsClick;
+  { The list of things to start runs down to the page's bottom edge. }
+  if LogButton.Top - ScaleY(8) > WizardForm.RunList.Top then
+    WizardForm.RunList.Height := LogButton.Top - ScaleY(8) - WizardForm.RunList.Top;
+end;
+
+procedure CurPageChanged(CurPageID: Integer);
+begin
+  if CurPageID = wpFinished then
+    AddLogButton();
+end;
+
+#if Variant == "full"
+const
+  ShortcutFileName = 'NetRuleRouter.lnk';
+
+var
+  InstallForPage: TInputOptionWizardPage;
+  { 'all' or 'me', settled when the installation starts. }
+  InstallFor: String;
+  { The per-user shortcuts this installation leaves in place, '' for none. }
+  OwnShortcut, OwnDesktop: String;
+  KeepEarlierShortcut: Boolean;
 
 { A silent Setup has no one else to ask about: "me" is the account it runs as. }
 <event('InitializeWizard')>
@@ -915,6 +1070,7 @@ begin
   Wanted := WizardIsTaskSelected('addtopath');
   { Links always: the app's own "add to PATH" setting registers bin too. }
   Arguments := '-Action ConsoleLinks -Links';
+  ShowStatus('StatusConsoleLinks');
   if RunAction(ExpandConstant('{app}\scripts\setup-actions.ps1'), Arguments) <> 0 then
     Log('the console links in ' + ConsoleBin() + ' are incomplete');
   EditPath(HKLM, MachineEnvironmentKey, ConsoleBin(), Wanted and not PathForMe());

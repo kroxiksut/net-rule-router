@@ -23,6 +23,10 @@ QtObject {
     readonly property color colorDanger: isHighContrast ? "#ff6b6b" : isDark ? "#ff6b6b" : "#c92a2a"
     readonly property color colorSuccess: isHighContrast ? "#9be58f" : isDark ? "#4cc38a" : "#23744a"
     readonly property color colorOnAccent: isHighContrast ? "#000000" : isDark ? "#0b1020" : "#ffffff"
+    // The logo's purple: only the ring round a focused button or list,
+    // lighter in the dark theme, the contrast theme's own accent there.
+    readonly property color colorBrand: isHighContrast ? "#ffd24d" : isDark ? "#9b6cf0" : "#783ade"
+    readonly property color colorButtonOutline: colorBrand
     readonly property color colorFocusRing: isHighContrast ? "#ffd24d" : colorAccent
     readonly property color colorSelection: isHighContrast ? "#ffd24d" : Qt.tint(colorBase, Qt.rgba(colorAccent.r, colorAccent.g, colorAccent.b, 0.35))
 
@@ -71,10 +75,11 @@ QtObject {
     readonly property color stateDefaultBorder: colorBorder
     readonly property color stateFocusedBorder: colorFocusRing
     // On a control filled with the accent (or the danger colour) the accent
-    // ring has nothing to stand out against: the outer ring in the text colour
-    // shows against the panel, the inner one in the on-accent colour against
-    // the fill (white on the contrast theme's yellow read at 1.4:1).
-    readonly property color stateFocusedBorderOnFill: colorText
+    // ring has nothing to stand out against: the outer ring in the brand
+    // colour (white on the contrast theme) shows against the panel, the inner
+    // one in the on-accent colour against the fill (white on the contrast
+    // theme's yellow read at 1.4:1).
+    readonly property color stateFocusedBorderOnFill: isHighContrast ? "#ffffff" : colorButtonOutline
     readonly property color stateFocusedInnerOnFill: colorOnAccent
     readonly property color stateDisabledBorder: Qt.rgba(colorBorder.r, colorBorder.g, colorBorder.b, 0.55)
     readonly property color stateSelectedBorder: colorAccent

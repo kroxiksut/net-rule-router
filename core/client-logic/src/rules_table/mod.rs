@@ -302,3 +302,52 @@ impl RuleRow {
         )
     }
 }
+
+/// What merging an imported set into the user's rows changes
+/// ([`import_merge_plan`]).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ImportMergePlan {
+    /// Imported rows to append, by index, in order.
+    pub add: Vec<usize>,
+    /// Own rows whose `?` drops: the set names them plainly.
+    pub plain: Vec<usize>,
+    /// Appended rows whose `?` drops for a later plain copy in the set.
+    pub plain_added: Vec<usize>,
+}
+
+/// A set merged into the user's rules (`importMergePlan`): every own row
+/// stays, and an imported row is added unless one with its
+/// [`RuleRow::merge_key`] is there. `?x` and `x` on one route are one rule and
+/// the plain one wins.
+pub fn import_merge_plan(existing: &[RuleRow], imported: &[RuleRow]) -> ImportMergePlan {
+    enum Seen {
+        Own(usize),
+        Added(usize),
+    }
+    let mut seen: std::collections::HashMap<String, Seen> = existing
+        .iter()
+        .enumerate()
+        .map(|(at, row)| (row.merge_key(), Seen::Own(at)))
+        .collect();
+    let mut plan = ImportMergePlan::default();
+    for (at, row) in imported.iter().enumerate() {
+        match seen.get(&row.merge_key()) {
+            None => {
+                plan.add.push(at);
+                seen.insert(row.merge_key(), Seen::Added(at));
+            }
+            Some(_) if row.is_verify() => {}
+            Some(Seen::Own(own)) => {
+                if existing[*own].is_verify() && !plan.plain.contains(own) {
+                    plan.plain.push(*own);
+                }
+            }
+            Some(Seen::Added(added)) => {
+                if imported[*added].is_verify() && !plan.plain_added.contains(added) {
+                    plan.plain_added.push(*added);
+                }
+            }
+        }
+    }
+    plan
+}

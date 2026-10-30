@@ -11,7 +11,7 @@ import "../lib/rules.js" as Rules
 // `property alias ruleDialog`, the overlays array, and the RulesSection calls
 // through `root.ruleDialog.{resetForEdit,open}` — is
 // unchanged. All shared state (models, theme, window helpers such as
-// `saveRule`, `ruleTypeLabel`, `routeRoleOptions`, `comboPopupWidth`,
+// `saveRule`, `ruleTypeLabel`, `ruleTypeChoiceLabel`, `routeRoleOptions`, `comboPopupWidth`,
 // `_punycodeFor`, `platformProfile`) comes in through `root` (the
 // ApplicationWindow). The dialog's own fields and validators stay local.
 Dialog {
@@ -761,7 +761,7 @@ Dialog {
             : root.tr("dialog.rule.bulk.type-unknown", "Type not known")]
         parts.push(row.route === "block" ? root.tr("label.block", "Denied") : root.routeLabel(row.route))
         if (!row.enabled) parts.push(root.tr("label.disabled", "disabled"))
-        if (row.verify) parts.push(root.tr("rules.filter.route.unsure", "Unsure (?)"))
+        if (row.verify) parts.push(root.tr("rules.filter.route.unsure", "Checking"))
         var status = row.status === "ok" && row.action === "add"
             ? root.tr("dialog.rule.bulk.will-add", "will be added")
             : verdictMessage(row.key, _bulkArgs(row), row.status === "error"
@@ -772,9 +772,9 @@ Dialog {
     function bulkMoveText(row) {
         if (row.route === "block") return root.tr("tray.add-rule.deny-instead", "Deny instead")
         if (row.otherRoute === "block") {
-            return root.tr("tray.add-rule.lift-deny", "Lift the deny, use this route")
+            return root.tr("tray.add-rule.lift-deny", "Lift the deny, use this connection")
         }
-        return root.tr("tray.add-rule.move", "Move to this route")
+        return root.tr("tray.add-rule.move", "Move to this connection")
     }
     function bulkSummaryText() {
         var p = bulkPlan
@@ -923,10 +923,10 @@ Dialog {
                 model: root.ruleTypesModel
                 textRole: "id"
                 valueRole: "id"
-                labelResolver: function(item) { return item ? root.ruleTypeLabel(item.id) : "" }
+                labelResolver: function(item) { return item ? root.ruleTypeChoiceLabel(item.id) : "" }
                 displayText: root.uiRevision >= 0 && currentIndex >= 0 && currentIndex < root.ruleTypesModel.count
-                    ? root.ruleTypeLabel(root.ruleTypesModel.get(currentIndex).id) : ""
-                popup.width: root.comboPopupWidth(ruleTypeCombo, root.ruleTypesModel, "id", function(item) { return root.ruleTypeLabel(item.id) })
+                    ? root.ruleTypeChoiceLabel(root.ruleTypesModel.get(currentIndex).id) : ""
+                popup.width: root.comboPopupWidth(ruleTypeCombo, root.ruleTypesModel, "id", function(item) { return root.ruleTypeChoiceLabel(item.id) })
                 onActivated: ruleDialog.localRuleType = root.ruleTypesModel.get(currentIndex).id
                 // All rule types are selectable. `application` routes the app's
                 // OBSERVED destinations via the secondary (app-routing via
@@ -942,7 +942,7 @@ Dialog {
                     contentItem: Text {
                         leftPadding: root.uiTheme.spacingSm
                         rightPadding: root.uiTheme.spacingSm
-                        text: root.ruleTypeLabel(model.id)
+                        text: root.ruleTypeChoiceLabel(model.id)
                         color: !enabled
                                    ? Qt.rgba(root.uiTheme.colorText.r, root.uiTheme.colorText.g,
                                              root.uiTheme.colorText.b, 0.45)
@@ -1234,7 +1234,7 @@ Dialog {
                         ? root.tr("rules.application-routing-note-linux",
                             "Routes everything this program connects to through the additional connection. NetRuleRouter learns the program's destinations by watching its connections, so routing fills in as it connects. Enter the process name, e.g. browser.")
                         : root.tr("rules.application-routing-note",
-                            "Routes everything this app connects to through the additional adapter. NetRuleRouter learns the app's destinations by watching its connections, so routing fills in as the app connects — enable «Connection observation» in Settings → Diagnostics for this to work. Enter the executable name, e.g. chrome.exe."))
+                            "Sends everything this program connects to through the additional connection. NetRuleRouter learns where the program goes as it connects, so the rule fills in over time. Enter the program's file name, e.g. chrome.exe."))
                     : ""
             }
             // Where a per-application block is not leak-proof, say so next to the
@@ -1400,7 +1400,7 @@ Dialog {
             Label {
                 Layout.fillWidth: true
                 wrapMode: Text.Wrap
-                text: root.tr("label.target-route", "Target route")
+                text: root.tr("label.target-route", "Connection")
                 color: root.textColor
             }
             ThemedComboBox {
@@ -1422,7 +1422,7 @@ Dialog {
                 popup.width: root.comboPopupWidth(routeTargetCombo, model, "",
                     function(item) { return routeTargetCombo._spoken(item) })
                 Accessible.name: root.uiRevision >= 0
-                    ? root.tr("label.target-route", "Target route") + ": "
+                    ? root.tr("label.target-route", "Connection") + ": "
                         + routeTargetCombo._spoken(routeTargetCombo._current)
                     : ""
                 Accessible.description: ""
@@ -1470,12 +1470,12 @@ Dialog {
                             "A site in every zone is not checked: the check needs one host.")
                         : ruleDialog.verifyDroppedForIpv6
                         ? root.tr("dialog.rule.verify-ipv6",
-                            "An IPv6 address is not checked: the check goes out over IPv4 only, so this stays an ordinary route rule.")
+                            "An IPv6 address is not checked: the check goes out over IPv4 only, so this stays an ordinary rule.")
                         : ruleDialog.verifyRefusedByDeny
                         ? root.tr("dialog.rule.verify-deny",
                             "A denied rule is not checked: its traffic goes through no connection.")
                         : root.tr("dialog.rule.verify-hint",
-                            "Works through the route it is written for. If the site or address does not open there but does on the other route, NetRuleRouter offers to move the rule."))
+                            "Works through the connection it is written for. If the site or address does not open there but does through the other connection, NetRuleRouter offers to move the rule."))
                     : ""
                 Accessible.role: Accessible.StaticText
                 Accessible.name: text
@@ -1543,8 +1543,8 @@ Dialog {
                     checked: ruleDialog.localEnabled
                     onToggled: ruleDialog.localEnabled = checked
                     text: ruleDialog.localEnabled
-                        ? root.tr("dialog.rule.enabled-on", "Rule is enabled (applied to routing)")
-                        : root.tr("dialog.rule.enabled-off", "Rule is disabled (kept in the file, not applied)")
+                        ? root.tr("dialog.rule.enabled-on", "Rule is on")
+                        : root.tr("dialog.rule.enabled-off", "Rule is off (kept, but not in use)")
                     Accessible.role: Accessible.CheckBox
                     Accessible.name: text
                 }
@@ -1570,8 +1570,7 @@ Dialog {
                     if (val === "") return ""
                     if (Pure.isPublicSuffixValue(val)) {
                         return root.tr("rules.value.public-suffix-warning",
-                            "{value} is a public registry, not one service: the rule would "
-                            + "route unrelated owners. Use a zone rule if that is what you want.")
+                            "{value} is a shared zone, not one service: the rule would take in sites of other owners. Use the type “Zone” if that is what you want.")
                             .replace("{value}", val)
                     }
                     // A plain domain rule already says how far it reaches, in the

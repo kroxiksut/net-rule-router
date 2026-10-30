@@ -2,7 +2,7 @@
 # name: Vietnam Default Split - Secondary Route
 # description: Medium, Reddit and Telegram, blocked or restricted by Vietnamese ISPs, routed to secondary
 # author: NetRuleRouter contributors
-# preset_version: 2
+# preset_version: 3
 
 --- Zones
 # Keep empty to avoid over-broad routing by TLD
@@ -22,6 +22,21 @@ telegram.*  # Telegram: blocked nationwide in 2025, the block order was never wi
 
 --- IP
 # Intentionally left empty: do not pin DNS resolver IPs in presets
+
+--- CIDR
+91.105.192.0/23  # Telegram: its apps reach these networks by address, not by name
+91.108.4.0/22
+91.108.8.0/22
+91.108.12.0/22
+91.108.16.0/22
+91.108.20.0/22
+91.108.56.0/22
+149.154.160.0/20
+185.76.151.0/24
+2001:67c:4e8::/48
+2001:b28:f23c::/48
+2001:b28:f23d::/48
+2001:b28:f23f::/48
 
 --- Windows
 telegram.exe  # Telegram: blocked nationwide in 2025, the block order was never withdrawn

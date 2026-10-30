@@ -81,7 +81,7 @@ ColumnLayout {
         var lines = []
         var was = String(previous["target-route"] || "")
         if (was !== "" && was !== String(row.targetRoute || "")) {
-            lines.push(root.tr("rules.recent.previous-route", "Route: {from} \u2192 {to}")
+            lines.push(root.tr("rules.recent.previous-route", "Connection: {from} → {to}")
                 .replace("{from}", root.routeLabel(was))
                 .replace("{to}", root.routeLabel(String(row.targetRoute || ""))))
         }
@@ -92,8 +92,8 @@ ColumnLayout {
         }
         if ((previous.verify === true) !== (row.verify === true)) {
             lines.push(row.verify === true
-                ? root.tr("rules.recent.previous-sure", "Was without \u201c?\u201d")
-                : root.tr("rules.recent.previous-unsure", "Was marked \u201c?\u201d"))
+                ? root.tr("rules.recent.previous-sure", "Was not being checked")
+                : root.tr("rules.recent.previous-unsure", "Was being checked"))
         }
         return lines.join("\n")
     }
@@ -289,7 +289,7 @@ ColumnLayout {
         var hosts = Rules.mainRouteCheckHosts(rows)
         if (hosts.length === 0) {
             root.statusLine = root.tr("rules.main-route.nothing-to-check",
-                "There are no additional-route address rules to check.")
+                "There are no address rules on the additional connection to check.")
             return
         }
         var corr = root.rpc.rpcAutoRuleCandidatesProbe({ "rule-hostnames": hosts })
@@ -343,7 +343,7 @@ ColumnLayout {
         }
         var total = section.mainRouteCheckHosts.length
         root.statusLine = root.tr("rules.main-route.check-done",
-                "Main route check finished: reaches {answered}, does not reach {silent}, not checked {other}.")
+                "Main connection check finished: reaches {answered}, does not reach {silent}, not checked {other}.")
             .replace("{answered}", String(answered))
             .replace("{silent}", String(silent))
             .replace("{other}", String(Math.max(0, total - answered - silent)))
@@ -1141,7 +1141,7 @@ ColumnLayout {
         var secB64 = secAbs ? String(nrrNativeBridge.readFileBytes(secAbs) || "") : ""
         if (!primB64 && !secB64) {
             root.statusLine = root.tr("status.import-read-failed",
-                "Cannot read preset file. See logs for details.")
+                "Cannot read the rules file. See the logs for details.")
             return
         }
         if (typeof root.presetImportController.startBothRoutesPresetImportReviewFlow === "function") {
@@ -1200,7 +1200,7 @@ ColumnLayout {
             Label {
                 Layout.fillWidth: true
                 text: root.tr("rules.locked.banner-body",
-                    "Changing rules is turned off on this computer. You can still view, search, filter and export them.")
+                    "Changing rules is turned off on this computer. You can still view, search and save them to a file.")
                 color: root.mutedTextColor
                 wrapMode: Text.WordWrap
             }
@@ -1335,7 +1335,7 @@ ColumnLayout {
                         ? root.tr("rules.state.unknown",
                             "Not verified — the service isn't reachable right now.")
                         : root.tr("rules.state.in-sync",
-                            "The rules match the service and your rules file.")
+                            "The rules on screen are in use and saved in your rules file.")
                 color: (root.rulesNotAppliedToService || root.rulesNotSavedToFile)
                     ? root.textColor : root.mutedTextColor
                 // Padded to the button height so the row reads as one line; the
@@ -1349,14 +1349,14 @@ ColumnLayout {
             ThemedButton {
                 theme: root.uiTheme
                 visible: root.rulesNotAppliedToService
-                text: root.tr("rules.state.not-applied", "Not applied to the service")
+                text: root.tr("rules.state.not-applied", "Changes not applied yet")
                 icon.source: root.uiIconSource("apply")
                 enabled: !root.mutationsModel.hasInFlight && !section.rulesLocked
                 Accessible.role: Accessible.Button
                 Accessible.name: text
                 ToolTip.visible: hovered && root.prefs.tooltipsEnabled
                 ToolTip.text: root.tr("rules.state.not-applied-tooltip",
-                    "The rules shown here differ from the ones the service is enforcing. Apply them.")
+                    "The rules on screen differ from the ones in use now. Click to apply them.")
                 onClicked: section._triggerReviewFlow()
             }
             ThemedButton {
@@ -1400,7 +1400,7 @@ ColumnLayout {
                 text: root.uiRevision >= 0
                     ? (section._userPresetsActive
                         ? root.tr("rules.bundled-preset.user-label", "My rule set:")
-                        : root.tr("rules.bundled-preset.label", "Bundled preset:"))
+                        : root.tr("rules.bundled-preset.label", "Ready-made set:"))
                     : ""
                 color: root.textColor
                 verticalAlignment: Text.AlignVCenter
@@ -1411,7 +1411,7 @@ ColumnLayout {
                 accessibleLabel: root.uiRevision >= 0
                     ? (section._userPresetsActive
                         ? root.tr("rules.bundled-preset.user-label", "My rule set:")
-                        : root.tr("rules.bundled-preset.label", "Bundled preset:"))
+                        : root.tr("rules.bundled-preset.label", "Ready-made set:"))
                     : ""
                 theme: root.uiTheme
                 Layout.fillWidth: true
@@ -1453,13 +1453,13 @@ ColumnLayout {
                 text: root.tr("rules.bundled-preset.hide", "Hide")
                 ToolTip.visible: hovered
                 ToolTip.text: root.tr("rules.bundled-preset.hide-tooltip",
-                    "Hide the bundled-preset quick-load row. Re-enable it in Settings.")
+                    "Hide the ready-made sets row. You can bring it back in Settings.")
                 onClicked: {
                     if (typeof root.updatePrefs === "function") {
                         root.updatePrefs({ showBundledPresets: false })
                     }
                     root.statusLine = root.tr("status.presets-hidden",
-                        "Bundled presets hidden. Re-enable them in Settings → Presets.")
+                        "Ready-made sets are hidden. Bring them back in Settings → Rules and settings files.")
                 }
             }
         }
@@ -1550,12 +1550,12 @@ ColumnLayout {
             Layout.fillWidth: true
             text: section.mainRouteCheckBusy
                 ? root.tr("rules.suggestions.inbox.action-check-main-route-busy", "Checking...")
-                : root.tr("rules.main-route.action-check", "Check the main route")
+                : root.tr("rules.main-route.action-check", "Check the main connection")
             icon.source: root.uiIconSource("refresh-dot")
             enabled: !section.mainRouteCheckBusy && root.rulesModel.count > 0
             ToolTip.visible: hovered && root.prefs.tooltipsEnabled
             ToolTip.text: root.tr("rules.main-route.action-check-tooltip",
-                "Tries to reach the addresses of your additional-route rules over the main connection, and shows the result in the Main route column. Answering there does not mean the site works there — a rule may still be earning its place.")
+                "Tries to reach the addresses of your additional-connection rules over the main connection, and shows the result in the Main connection column. Answering there does not mean the site works there — a rule may still be earning its place.")
             Accessible.role: Accessible.Button
             Accessible.name: text
             Accessible.description: ToolTip.text
@@ -1584,13 +1584,13 @@ ColumnLayout {
         ThemedButton {
             theme: root.uiTheme
             Layout.fillWidth: true
-            text: root.tr("rules.action.save-and-review", "Save and review...")
+            text: root.tr("rules.action.save-and-review", "Apply…")
             icon.source: root.uiIconSource("apply")
             enabled: !root.mutationsModel.hasInFlight && !section.rulesLocked
             ToolTip.visible: hovered && !enabled
             ToolTip.text: section.rulesLocked
                 ? root.tr("rules.locked.banner-body",
-                    "Changing rules is turned off on this computer. You can still view, search, filter and export them.")
+                    "Changing rules is turned off on this computer. You can still view, search and save them to a file.")
                 : root.tr(
                     "mutations.in-progress-tooltip",
                     "Another operation is in progress. Wait for it to finish.")
@@ -1618,17 +1618,17 @@ ColumnLayout {
                 onAboutToShow: section._fitMenuWidth(exportRouteMenu)
                 MenuItem {
                     text: root.tr("rules.action.save-as-set",
-                        "Save as a set (both routes)...")
+                        "Save as a set (both connections)…")
                     onTriggered: root.boundFilesController.exportCurrentRulesInteractive(null)
                 }
                 MenuItem {
                     text: root.tr("rules.action.export-source-primary",
-                        "Export only the main route's rules to a file...")
+                        "Export only the main connection's rules to a file...")
                     onTriggered: section._openExportFor("primary")
                 }
                 MenuItem {
                     text: root.tr("rules.action.export-source-secondary",
-                        "Export only the additional route's rules to a file...")
+                        "Export only the additional connection's rules to a file...")
                     onTriggered: section._openExportFor("secondary")
                 }
             }
@@ -1682,7 +1682,7 @@ ColumnLayout {
                     onTriggered: section._triggerBaselineReviewFlow()
                 }
                 MenuItem {
-                    text: root.tr("rules.action.load-demo-rules", "Load demo rules...")
+                    text: root.tr("rules.action.load-demo-rules", "Load example rules…")
                     enabled: !root.mutationsModel.hasInFlight && !section.rulesLocked
                     onTriggered: {
                         if (typeof root.loadDemoRules === "function") {
@@ -1746,7 +1746,7 @@ ColumnLayout {
             ThemedButton {
                 theme: root.uiTheme
                 text: root.tr("rules.bulk.move-to-route",
-                    "Move to route")
+                    "Change connection")
                 enabled: !section.rulesLocked
                 onClicked: bulkMoveRouteMenu.popup()
                 Menu {
@@ -1757,7 +1757,7 @@ ColumnLayout {
                         onTriggered: section._bulkMoveSelectedToRoute("primary")
                     }
                     MenuItem {
-                        text: root.routeLabel("secondary")
+                        text: root.routeChoiceLabel("secondary")
                         onTriggered: section._bulkMoveSelectedToRoute("secondary")
                     }
                     MenuItem {
@@ -1807,7 +1807,7 @@ ColumnLayout {
                 wrapMode: Text.WordWrap
                 color: root.textColor
                 text: root.tr("rules.bulk.delete-body",
-                    "{n} selected rule(s) will be removed. You can apply the change to the service later via 'Save and review...'.")
+                    "{n} rule(s) will be removed. Press Apply to put the change into effect.")
                         .replace("{n}", String(section.selectedCount))
             }
             RowLayout {
@@ -1855,7 +1855,7 @@ ColumnLayout {
                     var row = root.rulesModel.get(root.selectedRule)
                     if (!row) return ""
                     return root.tr("rules.action.delete-single-body",
-                        "Rule {id} ({value}) will be removed from this app. Apply the change to the service later via 'Save and review...'.")
+                        "Rule {id} ({value}) will be removed. Press Apply to put the change into effect.")
                             .replace("{id}", String(row.id || ""))
                             .replace("{value}", Pure.displayText(row.matchValue))
                 }
@@ -1922,7 +1922,7 @@ ColumnLayout {
                 wrapMode: Text.WordWrap
                 color: root.textColor
                 text: root.tr("rules.action.clear-all-body",
-                    "All rules will be removed from this app and (when the service is running) from the service as well. The OS will route traffic without any NetRuleRouter overrides. This cannot be undone.")
+                    "All rules will be removed. All traffic will go as usual, without NetRuleRouter. This cannot be undone.")
             }
             RowLayout {
                 Layout.fillWidth: true
@@ -1954,9 +1954,9 @@ ColumnLayout {
         id: importFileDialog
         fileMode: FileDialog.OpenFile
         // Open where the user keeps their rule sets, when they chose a folder.
-        title: root.tr("rules.dialog.import-title", "Choose preset to import")
+        title: root.tr("rules.dialog.import-title", "Choose a rules file")
         nameFilters: [
-            root.tr("rules.dialog.preset-filter", "Preset files (*.txt)"),
+            root.tr("rules.dialog.preset-filter", "Rules files (*.txt)"),
             root.tr("rules.dialog.all-filter", "All files (*)")
         ]
         property string pendingTargetRoute: ""
@@ -1967,9 +1967,9 @@ ColumnLayout {
     FileDialog {
         id: exportFileDialog
         fileMode: FileDialog.SaveFile
-        title: root.tr("rules.dialog.export-title", "Save preset as...")
+        title: root.tr("rules.dialog.export-title", "Save rules as…")
         nameFilters: [
-            root.tr("rules.dialog.preset-filter", "Preset files (*.txt)"),
+            root.tr("rules.dialog.preset-filter", "Rules files (*.txt)"),
             root.tr("rules.dialog.all-filter", "All files (*)")
         ]
         defaultSuffix: "txt"
@@ -2041,7 +2041,7 @@ ColumnLayout {
         if (!b64 || b64.length === 0) {
             root.statusLine = root.tr(
                 "status.import-read-failed",
-                "Cannot read preset file. See logs for details.")
+                "Cannot read the rules file. See the logs for details.")
             return
         }
         // 2. Kick off the review flow with bytes attached.
@@ -2471,11 +2471,11 @@ ColumnLayout {
                 id: typeFilterCombo
                 accessibleLabel: root.uiRevision >= 0 ? root.tr("rules.filter.type.label", "Type") : ""
                 theme: root.uiTheme
-                implicitWidth: 200
+                implicitWidth: 240
                 model: Rules.RULES_TYPE_FILTERS
                 function typeLabel(id) {
                     if (id === "all") return root.tr("rules.filter.type.all", "All types")
-                    return root.tr("rules.filter.type." + id, root.tr("rules.type." + id, id))
+                    return root.ruleTypeChoiceLabel(id)
                 }
                 labelResolver: function(item) { return typeFilterCombo.typeLabel(item) }
                 currentIndex: 0
@@ -2497,20 +2497,20 @@ ColumnLayout {
 
             Label {
                 id: routeFilterLabel
-                text: root.uiRevision >= 0 ? root.tr("rules.filter.route.label", "Route") : ""
+                text: root.uiRevision >= 0 ? root.tr("rules.filter.route.label", "Connection") : ""
                 color: root.textColor
                 verticalAlignment: Text.AlignVCenter
                 height: routeFilterCombo.height
             }
             ThemedComboBox {
                 id: routeFilterCombo
-                accessibleLabel: root.uiRevision >= 0 ? root.tr("rules.filter.route.label", "Route") : ""
+                accessibleLabel: root.uiRevision >= 0 ? root.tr("rules.filter.route.label", "Connection") : ""
                 theme: root.uiTheme
                 implicitWidth: 200
                 model: Rules.RULES_ROUTE_FILTERS
                 function routeLabelFor(id) {
-                    if (id === "all") return root.tr("rules.filter.route.all", "All routes")
-                    if (id === "unsure") return root.tr("rules.filter.route.unsure", "Unsure (?)")
+                    if (id === "all") return root.tr("rules.filter.route.all", "All connections")
+                    if (id === "unsure") return root.tr("rules.filter.route.unsure", "Checking")
                     if (id === "block") return root.tr("rules.filter.route.denied", "Denied")
                     return root.routeLabel(id)
                 }
@@ -2793,7 +2793,7 @@ ColumnLayout {
                     + "The background service is not needed for this.")
                 : root.tr(
                     "rules.empty.body",
-                    "Add your first routing rule to start sending traffic through the additional route.")
+                    "Add your first rule to send the sites you choose through the additional connection.")
             color: root.uiTheme.colorTextMuted
             wrapMode: Text.WordWrap
             horizontalAlignment: Text.AlignHCenter
@@ -2993,7 +2993,7 @@ ColumnLayout {
                 Label {
                     id: routeHeader
                     anchors.fill: parent
-                    text: root.tr("rules.column.route", "Route") + " " + section.sortArrowFor("by-route")
+                    text: root.tr("rules.column.route", "Connection") + " " + section.sortArrowFor("by-route")
                     color: section.sortBy === "by-route" ? root.uiTheme.colorAccent : root.textColor
                     font.bold: true
                     verticalAlignment: Text.AlignVCenter
@@ -3011,11 +3011,11 @@ ColumnLayout {
                 ToolTip.visible: containsMouse && root.prefs.tooltipsEnabled
                 ToolTip.delay: 400
                 ToolTip.text: root.tr("rules.column.main-route-tooltip",
-                    "What the last check found: does this address answer over the main connection. Appears after \"Check the main route\".")
+                    "What the last check found: does this address answer over the main connection. Appears after \"Check the main connection\".")
                 Label {
                     id: mainRouteHeader
                     anchors.fill: parent
-                    text: root.tr("rules.column.main-route", "Main route") + " " + section.sortArrowFor("by-main-route")
+                    text: root.tr("rules.column.main-route", "Main connection") + " " + section.sortArrowFor("by-main-route")
                     color: section.sortBy === "by-main-route" ? root.uiTheme.colorAccent : root.textColor
                     font.bold: true
                     elide: Text.ElideRight
@@ -3316,7 +3316,11 @@ ColumnLayout {
                         // use a binary ternary (a block would mislabel as
                         // Secondary via the fall-through).
                         readonly property bool unsure: Rules.rowIsVerify(model)
-                        text: root.routeLabel(model.targetRoute) + (unsure ? " ?" : "")
+                        // A word, not the file's `?`: "Main (checking)".
+                        text: root.uiRevision >= 0 && unsure
+                            ? root.tr("rules.route-checking", "{route} (checking)")
+                                .replace("{route}", root.routeLabel(model.targetRoute))
+                            : root.routeLabel(model.targetRoute)
                         color: root.textColor
                         wrapMode: Text.WordWrap
                         opacity: model.enabled ? 1.0 : 0.5
@@ -3324,13 +3328,13 @@ ColumnLayout {
                             ? root.routeLabel(model.targetRoute) + ", "
                                 + root.tr("dialog.rule.verify", "Unsure — check where it works")
                             : root.routeLabel(model.targetRoute)
-                        // The mark is one character; what it means is worth a hover.
+                        // What "checking" means is worth a hover.
                         HoverHandler { id: routeCellHover }
                         ToolTip.visible: routeCellHover.hovered && unsure
                         ToolTip.delay: 400
                         ToolTip.text: root.uiRevision >= 0 && unsure
                             ? root.tr("dialog.rule.verify-hint",
-                                "Works through the route it is written for. If the site or address does not open there but does on the other route, NetRuleRouter offers to move the rule.")
+                                "Works through the connection it is written for. If the site or address does not open there but does through the other connection, NetRuleRouter offers to move the rule.")
                             : ""
                     }
                     // What the last main-route check found. A fact, not advice:
@@ -3354,7 +3358,7 @@ ColumnLayout {
                         elide: Text.ElideRight
                         opacity: model.enabled ? 1.0 : 0.5
                         Accessible.name: root.uiRevision >= 0 && mark !== ""
-                            ? root.tr("rules.column.main-route", "Main route") + ": " + text : ""
+                            ? root.tr("rules.column.main-route", "Main connection") + ": " + text : ""
                         HoverHandler { id: mainRouteCellHover }
                         ToolTip.visible: mainRouteCellHover.hovered && mainRouteCell.mark !== ""
                         ToolTip.delay: 300
@@ -3756,7 +3760,7 @@ ColumnLayout {
                         ToolTip.visible: pinnedBadgeHover.hovered
                         ToolTip.delay: 300
                         ToolTip.text: root.tr("rules.app-pins.tooltip",
-                            "These are the addresses this application has been seen using, and they now travel the additional link for EVERY program on this computer — a route cannot be told which process it is for. An address another program starts using is given back to the main connection automatically.")
+                            "These are the addresses this application has been seen using, and they now travel the additional connection for EVERY program on this computer — a route cannot be told which process it is for. An address another program starts using is given back to the main connection automatically.")
                             + "\n" + String(model.pinnedSample || "")
                     }
                     Label {
@@ -3854,7 +3858,7 @@ ColumnLayout {
                     ToolTip.text: root.uiRevision >= 0
                         ? (restorable
                             ? root.tr("rules.recent.restore-tooltip",
-                                "Put the rule back with the route, switch and note it had.")
+                                "Put the rule back with the connection, switch and note it had.")
                             : root.tr("rules.recent.restore-present",
                                 "A rule with this type and value is already in the list."))
                         : ""

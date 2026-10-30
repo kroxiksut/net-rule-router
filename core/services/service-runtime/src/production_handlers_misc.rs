@@ -2359,6 +2359,8 @@ mod install_policy_tests {
         let mut record = RoutePolicyRecord::empty(BindingSource::UserAssigned);
         record.primary = Some(binding("main"));
         record.secondary = secondary.then(|| binding("tunnel"));
+        // Protection switched off: what is left is the install policy's to say.
+        record.leak_protection = nrr_domain::LeakProtection::Off;
         RouteBindingsRepository::new(&guard)
             .update_for_sid(sid, &record, 1)
             .expect("bind");

@@ -21,11 +21,12 @@ use nrr_client_logic::review::{self, Outcome};
 use nrr_client_logic::route_policy;
 use nrr_client_logic::rules_table::{
     build_rules_file_text, drift_row_from_parsed_rule, drift_row_from_service_wire,
-    file_row_from_service_wire, main_route_check_hosts, main_route_rank, normalize_host_input,
-    override_remaining, parsed_rule_target_route, parsed_rule_verify, rule_override_key,
-    rule_row_to_wire_dto, RowOrigin, RuleRow, RuleType, RulesFileOptions, TargetRoute,
-    WireDtoOptions, PRESET_FORMAT_VERSION, RULES_FILE_HINT_KEYS,
+    file_row_from_service_wire, import_merge_plan, main_route_check_hosts, main_route_rank,
+    normalize_host_input, override_remaining, parsed_rule_target_route, parsed_rule_verify,
+    rule_override_key, rule_row_to_wire_dto, RowOrigin, RuleRow, RuleType, RulesFileOptions,
+    TargetRoute, WireDtoOptions, PRESET_FORMAT_VERSION, RULES_FILE_HINT_KEYS,
 };
+use nrr_client_logic::vpn_client_trust::PickerRow;
 use nrr_client_logic::Route;
 use nrr_shared::ipc_payloads::{
     InterfaceRowDto, OperationStatusResponse, ReviewSummaryResponse, RouteBindingDto, RuleRowEntry,
@@ -725,6 +726,58 @@ fn first_run_suggestion_matches_js() {
 }
 
 #[test]
+fn first_run_just_connected_matches_js() {
+    let (document, cases) = load_vectors("first_run_just_connected");
+    let base = &document["base-row"];
+    let rows = |list: &Value| -> Vec<Value> {
+        list.as_array()
+            .map_or(&[][..], Vec::as_slice)
+            .iter()
+            .map(|patch| merged(base, patch))
+            .collect()
+    };
+    let cases: Vec<Case> = cases
+        .into_iter()
+        .map(|case| Case {
+            input: json!({
+                "skip": case.input.get("skip").cloned().unwrap_or(json!(-1)),
+                "before": rows(&case.input["before"]),
+                "now": rows(&case.input["now"]),
+            }),
+            ..case
+        })
+        .collect();
+    check_cases(
+        "first_run_just_connected",
+        &cases,
+        &mut JsLib::pure(),
+        |input| {
+            format!(
+                "(function (i) {{
+                    var rows = function (list) {{ return list.map(function (w) {{
+                        var row = mapWireInterfaceRow(w);
+                        row.selectedRole = w[\"selected-role\"] || \"\";
+                        return row;
+                    }}) }};
+                    return firstRunJustConnected(rows(i.before), rows(i.now), i.skip);
+                }})({})",
+                lit(input)
+            )
+        },
+        |input| {
+            let rows = |key: &str| -> Vec<InterfaceRowDto> {
+                serde_json::from_value(input[key].clone()).expect("vector rows are InterfaceRowDto")
+            };
+            let skip = input["skip"].as_u64().and_then(|i| usize::try_from(i).ok());
+            json!(
+                adapters::first_run_just_connected(&rows("before"), &rows("now"), skip)
+                    .map_or(-1, |i| i64::try_from(i).unwrap_or(-1))
+            )
+        },
+    );
+}
+
+#[test]
 fn adapter_driver_siblings_match_js() {
     let (document, cases) = load_vectors("adapter_driver_siblings");
     let base = &document["base-row"];
@@ -1120,6 +1173,28 @@ fn row_identity_matches_js() {
 }
 
 #[test]
+fn import_merge_plan_matches_js() {
+    check(
+        "import_merge_plan",
+        &mut JsLib::rules(),
+        |input| {
+            format!(
+                "importMergePlan({}, {})",
+                arg(input, "existing"),
+                arg(input, "imported")
+            )
+        },
+        |input| {
+            let plan = import_merge_plan(
+                &rows_from_js(&input["existing"]),
+                &rows_from_js(&input["imported"]),
+            );
+            json!({ "add": plan.add, "plain": plan.plain, "plainAdded": plan.plain_added })
+        },
+    );
+}
+
+#[test]
 fn rebase_edits_matches_js() {
     check(
         "rebase_edits",
@@ -1436,6 +1511,24 @@ fn refusal_detail_matches_js() {
 }
 
 #[test]
+fn review_entry_parts_matches_js() {
+    check(
+        "review_entry_parts",
+        &mut JsLib::pure(),
+        |input| format!("reviewEntryParts({})", arg(input, "display")),
+        |input| {
+            let p = review::review_entry_parts(text(input, "display"));
+            json!({
+                "rule": p.rule,
+                "app": p.app,
+                "moved": p.moved.map_or(Value::Null, |(from, to)| json!([from, to])),
+                "invalid": p.invalid,
+            })
+        },
+    );
+}
+
+#[test]
 fn operation_outcome_matches_js() {
     check(
         "operation_outcome",
@@ -1453,6 +1546,71 @@ fn operation_outcome_matches_js() {
                 .filter(|ok| *ok)
                 .and_then(|_| serde_json::from_value(input["status"].clone()).ok());
             outcome_json(review::operation_outcome(status.as_ref()))
+        },
+    );
+}
+
+#[test]
+fn first_run_idle_vpns_match_js() {
+    let (document, cases) = load_vectors("first_run_idle_vpns");
+    let base = &document["base-row"];
+    let cases: Vec<Case> = cases
+        .into_iter()
+        .map(|case| Case {
+            input: json!({
+                "skip": case.input.get("skip").cloned().unwrap_or(json!(-1)),
+                "programs": case.input["programs"],
+                "rows": case.input["rows"]
+                    .as_array()
+                    .map_or(&[][..], Vec::as_slice)
+                    .iter()
+                    .map(|patch| merged(base, patch))
+                    .collect::<Vec<Value>>(),
+            }),
+            ..case
+        })
+        .collect();
+    check_cases(
+        "first_run_idle_vpns",
+        &cases,
+        &mut JsLib::pure(),
+        |input| {
+            format!(
+                "(function (i) {{
+                    var rows = i.rows.map(function (w) {{
+                        var row = mapWireInterfaceRow(w);
+                        row.selectedRole = w[\"selected-role\"] || \"\";
+                        return row;
+                    }});
+                    return firstRunIdleVpns(rows, i.programs, i.skip);
+                }})({})",
+                lit(input)
+            )
+        },
+        |input| {
+            let rows: Vec<InterfaceRowDto> = serde_json::from_value(input["rows"].clone())
+                .expect("vector rows are InterfaceRowDto");
+            let text = |v: &Value, k: &str| v[k].as_str().unwrap_or_default().to_owned();
+            let programs: Vec<PickerRow> = input["programs"]
+                .as_array()
+                .map_or(&[][..], Vec::as_slice)
+                .iter()
+                .map(|p| PickerRow {
+                    display_name: text(p, "displayName"),
+                    exe_path: text(p, "exePath"),
+                    running: p["running"].as_bool().unwrap_or(false),
+                    source: text(p, "source"),
+                    interface_name: text(p, "interfaceName"),
+                })
+                .collect();
+            let skip = input["skip"].as_u64().and_then(|i| usize::try_from(i).ok());
+            let found = adapters::first_run_idle_vpns(&rows, &programs, skip);
+            json!({
+                "rows": found.rows.iter().map(|r| json!({ "index": r.index, "program": r.program }))
+                    .collect::<Vec<Value>>(),
+                "preselect": found.preselect.map_or(-1, |i| i64::try_from(i).unwrap_or(-1)),
+                "startVpnFirst": found.start_vpn_first,
+            })
         },
     );
 }

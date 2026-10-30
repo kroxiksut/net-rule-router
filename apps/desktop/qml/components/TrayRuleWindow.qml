@@ -52,8 +52,13 @@ ApplicationWindow {
         return Rules.routeDisplayLabel(role, trayHost.routePrimaryLabel,
             trayHost.routeSecondaryLabel, tr)
     }
-    function routeRoleOptions() { return Rules.routeRoleOptions(true, routeLabel, tr) }
+    function routeChoiceLabel(role) {
+        return Rules.routeChoiceLabel(role, trayHost.routePrimaryLabel,
+            trayHost.routeSecondaryLabel, tr)
+    }
+    function routeRoleOptions() { return Rules.routeRoleOptions(true, routeChoiceLabel, tr) }
     function ruleTypeLabel(id) { return support.ruleTypeLabel(id) }
+    function ruleTypeChoiceLabel(id) { return support.ruleTypeChoiceLabel(id) }
     function _punycodeFor(host) { return support.aceCodec.hint(host) }
     function nextFreeRuleId() { return Rules.nextFreeRuleId(_rows) }
     function comboPopupWidth(control, model, textRole, textResolver) {
@@ -163,8 +168,8 @@ ApplicationWindow {
     }
 
     // ── What happened to the saved rule ──
-    // "" while the form is up; "busy", "duplicate", "elsewhere", "error" or
-    // "changed-elsewhere" while this pane stands in for it.
+    // "" while the form is up; "busy", "duplicate", "elsewhere", "error",
+    // "alert-gate" or "changed-elsewhere" while this pane stands in for it.
     property string _state: ""
     property string _message: ""
     /// Rules waiting for the user's answer to "change the existing rule?".
@@ -191,6 +196,7 @@ ApplicationWindow {
             textFormat: Text.PlainText
             text: trayRuleWindow._message
             color: trayRuleWindow._state === "error" || trayRuleWindow._state === "changed-elsewhere"
+                    || trayRuleWindow._state === "alert-gate"
                 ? trayRuleWindow.uiTheme.colorDanger : trayRuleWindow.textColor
             Accessible.role: Accessible.StaticText
             Accessible.name: text
@@ -206,6 +212,17 @@ ApplicationWindow {
                 highlighted: true
                 text: trayRuleWindow._moveLabel
                 onClicked: trayRuleWindow._submit(trayRuleWindow._pendingItems, true)
+                Accessible.name: text
+            }
+            ThemedButton {
+                visible: trayRuleWindow._state === "alert-gate"
+                theme: trayRuleWindow.uiTheme
+                highlighted: true
+                text: trayRuleWindow.tr("action.open-security-alert", "Open the alert")
+                onClicked: {
+                    trayRuleWindow.trayHost.openSecurityAlerts()
+                    trayRuleWindow._closeSoon()
+                }
                 Accessible.name: text
             }
             ThemedButton {
@@ -469,21 +486,21 @@ ApplicationWindow {
             var one = denied > 0
                 ? tr("tray.add-rule.already-denied", "{value} is already denied in your rules.")
                 : tr("tray.add-rule.on-other-route",
-                    "{value} is already in your rules, on the route {route}.")
+                    "{value} is already in your rules, on the connection {route}.")
             return one.replace("{value}", Pure.displayText(row.matchValue))
                 .replace("{route}", routeLabel(String(row.targetRoute)))
         }
         var many = String(elsewhere[0].item.targetRoute) === "block"
             ? tr("tray.add-rule.on-a-route-many",
-                "{count} of these are already in your rules, on a route.")
+                "{count} of these are already in your rules, on one of the connections.")
             : denied === elsewhere.length
             ? tr("tray.add-rule.already-denied-many",
                 "{count} of these are already denied in your rules.")
             : denied > 0
             ? tr("tray.add-rule.on-other-route-or-denied-many",
-                "{count} of these are already in your rules, on the other route or denied.")
+                "{count} of these are already in your rules, on the other connection or denied.")
             : tr("tray.add-rule.on-other-route-many",
-                "{count} of these are already in your rules, on another route.")
+                "{count} of these are already in your rules, on the other connection.")
         return many.replace("{count}", String(elsewhere.length))
     }
 
@@ -491,8 +508,8 @@ ApplicationWindow {
         if (String(elsewhere[0].item.targetRoute) === "block")
             return tr("tray.add-rule.deny-instead", "Deny instead")
         if (_deniedCount(elsewhere) === elsewhere.length)
-            return tr("tray.add-rule.lift-deny", "Lift the deny, use this route")
-        return tr("tray.add-rule.move", "Move to this route")
+            return tr("tray.add-rule.lift-deny", "Lift the deny, use this connection")
+        return tr("tray.add-rule.move", "Move to this connection")
     }
 
     function _send(plan) {
@@ -540,7 +557,7 @@ ApplicationWindow {
         var parts = [tr("status.rules-list-added", "Rules added: {count}.")
             .replace("{count}", String(plan.added))]
         if (plan.changed > 0) {
-            parts.push(tr("status.rules-list-moved", "Moved to the chosen route: {count}.")
+            parts.push(tr("status.rules-list-moved", "Moved to the chosen connection: {count}.")
                 .replace("{count}", String(plan.changed)))
         }
         return parts.join(" ")
@@ -577,7 +594,7 @@ ApplicationWindow {
                     .replace("{count}", String(plan.changed)))
             }
             if (!toDeny && plan.changed - lifted > 0) {
-                parts.push(tr("tray.add-rule.moved-count", "Moved to this route: {count}.")
+                parts.push(tr("tray.add-rule.moved-count", "Moved to this connection: {count}.")
                     .replace("{count}", String(plan.changed - lifted)))
             }
             if (lifted > 0) {
@@ -600,7 +617,7 @@ ApplicationWindow {
                 ? tr("tray.add-rule.added-deny", "Rule added: {value} denied.")
                 : _awaitsConfirmation(plan)
                 ? tr("tray.add-rule.added-awaits-confirmation",
-                    "Rule added: {value} → {route}. It is not applied yet: the protection of system programs holds it until you confirm it in the rules list.")
+                    "Rule added: {value} → {route}. Not in use yet: it touches a protected system program — confirm it in the rules list.")
                 : tr("tray.add-rule.added", "Rule added: {value} → {route}")
         } else {
             template = toDeny
@@ -621,7 +638,10 @@ ApplicationWindow {
                 "Your rules were changed elsewhere in the meantime, so nothing was added. Open the main window and add the rule there."))
             return
         }
-        _fail("error", typeof submitter.describeFailure === "function"
+        var gate = trayHost.rpc ? trayHost.rpc.securityAlertGateCode : ""
+        var refusedByGate = gate !== "" && r
+            && (String(r.code || "") === gate || String(r.failure || "") === gate)
+        _fail(refusedByGate ? "alert-gate" : "error", typeof submitter.describeFailure === "function"
             ? submitter.describeFailure(r, tr) : String(reason))
     }
 

@@ -287,7 +287,7 @@ fn the_form_says_what_the_rule_overlaps_before_it_is_saved() {
     assert!(form.contains("Overlaps:"), "{form}");
     assert!(
         form.contains(
-            "news.example.com (Domain) goes over Additional: it is narrower than *.example.com (Domain) on Primary."
+            "news.example.com (Domain) goes over Additional: it is narrower than *.example.com (Domain) on Main."
         ),
         "{form}"
     );
@@ -380,7 +380,8 @@ fn a_wide_rule_over_an_older_narrow_one_still_asks() {
 }
 
 /// "Unsure" is a mark on a rule of its route, offered for a name or an address
-/// and never for a block; the list shows it after the route.
+/// and never for a block; the list says it in a word after the route, not
+/// with the rules file's bare `?`.
 #[test]
 fn an_unsure_rule_keeps_its_route_and_shows_its_mark() {
     let fake = service(Vec::new());
@@ -393,7 +394,7 @@ fn an_unsure_rule_keeps_its_route_and_shows_its_mark() {
     assert!(saved.is_verify());
     let text = screen_text(&app, ScreenId::Rules);
     assert!(
-        text.contains("shop.example.com \u{2014} Primary ?"),
+        text.contains("shop.example.com \u{2014} Main (checking)"),
         "{text}"
     );
 
@@ -479,6 +480,43 @@ fn a_loaded_set_goes_to_the_review_at_once() {
         matches!(app.rules.mode, Mode::Review(_)),
         "{:?}",
         app.rules.mode
+    );
+}
+
+/// "Add" promises the user's own rules stay: what goes to the service's review
+/// is every own rule plus the set's new ones, and the user's section for
+/// another system keeps its lines beside the set's.
+#[test]
+fn adding_a_set_keeps_every_own_rule_and_section() {
+    let fake = service(vec![
+        rule("1", "suffix-domain", "mine.example", "primary"),
+        rule("2", "domain", "news.example.com", "secondary"),
+    ]);
+    previews_one_added(&fake);
+    let mut app = on_rules(&fake);
+    app.rules.table.passthrough[0].insert("Linux".into(), "own-app\n".into());
+    let mut set = one_rule_set();
+    set.rows.push(RuleRow {
+        match_value: "added.example".into(),
+        ..set.rows[0].clone()
+    });
+    set.passthrough[0].insert("Linux".into(), "their-app\n".into());
+    super::import(&mut app, set, "ru_home".into(), false);
+    drain(&mut app, &fake);
+
+    let sent = fake.sent(IpcOperationName::MutationSubmit);
+    let request = sent.last().expect("the merged list went to the review");
+    let text = request.to_string();
+    for value in ["mine.example", "news.example.com", "added.example"] {
+        assert!(text.contains(value), "{value} missing from {text}");
+    }
+    assert_eq!(text.matches("news.example.com").count(), 1, "{text}");
+    assert_eq!(
+        app.rules.table.passthrough[0]
+            .get("Linux")
+            .map(String::as_str),
+        Some("own-app\ntheir-app\n"),
+        "the user's own lines for another system were replaced"
     );
 }
 
@@ -953,16 +991,16 @@ mod main_route {
         let mut app = on_rules(&service(every_verdict()));
         let text = screen_text(&app, ScreenId::Rules);
         for expected in [
-            "silent.example \u{2014} Additional \u{b7} Main route: does not reach",
-            "answered.example \u{2014} Additional \u{b7} Main route: reaches",
-            "new.example \u{2014} Additional \u{b7} Main route: not seen yet",
-            "odd.example \u{2014} Additional \u{b7} Main route: could not check",
-            "ru \u{2014} Additional \u{b7} Main route: not checked",
+            "silent.example \u{2014} Additional \u{b7} Main connection: does not reach",
+            "answered.example \u{2014} Additional \u{b7} Main connection: reaches",
+            "new.example \u{2014} Additional \u{b7} Main connection: not seen yet",
+            "odd.example \u{2014} Additional \u{b7} Main connection: could not check",
+            "ru \u{2014} Additional \u{b7} Main connection: not checked",
         ] {
             assert!(text.contains(expected), "{expected}\n{text}");
         }
         for unmarked in [
-            "main.example \u{2014} Primary\n",
+            "main.example \u{2014} Main\n",
             "later.example \u{2014} Additional\n",
         ] {
             assert!(text.contains(unmarked), "{unmarked}\n{text}");
@@ -1011,7 +1049,7 @@ mod main_route {
             rule("2", "domain", "example.com", "secondary"),
         ]));
         let text = screen_text(&app, ScreenId::Rules);
-        assert!(!text.contains("Main route"), "{text}");
+        assert!(!text.contains("Main connection"), "{text}");
     }
 
     #[test]
@@ -1020,7 +1058,7 @@ mod main_route {
         // Value, type, route, then the main route check.
         answer(&mut app, &["O", "O", "O", "O"]);
         let text = screen_text(&app, ScreenId::Rules);
-        assert!(text.contains("Sort: Main route check"), "{text}");
+        assert!(text.contains("Sort: Main connection check"), "{text}");
         let order = [
             "silent.example",
             "answered.example",
@@ -1082,7 +1120,7 @@ mod main_route {
             "{text}"
         );
         assert!(
-            text.contains("ru \u{2014} Additional \u{b7} Main route: not checked"),
+            text.contains("ru \u{2014} Additional \u{b7} Main connection: not checked"),
             "{text}"
         );
 
@@ -1126,11 +1164,13 @@ mod main_route {
         assert!(app.outbox.take_delayed().is_empty(), "no more polls");
         assert_eq!(
             note(&app),
-            "Main route check finished: reaches 1, does not reach 1, not checked 1."
+            "Main connection check finished: reaches 1, does not reach 1, not checked 1."
         );
         let text = screen_text(&app, ScreenId::Rules);
         assert!(
-            text.contains("shop.example \u{2014} Additional \u{b7} Main route: does not reach"),
+            text.contains(
+                "shop.example \u{2014} Additional \u{b7} Main connection: does not reach"
+            ),
             "{text}"
         );
         assert!(text.contains("added.example"), "the edit is still there");
@@ -1151,7 +1191,7 @@ mod main_route {
             .is_empty());
         assert_eq!(
             note(&app),
-            "There are no additional-route address rules to check."
+            "There are no address rules on the additional connection to check."
         );
     }
 
@@ -1231,15 +1271,19 @@ mod main_route {
         }
         let text = String::from_utf8(session.into_inner()).expect("UTF-8");
         assert!(
-            text.contains("c: check whether the main route reaches"),
+            text.contains("c: check whether the main connection reaches"),
             "{text}"
         );
         assert!(
-            text.contains("shop.example \u{2014} Additional \u{b7} Main route: does not reach"),
+            text.contains(
+                "shop.example \u{2014} Additional \u{b7} Main connection: does not reach"
+            ),
             "{text}"
         );
         assert!(
-            text.contains("Main route check finished: reaches 0, does not reach 1, not checked 0."),
+            text.contains(
+                "Main connection check finished: reaches 0, does not reach 1, not checked 0."
+            ),
             "{text}"
         );
         assert!(!text.contains('\u{1b}'), "{text}");
@@ -1513,7 +1557,7 @@ mod rules_folder {
             text.contains("Addresses that do not open where they are written: 1"),
             "{text}"
         );
-        assert!(text.contains("shop.example \u{2192} Primary"), "{text}");
+        assert!(text.contains("shop.example \u{2192} Main"), "{text}");
         assert!(text.contains("m: Move. n: Not now."), "{text}");
         assert_eq!(app.notices.len(), 1, "{:?}", app.notices);
         assert!(app.notices[0].body.contains("open screen 4, Rules"));
@@ -1552,7 +1596,7 @@ mod rules_folder {
         let written = std::fs::read_to_string(&primary).expect("bound file");
         assert!(written.contains("example.com"), "{written}");
         assert!(
-            note(&app).contains("moved to the route where they work"),
+            note(&app).contains("moved to the connection where they work"),
             "{}",
             note(&app)
         );
@@ -2589,7 +2633,10 @@ mod several_rules {
         assert_eq!(form.text, "not a rule");
         let said = note(&app);
         assert!(said.contains("Rules added: 2."), "{said}");
-        assert!(said.contains("Moved to the chosen route: 1."), "{said}");
+        assert!(
+            said.contains("Moved to the chosen connection: 1."),
+            "{said}"
+        );
         assert!(said.contains("Left in the form to fix: 1."), "{said}");
     }
 
@@ -2796,7 +2843,7 @@ mod recent {
         );
         assert!(shown.contains("Deleted"), "{shown}");
         assert!(
-            shown.contains("U1. Domain  gone.example — Primary, deleted"),
+            shown.contains("U1. Domain  gone.example — Main, deleted"),
             "{shown}"
         );
         assert!(shown.contains("History is kept from"), "{shown}");
@@ -3303,7 +3350,7 @@ mod file_merge {
         );
         let shown = screen_text(&app, ScreenId::Rules);
         assert!(
-            shown.contains("Rules written into both routes (1)"),
+            shown.contains("Rules set on both connections (1)"),
             "{shown}"
         );
         assert!(shown.contains("both.example"), "{shown}");
@@ -3808,7 +3855,7 @@ mod form_hints {
             answer(&mut app, &[value]);
             let shown = screen_text(&app, ScreenId::Rules);
             assert_eq!(
-                shown.contains("is a public registry, not one service"),
+                shown.contains("is a shared zone, not one service"),
                 warned,
                 "{value}: {shown}"
             );
@@ -3891,4 +3938,20 @@ mod form_hints {
         );
         assert_eq!(app.rules.table.rows[0].rule.comment.chars().count(), 200);
     }
+}
+
+/// The review listed `chrome.exe (app)` and `(primary → secondary)` in English
+/// on a Russian screen: the service's markers are said in the session language.
+#[test]
+fn a_review_row_says_the_service_markers_in_the_session_language() {
+    let ru = crate::i18n::Texts::load(Some("ru"), &[]);
+    let shown = super::render::entry_text("chrome.exe (app) (primary → secondary)", &ru);
+    assert!(shown.starts_with("chrome.exe"), "{shown}");
+    for english in ["(app)", "primary", "secondary"] {
+        assert!(
+            !shown.contains(english),
+            "{english} left in English: {shown}"
+        );
+    }
+    assert_eq!(super::render::entry_text("example.com", &ru), "example.com");
 }

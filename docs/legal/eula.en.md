@@ -58,9 +58,10 @@ your own risk**.
 The software requires the installation of a background system service (a
 Windows service, or a systemd service on Linux; administrator rights are
 needed). The software modifies the routing
-table and creates network traffic filters. All such changes are
-**temporary**: they are removed when the service is stopped and do not
-survive a computer restart.
+table and creates network traffic filters. All such changes belong to
+the service: they are removed when the service is stopped or the software
+is removed, and after a computer restart the service sets them up again
+when it starts.
 
 If anything is left behind, undo it from the application itself:
 **Settings → Service management → Restore network**. That button removes

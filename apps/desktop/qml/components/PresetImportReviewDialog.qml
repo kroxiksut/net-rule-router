@@ -31,7 +31,7 @@ import QtQuick.Layouts 1.15
 Dialog {
     id: root
     title: typeof root.tr === "function"
-        ? root.tr("dialog.preset-review.title", "Review preset import")
+        ? root.tr("dialog.preset-review.title", "Loading rules — your decision needed")
         : "Review preset import"
 
     modal: true

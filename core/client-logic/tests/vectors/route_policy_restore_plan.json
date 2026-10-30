@@ -157,7 +157,7 @@
             "user-confirmed": true
           }
         },
-        "service": {},
+        "service": { "leak-protection": "off" },
         "present": [
           "B"
         ]
@@ -301,7 +301,7 @@
           "leak-protection": "everything",
           "mode": "prefer-secondary-when-available"
         },
-        "service": { "secondary": { "stable-id": "B", "display-name": "Tunnel" } },
+        "service": { "leak-protection": "off", "secondary": { "stable-id": "B", "display-name": "Tunnel" } },
         "present": []
       },
       "expected": {
@@ -457,7 +457,7 @@
           "mode": "strict-secondary-fail-closed",
           "kill-switch-enabled": true
         },
-        "service": { "secondary": { "stable-id": "B", "display-name": "Tunnel" } },
+        "service": { "leak-protection": "off", "secondary": { "stable-id": "B", "display-name": "Tunnel" } },
         "present": []
       },
       "expected": {

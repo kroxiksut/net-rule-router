@@ -47,7 +47,7 @@ Window {
     // working unchanged.
     function open() { visible = true }
 
-    width: 760
+    width: 900
     height: 360
     visible: false
     modality: Qt.WindowModal
@@ -96,7 +96,8 @@ Window {
 
         Item { Layout.fillHeight: true }
 
-        // Action row wraps to two lines on narrow displays via Flow.
+        // Right to left with the main action first: a narrow screen wraps the
+        // secondary buttons onto a second row, never the main one.
         Item {
             Layout.fillWidth: true
             Layout.topMargin: 6
@@ -106,17 +107,13 @@ Window {
                 anchors.left: parent.left
                 anchors.right: parent.right
                 spacing: 8
+                layoutDirection: Qt.RightToLeft
                 ThemedButton {
                     theme: root.ownerRoot ? root.ownerRoot.uiTheme : null
-                    text: root.tr("dialog.first-launch-install.learn-more",
-                        "Learn more")
-                    onClicked: { root.learnMoreRequested(); }
-                }
-                ThemedButton {
-                    theme: root.ownerRoot ? root.ownerRoot.uiTheme : null
-                    text: root.tr("dialog.first-launch-install.skip-button",
-                        "Continue without service (limited)")
-                    onClicked: { root.skipRequested(); root.close() }
+                    text: root.tr("dialog.first-launch-install.install-button",
+                        "Install and start service (recommended)")
+                    highlighted: true
+                    onClicked: { root.installRequested(); root.close() }
                 }
                 ThemedButton {
                     theme: root.ownerRoot ? root.ownerRoot.uiTheme : null
@@ -126,10 +123,15 @@ Window {
                 }
                 ThemedButton {
                     theme: root.ownerRoot ? root.ownerRoot.uiTheme : null
-                    text: root.tr("dialog.first-launch-install.install-button",
-                        "Install and start service (recommended)")
-                    highlighted: true
-                    onClicked: { root.installRequested(); root.close() }
+                    text: root.tr("dialog.first-launch-install.skip-button",
+                        "Continue without service (limited)")
+                    onClicked: { root.skipRequested(); root.close() }
+                }
+                ThemedButton {
+                    theme: root.ownerRoot ? root.ownerRoot.uiTheme : null
+                    text: root.tr("dialog.first-launch-install.learn-more",
+                        "Learn more")
+                    onClicked: { root.learnMoreRequested(); }
                 }
             }
         }

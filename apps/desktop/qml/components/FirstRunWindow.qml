@@ -21,12 +21,12 @@ Window {
     // ApplicationWindow injected by the caller (`root: window`).
     property var root: null
 
-    width: 640
-    // Within the screen's free area: the bar under the pages must never sit
-    // under the taskbar; the pages scroll instead.
-    readonly property int _frameAllowance: 40
-    height: Math.min(640, Math.max(320,
-        Math.min(Screen.height, Screen.desktopAvailableHeight) - 2 * _frameAllowance))
+    // The size wanted; `_fitOnScreen` shrinks it to the free part of the
+    // screen, so the bar under the pages never sits under the taskbar.
+    readonly property int _wantWidth: 640
+    readonly property int _wantHeight: 640
+    width: _wantWidth
+    height: _wantHeight
     visible: false
     modality: Qt.WindowModal
     color: root.panelColor
@@ -181,6 +181,50 @@ Window {
         if (other !== "" && key === other) return false
         return Pure.adapterPassesFilter(item, showAllAdapters, "")
             || (own !== "" && key === own)
+            || (role === "secondary" && _idleVpnProgram(item) !== null)
+    }
+
+    /// The found VPN's adapters that are down: listed on the additional step
+    /// without "Show unavailable adapters", as the VPN is only not started.
+    function _idleVpnOffer() {
+        return Pure.firstRunIdleVpns(_modelRows(), _vpnPrograms, _modelIndexOfKey(pickedPrimaryKey))
+    }
+
+    /// Asks to turn the VPN on when several down adapters, of any driver, may
+    /// be its: which one it takes shows only once it is on.
+    function _startVpnFirstHint() {
+        var programs = _idleVpnOffer().startVpnFirst
+        if (programs.length === 0) return ""
+        return programs.length === 1 && programs[0] !== ""
+            ? root.tr("dialog.first-run-wizard.secondary-adapter-start-vpn-first-program",
+                "{program} may use any of several connections on this computer, and while the VPN is off there is no telling which one. Turn the VPN on — the wizard will see it and pick it.")
+                .replace("{program}", Pure.displayText(programs[0]))
+            : root.tr("dialog.first-run-wizard.secondary-adapter-start-vpn-first",
+                "Your VPN may use any of several connections on this computer, and while it is off there is no telling which one. Turn the VPN on — the wizard will see it and pick it.")
+    }
+
+    /// A connection that is down while other copies of its driver sit on the
+    /// machine is not set from this step: the VPN takes whichever copy it
+    /// likes, and the warning above the list says so.
+    function _pooledDown(index) {
+        if (index < 0 || index >= root.interfacesModel.count) return false
+        var row = root.interfacesModel.get(index)
+        if (String(row.availability || "") === "available") return false
+        var siblings = Pure.adapterDriverSiblings(_modelRows(), index, "secondary")
+        return siblings.live.length + siblings.idle > 0
+    }
+
+    /// The program an offered down VPN adapter belongs to ("" when unsure),
+    /// null for an adapter not offered so.
+    function _idleVpnProgram(item) {
+        var key = _rowKey(item)
+        if (key === "") return null
+        var offer = _idleVpnOffer()
+        for (var i = 0; i < offer.rows.length; i += 1) {
+            if (_rowKey(root.interfacesModel.get(offer.rows[i].index)) === key)
+                return offer.rows[i].program
+        }
+        return null
     }
 
     /// The pick for `role`; the other route loses a pick of the same adapter.
@@ -192,6 +236,106 @@ Window {
             pickedSecondaryKey = key
             if (pickedPrimaryKey === key) pickedPrimaryKey = ""
         }
+    }
+
+    // An answered connection page shows its answer and "Change", which brings
+    // the list back with the answer picked; going Back never locks a choice.
+    property bool changingPrimary: false
+    property bool changingSecondary: false
+    readonly property bool choosingPrimary: !primaryAssigned || changingPrimary
+    readonly property bool choosingSecondary:
+        (!secondaryAssigned && !secondaryDeferred) || changingSecondary
+
+    function _changeChoice(role) {
+        if (role === "primary") {
+            changingPrimary = true
+            if (assignedPrimaryIndex >= 0)
+                _pick("primary", _rowKey(root.interfacesModel.get(assignedPrimaryIndex)))
+        } else {
+            changingSecondary = true
+            secondaryDeferred = false
+            if (assignedSecondaryIndex >= 0)
+                _pick("secondary", _rowKey(root.interfacesModel.get(assignedSecondaryIndex)))
+        }
+        Qt.callLater(_focusStep)
+    }
+
+    function _keepChoice(role) {
+        if (role === "primary") changingPrimary = false
+        else changingSecondary = false
+        Qt.callLater(_focusStep)
+    }
+
+    // The adapter a "Set as" press asked for, until the role lands on it: the
+    // controller may ask a question first, and a declined one leaves the page.
+    property string _awaitPrimaryKey: ""
+    property string _awaitSecondaryKey: ""
+
+    /// "Set as main" answers its page and the window goes on; "Set as
+    /// additional" stays, so another VPN can still be set up there.
+    function _assignFromPage(role, index) {
+        var ctl = root.interfacesRolesController
+        if (!ctl || typeof ctl.assignRole !== "function"
+                || index < 0 || index >= root.interfacesModel.count) return
+        var key = _rowKey(root.interfacesModel.get(index))
+        _pick(role, key)
+        if (role === "primary") _awaitPrimaryKey = key
+        else _awaitSecondaryKey = key
+        ctl.assignRole(index, role)
+        _afterAssign()
+    }
+
+    function _afterAssign() {
+        var landed = function(held, key) {
+            return key !== "" && held >= 0 && _rowKey(root.interfacesModel.get(held)) === key
+        }
+        if (landed(assignedSecondaryIndex, _awaitSecondaryKey)) {
+            _awaitSecondaryKey = ""
+            changingSecondary = false
+        }
+        if (landed(assignedPrimaryIndex, _awaitPrimaryKey)) {
+            _awaitPrimaryKey = ""
+            changingPrimary = false
+            if (step === 0) step = 1
+        }
+    }
+
+    // While the additional connection is asked, a link that comes up is most
+    // likely the VPN the user has just started: it is named and offered in one
+    // press. `_adaptersSeen` is the last look, kept across pages.
+    property var _adaptersSeen: null
+    property string justConnectedKey: ""
+
+    function _watchAdapters() {
+        if (!visible || step !== 1 || !root.interfacesAreLive) return
+        var rows = _modelRows()
+        if (_adaptersSeen !== null) {
+            var i = Pure.firstRunJustConnected(_adaptersSeen, rows, _modelIndexOfKey(pickedPrimaryKey))
+            if (i >= 0 && _rowKey(rows[i]) !== justConnectedKey) {
+                justConnectedKey = _rowKey(rows[i])
+                if (pickedSecondaryKey === "") _pick("secondary", justConnectedKey)
+                // Which program it is: the scan says which ones run now.
+                _scanInstalledVpns()
+            }
+        }
+        var j = _modelIndexOfKey(justConnectedKey)
+        if (justConnectedKey !== "" && (j < 0
+                || String(rows[j].availability || "") !== "available"
+                || String(rows[j].selectedRole || "") !== ""))
+            justConnectedKey = ""
+        _adaptersSeen = rows.map(function(row) {
+            return { persistentId: String(row.persistentId || ""), name: String(row.name || ""),
+                availability: String(row.availability || "") }
+        })
+    }
+
+    function _pickIsIdleVpn() {
+        var i = _modelIndexOfKey(pickedSecondaryKey)
+        return i >= 0 && _idleVpnProgram(root.interfacesModel.get(i)) !== null
+    }
+
+    function _assignJustConnected() {
+        _assignFromPage("secondary", _modelIndexOfKey(justConnectedKey))
     }
 
     // The one connected adapter that fits a role is picked for the user, who
@@ -207,17 +351,53 @@ Window {
         }
         if (step === 1 && !secondaryAssigned && !secondaryDeferred && pickedSecondaryKey === "") {
             var s = Pure.firstRunSuggestion(rows, "secondary", _modelIndexOfKey(pickedPrimaryKey))
+            // A connected VPN first, else the found VPN's adapter that is down.
+            if (s < 0) s = _idleVpnOffer().preselect
             if (s >= 0) pickedSecondaryKey = _rowKey(rows[s])
         }
     }
     Connections {
         target: root
-        function onUiRevisionChanged() { firstRunWindow._suggestPicks() }
+        function onUiRevisionChanged() {
+            firstRunWindow._afterAssign()
+            firstRunWindow._watchAdapters()
+            firstRunWindow._suggestPicks()
+        }
+    }
+
+    // A VPN started while its page is shown must show up without a press on
+    // Refresh: the list is probed every 2 s on that page only, and re-read
+    // only when an adapter appeared, left, or went up or down.
+    property string _adapterPrint: ""
+    Timer {
+        interval: 2000
+        repeat: true
+        running: firstRunWindow.visible && firstRunWindow.step === 1
+            && firstRunWindow.choosingSecondary
+        onTriggered: firstRunWindow._probeAdapters()
+    }
+    function _probeAdapters() {
+        var ctl = root.interfacesRolesController
+        if (!root.bridgeAvailable || typeof nrrNativeBridge === "undefined" || !nrrNativeBridge
+                || typeof nrrNativeBridge.rpcSnapshotInterfacesGet !== "function"
+                || !ctl || typeof ctl.refreshInterfacesFromService !== "function") return
+        var corr = nrrNativeBridge.rpcSnapshotInterfacesGet()
+        if (!corr) return
+        root.rpc.registerRpcCallback(corr, function(ok, payload) {
+            if (!ok || !payload) return
+            var print = (payload.rows || []).map(function(w) {
+                return String(w["persistent-id"] || w.name || "") + "=" + String(w.availability || "")
+            }).join("|")
+            if (print === _adapterPrint) return
+            _adapterPrint = print
+            ctl.refreshInterfacesFromService()
+        })
     }
 
     // VPN programs installed on this machine, named in the hint while no VPN
     // connection is up: "start it first" is easier to act on with a name.
     property var installedVpnNames: []
+    property var _vpnPrograms: []
     function _scanInstalledVpns() {
         if (!root.rpc || typeof root.rpc.rpcVpnDiscover !== "function"
                 || typeof root.rpc.registerRpcCallback !== "function") return
@@ -232,7 +412,34 @@ Window {
                 if (n !== "" && names.indexOf(n) < 0) names.push(n)
             }
             installedVpnNames = names
+            _vpnPrograms = rows
+            _suggestPicks()
         })
+    }
+
+    /// The VPN program behind the connection that just came up: the running
+    /// one that names it, else the only one running; "" when unsure.
+    function _justConnectedProgram(adapterName) {
+        var running = _vpnPrograms.filter(function(p) { return p.running === true })
+        var named = running.filter(function(p) {
+            return p.interfaceName !== "" && p.interfaceName === adapterName
+        })
+        var pick = named.length > 0 ? named[0] : (running.length === 1 ? running[0] : null)
+        return pick ? Pure.displayText(pick.displayName || _basename(pick.exePath)) : ""
+    }
+
+    function _justConnectedHint() {
+        var i = _modelIndexOfKey(justConnectedKey)
+        if (i < 0) return ""
+        var name = String(root.interfacesModel.get(i).name || "")
+        var program = _justConnectedProgram(name)
+        return (program !== ""
+            ? root.tr("dialog.first-run-wizard.secondary-adapter-just-connected-program",
+                "Just connected: {name} — probably your VPN ({program}).")
+            : root.tr("dialog.first-run-wizard.secondary-adapter-just-connected",
+                "Just connected: {name} — probably your VPN."))
+            .replace("{name}", Pure.adapterDisplayName(root.interfacesModel.get(i)))
+            .replace("{program}", program)
     }
 
     function _commitPendingPicks() {
@@ -425,6 +632,16 @@ Window {
     /// and the hint which role the recommendation sees in it.
     function _adapterLabel(row, role) {
         if (!row) return ""
+        var program = role === "secondary" ? _idleVpnProgram(row) : null
+        if (program !== null) {
+            return (program !== ""
+                ? root.tr("dialog.first-run-wizard.secondary-adapter-idle-vpn-program",
+                    "{name} (VPN {program}, not connected now)")
+                : root.tr("dialog.first-run-wizard.secondary-adapter-idle-vpn",
+                    "{name} (VPN, not connected now)"))
+                .replace("{name}", Pure.adapterDisplayName(row))
+                .replace("{program}", Pure.displayText(program))
+        }
         // One rule for how an adapter reads, shared with every dialog.
         var parts = [Pure.adapterDisplayName(row)]
         var tech = String(row.deviceTechnology || "")
@@ -484,9 +701,15 @@ Window {
     property int step: 0
     onStepChanged: {
         wizardScroller.contentItem.contentY = 0
+        // A page comes back showing its answer, with "Change" beside it.
+        changingPrimary = false
+        changingSecondary = false
+        _awaitPrimaryKey = ""
+        _awaitSecondaryKey = ""
         // The review names the protection in force: it is sent on the way in.
         if (visible && step === stepCount - 1) _saveProtection()
         Qt.callLater(_suggestPicks)
+        Qt.callLater(_watchAdapters)
         Qt.callLater(_focusStep)
     }
 
@@ -497,6 +720,9 @@ Window {
         if (step === stepCount - 1 && finishButton.visible) finishButton.forceActiveFocus()
         else if (step === 0 && firstRunPrimaryCombo.visible && firstRunPrimaryCombo.enabled)
             firstRunPrimaryCombo.forceActiveFocus()
+        else if (step === 1 && justConnectedAssign.visible) justConnectedAssign.forceActiveFocus()
+        else if (step === 2 && countryPresetOption.visible) countryPresetOption.forceActiveFocus()
+        else if (step === 2 && !nextButton.enabled) demoOption.forceActiveFocus()
         else if (step === 1 && firstRunSecondaryCombo.visible && firstRunSecondaryCombo.enabled)
             firstRunSecondaryCombo.forceActiveFocus()
         else if (nextButton.visible) nextButton.forceActiveFocus()
@@ -505,7 +731,7 @@ Window {
     function _stepTitle(index) {
         switch (index) {
         case 0: return root.tr("interfaces.role.primary", "Main connection")
-        case 1: return root.tr("interfaces.role.secondary", "Additional connection")
+        case 1: return root.tr("interfaces.role.secondary", "Additional connection (e.g. VPN)")
         case 2: return root.tr("dialog.first-run-wizard.step-rules", "Starting rules")
         case 3: return root.tr("dialog.first-run-wizard.step-options", "Protection and options")
         default: return root.tr("dialog.first-run-wizard.step-review", "Ready to finish")
@@ -515,8 +741,37 @@ Window {
     // A connection page is settled once its role is set or deferred; until
     // then its "Set as" button is the next thing to press, not Next.
     readonly property bool stepSettled: step === 0
-        ? primaryAssigned
-        : step === 1 && (secondaryAssigned || secondaryDeferred)
+        ? !choosingPrimary
+        : step === 1 && !choosingSecondary
+
+    /// The rules page asks for a decision: a set, or "Start empty" pressed.
+    function _nextAllowed() {
+        return step !== 2 || chosenStart !== null
+    }
+
+    /// The one thing that pulses: what the user has to do next.
+    function _pulseTarget() {
+        switch (step) {
+        case 0: return choosingPrimary ? "primary-assign" : "next"
+        case 1:
+            if (!choosingSecondary) return "next"
+            return justConnectedKey !== "" ? "just-connected" : "secondary-assign"
+        case 2: return chosenStart === null ? "rule-options" : "next"
+        case stepCount - 1: return "finish"
+        default: return "next"
+        }
+    }
+    readonly property string pulseTarget: root.uiRevision >= 0 && visible ? _pulseTarget() : ""
+    // A ring round the button comes and goes; the button itself never dims,
+    // or a pressable button reads as a disabled one.
+    property real pulse: 0
+    SequentialAnimation on pulse {
+        running: firstRunWindow.visible && firstRunWindow.pulseTarget !== ""
+        loops: Animation.Infinite
+        NumberAnimation { to: 1.0; duration: 650; easing.type: Easing.InOutQuad }
+        NumberAnimation { to: 0.0; duration: 650; easing.type: Easing.InOutQuad }
+        onRunningChanged: if (!running) firstRunWindow.pulse = 0
+    }
 
     /// The connection the review page names for `role`: the one holding it,
     /// else the pick the close will commit.
@@ -539,7 +794,7 @@ Window {
             .replace("{name}", _reviewAdapterName("primary"))]
         if (!primaryAssigned && Pure.firstRunPickToCommit(_modelRows(), "primary", pickedPrimaryKey) < 0)
             lines.push(root.tr("dialog.first-run-wizard.review-no-primary",
-                "Your rules are not applied until a main connection is chosen. You can choose it later in Interfaces and routes."))
+                "Your rules are not applied until a main connection is chosen. You can choose it later in Connections."))
         lines.push(root.tr("dialog.first-run-wizard.review-secondary", "Additional connection: {name}")
             .replace("{name}", _reviewAdapterName("secondary")))
         lines.push(root.tr("dialog.first-run-wizard.review-rules", "Starting rules: {name}")
@@ -574,8 +829,16 @@ Window {
         pickedPrimaryKey = ""
         pickedSecondaryKey = ""
         secondaryDeferred = false
+        changingPrimary = false
+        changingSecondary = false
+        _awaitPrimaryKey = ""
+        _awaitSecondaryKey = ""
+        _adaptersSeen = null
+        justConnectedKey = ""
+        _adapterPrint = ""
         showAllAdapters = false
         installedVpnNames = []
+        _vpnPrograms = []
         chosenStart = null
         chosenStartError = ""
         _heldProtection = null
@@ -592,21 +855,76 @@ Window {
         _stabilityWritePending = false
     }
 
-    /// Moves the window back inside the free area of its screen.
-    function _fitOnScreen() {
-        var free = Math.min(Screen.height, Screen.desktopAvailableHeight)
-        var bottom = Screen.virtualY + free - 8
-        if (y + height > bottom) y = bottom - height
-        if (y < Screen.virtualY + _frameAllowance) y = Screen.virtualY + _frameAllowance
-        var right = Screen.virtualX + Math.min(Screen.width, Screen.desktopAvailableWidth)
-        if (x + width > right) x = right - width
-        if (x < Screen.virtualX) x = Screen.virtualX
+    /// The free part of the screen this window is on, taskbar excluded; null
+    /// before there is a screen. QML's `desktopAvailable*` spans every
+    /// monitor: the host's work area of the primary screen is asked first.
+    function _workArea() {
+        var s = firstRunWindow.screen
+        var bridge = typeof nrrNativeBridge !== "undefined" ? nrrNativeBridge : null
+        if (bridge && typeof bridge.trayNoticeScreenGeometry === "function") {
+            var r = bridge.trayNoticeScreenGeometry()
+            var inside = !s || !(s.width > 0) || (r && r.x >= s.virtualX && r.y >= s.virtualY
+                && r.x + r.width <= s.virtualX + s.width && r.y + r.height <= s.virtualY + s.height)
+            if (r && r.width > 0 && r.height > 0 && inside) return r
+        }
+        if (!s || !(s.width > 0) || !(s.height > 0)) return null
+        var inset = Math.max(0, Math.min(120, s.height - s.desktopAvailableHeight))
+        return { x: s.virtualX, y: s.virtualY,
+            width: Math.min(s.width, s.desktopAvailableWidth || s.width), height: s.height - inset }
+    }
+
+    /// Size and place within `area` for a window wanted at `x`, `y`: the title
+    /// bar above `y` and the frame below `y + height` stay inside too.
+    function _fitIn(area, atX, atY) {
+        var titleBar = 36, frame = 8
+        var w = Math.max(320, Math.min(_wantWidth, area.width - 2 * frame))
+        var h = Math.max(320, Math.min(_wantHeight, area.height - titleBar - 2 * frame))
+        var nx = Math.max(area.x + frame, Math.min(atX, area.x + area.width - w - frame))
+        var ny = Math.max(area.y + titleBar, Math.min(atY, area.y + area.height - h - frame))
+        return { x: nx, y: ny, width: w, height: h }
+    }
+
+    /// Over the part of the main window that lies in `area`, the middle of
+    /// `area` when none does: a main window still settling (restored, resized
+    /// or off-screen) never pushes the wizard to the screen edge.
+    function _centerIn(area) {
+        var l = Math.max(area.x, root.x), r = Math.min(area.x + area.width, root.x + root.width)
+        var t = Math.max(area.y, root.y), b = Math.min(area.y + area.height, root.y + root.height)
+        var cx = r > l ? (l + r) / 2 : area.x + area.width / 2
+        var cy = b > t ? (t + b) / 2 : area.y + area.height / 2
+        x = Math.round(cx - width / 2)
+        y = Math.round(cy - height / 2)
+    }
+
+    /// Fits the window into the free part of its screen; `center` first puts
+    /// it over the main window.
+    function _fitOnScreen(center) {
+        var area = _workArea()
+        if (!area) return
+        var size = _fitIn(area, x, y)
+        if (width !== size.width) width = size.width
+        if (height !== size.height) height = size.height
+        if (center) _centerIn(area)
+        // A move that changes nothing still goes through the platform layer.
+        var at = _fitIn(area, x, y)
+        if (x !== at.x) x = at.x
+        if (y !== at.y) y = at.y
+    }
+    onScreenChanged: if (visible) _fitOnScreen(false)
+    onActiveChanged: if (active) _fitOnScreen(false)
+    Connections {
+        target: firstRunWindow.screen
+        ignoreUnknownSignals: true
+        function onDesktopGeometryChanged() { if (firstRunWindow.visible) firstRunWindow._fitOnScreen(false) }
+        function onHeightChanged() { if (firstRunWindow.visible) firstRunWindow._fitOnScreen(false) }
+        function onWidthChanged() { if (firstRunWindow.visible) firstRunWindow._fitOnScreen(false) }
     }
 
     onVisibleChanged: {
         if (visible) {
-            root.centerChildWindow(firstRunWindow)
-            _fitOnScreen()
+            _fitOnScreen(true)
+            // Again once the main window has taken its place.
+            Qt.callLater(function() { firstRunWindow._fitOnScreen(true) })
             root.applyTitleBarTo(firstRunWindow)
             _startRun()
             _detectCountryPreset()
@@ -799,7 +1117,8 @@ Window {
         var flows = root.presetImportController
         // This window is gone by the time the service answers: the outcome is
         // a message box over the main window, named as the user picked it.
-        var opts = { label: c.label }
+        // Picked here, so applied without a second review.
+        var opts = { label: c.label, confirmed: true }
         if (c.route === "both") {
             if (typeof flows.startBothRoutesPresetImportReviewFlow === "function")
                 flows.startBothRoutesPresetImportReviewFlow(c.primB64, c.secB64, c.primPath, c.secPath, opts)
@@ -853,7 +1172,7 @@ Window {
     function _applyBuiltinDemo() {
         var primRel = root.builtinDemoPreset("rules_primary.txt")
         var secRel = root.builtinDemoPreset("rules_secondary.txt")
-        _choose("demo", root.tr("dialog.first-run-wizard.rule-set-demo-name", "the built-in demo rules"),
+        _choose("demo", root.tr("dialog.first-run-wizard.rule-set-demo-name", "Example rules"),
             _readPresetBytes(primRel), _readPresetBytes(secRel),
             _resolvePresetAbs(primRel), _resolvePresetAbs(secRel))
     }
@@ -870,7 +1189,7 @@ Window {
     function _chooseFailed(detail) {
         chosenStart = null
         chosenStartError = root.tr("status.wizard-import-failed",
-            "First-run wizard import failed: ") + detail
+            "Could not load the starting rules: ") + detail
     }
 
     function _localPathFromUrl(urlValue) {
@@ -915,9 +1234,9 @@ Window {
         fileMode: FileDialog.OpenFile
         // Same folder every other rule-file dialog uses.
         title: root.tr("dialog.first-run-wizard.pick-primary-title",
-            "Choose primary route preset file")
+            "Choose the rules file for the main connection")
         nameFilters: [
-            root.tr("rules.dialog.preset-filter", "Preset files (*.txt)"),
+            root.tr("rules.dialog.preset-filter", "Rules files (*.txt)"),
             root.tr("rules.dialog.all-filter", "All files (*)")
         ]
         onAccepted: firstRunWindow.pickedPrimaryPath =
@@ -928,9 +1247,9 @@ Window {
         id: firstRunOpenSecondaryDialog
         fileMode: FileDialog.OpenFile
         title: root.tr("dialog.first-run-wizard.pick-secondary-title",
-            "Choose additional route preset file")
+            "Choose the rules file for the additional connection")
         nameFilters: [
-            root.tr("rules.dialog.preset-filter", "Preset files (*.txt)"),
+            root.tr("rules.dialog.preset-filter", "Rules files (*.txt)"),
             root.tr("rules.dialog.all-filter", "All files (*)")
         ]
         onAccepted: firstRunWindow.pickedSecondaryPath =
@@ -963,8 +1282,10 @@ Window {
             x: wizardScroller.width - width
             y: wizardScroller.topPadding
             height: wizardScroller.availableHeight
-            policy: wizardScroller.contentHeight > wizardScroller.height
-                ? ScrollBar.AlwaysOn : ScrollBar.AsNeeded
+            // Drawn here, so no style hides it: only a page taller than the
+            // view shows it.
+            visible: wizardScroller.contentHeight > wizardScroller.availableHeight
+            policy: ScrollBar.AlwaysOn
             contentItem: Rectangle {
                 implicitWidth: 8
                 implicitHeight: 32
@@ -1060,7 +1381,7 @@ Window {
                     color: root.mutedTextColor
                     text: firstRunWindow.primaryAssigned
                         ? root.tr("dialog.first-run-wizard.primary-adapter-assigned",
-                            "Main connection: {name}. You can change it later in Interfaces and routes.")
+                            "Main connection: {name}. You can change it later in Connections.")
                             .replace("{name}", firstRunWindow.assignedPrimaryName)
                         : root.tr("dialog.first-run-wizard.primary-adapter-description",
                             "The connection everything travels by default. Until you name it, your rules are not applied.")
@@ -1074,10 +1395,20 @@ Window {
                     text: root.uiRevision >= 0 ? firstRunWindow._siblingWarning("primary") : ""
                     visible: text !== ""
                 }
+                // The answer given stays changeable here, not only in Interfaces.
+                ThemedButton {
+                    id: firstRunPrimaryChange
+                    theme: root.uiTheme
+                    visible: !firstRunWindow.choosingPrimary
+                    text: root.tr("action.change", "Change...")
+                    Accessible.role: Accessible.Button
+                    Accessible.name: root.tr("interfaces.role.primary", "Main connection") + ": " + text
+                    onClicked: firstRunWindow._changeChoice("primary")
+                }
                 RowLayout {
                     Layout.fillWidth: true
                     spacing: root.uiTheme.spacingSm
-                    visible: !firstRunWindow.primaryAssigned
+                    visible: firstRunWindow.choosingPrimary
                     ThemedComboBox {
                         id: firstRunPrimaryCombo
                         theme: root.uiTheme
@@ -1123,23 +1454,18 @@ Window {
                         highlighted: enabled
                         enabled: root.interfacesAreLive && root.uiRevision >= 0
                             && firstRunWindow._offeredFor(firstRunPrimaryCombo.currentIndex, "primary")
-                        // Pulses until pressed, the one thing to do on this page:
-                        // nothing is applied before the main connection is named.
-                        SequentialAnimation on opacity {
-                            running: firstRunPrimaryAssign.enabled && firstRunPrimaryAssign.visible
-                                && firstRunWindow.visible
-                            loops: Animation.Infinite
-                            NumberAnimation { to: 0.45; duration: 650; easing.type: Easing.InOutQuad }
-                            NumberAnimation { to: 1.0; duration: 650; easing.type: Easing.InOutQuad }
-                            onRunningChanged: if (!running) firstRunPrimaryAssign.opacity = 1
-                        }
-                        onClicked: {
-                            if (root.interfacesRolesController
-                                    && typeof root.interfacesRolesController.assignRole === "function") {
-                                root.interfacesRolesController.assignRole(
-                                    firstRunPrimaryCombo.currentIndex, "primary")
-                            }
-                        }
+                        attention: enabled && firstRunWindow.pulseTarget === "primary-assign"
+                            ? firstRunWindow.pulse : 0
+                        onClicked: firstRunWindow._assignFromPage("primary",
+                            firstRunPrimaryCombo.currentIndex)
+                    }
+                    ThemedButton {
+                        theme: root.uiTheme
+                        visible: firstRunWindow.changingPrimary && firstRunWindow.primaryAssigned
+                        text: root.tr("action.cancel", "Cancel")
+                        Accessible.role: Accessible.Button
+                        Accessible.name: text
+                        onClicked: firstRunWindow._keepChoice("primary")
                     }
                 }
                 Label {
@@ -1147,24 +1473,24 @@ Window {
                     Layout.preferredWidth: 0
                     wrapMode: Text.WordWrap
                     color: root.mutedTextColor
-                    visible: !firstRunWindow.primaryAssigned && root.uiRevision >= 0
+                    visible: firstRunWindow.choosingPrimary && root.uiRevision >= 0
                         && firstRunPrimaryCombo.currentIndex >= 0
                         && !firstRunWindow._offeredFor(firstRunPrimaryCombo.currentIndex, "primary")
                     text: root.tr("interfaces.role.exclusive-note",
-                        "One adapter cannot carry both routes: to use it for the other one, unassign its current role first.")
+                        "One connection cannot be both main and additional: to use it for the other role, unassign its current one first.")
                 }
                 Label {
                     Layout.fillWidth: true
                     wrapMode: Text.WordWrap
                     color: root.mutedTextColor
-                    visible: !firstRunWindow.primaryAssigned
+                    visible: firstRunWindow.choosingPrimary
                         && (root.interfacesModel.count === 0 || !root.interfacesAreLive)
                     text: root.tr("dialog.first-run-wizard.primary-adapter-unavailable",
-                        "No connections to choose from yet — the background service reports them once it is running. You can set this later in Interfaces and routes.")
+                        "No connections to choose from yet — the background service reports them once it is running. You can set this later in Connections.")
                 }
                 CheckBox {
                     id: firstRunPrimaryShowAll
-                    visible: !firstRunWindow.primaryAssigned
+                    visible: firstRunWindow.choosingPrimary
                     checked: firstRunWindow.showAllAdapters
                     onToggled: firstRunWindow.showAllAdapters = checked
                     text: root.tr("interfaces.toggle.show-unavailable-adapters",
@@ -1192,7 +1518,7 @@ Window {
 
                 Label {
                     text: root.tr("interfaces.role.secondary",
-                        "Additional connection")
+                        "Additional connection (e.g. VPN)")
                     color: root.textColor
                     font.bold: true
                 }
@@ -1203,13 +1529,13 @@ Window {
                     text: firstRunWindow.secondaryAssigned
                         ? (firstRunWindow.secondaryAssignedDown
                             ? root.tr("dialog.first-run-wizard.secondary-adapter-assigned-down",
-                                "Additional connection: {name} — chosen, not connected yet. Your rules use it as soon as it connects. You can change it later in Interfaces and routes.")
+                                "Additional connection: {name} — chosen, not connected yet. Your rules use it as soon as it connects. You can change it later in Connections.")
                             : root.tr("dialog.first-run-wizard.secondary-adapter-assigned",
-                                "Additional connection: {name}. You can change it later in Interfaces and routes."))
+                                "Additional connection: {name}. You can change it later in Connections."))
                             .replace("{name}", firstRunWindow.assignedSecondaryName)
                         : (firstRunWindow.secondaryDeferred
                             ? root.tr("dialog.first-run-wizard.secondary-adapter-deferred",
-                                "You can assign it any time in Interfaces and routes. Until then, with leak protection on, the traffic your rules send that way is blocked instead of leaking to the main connection.")
+                                "You can assign it any time in Connections. Until then, with leak protection on, the traffic your rules send that way is blocked instead of leaking to the main connection.")
                             : root.tr("dialog.first-run-wizard.secondary-adapter-description",
                                 "The connection your rules send traffic to — a VPN or a second network. Rules that name it do nothing until it is assigned."))
                 }
@@ -1222,10 +1548,61 @@ Window {
                     text: root.uiRevision >= 0 ? firstRunWindow._siblingWarning("secondary") : ""
                     visible: text !== ""
                 }
+                ThemedButton {
+                    id: firstRunSecondaryChange
+                    theme: root.uiTheme
+                    visible: firstRunWindow.secondaryAssigned && !firstRunWindow.changingSecondary
+                    text: root.tr("action.change", "Change...")
+                    Accessible.role: Accessible.Button
+                    Accessible.name: root.tr("interfaces.role.secondary", "Additional connection (e.g. VPN)") + ": " + text
+                    onClicked: firstRunWindow._changeChoice("secondary")
+                }
+                // The VPN the user has just started, named and set in one press.
+                Rectangle {
+                    Layout.fillWidth: true
+                    Layout.preferredHeight: justConnectedRow.implicitHeight + 2 * root.uiTheme.spacingSm
+                    visible: firstRunWindow.choosingSecondary && firstRunWindow.justConnectedKey !== ""
+                    radius: 4
+                    color: Qt.rgba(root.uiTheme.colorAccent.r, root.uiTheme.colorAccent.g,
+                        root.uiTheme.colorAccent.b, 0.12)
+                    border.color: root.uiTheme.colorAccent
+                    border.width: 2
+                    RowLayout {
+                        id: justConnectedRow
+                        anchors.fill: parent
+                        anchors.margins: root.uiTheme.spacingSm
+                        spacing: root.uiTheme.spacingSm
+                        Label {
+                            id: justConnectedText
+                            Layout.fillWidth: true
+                            Layout.preferredWidth: 0
+                            wrapMode: Text.WordWrap
+                            textFormat: Text.PlainText
+                            font.bold: true
+                            color: root.textColor
+                            text: root.uiRevision >= 0 && firstRunWindow.justConnectedKey !== ""
+                                ? firstRunWindow._justConnectedHint() : ""
+                            Accessible.role: Accessible.StaticText
+                            Accessible.name: text
+                        }
+                        ThemedButton {
+                            id: justConnectedAssign
+                            theme: root.uiTheme
+                            highlighted: true
+                            attention: firstRunWindow.pulseTarget === "just-connected"
+                                ? firstRunWindow.pulse : 0
+                            text: root.tr("dialog.first-run-wizard.secondary-adapter-assign",
+                                "Set as additional")
+                            Accessible.role: Accessible.Button
+                            Accessible.name: justConnectedText.text + " " + text
+                            onClicked: firstRunWindow._assignJustConnected()
+                        }
+                    }
+                }
                 RowLayout {
                     Layout.fillWidth: true
                     spacing: root.uiTheme.spacingSm
-                    visible: !firstRunWindow.secondaryAssigned && !firstRunWindow.secondaryDeferred
+                    visible: firstRunWindow.choosingSecondary
                     ThemedComboBox {
                         id: firstRunSecondaryCombo
                         theme: root.uiTheme
@@ -1259,7 +1636,7 @@ Window {
                                 "Choose a connection")
                         Accessible.role: Accessible.ComboBox
                         Accessible.name: root.tr("interfaces.role.secondary",
-                            "Additional connection")
+                            "Additional connection (e.g. VPN)")
                     }
                     ThemedButton {
                         id: firstRunSecondaryAssign
@@ -1269,25 +1646,23 @@ Window {
                         highlighted: enabled
                         enabled: root.interfacesAreLive && root.uiRevision >= 0
                             && firstRunWindow._offeredFor(firstRunSecondaryCombo.currentIndex, "secondary")
-                        // Pulses until pressed, the one thing to do on this page.
-                        SequentialAnimation on opacity {
-                            running: firstRunSecondaryAssign.highlighted && firstRunSecondaryAssign.visible
-                                && firstRunWindow.visible
-                            loops: Animation.Infinite
-                            NumberAnimation { to: 0.45; duration: 650; easing.type: Easing.InOutQuad }
-                            NumberAnimation { to: 1.0; duration: 650; easing.type: Easing.InOutQuad }
-                            onRunningChanged: if (!running) firstRunSecondaryAssign.opacity = 1
-                        }
-                        onClicked: {
-                            if (root.interfacesRolesController
-                                    && typeof root.interfacesRolesController.assignRole === "function") {
-                                root.interfacesRolesController.assignRole(
-                                    firstRunSecondaryCombo.currentIndex, "secondary")
-                            }
-                        }
+                            && !firstRunWindow._pooledDown(firstRunSecondaryCombo.currentIndex)
+                        attention: enabled && firstRunWindow.pulseTarget === "secondary-assign"
+                            ? firstRunWindow.pulse : 0
+                        onClicked: firstRunWindow._assignFromPage("secondary",
+                            firstRunSecondaryCombo.currentIndex)
                     }
                     ThemedButton {
                         theme: root.uiTheme
+                        visible: firstRunWindow.changingSecondary && firstRunWindow.secondaryAssigned
+                        text: root.tr("action.cancel", "Cancel")
+                        Accessible.role: Accessible.Button
+                        Accessible.name: text
+                        onClicked: firstRunWindow._keepChoice("secondary")
+                    }
+                    ThemedButton {
+                        theme: root.uiTheme
+                        visible: !firstRunWindow.secondaryAssigned
                         text: root.tr("dialog.first-run-wizard.secondary-adapter-later",
                             "I will choose it later")
                         Accessible.role: Accessible.Button
@@ -1315,33 +1690,42 @@ Window {
                     Layout.preferredWidth: 0
                     wrapMode: Text.WordWrap
                     color: root.mutedTextColor
-                    visible: !firstRunWindow.secondaryAssigned && !firstRunWindow.secondaryDeferred
+                    visible: firstRunWindow.choosingSecondary
                         && root.uiRevision >= 0
                         && firstRunSecondaryCombo.currentIndex >= 0
                         && !firstRunWindow._offeredFor(firstRunSecondaryCombo.currentIndex, "secondary")
                     text: root.tr("interfaces.role.exclusive-note",
-                        "One adapter cannot carry both routes: to use it for the other one, unassign its current role first.")
+                        "One connection cannot be both main and additional: to use it for the other role, unassign its current one first.")
                 }
+                // "Set up my VPN" stays once a VPN is set: the next VPN
+                // program is added from here too.
                 RowLayout {
                     Layout.fillWidth: true
                     spacing: root.uiTheme.spacingSm
-                    visible: !firstRunWindow.secondaryAssigned && !firstRunWindow.secondaryDeferred
                     Label {
                         Layout.fillWidth: true
                         Layout.preferredWidth: 0
                         wrapMode: Text.WordWrap
                         color: root.mutedTextColor
+                        opacity: firstRunWindow.choosingSecondary
+                            && firstRunWindow.justConnectedKey === "" ? 1 : 0
+                        Accessible.ignored: opacity === 0
                         text: root.uiRevision < 0 ? ""
+                            : firstRunWindow._pickIsIdleVpn()
+                            ? root.tr("dialog.first-run-wizard.secondary-adapter-idle-vpn-later",
+                                "Connect the VPN later: the program starts sending sites through it as soon as it is on.")
                             : firstRunWindow._tunnelCandidateName() !== ""
                             ? root.tr("dialog.first-run-wizard.secondary-adapter-vpn-hint",
-                                "{name} looks like a VPN connection. We recommend it as the additional route: choose it above and press \"Set as additional\".")
+                                "{name} looks like your VPN. We recommend making it the additional connection: choose it above and press \"Set as additional\".")
                                 .replace("{name}", firstRunWindow._tunnelCandidateName())
+                            : firstRunWindow._startVpnFirstHint() !== ""
+                            ? firstRunWindow._startVpnFirstHint()
                             : firstRunWindow.installedVpnNames.length > 0
                             ? root.tr("dialog.first-run-wizard.secondary-adapter-vpn-installed",
-                                "VPN found on this computer: {names}. Start it and connect first: its connection then shows up in the list above as connected and is easy to pick. Then press \"Refresh interfaces\".")
+                                "VPN found on this computer: {names}. Not sure which connection is your VPN? Start it and connect: the program notices the new connection by itself.")
                                 .replace("{names}", firstRunWindow.installedVpnNames.join(", "))
                             : root.tr("dialog.first-run-wizard.secondary-adapter-vpn-none",
-                                "No VPN connection found yet. Start your VPN and connect first: its connection then shows up in the list above as connected and is easy to pick. Then press \"Refresh interfaces\".")
+                                "Not sure which connection is your VPN? Start your VPN and connect: the program notices the new connection by itself.")
                     }
                     ThemedButton {
                         theme: root.uiTheme
@@ -1351,11 +1735,10 @@ Window {
                         Accessible.name: text
                         onClicked: root.openVpnOnboarding()
                     }
-                    // The hint says "connect it, then come back": a VPN brought
-                    // up while the wizard is open must not need a restart to show.
                     ThemedButton {
                         theme: root.uiTheme
-                        text: root.tr("action.refresh-interfaces", "Refresh interfaces")
+                        visible: firstRunWindow.choosingSecondary
+                        text: root.tr("action.refresh-interfaces", "Refresh connections")
                         Accessible.role: Accessible.Button
                         Accessible.name: text
                         enabled: !!root.interfacesRolesController
@@ -1366,15 +1749,15 @@ Window {
                     Layout.fillWidth: true
                     wrapMode: Text.WordWrap
                     color: root.mutedTextColor
-                    visible: !firstRunWindow.secondaryAssigned && !firstRunWindow.secondaryDeferred
+                    visible: firstRunWindow.choosingSecondary
                         && (root.interfacesModel.count === 0 || !root.interfacesAreLive)
                     text: root.tr("dialog.first-run-wizard.primary-adapter-unavailable",
-                        "No connections to choose from yet — the background service reports them once it is running. You can set this later in Interfaces and routes.")
+                        "No connections to choose from yet — the background service reports them once it is running. You can set this later in Connections.")
                 }
                 // The same filter as on the main connection's page.
                 CheckBox {
                     id: firstRunSecondaryShowAll
-                    visible: !firstRunWindow.secondaryAssigned && !firstRunWindow.secondaryDeferred
+                    visible: firstRunWindow.choosingSecondary
                     checked: firstRunWindow.showAllAdapters
                     onToggled: firstRunWindow.showAllAdapters = checked
                     text: root.tr("interfaces.toggle.show-unavailable-adapters",
@@ -1404,7 +1787,7 @@ Window {
                     wrapMode: Text.WordWrap
                     color: root.mutedTextColor
                     text: root.tr("dialog.first-run-wizard.description",
-                        "Choose how to populate your initial rule set. You can change it later from the Rules toolbar or in Settings → Presets and settings.")
+                        "Choose which rules to start with. You can change this later in Rules or in Settings → Rules and settings files.")
                 }
 
                 // Option 1: Country preset (if a pack exists for the detected locale).
@@ -1453,12 +1836,14 @@ Window {
                         Layout.fillWidth: true
                         text: (firstRunWindow.useAbroadPack
                                 ? root.tr("dialog.first-run-wizard.option-country-preset-abroad",
-                                    "Use the access preset ({country})")
+                                    "Use the access rule set ({country})")
                                 : root.tr("dialog.first-run-wizard.option-country-preset",
-                                    "Use the preset for your region ({country})"))
+                                    "Use the rule set for your region ({country})"))
                             .replace("{country}", firstRunWindow.countryText("name"))
+                        id: countryPresetOption
                         highlighted: firstRunWindow._isChosen(firstRunWindow._countryPackKey())
                         icon.source: highlighted ? root.uiIconSourceOnAccent("apply") : root.uiIconSource("load-list")
+                        attention: firstRunWindow.pulseTarget === "rule-options" ? firstRunWindow.pulse : 0
                         Accessible.role: Accessible.Button
                         Accessible.checkable: true
                         Accessible.checked: firstRunWindow._isChosen(firstRunWindow._countryPackKey())
@@ -1472,9 +1857,10 @@ Window {
                         color: root.mutedTextColor
                         text: firstRunWindow.useAbroadPack
                             ? root.tr("dialog.first-run-wizard.option-country-preset-abroad-description",
-                                "Everything stays on your local provider; only that country's services take the additional route.")
+                                "Everything stays on your local provider; only that country's services go through the additional connection.")
                             : root.tr("dialog.first-run-wizard.option-country-preset-description",
-                                "Detected from your system's region setting. The set that comes with the app for your region.")
+                                "Recommended for {country}: the ready-made rule set for your region, taken from the system's region setting. You can change it afterwards.")
+                                .replace("{country}", firstRunWindow.countryText("name"))
                     }
                 }
                 // Option 1 fallback note when no country pack found.
@@ -1484,7 +1870,7 @@ Window {
                     color: root.mutedTextColor
                     visible: !firstRunWindow.hasAnyCountryPack
                     text: root.tr("dialog.first-run-wizard.option-country-not-available",
-                        "No country preset is bundled for your region — pick a different option.")
+                        "No ready-made rule set is bundled for your region — pick a different option.")
                 }
 
                 // Every bundled set stays within reach, whatever country was detected.
@@ -1497,6 +1883,14 @@ Window {
                         text: root.tr("dialog.first-run-wizard.other-countries",
                             "Rule set of another country")
                         color: root.textColor
+                    }
+                    Label {
+                        Layout.fillWidth: true
+                        Layout.leftMargin: root.uiTheme.spacingMd
+                        wrapMode: Text.WordWrap
+                        color: root.mutedTextColor
+                        text: root.tr("dialog.first-run-wizard.other-countries-description",
+                            "When the region was detected wrong, or you need the sites of another country to take the additional connection.")
                     }
                     RowLayout {
                         Layout.fillWidth: true
@@ -1519,6 +1913,8 @@ Window {
                             highlighted: firstRunWindow._isChosen(firstRunWindow._comboPackKey(otherCountryCombo.currentIndex))
                             icon.source: highlighted ? root.uiIconSourceOnAccent("apply") : root.uiIconSource("load-list")
                             enabled: otherCountryCombo.currentIndex >= 0
+                            attention: enabled && firstRunWindow.pulseTarget === "rule-options"
+                                ? firstRunWindow.pulse : 0
                             Accessible.role: Accessible.Button
                             Accessible.name: otherCountriesTitle.text + ": " + text
                             Accessible.checkable: true
@@ -1538,9 +1934,11 @@ Window {
                         theme: root.uiTheme
                         Layout.fillWidth: true
                         text: root.tr("dialog.first-run-wizard.option-builtin-demo",
-                                "Use the built-in demo rules")
+                                "Use the example rules")
+                        id: demoOption
                         highlighted: firstRunWindow._isChosen("demo")
                         icon.source: highlighted ? root.uiIconSourceOnAccent("apply") : root.uiIconSource("add")
+                        attention: firstRunWindow.pulseTarget === "rule-options" ? firstRunWindow.pulse : 0
                         Accessible.role: Accessible.Button
                         Accessible.checkable: true
                         Accessible.checked: firstRunWindow._isChosen("demo")
@@ -1553,7 +1951,7 @@ Window {
                         wrapMode: Text.WordWrap
                         color: root.mutedTextColor
                         text: root.tr("dialog.first-run-wizard.option-builtin-demo-description",
-                            "A tiny showcase set covering each rule kind. Replace with your own later.")
+                            "A small example with rules of each type. Replace them with your own later.")
                     }
                 }
 
@@ -1574,7 +1972,7 @@ Window {
                         wrapMode: Text.WordWrap
                         color: root.mutedTextColor
                         text: root.tr("dialog.first-run-wizard.option-open-file-description",
-                            "Choose one or two preset .txt files — one for each route. Leave a route empty to start it blank.")
+                            "Choose one or two rules files (.txt) — one for each connection. One of them can stay without a file.")
                     }
                     // Primary route slot.
                     RowLayout {
@@ -1586,7 +1984,7 @@ Window {
                         Label {
                             id: primaryFileSlotLabel
                             text: root.tr("dialog.first-run-wizard.primary-file-label",
-                                "Main route:")
+                                "Main connection:")
                             color: root.textColor
                             Layout.preferredWidth: Math.max(implicitWidth,
                                 secondaryFileSlotLabel.implicitWidth)
@@ -1623,7 +2021,7 @@ Window {
                         Label {
                             id: secondaryFileSlotLabel
                             text: root.tr("dialog.first-run-wizard.secondary-file-label",
-                                "Additional route:")
+                                "Additional connection:")
                             color: root.textColor
                             Layout.preferredWidth: Math.max(implicitWidth,
                                 primaryFileSlotLabel.implicitWidth)
@@ -1680,6 +2078,7 @@ Window {
                                 "Start empty")
                         highlighted: firstRunWindow._isChosen("empty")
                         icon.source: highlighted ? root.uiIconSourceOnAccent("apply") : ""
+                        attention: firstRunWindow.pulseTarget === "rule-options" ? firstRunWindow.pulse : 0
                         Accessible.role: Accessible.Button
                         Accessible.checkable: true
                         Accessible.checked: firstRunWindow._isChosen("empty")
@@ -1724,6 +2123,7 @@ Window {
                             Accessible.ignored: true
                         }
                         Label {
+                            id: ruleSetChoiceText
                             Layout.fillWidth: true
                             Layout.preferredWidth: 0
                             wrapMode: Text.WordWrap
@@ -1739,7 +2139,7 @@ Window {
                                             "Starting rules: {name}. They are imported when you press Finish; choose another option above to change them.")
                                             .replace("{name}", firstRunWindow.chosenStart.label)
                                         : root.tr("dialog.first-run-wizard.rule-set-none",
-                                            "No starting rules chosen yet. Without a choice, Finish starts with the rules already applied to you.")))
+                                            "Choose a rule set, or \"Start empty\", to go on.")))
                                 : ""
                             Accessible.role: Accessible.StaticText
                             Accessible.name: text
@@ -1780,6 +2180,8 @@ Window {
                         id: leakProtectionTitle
                         text: root.tr("settings.routing.kill-switch.title", "Leak protection")
                         color: root.textColor
+                        font.bold: true
+                        topPadding: root.uiTheme.spacingSm
                     }
                     ThemedRadioButton {
                         theme: root.uiTheme
@@ -1798,7 +2200,7 @@ Window {
                         checked: firstRunWindow.leakProtectionChoice === "sites"
                         text: root.tr("settings.routing.leak-protection.option-sites", "Routed sites")
                             + " — " + root.tr("settings.routing.leak-protection.note-sites",
-                                "What your rules send through the additional connection never goes out the main one while strict blocking of shared addresses is on, as it is by default. Everything else keeps working, except sites that share an address with a routed one.")
+                                "What your rules send through the additional connection never goes out the main one while strict protection is on, as it is by default. Everything else keeps working, though a few ordinary sites may not open until the additional connection is back.")
                         onToggled: if (checked) firstRunWindow.chooseLeakProtection("sites")
                     }
                     ThemedRadioButton {
@@ -2038,19 +2440,13 @@ Window {
                 theme: root.uiTheme
                 text: root.tr("action.next", "Next")
                 visible: firstRunWindow.step < firstRunWindow.stepCount - 1
-                highlighted: true
+                highlighted: enabled
+                enabled: firstRunWindow._nextAllowed()
+                attention: firstRunWindow.pulseTarget === "next" ? firstRunWindow.pulse : 0
                 Accessible.role: Accessible.Button
                 Accessible.name: text
+                Accessible.description: enabled ? "" : ruleSetChoiceText.text
                 onClicked: firstRunWindow.step += 1
-                // Once a connection page is settled, the eye goes on to Next.
-                SequentialAnimation on opacity {
-                    running: nextButton.visible && firstRunWindow.visible
-                        && firstRunWindow.step <= 1 && firstRunWindow.stepSettled
-                    loops: Animation.Infinite
-                    NumberAnimation { to: 0.45; duration: 650; easing.type: Easing.InOutQuad }
-                    NumberAnimation { to: 1.0; duration: 650; easing.type: Easing.InOutQuad }
-                    onRunningChanged: if (!running) nextButton.opacity = 1
-                }
             }
             ThemedButton {
                 id: finishButton
@@ -2058,6 +2454,7 @@ Window {
                 text: root.tr("action.finish", "Finish")
                 visible: firstRunWindow.step === firstRunWindow.stepCount - 1
                 highlighted: true
+                attention: firstRunWindow.pulseTarget === "finish" ? firstRunWindow.pulse : 0
                 Accessible.role: Accessible.Button
                 Accessible.name: text
                 Accessible.description: finishHint.text

@@ -17,12 +17,12 @@ use crate::state::{AppState, Effect, NoticeLevel};
 
 pub const HELP: Key = key(
     "tui.help.status-confirm-primary",
-    "p: confirm the suggested main connection; another one is chosen under Interfaces and routes",
+    "p: confirm the suggested main connection; another one is chosen under Connections",
 );
 
 pub const AMBIGUOUS: Key = key(
     "tui.status.primary-suggestion-ambiguous",
-    "No single connection answers to that name now. Choose the main connection under Interfaces and routes.",
+    "No single connection answers to that name now. Choose the main connection under Connections.",
 );
 
 /// Between the key and the service's answer.

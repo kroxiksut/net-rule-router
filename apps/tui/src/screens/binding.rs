@@ -253,7 +253,16 @@ pub fn error_text(code: &str, texts: &Texts) -> String {
     if code.is_empty() {
         return texts.get(k::ERROR_UNKNOWN);
     }
-    texts.dynamic(&format!("errors.{code}"), code)
+    with_alert_hint(code, texts.dynamic(&format!("errors.{code}"), code), texts)
+}
+
+/// A change refused until a security alert is acknowledged says where the
+/// alert is and which key acknowledges it.
+pub fn with_alert_hint(code: &str, text: String, texts: &Texts) -> String {
+    if code != nrr_shared::ipc_transport::SECURITY_ALERT_UNACKNOWLEDGED_CLIENT_SLUG {
+        return text;
+    }
+    format!("{text} {}", texts.get(crate::keys::ALERT_GATE_HINT))
 }
 
 /// A route-policy write. `route.policy.update` replaces the whole row, so the
@@ -515,6 +524,15 @@ pub fn positional(template: &str, values: &[&str]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_change_held_by_a_security_alert_names_the_way_to_it() {
+        let texts = Texts::load(Some("en"), &[]);
+        let text = error_text("security-alert-unacknowledged", &texts);
+        assert!(text.starts_with("Rules cannot be changed"), "{text}");
+        assert!(text.contains("(9)") && text.contains("press a"), "{text}");
+        assert!(!error_text("forbidden", &texts).contains("(9)"));
+    }
 
     #[test]
     fn positional_fills_in_order() {

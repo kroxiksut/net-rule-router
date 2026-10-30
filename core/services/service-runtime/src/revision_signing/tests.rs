@@ -788,3 +788,111 @@ fn the_watch_catches_an_active_rule_set_deleted_while_running() {
 
     assert_eq!(rules_store_alerts(&host).len(), 1);
 }
+
+/// The database the next install creates after the data folder was removed,
+/// born after `old`.
+fn created_after(old: &Host) -> Host {
+    let born: i64 = outside(old)
+        .query_row("SELECT MIN(applied_at) FROM schema_migrations", [], |r| {
+            r.get(0)
+        })
+        .expect("birth");
+    let fresh = host();
+    outside(&fresh)
+        .execute(
+            "UPDATE schema_migrations SET applied_at = ?1",
+            [born + 60_000],
+        )
+        .expect("later birth");
+    fresh
+}
+
+/// The uninstaller's data removal: the database goes, and so does the record
+/// beside the key; the key stays for the audit trail.
+#[test]
+fn an_install_over_a_removed_data_folder_raises_nothing() {
+    let old = host();
+    let old_store = Arc::new(InMemKeyStore::new());
+    previous_run(&old, &old_store);
+    let fresh = created_after(&old);
+    let key_store = Arc::new(InMemKeyStore::with_key(
+        old_store.load().expect("load").expect("key"),
+    ));
+
+    let (coord, _watch) = boot(&fresh, &key_store, BOOT_MS + 1_000);
+
+    assert!(rules_store_alerts(&fresh).is_empty());
+    assert!(matches!(
+        rules_update(&gated_executor(&fresh, &coord), &coord, "h-new-1"),
+        MutationOutcome::Completed(_)
+    ));
+    // The new record guards the new database.
+    let second = activate(&coord, "h-new-2");
+    delete_from_outside(&fresh, &second);
+    boot(&fresh, &key_store, BOOT_MS + 2_000);
+    assert_eq!(rules_store_alerts(&fresh).len(), 1);
+}
+
+/// What is inside the database says nothing about which database it is:
+/// a new, empty one put where the recorded one was is still a lost rule set.
+#[test]
+fn an_empty_database_in_place_of_the_recorded_one_raises_an_alert() {
+    let old = host();
+    let key_store = Arc::new(InMemKeyStore::new());
+    previous_run(&old, &key_store);
+    let fresh = created_after(&old);
+
+    boot(&fresh, &key_store, BOOT_MS + 1_000);
+
+    assert_eq!(rules_store_alerts(&fresh).len(), 1);
+}
+
+#[test]
+fn every_rule_set_deleted_from_the_recorded_database_still_raises_an_alert() {
+    let host = host();
+    let key_store = Arc::new(InMemKeyStore::new());
+    previous_run(&host, &key_store);
+    outside(&host)
+        .execute_batch("DELETE FROM active_revision_pointer; DELETE FROM revisions;")
+        .expect("wipe the rules");
+
+    boot(&host, &key_store, BOOT_MS + 1_000);
+
+    assert_eq!(
+        rules_store_alerts(&host).len(),
+        1,
+        "emptied in place is not a new database"
+    );
+}
+
+#[test]
+fn a_full_reset_then_a_restart_raises_nothing() {
+    use crate::ipc_handlers::providers::PrincipalDataPurger;
+    let host = host();
+    let key_store = Arc::new(InMemKeyStore::new());
+    previous_run(&host, &key_store);
+    let (coord, _watch) = boot(&host, &key_store, BOOT_MS + 1_000);
+
+    // As `principal-data.purge` with the rules history runs it.
+    let reset = gated_executor(&host, &coord).execute(
+        StoredMutation {
+            kind: MutationKind::RulesResetToBaseline,
+            payload: serde_json::json!({}),
+            correlation_id: Some("full-reset".into()),
+            issuer_sid: USER.to_string(),
+            caller_is_elevated: false,
+        },
+        USER,
+    );
+    assert!(matches!(reset, MutationOutcome::Completed(_)), "{reset:?}");
+    crate::production_handlers_misc::ProductionPrincipalDataPurger::new(Arc::clone(&host.conn))
+        .purge_for_sid(USER, true)
+        .expect("purge");
+
+    let (coord, _watch) = boot(&host, &key_store, BOOT_MS + 2_000);
+    assert!(rules_store_alerts(&host).is_empty());
+    assert!(matches!(
+        rules_update(&gated_executor(&host, &coord), &coord, "h-after-reset"),
+        MutationOutcome::Completed(_)
+    ));
+}

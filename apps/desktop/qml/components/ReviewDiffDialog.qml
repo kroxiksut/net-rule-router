@@ -321,6 +321,26 @@ Dialog {
             Accessible.role: Accessible.StaticText
             Accessible.name: text
         }
+        // Said before the user agrees, not found in the Removed column.
+        Label {
+            Layout.fillWidth: true
+            Layout.preferredWidth: 0
+            readonly property int replaced: root.ownerRoot && root.visible
+                ? Pure.rulesReplacedByLoad(root.ownerRoot._activeReviewKind,
+                    root.ownerRoot.pendingPresetImportState, root.summary)
+                : 0
+            visible: replaced > 0
+            text: replaced > 0
+                ? Plurals.counted(root.tr, "dialog.review-diff.replaces-own.", replaced,
+                    "Loading this set replaces your rules for the connections it covers: {count} rule will be removed (see Removed). Cancel to keep it.",
+                    "Loading this set replaces your rules for the connections it covers: {count} rules will be removed (see Removed). Cancel to keep them.")
+                : ""
+            wrapMode: Text.Wrap
+            font.bold: true
+            color: root.ownerRoot ? root.ownerRoot.textColor : palette.text
+            Accessible.role: Accessible.StaticText
+            Accessible.name: text
+        }
 
         // ── Risk signals ─────────────────────────────────────────
         Label {
@@ -375,7 +395,7 @@ Dialog {
             Layout.fillWidth: true
             wrapMode: Text.Wrap
             text: root.tr("dialog.review-diff.duplicates-heading",
-                "Rules written into both routes")
+                "Rules set on both connections")
             font.bold: true
             color: root.ownerRoot ? root.ownerRoot.textColor : palette.text
             visible: root.crossSetDuplicates().length > 0
@@ -384,7 +404,7 @@ Dialog {
             Layout.fillWidth: true
             visible: root.crossSetDuplicates().length > 0
             text: root.tr("dialog.review-diff.duplicates-hint",
-                "Each of these is enabled on both routes, so which one carries the traffic is decided by evaluation order rather than by you. Pick the route that should keep it — the other copy stays in your list, switched off.")
+                "Each of these is enabled on both connections, so which one carries the traffic is decided by evaluation order rather than by you. Pick the connection that should keep it — the other copy stays in your list, switched off.")
             wrapMode: Text.Wrap
             color: root.ownerRoot ? root.ownerRoot.mutedTextColor : palette.text
         }
@@ -403,7 +423,7 @@ Dialog {
             }
             Accessible.role: Accessible.List
             Accessible.name: root.tr("dialog.review-diff.duplicates-heading",
-                "Rules written into both routes")
+                "Rules set on both connections")
             delegate: RowLayout {
                 width: ListView.view.width
                 spacing: 8
@@ -418,7 +438,7 @@ Dialog {
                     theme: root.ownerRoot ? root.ownerRoot.uiTheme : null
                     text: root.ownerRoot
                         ? root.ownerRoot.routeLabel("primary")
-                        : root.tr("label.primary", "Primary")
+                        : root.tr("label.primary", "Main")
                     onClicked: root.duplicateResolved(
                         String(modelData["primary-rule-id"] || ""),
                         String(modelData["secondary-rule-id"] || ""),
@@ -519,7 +539,7 @@ Dialog {
             Accessible.name: text
             Accessible.description: root.tr(
                 "dialog.confirm-activate.checkbox-understand-description",
-                "Required acknowledgement before applying a Critical-risk activation")
+                "Must be ticked to apply risky changes")
         }
 
         RowLayout {
@@ -565,7 +585,7 @@ Dialog {
                 // Single-step: this now applies directly (no second
                 // confirmation dialog). Disabled until the acknowledgement
                 // is ticked for Critical-risk activations.
-                text: root.tr("dialog.review-diff.apply", "Apply changes")
+                text: root.tr("dialog.review-diff.apply", "Apply")
                 highlighted: true
                 enabled: !root.isCritical() || root._understandChecked
                 Accessible.role: Accessible.Button

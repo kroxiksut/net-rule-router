@@ -43,7 +43,7 @@ fn a_session_reads_as_a_transcript() {
         .find("Service: OK")
         .expect("the connection is announced");
     let limited = text
-        .find("Routing state: Routing limited")
+        .find("Rules status: Some rules not working")
         .expect("the routing change is announced with its panel");
     let notice = text
         .find("Warning: The additional connection is not up")

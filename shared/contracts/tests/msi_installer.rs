@@ -608,3 +608,136 @@ fn the_recorded_revision_comes_from_the_agreement_shown() {
         "translations naming different revisions are not refused"
     );
 }
+
+/// Removal from Settings → Apps runs msiexec without `/l`: only the
+/// `MsiLogging` property makes that run, or an install from Explorer, keep a log.
+#[test]
+fn every_msi_run_keeps_a_log_without_being_asked() {
+    let wxs = wxs();
+    let declared = wxs
+        .lines()
+        .find(|line| line.contains("<Property Id=\"MsiLogging\""))
+        .unwrap_or_else(|| panic!("no MsiLogging property: a removal leaves no log"));
+    assert!(
+        declared.contains("Value=\"voicewarmupx\""),
+        "MsiLogging logs too little to tell why a removal failed: {declared}"
+    );
+}
+
+/// The progress page said nothing while the MSI closed the program, stopped,
+/// registered and started the service: a minute of "Please wait" read as a
+/// hang. Every step of ours names itself there, in the wizard's language.
+#[test]
+fn every_step_of_ours_says_on_the_progress_page_what_it_is_doing() {
+    let wxs = wxs();
+    let english = read("packaging/windows/NetRuleRouter.en-US.wxl");
+    let russian = read("packaging/windows/NetRuleRouter.ru-RU.wxl");
+    let steps: Vec<&str> = wxs
+        .split("<CustomAction Id=\"")
+        .skip(1)
+        .filter(|rest| {
+            rest.split("/>")
+                .next()
+                .is_some_and(|tag| tag.contains("DllEntry=\"WixQuietExec\""))
+        })
+        .filter_map(|rest| rest.split('"').next())
+        .collect();
+    assert!(steps.len() >= 8, "only {steps:?}");
+    for step in steps {
+        let text = tag_with(&wxs, &format!("<ProgressText Action=\"{step}\""))
+            .unwrap_or_else(|| panic!("{step} runs with nothing on the progress page"));
+        let message = attribute(text, "Message").unwrap_or_default();
+        let id = message
+            .strip_prefix("!(loc.")
+            .and_then(|rest| rest.strip_suffix(')'))
+            .unwrap_or_else(|| panic!("untranslated: {text}"));
+        for wxl in [&english, &russian] {
+            let value = tag_with(wxl, &format!("<String Id=\"{id}\""))
+                .and_then(|tag| attribute(tag, "Value"))
+                .unwrap_or_default();
+            assert!(!value.trim().is_empty(), "{id} is empty in a language");
+        }
+    }
+}
+
+/// Asked to see what the installation did, the person had to know Windows
+/// Installer keeps its log in %TEMP% under a random name: the last page names it.
+#[test]
+fn the_last_page_names_the_installation_log() {
+    let wxs = wxs();
+    let shown = tag_with(&wxs, "<SetProperty Id=\"WIXUI_EXITDIALOGOPTIONALTEXT\"")
+        .expect("the last page carries a text of ours");
+    assert!(shown.contains("Sequence=\"ui\""), "{shown}");
+    let id = attribute(shown, "Value")
+        .and_then(|value| value.strip_prefix("!(loc."))
+        .and_then(|rest| rest.strip_suffix(')'))
+        .unwrap_or_else(|| panic!("untranslated: {shown}"));
+    for culture in ["en-US", "ru-RU"] {
+        let wxl = read(&format!("packaging/windows/NetRuleRouter.{culture}.wxl"));
+        let value = tag_with(&wxl, &format!("<String Id=\"{id}\""))
+            .and_then(|tag| attribute(tag, "Value"))
+            .unwrap_or_default();
+        assert!(
+            value.contains("[MsiLogFileLocation]"),
+            "the {culture} text does not name the log: {value}"
+        );
+    }
+    // Only a run that keeps a log can name one.
+    assert!(wxs.contains("<Property Id=\"MsiLogging\""));
+}
+
+/// The owner's rule: the symbol on the glass plate is the app's icon (window,
+/// tray, executables, Apps entry); the wizards' own pictures show the symbol
+/// without it. The picture comes from a copy the build alone reads: anything
+/// under assets\ other than assets\brand ships beside the binaries.
+#[test]
+fn wizard_pictures_show_the_symbol_and_the_app_keeps_its_icon() {
+    let script = package_script();
+    let body = script
+        .split("function New-InstallerImages {")
+        .nth(1)
+        .and_then(|rest| rest.split("\n}\n").next())
+        .expect("New-InstallerImages");
+    assert!(
+        body.contains(r"'packaging\windows\art\logo-symbol.png'"),
+        "the wizard pictures are not drawn from the symbol: {body}"
+    );
+    assert!(
+        !body.contains(r"assets\icons") && !body.contains(r"assets\brand"),
+        "the wizard pictures are drawn from the app icon or unshipped brand art: {body}"
+    );
+    let symbol = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../..")
+        .join("packaging/windows/art/logo-symbol.png");
+    let bytes = std::fs::read(&symbol).expect("the symbol is in the checkout");
+    assert!(bytes.starts_with(b"\x89PNG\r\n\x1a\n"), "not a PNG");
+    // Colour type 6: RGBA, so the symbol sits on the wizard's own background.
+    assert_eq!(bytes.get(25), Some(&6), "the symbol has no transparency");
+    assert!(
+        !script.contains("Copy-Payload 'packaging"),
+        "the build's art would ship with the program"
+    );
+
+    let wxs = wxs();
+    let icon = tag_with(&wxs, "<Icon Id=\"AppIcon\"").expect("the Apps icon");
+    assert!(icon.contains(r"assets\icons\app\app.ico"), "{icon}");
+    let iss = read("packaging/windows/NetRuleRouter.iss");
+    assert!(
+        iss.lines()
+            .any(|l| l == r"SetupIconFile={#PackageDir}\assets\icons\app\app.ico"),
+        "Setup.exe lost the app icon"
+    );
+    for (needle, define) in [
+        ("WixUIBannerBmp", "$(var.BannerBmp)"),
+        ("WixUIDialogBmp", "$(var.DialogBmp)"),
+    ] {
+        let tag = tag_with(&wxs, &format!("Id=\"{needle}\"")).expect(needle);
+        assert_eq!(attribute(tag, "Value"), Some(define));
+    }
+    for line in [
+        "WizardImageFile={#WizardImages}",
+        "WizardSmallImageFile={#WizardSmallImages}",
+    ] {
+        assert!(iss.lines().any(|l| l == line), "{line}");
+    }
+}

@@ -66,7 +66,7 @@ Dialog {
             color: root.ownerRoot ? root.ownerRoot.textColor : palette.text
             text: root.mode === "overwrite-set"
                 ? root.tr("dialog.overwrite-set.body",
-                    "The folder you chose already has a primary or additional-route rules file in it. Saving here replaces them.")
+                    "The folder you chose already has a rules file for the main or additional connection in it. Saving here replaces them.")
                 : root.tr("dialog.factory-preset-save.body",
                     "The rules file you are saving to is one of the sets that come with the app, and the next update replaces that folder — anything saved there would be lost. Save into a folder of your own instead, or save here anyway if that is what you want.")
         }

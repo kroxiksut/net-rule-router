@@ -29,7 +29,7 @@ use crate::state::AppState;
 pub const TITLE: Key = key("vpn-onboarding.title", "Your VPN client");
 pub const NOTE: Key = key(
     "settings.routing.providers.note",
-    "Programs that keep working over your main link while leak protection is on, such as your VPN client. Type a program's full path to add one.",
+    "Programs that keep working over your main connection while leak protection is on, such as your VPN client. Type a program's full path to add one.",
 );
 pub const EMPTY: Key = key(
     "settings.routing.providers.empty",
@@ -49,11 +49,11 @@ pub const NEED_PATH: Key = key(
 );
 pub const ADDED: Key = key(
     "vpn-onboarding.confirmed-status",
-    "NetRuleRouter will keep {name} working over your main link while leak protection is on.",
+    "NetRuleRouter will keep {name} working over your main connection while leak protection is on.",
 );
 pub const REMOVED: Key = key(
     "settings.routing.providers.removed",
-    "{name} was removed. Leak protection no longer keeps it working over your main link.",
+    "{name} was removed. Leak protection no longer keeps it working over your main connection.",
 );
 
 pub const GATEWAYS_TITLE: Key = key("settings.vpn-gateways.title", "Other VPNs you allowed");
@@ -76,7 +76,7 @@ pub const SCAN_AGAIN: Key = key("vpn-onboarding.scan-again", "Scan again");
 pub const SCANNING: Key = key("vpn-onboarding.scanning", "Scanning…");
 pub const FOUND_HINT: Key = key(
     "vpn-onboarding.multi-hint",
-    "Tick every program that's part of your VPN — for example a client together with its background service or command-line helper. All of them will keep working over your main link.",
+    "Tick every program that's part of your VPN — for example a client together with its background service or command-line helper. All of them will keep working over your main connection.",
 );
 pub const FOUND_NONE: Key = key(
     "vpn-onboarding.empty",
@@ -86,7 +86,7 @@ pub const FOUND_NO_FILE: Key = key("vpn-onboarding.not-found", "not found — pi
 pub const RUNNING: Key = key("vpn-onboarding.running", "running now");
 pub const TUNNEL_ASSIGN: Key = key(
     "vpn-onboarding.kernel-tunnel-assign",
-    "Kernel tunnel {name} — assign adapter {interface} as the additional link",
+    "Kernel tunnel {name} — assign adapter {interface} as the additional connection",
 );
 pub const TUNNEL_DOWN: Key = key(
     "vpn-onboarding.kernel-tunnel-down",
@@ -94,7 +94,7 @@ pub const TUNNEL_DOWN: Key = key(
 );
 pub const CLEARED: Key = key(
     "vpn-onboarding.cleared-status",
-    "No program is kept working over your main link any more.",
+    "No program is kept working over your main connection any more.",
 );
 pub const OFFER_ROW: Key = key(
     "notifications.vpn-client-offer.tui-row",

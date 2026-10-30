@@ -100,12 +100,12 @@ fn pairs_say_which_route_the_sites_take() {
     assert!(wide.contains("4 overlaps not confirmed"), "{wide}");
     assert!(
         wide.contains(
-            "video.example.com (Domain) goes over Additional: it is narrower than *.example.com (Domain) on Primary."
+            "video.example.com (Domain) goes over Additional: it is narrower than *.example.com (Domain) on Main."
         ),
         "{wide}"
     );
     assert!(
-        wide.contains("dup.test (Domain) is set on both routes. It goes over Primary"),
+        wide.contains("dup.test (Domain) is set on both connections. It goes over Main"),
         "{wide}"
     );
     assert!(
@@ -213,7 +213,7 @@ fn sending_over_edits_the_rules_and_waits_for_apply() {
     // A block side cannot.
     press(&mut app, KeyCode::Home);
     press(&mut app, KeyCode::Char('o'));
-    assert!(render(&app, 200, 60).contains("cannot be sent over the other route here"));
+    assert!(render(&app, 200, 60).contains("cannot be sent over the other connection here"));
 
     // Coming back does not throw the edit away with a re-read.
     app.open(ScreenId::Status);

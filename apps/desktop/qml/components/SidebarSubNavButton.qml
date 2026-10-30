@@ -17,6 +17,10 @@ ThemedButton {
     property string iconName: ""
     // Items waiting in the section; hidden at zero.
     property int badge: 0
+    // The focus ring follows the keyboard: a click leaves focus here without
+    // drawing it, unless the user asked for focus to show always.
+    readonly property bool focusShown: visualFocus
+        || (activeFocus && shell.prefs.enhancedFocus === true)
 
     theme: shell.uiTheme
     Layout.fillWidth: true
@@ -30,14 +34,14 @@ ThemedButton {
         color: control.highlighted ? control.shell.accentColor
             : !control.enabled ? control.theme.stateDisabledFill
             : (control.hovered ? control.theme.stateHoverFill : control.shell.panelColor)
-        border.width: control.activeFocus ? control.theme.focusBorderWidth : control.theme.borderWidth
-        border.color: control.activeFocus
-            ? (control.highlighted ? control.theme.stateFocusedBorderOnFill : control.theme.stateFocusedBorder)
+        border.width: control.focusShown ? control.theme.focusBorderWidth : control.theme.borderWidth
+        border.color: control.focusShown
+            ? (control.highlighted ? control.theme.stateFocusedBorderOnFill : control.theme.colorButtonOutline)
             : control.highlighted ? control.theme.stateSelectedBorder
             : !control.enabled ? control.theme.stateDisabledBorder
             : control.theme.stateDefaultBorder
         Rectangle {
-            visible: control.activeFocus && control.highlighted
+            visible: control.focusShown && control.highlighted
             anchors.fill: parent
             anchors.margins: control.theme.focusBorderWidth
             radius: Math.max(0, parent.radius - control.theme.focusBorderWidth)

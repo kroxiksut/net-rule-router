@@ -471,7 +471,9 @@ split_symbols() {
     "$strip_bin" --strip-debug "$file"
     "$objcopy_bin" --add-gnu-debuglink="$dest/$name.debug" "$file"
     chmod 0644 "$dest/$name.debug"
-    if readelf -S -W "$file" | grep -q ' \.debug_'; then
+    # `.debug_gdb_scripts` is a loaded section (gdb's pretty-printer hint),
+    # not debug info: strip rightly keeps it.
+    if readelf -S -W "$file" | grep ' \.debug_' | grep -qv ' \.debug_gdb_scripts '; then
       die "$file still carries debug info after the split"
     fi
     id="$(readelf -n "$file" | sed -n 's/.*Build ID: *\([0-9a-f]\{4,\}\).*/\1/p' | head -n 1)"

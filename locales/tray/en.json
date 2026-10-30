@@ -16,20 +16,20 @@
   "a11y": {
     "tray": {
       "status-text": {
-        "preview-mode": "First-run setup is not finished: your rules are not applied yet.",
+        "preview-mode": "The first steps are not finished: your rules are not working yet.",
         "checking-status": "Checking whether the service is reachable and whether your rules are being applied.",
         "no-active-policy": "Your rules are not being applied right now.",
         "service-unavailable": "The background service is not reachable: rules cannot be applied or changed until it is back."
       },
       "setup-state": {
         "allowed": "Action is available in the current setup state.",
-        "soft-guided": "Available; finishing the first-run setup first is recommended.",
-        "blocked-until-wizard-completion": "Available once the first-run setup is finished."
+        "soft-guided": "Available; finishing the first steps first is recommended.",
+        "blocked-until-wizard-completion": "Available once the first steps are finished."
       },
       "preview-only-note": "This action is not available yet.",
       "action-label": {
         "open-main-window": "Open NetRuleRouter",
-        "interfaces-routes": "Interfaces and routes",
+        "interfaces-routes": "Connections",
         "rules": "Rules",
         "diagnostics": "Diagnostics",
         "logs": "Logs",
@@ -38,15 +38,15 @@
         "open-license-window": "License",
         "open-logs-folder": "Open logs folder",
         "exit-application": "Exit",
-        "refresh-interfaces": "Refresh interfaces",
+        "refresh-interfaces": "Refresh connections",
         "check-service-status": "Check service status",
         "safe-rollback": "Safe rollback",
-        "temporary-disable-product-impact": "Temporarily disable product impact",
+        "temporary-disable-product-impact": "Turn off rules",
         "check-for-updates": "Check for updates"
       },
       "action-description": {
         "open-main-window": "Open the main NetRuleRouter window.",
-        "interfaces-routes": "Open interfaces and routes screen.",
+        "interfaces-routes": "Open the Connections section.",
         "rules": "Open rules screen.",
         "diagnostics": "Open diagnostics screen.",
         "logs": "Open logs screen.",
@@ -76,20 +76,20 @@
       "title": "Add rule",
       "saving": "Adding the rule…",
       "load-failed": "Could not read your rules from the service, so nothing was added. Check that the service is running.",
-      "on-other-route": "{value} is already in your rules, on the route {route}.",
-      "on-other-route-many": "{count} of these are already in your rules, on another route.",
+      "on-other-route": "{value} is already in your rules, on the connection {route}.",
+      "on-other-route-many": "{count} of these are already in your rules, on the other connection.",
       "already-denied": "{value} is already denied in your rules.",
       "already-denied-many": "{count} of these are already denied in your rules.",
-      "on-a-route-many": "{count} of these are already in your rules, on a route.",
-      "on-other-route-or-denied-many": "{count} of these are already in your rules, on the other route or denied.",
+      "on-a-route-many": "{count} of these are already in your rules, on one of the connections.",
+      "on-other-route-or-denied-many": "{count} of these are already in your rules, on the other connection or denied.",
       "added": "Rule added: {value} → {route}",
-      "added-awaits-confirmation": "Rule added: {value} → {route}. It is not applied yet: the protection of system programs holds it until you confirm it in the rules list.",
+      "added-awaits-confirmation": "Rule added: {value} → {route}. Not in use yet: it touches a protected system program — confirm it in the rules list.",
       "added-disabled": "Rule added, switched off: {value} → {route}. It does not route anything until you switch it on.",
       "added-deny": "Rule added: {value} denied.",
       "added-deny-many": "Deny rules added: {count}.",
       "added-deny-disabled": "Rule added, switched off: deny {value}. It does not deny anything until you switch it on.",
       "moved": "Rule moved: {value} → {route}",
-      "moved-count": "Moved to this route: {count}.",
+      "moved-count": "Moved to this connection: {count}.",
       "moved-deny": "Rule changed: {value} is now denied.",
       "now-denied-count": "Now denied: {count}.",
       "deny-lifted": "Deny lifted: {value} → {route}",
@@ -102,8 +102,8 @@
     },
     "external": {
       "label": "External IP",
-      "main-route": "Main route",
-      "additional-route": "Additional route",
+      "main-route": "Main connection",
+      "additional-route": "Additional connection",
       "checking": "checking…",
       "unknown": "check",
       "last-known": "last known {when}"
@@ -123,7 +123,7 @@
     "status": {
       "preview-mode": "Setup not finished",
       "checking-status": "Checking status...",
-      "no-active-policy": "No active policy application",
+      "no-active-policy": "Rules are not working",
       "service-unavailable": "Service unavailable"
     },
     "action": {
@@ -135,16 +135,16 @@
       "service-pending": "Service changing state...",
       "service-not-installed": "Service not installed — click to install",
       "service-unknown": "Cannot read service status",
-      "no-updates": "The service is running, but this app is not receiving updates from it",
-      "rules-applied": "NetRuleRouter — your rules are being applied",
-      "no-rules-applied": "NetRuleRouter — no rules are being applied yet",
-      "contract-skew": "App and service builds differ — changes are off"
+      "no-updates": "The service is running, but the program is not getting news from it",
+      "rules-applied": "NetRuleRouter — your rules are working",
+      "no-rules-applied": "NetRuleRouter — your rules are not working yet",
+      "contract-skew": "Program and service versions differ — rules cannot be changed for now"
     },
     "auto-rules": {
       "body-multi": "Found addresses that {count} of the sites you routed need.",
       "item-companion-short": "← {name}",
-      "route-line-primary": "They will be added to the main route.",
-      "route-line-secondary": "They will be added to the additional route.",
+      "route-line-primary": "They will go through the main connection.",
+      "route-line-secondary": "They will go through the additional connection.",
       "empty": "No addresses to suggest right now.",
       "none-pending": "Nothing is waiting to be added right now.",
       "list-accessible-name": "Suggested addresses",
@@ -158,18 +158,18 @@
         "always": "Add automatically from now on",
         "dismiss": "Never suggest checked"
       },
-      "body-blocked-multi": "Connections to {count} sites keep failing on the main route.",
+      "body-blocked-multi": "Connections to {count} sites keep failing on the main connection.",
       "reload": {
         "title": "Rule applied"
       }
     },
     "auto-rules-mode-confirm": {
       "title": "Turn on “Apply automatically”?",
-      "body": "From now on NetRuleRouter will add suggested addresses to your rules files by itself, without asking. You can undo this anytime in Settings → Routing, by switching back to “Suggest only”.",
+      "body": "From now on NetRuleRouter will add suggested addresses to your rules files by itself, without asking. You can undo this anytime in Settings → Routing behavior, by switching back to “Suggest only”.",
       "confirm": "Turn on"
     },
     "rules-drift": {
-      "body": "The rules saved in your files are not the ones being applied right now. Apply the files, or open the app to see the difference.",
+      "body": "The rules in your files are not the ones in use right now. Apply them, or open the program to see the difference.",
       "list-accessible-name": "Rule files that differ",
       "action": {
         "compare": "Open and compare",
@@ -177,34 +177,34 @@
       }
     },
     "block-notice": {
-      "title-route-down": "Additional route is unavailable",
+      "title-route-down": "Additional connection is unavailable",
       "merged": {
         "title": "{count} connections blocked",
-        "body": "Check the addresses to send over the additional route.",
+        "body": "Tick the addresses to send through the additional connection.",
         "list-accessible-name": "Blocked connections"
       },
       "attempts": "{count} attempts",
       "reason": {
-        "route-unavailable": "The route these addresses are bound to is down right now, so none of them open. This is one notice for the whole route.",
+        "route-unavailable": "The connection these addresses should go through is down right now, so none of them open. This is one notice for the whole connection.",
         "blocked-by-rule": "A rule denies this address directly.",
         "ipv6-blocked": "With leak protection set to Everything, IPv6 goes out only through the additional connection, and this IPv6 address could not. No rule blocked it — the switch is in Settings.",
-        "dns-lockdown": "This app tried to reach a public DNS resolver of its own instead of the one NetRuleRouter provides, and encrypted-DNS blocking closed it. No rule blocked it — the switch is in Settings, under Routing.",
-        "unattributed": "NetRuleRouter blocked this address, but could not identify which filter did it.",
+        "dns-lockdown": "This app tried to reach a public DNS resolver of its own instead of the one NetRuleRouter provides, and encrypted-DNS blocking closed it. No rule blocked it — the switch is in Settings, under Routing behavior.",
+        "unattributed": "NetRuleRouter blocked this address, but could not tell what exactly stopped it.",
         "unspecified": "No further detail available."
       },
       "reason-short": {
-        "route-unavailable": "Route is down",
+        "route-unavailable": "Connection is down",
         "blocked-by-rule": "Denied by a rule",
         "ipv6-blocked": "IPv6 held by leak protection",
         "dns-lockdown": "Own encrypted DNS",
-        "unattributed": "Blocked, filter unknown",
+        "unattributed": "Blocked, reason unclear",
         "unspecified": "Blocked"
       },
       "action": {
-        "open-routes": "Open routes"
+        "open-routes": "Open Connections"
       },
       "route-confirm": {
-        "title-many": "Route {count} addresses via the additional link?"
+        "title-many": "Send {count} addresses through the additional connection (e.g. VPN)?"
       },
       "snooze": {
         "body-many": "Stop asking about these {count} addresses for a while."
@@ -239,17 +239,17 @@
     "settings-restore-failed": "Your settings could not be restored. Open the app to try again.",
     "pause": {
       "title": "Turn off rules",
-      "body": "Your routing and leak protection stop for the time you choose and come back on their own.",
+      "body": "Your rules and leak protection stop for the time you choose and come back on their own.",
       "failed": "Could not turn the rules off: "
     }
   },
   "notifications": {
     "verify-verdicts": {
-      "list": "Rules and the route they would move to"
+      "list": "Rules and the connection they would move to"
     },
     "local-networks": {
-      "body": "{cidr} on {adapter} stays reachable while routed traffic is blocked. Keep it that way?",
-      "body-open": "Your home network's IPv6 addresses {cidr} on {adapter} are closed while routed traffic is blocked. Open them to devices on this network?"
+      "body": "{cidr} on {adapter} stays reachable while leak protection blocks traffic. Keep it that way?",
+      "body-open": "Your home network's IPv6 addresses {cidr} on {adapter} are closed while leak protection blocks traffic. Open them to devices on this network?"
     },
     "enforcement": {
       "no-policy": {
@@ -257,7 +257,7 @@
       }
     },
     "vpn-client-trust": {
-      "tray-body": "{apps} looks like a VPN client, but it is not installed in a protected program folder. Open NetRuleRouter to confirm it, or leak protection keeps blocking it while the additional route is down."
+      "tray-body": "{apps} looks like a VPN client, but it is not installed in a protected program folder. Open NetRuleRouter to confirm it, or leak protection keeps blocking it while the additional connection is down."
     },
     "vpn-gateway-trust": {
       "tray-body": "A VPN is waiting for your answer in the NetRuleRouter window: leak protection stopped it from reaching its server {addresses}."

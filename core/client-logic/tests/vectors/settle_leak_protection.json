@@ -22,9 +22,9 @@
       "expected": { "mode": "prefer-primary", "leak-protection": "everything" }
     },
     {
-      "name": "an empty request gains off and no mode",
+      "name": "an empty request gains the default, routed sites, and no mode",
       "input": { "request": {} },
-      "expected": { "leak-protection": "off" }
+      "expected": { "leak-protection": "sites" }
     },
     {
       "name": "an empty mode reads as the main route and keeps sites",
@@ -47,9 +47,9 @@
       "expected": { "mode": "prefer-primary", "leak-protection": "off" }
     },
     {
-      "name": "a null level under the additional route is off",
+      "name": "a null level under the additional route is the default as that route offers it",
       "input": { "request": { "mode": "prefer-secondary-when-available", "leak-protection": null } },
-      "expected": { "mode": "prefer-secondary-when-available", "leak-protection": "off" }
+      "expected": { "mode": "prefer-secondary-when-available", "leak-protection": "everything" }
     },
     {
       "name": "other keys ride unchanged",

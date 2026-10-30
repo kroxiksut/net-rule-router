@@ -160,13 +160,13 @@ ColumnLayout {
             Label {
                 Layout.fillWidth: true
                 text: root.tr("interfaces.placeholder-rows.banner-body",
-                    "The list below did not come from this machine — the background service could not enumerate the adapters, so example rows are shown. Assigning a route here would bind it to an adapter that does not exist, so the buttons stay disabled until a real list arrives.")
+                    "The list below did not come from this machine — the background service could not enumerate the adapters, so example rows are shown. Assigning a role here would bind it to an adapter that does not exist, so the buttons stay disabled until a real list arrives.")
                 color: root.textColor
                 wrapMode: Text.WordWrap
             }
             ThemedButton {
                 theme: root.uiTheme
-                text: root.tr("action.refresh-interfaces", "Refresh interfaces")
+                text: root.tr("action.refresh-interfaces", "Refresh connections")
                 onClicked: root.interfacesRolesController.refreshInterfacesFromService()
             }
         }
@@ -191,7 +191,7 @@ ColumnLayout {
                     ? root.tr("interfaces.fail-closed.banner-title",
                         "Leak protection is blocking traffic")
                     : root.tr("interfaces.secondary-absent.banner-title",
-                        "The additional route is not available")
+                        "The additional connection is not available")
                 color: root.uiTheme.colorAccent
                 font.bold: true
                 wrapMode: Text.WordWrap
@@ -200,9 +200,9 @@ ColumnLayout {
                 Layout.fillWidth: true
                 text: section._failClosedReported
                     ? root.tr("interfaces.fail-closed.banner-body",
-                        "Additional route is unavailable. Matched traffic is being blocked instead of leaking to the primary.")
+                        "The additional connection is unavailable. What your rules send through it is blocked for now instead of leaking through the main connection.")
                     : root.tr("interfaces.secondary-absent.banner-body",
-                        "The adapter you bound as the additional route is not present right now. Traffic your rules send there is blocked rather than leaked to the main route. Bring the connection back up, or assign another adapter to the role below.")
+                        "The connection you chose as additional is not there right now. What your rules send through it is blocked rather than leaked to the main connection. Turn it back on (for example, connect your VPN) or choose another connection in the list below.")
                 color: root.textColor
                 wrapMode: Text.WordWrap
             }
@@ -217,7 +217,7 @@ ColumnLayout {
     Label {
         Layout.fillWidth: true
         text: root.tr("interfaces.role-explanation",
-            "The primary route uses the default interface; the additional route carries the traffic your rules send to it.")
+            "The main connection is your usual internet. The additional connection (e.g. VPN) carries what your rules send to it.")
         color: root.mutedTextColor
         wrapMode: Text.WordWrap
     }
@@ -241,7 +241,10 @@ ColumnLayout {
                     id: behaviorCombo
                     accessibleLabel: root.uiRevision >= 0 ? root.tr("label.mode", "Mode") : ""
                     theme: root.uiTheme
-                    width: 340
+                    width: root.uiRevision >= 0
+                        ? root.comboFitWidth(behaviorCombo, root.behaviorModeModel, "id",
+                            function(item) { return root.behaviorModeLabel(item.id) }, 340)
+                        : 340
                     model: root.behaviorModeModel
                     textRole: "id"
                     labelResolver: function(item) {
@@ -329,13 +332,13 @@ ColumnLayout {
                 spacing: root.uiTheme.spacingSm
                 Label {
                     text: root.tr("settings.routing.auto-rules.label",
-                        "Missing companion domains")
+                        "Suggested addresses")
                     color: root.textColor
                     anchors.verticalCenter: parent.verticalCenter
                 }
                 ThemedComboBox {
                     id: autoRulesModeCombo
-                    accessibleLabel: root.uiRevision >= 0 ? root.tr("settings.routing.auto-rules.label", "Missing companion domains") : ""
+                    accessibleLabel: root.uiRevision >= 0 ? root.tr("settings.routing.auto-rules.label", "Suggested addresses") : ""
                     theme: root.uiTheme
                     width: 260
                     anchors.verticalCenter: parent.verticalCenter
@@ -360,7 +363,7 @@ ColumnLayout {
                     ToolTip.visible: hovered
                     ToolTip.delay: 400
                     ToolTip.text: root.tr("settings.routing.auto-rules.note",
-                        "A routed site often loads its images and video from other domains your rules do not list, so the page opens but its content does not. By default NetRuleRouter collects these missing domains and offers them in the tray — nothing is added to your rules without your confirmation. “Apply automatically” adds them for you; “Off” stops collecting them altogether.")
+                        "A routed site often loads its images and video from other addresses your rules do not list, so the page opens but its content does not. By default NetRuleRouter finds these addresses and offers them in the tray — nothing is added to your rules without your confirmation. “Apply automatically” adds them for you; “Off” stops looking for them altogether.")
                     function _indexOfSlug(slug) {
                         for (var i = 0; i < autoRulesModeCombo.model.count; i += 1)
                             if (String(autoRulesModeCombo.model.get(i).slug) === slug)
@@ -435,7 +438,7 @@ ColumnLayout {
             ThemedButton {
                 theme: root.uiTheme
                 visible: typeof root.openAppGroupRouting === "function"
-                text: root.tr("app-groups.open-button", "Set up routes")
+                text: root.tr("app-groups.open-button", "Programs and devices…")
                 onClicked: root.openAppGroupRouting()
             }
         }
@@ -625,7 +628,7 @@ ColumnLayout {
                                     ? root.tr("interfaces.remembered.switched-off-hint",
                                         "The adapter is switched off. Turn it back on, or assign another adapter to this role in the list below.")
                                     : root.tr("interfaces.remembered.recovery-hint",
-                                        "If the connection is back up, send the binding to the service again. Otherwise assign another adapter to this role in the list below.")
+                                        "If the connection works again, send your choice to the service once more. Otherwise choose another connection for this role in the list below.")
                                 color: root.mutedTextColor
                                 wrapMode: Text.WordWrap
                                 font.pixelSize: Math.max(11, root.uiTheme.baseFontSizePx - 1)
@@ -646,11 +649,11 @@ ColumnLayout {
                                 Layout.alignment: Qt.AlignRight
                                 visible: !rememberedCard.switchedOff
                                 theme: root.uiTheme
-                                text: root.tr("status.policy-inactive-send", "Send adapter to the service")
+                                text: root.tr("status.policy-inactive-send", "Send the choice to the service")
                                 Accessible.role: Accessible.Button
                                 Accessible.name: text
                                 Accessible.description: root.tr("interfaces.remembered.recovery-hint",
-                                    "If the connection is back up, send the binding to the service again. Otherwise assign another adapter to this role in the list below.")
+                                    "If the connection works again, send your choice to the service once more. Otherwise choose another connection for this role in the list below.")
                                 onClicked: root.resendRouteBindingToService()
                             }
                         }
@@ -827,7 +830,7 @@ ColumnLayout {
                                 Layout.preferredWidth: 0
                                 visible: String(model.selectedRole || "") !== ""
                                 text: root.tr("interfaces.role.exclusive-note",
-                                    "One adapter cannot carry both routes: to use it for the other one, unassign its current role first.")
+                                    "One connection cannot be both main and additional: to use it for the other role, unassign its current one first.")
                                 color: root.mutedTextColor
                                 wrapMode: Text.WordWrap
                                 font.pixelSize: Math.max(11, root.uiTheme.baseFontSizePx - 1)
@@ -870,7 +873,7 @@ ColumnLayout {
                             }
                             Label {
                                 text: model.selectedRole === "primary" ? root.routeLabel("primary")
-                                    : model.selectedRole === "secondary" ? root.routeLabel("secondary") : ""
+                                    : model.selectedRole === "secondary" ? root.routeChoiceLabel("secondary") : ""
                                 visible: text !== ""
                                 color: root.accentColor
                                 font.bold: true
@@ -1055,13 +1058,13 @@ ColumnLayout {
                                 text: root.uiRevision >= 0
                                     ? (_holdsPrimary
                                         ? root.tr("interfaces.action.unassign-primary",
-                                            "Unassign primary")
+                                            "No longer main")
                                         : root.routeLabel("primary"))
                                     : ""
                                 ToolTip.visible: hovered && !cardFrame.isAvailable && !_holdsPrimary && enabled
                                 ToolTip.text: root.tr(
                                     "interfaces.action.assign-unavailable-tooltip",
-                                    "Adapter is currently unavailable — the role will activate automatically when it comes back up.")
+                                    "This connection is unavailable right now — your choice takes effect by itself as soon as it works again.")
                                 onClicked: _holdsPrimary
                                     ? root.interfacesRolesController.unassignRole(index, "primary")
                                     : root.interfacesRolesController.assignRole(index, "primary")
@@ -1082,13 +1085,13 @@ ColumnLayout {
                                 text: root.uiRevision >= 0
                                     ? (_holdsSecondary
                                         ? root.tr("interfaces.action.unassign-secondary",
-                                            "Unassign additional")
-                                        : root.routeLabel("secondary"))
+                                            "No longer additional")
+                                        : root.routeChoiceLabel("secondary"))
                                     : ""
                                 ToolTip.visible: hovered && !cardFrame.isAvailable && !_holdsSecondary && enabled
                                 ToolTip.text: root.tr(
                                     "interfaces.action.assign-unavailable-tooltip",
-                                    "Adapter is currently unavailable — the role will activate automatically when it comes back up.")
+                                    "This connection is unavailable right now — your choice takes effect by itself as soon as it works again.")
                                 onClicked: _holdsSecondary
                                     ? root.interfacesRolesController.unassignRole(index, "secondary")
                                     : root.interfacesRolesController.assignRole(index, "secondary")

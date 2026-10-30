@@ -1,36 +1,36 @@
 Service: OK
-> Screens                  Service
-  1 Status                 Service running
-  2 First run              Active revision: rev-7
-  3 Interfaces and routes  The service started 2.4 s before this boot reached the sign-in screen.
-  4 Rules                  Cache healthy · Entries: 42
-  5 Overlaps               3 log file(s)
-  6 Suggested addresses    l: switch between diagnostics, the log and the audit trail
-  7 Connection trace       Audit trail
-  8 Cache                  Audit chain intact
-> 9 Diagnostics and logs   Security alerts requiring attention: 1
-  0 Settings               > 1. Active security alert: Database tampering detected ·
-                           integrity.revision_signature
-                           Rows 1–1 of 1.
-                           audit-2026-10-06.ndjson
-                           a: Acknowledge
+> Screens                 Service
+  1 Status                Service running
+  2 First run             Active revision: rev-7
+  3 Connections           The service started 2.4 s before this boot reached the sign-in screen.
+  4 Rules                 Cache healthy · Entries: 42
+  5 Overlaps              3 log file(s)
+  6 Suggested addresses   l: switch between diagnostics, the log and the audit trail
+  7 Connection trace      Audit trail
+  8 Cache                 Audit chain intact
+> 9 Diagnostics and logs  Security alerts requiring attention: 1
+  0 Settings              > 1. Active security alert: Database tampering detected ·
+                          integrity.revision_signature
+                          Rows 1–1 of 1.
+                          audit-2026-10-06.ndjson
+                          a: Acknowledge
 
-                           Explain sample
-                           No probe has been run yet. Enter a query above and click Probe.
-                           e: Enter a hostname or IP to simulate the routing decision against the
-                           active rule set.
+                          Which rule applies to a site
+                          No probe has been run yet. Enter a query above and click Probe.
+                          e: Enter a hostname or IP to simulate the routing decision against the
+                          active rule set.
 
-                           Check a site
-                           Is it the network or the site? The site's names are checked over your
-                           routes: their address, the route your rules give them, and whether they
-                           answer there. Runs only when you ask.
+                          Check a site
+                          Is it the network or the site? The site's names are checked over your
+                          connections: their address, the connection your rules give them, and
+                          whether they answer there. Runs only when you ask.
 
-                           Diagnostic archive export
-                           The archive is saved in the service archives directory (per-user).
-                           Ready
-                           x: Diagnostic archive export
-                           Detail level: Standard (recommended) · Only logs from the current
-                           session: Yes · Log size limit in the archive: Unlimited
+                          Diagnostic archive export
+                          The archive is saved in the service archives directory (per-user).
+                          Ready
+                          x: Diagnostic archive export
+                          Detail level: Standard (recommended) · Only logs from the current session:
+                          Yes · Log size limit in the archive: Unlimited
 
 
 

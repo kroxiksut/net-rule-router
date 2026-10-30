@@ -53,6 +53,11 @@ impl FakeService {
         lock(&self.refusals).push((op, code));
     }
 
+    /// `op` is answered again: the refusal is lifted.
+    pub fn stop_refusing(&self, op: IpcOperationName) {
+        lock(&self.refusals).retain(|(o, _)| *o != op);
+    }
+
     /// Deliver a push frame to the committed subscriber.
     pub fn push(&self, frame: Value) {
         if let Some(tx) = lock(&self.push).as_ref() {

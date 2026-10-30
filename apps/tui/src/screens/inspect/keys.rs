@@ -28,7 +28,7 @@ pub const TYPING_HINT: Key = key("tui.list.typing-hint", "Enter: done   Esc: can
 pub const YES_NO: Key = key("tui.list.yes-no", "y: yes   n: no");
 pub const YES: Key = key("label.yes", "Yes");
 pub const NO: Key = key("label.no", "No");
-pub const PRIMARY: Key = key("label.primary", "Primary");
+pub const PRIMARY: Key = key("label.primary", "Main");
 pub const SECONDARY: Key = key("label.secondary", "Additional");
 
 // ── Connection trace ─────────────────────────────────────────────────────────
@@ -40,11 +40,11 @@ pub const TRACE_SEARCH: Key = key("tui.trace.search", "Search: {text}");
 pub const TRACE_PATH: Key = key("tui.trace.path", "Path: {path}");
 pub const TRACE_SUBTITLE: Key = key(
     "diag.conn-trace.subtitle",
-    "Recently-observed outbound connections and which interface they actually left through.",
+    "Recently-observed outbound connections and which connection they actually left through (main or additional).",
 );
 pub const TRACE_VERDICT_NOTE: Key = key(
     "diag.conn-trace.verdict-note",
-    "\"Blocked\" means the connection was dropped by a filter in the system — this can be the system firewall or your antivirus, not necessarily NetRuleRouter.",
+    "\"Blocked\" means some filter in the system dropped the connection, such as a firewall or an antivirus. \"Blocked (NetRuleRouter)\" means NetRuleRouter stopped it: a deny rule, or leak protection while the additional connection is not working. Apart from that, NetRuleRouter does not block traffic on your main connection.",
 );
 pub const TRACE_LOADING: Key = key("diag.conn-trace.entries-loading", "Loading connections...");
 pub const TRACE_EMPTY: Key = key(
@@ -86,7 +86,7 @@ pub const TRACE_FROM: Key = key("diag.conn-trace.entries-from", "from");
 pub const TRACE_RELAY_FOR: Key = key("diag.conn-trace.relay-for", "relay for %1");
 pub const TRACE_LEARNED_ROUTE: Key = key(
     "diag.conn-trace.learned-route",
-    "First connection held at %1 while the address was being learned, then sent over the additional route",
+    "First connection held at %1 while the address was being learned, then sent over the additional connection",
 );
 pub const TRACE_HOST_OTHERS: Key = key("diag.conn-trace.remote-host-others", "%1 (+%2)");
 pub const TRACE_FAKE_IP: Key = key("diag.conn-trace.fake-ip", "fake-IP");
@@ -100,9 +100,9 @@ pub const TRACE_NAMES: Key = key(
 );
 pub const TRACE_LEAK: Key = key(
     "diag.conn-trace.leak-mismatch-tip",
-    "Mismatch: this address belongs to a rule routed to the additional adapter, but the connection was allowed out over the PRIMARY link — a leak indicator.",
+    "Mismatch: this address belongs to a rule routed to the additional adapter, but the connection was allowed out over the MAIN connection — a leak indicator.",
 );
-pub const TRACE_WHY: Key = key("diag.conn-trace.why-this-route", "Why this route?");
+pub const TRACE_WHY: Key = key("diag.conn-trace.why-this-route", "Why this connection?");
 pub const COL_PROCESS: Key = key("diag.conn-trace.col-process", "Process");
 pub const COL_REMOTE: Key = key("diag.conn-trace.col-remote", "Remote");
 pub const COL_EGRESS: Key = key("diag.conn-trace.col-egress", "Egress");
@@ -110,7 +110,7 @@ pub const COL_VERDICT: Key = key("diag.conn-trace.col-verdict", "Verdict");
 
 pub const TRACE_HELP_EXPLAIN: Key = key(
     "tui.trace.help-explain",
-    "Enter: why the chosen connection took its route (opens Diagnostics)",
+    "Enter: why the chosen connection went where it did (opens Diagnostics)",
 );
 pub const TRACE_HELP_SEARCH: Key = key(
     "tui.trace.help-search",
@@ -126,7 +126,7 @@ pub const TRACE_PLAIN_DETAILS: Key = key(
 );
 pub const TRACE_PLAIN_EXPLAIN: Key = key(
     "tui.trace.plain-explain",
-    "e and a row number: why that connection took its route, for example e 3",
+    "e and a row number: why that connection went where it did, for example e 3",
 );
 pub const TRACE_PLAIN_SEARCH: Key = key(
     "tui.trace.plain-search",
@@ -134,7 +134,7 @@ pub const TRACE_PLAIN_SEARCH: Key = key(
 );
 pub const TRACE_HELP_OUTAGE: Key = key(
     "tui.trace.help-outage",
-    "o: what was blocked while the additional route was down",
+    "o: what was blocked while the additional connection was down",
 );
 pub const TRACE_HELP_HISTORY: Key = key(
     "tui.trace.help-history",
@@ -221,11 +221,11 @@ pub const HISTORY_FAILED: Key = key(
 
 pub const OUTAGE_INTRO: Key = key(
     "diag.outage-blocks.intro",
-    "What leak protection held back while the additional route was down. Your rules send these addresses there, so they were blocked instead of leaving through the main connection.",
+    "What leak protection held back while the additional connection was down. Your rules send these addresses there, so they were blocked instead of leaving through the main connection.",
 );
 pub const OUTAGE_ACTIVE: Key = key(
     "diag.outage-blocks.episode-active",
-    "The additional route has been down since {since}.",
+    "The additional connection has been down since {since}.",
 );
 pub const OUTAGE_ENDED: Key = key(
     "diag.outage-blocks.episode-ended",
@@ -233,7 +233,7 @@ pub const OUTAGE_ENDED: Key = key(
 );
 pub const OUTAGE_NONE: Key = key(
     "diag.outage-blocks.no-episode",
-    "The additional route has not been down since the service started.",
+    "The additional connection has not been down since the service started.",
 );
 pub const OUTAGE_EMPTY: Key = key(
     "diag.outage-blocks.empty",
@@ -248,10 +248,7 @@ pub const OUTAGE_OBSERVER_OFF: Key = key(
     "On this system NetRuleRouter cannot tell which connections an outage blocked, so this list stays empty.",
 );
 pub const OUTAGE_FAILED: Key = key("diag.outage-blocks.failed", "Could not load the list: ");
-pub const OUTAGE_OPEN_ROUTES: Key = key(
-    "diag.outage-blocks.open-routes",
-    "Open interfaces and routes",
-);
+pub const OUTAGE_OPEN_ROUTES: Key = key("diag.outage-blocks.open-routes", "Open Connections");
 pub const COL_ATTEMPTS: Key = key("diag.outage-blocks.col-attempts", "Attempts");
 pub const COL_FIRST: Key = key("diag.outage-blocks.col-first", "First");
 pub const COL_LAST: Key = key("diag.outage-blocks.col-last", "Last");
@@ -288,7 +285,7 @@ pub const CACHE_REDACTED: Key = key(
 pub const COL_HOST: Key = key("diag.cache.col-hostname", "Host");
 pub const COL_IP: Key = key("diag.cache.col-ip", "IP");
 pub const COL_SOURCE: Key = key("diag.cache.col-source", "Source");
-pub const COL_ROUTE: Key = key("diag.cache.col-route", "Route");
+pub const COL_ROUTE: Key = key("diag.cache.col-route", "Connection");
 pub const COL_FRESHNESS: Key = key("diag.cache.col-freshness", "Freshness");
 pub const COL_FAKE_IP: Key = key("diag.cache.col-fake-ip", "Fake-IP");
 pub const CACHE_RESOLVED: Key = key("diag.cache.entries-resolved", "resolved");
@@ -326,7 +323,7 @@ pub const CACHE_HELP_CLEAR: Key = key(
 );
 pub const CACHE_HELP_FILTERS: Key = key(
     "tui.cache.help-filters",
-    "f: freshness, t: source, w: route; each press shows the next choice of that filter",
+    "f: freshness, t: source, w: connection; each press shows the next choice of that filter",
 );
 pub const CACHE_HELP_SEED: Key = key(
     "tui.cache.help-seed",
@@ -340,7 +337,7 @@ pub const CACHE_SOURCE_ALL: Key = key("diag.cache.source-filter.all", "All sourc
 pub const CACHE_FRESH_ALL: Key = key("diag.cache.freshness-filter.all", "Any freshness");
 pub const CACHE_FRESH_FRESH: Key = key("diag.cache.freshness-filter.fresh", "Fresh");
 pub const CACHE_FRESH_STALE: Key = key("diag.cache.freshness-filter.stale", "Stale");
-pub const CACHE_ROUTE_ALL: Key = key("diag.cache.route-filter.all", "All routes");
+pub const CACHE_ROUTE_ALL: Key = key("diag.cache.route-filter.all", "All connections");
 pub const CACHE_ROUTE_NONE: Key = key("diag.cache.route-filter.none", "No rule");
 pub const CACHE_SEED_STARTED: Key = key(
     "diag.cache.seed-browser-history.started",
@@ -452,7 +449,7 @@ pub const REVIEW_POINTER: Key = key(
 pub const REVIEW_RULES: Key = key("diag.alert.review.rule-count", "{count} rules");
 pub const REVIEW_IN_USE: Key = key("diag.alert.review.status-active", "in use");
 
-pub const EXPLAIN: Key = key("diag.explain.title", "Explain sample");
+pub const EXPLAIN: Key = key("diag.explain.title", "Which rule applies to a site");
 pub const EXPLAIN_SUBTITLE: Key = key(
     "diag.explain.subtitle",
     "Enter a hostname or IP to simulate the routing decision against the active rule set.",
@@ -467,17 +464,17 @@ pub const EXPLAIN_REQUIRED: Key = key(
     "diag.explain.input-required",
     "Enter a hostname or IP to probe",
 );
-pub const ROUTE_NONE: Key = key("diag.explain.route.none", "no route");
+pub const ROUTE_NONE: Key = key("diag.explain.route.none", "no connection");
 pub const ROUTE_BLOCKED: Key = key("diag.explain.route.blocked", "blocked");
-pub const ROUTE_PRIMARY: Key = key("diag.explain.route.primary", "primary route");
-pub const ROUTE_SECONDARY: Key = key("diag.explain.route.secondary", "additional route");
+pub const ROUTE_PRIMARY: Key = key("diag.explain.route.primary", "main connection");
+pub const ROUTE_SECONDARY: Key = key("diag.explain.route.secondary", "additional connection");
 pub const VERDICT_BLOCK: Key = key("diag.conn-trace.verdict.block", "Blocked");
 pub const VERDICT_PERMIT: Key = key("diag.conn-trace.verdict.permit", "Allowed");
 
 pub const SITE_CHECK: Key = key("diag.site-check.title", "Check a site");
 pub const SITE_SUBTITLE: Key = key(
     "diag.site-check.subtitle",
-    "Is it the network or the site? The site's names are checked over your routes: their address, the route your rules give them, and whether they answer there. Runs only when you ask.",
+    "Is it the network or the site? The site's names are checked over your connections: their address, the connection your rules give them, and whether they answer there. Runs only when you ask.",
 );
 pub const SITE_INPUT: Key = key("diag.site-check.placeholder", "site name, e.g. example.com");
 pub const SITE_RUNNING: Key = key("diag.site-check.running", "Checking {host}…");
@@ -505,7 +502,7 @@ pub const SITE_COOKIES_NOTE: Key = key(
 );
 pub const SITE_MOVE: Key = key(
     "tui.diagnostics.site-move",
-    "m: move the sign-in names to the site's route (Rules opens with them, and you confirm)",
+    "m: move the sign-in names to the site's connection (Rules opens with them, and you confirm)",
 );
 pub const SITE_TRACE: Key = key(
     "tui.diagnostics.site-trace",
@@ -518,7 +515,7 @@ pub const DIAG_HELP_SITE: Key = key(
 );
 pub const DIAG_PLAIN_SITE: Key = key(
     "tui.diagnostics.plain-site-check",
-    "c and a site name: check it, for example c example.com; m: move the sign-in names the check found to the site's route",
+    "c and a site name: check it, for example c example.com; m: move the sign-in names the check found to the site's connection",
 );
 pub const TRACE_HELP_CHECK: Key = key(
     "tui.trace.help-check-site",

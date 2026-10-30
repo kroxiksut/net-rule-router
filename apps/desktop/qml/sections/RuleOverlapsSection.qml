@@ -56,7 +56,7 @@ ColumnLayout {
             return root.tr("rules.overlaps.reason.block-tie", "A deny wins a tie")
         var kind = String(overlap.kind)
         return kind === "duplicate"
-            ? root.tr("rules.overlaps.reason.duplicate", "Same rule on both routes")
+            ? root.tr("rules.overlaps.reason.duplicate", "Same rule on both connections")
             : kind === "intersecting"
             ? root.tr("rules.overlaps.reason.intersecting", "Narrower where they meet")
             : root.tr("rules.overlaps.reason.nested", "Narrower rule")
@@ -142,7 +142,7 @@ ColumnLayout {
             color: root.textColor
             text: root.uiRevision >= 0
                 ? root.tr("rules.overlaps.intro",
-                    "When rules of the two routes cover the same sites or addresses, the narrower rule wins: an exact name beats a wildcard, a wildcard beats a zone, a longer name beats a shorter one; an exact address beats a subnet or range, a smaller network beats a larger one. Check that each item below goes where you want it to: confirm it, or send it over the other route. Changes go to your rules list, where you review and apply them.")
+                    "When rules of the two connections cover the same sites or addresses, the narrower rule wins: an exact name beats a wildcard, a wildcard beats a zone, a longer name beats a shorter one; an exact address beats a subnet or range, a smaller network beats a larger one. Check that each item below goes where you want it to: confirm it, or send it over the other connection. Changes go to your rules list, where you review and apply them.")
                 : ""
             Accessible.role: Accessible.StaticText
             Accessible.name: text
@@ -218,7 +218,7 @@ ColumnLayout {
             : section.controller.loadState === "error"
             ? root.tr("rules.overlaps.load-failed", "Could not check the rules for overlaps. Try again in a moment.")
             : section.controller.overlaps.length === 0
-            ? root.tr("rules.overlaps.empty", "No rules of the two routes cover the same sites or addresses.")
+            ? root.tr("rules.overlaps.empty", "No rules of the two connections cover the same sites or addresses.")
             : root.tr("rules.overlaps.all-resolved", "Every overlap is resolved.")
         Accessible.role: Accessible.StaticText
         Accessible.name: text
@@ -390,8 +390,8 @@ ColumnLayout {
                                 theme: root.uiTheme
                                 visible: section.controller.canReroute(row.overlap)
                                 enabled: root.ruleEditsLocked !== true
-                                text: root.tr("rules.overlaps.send-over", "Send over {route} instead")
-                                    .replace("{route}", root.routeLabel(String(row.overlap.loser.route)))
+                                text: root.tr("rules.action.send-over", "Send over {route}")
+                                    .replace("{route}", root.routeChoiceLabel(String(row.overlap.loser.route)))
                                 Accessible.role: Accessible.Button
                                 Accessible.name: text
                                 onClicked: section.controller.sendOverLoserRoute(row.overlap)

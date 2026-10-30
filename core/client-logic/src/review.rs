@@ -152,3 +152,50 @@ pub fn preview_outcome(
         Outcome::Failed("unknown".to_owned())
     }
 }
+
+/// A review row's rule as the service spelled it, taken apart so each client
+/// says its English markers in the user's language (`reviewEntryParts`).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ReviewEntryParts {
+    /// What the rule matches, its markers taken off.
+    pub rule: String,
+    /// An application rule (the service's ` (app)`).
+    pub app: bool,
+    /// A rule moved between routes: the route slugs it left and joined.
+    pub moved: Option<(String, String)>,
+    /// A rule that matches nothing.
+    pub invalid: bool,
+}
+
+const APP_MARK: &str = " (app)";
+const INVALID_RULE: &str = "(no match — invalid rule)";
+
+/// Takes the service's review `display` apart (`nrr_domain::review`):
+/// `<rule>[ (app)][ (<from> → <to>)]`.
+pub fn review_entry_parts(display: &str) -> ReviewEntryParts {
+    let mut rule = display;
+    let mut moved = None;
+    if let Some(open) = rule.strip_suffix(')').and_then(|r| r.rfind(" (")) {
+        let inside = &rule[open + 2..rule.len() - 1];
+        if let Some((from, to)) = inside.split_once(" → ") {
+            if is_route_slug(from) && is_route_slug(to) {
+                moved = Some((from.to_owned(), to.to_owned()));
+                rule = &rule[..open];
+            }
+        }
+    }
+    let app = rule.ends_with(APP_MARK) && rule.len() > APP_MARK.len();
+    if app {
+        rule = &rule[..rule.len() - APP_MARK.len()];
+    }
+    ReviewEntryParts {
+        rule: rule.to_owned(),
+        app,
+        moved,
+        invalid: rule == INVALID_RULE,
+    }
+}
+
+fn is_route_slug(s: &str) -> bool {
+    s == "primary" || s == "secondary"
+}

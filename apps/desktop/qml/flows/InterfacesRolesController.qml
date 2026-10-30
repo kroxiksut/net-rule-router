@@ -451,7 +451,7 @@ QtObject {
         root.routePolicyController.pushRouteBindingToService(undefined, undefined,
             "user:interfaces")
         root.statusLine = root.tr("status.secondary-rebound",
-            "Additional adapter re-confirmed.")
+            "Additional connection confirmed again.")
     }
 
     /// Auto-confirm path for a reinstalled secondary adapter.
@@ -464,7 +464,7 @@ QtObject {
         if (_staleSecondaryHealRow() === null) return
         _reconfirmSecondaryBinding()
         root.statusLine = root.tr("status.secondary-auto-confirmed",
-            "Additional adapter ID changed — auto-confirmed by matching name.")
+            "Additional connection was reinstalled — confirmed automatically by its matching name.")
     }
 
     // Returns the index of the adapter currently holding `role`, or -1 if no
@@ -505,7 +505,7 @@ QtObject {
                 && _askHoldsNow(null, selectedId, selectedName, function(now) {
                     if (now < 0) {
                         root.statusLine = root.tr("status.role-adapter-gone-unassign",
-                            "That adapter is no longer on this computer, so its role was left as it was.")
+                            "That connection is no longer on this computer, so the choice was left as it was.")
                         return
                     }
                     interfacesRolesController.unassignRole(now, role, true)
@@ -535,7 +535,7 @@ QtObject {
         root.updatePrefs(patch)
         root.emitPrefs()
         root.statusLine = root.tr("status.role-unassigned",
-            "{role} unassigned from this adapter.").replace("{role}", root.routeLabel(role))
+            "Choice cleared: {role}.").replace("{role}", root.routeLabel(role))
         // Mirror the binding into the service policy so enforcement sees the
         // cleared slot. Unbinding must be explicit: a blank pref alone means
         // "leave as is" on the service side, never "unbind".
@@ -612,7 +612,7 @@ QtObject {
             if (_askHoldsNow(nextSecondary, selectedId, selectedName, function(now) {
                     if (now < 0) {
                         root.statusLine = root.tr("status.role-adapter-gone",
-                            "That adapter is no longer on this computer, so no role was assigned.")
+                            "That connection is no longer on this computer, so it was not chosen.")
                         return
                     }
                     interfacesRolesController.assignRole(now, role, false, true)
@@ -635,7 +635,7 @@ QtObject {
                     var now = interfacesRolesController._modelIndexOf(selectedId, selectedName)
                     if (now < 0) {
                         root.statusLine = root.tr("status.role-adapter-gone",
-                            "That adapter is no longer on this computer, so no role was assigned.")
+                            "That connection is no longer on this computer, so it was not chosen.")
                         return
                     }
                     interfacesRolesController.assignRole(now, role, true)

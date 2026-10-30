@@ -461,7 +461,10 @@ fn line_mode_assigns_by_numbered_questions() {
     let text = String::from_utf8(session.into_inner()).expect("UTF-8");
     assert!(text.contains("Which adapter?"), "{text}");
     assert!(text.contains("What should Wi-Fi carry?"), "{text}");
-    assert!(text.contains("Additional connection: Wi-Fi."), "{text}");
+    assert!(
+        text.contains("Additional connection (e.g. VPN): Wi-Fi."),
+        "{text}"
+    );
     let request = &fake.sent(IpcOperationName::RoutePolicyUpdate)[0];
     assert_eq!(request["secondary"]["stable-id"], json!(WIFI));
     assert_snapshot("interfaces-plain", &text);

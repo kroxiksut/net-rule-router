@@ -154,15 +154,17 @@ pub(super) fn clamp_liveness_window_secs(value: u32) -> u32 {
 
 /// A route label as stored: empty when the user never renamed the route, so
 /// the window names it in whatever language it runs. The values listed are
-/// defaults older builds wrote into the file (a data migration, not a list of
-/// languages).
+/// stock names, current and from older builds (a data migration, not a list
+/// of languages).
 pub fn route_label_as_stored(value: &str) -> String {
-    const FORMER_DEFAULTS: [&str; 5] = [
+    const FORMER_DEFAULTS: [&str; 7] = [
         "Primary",
         "Secondary",
         "Additional",
         "Основной",
         "Дополнительный",
+        "Основное",
+        "Дополнительное",
     ];
     let value = value.trim();
     if FORMER_DEFAULTS.contains(&value) {

@@ -584,6 +584,10 @@ fn windows_symbols_release_flaw(workflow: &str) -> Option<String> {
     if !workflow.contains("arch: [x64, arm64]") {
         return Some("the Windows job no longer builds both x64 and arm64".into());
     }
+    // A test build may skip the symbols; a release never.
+    if workflow.contains("-NoSymbols") {
+        return Some("the release builds Windows packages without their symbols".into());
+    }
     if !workflow.contains("/dist/*.zip") {
         return Some(
             "the Windows job does not upload the *.zip files (portable and symbols)".into(),
@@ -657,4 +661,10 @@ fn each_symbols_regression_is_seen() {
     assert!(windows_symbols_release_flaw(&no_arm).is_some());
     let unnoted = edit(&workflow, "--notes", "--title-again");
     assert!(windows_symbols_release_flaw(&unnoted).is_some());
+    let skipped = edit(
+        &workflow,
+        "package-windows.ps1 `",
+        "package-windows.ps1 -NoSymbols `",
+    );
+    assert!(windows_symbols_release_flaw(&skipped).is_some());
 }

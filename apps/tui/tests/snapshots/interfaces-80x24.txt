@@ -1,24 +1,24 @@
 Service: OK
-╭Screens───────────────────╮╭Connections — +4 more rows────────────────────────╮
-│  1 Status                ││The primary route uses the default interface; the │
-│  2 First run             ││additional route carries the traffic your rules   │
-│> 3 Interfaces and routes ││send to it.                                       │
-│  4 Rules                 ││Main connection: Ethernet — Example Network       │
-│  5 Overlaps              ││Adapter — Available                               │
-│  6 Suggested addresses   ││Additional connection: Example Tunnel — Example   │
-│  7 Connection trace      │╰──────────────────────────────────────────────────╯
-│  8 Cache                 │╭Adapters — +5 more rows───────────────────────────╮
-│  9 Diagnostics and logs  ││  2. Example Tunnel — Example Network Adapter —   │
-│  0 Settings              ││Wired (Ethernet) — Available — Additional         │
-│                          ││connection                                        │
-│                          ││> 3. Wi-Fi — Wi-Fi — Available                    │
-│                          ││  4. Host-only Network — Virtual (VM, container) —│
-│                          │╰──────────────────────────────────────────────────╯
-│                          │╭Chosen adapter: Wi-Fi─────────────────────────────╮
-│                          ││Wi-Fi · looks like the main connection            │
-│                          ││Type: Wi-Fi | IP: 192.0.2.10 | Gateway: 192.0.2.1 │
-│                          ││DNS: 192.0.2.53 | Default route: Yes              │
-│                          ││internet • unknown • Regular interface 90%        │
-│                          ││Recommended as primary                            │
-╰──────────────────────────╯╰──────────────────────────────────────────────────╯
+╭Screens──────────────────╮╭Connections — +4 more rows─────────────────────────╮
+│  1 Status               ││The main connection is your usual internet. The    │
+│  2 First run            ││additional connection (e.g. VPN) carries what your │
+│> 3 Connections          ││rules send to it.                                  │
+│  4 Rules                ││Main connection: Ethernet — Example Network Adapter│
+│  5 Overlaps             ││— Available                                        │
+│  6 Suggested addresses  ││Additional connection (e.g. VPN): Example Tunnel — │
+│  7 Connection trace     │╰───────────────────────────────────────────────────╯
+│  8 Cache                │╭Adapters — +6 more rows────────────────────────────╮
+│  9 Diagnostics and logs ││Wired (Ethernet) — Available — Additional          │
+│  0 Settings             ││connection (e.g. VPN)                              │
+│                         ││> 3. Wi-Fi — Wi-Fi — Available                     │
+│                         ││  4. Host-only Network — Virtual (VM, container) — │
+│                         ││Available                                          │
+│                         │╰───────────────────────────────────────────────────╯
+│                         │╭Chosen adapter: Wi-Fi──────────────────────────────╮
+│                         ││Wi-Fi · looks like the main connection             │
+│                         ││Type: Wi-Fi | IP: 192.0.2.10 | Gateway: 192.0.2.1  │
+│                         ││DNS: 192.0.2.53 | Default route: Yes               │
+│                         ││internet • unknown • Regular interface 90%         │
+│                         ││Recommended as main                                │
+╰─────────────────────────╯╰───────────────────────────────────────────────────╯
 F1: help   q: quit

@@ -87,7 +87,9 @@ impl PerSidApplyOrchestrator {
         );
         let unresolved_apps = findings.unresolved_apps;
         if log_unresolved && !unresolved_apps.is_empty() {
-            tracing::warn!(
+            // Info: a shared rule set naming programs this machine lacks is the
+            // normal case, not a fault, and the GUI banner already lists them.
+            tracing::info!(
                 target: "nrr::app-resolver",
                 msg_key = "persid-plan-app-rules-unresolved",
                 sid = %sid,

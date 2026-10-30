@@ -19,7 +19,9 @@
 //! this one. Three outcomes per named destination:
 //!
 //! - **navigation** — quiet before it, a burst after it. The page a person opened.
-//! - **companion** — it arrived inside a burst somebody else started.
+//! - **companion** — it arrived inside a burst somebody else started: another
+//!   site's page, a page's worth of connections even without this host's own
+//!   site. A site's own retries and sibling hosts are never its companions.
 //! - **solo** — quiet before AND after: nothing followed it. A banner refreshing
 //!   on a timer in an open tab looks exactly like this, which is why "quiet
 //!   before" alone cannot mean navigation: on a machine averaging one
@@ -64,6 +66,10 @@ const ENTRY_TTL_MS: u64 = 6 * 60 * 60 * 1_000;
 const MAX_HOSTS: usize = 4096;
 const MAX_PROCESSES: usize = 256;
 
+/// Named connections a burst keeps for judging when it settles. Past this the
+/// burst is a page by any measure, and the rest are judged on arrival.
+const MAX_BURST_MEMBERS: usize = 64;
+
 /// How often the accumulated distribution is worth saying out loud.
 const REPORT_EVERY_MS: u64 = 10 * 60 * 1_000;
 
@@ -83,6 +89,9 @@ pub struct HostCounts {
     pub companions: u32,
     /// Quiet before and after: nothing followed it.
     pub solo: u32,
+    /// Arrived in a burst that, without this host's own site, was too small to
+    /// be anybody's page: the site made up the burst itself.
+    pub own_burst: u32,
     /// Arrived close behind its process's previous connection, from a process
     /// never seen starting a burst. The measure is blind there, so this says
     /// nothing either way.
@@ -95,6 +104,7 @@ impl HostCounts {
         self.navigations
             .saturating_add(self.companions)
             .saturating_add(self.solo)
+            .saturating_add(self.own_burst)
             .saturating_add(self.unmeasured)
     }
 
@@ -102,7 +112,7 @@ impl HostCounts {
     /// says anyone set out for this host.
     #[must_use]
     pub fn only_pulled_in(&self) -> bool {
-        self.companions > 0 && self.navigations == 0 && self.solo == 0
+        self.companions > 0 && self.navigations == 0 && self.solo == 0 && self.own_burst == 0
     }
 }
 
@@ -133,6 +143,49 @@ struct Candidate {
     hostname: Option<String>,
     at_ms: u64,
     followers: u32,
+    /// Named connections inside the window, judged when it settles: whether
+    /// one was pulled in depends on what the rest of the burst turns out to be.
+    members: Vec<String>,
+}
+
+impl Candidate {
+    fn new(hostname: Option<&str>, at_ms: u64) -> Self {
+        Self {
+            hostname: hostname.map(str::to_string),
+            at_ms,
+            followers: 0,
+            members: Vec::new(),
+        }
+    }
+
+    /// How `member` stands in this burst, given the leader's outcome once the
+    /// burst has settled. The leader's own site shares the leader's outcome.
+    /// `None` while the burst is open and the answer may still change: only a
+    /// companion stays one however the burst grows.
+    fn judge(&self, member: &str, leader: Option<Outcome>, min_followers: u32) -> Option<Outcome> {
+        let site = site_of(member);
+        if self
+            .hostname
+            .as_deref()
+            .is_some_and(|lead| site_of(lead) == site)
+        {
+            return leader;
+        }
+        let own = self.members.iter().filter(|m| site_of(m) == site).count();
+        let own = u32::try_from(own).unwrap_or(u32::MAX);
+        // The leader and its followers, less this host's own site.
+        let rest = self.followers.saturating_add(1).saturating_sub(own);
+        if rest >= min_followers {
+            Some(Outcome::Companion)
+        } else {
+            leader.map(|_| Outcome::OwnBurst)
+        }
+    }
+}
+
+/// The registrable domain a host belongs to; a name without one is its own site.
+fn site_of(host: &str) -> &str {
+    nrr_domain::companion_affinity::registrable_domain(host).unwrap_or(host)
 }
 
 #[derive(Debug)]
@@ -147,6 +200,9 @@ struct ProcState {
     /// the first connection after every start a navigation.
     primed: bool,
     candidate: Option<Candidate>,
+    /// Site of the process's last named connection: a connection close behind
+    /// its own site is that site continuing, not something a page pulled in.
+    last_site: Option<String>,
     /// Navigations this process has ever produced. A process that has produced
     /// none has never been observed going quiet, so its hosts' zeroes say
     /// nothing about them — see [`NavigationRegistry::process_ever_navigated`].
@@ -262,48 +318,58 @@ impl NavigationRegistry {
                 last_at_ms: at_ms,
                 primed: false,
                 candidate: None,
+                last_site: None,
                 navigations: 0,
             });
             if !entry.primed {
                 entry.primed = true;
                 entry.last_at_ms = at_ms;
+                entry.last_site = hostname.map(|h| site_of(h).to_string());
                 Self::evict_procs_to_cap(&mut procs, self.proc_cap);
+                // The report takes this lock too: release it first.
+                drop(procs);
                 return self.due_report(at_ms);
             }
             let gap = at_ms.saturating_sub(entry.last_at_ms);
             entry.last_at_ms = entry.last_at_ms.max(at_ms);
             self.record_gap(gap);
 
-            let mut settled = None;
+            let mut settled = Vec::new();
             match entry.candidate.take() {
                 Some(mut candidate)
                     if at_ms.saturating_sub(candidate.at_ms) <= self.burst_window_ms =>
                 {
-                    // Inside the candidate's window: this connection is part of
-                    // its burst, and is itself a companion.
+                    // Inside the candidate's window: part of its burst, judged
+                    // when the burst settles.
                     candidate.followers = candidate.followers.saturating_add(1);
-                    entry.candidate = Some(candidate);
                     if let Some(host) = hostname {
-                        settled = Some((host.to_string(), Outcome::Companion));
+                        if candidate.members.len() < MAX_BURST_MEMBERS {
+                            candidate.members.push(host.to_string());
+                        } else if let Some(outcome) =
+                            candidate.judge(host, None, self.burst_min_followers)
+                        {
+                            settled.push((host.to_string(), outcome));
+                        }
                     }
+                    entry.candidate = Some(candidate);
                 }
                 Some(candidate) => {
                     // The window closed. Settle it, then judge this connection
                     // on its own gap.
-                    let outcome = self.settle(&candidate, &mut entry.navigations);
-                    if let Some(host) = candidate.hostname.as_deref() {
-                        self.credit(owner, host, outcome, at_ms);
-                    }
-                    settled = self.begin_or_credit(entry, hostname, gap, at_ms);
+                    settled = self.settle(candidate, &mut entry.navigations);
+                    settled.extend(self.begin_or_credit(entry, hostname, gap, at_ms));
                 }
                 None => {
-                    settled = self.begin_or_credit(entry, hostname, gap, at_ms);
+                    settled.extend(self.begin_or_credit(entry, hostname, gap, at_ms));
                 }
+            }
+            if let Some(host) = hostname {
+                entry.last_site = Some(site_of(host).to_string());
             }
             Self::evict_procs_to_cap(&mut procs, self.proc_cap);
             settled
         };
-        if let Some((host, outcome)) = settled {
+        for (host, outcome) in settled {
             self.credit(owner, &host, outcome, at_ms);
         }
         self.due_report(at_ms)
@@ -330,7 +396,7 @@ impl NavigationRegistry {
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .retain(|_, (_, last)| now_ms.saturating_sub(*last) < self.ttl_ms);
-        let ripe: Vec<(String, Candidate, Outcome)> = {
+        let ripe: Vec<(String, Vec<(String, Outcome)>)> = {
             let mut procs = self.procs.lock().unwrap_or_else(|p| p.into_inner());
             Self::expire_procs(&mut procs, now_ms, self.ttl_ms);
             let mut ripe = Vec::new();
@@ -344,28 +410,50 @@ impl NavigationRegistry {
                 let Some(candidate) = state.candidate.take() else {
                     continue;
                 };
-                let outcome = self.settle(&candidate, &mut state.navigations);
-                ripe.push((state.owner.clone(), candidate, outcome));
+                let settled = self.settle(candidate, &mut state.navigations);
+                ripe.push((state.owner.clone(), settled));
             }
             ripe
         };
-        for (owner, candidate, outcome) in ripe {
-            if let Some(host) = candidate.hostname.as_deref() {
-                self.credit(&owner, host, outcome, now_ms);
+        for (owner, settled) in ripe {
+            for (host, outcome) in settled {
+                self.credit(&owner, &host, outcome, now_ms);
             }
         }
     }
 
     /// What was counted for `hostname` on `owner`'s connections. All zeroes
     /// for a host that user was never seen reaching.
+    ///
+    /// A burst still open adds only its companions, the one answer more
+    /// connections cannot undo. [`Self::sweep`] first closes the bursts whose
+    /// window has passed.
     #[must_use]
     pub fn counts_of(&self, owner: Option<&str>, hostname: &str) -> HostCounts {
-        self.hosts
+        let owner = owner.unwrap_or_default();
+        let mut counts = self
+            .hosts
             .lock()
             .unwrap_or_else(|p| p.into_inner())
-            .get(&scoped(owner.unwrap_or_default(), hostname))
+            .get(&scoped(owner, hostname))
             .map(|(counts, _)| *counts)
-            .unwrap_or_default()
+            .unwrap_or_default();
+        let procs = self.procs.lock().unwrap_or_else(|p| p.into_inner());
+        for candidate in procs
+            .values()
+            .filter(|state| state.owner == owner)
+            .filter_map(|state| state.candidate.as_ref())
+        {
+            let sightings = candidate.members.iter().filter(|m| *m == hostname).count();
+            if sightings > 0
+                && candidate.judge(hostname, None, self.burst_min_followers)
+                    == Some(Outcome::Companion)
+            {
+                let sightings = u32::try_from(sightings).unwrap_or(u32::MAX);
+                counts.companions = counts.companions.saturating_add(sightings);
+            }
+        }
+        counts
     }
 
     /// Has this process ever been seen starting a burst?
@@ -406,33 +494,44 @@ impl NavigationRegistry {
         at_ms: u64,
     ) -> Option<(String, Outcome)> {
         if gap >= self.quiet_before_ms {
-            entry.candidate = Some(Candidate {
-                hostname: hostname.map(str::to_string),
-                at_ms,
-                followers: 0,
-            });
+            entry.candidate = Some(Candidate::new(hostname, at_ms));
             return None;
         }
         // Close behind the previous connection with no burst open. A companion
         // only if this process has ever gone quiet and navigated: one that never
         // does lands every connection here, and "pulled in" would then describe
-        // the process, not the host.
-        let outcome = if entry.navigations > 0 {
+        // the process, not the host. Close behind its own site it is that site
+        // continuing, which says nothing either way.
+        let host = hostname?;
+        let continues = entry.last_site.as_deref() == Some(site_of(host));
+        let outcome = if entry.navigations > 0 && !continues {
             Outcome::Companion
         } else {
             Outcome::Unmeasured
         };
-        hostname.map(|host| (host.to_string(), outcome))
+        Some((host.to_string(), outcome))
     }
 
-    fn settle(&self, candidate: &Candidate, navigations: &mut u32) -> Outcome {
+    /// Close a burst: the leader's outcome, then each member judged against
+    /// the burst as it ended.
+    fn settle(&self, candidate: Candidate, navigations: &mut u32) -> Vec<(String, Outcome)> {
         self.record_burst(candidate.followers);
-        if candidate.followers >= self.burst_min_followers {
+        let outcome = if candidate.followers >= self.burst_min_followers {
             *navigations = navigations.saturating_add(1);
             Outcome::Navigation
         } else {
             Outcome::Solo
+        };
+        let mut settled = Vec::with_capacity(candidate.members.len() + 1);
+        if let Some(lead) = candidate.hostname.as_deref() {
+            settled.push((lead.to_string(), outcome));
         }
+        for member in &candidate.members {
+            if let Some(judged) = candidate.judge(member, Some(outcome), self.burst_min_followers) {
+                settled.push((member.clone(), judged));
+            }
+        }
+        settled
     }
 
     fn credit(&self, owner: &str, hostname: &str, outcome: Outcome, at_ms: u64) {
@@ -447,6 +546,7 @@ impl NavigationRegistry {
             Outcome::Navigation => counts.navigations = counts.navigations.saturating_add(1),
             Outcome::Companion => counts.companions = counts.companions.saturating_add(1),
             Outcome::Solo => counts.solo = counts.solo.saturating_add(1),
+            Outcome::OwnBurst => counts.own_burst = counts.own_burst.saturating_add(1),
             Outcome::Unmeasured => counts.unmeasured = counts.unmeasured.saturating_add(1),
         }
         if hosts.len() > self.host_cap {
@@ -533,6 +633,7 @@ enum Outcome {
     Navigation,
     Companion,
     Solo,
+    OwnBurst,
     Unmeasured,
 }
 
@@ -548,6 +649,7 @@ pub fn log_counts(hostname: &str, counts: &HostCounts) {
         navigations = counts.navigations,
         companions = counts.companions,
         solo = counts.solo,
+        own_burst = counts.own_burst,
         unmeasured = counts.unmeasured,
         "how this destination was reached before it stopped answering",
     );
@@ -592,6 +694,35 @@ mod tests {
     const PROC: &str = "C:/apps/browser.exe";
     const OWNER: Option<&str> = Some("S-1-5-21-1");
 
+    /// A process's first connection landing when the report falls due used to
+    /// ask for the report under the process table's lock, which the report
+    /// takes too: the observer thread waited on itself and app rules stopped
+    /// learning for the rest of the session.
+    #[test]
+    fn a_new_process_seen_when_the_report_is_due_does_not_hang_the_observer() {
+        let reg = std::sync::Arc::new(registry().with_report_interval(1_000));
+        reg.note_attempt(OWNER, Some(PROC), None, 1);
+        let (tx, rx) = std::sync::mpsc::channel();
+        let worker = std::sync::Arc::clone(&reg);
+        std::thread::spawn(move || {
+            let report = worker.note_attempt(
+                OWNER,
+                Some("C:/apps/messenger.exe"),
+                Some("a.example"),
+                5_000,
+            );
+            let _ = tx.send(report);
+        });
+        let report = rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("the first connection of a new process must not deadlock the observer");
+        assert_eq!(
+            report.map(|d| d.processes),
+            Some(2),
+            "the due report is still given"
+        );
+    }
+
     /// One connection long before the interesting one. A process's FIRST
     /// sighting has no observed gap in front of it, so every test that means
     /// "quiet, then something" has to establish the process first — exactly as
@@ -626,6 +757,7 @@ mod tests {
                 navigations: 1,
                 companions: 0,
                 solo: 0,
+                own_burst: 0,
                 unmeasured: 0
             },
             "quiet before it and a burst after it is what opening a page looks like"
@@ -638,6 +770,7 @@ mod tests {
                 navigations: 0,
                 companions: 1,
                 solo: 0,
+                own_burst: 0,
                 unmeasured: 0
             },
             "a name the page pulled in arrived inside somebody else's burst"
@@ -659,6 +792,7 @@ mod tests {
                 navigations: 0,
                 companions: 0,
                 solo: 1,
+                own_burst: 0,
                 unmeasured: 0
             },
             "nothing followed it, so nobody opened anything"
@@ -736,6 +870,100 @@ mod tests {
         );
         assert!(reg.counts_of(OWNER, "ads.tracker.example").only_pulled_in());
         assert!(!reg.counts_of(OWNER, "site.example").only_pulled_in());
+    }
+
+    /// Field case: a site the user typed does not open. The browser opens a
+    /// second socket to it a quarter-second later and a third soon after, and
+    /// the stall verdict reads the counts before the window has closed. Those
+    /// sockets are the site's own, not another page's burst.
+    #[test]
+    fn a_site_that_does_not_open_is_not_pulled_in_by_its_own_retries() {
+        let reg = registry();
+        warm(&reg, 1_000);
+        for at in [10_000, 10_250, 10_400] {
+            reg.note_attempt(OWNER, Some(PROC), Some("photos.example"), at);
+        }
+        assert!(
+            !reg.counts_of(OWNER, "photos.example").only_pulled_in(),
+            "read mid-window, the site's own sockets must not read as somebody else's burst"
+        );
+        reg.sweep(20_000);
+        let counts = reg.counts_of(OWNER, "photos.example");
+        assert_eq!(counts.companions, 0, "{counts:?}");
+        assert!(!counts.only_pulled_in());
+    }
+
+    /// Field case: the browser's own request as the address is typed opens the
+    /// window, and the typed site lands in it with every socket it retries.
+    /// Without that site the burst is one connection — no page pulled it in.
+    #[test]
+    fn a_site_typed_behind_the_browsers_own_request_is_not_pulled_in() {
+        let reg = registry();
+        warm(&reg, 1_000);
+        reg.note_attempt(OWNER, Some(PROC), Some("suggest.vendor.example"), 10_000);
+        for at in [10_100, 10_350, 10_450] {
+            reg.note_attempt(OWNER, Some(PROC), Some("photos.example"), at);
+        }
+        reg.sweep(20_000);
+        let counts = reg.counts_of(OWNER, "photos.example");
+        assert!(!counts.only_pulled_in(), "{counts:?}");
+
+        // Positive control: a page that loads its own burst still pulls in the
+        // ad, however many sockets the stalled ad host is given.
+        page_load(
+            &reg,
+            40_000,
+            "news.example",
+            &[
+                "static.news.example",
+                "ads.tracker.example",
+                "cdn.example",
+                "ads.tracker.example",
+                "ads.tracker.example",
+            ],
+        );
+        assert!(
+            reg.counts_of(OWNER, "ads.tracker.example").only_pulled_in(),
+            "{:?}",
+            reg.counts_of(OWNER, "ads.tracker.example")
+        );
+    }
+
+    /// A page's own hosts are the page, whatever subdomain they sit on: a
+    /// failing image host of the site the user opened is offered like the site.
+    #[test]
+    fn a_sibling_host_of_the_page_is_not_pulled_in() {
+        let reg = registry();
+        page_load(
+            &reg,
+            10_000,
+            "photos.example",
+            &["images.photos.example", "a.example", "b.example"],
+        );
+        let counts = reg.counts_of(OWNER, "images.photos.example");
+        assert_eq!(counts.companions, 0, "{counts:?}");
+        assert!(!counts.only_pulled_in());
+    }
+
+    /// Behind a window that has closed, a lazily loaded ad keeps its verdict
+    /// even when its stalled host is retried back to back.
+    #[test]
+    fn a_late_ad_retried_back_to_back_stays_pulled_in() {
+        let reg = registry();
+        warm(&reg, 1_000);
+        reg.note_attempt(OWNER, Some(PROC), Some("news.example"), 10_000);
+        for (i, host) in ["static.news.example", "cdn.example", "img.example"]
+            .iter()
+            .enumerate()
+        {
+            reg.note_attempt(OWNER, Some(PROC), Some(host), 10_050 + i as u64 * 10);
+        }
+        // Past the window, still close behind the page's own traffic.
+        reg.note_attempt(OWNER, Some(PROC), Some("cdn.example"), 10_900);
+        reg.note_attempt(OWNER, Some(PROC), Some("ads.tracker.example"), 11_000);
+        reg.note_attempt(OWNER, Some(PROC), Some("ads.tracker.example"), 11_250);
+        reg.sweep(30_000);
+        assert!(reg.counts_of(OWNER, "ads.tracker.example").only_pulled_in());
     }
 
     #[test]

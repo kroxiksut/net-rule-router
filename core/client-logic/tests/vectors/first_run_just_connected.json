@@ -1,0 +1,516 @@
+{
+  "description": "firstRunJustConnected / first_run_just_connected: while the first-run window asks for the additional connection, the adapter that came up since the last look is named as the likely VPN. `before` and `now` are patches over `base-row`; `skip` is the row picked for the main connection; `expected` is the index in `now`, -1 for none.",
+  "base-row": {
+    "persistent-id": "{00000000-0000-0000-0000-000000000001}",
+    "adapter-name": "{00000000-0000-0000-0000-000000000001}",
+    "name": "Ethernet",
+    "interface-description": "Example Gigabit Network Connection",
+    "interface-type": "ethernet",
+    "kind": "ethernet",
+    "is-bluetooth-like": false,
+    "local-ip": "192.0.2.10",
+    "gateway": "192.0.2.1",
+    "dns-servers": "192.0.2.53",
+    "has-default-route": true,
+    "has-forwarding-path": true,
+    "availability": "available",
+    "route-state": "not-selected",
+    "observed-facts": {
+      "connectivity-state": "internet",
+      "external-ip-status": "unknown",
+      "external-ip": null,
+      "external-probe-attempted": false,
+      "external-probe-note": ""
+    },
+    "derived-assessment": {
+      "vpn-tunnel-likelihood": "unlikely",
+      "virtual-interface-likelihood": "unlikely",
+      "service-interface-likelihood": "unlikely",
+      "classification": "regular-interface",
+      "confidence-percent": 90,
+      "heuristic-only": true,
+      "signals": []
+    },
+    "recommendation": {
+      "class": "preferred-primary",
+      "confidence": "high",
+      "advisory-only": true,
+      "key-signals": [],
+      "excluded-alternatives": []
+    }
+  },
+  "cases": [
+    {
+      "name": "a VPN tunnel that was down comes up",
+      "input": {
+        "before": [
+          {
+            "selected-role": "primary"
+          },
+          {
+            "persistent-id": "{tap}",
+            "adapter-name": "{tap}",
+            "name": "Ethernet 10",
+            "interface-description": "TAP-Windows Adapter V9 #10",
+            "kind": "tunnel",
+            "availability": "unavailable",
+            "gateway": "-",
+            "has-default-route": false,
+            "has-forwarding-path": false,
+            "derived-assessment": {
+              "vpn-tunnel-likelihood": "likely",
+              "classification": "vpn-tunnel"
+            },
+            "recommendation": {
+              "class": "preferred-secondary"
+            }
+          }
+        ],
+        "now": [
+          {
+            "selected-role": "primary"
+          },
+          {
+            "persistent-id": "{tap}",
+            "adapter-name": "{tap}",
+            "name": "Ethernet 10",
+            "interface-description": "TAP-Windows Adapter V9 #10",
+            "kind": "tunnel",
+            "availability": "available",
+            "gateway": "10.8.0.1",
+            "has-default-route": false,
+            "has-forwarding-path": true,
+            "derived-assessment": {
+              "vpn-tunnel-likelihood": "likely",
+              "classification": "vpn-tunnel"
+            },
+            "recommendation": {
+              "class": "preferred-secondary"
+            }
+          }
+        ]
+      },
+      "expected": 1
+    },
+    {
+      "name": "a VPN adapter that was not there appears connected",
+      "input": {
+        "before": [
+          {
+            "selected-role": "primary"
+          }
+        ],
+        "now": [
+          {
+            "selected-role": "primary"
+          },
+          {
+            "persistent-id": "{tap}",
+            "adapter-name": "{tap}",
+            "name": "Ethernet 10",
+            "interface-description": "TAP-Windows Adapter V9 #10",
+            "kind": "tunnel",
+            "availability": "available",
+            "gateway": "10.8.0.1",
+            "has-default-route": false,
+            "has-forwarding-path": true,
+            "derived-assessment": {
+              "vpn-tunnel-likelihood": "likely",
+              "classification": "vpn-tunnel"
+            },
+            "recommendation": {
+              "class": "preferred-secondary"
+            }
+          }
+        ]
+      },
+      "expected": 1
+    },
+    {
+      "name": "an adapter that was already up is not news",
+      "input": {
+        "before": [
+          {
+            "selected-role": "primary"
+          },
+          {
+            "persistent-id": "{tap}",
+            "adapter-name": "{tap}",
+            "name": "Ethernet 10",
+            "interface-description": "TAP-Windows Adapter V9 #10",
+            "kind": "tunnel",
+            "availability": "available",
+            "gateway": "10.8.0.1",
+            "has-default-route": false,
+            "has-forwarding-path": true,
+            "derived-assessment": {
+              "vpn-tunnel-likelihood": "likely",
+              "classification": "vpn-tunnel"
+            },
+            "recommendation": {
+              "class": "preferred-secondary"
+            }
+          }
+        ],
+        "now": [
+          {
+            "selected-role": "primary"
+          },
+          {
+            "persistent-id": "{tap}",
+            "adapter-name": "{tap}",
+            "name": "Ethernet 10",
+            "interface-description": "TAP-Windows Adapter V9 #10",
+            "kind": "tunnel",
+            "availability": "available",
+            "gateway": "10.8.0.1",
+            "has-default-route": false,
+            "has-forwarding-path": true,
+            "derived-assessment": {
+              "vpn-tunnel-likelihood": "likely",
+              "classification": "vpn-tunnel"
+            },
+            "recommendation": {
+              "class": "preferred-secondary"
+            }
+          }
+        ]
+      },
+      "expected": -1
+    },
+    {
+      "name": "a VPN adapter that appears but is not connected is not news",
+      "input": {
+        "before": [
+          {
+            "selected-role": "primary"
+          }
+        ],
+        "now": [
+          {
+            "selected-role": "primary"
+          },
+          {
+            "persistent-id": "{tap}",
+            "adapter-name": "{tap}",
+            "name": "Ethernet 10",
+            "interface-description": "TAP-Windows Adapter V9 #10",
+            "kind": "tunnel",
+            "availability": "unavailable",
+            "gateway": "-",
+            "has-default-route": false,
+            "has-forwarding-path": false,
+            "derived-assessment": {
+              "vpn-tunnel-likelihood": "likely",
+              "classification": "vpn-tunnel"
+            },
+            "recommendation": {
+              "class": "preferred-secondary"
+            }
+          }
+        ]
+      },
+      "expected": -1
+    },
+    {
+      "name": "the main connection coming back is not the VPN",
+      "input": {
+        "before": [
+          {
+            "selected-role": "primary",
+            "availability": "unavailable"
+          },
+          {
+            "persistent-id": "{tap}",
+            "adapter-name": "{tap}",
+            "name": "Ethernet 10",
+            "interface-description": "TAP-Windows Adapter V9 #10",
+            "kind": "tunnel",
+            "availability": "available",
+            "gateway": "10.8.0.1",
+            "has-default-route": false,
+            "has-forwarding-path": true,
+            "derived-assessment": {
+              "vpn-tunnel-likelihood": "likely",
+              "classification": "vpn-tunnel"
+            },
+            "recommendation": {
+              "class": "preferred-secondary"
+            }
+          }
+        ],
+        "now": [
+          {
+            "selected-role": "primary"
+          },
+          {
+            "persistent-id": "{tap}",
+            "adapter-name": "{tap}",
+            "name": "Ethernet 10",
+            "interface-description": "TAP-Windows Adapter V9 #10",
+            "kind": "tunnel",
+            "availability": "available",
+            "gateway": "10.8.0.1",
+            "has-default-route": false,
+            "has-forwarding-path": true,
+            "derived-assessment": {
+              "vpn-tunnel-likelihood": "likely",
+              "classification": "vpn-tunnel"
+            },
+            "recommendation": {
+              "class": "preferred-secondary"
+            }
+          }
+        ]
+      },
+      "expected": -1
+    },
+    {
+      "name": "the adapter picked for the main connection is not the VPN",
+      "input": {
+        "before": [
+          {
+            "availability": "unavailable"
+          }
+        ],
+        "now": [
+          {}
+        ],
+        "skip": 0
+      },
+      "expected": -1
+    },
+    {
+      "name": "the program's own tunnel coming up is never the user's VPN",
+      "input": {
+        "before": [
+          {
+            "selected-role": "primary"
+          },
+          {
+            "persistent-id": "{own}",
+            "adapter-name": "{own}",
+            "name": "NetRuleRouter",
+            "kind": "tunnel",
+            "availability": "unavailable"
+          }
+        ],
+        "now": [
+          {
+            "selected-role": "primary"
+          },
+          {
+            "persistent-id": "{own}",
+            "adapter-name": "{own}",
+            "name": "NetRuleRouter",
+            "kind": "tunnel",
+            "availability": "available"
+          }
+        ]
+      },
+      "expected": -1
+    },
+    {
+      "name": "an adapter already bound as the additional one is not offered again",
+      "input": {
+        "before": [
+          {
+            "selected-role": "primary"
+          },
+          {
+            "persistent-id": "{tap}",
+            "adapter-name": "{tap}",
+            "name": "Ethernet 10",
+            "interface-description": "TAP-Windows Adapter V9 #10",
+            "kind": "tunnel",
+            "availability": "unavailable",
+            "gateway": "-",
+            "has-default-route": false,
+            "has-forwarding-path": false,
+            "derived-assessment": {
+              "vpn-tunnel-likelihood": "likely",
+              "classification": "vpn-tunnel"
+            },
+            "recommendation": {
+              "class": "preferred-secondary"
+            },
+            "selected-role": "secondary"
+          }
+        ],
+        "now": [
+          {
+            "selected-role": "primary"
+          },
+          {
+            "persistent-id": "{tap}",
+            "adapter-name": "{tap}",
+            "name": "Ethernet 10",
+            "interface-description": "TAP-Windows Adapter V9 #10",
+            "kind": "tunnel",
+            "availability": "available",
+            "gateway": "10.8.0.1",
+            "has-default-route": false,
+            "has-forwarding-path": true,
+            "derived-assessment": {
+              "vpn-tunnel-likelihood": "likely",
+              "classification": "vpn-tunnel"
+            },
+            "recommendation": {
+              "class": "preferred-secondary"
+            },
+            "selected-role": "secondary"
+          }
+        ]
+      },
+      "expected": -1
+    },
+    {
+      "name": "a tunnel wins over a Wi-Fi link that came up with it",
+      "input": {
+        "before": [
+          {
+            "selected-role": "primary"
+          },
+          {
+            "persistent-id": "{wifi}",
+            "adapter-name": "{wifi}",
+            "name": "Wi-Fi",
+            "kind": "wireless",
+            "availability": "unavailable"
+          },
+          {
+            "persistent-id": "{tap}",
+            "adapter-name": "{tap}",
+            "name": "Ethernet 10",
+            "interface-description": "TAP-Windows Adapter V9 #10",
+            "kind": "tunnel",
+            "availability": "unavailable",
+            "gateway": "-",
+            "has-default-route": false,
+            "has-forwarding-path": false,
+            "derived-assessment": {
+              "vpn-tunnel-likelihood": "likely",
+              "classification": "vpn-tunnel"
+            },
+            "recommendation": {
+              "class": "preferred-secondary"
+            }
+          }
+        ],
+        "now": [
+          {
+            "selected-role": "primary"
+          },
+          {
+            "persistent-id": "{wifi}",
+            "adapter-name": "{wifi}",
+            "name": "Wi-Fi",
+            "kind": "wireless",
+            "availability": "available"
+          },
+          {
+            "persistent-id": "{tap}",
+            "adapter-name": "{tap}",
+            "name": "Ethernet 10",
+            "interface-description": "TAP-Windows Adapter V9 #10",
+            "kind": "tunnel",
+            "availability": "available",
+            "gateway": "10.8.0.1",
+            "has-default-route": false,
+            "has-forwarding-path": true,
+            "derived-assessment": {
+              "vpn-tunnel-likelihood": "likely",
+              "classification": "vpn-tunnel"
+            },
+            "recommendation": {
+              "class": "preferred-secondary"
+            }
+          }
+        ]
+      },
+      "expected": 2
+    },
+    {
+      "name": "a plain link that came up alone is still named",
+      "input": {
+        "before": [
+          {
+            "selected-role": "primary"
+          },
+          {
+            "persistent-id": "{wifi}",
+            "adapter-name": "{wifi}",
+            "name": "Wi-Fi",
+            "kind": "wireless",
+            "availability": "unavailable"
+          }
+        ],
+        "now": [
+          {
+            "selected-role": "primary"
+          },
+          {
+            "persistent-id": "{wifi}",
+            "adapter-name": "{wifi}",
+            "name": "Wi-Fi",
+            "kind": "wireless",
+            "availability": "available"
+          }
+        ]
+      },
+      "expected": 1
+    },
+    {
+      "name": "the list rebuilt in another order still matches by identity",
+      "input": {
+        "before": [
+          {
+            "persistent-id": "{tap}",
+            "adapter-name": "{tap}",
+            "name": "Ethernet 10",
+            "interface-description": "TAP-Windows Adapter V9 #10",
+            "kind": "tunnel",
+            "availability": "available",
+            "gateway": "10.8.0.1",
+            "has-default-route": false,
+            "has-forwarding-path": true,
+            "derived-assessment": {
+              "vpn-tunnel-likelihood": "likely",
+              "classification": "vpn-tunnel"
+            },
+            "recommendation": {
+              "class": "preferred-secondary"
+            }
+          },
+          {
+            "selected-role": "primary"
+          }
+        ],
+        "now": [
+          {
+            "selected-role": "primary"
+          },
+          {
+            "persistent-id": "{tap}",
+            "adapter-name": "{tap}",
+            "name": "Ethernet 10",
+            "interface-description": "TAP-Windows Adapter V9 #10",
+            "kind": "tunnel",
+            "availability": "available",
+            "gateway": "10.8.0.1",
+            "has-default-route": false,
+            "has-forwarding-path": true,
+            "derived-assessment": {
+              "vpn-tunnel-likelihood": "likely",
+              "classification": "vpn-tunnel"
+            },
+            "recommendation": {
+              "class": "preferred-secondary"
+            }
+          }
+        ]
+      },
+      "expected": -1
+    }
+  ]
+}

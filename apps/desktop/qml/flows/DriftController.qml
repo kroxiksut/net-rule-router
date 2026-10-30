@@ -324,7 +324,7 @@ QtObject {
             ? nrrNativeBridge.readFileBytes(secondaryPath) : ""
         if (!primB64 && !secB64) {
             root.statusLine = root.tr("status.import-read-failed",
-                "Cannot read preset file. See logs for details.")
+                "Cannot read the rules file. See the logs for details.")
             return
         }
         var target = (primB64 && secB64) ? "both"

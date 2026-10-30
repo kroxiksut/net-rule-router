@@ -27,6 +27,9 @@ Button {
     // `danger` wins so a destructive primary action still reads as red.
     property bool danger: false
     readonly property color _dangerFill: theme.colorDanger
+    // 0..1: a ring outside the button that asks to be pressed next. The
+    // button itself keeps its look: a dimmed one reads as disabled.
+    property real attention: 0
 
     activeFocusOnTab: true
     implicitWidth: Math.max(72, contentItem.implicitWidth + theme.spacingMd * 2)
@@ -58,7 +61,8 @@ Button {
             // see the background note below.
             color: !root.enabled
                 ? Qt.rgba(root.theme.colorText.r, root.theme.colorText.g, root.theme.colorText.b, 0.55)
-                : ((root.danger || root.highlighted) ? root.theme.colorOnAccent : root.theme.colorText)
+                : (root.danger ? root.theme.colorOnAccent
+                    : root.highlighted ? root.theme.colorOnAccent : root.theme.colorText)
             horizontalAlignment: Text.AlignHCenter
             verticalAlignment: Text.AlignVCenter
             wrapMode: root.wrapText ? Text.Wrap : Text.NoWrap
@@ -99,13 +103,13 @@ Button {
         border.color: root.activeFocus
                           ? (root.highlighted || root.danger
                                  ? theme.stateFocusedBorderOnFill
-                                 : theme.stateFocusedBorder)
+                                 : theme.colorButtonOutline)
                           : !root.enabled
                               ? theme.stateDisabledBorder
                               : root.danger
                                   ? Qt.darker(root._dangerFill, 1.25)
                                   : root.highlighted
-                                      ? theme.stateSelectedBorder
+                                      ? theme.colorAccent
                                       : theme.stateDefaultBorder
         Rectangle {
             visible: root.activeFocus && root.enabled && (root.highlighted || root.danger)
@@ -115,6 +119,16 @@ Button {
             color: "transparent"
             border.width: root.theme.borderWidth
             border.color: root.theme.stateFocusedInnerOnFill
+        }
+        Rectangle {
+            visible: root.attention > 0 && root.enabled
+            anchors.fill: parent
+            anchors.margins: -3
+            radius: parent.radius + 3
+            color: "transparent"
+            border.width: 2
+            border.color: root.theme.colorButtonOutline
+            opacity: root.attention
         }
     }
 }

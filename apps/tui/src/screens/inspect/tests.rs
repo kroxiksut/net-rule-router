@@ -455,7 +455,7 @@ fn the_cache_filters_narrow_the_rows_and_b_seeds_from_history() {
     open(&mut app, &fake, ScreenId::Cache);
     let text = view_text(&app, ScreenId::Cache);
     assert!(
-        text.contains("Shown: All sources · Any freshness · All routes"),
+        text.contains("Shown: All sources · Any freshness · All connections"),
         "{text}"
     );
 
@@ -901,14 +901,14 @@ fn the_outage_list_names_what_was_blocked_while_the_route_is_down() {
     open(&mut app, &fake, ScreenId::OutageBlocks);
     let picture = render(&app, 140, 40);
     assert!(
-        picture.contains("Blocked while the route was down"),
+        picture.contains("Blocked while the additional connection was down"),
         "the menu shows the screen while it is open:\n{picture}"
     );
     assert_snapshot("outage-140x40", &picture);
 
     let text = view_text(&app, ScreenId::OutageBlocks);
     assert!(
-        text.contains("The additional route has been down since 2026-10-06 11:50:00."),
+        text.contains("The additional connection has been down since 2026-10-06 11:50:00."),
         "{text}"
     );
     assert!(
@@ -926,7 +926,7 @@ fn the_outage_list_names_what_was_blocked_while_the_route_is_down() {
         "the rule's host stands in for a missing name:\n{text}"
     );
     assert!(text.contains("? | 198.51.100.9 | 12"), "{text}");
-    assert!(text.contains("3: Open interfaces and routes"), "{text}");
+    assert!(text.contains("3: Open Connections"), "{text}");
     assert!(text.contains("Path: /opt/example/browser.exe"), "{text}");
 
     key(&mut app, KeyCode::Tab);
@@ -946,7 +946,7 @@ fn an_ended_outage_says_when_and_offers_no_fix() {
         text.contains("The last outage lasted from 2026-10-06 11:50:00 to 2026-10-06 12:00:00."),
         "{text}"
     );
-    assert!(!text.contains("Open interfaces and routes"), "{text}");
+    assert!(!text.contains("Open Connections"), "{text}");
 }
 
 #[test]
@@ -955,7 +955,7 @@ fn without_an_outage_the_screen_says_so() {
     answer["entries"] = json!([]);
     let text = outage_text(answer);
     assert!(
-        text.contains("The additional route has not been down since the service started."),
+        text.contains("The additional connection has not been down since the service started."),
         "{text}"
     );
     assert!(!text.contains("Nothing was blocked"), "{text}");
@@ -1006,7 +1006,7 @@ fn o_on_the_trace_opens_the_outage_list_and_r_reads_it_again() {
     let mut app = connected();
     open(&mut app, &fake, ScreenId::Trace);
     let picture = render(&app, 140, 40);
-    assert!(!picture.contains("Blocked while the route was down"));
+    assert!(!picture.contains("Blocked while the additional connection was down"));
     key(&mut app, KeyCode::Char('o'));
     assert_eq!(app.screen, ScreenId::OutageBlocks);
     settle(&mut app, &fake);
@@ -1024,11 +1024,11 @@ fn o_on_the_trace_opens_the_outage_list_and_r_reads_it_again() {
 fn line_mode_reads_the_outage_list() {
     let text = transcript(&["7", "o", "", "d 2"]);
     assert!(
-        text.contains("o: what was blocked while the additional route was down"),
+        text.contains("o: what was blocked while the additional connection was down"),
         "{text}"
     );
     assert!(
-        text.contains("Screen: Blocked while the route was down"),
+        text.contains("Screen: Blocked while the additional connection was down"),
         "{text}"
     );
     assert!(
@@ -1518,7 +1518,7 @@ fn check_site_from_the_trace_follows_the_check_to_its_verdict() {
         .collect();
     let text = text.join("\n");
     assert!(
-        text.contains("The site's sign-in goes over a different route than the site"),
+        text.contains("The site's sign-in goes over a different connection than the site"),
         "{text}"
     );
     assert!(text.contains("login.site.example (sign-in)"), "{text}");

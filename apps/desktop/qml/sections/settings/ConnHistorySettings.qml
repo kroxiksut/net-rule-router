@@ -103,7 +103,7 @@ Frame {
         Label {
             Layout.fillWidth: true
             text: root.tr("settings.conn-history.help",
-                "Which of your programs connected where, and over which route, kept on this computer for the days you choose. Only you can read your history; it is never part of the diagnostic archive.")
+                "Which of your programs connected where, and over which connection, kept on this computer for the days you choose. Only you can read your history; it is never part of the diagnostic archive.")
             color: root.mutedTextColor
             wrapMode: Text.WordWrap
             font.pixelSize: root.uiTheme.baseFontSizePx - 1

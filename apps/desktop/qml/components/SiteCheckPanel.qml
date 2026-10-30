@@ -151,7 +151,7 @@ Frame {
         Label {
             Layout.fillWidth: true
             text: root.tr("diag.site-check.subtitle",
-                "Is it the network or the site? The site's names are checked over your routes: their address, the route your rules give them, and whether they answer there. Runs only when you ask.")
+                "Is it the network or the site? The site's names are checked over your connections: their address, the connection your rules give them, and whether they answer there. Runs only when you ask.")
             color: root.mutedTextColor
             wrapMode: Text.WordWrap
         }
@@ -257,7 +257,7 @@ Frame {
             theme: root.uiTheme
             visible: !panel._running && panel._verdict === "sign-in-split"
                 && ((panel._report || {})["move-names"] || []).length > 0
-            text: root.tr("diag.site-check.move", "Move the sign-in names to the site's route…")
+            text: root.tr("diag.site-check.move", "Move the sign-in names to the site's connection…")
             onClicked: panel._moveSignIn()
         }
         // (c): the site does not answer where it is routed; the trace shows

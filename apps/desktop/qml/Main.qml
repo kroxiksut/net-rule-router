@@ -326,9 +326,11 @@ ApplicationWindow {
     // Third reading of the same silence: no adapter to send anything to, but
     // leak protection is on — so the traffic those rules name is being BLOCKED,
     // not merely unrouted. Saying "not applied" there would be false comfort.
+    // Only a saved policy holds anything: the default level alone blocks nothing.
     readonly property bool policyInactiveKillSwitchBlocking:
         policyInactiveBannerVisible && !_policyIdlePrefsHaveSecondary
-        && uiRevision >= 0 && routingState.leakProtection !== "off"
+        && uiRevision >= 0 && _serviceRoutePolicy !== null
+        && routingState.leakProtection !== "off"
     // The app and the service each store which adapters carry which role, and
     // a disagreement between them is not ours to settle: only the user knows
     // whether the choice in front of them or the one being enforced is the
@@ -346,7 +348,7 @@ ApplicationWindow {
             var d = routeBindingDivergence[i]
             var role = (String(d.role) === "primary")
                 ? tr("interfaces.role.primary", "Main connection")
-                : tr("interfaces.role.secondary", "Additional connection")
+                : tr("interfaces.role.secondary", "Additional connection (e.g. VPN)")
             parts.push(role + ": " + tr("status.route-binding-divergence-pair",
                 "the app shows {mine}, the service is applying {service}")
                 .replace("{mine}", String(d.mine)).replace("{service}", String(d.service)))
@@ -933,12 +935,23 @@ ApplicationWindow {
     function routeLabel(role) {
         return Rules.routeDisplayLabel(role, prefs.routePrimaryLabel, prefs.routeSecondaryLabel, tr)
     }
+    // Tools menu: the pause shortcut toggles, so the item names what it does now.
+    readonly property string pauseMenuText: uiRevision >= 0 && routingState.routingPaused
+        ? tr("action.resume-rules", "Turn rules on")
+        : tr("action.temporary-disable-product-impact", "Turn off rules")
+    function routeChoiceLabel(role) {
+        return Rules.routeChoiceLabel(role, prefs.routePrimaryLabel, prefs.routeSecondaryLabel, tr)
+    }
     function routeRoleOptions() {
-        return Rules.routeRoleOptions(true, routeLabel, tr)
+        return Rules.routeRoleOptions(true, routeChoiceLabel, tr)
     }
     // Memoized in the support object, keyed by slug, dropped on a language switch.
     function ruleTypeLabel(id) {
         return ruleEditSupport.ruleTypeLabel(id)
+    }
+    /// A type as a picker offers it, with a plain explanation.
+    function ruleTypeChoiceLabel(id) {
+        return ruleEditSupport.ruleTypeChoiceLabel(id)
     }
     function themeLabel(id) { return tr("theme." + id, id) }
     function fallbackLanguage() {
@@ -983,6 +996,16 @@ ApplicationWindow {
             function(text) { return measuredTextWidth(text, control.font) },
             function(width) { return clampPopupWidth(control, width) })
     }
+    /// A closed combo wide enough for its longest option, so the choice on show
+    /// is never cut; never under `minWidth`, never past the window.
+    function comboFitWidth(control, model, textRole, textResolver, minWidth) {
+        var widest = 0
+        for (var i = 0; i < Pure.modelLength(model); i += 1) {
+            widest = Math.max(widest, measuredTextWidth(
+                Pure.comboItemText(Pure.modelItem(model, i), textRole, textResolver, i)))
+        }
+        return Math.min(Math.max(minWidth, widest + 72), popupAvailableWidth(control))
+    }
     function menuPopupWidth(labels) {
         var maxWidth = 0
         for (var i = 0; i < labels.length; i += 1) {
@@ -1008,7 +1031,7 @@ ApplicationWindow {
         return Math.min(Math.max(220, candidateWidth), popupAvailableWidth(item))
     }
     function sectionTitle(id) {
-        if (id === "interfaces-routes") return tr("section.interfaces-routes", "Interfaces and routes")
+        if (id === "interfaces-routes") return tr("section.interfaces-routes", "Connections")
         if (id === "rules") return tr("section.rules", "Rules")
         if (id === "rule-suggestions") return tr("rules.suggestions.inbox.nav-label", "Suggested addresses")
         if (id === "rule-overlaps") return tr("rules.overlaps.nav-label", "Overlaps")
@@ -1016,7 +1039,7 @@ ApplicationWindow {
         if (id === "diagnostics") return tr("section.diagnostics", "Diagnostics")
         if (id === "conn-trace") return tr("diag.conn-trace.title", "Connection trace")
         if (id === "cache") return tr("diag.cache.title", "Cache")
-        if (id === "outage-blocks") return tr("diag.outage-blocks.title", "Blocked while the route was down")
+        if (id === "outage-blocks") return tr("diag.outage-blocks.title", "Blocked while the additional connection was down")
         if (id === "logs") return tr("section.logs", "Logs")
         if (id === "settings") return tr("section.settings", "Settings")
         return id
@@ -1569,7 +1592,7 @@ ApplicationWindow {
             "kind": "forwarded-traffic",
             "title": tr("notifications.forwarded-traffic.title", "WSL or containers are running"),
             "body": tr("notifications.forwarded-traffic.body",
-                "Choose what WSL, containers and virtual machines get when the additional route goes down. Until you choose, they are protected like this computer."),
+                "Choose what WSL, containers and virtual machines get when the additional connection goes down. Until you choose, they are protected like this computer."),
             "actionKey": "open-forwarded-traffic",
             "actionText": tr("action.configure", "Configure")
         })
@@ -1579,6 +1602,11 @@ ApplicationWindow {
 
     function focusSetting(focusId, context) {
         var id = String(focusId || "")
+        // The tray's "Open the alert" after a refused change.
+        if (id === "security-alerts") {
+            openSecurityAlerts()
+            return true
+        }
         var category = _settingsFocusCategories[id]
         if (category === undefined) {
             console.log("focusSetting: unknown focus id ignored:", id)
@@ -2052,7 +2080,7 @@ ApplicationWindow {
         for (var i = 0; i < appGroupsOfferApps.length && i < 3; i += 1)
             names.push(Pure.displayText(appGroupsOfferApps[i].displayName))
         var text = tr("status.app-groups-offer",
-            "Found programs that can be given their own route: {names}.")
+            "Found programs that can be given their own connection: {names}.")
             .replace("{names}", names.join(", "))
         if (appGroupsOfferApps.length <= 3) return text
         return text + " " + tr("status.local-network-offer-more",
@@ -2095,9 +2123,9 @@ ApplicationWindow {
         // keep it so; a public IPv6 prefix stays closed until the answer.
         var head = (first.allowed === true
             ? tr("status.local-network-offer",
-                "Found a local network on this computer: {cidr} ({adapter}). Keep it reachable while routed traffic is blocked?")
+                "Found a local network on this computer: {cidr} ({adapter}). Keep it reachable while leak protection blocks traffic?")
             : tr("status.local-network-offer-open",
-                "Found your home network's IPv6 addresses: {cidr} ({adapter}). Open them to devices on this network while routed traffic is blocked?"))
+                "Found your home network's IPv6 addresses: {cidr} ({adapter}). Open them to devices on this network while leak protection blocks traffic?"))
             .replace("{cidr}", String(first.cidr || ""))
             .replace("{adapter}", Pure.displayText(first.adapter))
         if (pendingLocalNetworks.length === 1) return head
@@ -2147,7 +2175,7 @@ ApplicationWindow {
             window.pendingLocalNetworks = []
             window.uiRevision += 1
             window.statusLine = tr("status.local-network-offer-accepted",
-                "These local networks stay reachable while routed traffic is blocked.")
+                "These local networks stay reachable while leak protection blocks traffic.")
         })
     }
 
@@ -2672,7 +2700,7 @@ ApplicationWindow {
         var missing = _unenforcedAppRulesSummary()
         if (missing !== "")
             parts.push(tr("notifications.app-unresolved.body",
-                "NetRuleRouter couldn't find these programs (they may not be installed in a standard location, or aren't running), so their traffic isn't routed by your rules: {apps}. Launch the app, or check the program name in Rules.")
+                "NetRuleRouter could not find these programs: {apps}. They may be installed outside the usual folder or not running, so the rules do not reach them yet. Start the program, or check its name in Rules.")
                 .replace("{apps}", missing))
         for (var i = 0; i < unenforcedAppRules.length; i += 1) {
             var reason = _unenforcedAppReason(unenforcedAppRules[i])
@@ -2998,7 +3026,7 @@ ApplicationWindow {
     /// the first few rules with the route they would move to.
     function verifyVerdictsBody(notice) {
         var lines = [tr("notifications.verify-verdicts.body",
-            "They do get through over the other route and use it until the service restarts. “Move” writes them there for good; “Not now” keeps them as written and checks again after the service restarts.")]
+            "They do get through over the other connection and use it until the service restarts. “Move” writes them there for good; “Not now” keeps them as written and checks again after the service restarts.")]
         for (var i = 0; i < notice.shown.length; i += 1) {
             lines.push(tr("notifications.verify-verdicts.item", "{value} → {route}")
                 .replace("{value}", notice.shown[i].value)
@@ -3140,6 +3168,11 @@ ApplicationWindow {
     // dialog instances. Reached as `root.boundFilesController` from the close-dialog
     // wiring, footer chip, and ReviewFlowController.
     property alias boundFilesController: boundFilesController
+    property alias settingsExportController: settingsExportController
+    SettingsExportController {
+        id: settingsExportController
+        root: window
+    }
     BoundFilesController {
         id: boundFilesController
         root: window
@@ -3223,7 +3256,7 @@ ApplicationWindow {
             return Pure.vpnClientTrustConfirmedApps(existing, offer, withBundle)
         }, function() {
             return tr("vpn-onboarding.confirmed-status",
-                "NetRuleRouter will keep {name} working over your main link while leak protection is on.")
+                "NetRuleRouter will keep {name} working over your main connection while leak protection is on.")
                 .replace("{name}", Pure.displayText(offer.name))
         })
         if (!started) return
@@ -3267,7 +3300,7 @@ ApplicationWindow {
                 "kind": "vpn-client-offer",
                 "title": tr("notifications.vpn-client-trust.title", "Is this your VPN?"),
                 "body": tr("notifications.vpn-client-offer.body",
-                        "Looks like your VPN is {name}. Use it as your VPN client, so it keeps working over your main link while leak protection is on? Programs: {apps}")
+                        "Looks like your VPN is {name}. Use it as your VPN client, so it keeps working over your main connection while leak protection is on? Programs: {apps}")
                     .replace("{name}", Pure.displayText(offer.name))
                     .replace("{apps}", Pure.displayTextList(offer.exePaths.map(function(p) {
                         return Pure.vpnProviderNames([{ "exe-path": p, "display-name": "" }])[0]
@@ -3292,7 +3325,7 @@ ApplicationWindow {
             return Pure.vpnPickerResultApps(offer.rows, offer.exePaths, existing)
         }, function(stored) {
             return tr("vpn-onboarding.confirmed-status",
-                "NetRuleRouter will keep {name} working over your main link while leak protection is on.")
+                "NetRuleRouter will keep {name} working over your main connection while leak protection is on.")
                 .replace("{name}", Pure.listSummary(
                     Pure.displayTextList(Pure.vpnProviderNames(stored)),
                     tr("status.app-unresolved-more", "+{n} more")))
@@ -4255,9 +4288,9 @@ ApplicationWindow {
                     "kind": "rule-duplicates",
                     "muteKind": "rule-duplicates",
                     "title": tr("notifications.rule-duplicates.title",
-                        "A rule is set on both routes"),
+                        "A rule is set on both connections"),
                     "body": tr("notifications.rule-duplicates.body",
-                        "{count} of your rules are enabled on both routes, starting with {sample}. Which one carries the traffic is decided by evaluation order.")
+                        "{count} of your rules are enabled on both connections, starting with {sample}. Which one carries the traffic is decided by evaluation order.")
                         .replace("{count}", String(Number(event["count"] || 0)))
                         .replace("{sample}", String(event["sample"] || "")),
                     "actionKey": "open-rules",
@@ -4280,7 +4313,7 @@ ApplicationWindow {
                     "title": tr("notifications.host-unreachable.title",
                         "A site does not answer on either link"),
                     "body": tr("notifications.host-unreachable.body",
-                        "{host} did not answer through the main link or through the additional one, so moving it would not help and nothing was offered. The problem is most likely on the site's side.")
+                        "{host} did not answer through the main connection or through the additional one, so moving it would not help and nothing was offered. The problem is most likely on the site's side.")
                         .replace("{host}", Pure.displayText(event["host"])),
                     // "Most likely" is a guess; the site check settles it.
                     "actionKey": "check-site",
@@ -4305,7 +4338,7 @@ ApplicationWindow {
                     "body": tr("notifications.link-keeps-dropping.body",
                         "It went down and came back several times in the last two minutes. Your rules stayed in force, but pages may have failed to load in between. Check the cable, the Wi-Fi or the VPN."),
                     "actionKey": "open-interfaces",
-                    "actionText": tr("notifications.enforcement.action", "Open interfaces")
+                    "actionText": tr("notifications.enforcement.action", "Open Connections")
                 })
                 break
             case "secondary-external-address-observed":
@@ -4377,6 +4410,9 @@ ApplicationWindow {
             case "local-network-too-wide":
                 _onLocalNetworkTooWide(event)
                 break
+            case "additional-connection-moved":
+                _onAdditionalConnectionMoved(event)
+                break
             case "protection-coverage-changed":
                 _onProtectionCoverageChanged(event)
                 break
@@ -4445,12 +4481,33 @@ ApplicationWindow {
             // later detection is news.
             "refractoryMs": 600000,
             "title": tr("notifications.unassigned-tunnel.title",
-                "The additional route is not assigned"),
+                "The additional connection is not chosen"),
             "body": tr("notifications.unassigned-tunnel.body",
-                    "{adapter} is up, but no connection is assigned to the additional route — so the sites your rules send there will not open.")
+                    "{adapter} is up, but no additional connection is chosen — so the sites your rules send there will not open.")
                 .replace("{adapter}", Pure.displayText(adapter)),
             "actionKey": "open-interfaces",
             "actionText": tr("notifications.unassigned-tunnel.action", "Assign it now")
+        })
+    }
+
+    /// The service moved the additional connection onto the adapter the VPN
+    /// came up on and saved it; the card names the connection the rules use now.
+    function _onAdditionalConnectionMoved(event) {
+        var adapter = String(event["adapter-name"] || "")
+        if (adapter === "") return
+        notificationsController._addPushNotice({
+            "id": "additional-moved:" + adapter,
+            "severity": "info",
+            "dismissible": true,
+            "autoDismissMs": 30000,
+            "kind": "additional-moved",
+            "title": tr("notifications.additional-moved.title",
+                "The additional connection moved"),
+            "body": tr("notifications.additional-moved.body",
+                    "Your VPN came up on {adapter}, so the additional connection now uses it and your rules go through it. The choice is saved.")
+                .replace("{adapter}", Pure.displayText(adapter)),
+            "actionKey": "open-interfaces",
+            "actionText": tr("notifications.enforcement.action", "Open Connections")
         })
     }
 
@@ -4521,7 +4578,7 @@ ApplicationWindow {
         // lives here, not in the translated string, so the locale text stays
         // plain prose. Same trick as the tray's own notice for this event.
         var body = tr("tray.external-address.body",
-                "External address of the additional route: {address}")
+                "External address of the additional connection: {address}")
             .replace("{address}", "<b>" + Pure.escapeMarkup(address) + "</b>")
         if (adapter !== "") {
             body = body + " " + Pure.fillPlaceholders(
@@ -4546,7 +4603,7 @@ ApplicationWindow {
             // An answer silences this address for a while; a reconnect later is news.
             "refractoryMs": 600000,
             "noticeMuteKind": "external-address",
-            "title": tr("tray.external-address.title", "Additional route connected"),
+            "title": tr("tray.external-address.title", "Additional connection is up"),
             "body": body,
             "bodyRichText": true
         })
@@ -4615,9 +4672,9 @@ ApplicationWindow {
             "refractoryMs": 600000,
             "noticeMuteKind": "enforcement-restored",
             "title": tr("notifications.enforcement.restored.title",
-                "Routing is working again"),
+                "Rules are working again"),
             "body": tr("notifications.enforcement.restored.body",
-                "Your rules are being applied again. Pages that were refused while the connection was down keep showing the error until you reload them — press F5 on those tabs."),
+                "Your rules work again. Reload the pages that did not open while the connection was down — press F5 on those tabs."),
             "actionKey": "open-outage-blocks",
             "actionText": tr("action.outage-blocks", "What was blocked")
         })
@@ -4749,10 +4806,10 @@ ApplicationWindow {
                     "Confirm your main connection: {name}")
                 .replace("{name}", Pure.displayText(String(candidates[0])))
             body = tr("notifications.enforcement.no-policy.suggest-body",
-                "Nothing is routed until you confirm it. Rules for the additional connection wait until you choose one.")
+                "Your rules do not work until you confirm it. Rules for the additional connection wait until you choose one.")
         } else if (status === "no-policy") {
             body = tr("notifications.enforcement.no-policy.body",
-                "The service has no routing settings for you yet, so nothing is being routed. Choose the main and additional connections.")
+                "Your connections are not chosen yet, so your rules are not working. Choose the main and additional connections.")
         } else if (status === "secondary-down") {
             // The service reports which role went down; before this the primary
             // going down was announced as "the additional connection is not up".
@@ -4768,7 +4825,7 @@ ApplicationWindow {
         } else {
             // An unknown status still says the one thing that matters.
             body = tr("notifications.enforcement.unknown.body",
-                "The service reported a state this version does not recognise. Open interfaces and routes to check the setup.")
+                "The service reported a state this version does not recognise. Open Connections to check the setup.")
         }
         // A switched-off tunnel is the one state here the user may silence;
         // the rest are faults to fix, so their cards offer no mute.
@@ -4783,7 +4840,7 @@ ApplicationWindow {
             "body": body,
             "actionKey": "open-interfaces",
             "actionText": tr("notifications.enforcement.action",
-                "Open interfaces")
+                "Open Connections")
         }
         // The mute read may outlast the outage.
         if (routine) {
@@ -4822,9 +4879,9 @@ ApplicationWindow {
             // The same set coming back on another day is worth saying again.
             "refractoryMs": 86400000,
             "title": tr("notifications.routes-held.title",
-                "Some addresses follow another user's route"),
+                "Some addresses follow another user's connection"),
             "body": tr("notifications.routes-held.body",
-                "Another user signed in to this computer already routes some addresses from your rules through a different connection. Addresses affected: {count}. While that user stays signed in, these addresses follow their route, or are blocked for you if leak protection is on. Among them: {list}.")
+                "Another user signed in to this computer already routes some addresses from your rules through a different connection. Addresses affected: {count}. While that user stays signed in, these addresses follow their connection, or are blocked for you if leak protection is on. Among them: {list}.")
                 .replace("{count}", String(count))
                 .replace("{list}", sample.join(", "))
         }, function() { return _routesHeldNoticeId === noticeId })
@@ -4860,10 +4917,10 @@ ApplicationWindow {
         _trafficCarriedNoticeId = noticeId
         var body = link !== ""
             ? tr("notifications.traffic-carried.body",
-                "Another user of this computer signed in earlier and sends all their traffic through the tunnel \"{link}\". This computer has one route table for everyone, so whatever your rules do not send to your additional connection goes through that tunnel too. To avoid this, sign in before that user, or ask them to send only chosen sites through their tunnel.")
+                "Another user of this computer signed in before you and sends all their traffic through \"{link}\". On this computer that applies to everyone, so whatever your rules do not send through your additional connection goes through \"{link}\" too. To avoid this, sign in before that user, or ask them to send only chosen sites there.")
                 .replace("{link}", function() { return link })
             : tr("notifications.traffic-carried.body-unnamed",
-                "Another user of this computer signed in earlier and sends all their traffic through their tunnel. This computer has one route table for everyone, so whatever your rules do not send to your additional connection goes through that tunnel too. To avoid this, sign in before that user, or ask them to send only chosen sites through their tunnel.")
+                "Another user of this computer signed in before you and sends all their traffic through their own connection (for example a VPN). On this computer that applies to everyone, so whatever your rules do not send through your additional connection goes through it too. To avoid this, sign in before that user, or ask them to send only chosen sites there.")
         notificationsController._addPushNoticeUnlessMuted("traffic-carried", {
             "id": noticeId,
             "severity": "warning",
@@ -4873,7 +4930,7 @@ ApplicationWindow {
             // Still carried on another day is worth saying again.
             "refractoryMs": 86400000,
             "title": tr("notifications.traffic-carried.title",
-                "Your traffic goes through another user's tunnel"),
+                "Your traffic goes through another user's connection"),
             "body": body
         }, function() { return _trafficCarriedNoticeId === noticeId })
     }
@@ -4894,7 +4951,7 @@ ApplicationWindow {
         switch (String(reason || "")) {
             case "route-unavailable":
                 return tr("notifications.block-notice.reason.route-unavailable",
-                    "The route this connection needed was unavailable.")
+                    "The connection this traffic should have gone through was unavailable.")
             case "blocked-by-rule":
                 return tr("notifications.block-notice.reason.blocked-by-rule",
                     "A rule denies this connection.")
@@ -6689,7 +6746,7 @@ ApplicationWindow {
         var status = tr("status.rules-list-added", "Rules added: {count}.")
             .replace("{count}", String(added))
         if (moved > 0) {
-            status += " " + tr("status.rules-list-moved", "Moved to the chosen route: {count}.")
+            status += " " + tr("status.rules-list-moved", "Moved to the chosen connection: {count}.")
                 .replace("{count}", String(moved))
         }
         if (capped) {
@@ -6869,7 +6926,7 @@ ApplicationWindow {
     Action { id: diagnosticsAction; text: sectionTitle("diagnostics"); shortcut: "Ctrl+3"; icon.source: sectionIconSource("diagnostics"); onTriggered: requestSectionChange("diagnostics") }
     Action { id: logsAction; text: sectionTitle("logs"); shortcut: "Ctrl+4"; icon.source: sectionIconSource("logs"); onTriggered: requestSectionChange("logs") }
     Action { id: settingsAction; text: sectionTitle("settings"); shortcut: "Ctrl+,"; icon.source: sectionIconSource("settings"); onTriggered: requestSectionChange("settings") }
-    Action { id: refreshAction; text: tr("action.refresh-interfaces", "Refresh interfaces"); shortcut: StandardKey.Refresh; icon.source: uiIconSource("refresh"); onTriggered: { statusLine = tr("status.interfaces-refreshed", "Interfaces list refreshed."); interfacesRolesController.refreshInterfacesFromService() } }
+    Action { id: refreshAction; text: tr("action.refresh-interfaces", "Refresh connections"); shortcut: StandardKey.Refresh; icon.source: uiIconSource("refresh"); onTriggered: { statusLine = tr("status.interfaces-refreshed", "Connections list refreshed."); interfacesRolesController.refreshInterfacesFromService() } }
     Action { id: closeOverlayAction; text: tr("action.close", "Close"); shortcut: StandardKey.Close; onTriggered: closeActiveOverlay() }
     Action { id: applyOverlayAction; text: tr("action.apply", "Apply"); shortcut: "Ctrl+Return"; onTriggered: applyActiveOverlay() }
 
@@ -6880,6 +6937,7 @@ ApplicationWindow {
     Shortcut { sequence: settingsAction.shortcut; context: Qt.ApplicationShortcut; onActivated: settingsAction.trigger() }
     Shortcut { sequence: refreshAction.shortcut; context: Qt.ApplicationShortcut; onActivated: refreshAction.trigger() }
     Shortcut { sequence: StandardKey.Open; context: Qt.ApplicationShortcut; onActivated: openLoadRuleListWindow() }
+    Shortcut { sequence: "Ctrl+Alt+S"; context: Qt.ApplicationShortcut; onActivated: settingsExportController.chooseAndExport() }
     Shortcut { sequence: aboutAction.shortcut; context: Qt.ApplicationShortcut; onActivated: aboutAction.trigger() }
     Shortcut { sequence: licenseAction.shortcut; context: Qt.ApplicationShortcut; onActivated: licenseAction.trigger() }
     Shortcut { sequence: logsFolderAction.shortcut; context: Qt.ApplicationShortcut; onActivated: logsFolderAction.trigger() }
@@ -7221,14 +7279,15 @@ ApplicationWindow {
         })
     }
 
-    /// The offered set, loaded as the quick-load's Load would load it. Taking
+    /// The offered set, loaded as the quick-load's Load loads it but without
+    /// its review: the user pressed Load on the set named in the offer. Taking
     /// it answers the offer.
     function loadOfferedRuleSet() {
         if (ruleEditsLocked === true) return
         var index = ruleSetCatalog.defaultRuleSetIndex()
         if (index < 0) return
         answerRuleSetOffer()
-        ruleSetCatalog.loadRuleSetAt(index)
+        ruleSetCatalog.loadRuleSetAt(index, { confirmed: true })
     }
 
     function answerRuleSetOffer() {
@@ -7849,7 +7908,7 @@ ApplicationWindow {
             ShortcutMenuItem { theme: uiTheme; labelText: tr("action.load-rule-list", "Load rules list..."); shortcutText: "Ctrl+O"; enabled: !window.ruleEditsLocked; onTriggered: openLoadRuleListWindow() }
             // Show WHAT is being exported, then ask where to put it.
             ShortcutMenuItem { theme: uiTheme; labelText: tr("action.export-current-rule-list", "Export current list..."); shortcutText: "Ctrl+Shift+S"; onTriggered: { rulesAction.trigger(); boundFilesController.exportCurrentRulesInteractive(null) } }
-            ShortcutMenuItem { theme: uiTheme; labelText: tr("action.export-settings", "Export settings..."); shortcutText: "Ctrl+Alt+S"; onTriggered: settingsAction.trigger() }
+            ShortcutMenuItem { theme: uiTheme; labelText: tr("action.export-settings", "Export settings..."); shortcutText: "Ctrl+Alt+S"; onTriggered: settingsExportController.chooseAndExport() }
             MenuSeparator {}
             ShortcutMenuItem { theme: uiTheme; labelText: exitAction.text; shortcutText: "Ctrl+Q"; onTriggered: exitAction.trigger() }
         }
@@ -7876,12 +7935,12 @@ ApplicationWindow {
                 Pure.menuActionText(refreshAction.text, "F5"),
                 Pure.menuActionText(tr("action.check-service-status", "Check service status"), "Ctrl+Shift+D"),
                 Pure.menuActionText(tr("action.safe-rollback", "Safe rollback"), "Ctrl+Shift+R"),
-                Pure.menuActionText(tr("action.temporary-disable-product-impact", "Temporarily disable product impact"), "Ctrl+Shift+P")
+                Pure.menuActionText(pauseMenuText, "Ctrl+Shift+P")
             ])
             ShortcutMenuItem { theme: uiTheme; labelText: refreshAction.text; shortcutText: "F5"; onTriggered: refreshAction.trigger() }
             ShortcutMenuItem { theme: uiTheme; labelText: tr("action.check-service-status", "Check service status"); shortcutText: "Ctrl+Shift+D"; onTriggered: { diagnosticsAction.trigger(); refreshBackendStatus() } }
             ShortcutMenuItem { theme: uiTheme; labelText: tr("action.safe-rollback", "Safe rollback"); shortcutText: "Ctrl+Shift+R"; onTriggered: boundFilesController.openSafeRollback() }
-            ShortcutMenuItem { theme: uiTheme; labelText: tr("action.temporary-disable-product-impact", "Temporarily disable product impact"); shortcutText: "Ctrl+Shift+P"; onTriggered: setRoutingPauseEnabled(!routingState.routingPaused, "") }
+            ShortcutMenuItem { theme: uiTheme; labelText: pauseMenuText; shortcutText: "Ctrl+Shift+P"; onTriggered: setRoutingPauseEnabled(!routingState.routingPaused, "") }
         }
         Menu {
             title: Pure.menuTitleText(tr("menu.help", "Help"), "H")
@@ -7925,7 +7984,7 @@ ApplicationWindow {
                 radius: uiTheme.radiusSm
                 color: startupLogPopup.visible ? uiTheme.stateHoverFill : "transparent"
                 border.width: activeFocus ? uiTheme.focusBorderWidth : uiTheme.borderWidth
-                border.color: activeFocus ? uiTheme.stateFocusedBorder : uiTheme.stateDefaultBorder
+                border.color: activeFocus ? uiTheme.colorButtonOutline : uiTheme.stateDefaultBorder
                 RowLayout {
                     id: progressPillRow
                     anchors.fill: parent
@@ -8001,7 +8060,7 @@ ApplicationWindow {
                     uiTheme.colorWarning.b, 0.16)
                 border.width: activeFocus ? uiTheme.focusBorderWidth : uiTheme.borderWidth
                 border.color: activeFocus
-                    ? uiTheme.stateFocusedBorder
+                    ? uiTheme.colorButtonOutline
                     : Qt.rgba(uiTheme.colorWarning.r, uiTheme.colorWarning.g,
                         uiTheme.colorWarning.b, 0.55)
                 RowLayout {
@@ -8061,7 +8120,7 @@ ApplicationWindow {
                         : "transparent")
                 border.width: activeFocus ? uiTheme.focusBorderWidth : uiTheme.borderWidth
                 border.color: activeFocus
-                    ? uiTheme.stateFocusedBorder
+                    ? uiTheme.colorButtonOutline
                     : notificationsChip.warn
                     ? Qt.rgba(uiTheme.colorWarning.r, uiTheme.colorWarning.g,
                         uiTheme.colorWarning.b, 0.55)
@@ -8141,11 +8200,9 @@ ApplicationWindow {
                         "Everything on screen is already applied.")
                     : (window.rulesNotAppliedToService && !window._routingBackendConnected()
                         ? window.tr("action.apply-tooltip-service-stopped",
-                            "The rules on screen are not applied to the service. It is stopped, "
-                            + "so Apply saves them to your rules file for now and stays available "
-                            + "until the service can take them.")
+                            "The service is stopped, so Apply saves the rules to your rules file for now. They take effect once the service starts.")
                         : window.tr("action.apply-tooltip-pending",
-                            "Send the changes on screen to the background service."))
+                            "Put the changes on screen into effect."))
                 onClicked: window.applyPendingChanges()
                 Rectangle {
                     z: -1
@@ -8507,7 +8564,7 @@ ApplicationWindow {
         var secB64 = secondaryPath ? nrrNativeBridge.readFileBytes(secondaryPath) : ""
         if (!primB64 && !secB64) {
             statusLine = tr("status.import-read-failed",
-                "Cannot read preset file. See logs for details.")
+                "Cannot read the rules file. See the logs for details.")
             return
         }
         // Parse primary then secondary (the parser is async over the
@@ -8576,11 +8633,11 @@ ApplicationWindow {
         section = "rules"
         if (appended === 0) {
             statusLine = tr("status.demo-rules-all-present",
-                "All demo rules are already present. Nothing added.")
+                "All the example rules are already there. Nothing added.")
             return
         }
         statusLine = tr("status.demo-rules-loaded",
-            "Demo rules loaded. Review and confirm to activate.")
+            "Example rules loaded. Check them and press Apply.")
 
         // Build canonical JSON from the CURRENT rulesModel state
         // (user rows + newly-added demo rows) so the review-flow
@@ -8745,7 +8802,9 @@ ApplicationWindow {
     /// demand from Settings → Service management. Empty signatures
     /// (rows missing type/value/route) are filtered out so we don't
     /// accidentally tell the sidecar that those wildcards are "active".
-    function _gcSidecarCommentOrphans() {
+    /// `applied`: the table is what the user has just applied, so an empty one
+    /// means "no rules" and their comments go too.
+    function _gcSidecarCommentOrphans(applied) {
         if (!bridgeAvailable
                 || typeof nrrNativeBridge === "undefined"
                 || nrrNativeBridge === null
@@ -8758,14 +8817,10 @@ ApplicationWindow {
             if (p.type === "" || p.value === "" || p.route === "") continue
             active.push({ type: p.type, value: p.value, route: p.route })
         }
-        // An empty keep-set deletes every stored comment, and this sweep cannot
-        // tell "the user removed all their rules" from "the table is not filled
-        // yet". Both of its call sites run while the model is legitimately
-        // empty — the cold start, and a refresh that came back with nothing —
-        // so the automatic sweep stands down. Clearing comments after a
-        // deliberate wipe stays available through the Settings button, which
-        // asks for the same GC with the user standing behind it.
-        if (active.length === 0) return
+        // An empty keep-set deletes every stored comment. At the cold start and
+        // on a refresh that came back empty the table may not be filled yet, so
+        // only an apply sweeps down to nothing.
+        if (active.length === 0 && applied !== true) return
         var corr = nrrNativeBridge.rpcSidecarCommentGc(active)
         rpcTransport.registerRpcCallback(corr, function(ok, payload, code, msg) {
             if (!ok) {
@@ -8811,9 +8866,13 @@ ApplicationWindow {
     }
 
     /// Best-effort sidecar write of one row's comment; empty deletes it.
-    function _sidecarWriteCommentForRow(row) {
-        if (!bridgeAvailable) return
-        ruleEditSupport.writeComment(row)
+    /// `answered`, when given, runs once the write has answered or was skipped.
+    function _sidecarWriteCommentForRow(row, answered) {
+        if (!bridgeAvailable) {
+            if (typeof answered === "function") answered()
+            return
+        }
+        ruleEditSupport.writeComment(row, answered)
     }
 
     /// Single-route canonical V1 envelope from `rows` filtered by `route` --
@@ -9120,12 +9179,12 @@ ApplicationWindow {
                     "Administrator prompt declined — operation cancelled."),
                 "warn")
         }
-        // A service action succeeded through the
-        // session elevation broker (non-elevated GUI), so the elevated session
-        // is now live. Mark it: the review banner stops warning "will prompt
-        // once" and the sidebar "revoke administrator approval" control appears.
+        // A service action succeeded through the broker. Whether an elevated
+        // session outlived it is the broker's answer, asked now: a full reset
+        // ends with the broker gone, and a flag set here showed "Revoke
+        // administrator approval" to a user who held no rights.
         function onBrokerSessionEstablished() {
-            if (!reviewFlowController._isAppElevated()) window._brokerSessionElevated = true
+            window.refreshBackendStatus()
         }
     }
 
@@ -9385,7 +9444,34 @@ ApplicationWindow {
     function showNotice(title, body) {
         infoNoticeDialog.noticeTitle = String(title || "")
         infoNoticeDialog.noticeBody = String(body || "")
+        // Raised for a change the alert gate refused: the way to the alert.
+        infoNoticeDialog.offerOpenAlert = rpcTransport.handlingAlertGate
         infoNoticeDialog.open()
+    }
+
+    /// Diagnostics, scrolled to the security alerts, in front of every other
+    /// window. A wizard left open stays as it was.
+    /// Taken by Diagnostics once it shows the alerts.
+    property bool securityAlertsFocusPending: false
+    // Where the user was when a refusal sent them to the alerts: once the
+    // alert is acknowledged and the held change goes, they are taken back.
+    property string _sectionBeforeAlerts: ""
+
+    function openSecurityAlerts() {
+        if (section !== "diagnostics") _sectionBeforeAlerts = section
+        requestSectionChange("diagnostics", function() {
+            window.securityAlertsFocusPending = false
+            window.securityAlertsFocusPending = true
+        })
+        window.show()
+        window.raise()
+        window.requestActivate()
+    }
+
+    function returnFromSecurityAlerts() {
+        var back = _sectionBeforeAlerts
+        _sectionBeforeAlerts = ""
+        if (back !== "" && section === "diagnostics") requestSectionChange(back)
     }
 
     /// Ask the user to confirm a choice that puts an adapter with no way out to

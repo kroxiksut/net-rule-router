@@ -2,7 +2,7 @@
 # name: Iran Default Split - Secondary Route
 # description: Foreign social, messaging, developer, and AI services routed to secondary
 # author: NetRuleRouter contributors
-# preset_version: 1
+# preset_version: 3
 
 --- Zones
 # Keep empty to avoid over-broad routing by TLD
@@ -49,8 +49,32 @@
 *.releases.hashicorp.com  # Developer and IT services measured as unreachable from this country
 *.sentry.io  # Developer and IT services measured as unreachable from this country
 
+*.adobe.com  # Adobe: refuses users in this country (sanctions)
+*.adobe.io  # Adobe: refuses users in this country (sanctions)
+*.adobelogin.com  # Adobe: refuses users in this country (sanctions)
+*.adobecc.com  # Adobe: refuses users in this country (sanctions)
+*.typekit.net  # Adobe Fonts: refuses users in this country (sanctions)
+*.behance.net  # Behance (Adobe): refuses users in this country (sanctions)
+*.figma.com  # Figma: blocked for users in this country (sanctions)
+*.canva.com  # Canva: blocked for users in this country (sanctions)
+
 --- IP
 # Intentionally left empty: do not pin DNS resolver IPs in presets
+
+--- CIDR
+91.105.192.0/23  # Telegram: its apps reach these networks by address, not by name
+91.108.4.0/22
+91.108.8.0/22
+91.108.12.0/22
+91.108.16.0/22
+91.108.20.0/22
+91.108.56.0/22
+149.154.160.0/20
+185.76.151.0/24
+2001:67c:4e8::/48
+2001:b28:f23c::/48
+2001:b28:f23d::/48
+2001:b28:f23f::/48
 
 --- Windows
 telegram.exe

@@ -5,8 +5,9 @@ use crate::i18n::{key, Key, Plural};
 
 // ── Shared with the GUI ──────────────────────────────────────────────────────
 
-pub const ROUTE_PRIMARY: Key = key("label.primary", "Primary");
+pub const ROUTE_PRIMARY: Key = key("label.primary", "Main");
 pub const ROUTE_SECONDARY: Key = key("label.secondary", "Additional");
+pub const ROUTE_SECONDARY_CHOICE: Key = key("label.secondary-choice", "Additional (e.g. VPN)");
 pub const ROUTE_BLOCK: Key = key("label.block", "Denied");
 pub const FILTER_DENIED: Key = key("rules.filter.route.denied", "Denied");
 pub const ROUTE_DENY: Key = key("rules.route.deny", "Deny");
@@ -14,9 +15,10 @@ pub const ROUTE_DENY_DESCRIPTION: Key = key(
     "rules.route.deny-description",
     "Deny — never send through any connection",
 );
-pub const ROUTE_UNSURE: Key = key("rules.filter.route.unsure", "Unsure (?)");
-pub const ROUTE_ALL: Key = key("rules.filter.route.all", "All routes");
-pub const ROUTE_FILTER: Key = key("rules.filter.route.label", "Route");
+pub const ROUTE_UNSURE: Key = key("rules.filter.route.unsure", "Checking");
+pub const ROUTE_CHECKING: Key = key("rules.route-checking", "{route} (checking)");
+pub const ROUTE_ALL: Key = key("rules.filter.route.all", "All connections");
+pub const ROUTE_FILTER: Key = key("rules.filter.route.label", "Connection");
 pub const SEARCH: Key = key("action.search", "Search");
 pub const DISABLED: Key = key("label.disabled", "disabled");
 pub const AUTO_ORIGIN: Key = key("rules.auto-origin.badge", "Added for you");
@@ -32,14 +34,14 @@ pub const HOSTS_NOTE: Key = key(
 );
 pub const APP_PINS_NOTE: Key = key(
     "rules.app-pins.tooltip",
-    "These are the addresses this application has been seen using, and they now travel the additional link for EVERY program on this computer — a route cannot be told which process it is for. An address another program starts using is given back to the main connection automatically.",
+    "These are the addresses this application has been seen using, and they now travel the additional connection for EVERY program on this computer — a route cannot be told which process it is for. An address another program starts using is given back to the main connection automatically.",
 );
 pub const VALIDATION_ERROR: Key = key("rules.validation.error", "Error — rule is inactive");
 pub const VALIDATION_WARNING: Key = key("rules.validation.warning", "Valid with warnings");
 pub const EMPTY_TITLE: Key = key("rules.empty.title", "No rules yet");
 pub const EMPTY_BODY: Key = key(
     "rules.empty.body",
-    "Add your first routing rule to start sending traffic through the additional route.",
+    "Add your first rule to send the sites you choose through the additional connection.",
 );
 pub const NO_DATA: Key = key("diag.status.no-data", "No data from the service yet");
 
@@ -47,20 +49,17 @@ pub const FORM_ADD: Key = key("dialog.rule.add", "Add");
 pub const FORM_EDIT: Key = key("dialog.rule.edit", "Edit");
 pub const FIELD_TYPE: Key = key("label.rule-type", "Rule type");
 pub const FIELD_VALUE: Key = key("label.match-value", "Match value");
-pub const FIELD_ROUTE: Key = key("label.target-route", "Target route");
+pub const FIELD_ROUTE: Key = key("label.target-route", "Connection");
 pub const FIELD_COMMENT: Key = key("label.comment", "Comment");
-pub const ENABLED_ON: Key = key(
-    "dialog.rule.enabled-on",
-    "Rule is enabled (applied to routing)",
-);
+pub const ENABLED_ON: Key = key("dialog.rule.enabled-on", "Rule is on");
 pub const ENABLED_OFF: Key = key(
     "dialog.rule.enabled-off",
-    "Rule is disabled (kept in the file, not applied)",
+    "Rule is off (kept, but not in use)",
 );
 pub const VERIFY: Key = key("dialog.rule.verify", "Unsure — check where it works");
 pub const VERIFY_HINT: Key = key(
     "dialog.rule.verify-hint",
-    "Works through the route it is written for. If the site or address does not open there but does on the other route, NetRuleRouter offers to move the rule.",
+    "Works through the connection it is written for. If the site or address does not open there but does through the other connection, NetRuleRouter offers to move the rule.",
 );
 pub const VERIFY_ANY_ZONE: Key = key(
     "dialog.rule.verify-any-zone",
@@ -68,7 +67,7 @@ pub const VERIFY_ANY_ZONE: Key = key(
 );
 pub const VERIFY_IPV6: Key = key(
     "dialog.rule.verify-ipv6",
-    "An IPv6 address is not checked: the check goes out over IPv4 only, so this stays an ordinary route rule.",
+    "An IPv6 address is not checked: the check goes out over IPv4 only, so this stays an ordinary rule.",
 );
 pub const VERIFY_DENY: Key = key(
     "dialog.rule.verify-deny",
@@ -127,7 +126,7 @@ pub const SUBDOMAINS_KEY: Key = key(
 );
 pub const PUBLIC_SUFFIX_WARNING: Key = key(
     "rules.value.public-suffix-warning",
-    "{value} is a public registry, not one service: the rule would route unrelated owners. Use a zone rule if that is what you want.",
+    "{value} is a shared zone, not one service: the rule would take in sites of other owners. Use the type “Zone” if that is what you want.",
 );
 pub const SUFFIX_REACH: Key = key(
     "rules.value.suffix-reach",
@@ -144,7 +143,7 @@ pub const APP_FOLDER_SCRIPTS_DENY: Key = key(
 /// platform: Windows names the program by its executable, Linux by process.
 pub const APP_ROUTING_NOTE: Key = key(
     "rules.application-routing-note",
-    "Routes everything this app connects to through the additional adapter. NetRuleRouter learns the app's destinations by watching its connections, so routing fills in as the app connects — enable «Connection observation» in Settings → Diagnostics for this to work. Enter the executable name, e.g. chrome.exe.",
+    "Sends everything this program connects to through the additional connection. NetRuleRouter learns where the program goes as it connects, so the rule fills in over time. Enter the program's file name, e.g. chrome.exe.",
 );
 pub const APP_ROUTING_NOTE_LINUX: Key = key(
     "rules.application-routing-note-linux",
@@ -156,7 +155,7 @@ pub const VERDICTS_TITLE: Key = key(
 );
 pub const VERDICTS_BODY: Key = key(
     "notifications.verify-verdicts.body",
-    "They do get through over the other route and use it until the service restarts. “Move” writes them there for good; “Not now” keeps them as written and checks again after the service restarts.",
+    "They do get through over the other connection and use it until the service restarts. “Move” writes them there for good; “Not now” keeps them as written and checks again after the service restarts.",
 );
 pub const VERDICTS_ITEM: Key = key("notifications.verify-verdicts.item", "{value} → {route}");
 pub const VERDICTS_WHERE: Key = key(
@@ -165,7 +164,7 @@ pub const VERDICTS_WHERE: Key = key(
 );
 pub const VERDICTS_MOVED: Key = key(
     "status.verify-verdicts.moved",
-    "Rules moved to the route where they work.",
+    "Rules moved to the connection where they work.",
 );
 pub const VERDICTS_FAILED: Key = key(
     "status.verify-verdicts.failed",
@@ -173,7 +172,7 @@ pub const VERDICTS_FAILED: Key = key(
 );
 pub const DUPLICATE: Key = key(
     "dialog.rule.duplicate-body",
-    "A rule with the same type, value, and target route already exists ({id}). Open the existing rule to change it, or cancel to keep editing the new one.",
+    "A rule with the same type, value and connection already exists ({id}). Open it to change it, or cancel to keep editing this one.",
 );
 pub const OPEN_EXISTING: Key = key("dialog.rule.duplicate-open-existing", "Open existing");
 pub const OVERLAPS_HEADING: Key = key("rules.overlaps.nav-label", "Overlaps");
@@ -203,7 +202,7 @@ pub const RELOAD_HINT: Key = key(
 pub const CANCEL: Key = key("action.cancel", "Cancel");
 
 pub const REVIEW_TITLE: Key = key("dialog.review-diff.title", "Review changes");
-pub const REVIEW_APPLY: Key = key("dialog.review-diff.apply", "Apply changes");
+pub const REVIEW_APPLY: Key = key("dialog.review-diff.apply", "Apply");
 pub const REVIEW_EMPTY: Key = key(
     "dialog.review-diff.summary-empty",
     "No structural changes detected.",
@@ -223,6 +222,12 @@ pub const REVIEW_CHANGED: Key = key(
     "Modified or retargeted",
 );
 pub const REVIEW_NONE: Key = key("dialog.review-diff.column-empty", "(none)");
+pub const REVIEW_ENTRY_APP: Key = key("dialog.review-diff.entry-app", "{rule} (app)");
+pub const REVIEW_ENTRY_MOVED: Key = key("dialog.review-diff.entry-moved", "{rule} ({from} → {to})");
+pub const REVIEW_ENTRY_INVALID: Key = key(
+    "dialog.review-diff.entry-invalid",
+    "(no match — invalid rule)",
+);
 pub const REVIEW_RESET_FILES: Key = key(
     "dialog.review-diff.reset-files",
     "Your linked rules files will be rewritten with the baseline rules: {files}.",
@@ -231,7 +236,7 @@ pub const RISK_HEADING: Key = key("dialog.review-diff.risk-heading", "Risk asses
 pub const SIGNALS_HEADING: Key = key("dialog.review-diff.signals-heading", "Detected signals");
 pub const DUPLICATES_HEADING: Key = key(
     "dialog.review-diff.duplicates-heading",
-    "Rules written into both routes",
+    "Rules set on both connections",
 );
 pub const UNDERSTAND: Key = key(
     "dialog.confirm-activate.checkbox-understand",
@@ -252,7 +257,7 @@ pub const INVALID_VALUES: Key = key(
 
 pub const NOTHING_TO_APPLY: Key = key(
     "dialog.nothing-to-apply.body",
-    "There are no changes to apply — the current rules already match what is active.",
+    "Nothing to apply: the rules on screen are already in use.",
 );
 pub const ACTIVATED: Key = key("status.rules-activate-completed", "Rules activated.");
 pub const ACTIVATE_FAILED: Key = key("status.rules-activate-failed", "Failed to activate rules: ");
@@ -369,11 +374,11 @@ pub const FILES_MERGE_BUCKET_SERVICE: Key =
     key("dialog.merge.bucket-service-only", "Only in the app");
 pub const FILES_MERGE_DUPLICATES: Key = key(
     "dialog.review-diff.duplicates-heading",
-    "Rules written into both routes",
+    "Rules set on both connections",
 );
 pub const FILES_MERGE_DUPLICATES_HINT: Key = key(
     "dialog.merge.duplicates-hint",
-    "Each of these was enabled on both routes, so the merge kept the main route's copy and switched the other one off. Pick a different route if that is not what you meant \u{2014} the other copy stays in your list, switched off.",
+    "Each of these was enabled on both connections, so the merge kept the main connection's copy and switched the other one off. Pick a different connection if that is not what you meant — the other copy stays in your list, switched off.",
 );
 pub const FILES_MERGE_PICK_FILE: Key = key("dialog.merge.pick-file", "File");
 pub const FILES_MERGE_PICK_SERVICE: Key = key("dialog.merge.pick-service", "App");
@@ -439,19 +444,19 @@ pub const SPARE_REMOVED: Plural = Plural {
 };
 pub const HELP_SPARE: Key = key(
     "tui.rules.help.spare",
-    "Shift+C: remove the rules a wildcard rule of the same route already covers; where traffic goes does not change",
+    "Shift+C: remove the rules a wildcard rule of the same connection already covers; where traffic goes does not change",
 );
 pub const PLAIN_SPARE: Key = key(
     "tui.rules.plain.spare",
-    "C: remove the rules a wildcard rule of the same route already covers",
+    "C: remove the rules a wildcard rule of the same connection already covers",
 );
 pub const HELP_APP_GROUPS: Key = key(
     "tui.rules.help.app-groups",
-    "g: send a group of programs or a hypervisor's machines over a route",
+    "g: send a group of programs or a hypervisor's machines over the connection you choose",
 );
 pub const PLAIN_APP_GROUPS: Key = key(
     "tui.rules.plain.app-groups",
-    "g: application and device routes",
+    "g: connections for applications and devices",
 );
 pub const HAND_EDITED_TITLE: Key = key(
     "dialog.rules-file-edited.title",
@@ -515,7 +520,7 @@ pub const TICKED: Key = key("tui.rules.ticked", "[x]");
 pub const UNTICKED: Key = key("tui.rules.unticked", "[ ]");
 pub const FILTER_QUESTION: Key = key(
     "tui.rules.filter-question",
-    "Show the rules of which route?",
+    "Show the rules of which connection?",
 );
 pub const SEARCH_QUESTION: Key = key(
     "tui.rules.search-question",
@@ -581,7 +586,7 @@ pub const LOCKED_TITLE: Key = key(
 );
 pub const LOCKED_BODY: Key = key(
     "rules.locked.banner-body",
-    "Changing rules is turned off on this computer. You can still view, search, filter and export them.",
+    "Changing rules is turned off on this computer. You can still view, search and save them to a file.",
 );
 pub const RULE_SET_OFFER: Key = key(
     "status.rule-set-offer",
@@ -604,16 +609,16 @@ pub const FOLDER_OFFER_HOW: Key = key(
 );
 pub const HELP_MORE_FILES: Key = key(
     "tui.rules.help.more-files",
-    "X: save one route's rules to a file. L: add the demo rules. W: clear all rules (asks first)",
+    "X: save one connection's rules to a file. L: add the demo rules. W: clear all rules (asks first)",
 );
 pub const ROUTE_QUESTION: Key = key("tui.rules.export-route-question", "Which rules to save?");
 pub const EXPORT_PRIMARY: Key = key(
     "rules.action.export-source-primary",
-    "Export only the main route's rules to a file...",
+    "Export only the main connection's rules to a file...",
 );
 pub const EXPORT_SECONDARY: Key = key(
     "rules.action.export-source-secondary",
-    "Export only the additional route's rules to a file...",
+    "Export only the additional connection's rules to a file...",
 );
 pub const EXPORT_ROUTE_QUESTION: Key = key(
     "tui.rules.export-route-file",
@@ -639,7 +644,7 @@ pub const SHIPPED_CONFIRM: Key = key(
 pub const CLEAR_ALL_TITLE: Key = key("rules.action.clear-all-title", "Clear all rules?");
 pub const CLEAR_ALL_BODY: Key = key(
     "rules.action.clear-all-body",
-    "All rules will be removed from this app and (when the service is running) from the service as well. The OS will route traffic without any NetRuleRouter overrides. This cannot be undone.",
+    "All rules will be removed. All traffic will go as usual, without NetRuleRouter. This cannot be undone.",
 );
 pub const CLEAR_ALL_CONFIRM: Key = key("rules.action.clear-all-confirm", "Clear all rules");
 pub const CLEARED: Key = key("status.rules-cleared", "All rules cleared from the app.");
@@ -740,14 +745,14 @@ pub const MARKED_QUESTION: Key = key(
 );
 pub const BULK_ENABLE: Key = key("rules.bulk.enable", "Enable");
 pub const BULK_DISABLE: Key = key("rules.bulk.disable", "Disable");
-pub const BULK_MOVE: Key = key("rules.bulk.move-to-route", "Move to route");
+pub const BULK_MOVE: Key = key("rules.bulk.move-to-route", "Change connection");
 pub const BULK_DENY: Key = key("rules.route.deny", "Deny");
 pub const BULK_DELETE: Key = key("rules.bulk.delete", "Delete...");
 pub const BULK_UNMARK: Key = key("tui.rules.unmark-all", "Unselect all");
 pub const BULK_DELETE_TITLE: Key = key("rules.bulk.delete-title", "Delete selected rules?");
 pub const BULK_DELETE_BODY: Key = key(
     "rules.bulk.delete-body",
-    "{n} selected rule(s) will be removed. You can apply the change to the service later via 'Save and review...'.",
+    "{n} rule(s) will be removed. Press Apply to put the change into effect.",
 );
 pub const BULK_DELETE_CONFIRM: Key = key("rules.bulk.delete-confirm", "Delete");
 pub const BULK_ENABLED: Key = key("status.rules-bulk-enabled", "{n} rule(s) enabled.");
@@ -858,7 +863,7 @@ pub const HELP_DELETE: Key = key(
 );
 pub const HELP_FILTER: Key = key(
     "tui.rules.help.filter",
-    "f: show the rules of one route. /: search; a pasted web address is reduced to its site",
+    "f: show the rules of one connection. /: search; a pasted web address is reduced to its site",
 );
 pub const HELP_APPLY: Key = key(
     "tui.rules.help.apply",
@@ -886,7 +891,7 @@ pub const HELP_MOVE_TO_TYPE: Key = key(
 );
 pub const HELP_VERDICTS: Key = key(
     "tui.rules.help.verdicts",
-    "m: move the rules that work only on the other route there for good. n: not now",
+    "m: move the rules that work only on the other connection there for good. n: not now",
 );
 pub const HELP_FORM: Key = key(
     "tui.rules.help.form",
@@ -905,7 +910,7 @@ pub const PLAIN_TOGGLE: Key = key(
 );
 pub const PLAIN_FILTER: Key = key(
     "tui.rules.plain.filter",
-    "f: choose which route's rules to show",
+    "f: choose which connection's rules to show",
 );
 pub const PLAIN_SEARCH: Key = key(
     "tui.rules.plain.search",
@@ -926,7 +931,7 @@ pub const PLAIN_FILES: Key = key(
 );
 pub const PLAIN_VERDICTS: Key = key(
     "tui.rules.plain.verdicts",
-    "m: move the rules that work only on the other route. n: not now",
+    "m: move the rules that work only on the other connection. n: not now",
 );
 pub const PLAIN_RELOAD: Key = key(
     "tui.rules.plain.reload",
@@ -939,7 +944,7 @@ pub const PLAIN_BOOK: Key = key(
 
 // ── The main-route check ─────────────────────────────────────────────────────
 
-pub const MAIN_ROUTE_COLUMN: Key = key("rules.column.main-route", "Main route");
+pub const MAIN_ROUTE_COLUMN: Key = key("rules.column.main-route", "Main connection");
 pub const MAIN_ROUTE_ANSWERED: Key = key("rules.main-route.answered", "reaches");
 pub const MAIN_ROUTE_SILENT: Key = key("rules.main-route.silent", "does not reach");
 pub const MAIN_ROUTE_NO_ADDRESS: Key = key("rules.main-route.no-address", "not seen yet");
@@ -979,7 +984,7 @@ pub const CHECK_PROGRESS: Key = key(
 );
 pub const CHECK_DONE: Key = key(
     "rules.main-route.check-done",
-    "Main route check finished: reaches {answered}, does not reach {silent}, not checked {other}.",
+    "Main connection check finished: reaches {answered}, does not reach {silent}, not checked {other}.",
 );
 pub const CHECK_NOTHING: Key = key(
     "rules.main-route.check-nothing",
@@ -987,15 +992,15 @@ pub const CHECK_NOTHING: Key = key(
 );
 pub const NOTHING_TO_CHECK: Key = key(
     "rules.main-route.nothing-to-check",
-    "There are no additional-route address rules to check.",
+    "There are no address rules on the additional connection to check.",
 );
 pub const CHECK_FAILED: Key = key("tui.suggestions.failed", "Not done: {error}");
 pub const SORT: Key = key("rules.sort.label", "Sort");
-pub const SORT_DISPLAY: Key = key("rules.sort.by-display-order", "Display order");
-pub const SORT_MAIN_ROUTE: Key = key("rules.sort.by-main-route", "Main route check");
-pub const SORT_MATCH_VALUE: Key = key("rules.sort.by-match-value", "Match value (A–Z)");
+pub const SORT_DISPLAY: Key = key("rules.sort.by-display-order", "As listed");
+pub const SORT_MAIN_ROUTE: Key = key("rules.sort.by-main-route", "Main connection check");
+pub const SORT_MATCH_VALUE: Key = key("rules.sort.by-match-value", "Value (A–Z)");
 pub const SORT_TYPE: Key = key("rules.sort.by-type", "Rule type");
-pub const SORT_ROUTE: Key = key("rules.sort.by-route", "Target route");
+pub const SORT_ROUTE: Key = key("rules.sort.by-route", "Connection");
 pub const STATUS_FILTER: Key = key("rules.filter.enabled.label", "Status");
 pub const STATUS_ALL: Key = key("rules.filter.enabled.all", "All");
 pub const STATUS_ENABLED: Key = key("rules.filter.enabled.enabled-only", "Enabled only");
@@ -1007,12 +1012,20 @@ pub const STATUS_QUESTION: Key = key(
 );
 pub const TYPE_FILTER: Key = key("rules.filter.type.label", "Type");
 pub const TYPE_FILTER_ALL: Key = key("rules.filter.type.all", "All types");
-pub const TYPE_FILTER_ZONE: Key = key("rules.filter.type.zone", "Zone");
-pub const TYPE_FILTER_DOMAIN: Key = key("rules.filter.type.domain", "Domain");
-pub const TYPE_FILTER_EXACT_IP: Key = key("rules.filter.type.exact-ip", "Exact IP");
-pub const TYPE_FILTER_IP_RANGE: Key = key("rules.type.ip-range", "IP range");
-pub const TYPE_FILTER_SUBNET: Key = key("rules.type.subnet", "Subnet (CIDR)");
-pub const TYPE_FILTER_APPLICATION: Key = key("rules.filter.type.application", "Application");
+pub const TYPE_FILTER_ZONE: Key = key("rules.type-explained.zone", "Zone (e.g. all .ru sites)");
+pub const TYPE_FILTER_DOMAIN: Key = key("rules.type-explained.domain", "Domain (website address)");
+pub const TYPE_FILTER_EXACT_IP: Key = key(
+    "rules.type-explained.exact-ip",
+    "IP address (a computer's address)",
+);
+pub const TYPE_FILTER_IP_RANGE: Key =
+    key("rules.type-explained.ip-range", "Address range (from–to)");
+pub const TYPE_FILTER_SUBNET: Key = key(
+    "rules.type-explained.subnet",
+    "Subnet (a group of addresses)",
+);
+pub const TYPE_FILTER_APPLICATION: Key =
+    key("rules.type-explained.application", "Application (program)");
 pub const TYPE_QUESTION: Key = key("tui.rules.type-question", "Show the rules of which type?");
 pub const AUTO_ONLY: Key = key("rules.filter.auto-added", "Auto-added only");
 pub const NOT_WORKING_HIDDEN: Key = key(
@@ -1042,11 +1055,11 @@ pub const PLAIN_FILTERS: Key = key(
 );
 pub const HELP_MAIN_ROUTE: Key = key(
     "tui.rules.help.main-route",
-    "c: check whether the main route reaches the sites of your additional-route rules; the answer shows beside each rule. Shift+O: the next order — by value, type, route, main route check, as kept",
+    "c: check whether the main connection reaches the sites of your additional-connection rules; the answer shows beside each rule. Shift+O: the next order — by value, type, connection, main connection check, as kept",
 );
 pub const PLAIN_MAIN_ROUTE: Key = key(
     "tui.rules.plain.main-route",
-    "c: check whether the main route reaches the sites of your additional-route rules. O: list what it does not reach first, or back",
+    "c: check whether the main connection reaches the sites of your additional-connection rules. O: list what it does not reach first, or back",
 );
 
 pub const TITLE_BASELINE: Key = key(
@@ -1095,7 +1108,7 @@ pub const GATEWAY_TITLE: Key = key(
 );
 pub const GATEWAY_NOTE: Key = key(
     "settings.routing.vpn-gateway.note",
-    "For a VPN that connects only from one network, such as a work VPN allowed only from abroad: its gateway gets a rule for the channel you choose, so it always connects through that channel. If that channel is down, the VPN does not connect over the other one.",
+    "For a VPN that connects only from one network, such as a work VPN allowed only from abroad: its gateway gets a rule for the connection you choose, so it always goes out over that connection. If that connection is down, the VPN does not connect over the other one.",
 );
 pub const GATEWAY_FINDING: Key = key(
     "settings.routing.vpn-gateway.finding",
@@ -1156,7 +1169,7 @@ pub const GATEWAY_PROGRAM_KEYS: Key = key(
 );
 pub const GATEWAY_CHANNEL_QUESTION: Key = key(
     "tui.rules.gateway.channel-question",
-    "Through which channel should it connect?",
+    "Which connection should it go out over?",
 );
 pub const GATEWAY_PICK: Key = key(
     "tui.rules.gateway.pick",
@@ -1172,7 +1185,7 @@ pub const GATEWAY_NONE_FOUND: Key = key(
 );
 pub const HELP_GATEWAY: Key = key(
     "tui.rules.help.gateway",
-    "v: add a rule for a VPN's gateway, so that VPN connects through the channel you choose",
+    "v: add a rule for a VPN's gateway, so that VPN goes out over the connection you choose",
 );
 pub const PLAIN_GATEWAY: Key = key(
     "tui.rules.plain.gateway",
@@ -1201,13 +1214,16 @@ pub const BULK_BOUND_SIZE: Key = key(
 pub const BULK_TYPE_UNKNOWN: Key = key("dialog.rule.bulk.type-unknown", "Type not known");
 pub const BULK_WILL_ADD: Key = key("dialog.rule.bulk.will-add", "will be added");
 pub const MOVE_TO_TYPE_ACTION: Key = key("rules.move-to-type.action", "Move to “{type}”");
-pub const MOVE_HERE: Key = key("tray.add-rule.move", "Move to this route");
+pub const MOVE_HERE: Key = key("tray.add-rule.move", "Move to this connection");
 pub const DENY_INSTEAD: Key = key("tray.add-rule.deny-instead", "Deny instead");
-pub const LIFT_DENY: Key = key("tray.add-rule.lift-deny", "Lift the deny, use this route");
+pub const LIFT_DENY: Key = key(
+    "tray.add-rule.lift-deny",
+    "Lift the deny, use this connection",
+);
 pub const LIST_ADDED: Key = key("status.rules-list-added", "Rules added: {count}.");
 pub const LIST_MOVED: Key = key(
     "status.rules-list-moved",
-    "Moved to the chosen route: {count}.",
+    "Moved to the chosen connection: {count}.",
 );
 pub const LIST_LEFT: Key = key(
     "status.rules-list-left",
@@ -1224,7 +1240,7 @@ pub const BULK_PASTE_CUT: Key = key(
 );
 pub const BULK_HINT: Key = key(
     "tui.rules.bulk.hint",
-    "Tab: next part. In the text Enter starts a new line; the preview follows each finished line. In the preview: t picks a type, m moves a rule found on another route. Ctrl+S: add. F2: one rule. Esc: cancel.",
+    "Tab: next part. In the text Enter starts a new line; the preview follows each finished line. In the preview: t picks a type, m moves a rule found on the other connection. Ctrl+S: add. F2: one rule. Esc: cancel.",
 );
 pub const BULK_TYPE_KEY: Key = key("tui.rules.bulk.type-key", "t: {choices}");
 pub const BULK_MOVE_KEY: Key = key("tui.rules.bulk.move-key", "m: {tick} {move}");
@@ -1263,17 +1279,11 @@ pub const RECENT_YESTERDAY: Key = key("rules.recent.yesterday", "yesterday {time
 pub const RECENT_ADDED: Key = key("rules.recent.added", "added");
 pub const RECENT_CHANGED: Key = key("rules.recent.changed", "changed");
 pub const RECENT_PREVIOUS_ROUTE: Key =
-    key("rules.recent.previous-route", "Route: {from} \u{2192} {to}");
+    key("rules.recent.previous-route", "Connection: {from} → {to}");
 pub const RECENT_PREVIOUS_OFF: Key = key("rules.recent.previous-off", "Was switched off");
 pub const RECENT_PREVIOUS_ON: Key = key("rules.recent.previous-on", "Was switched on");
-pub const RECENT_PREVIOUS_SURE: Key = key(
-    "rules.recent.previous-sure",
-    "Was without \u{201c}?\u{201d}",
-);
-pub const RECENT_PREVIOUS_UNSURE: Key = key(
-    "rules.recent.previous-unsure",
-    "Was marked \u{201c}?\u{201d}",
-);
+pub const RECENT_PREVIOUS_SURE: Key = key("rules.recent.previous-sure", "Was not being checked");
+pub const RECENT_PREVIOUS_UNSURE: Key = key("rules.recent.previous-unsure", "Was being checked");
 pub const RECENT_LOADING: Key = key("rules.recent.loading", "Reading recent changes\u{2026}");
 pub const RECENT_FAILED: Key = key(
     "rules.recent.failed",
@@ -1564,11 +1574,13 @@ pub const ALL: &[Key] = &[
     UNRECOGNIZED,
     ROUTE_PRIMARY,
     ROUTE_SECONDARY,
+    ROUTE_SECONDARY_CHOICE,
     ROUTE_BLOCK,
     FILTER_DENIED,
     ROUTE_DENY,
     ROUTE_DENY_DESCRIPTION,
     ROUTE_UNSURE,
+    ROUTE_CHECKING,
     ROUTE_ALL,
     ROUTE_FILTER,
     SEARCH,
@@ -1652,6 +1664,9 @@ pub const ALL: &[Key] = &[
     REVIEW_REMOVED,
     REVIEW_CHANGED,
     REVIEW_NONE,
+    REVIEW_ENTRY_APP,
+    REVIEW_ENTRY_MOVED,
+    REVIEW_ENTRY_INVALID,
     REVIEW_RESET_FILES,
     RISK_HEADING,
     SIGNALS_HEADING,

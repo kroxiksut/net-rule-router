@@ -151,7 +151,7 @@ Item {
             // status banner update / sidecar write happens.
             ownerRoot._pendingPresetReview = null
             ownerRoot.statusLine = ownerRoot.tr("status.preset-review-cancelled",
-                "Preset import cancelled by user.")
+                "Loading rules cancelled.")
         }
     }
 
@@ -301,9 +301,9 @@ Item {
             }, function(stored) {
                 if (stored.length === 0)
                     return ownerRoot.tr("vpn-onboarding.cleared-status",
-                        "No program is kept working over your main link any more.")
+                        "No program is kept working over your main connection any more.")
                 return ownerRoot.tr("vpn-onboarding.confirmed-status",
-                    "NetRuleRouter will keep {name} working over your main link while leak protection is on.")
+                    "NetRuleRouter will keep {name} working over your main connection while leak protection is on.")
                     .replace("{name}", Pure.listSummary(
                         Pure.displayTextList(Pure.vpnProviderNames(stored)),
                         ownerRoot.tr("status.app-unresolved-more", "+{n} more")))
@@ -312,7 +312,7 @@ Item {
         onRetryReadRequested: ownerRoot.openVpnOnboarding()
         onSkipped: {
             ownerRoot.statusLine = ownerRoot.tr("vpn-onboarding.skipped-status",
-                "No VPN set up. You can set one up later from Settings -> Routing.")
+                "No VPN set up. You can set one up later in Settings → Routing behavior.")
         }
         onManualPickRequested: {
             // The dialog opens a native file picker itself; this

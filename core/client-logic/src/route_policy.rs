@@ -34,11 +34,14 @@ impl FieldDefault {
 
 /// Every route-policy field this build writes, with its default.
 /// `binding-source` is absent on purpose: the writer always stamps it.
-/// `mode` and `leak-protection` have no wire default; theirs is the fallback
-/// for a snapshot that lacks them, and protection never reads as on by guess.
+/// `mode` and `leak-protection` have no wire default; theirs is what a user
+/// with no saved policy starts from, the service's own default for them.
 pub const FIELD_DEFAULTS: [(&str, FieldDefault); 25] = [
     ("mode", FieldDefault::Text(DEFAULT_ROUTE_MAIN)),
-    (LEAK_PROTECTION_KEY, FieldDefault::Text(LEAK_PROTECTION_OFF)),
+    (
+        LEAK_PROTECTION_KEY,
+        FieldDefault::Text(LEAK_PROTECTION_SITES),
+    ),
     ("kill-switch-protocols", FieldDefault::Int(127)),
     ("allow-dns-over-primary", FieldDefault::Bool(true)),
     ("include-subdomains", FieldDefault::Bool(true)),
@@ -72,7 +75,8 @@ pub const FIELD_DEFAULTS: [(&str, FieldDefault); 25] = [
 pub const SNAPSHOT_ONLY_KEYS: [&str; 2] =
     ["secondary-link-provider-apps", "doh-lockdown-effective"];
 
-/// Legal values of the slug fields; anything else reads as the default.
+/// Legal values of the slug fields, weakest first. A value outside them reads
+/// as the weakest: a damaged level never reads as protection nobody chose.
 pub const FIELD_CHOICES: [(&str, &[&str]); 1] = [(LEAK_PROTECTION_KEY, &LEAK_PROTECTION_LEVELS)];
 
 /// The default route that keeps unmatched traffic on the main connection.
@@ -131,13 +135,14 @@ pub fn coerce(key: &str, raw: &Value) -> Value {
             let valid = key != KILL_SWITCH_PROTOCOLS_KEY || is_protocol_selection(n);
             Value::from(if valid { n } else { fallback })
         }
-        FieldDefault::Text(fallback) => {
+        FieldDefault::Text(_) => {
             let text = js::to_display_string(raw);
-            let refused = FIELD_CHOICES
+            let weakest = FIELD_CHOICES
                 .iter()
                 .find(|(name, _)| *name == key)
-                .is_some_and(|(_, choices)| !choices.contains(&text.as_str()));
-            Value::String(if refused { fallback.to_owned() } else { text })
+                .filter(|(_, choices)| !choices.contains(&text.as_str()))
+                .and_then(|(_, choices)| choices.first());
+            Value::String(weakest.map_or(text, |weakest| (*weakest).to_owned()))
         }
     }
 }

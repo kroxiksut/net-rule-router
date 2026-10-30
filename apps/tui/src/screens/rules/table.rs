@@ -742,34 +742,31 @@ impl Table {
             .map(|(i, _)| i)
     }
 
-    /// Rows read from files: `replace` drops every row first; otherwise only
-    /// rows not already present are added. `?x` and `x` on one route are one
-    /// rule, and the plain one wins. Returns how many were added.
-    pub fn import(&mut self, parsed: Vec<RuleRow>, replace: bool) -> usize {
+    /// Rows read from files: `replace` drops every row first; otherwise the
+    /// set is merged into the user's rows as the window merges it
+    /// (`import_merge_plan`). Returns how many were added.
+    pub fn import(&mut self, mut parsed: Vec<RuleRow>, replace: bool) -> usize {
         if replace {
             self.rows.clear();
         }
-        let mut seen: HashMap<String, usize> = self
-            .rows
-            .iter()
-            .enumerate()
-            .map(|(i, r)| (r.rule.merge_key(), i))
-            .collect();
-        let mut added = 0;
-        for mut rule in parsed {
-            if let Some(&at) = seen.get(&rule.merge_key()) {
-                if !rule.is_verify() {
-                    self.rows[at].rule.verify = false;
-                }
-                continue;
-            }
+        let own: Vec<RuleRow> = self.rows.iter().map(|r| r.rule.clone()).collect();
+        let plan = logic::import_merge_plan(&own, &parsed);
+        for at in plan.plain {
+            self.rows[at].rule.verify = false;
+        }
+        for at in plan.plain_added {
+            parsed[at].verify = false;
+        }
+        let mut taken = vec![false; parsed.len()];
+        for &at in &plan.add {
+            taken[at] = true;
+        }
+        for (mut rule, _) in parsed.into_iter().zip(taken).filter(|(_, take)| *take) {
             rule.id = self.next_free_id();
-            seen.insert(rule.merge_key(), self.rows.len());
             self.rows.push(Row::new(rule));
-            added += 1;
         }
         self.clamp_cursor();
-        added
+        plan.add.len()
     }
 }
 

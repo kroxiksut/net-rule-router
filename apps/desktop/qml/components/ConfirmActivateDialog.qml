@@ -25,7 +25,7 @@ import QtQuick.Layouts 1.15
 Dialog {
     id: root
     title: typeof root.tr === "function"
-        ? root.tr("dialog.confirm-activate.title", "Confirm activation")
+        ? root.tr("dialog.confirm-activate.title", "Apply the changes?")
         : "Confirm activation"
 
     modal: true
@@ -127,7 +127,7 @@ Dialog {
             Accessible.name: text
             Accessible.description: root.tr(
                 "dialog.confirm-activate.checkbox-understand-description",
-                "Required acknowledgement before applying a Critical-risk activation"
+                "Must be ticked to apply risky changes"
             )
         }
 
@@ -144,7 +144,7 @@ Dialog {
                 Accessible.name: text
                 Accessible.description: root.tr(
                     "dialog.confirm-activate.cancel-description",
-                    "Cancel the activation and keep the previous rule set"
+                    "Do not apply; keep the previous rules"
                 )
                 onClicked: { root.cancelled(); root.close() }
             }
@@ -158,7 +158,7 @@ Dialog {
                 Accessible.name: text
                 Accessible.description: root.tr(
                     "dialog.confirm-activate.confirm-description",
-                    "Apply the reviewed rule set and start the activation"
+                    "Apply the reviewed rules"
                 )
                 onClicked: {
                     root.confirmed(root.confirmationToken)

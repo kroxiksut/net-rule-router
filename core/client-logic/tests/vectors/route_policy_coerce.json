@@ -12,7 +12,7 @@
     { "name": "bool from 1 is false", "input": { "key": "kill-switch-strict-shared-ips", "raw": 1 }, "expected": false },
     { "name": "bool absent takes a true default", "input": { "key": "allow-dns-over-primary" }, "expected": true },
     { "name": "bool false kept", "input": { "key": "allow-dns-over-primary", "raw": false }, "expected": false },
-    { "name": "leak protection absent reads as off", "input": { "key": "leak-protection" }, "expected": "off" },
+    { "name": "leak protection absent reads as the default, routed sites", "input": { "key": "leak-protection" }, "expected": "sites" },
     { "name": "leak protection kept", "input": { "key": "leak-protection", "raw": "sites" }, "expected": "sites" },
     { "name": "leak protection everything kept", "input": { "key": "leak-protection", "raw": "everything" }, "expected": "everything" },
     { "name": "leak protection unknown slug reads as off", "input": { "key": "leak-protection", "raw": "block-all" }, "expected": "off" },

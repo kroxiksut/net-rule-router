@@ -1,12 +1,13 @@
-//! The route-policy wire shape is pinned to `IPC_CONTRACT_REVISION`: a field
-//! added, removed or renamed without a bump would let a mismatched window and
-//! service talk past each other with no banner.
+//! The route-policy and set-import wire shapes are pinned to
+//! `IPC_CONTRACT_REVISION`: a field added, removed or renamed without a bump
+//! would let a mismatched window and service talk past each other with no
+//! banner.
 
 use std::collections::BTreeSet;
 
 use nrr_shared::ipc::IPC_CONTRACT_REVISION;
 use nrr_shared::ipc_payloads::{
-    RoutePolicyDto, RoutePolicyUpdateRequest, ROUTE_POLICY_SNAPSHOT_ONLY_KEYS,
+    PresetImportPayload, RoutePolicyDto, RoutePolicyUpdateRequest, ROUTE_POLICY_SNAPSHOT_ONLY_KEYS,
 };
 use nrr_shared::wire_fields::struct_wire_fields;
 
@@ -96,6 +97,34 @@ fn the_route_policy_fields_match_the_contract_revision() {
         fields::<RoutePolicyDto>(),
         SNAPSHOT_FIELDS.into_iter().collect(),
         "the snapshot fields changed: bump IPC_CONTRACT_REVISION and record the new set"
+    );
+}
+
+/// The set import replaces the routes it covers, whatever the client meant.
+/// A "merge" field added here would be skipped by an older service, which
+/// would replace the user's rules while the window promised to keep them: a
+/// new field needs the bump, so writes stop across the skew instead.
+const PRESET_IMPORT_FIELDS: [&str; 8] = [
+    "content-hash-primary",
+    "content-hash-secondary",
+    "correlation-id",
+    "import-only-active",
+    "include-child-processes",
+    "primary-bytes-b64",
+    "route",
+    "secondary-bytes-b64",
+];
+
+#[test]
+fn the_set_import_fields_match_the_contract_revision() {
+    assert_eq!(
+        IPC_CONTRACT_REVISION, REVISION,
+        "the revision moved: record its set-import fields here"
+    );
+    assert_eq!(
+        fields::<PresetImportPayload>(),
+        PRESET_IMPORT_FIELDS.into_iter().collect(),
+        "the set-import fields changed: bump IPC_CONTRACT_REVISION and record the new set"
     );
 }
 

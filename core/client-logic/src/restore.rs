@@ -402,8 +402,9 @@ mod tests {
 
     #[test]
     fn a_wiped_service_diverges_from_the_record() {
+        // Not the default level: a wiped service holds that one anyway.
         let intent = object(json!({
-            "leak-protection": "sites",
+            "leak-protection": "everything",
             "primary-probe-timeout-ms": "2000",
             "secondary": { "stable-id": "B", "display-name": "Tunnel", "user-confirmed": true }
         }));
@@ -413,7 +414,7 @@ mod tests {
             ["leak-protection", "primary-probe-timeout-ms", "secondary"]
         );
         let same = object(json!({
-            "leak-protection": "sites",
+            "leak-protection": "everything",
             "primary-probe-timeout-ms": 2000,
             "secondary": { "stable-id": "B2", "known-stable-ids": ["B"] }
         }));
@@ -426,7 +427,9 @@ mod tests {
             "mode": "prefer-secondary-when-available",
             "secondary": { "stable-id": "B", "display-name": "Tunnel", "user-confirmed": true }
         }));
-        let plan = restore_plan(&intent, &Map::new(), &["A"]);
+        // A row with protection off: the new default route moves no level.
+        let service = object(json!({ "leak-protection": "off" }));
+        let plan = restore_plan(&intent, &service, &["A"]);
         assert_eq!(plan.keys, ["mode"]);
         assert_eq!(
             plan.missing,
@@ -439,7 +442,7 @@ mod tests {
         assert_eq!(request["apply-only"], json!(["mode"]));
         assert!(request.get("secondary").is_none());
 
-        let with_adapter = restore_plan(&intent, &Map::new(), &["B"]);
+        let with_adapter = restore_plan(&intent, &service, &["B"]);
         let request = with_adapter.request.expect("a request");
         assert_eq!(request["secondary"]["stable-id"], json!("B"));
     }

@@ -146,7 +146,7 @@ GroupBox {
         if (role === "virtual") return root.tr("settings.traffic.role-virtual", "Virtual (VM)")
         var base = role === "secondary"
             ? root.tr("settings.traffic.through-secondary", "Through additional adapter")
-            : root.tr("settings.traffic.through-primary", "Through primary adapter")
+            : root.tr("settings.traffic.through-primary", "Through the main adapter")
         var lbl = String((role === "secondary"
             ? root.prefs.routeSecondaryLabel
             : root.prefs.routePrimaryLabel) || "")
@@ -301,7 +301,7 @@ GroupBox {
             color: root.mutedTextColor
             wrapMode: Text.WordWrap
             text: root.tr("settings.traffic.description",
-                "How much traffic goes through the additional (VPN) adapter versus directly over the primary — received and sent per adapter.")
+                "How much traffic goes through the additional (VPN) adapter versus directly over the main connection — received and sent per adapter.")
         }
 
         // Period selector (This session / Today) as an exclusive radio group,
@@ -571,7 +571,7 @@ GroupBox {
             color: root.mutedTextColor
             font.pixelSize: root.uiTheme.baseFontSizePx - 1
             text: root.tr("settings.traffic.tunnel-overlap-note",
-                "While a VPN session is active, the primary row excludes traffic that transited into the tunnel.")
+                "While a VPN session is active, the main connection row excludes traffic that transited into the tunnel.")
         }
 
         Rectangle {

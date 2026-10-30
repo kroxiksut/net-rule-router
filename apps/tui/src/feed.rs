@@ -161,7 +161,7 @@ pub const ADDRESSES_SHOWN: Key = key(
 );
 pub const HELP: Key = key(
     "tui.help.feed-keys",
-    "In the notifications: x: dismiss the chosen one   X: dismiss all   m: stop showing ones like it   H: hide addresses in block notifications. A blocked connection also offers v: the additional route, s: snooze, w: why it was blocked.",
+    "In the notifications: x: dismiss the chosen one   X: dismiss all   m: stop showing ones like it   H: hide addresses in block notifications. A blocked connection also offers v: the additional connection, s: snooze, w: why it was blocked.",
 );
 pub const PLAIN_DISMISS: Key = key(
     "tui.plain.feed-dismiss",
@@ -173,7 +173,7 @@ pub const PLAIN_MUTE: Key = key(
 );
 pub const PLAIN_BLOCK: Key = key(
     "tui.plain.feed-block",
-    "For a blocked connection N: v N: send it over the additional route   s N: snooze   w N: why it was blocked",
+    "For a blocked connection N: v N: send it over the additional connection   s N: snooze   w N: why it was blocked",
 );
 pub const HELP_SITE: Key = key(
     "tui.help.feed-site",

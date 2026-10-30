@@ -480,3 +480,118 @@ fn an_app_past_the_takeover_window_keeps_the_sub_primary_weight() {
     let past = app_block_band(APP_TAKEOVER_MAX_APPS as u64, true);
     assert_eq!(past, app_block_band(APP_TAKEOVER_MAX_APPS as u64, false));
 }
+
+// ── Destinations withdrawn from a pinned app ───────────────────────────────
+
+/// The ALE v4 verdict for `app` connecting to `to` out of `egress`: the
+/// highest-weight match wins, a tie goes to the block.
+fn app_verdict(filters: &[WfpFilterSpec], app: &str, to: Ipv4Addr, egress: u64) -> WfpAction {
+    filters
+        .iter()
+        .filter(|f| f.layer == WfpLayerKey::AleAuthConnectV4)
+        .filter(|f| f.app_pattern.as_deref().is_none_or(|a| a == app))
+        .filter(|f| f.local_interface_luid.is_none_or(|l| l == egress))
+        .filter(|f| f.remote_ip_set.is_empty() || f.covers_v4(to))
+        .max_by_key(|f| (f.weight, f.action == WfpAction::Block))
+        .map_or(WfpAction::Permit, |f| f.action)
+}
+
+/// A withdrawn destination may not be relearnt, so the app block held it off
+/// the main link for the rest of the session. The permit opens exactly that
+/// app to exactly that address, whichever band the block sits in.
+#[test]
+fn a_withdrawn_destination_opens_on_the_main_link_for_its_app_alone() {
+    const MAIN: u64 = 0x0006_0000_0000_0002;
+    let withdrawn = ip(149, 154, 167, 51);
+    let kept = ip(149, 154, 175, 50);
+    let apps = [
+        r"C:\Apps\tg.exe".to_string(),
+        r"C:\Apps\mail.exe".to_string(),
+    ];
+    for takeover in [false, true] {
+        let mut out =
+            app_kill_switch_filters_for("S", &apps, LUID, KillSwitchProtocols::ALL, takeover);
+        out.extend(app_withdrawn_permits(
+            "S",
+            &apps,
+            |app| {
+                if app == apps[0] {
+                    vec![IpAddr::V4(withdrawn)]
+                } else {
+                    Vec::new()
+                }
+            },
+            LUID,
+            KillSwitchProtocols::ALL,
+        ));
+        assert_eq!(
+            app_verdict(&out, &apps[0], withdrawn, MAIN),
+            WfpAction::Permit,
+            "takeover {takeover}"
+        );
+        assert_eq!(
+            app_verdict(&out, &apps[0], kept, MAIN),
+            WfpAction::Block,
+            "takeover {takeover}"
+        );
+        assert_eq!(
+            app_verdict(&out, &apps[1], withdrawn, MAIN),
+            WfpAction::Block,
+            "takeover {takeover}"
+        );
+        assert_eq!(
+            app_verdict(&out, &apps[0], kept, LUID),
+            WfpAction::Permit,
+            "takeover {takeover}"
+        );
+    }
+}
+
+/// The permit stays below everything that must still bind the app — the
+/// user's own Blocks and the exemptions — and needs the pair to exist at all.
+#[test]
+fn a_withdrawn_permit_loses_to_user_blocks_and_needs_the_pair() {
+    use crate::wfp_bands::{APP_EXEMPT_BASE, BASE_BLOCK};
+    let apps = ["tg.exe".to_string()];
+    let ips = |_: &str| {
+        vec![
+            IpAddr::V4(ip(149, 154, 167, 51)),
+            "2001:db8::51".parse().unwrap(),
+        ]
+    };
+    let out = app_withdrawn_permits("S", &apps, ips, LUID, KillSwitchProtocols::ALL);
+    assert_eq!(out.len(), 2, "one permit per family");
+    for f in &out {
+        assert_eq!(f.action, WfpAction::Permit);
+        assert_eq!(f.local_interface_luid, None);
+        assert_eq!(f.app_pattern.as_deref(), Some("tg.exe"));
+        assert_eq!(f.user_sid.as_deref(), Some("S"));
+        assert!(
+            f.weight < BASE_BLOCK,
+            "a user Block must still bind the app"
+        );
+        assert!(f.weight < APP_EXEMPT_BASE, "the exemptions stay above it");
+    }
+    assert!(out.iter().any(|f| f.layer == WfpLayerKey::AleAuthConnectV6));
+    assert!(app_withdrawn_permits("S", &apps, ips, 0, KillSwitchProtocols::ALL).is_empty());
+    let no_ale = KillSwitchProtocols::from_bits(0);
+    assert!(app_withdrawn_permits("S", &apps, ips, LUID, no_ale).is_empty());
+}
+
+/// A filter is immutable by key: a new withdrawal must mint a new id, or the
+/// add-only install keeps the old set.
+#[test]
+fn a_new_withdrawal_mints_a_new_permit_id() {
+    let apps = ["tg.exe".to_string()];
+    let id = |n: u8| {
+        app_withdrawn_permits(
+            "S",
+            &apps,
+            |_| (1..=n).map(|d| IpAddr::V4(ip(149, 154, 167, d))).collect(),
+            LUID,
+            KillSwitchProtocols::ALL,
+        )[0]
+        .id
+    };
+    assert_ne!(id(1), id(2));
+}

@@ -24,11 +24,11 @@ const DESTINATION_MAX: usize = 254;
 
 pub const ACTION: Key = key(
     "tray.block-notice.action.route-to-secondary",
-    "To additional route",
+    "Through additional",
 );
 pub const OFFER: Key = key(
     "tui.status.block-route-offer",
-    "{name} was blocked. v: send it over the additional route.",
+    "{name} was blocked. v: send it over the additional connection.",
 );
 pub const MORE: Key = key(
     "tui.status.block-route-more",
@@ -36,28 +36,28 @@ pub const MORE: Key = key(
 );
 pub const ASK: Key = key(
     "tray.block-notice.route-confirm.title",
-    "Route {name} via the additional link?",
+    "Send {name} through the additional connection (e.g. VPN)?",
 );
 pub const ASK_BODY: Key = key(
     "tray.block-notice.route-confirm.body",
-    "Adds a rule that sends this address over the additional route from now on. You can undo it later in Rules.",
+    "Adds a rule that sends this address over the additional connection from now on. You can undo it later in Rules.",
 );
 pub const YES_NO: Key = key("tui.list.yes-no", "y: yes   n: no");
 pub const DONE: Key = key(
     "tui.status.block-route-done",
-    "{name} now goes over the additional route. You can undo it in Rules.",
+    "{name} now goes over the additional connection. You can undo it in Rules.",
 );
 pub const ALREADY: Key = key(
     "tui.status.block-route-already",
-    "{name} already goes over the additional route; nothing was added.",
+    "{name} already goes over the additional connection; nothing was added.",
 );
 pub const FAILED: Key = key(
     "tui.status.block-route-failed",
-    "Could not send {name} over the additional route: {error}",
+    "Could not send {name} over the additional connection: {error}",
 );
 pub const HELP: Key = key(
     "tui.help.status-block-route",
-    "v: send the blocked site named under the state over the additional route; you are asked first",
+    "v: send the blocked site named under the state over the additional connection; you are asked first",
 );
 
 #[cfg(test)]

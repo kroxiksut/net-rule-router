@@ -670,6 +670,9 @@ pub struct ConnectionObservationConsumer {
     /// filter is one a Block rule compiled to. The user named that
     /// destination, so it is never reverse-named. `None` treats no drop as one.
     rule_block_drop_check: Option<KillswitchDropCheckFn>,
+    /// The fake-address pool. A drop into it is the pool's own machinery (UDP
+    /// stays closed while the relay carries TCP only), never anybody's block.
+    fake_ip_pool: nrr_platform_api::fake_ip::FakeIpPoolConfig,
     /// Proactive VPN-client learning — when wired, the OBSERVED
     /// PROCESS PATH of every role-verified kill-switch drop from a VPN-named
     /// process is handed to this sink, which registers the client for an
@@ -998,6 +1001,8 @@ use connection_facts::{
 
 #[cfg(test)]
 mod deny_drop_tests;
+#[cfg(test)]
+mod fake_pool_drop_tests;
 #[cfg(test)]
 mod owner_tests;
 #[cfg(test)]

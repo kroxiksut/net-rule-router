@@ -48,9 +48,10 @@ mod notice_latches;
 // `adapter_entry_binding_matches` are called from `production_handlers_misc`
 // as `route_coordinator::…`, and moving a file should not move a caller.
 use binding_resolver::{
-    adapter_answers_to_saved_name, adapter_carries_only_the_saved_brand, binding_matches_live,
-    derive_secondary_next_hop, derive_secondary_next_hop_v6, diagnostic_tally, has_own_way_out,
-    mac_anchor_id, preferred_display_name, replacement_candidates, sole_live_driver_sibling,
+    adapter_answers_to_saved_name, adapter_carries_only_the_saved_brand, adoptable_tunnels,
+    binding_matches_live, derive_secondary_next_hop, derive_secondary_next_hop_v6,
+    diagnostic_tally, has_own_way_out, mac_anchor_id, preferred_display_name,
+    replacement_candidates, sole_live_driver_sibling,
 };
 pub use binding_resolver::{
     adapter_binding_matches, adapter_entry_binding_matches, bound_adapter, bound_adapter_usable,

@@ -1,7 +1,7 @@
 Screens:
   1. Status
   2. First run
-  3. Interfaces and routes
+  3. Connections
   4. Rules
   5. Overlaps
   6. Suggested addresses
@@ -12,23 +12,23 @@ Screens:
 
 Screen: Status
 Service: OK
-Routing state:
-  Routing active
-  Rules apply on this user session.
+Rules status:
+  Rules are working
+  Your rules are working.
 Connections:
   Main connection: Ethernet — Example Network Adapter — Available — Rules applied
-  Additional connection: Example Tunnel — Example Network Adapter — Available — Rules applied
+  Additional connection (e.g. VPN): Example Tunnel — Example Network Adapter — Available — Rules applied
 Notifications:
   No notifications.
 Commands on this screen:
   r: restore your settings to a service that lost them
   t: confirm the first listed program as your VPN (T: with the programs it ships with), so leak protection keeps it working
   a: allow the first listed VPN to reach its server, so leak protection lets it connect
-  p: confirm the suggested main connection; another one is chosen under Interfaces and routes
-  v: send the blocked site named under the state over the additional route; you are asked first
+  p: confirm the suggested main connection; another one is chosen under Connections
+  v: send the blocked site named under the state over the additional connection; you are asked first
   x N: dismiss notification N   X: dismiss all
   m N: stop showing notifications like N   H: hide or show addresses in block notifications
-  For a blocked connection N: v N: send it over the additional route   s N: snooze   w N: why it was blocked
+  For a blocked connection N: v N: send it over the additional connection   s N: snooze   w N: why it was blocked
   For a site that does not open in notification N: c N: check whether the network or the site is at fault
 Type a screen number, h for help or q to quit, then press Enter.
 
@@ -41,11 +41,11 @@ Service:
 Audit trail:
   No data from the service yet
   No data from the service yet
-Explain sample:
+Which rule applies to a site:
   No probe has been run yet. Enter a query above and click Probe.
   e: Enter a hostname or IP to simulate the routing decision against the active rule set.
 Check a site:
-  Is it the network or the site? The site's names are checked over your routes: their address, the route your rules give them, and whether they answer there. Runs only when you ask.
+  Is it the network or the site? The site's names are checked over your connections: their address, the connection your rules give them, and whether they answer there. Runs only when you ask.
 Diagnostic archive export:
   The archive is saved in the service archives directory (per-user).
   Ready
@@ -55,7 +55,7 @@ Commands on this screen:
   l: switch between diagnostics, the log and the audit trail
   a and an alert number: acknowledge it, for example a 1
   e and a host or address: which rule decides it, for example e example.com
-  c and a site name: check it, for example c example.com; m: move the sign-in names the check found to the site's route
+  c and a site name: check it, for example c example.com; m: move the sign-in names the check found to the site's connection
   x: export a diagnostic archive
   d: change the detail level, o: only this session's logs or all of them, b: change the log size limit
   In the log: v next level, / and text filter by event type (/ on its own clears), s this session or all history
@@ -92,11 +92,11 @@ Audit trail:
   audit-2026-10-06.ndjson
   a: Acknowledge
   Acknowledging…
-Explain sample:
+Which rule applies to a site:
   No probe has been run yet. Enter a query above and click Probe.
   e: Enter a hostname or IP to simulate the routing decision against the active rule set.
 Check a site:
-  Is it the network or the site? The site's names are checked over your routes: their address, the route your rules give them, and whether they answer there. Runs only when you ask.
+  Is it the network or the site? The site's names are checked over your connections: their address, the connection your rules give them, and whether they answer there. Runs only when you ask.
 Diagnostic archive export:
   The archive is saved in the service archives directory (per-user).
   Ready
@@ -106,7 +106,7 @@ Commands on this screen:
   l: switch between diagnostics, the log and the audit trail
   a and an alert number: acknowledge it, for example a 1
   e and a host or address: which rule decides it, for example e example.com
-  c and a site name: check it, for example c example.com; m: move the sign-in names the check found to the site's route
+  c and a site name: check it, for example c example.com; m: move the sign-in names the check found to the site's connection
   x: export a diagnostic archive
   d: change the detail level, o: only this session's logs or all of them, b: change the log size limit
   In the log: v next level, / and text filter by event type (/ on its own clears), s this session or all history
@@ -136,11 +136,11 @@ Audit trail:
   audit-2026-10-06.ndjson
   a: Acknowledge
   Acknowledging…
-Explain sample:
+Which rule applies to a site:
   No probe has been run yet. Enter a query above and click Probe.
   e: Enter a hostname or IP to simulate the routing decision against the active rule set.
 Check a site:
-  Is it the network or the site? The site's names are checked over your routes: their address, the route your rules give them, and whether they answer there. Runs only when you ask.
+  Is it the network or the site? The site's names are checked over your connections: their address, the connection your rules give them, and whether they answer there. Runs only when you ask.
 Diagnostic archive export:
   The archive is saved in the service archives directory (per-user).
   Ready
@@ -150,7 +150,7 @@ Commands on this screen:
   l: switch between diagnostics, the log and the audit trail
   a and an alert number: acknowledge it, for example a 1
   e and a host or address: which rule decides it, for example e example.com
-  c and a site name: check it, for example c example.com; m: move the sign-in names the check found to the site's route
+  c and a site name: check it, for example c example.com; m: move the sign-in names the check found to the site's connection
   x: export a diagnostic archive
   d: change the detail level, o: only this session's logs or all of them, b: change the log size limit
   In the log: v next level, / and text filter by event type (/ on its own clears), s this session or all history
@@ -177,12 +177,12 @@ Audit trail:
   audit-2026-10-06.ndjson
   a: Acknowledge
   Security alert acknowledged.
-Explain sample:
+Which rule applies to a site:
   hostname or IP: example.com
   Probing...
   e: Enter a hostname or IP to simulate the routing decision against the active rule set.
 Check a site:
-  Is it the network or the site? The site's names are checked over your routes: their address, the route your rules give them, and whether they answer there. Runs only when you ask.
+  Is it the network or the site? The site's names are checked over your connections: their address, the connection your rules give them, and whether they answer there. Runs only when you ask.
 Diagnostic archive export:
   The archive is saved in the service archives directory (per-user).
   Ready
@@ -192,7 +192,7 @@ Commands on this screen:
   l: switch between diagnostics, the log and the audit trail
   a and an alert number: acknowledge it, for example a 1
   e and a host or address: which rule decides it, for example e example.com
-  c and a site name: check it, for example c example.com; m: move the sign-in names the check found to the site's route
+  c and a site name: check it, for example c example.com; m: move the sign-in names the check found to the site's connection
   x: export a diagnostic archive
   d: change the detail level, o: only this session's logs or all of them, b: change the log size limit
   In the log: v next level, / and text filter by event type (/ on its own clears), s this session or all history
@@ -200,8 +200,8 @@ Commands on this screen:
   n: next page (more)   p: previous page (back)
   r: read again from the service. Lists do not refresh by themselves, so nothing moves while you read.
 Type a screen number, h for help or q to quit, then press Enter.
-Explain sample: site.example  →  Additional — Allowed
-Explain sample: Denied by an address rule: this name resolves to a denied address (203.0.113.2)
+Which rule applies to a site: site.example  →  Additional — Allowed
+Which rule applies to a site: Denied by an address rule: this name resolves to a denied address (203.0.113.2)
 
 Screen: Diagnostics and logs
 Service: OK
@@ -214,7 +214,7 @@ Commands on this screen:
   l: switch between diagnostics, the log and the audit trail
   a and an alert number: acknowledge it, for example a 1
   e and a host or address: which rule decides it, for example e example.com
-  c and a site name: check it, for example c example.com; m: move the sign-in names the check found to the site's route
+  c and a site name: check it, for example c example.com; m: move the sign-in names the check found to the site's connection
   x: export a diagnostic archive
   d: change the detail level, o: only this session's logs or all of them, b: change the log size limit
   In the log: v next level, / and text filter by event type (/ on its own clears), s this session or all history
@@ -237,7 +237,7 @@ Commands on this screen:
   l: switch between diagnostics, the log and the audit trail
   a and an alert number: acknowledge it, for example a 1
   e and a host or address: which rule decides it, for example e example.com
-  c and a site name: check it, for example c example.com; m: move the sign-in names the check found to the site's route
+  c and a site name: check it, for example c example.com; m: move the sign-in names the check found to the site's connection
   x: export a diagnostic archive
   d: change the detail level, o: only this session's logs or all of them, b: change the log size limit
   In the log: v next level, / and text filter by event type (/ on its own clears), s this session or all history

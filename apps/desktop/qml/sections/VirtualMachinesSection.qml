@@ -32,7 +32,7 @@ ColumnLayout {
         var route = section.controller.routeOf(hypervisor)
         if (route === "mixed")
             return root.tr("rules.vm.route-now-mixed",
-                "The rules send {hypervisor}'s programs over different routes.")
+                "The rules send {hypervisor}'s programs over different connections.")
                 .replace("{hypervisor}", name)
         if (route === "block")
             return root.tr("rules.vm.route-now-block",
@@ -98,7 +98,7 @@ ColumnLayout {
                 "This machine's traffic leaves from {address}.")
                 .replace("{address}", String(attachment.boundAddress || ""))
         return root.tr("rules.vm.pin.rules",
-            "This machine follows your rules: sites from the rules take their route, everything else goes over {route}.")
+            "This machine follows your rules: sites from the rules go over their own connections, everything else goes over {route}.")
             .replace("{route}", root.routeLabel("primary"))
     }
     function _pinFailureText(failure) {
@@ -130,7 +130,7 @@ ColumnLayout {
             color: root.textColor
             text: root.uiRevision >= 0
                 ? root.tr("rules.vm.intro",
-                    "A virtual machine's traffic leaves your computer as the traffic of its hypervisor, so the route is chosen for the hypervisor and applies to all of its machines. Changes go to your rules list, where you review and apply them.")
+                    "A virtual machine's traffic leaves your computer as the traffic of its hypervisor, so the connection is chosen for the hypervisor and applies to all of its machines. Changes go to your rules list, where you review and apply them.")
                 : ""
             Accessible.role: Accessible.StaticText
             Accessible.name: text
@@ -251,7 +251,7 @@ ColumnLayout {
                                 color: root.mutedTextColor
                                 text: root.uiRevision >= 0
                                     ? root.tr("rules.vm.route-scope",
-                                        "{hypervisor} runs every machine as one program ({processes}), so a route applies to all of its machines.")
+                                        "{hypervisor} runs every machine as one program ({processes}), so the connection you choose applies to all of its machines.")
                                         .replace("{hypervisor}", section._hypervisorName(hypervisorBlock.hypervisor))
                                         .replace("{processes}", (hypervisorBlock.hypervisor.trafficProcesses || []).join(", "))
                                     : ""

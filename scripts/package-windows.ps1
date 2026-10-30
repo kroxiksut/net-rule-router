@@ -29,9 +29,9 @@
     specific copy can be tied back to the code that produced it.
 
     No package carries debug symbols (*.pdb): a panic names its file:line
-    without them. A run that writes any artifact also writes
-    <artifact>-symbols.zip beside it, the PDBs of exactly the executables
-    shipped, for reading a crash's call stack later. A bare folder gets none:
+    without them. A run that writes any artifact also writes, unless
+    -NoSymbols, <artifact>-symbols.zip beside it, the PDBs of exactly the
+    executables shipped, for reading a crash's call stack later. A bare folder gets none:
     the symbols of the same build stay in the target directory.
 
 .PARAMETER OutputRoot
@@ -65,6 +65,10 @@
     next to the folder, for carrying the build on a flash drive, and the
     -symbols.zip of the build.
 
+.PARAMETER NoSymbols
+    Skip the -symbols.zip, for a test build: the PDBs stay in the target
+    directory. A release never passes it.
+
 .PARAMETER Installers
     Also build both installers from the package: the EXE (Inno Setup 6) and the
     MSI (WiX Toolset 5), next to the folder, plus a SHA256 checksum file that
@@ -93,6 +97,7 @@ param(
     [string]$Arch = 'x64',
     [switch]$Full,
     [switch]$Zip,
+    [switch]$NoSymbols,
     [switch]$Installers,
     [switch]$Exe,
     [switch]$Msi,
@@ -492,8 +497,8 @@ function Get-AgreementRevision {
     throw "'$Source' names no agreement revision."
 }
 
-# The wizards' pictures, drawn from the app icon on a light background:
-# otherwise WiX shows its red ones and Inno Setup its own.
+# The wizards' pictures, drawn from the symbol without the app icon's plate on
+# a light background: otherwise WiX shows its red ones and Inno Setup its own.
 function New-Canvas {
     param([int] $Width, [int] $Height)
     $bitmap = New-Object System.Drawing.Bitmap $Width, $Height, ([System.Drawing.Imaging.PixelFormat]::Format24bppRgb)
@@ -550,9 +555,10 @@ function New-IconBitmap {
 function New-InstallerImages {
     param([string] $Folder)
     Add-Type -AssemblyName System.Drawing
-    $source = Join-Path $repoRoot 'assets\icons\app\icon-256.png'
+    # Read by the build alone: anything under assets\ ships beside the binaries.
+    $source = Join-Path $repoRoot 'packaging\windows\art\logo-symbol.png'
     if (-not (Test-Path -LiteralPath $source)) {
-        throw "The app icon '$source' is missing from the checkout."
+        throw "The symbol '$source' is missing from the checkout."
     }
     $icon = [System.Drawing.Image]::FromFile($source)
     try {
@@ -705,7 +711,7 @@ function Write-DocsFragment {
 # Resolved before the build, so a missing tool fails in seconds, not after it.
 $buildExe = $Installers -or $Exe
 $buildMsi = $Installers -or $Msi
-$buildSymbols = $Zip -or $buildExe -or $buildMsi
+$buildSymbols = ($Zip -or $buildExe -or $buildMsi) -and -not $NoSymbols
 $iscc = if ($buildExe) { Resolve-InnoCompiler } else { $null }
 $wix = if ($buildMsi) { Resolve-WixTool } else { $null }
 

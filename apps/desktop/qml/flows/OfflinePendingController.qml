@@ -60,7 +60,7 @@ QtObject {
     function _offlineRoutingKeyLabel(namespace, key) {
         switch (key) {
             case "mode":
-                return root.tr("settings.routing.default-route.title", "Default route")
+                return root.tr("settings.routing.default-route.title", "Where everything else goes")
             case "leak-protection":
                 return root.tr("settings.routing.kill-switch.title", "Leak protection")
             case "kill-switch-protocols":
@@ -85,7 +85,7 @@ QtObject {
                     "Fake-IP UDP relay (experimental)")
             case "fake-ip-instant-rst":
                 return root.tr("settings.routing.fake-ip-instant-rst.label",
-                    "Instant reset when the additional route is unavailable")
+                    "Instant reset when the additional connection is unavailable")
             case "dns-via-secondary":
                 return root.tr("settings.routing.dns-via-secondary.label",
                     "DNS through the tunnel")

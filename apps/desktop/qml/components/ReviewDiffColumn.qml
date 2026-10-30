@@ -10,6 +10,7 @@
 
 import QtQuick 2.15
 import QtQuick.Controls 2.15
+import "../lib/pure.js" as Pure
 import QtQuick.Layouts 1.15
 
 ColumnLayout {
@@ -103,6 +104,9 @@ ColumnLayout {
                             var display = modelData.display
                                 || modelData["display"] || modelData.id
                                 || JSON.stringify(modelData)
+                            if (root.ownerRoot && typeof root.ownerRoot.routeLabel === "function")
+                                display = Pure.reviewEntryText(display, root.ownerRoot.tr,
+                                    root.ownerRoot.routeLabel)
                             var suffix = ""
                             if (!diffRow.entryEnabled && root.ownerRoot
                                     && typeof root.ownerRoot.tr === "function") {
@@ -126,8 +130,10 @@ ColumnLayout {
                                 routeText = root.ownerRoot.tr(
                                     "label." + route, route)
                             }
-                            // A `?` rule names its route with the mark after it.
-                            if (modelData.verify === true) routeText += " ?"
+                            // A `?` rule says so in words.
+                            if (modelData.verify === true)
+                                routeText = root.tr("rules.route-checking", "{route} (checking)")
+                                    .replace("{route}", routeText)
                             return display + "  [" + routeText + "]" + suffix
                         }
                         return String(modelData)

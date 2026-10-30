@@ -885,6 +885,14 @@ pub enum StatusUpdateEvent {
         /// The segment as reported, with its prefix.
         network: String,
     },
+    /// The additional route's bound adapter was down and the user's VPN came
+    /// up on another one, so the service moved the route there and saved it;
+    /// the user is told which connection their rules now use.
+    AdditionalConnectionMoved {
+        sid: String,
+        /// Connection name as the interfaces list shows it.
+        adapter_name: String,
+    },
     /// A new block episode was recorded for `sid` and survived muting — the
     /// tray shows it as a notice. Fires once per episode (see
     /// `nrr_domain::block_notice`), not once per retried packet: a blocked
@@ -1035,6 +1043,7 @@ impl StatusUpdateEvent {
             | Self::SecondaryExternalAddressCleared { sid }
             | Self::UnassignedTunnelDetected { sid, .. }
             | Self::LocalNetworkTooWide { sid, .. }
+            | Self::AdditionalConnectionMoved { sid, .. }
             | Self::BlockNoticeRaised { sid, .. }
             | Self::BlockNoticeMutesChanged { sid }
             | Self::VerifyVerdictsChanged { sid, .. }

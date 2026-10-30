@@ -398,6 +398,10 @@ fn every_status_update_event() -> Vec<StatusUpdateEvent> {
             adapter_name: "Wi-Fi".into(),
             network: "0.0.0.0/1".into(),
         },
+        StatusUpdateEvent::AdditionalConnectionMoved {
+            sid: "S-1-5-21".into(),
+            adapter_name: "Tunnel".into(),
+        },
         StatusUpdateEvent::EnforcementStatusChanged {
             sid: "S-1-5-21".into(),
             status: "secondary-down".into(),

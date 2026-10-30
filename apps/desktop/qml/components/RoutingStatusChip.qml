@@ -22,18 +22,18 @@ Rectangle {
     }
     readonly property string labelText: {
         if (statusKey === "paused")
-            return root.tr("routing.status.paused", "Routing paused")
+            return root.tr("routing.status.paused", "Rules are off")
         if (statusKey === "no-tray")
-            return root.tr("routing.status.no-tray", "Tray offline")
+            return root.tr("routing.status.no-tray", "Tray icon not running")
         if (statusKey === "no-rules")
-            return root.tr("routing.status.no-rules", "No rules configured")
+            return root.tr("routing.status.no-rules", "No rules")
         if (statusKey === "disconnected")
             return root.tr("routing.status.disconnected", "Service not connected")
         if (statusKey === "error")
-            return root.tr("routing.status.error", "Routing error")
+            return root.tr("routing.status.error", "Rules not working")
         if (statusKey === "limited")
-            return root.tr("routing.status.limited", "Routing limited")
-        return root.tr("routing.status.active", "Routing active")
+            return root.tr("routing.status.limited", "Some rules not working")
+        return root.tr("routing.status.active", "Rules are working")
     }
 
     // What the state means, for the tooltip and the screen reader alike: a
@@ -41,16 +41,16 @@ Rectangle {
     readonly property string detailText: {
         if (chip.statusKey === "paused")
             return root.tr("routing.status.detail-paused",
-                "Rules are disabled for the time chosen; they come back on their own when it is up, or when you turn them back on.")
+                "Rules are off for the time chosen; they come back on their own when it is up, or when you turn them back on.")
         if (chip.statusKey === "no-tray")
             return root.tr("routing.status.detail-no-tray",
-                "Run the tray icon to apply rules on this session.")
+                "Start the tray icon so your rules work.")
         if (chip.statusKey === "no-rules")
             return root.tr("routing.status.detail-no-rules",
-                "Add rules in the Rules section, then click Save and review.")
+                "Add rules in the Rules section, then press Apply.")
         if (chip.statusKey === "disconnected")
             return root.tr("routing.status.detail-disconnected",
-                "Showing preview data. Install and start the NetRuleRouter service to apply rules.")
+                "This is an example view. Install and start the NetRuleRouter service so your rules work.")
         // The notices' own headlines: what happens to the traffic differs
         // per status, and only the notice beside the chip says which.
         if (chip.statusKey === "limited")
@@ -58,7 +58,7 @@ Rectangle {
                 || root.tr("routing.status.detail-limited",
                     "Some rules are not being applied right now. The notices say why.")
         return root.tr("routing.status.detail-active",
-            "Rules apply on this user session.")
+            "Your rules are working.")
     }
 
     implicitHeight: 26
@@ -67,7 +67,7 @@ Rectangle {
     color: Qt.rgba(statusColor.r, statusColor.g, statusColor.b, 0.16)
     border.width: activeFocus ? theme.focusBorderWidth : theme.borderWidth
     border.color: activeFocus
-        ? theme.stateFocusedBorder
+        ? theme.colorButtonOutline
         : Qt.rgba(statusColor.r, statusColor.g, statusColor.b, 0.55)
 
     signal clicked()

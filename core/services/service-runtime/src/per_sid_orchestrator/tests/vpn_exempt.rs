@@ -654,6 +654,25 @@ fn kill_switch_arms_with_no_secondary_bound_at_all() {
     );
 }
 
+/// Routed sites is what a new user starts with. Without an additional
+/// connection and with no rule for one, there is nothing to hold: the user's
+/// internet must work exactly as without the program.
+#[test]
+fn routed_sites_without_an_additional_connection_or_its_rules_blocks_nothing() {
+    let (api, orch, src, rules) = fixture_with_luid(None);
+    rules.set(rules_with_n_primary_ips(2));
+    let snap = snap_primary_only("Wi-Fi");
+    assert_eq!(snap.leak_protection, nrr_domain::LeakProtection::default());
+    src.set("S-1-5-21-A", snap);
+
+    orch.install_for_sid("S-1-5-21-A").unwrap();
+    let filters = api.wfp_filters.lock().unwrap();
+    assert!(
+        filters.iter().all(|f| f.action != WfpAction::Block),
+        "a user with no additional connection lost traffic to a block: {filters:?}",
+    );
+}
+
 #[test]
 fn everything_under_the_additional_route_blocks_all_when_unresolved() {
     let ip = Ipv4Addr::new(203, 0, 113, 9);

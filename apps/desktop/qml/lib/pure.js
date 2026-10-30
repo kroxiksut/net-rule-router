@@ -230,7 +230,7 @@ function settingsCategories(updateCheckAvailable) {
         { id: "traffic", key: "settings.traffic.category", fallback: "Traffic statistics", icon: "traffic-in" },
         { id: "routing", key: "settings.group.routing-behavior", fallback: "Routing behavior", icon: "routing" },
         { id: "service", key: "settings.service.title", fallback: "Service management", icon: "shield" },
-        { id: "presets", key: "settings.category.presets", fallback: "Presets and settings", icon: "load-list" },
+        { id: "presets", key: "settings.category.presets", fallback: "Rules and settings files", icon: "load-list" },
         { id: "experimental", key: "settings.group.experimental", fallback: "Experimental", icon: "experimental" },
         { id: "updates", key: "settings.group.updates", fallback: "Updates", icon: "download" }
     ]
@@ -1701,6 +1701,34 @@ function firstRunSuggestion(rows, role, skipIndex) {
     return found
 }
 
+// While the first-run window asks for the additional connection: the row of
+// `now` that came up since `before`, named as the VPN the user just started;
+// -1 for none. Holding no role, not our own tunnel, not `skipIndex` (the main
+// connection's pick); a tunnel wins over a link that came up with it. Twin of
+// `nrr_client_logic::adapters::first_run_just_connected`.
+function firstRunJustConnected(before, now, skipIndex) {
+    var skip = typeof skipIndex === "number" ? skipIndex : -1
+    var key = function(row) {
+        var id = String(row.persistentId || "")
+        return id !== "" ? id : String(row.name || "")
+    }
+    var up = []
+    for (var b = 0; b < (before || []).length; b += 1) {
+        var old = before[b]
+        if (old && String(old.availability || "") === "available") up.push(key(old))
+    }
+    var first = -1
+    for (var i = 0; i < (now || []).length; i += 1) {
+        var row = now[i]
+        if (i === skip || !row || String(row.availability || "") !== "available") continue
+        if (isOwnFakeIpTunRow(row) || String(row.selectedRole || "") !== "") continue
+        if (up.indexOf(key(row)) >= 0) continue
+        if (adapterLooksLikeTunnel(row)) return i
+        if (first < 0) first = i
+    }
+    return first
+}
+
 // For a picked adapter that is not connected, the other copies of its driver:
 // connected ones by index, the rest counted. Twin of
 // `nrr_client_logic::adapters::driver_siblings`.
@@ -1728,6 +1756,98 @@ function adapterDriverFamily(description) {
     var d = String(description || "").trim()
     var m = /^(.*\s)#([0-9]+)$/.exec(d)
     return (m ? m[1].trim() : d).toLowerCase()
+}
+
+// For the down row `index`: null for a lone copy of its driver, else whether
+// another copy is up. Twin of `driver_pool` in `nrr_client_logic::adapters`.
+function _idleVpnDriverPool(list, index, skip) {
+    var family = adapterDriverFamily(list[index].description)
+    if (family === "") return null
+    var pooled = false
+    var up = false
+    for (var i = 0; i < list.length; i += 1) {
+        var row = list[i]
+        if (i === index || i === skip || !row) continue
+        if (isOwnFakeIpTunRow(row) || adapterHeldOtherRole(row, "secondary") !== "") continue
+        if (adapterDriverFamily(row.description) !== family) continue
+        pooled = true
+        if (String(row.availability || "") === "available") up = true
+    }
+    return pooled ? up : null
+}
+
+// VPN adapters that are down, once a VPN program was found: `{ rows: [{ index,
+// program }], preselect, startVpnFirst }` (-1 for none). Tied by a word to a
+// found program, else the untied ones; a copy of a driver with other copies
+// beside it is never offered. Picked only as the one down VPN adapter on the
+// machine, or the one a program names as its link: among several (any
+// drivers) their programs go to `startVpnFirst` instead. Twin of
+// `nrr_client_logic::adapters::first_run_idle_vpns`.
+function firstRunIdleVpns(rows, programs, skipIndex) {
+    var skip = typeof skipIndex === "number" ? skipIndex : -1
+    var found = { rows: [], preselect: -1, startVpnFirst: [] }
+    var named = []
+    var distinct = []
+    for (var p = 0; p < (programs || []).length; p += 1) {
+        var program = programs[p] || {}
+        var label = String(program.displayName || "").trim()
+        if (label === "") label = String(program.exePath || "").trim().split(/[\\\/]/).pop().trim()
+        label = _linkTieStripExe(label)
+        if (label === "") continue
+        named.push({ program: program, label: label })
+        if (distinct.indexOf(label) < 0) distinct.push(label)
+    }
+    if (named.length === 0) return found
+    var seen = []
+    var list = rows || []
+    for (var i = 0; i < list.length; i += 1) {
+        var row = list[i]
+        if (i === skip || !row || String(row.availability || "") === "available") continue
+        if (isOwnFakeIpTunRow(row) || adapterHeldOtherRole(row, "secondary") !== "") continue
+        if (!adapterLooksLikeTunnel(row)) continue
+        var words = _linkTieWords(String(row.name || "") + " " + String(row.description || ""))
+        var rowName = _asciiLower(String(row.name || "").trim())
+        var owner = ""
+        var namesLink = false
+        for (var n = 0; n < named.length; n += 1) {
+            var c = named[n].program
+            var iface = _asciiLower(String(c.interfaceName || "").trim())
+            var byLink = iface !== "" && iface === rowName
+            if (byLink) namesLink = true
+            if (owner === "" && (_linkTieShares(words, c.displayName)
+                    || _linkTieShares(words, c.exePath) || byLink))
+                owner = named[n].label
+        }
+        seen.push({
+            index: i,
+            program: owner !== "" ? owner : (distinct.length === 1 ? distinct[0] : ""),
+            tied: owner !== "",
+            namedLink: namesLink,
+            pooled: namesLink ? null : _idleVpnDriverPool(list, i, skip)
+        })
+    }
+    var idle = function(c) { return { index: c.index, program: c.program } }
+    // A program that names its link has said which adapter is the VPN's.
+    if (seen.some(function(c) { return c.namedLink })) {
+        found.rows = seen.filter(function(c) { return c.namedLink }).map(idle)
+        if (found.rows.length === 1) found.preselect = found.rows[0].index
+        return found
+    }
+    var byTie = seen.some(function(c) { return c.tied })
+    found.rows = seen.filter(function(c) { return c.tied === byTie && c.pooled === null }).map(idle)
+    if (found.rows.length === 1 && seen.length === 1) {
+        found.preselect = found.rows[0].index
+        return found
+    }
+    // Several candidates: the programs they may belong to, named ones first;
+    // a driver with a copy already up is the VPN that is on, not one to start.
+    for (var h = 0; h < seen.length; h += 1) {
+        if (seen[h].pooled === true || found.startVpnFirst.indexOf(seen[h].program) >= 0) continue
+        found.startVpnFirst.push(seen[h].program)
+    }
+    if (found.startVpnFirst.some(function(p) { return p !== "" }))
+        found.startVpnFirst = found.startVpnFirst.filter(function(p) { return p !== "" })
+    return found
 }
 
 // The role this adapter holds other than `role`, or "". One adapter cannot
@@ -1849,6 +1969,55 @@ function previewRefusal(summary) {
         }
     }
     return null
+}
+
+// How many of the user's rules a loaded rule set takes away: a set loaded to
+// replace drops every rule of the covered routes it does not hold itself.
+// 0 for a merge and for every other kind of review.
+function rulesReplacedByLoad(reviewKind, loadState, summary) {
+    if (reviewKind !== "preset-import" || !loadState || loadState.mode === "merge") return 0
+    var removed = summary && summary["rules-removed"]
+    return removed && typeof removed.length === "number" ? removed.length : 0
+}
+
+// A review row's rule as the service spelled it (`<rule>[ (app)][ (<from> →
+// <to>)]`), taken apart so its English markers are said in the user's language:
+// { rule, app, moved: [from, to] | null, invalid }.
+function reviewEntryParts(display) {
+    var rule = String(display || "")
+    var moved = null
+    var open = rule.lastIndexOf(" (")
+    if (open >= 0 && rule.charAt(rule.length - 1) === ")") {
+        var inside = rule.substring(open + 2, rule.length - 1)
+        var arrow = inside.indexOf(" → ")
+        var from = arrow >= 0 ? inside.substring(0, arrow) : ""
+        var to = arrow >= 0 ? inside.substring(arrow + 3) : ""
+        if ((from === "primary" || from === "secondary") && (to === "primary" || to === "secondary")) {
+            moved = [from, to]
+            rule = rule.substring(0, open)
+        }
+    }
+    var mark = " (app)"
+    var app = rule.length > mark.length && rule.substring(rule.length - mark.length) === mark
+    if (app) rule = rule.substring(0, rule.length - mark.length)
+    return { rule: rule, app: app, moved: moved, invalid: rule === "(no match — invalid rule)" }
+}
+
+// The text of a review row's rule in the user's language; `routeLabel(slug)`
+// names a route as the rest of the window does.
+function reviewEntryText(display, tr, routeLabel) {
+    var p = reviewEntryParts(display)
+    var text = p.invalid
+        ? tr("dialog.review-diff.entry-invalid", "(no match — invalid rule)")
+        : p.rule
+    if (p.app) text = tr("dialog.review-diff.entry-app", "{rule} (app)").split("{rule}").join(text)
+    if (p.moved) {
+        var moved = tr("dialog.review-diff.entry-moved", "{rule} ({from} → {to})")
+        moved = moved.split("{from}").join(routeLabel(p.moved[0]))
+        moved = moved.split("{to}").join(routeLabel(p.moved[1]))
+        text = moved.split("{rule}").join(text)
+    }
+    return text
 }
 
 // The locale key and placeholder values of a refusal that names what it
@@ -2006,6 +2175,16 @@ function _displaySubstituted(s, from, to) {
     return out + s.substring(start, to)
 }
 
+// A log line's category or event type in the reader's language: `prefix` plus
+// the slug in key form (`dns_resolver`, `cache.store` -> `dns-resolver`,
+// `cache-store`). A slug with no name yet shows as it is.
+function logSlugText(tr, prefix, slug) {
+    var raw = String(slug || "")
+    if (raw === "") return ""
+    var key = raw.toLowerCase().replace(/[^a-z0-9-]+/g, "-").replace(/^-+|-+$/g, "")
+    return key === "" ? raw : tr(prefix + key, raw)
+}
+
 function displayText(value) {
     var s = value === undefined || value === null ? "" : String(value)
     if (_displayAdvance(s, 0, DISPLAY_TEXT_MAX_CHARS) >= s.length) {
@@ -2043,13 +2222,13 @@ var MUTABLE_NOTICE_KINDS = {
     "enforcement-restored": ["notifications.enforcement.restored.title",
         "Routing is working again"],
     "unassigned-tunnel": ["notifications.unassigned-tunnel.title",
-        "The additional route is not assigned"],
+        "The additional connection is not chosen"],
     "local-networks": ["notifications.local-networks.title", "A local network was found"],
     "rules-drift": ["tray.rules-drift.title", "Your rules files differ from what is applied"],
     "secondary-down": ["notifications.enforcement.secondary-down.title",
         "The additional connection is not up"],
     "routes-held": ["notifications.routes-held.title",
-        "Some addresses follow another user's route"],
+        "Some addresses follow another user's connection"],
     "traffic-carried": ["notifications.traffic-carried.title",
         "Your traffic goes through another user's tunnel"],
     "site-not-opening": ["settings.notifications.site-not-opening",
@@ -2700,11 +2879,11 @@ function parsePendingSummaryCounts(summaryJsonText) {
 // Main-link probing keys are listed here for the same reason as every other
 // field: a request that omits a key sends its default, so a panel writing ANY
 // key would otherwise reset the ones it does not mention.
-// `mode` and `leak-protection` have no wire default; theirs is the fallback for
-// a snapshot that lacks them, and protection never reads as on by guess.
+// `mode` and `leak-protection` have no wire default; theirs is what a user with
+// no saved policy starts from, the service's own default for them.
 var ROUTE_POLICY_FIELD_DEFAULTS = {
     "mode": "prefer-primary",
-    "leak-protection": "off",
+    "leak-protection": "sites",
     "kill-switch-protocols": 127,
     "allow-dns-over-primary": true,
     "include-subdomains": true,
@@ -2780,7 +2959,8 @@ var DEFAULT_ROUTES = ["prefer-primary", "prefer-secondary-when-available"]
 // Every leak-protection level, weakest first.
 var LEAK_PROTECTION_LEVELS = ["off", "sites", "everything"]
 
-// Legal values of the slug fields; anything else reads as the default.
+// Legal values of the slug fields, weakest first. A value outside them reads as
+// the weakest: a damaged level never reads as protection nobody chose.
 var ROUTE_POLICY_FIELD_CHOICES = {
     "leak-protection": ["off", "sites", "everything"]
 }
@@ -2802,7 +2982,7 @@ function routePolicyCoerce(key, raw) {
     }
     var text = String(raw)
     var choices = ROUTE_POLICY_FIELD_CHOICES[key]
-    if (choices && choices.indexOf(text) < 0) return def
+    if (choices && choices.indexOf(text) < 0) return choices[0]
     return text
 }
 

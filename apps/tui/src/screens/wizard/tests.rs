@@ -167,7 +167,8 @@ fn the_walk_binds_the_main_connection_sends_protection_once_and_hands_over() {
     );
     assert!(matches!(app.wizard.outcome, Some(Outcome::Role(_))));
 
-    take(&mut app, &Action::Next);
+    // "Set as main" went on to the additional connection by itself.
+    assert_eq!(app.wizard.step, Step::Secondary);
     take(&mut app, &Action::Later);
     take(&mut app, &Action::Next);
     // The starting rules come right after the connections, as in the window.
@@ -1298,7 +1299,7 @@ fn idle_vpn_adapters_do_not_bury_the_live_links() {
     assert!(!shown.iter().any(|l| l.contains("Idle Tap")), "{shown:?}");
     let picture = render(&app, 200, 50);
     assert!(
-        picture.contains("Example Tunnel looks like a VPN connection"),
+        picture.contains("Example Tunnel looks like your VPN"),
         "{picture}"
     );
     assert_eq!(
@@ -1601,5 +1602,444 @@ fn a_dead_bound_copy_of_a_driver_names_its_live_sibling() {
     assert!(
         !lines.iter().any(|l| l.contains("Ethernet 15")),
         "a connected main link warns of nothing: {lines:?}"
+    );
+}
+
+const MAIN_ID: &str = "{00000000-0000-0000-0000-000000000001}";
+const TUNNEL_ID: &str = "{00000000-0000-0000-0000-000000000002}";
+
+/// "Set as main" answers the step: the setup goes on to the additional
+/// connection once the service took it.
+#[test]
+fn setting_the_main_connection_goes_on_by_itself() {
+    let fake = service();
+    let mut app = app_on_wizard();
+    take(&mut app, &Action::Next);
+    take(&mut app, &Action::Assign(Route::Primary, MAIN_ID.into()));
+    assert_eq!(
+        app.wizard.step,
+        Step::Primary,
+        "nothing moves before the answer"
+    );
+    run_jobs(&mut app, &fake);
+    assert_eq!(app.wizard.step, Step::Secondary);
+    assert!(
+        matches!(app.wizard.outcome, Some(Outcome::Role(_))),
+        "the binding is not confirmed on the next step"
+    );
+}
+
+/// Back to an answered step: the answer is shown with a way to change it; the
+/// list comes back with the current answer under the cursor, and a new answer
+/// replaces it.
+#[test]
+fn an_answered_connection_step_can_be_changed_after_back() {
+    let fake = service();
+    let mut app = main_bound_only();
+    take(&mut app, &Action::Back);
+    assert_eq!(app.wizard.step, Step::Primary);
+    assert!(
+        !actions(&app)
+            .iter()
+            .any(|a| matches!(a, Action::Assign(..))),
+        "{:?}",
+        actions(&app)
+    );
+    take(&mut app, &Action::Change(Route::Primary));
+    let now = actions(&app);
+    assert_eq!(
+        now.get(app.wizard.cursor),
+        Some(&Action::Assign(Route::Primary, MAIN_ID.into())),
+        "the current answer is not under the cursor: {now:?}"
+    );
+    assert!(
+        now.contains(&Action::KeepCurrent(Route::Primary)),
+        "{now:?}"
+    );
+    take(&mut app, &Action::Assign(Route::Primary, TUNNEL_ID.into()));
+    run_jobs(&mut app, &fake);
+    let sent = fake.sent(IpcOperationName::RoutePolicyUpdate);
+    assert_eq!(sent[0]["primary"]["stable-id"], json!(TUNNEL_ID));
+    assert_eq!(app.wizard.step, Step::Secondary);
+    assert_eq!(app.wizard.changing, None);
+}
+
+/// The healthy machine with the main connection bound and the tunnel down.
+fn tunnel_down() -> AppState {
+    let texts = texts_en();
+    let mut snapshot = snapshot_json(&Fixture::healthy());
+    snapshot["route-policy"]
+        .as_object_mut()
+        .expect("fixture policy")
+        .remove("secondary");
+    snapshot["adapters"]["rows"][1]["availability"] = json!("unavailable");
+    let mut app = AppState::new(ScreenId::Status, false);
+    app.apply(BackendEvent::Link(Link::Connected), &texts, Instant::now());
+    let parsed = serde_json::from_value(snapshot).expect("snapshot parses");
+    app.apply(
+        BackendEvent::Snapshot(Box::new(parsed)),
+        &texts,
+        Instant::now(),
+    );
+    app.outbox.take();
+    app.open(ScreenId::Wizard);
+    app.wizard.go(Step::Secondary);
+    app
+}
+
+/// The user starts the VPN while the additional connection is asked: the
+/// connection that comes up is named as the likely VPN and offered first,
+/// under the cursor.
+#[test]
+fn a_vpn_started_on_the_additional_step_is_named_and_offered_first() {
+    let texts = texts_en();
+    let mut app = tunnel_down();
+    let mut snapshot = snapshot_json(&Fixture::healthy());
+    snapshot["route-policy"]
+        .as_object_mut()
+        .expect("fixture policy")
+        .remove("secondary");
+    let down = snapshot.clone();
+    let mut down = down;
+    down["adapters"]["rows"][1]["availability"] = json!("unavailable");
+    app.apply(
+        BackendEvent::Snapshot(Box::new(serde_json::from_value(down).expect("parses"))),
+        &texts,
+        Instant::now(),
+    );
+    assert_eq!(app.wizard.just_connected, None);
+    app.apply(
+        BackendEvent::Snapshot(Box::new(serde_json::from_value(snapshot).expect("parses"))),
+        &texts,
+        Instant::now(),
+    );
+    assert_eq!(app.wizard.just_connected.as_deref(), Some(TUNNEL_ID));
+    let said = summary(&app, &texts).join("\n");
+    assert!(
+        said.contains("Just connected: Example Tunnel"),
+        "the VPN that came up is not named:\n{said}"
+    );
+    assert_eq!(
+        actions(&app).get(app.wizard.cursor),
+        Some(&Action::Assign(Route::Secondary, TUNNEL_ID.into()))
+    );
+}
+
+/// The adapters are re-read every 2 s while the additional connection is
+/// asked, and only then.
+#[test]
+fn the_adapters_are_polled_on_the_additional_step_only() {
+    let mut app = tunnel_down();
+    // What opening the setup read.
+    app.outbox.take();
+    let start = Instant::now();
+    poll_adapters(&mut app, start);
+    assert_eq!(app.outbox.take().len(), 1, "no read on the additional step");
+    poll_adapters(&mut app, start + std::time::Duration::from_secs(1));
+    assert!(app.outbox.take().is_empty(), "read again within 2 s");
+    poll_adapters(&mut app, start + std::time::Duration::from_secs(2));
+    assert_eq!(app.outbox.take().len(), 1);
+    app.wizard.go(Step::Rules);
+    poll_adapters(&mut app, start + std::time::Duration::from_secs(10));
+    assert!(app.outbox.take().is_empty(), "read on another step");
+}
+
+/// The rules step asks for a decision: Next only after a set or "Start empty"
+/// was chosen. Back to it shows the choice, under the cursor, and keeps Next.
+#[test]
+fn the_rules_step_waits_for_a_choice_and_keeps_it_after_back() {
+    let texts = texts_en();
+    let mut app = app_on_wizard();
+    app.wizard.go(Step::Rules);
+    assert!(
+        !actions(&app).contains(&Action::Next),
+        "{:?}",
+        actions(&app)
+    );
+    let said = summary(&app, &texts).join("\n");
+    assert!(said.contains("\"Start empty\", to go on"), "{said}");
+    take(&mut app, &Action::StartEmpty);
+    take(&mut app, &Action::Back);
+    assert_eq!(app.wizard.step, Step::Rules);
+    assert!(actions(&app).contains(&Action::Next));
+    assert_eq!(
+        actions(&app).get(app.wizard.cursor),
+        Some(&Action::StartEmpty),
+        "the choice made is not under the cursor"
+    );
+    assert!(
+        label(&Action::StartEmpty, &app, &texts).contains("(current)"),
+        "{}",
+        label(&Action::StartEmpty, &app, &texts)
+    );
+}
+
+/// The set applied as the setup closes is the last one chosen: a set chosen
+/// and then replaced by a file that cannot be read is not applied.
+#[test]
+fn a_set_given_up_on_the_rules_step_is_not_applied() {
+    let fake = set_service();
+    let mut app = with_a_set_chosen(&fake);
+    take(&mut app, &Action::Back);
+    take(&mut app, &Action::OwnFiles);
+    app.wizard.paths[0] = "Z:/no/such/rules_primary.txt".into();
+    take(&mut app, &Action::ImportFiles);
+    assert!(matches!(
+        app.wizard.outcome,
+        Some(Outcome::FileError { .. })
+    ));
+    take(&mut app, &Action::Close);
+    while run_jobs(&mut app, &fake) > 0 {}
+    assert!(
+        !confirmed(&fake),
+        "the set the user moved away from was applied"
+    );
+
+    let fake = set_service();
+    let mut app = with_a_set_chosen(&fake);
+    take(&mut app, &Action::Back);
+    take(&mut app, &Action::StartEmpty);
+    take(&mut app, &Action::Close);
+    while run_jobs(&mut app, &fake) > 0 {}
+    assert!(!confirmed(&fake), "an empty start applied the earlier set");
+}
+
+/// A security alert stands when the setup closes: the starting set is refused
+/// until it is acknowledged. The set is kept, the feed says why and where the
+/// alert is, and once the alert is acknowledged the set goes by itself.
+#[test]
+fn a_set_held_by_a_security_alert_goes_once_the_alert_is_acknowledged() {
+    let texts = texts_en();
+    let fake = set_service();
+    let mut app = with_a_set_chosen(&fake);
+    fake.refuse(
+        IpcOperationName::MutationSubmit,
+        nrr_shared::ipc_transport::IpcErrorCode::SecurityAlertUnacknowledged,
+    );
+    take(&mut app, &Action::Close);
+    while run_jobs(&mut app, &fake) > 0 {}
+    assert!(!confirmed(&fake));
+    let effects = app.apply(
+        BackendEvent::Reply(crate::backend::Reply::new(|_| {})),
+        &texts,
+        Instant::now(),
+    );
+    drop(effects);
+    assert!(
+        app.notices
+            .iter()
+            .any(|n| n.body.contains("then it loads by itself")),
+        "the feed does not say the set waits for the alert: {:?}",
+        app.notices
+    );
+
+    // Acknowledged in Diagnostics (here or in the window).
+    fake.stop_refusing(IpcOperationName::MutationSubmit);
+    app.apply(
+        BackendEvent::Push(crate::backend::PushEvent::Status(Box::new(
+            nrr_shared::ipc_payloads::StatusUpdateEvent::SecurityAlertsChanged,
+        ))),
+        &texts,
+        Instant::now(),
+    );
+    while run_jobs(&mut app, &fake) > 0 {}
+    assert!(
+        confirmed(&fake),
+        "the set was not applied after the alert was acknowledged"
+    );
+}
+
+fn example_vpn() -> Vec<PickerRow> {
+    vec![PickerRow {
+        display_name: "Example VPN".into(),
+        exe_path: r"C:\Program Files\Example VPN\example.exe".into(),
+        running: false,
+        source: "installed".into(),
+        interface_name: String::new(),
+    }]
+}
+
+/// As in the window: hidemy.name installed, not started. Its adapter is down,
+/// so it hid behind "Show unavailable adapters" while the setup named the
+/// program. Once a VPN program is found, its adapter that is down is offered
+/// under the cursor, named as that VPN not connected now, and one key sets it.
+#[test]
+fn a_found_vpn_that_is_not_started_is_offered_first_without_show_all() {
+    let texts = texts_en();
+    let mut snapshot = snapshot_json(&Fixture::healthy());
+    snapshot["route-policy"]
+        .as_object_mut()
+        .expect("fixture policy")
+        .remove("secondary");
+    let tap = &mut snapshot["adapters"]["rows"][1];
+    tap["availability"] = json!("unavailable");
+    tap["kind"] = json!("tunnel");
+    tap["gateway"] = json!("-");
+    tap["derived-assessment"]["vpn-tunnel-likelihood"] = json!("likely");
+    tap["derived-assessment"]["classification"] = json!("vpn-tunnel");
+    tap["recommendation"]["class"] = json!("preferred-secondary");
+    let fake = FakeService::new(ConnectionStatus::Connected);
+    fake.answer(
+        IpcOperationName::SnapshotInterfacesGet,
+        snapshot["adapters"].clone(),
+    );
+    let mut app = AppState::new(ScreenId::Status, false);
+    app.apply(BackendEvent::Link(Link::Connected), &texts, Instant::now());
+    app.apply(
+        BackendEvent::Snapshot(Box::new(serde_json::from_value(snapshot).expect("parses"))),
+        &texts,
+        Instant::now(),
+    );
+    app.outbox.take();
+    let listed =
+        |app: &AppState| actions(app).contains(&Action::Assign(Route::Secondary, TUNNEL_ID.into()));
+    app.wizard.vpn_scan = example_vpn;
+    app.open(ScreenId::Wizard);
+    app.wizard.go(Step::Secondary);
+    assert!(!listed(&app), "a down adapter is listed with no VPN found");
+    run_jobs(&mut app, &fake);
+    assert!(listed(&app), "{:?}", actions(&app));
+    let wanted = Action::Assign(Route::Secondary, TUNNEL_ID.into());
+    assert_eq!(actions(&app).get(app.wizard.cursor), Some(&wanted));
+    assert!(
+        label(&wanted, &app, &texts).ends_with("(VPN Example VPN, not connected now)"),
+        "{}",
+        label(&wanted, &app, &texts)
+    );
+    let said = summary(&app, &texts).join("\n");
+    assert!(said.contains("Connect the VPN later"), "{said}");
+}
+
+/// As in the window: the found VPN's adapter is one of two copies of one
+/// driver, both down. Binding either one guessed, and the VPN came up on the
+/// other; no copy is offered, and the step asks to turn the VPN on.
+#[test]
+fn copies_of_one_driver_all_down_are_not_guessed_between() {
+    let texts = texts_en();
+    let mut snapshot = snapshot_json(&Fixture::healthy());
+    snapshot["route-policy"]
+        .as_object_mut()
+        .expect("fixture policy")
+        .remove("secondary");
+    let rows = snapshot["adapters"]["rows"]
+        .as_array_mut()
+        .expect("fixture rows");
+    let tap = &mut rows[1];
+    tap["availability"] = json!("unavailable");
+    tap["kind"] = json!("tunnel");
+    tap["gateway"] = json!("-");
+    tap["interface-description"] = json!("TAP-Windows Adapter V9");
+    tap["derived-assessment"]["vpn-tunnel-likelihood"] = json!("likely");
+    tap["derived-assessment"]["classification"] = json!("vpn-tunnel");
+    tap["recommendation"]["class"] = json!("preferred-secondary");
+    let mut copy = rows[1].clone();
+    copy["persistent-id"] = json!("{00000000-0000-0000-0000-000000000003}");
+    copy["adapter-name"] = copy["persistent-id"].clone();
+    copy["name"] = json!("Ethernet 3");
+    copy["interface-description"] = json!("TAP-Windows Adapter V9 #2");
+    rows.push(copy);
+    let fake = FakeService::new(ConnectionStatus::Connected);
+    fake.answer(
+        IpcOperationName::SnapshotInterfacesGet,
+        snapshot["adapters"].clone(),
+    );
+    let mut app = AppState::new(ScreenId::Status, false);
+    app.apply(BackendEvent::Link(Link::Connected), &texts, Instant::now());
+    app.apply(
+        BackendEvent::Snapshot(Box::new(serde_json::from_value(snapshot).expect("parses"))),
+        &texts,
+        Instant::now(),
+    );
+    app.outbox.take();
+    app.wizard.vpn_scan = example_vpn;
+    app.open(ScreenId::Wizard);
+    app.wizard.go(Step::Secondary);
+    run_jobs(&mut app, &fake);
+    assert!(
+        !actions(&app)
+            .iter()
+            .any(|a| matches!(a, Action::Assign(Route::Secondary, _))),
+        "a dead copy was offered: {:?}",
+        actions(&app)
+    );
+    let said = summary(&app, &texts).join("\n");
+    assert!(
+        said.contains("Example VPN may use any of several connections"),
+        "{said}"
+    );
+}
+
+/// The field machine: a pool of dead stock copies and the VPN's own adapter
+/// of another driver, also down. The VPN has come up on either kind, so the
+/// vendor adapter is listed as the VPN's but nothing is picked under the
+/// cursor; the step asks to turn the VPN on.
+#[test]
+fn a_vendor_adapter_beside_a_driver_pool_is_not_picked_while_the_vpn_is_off() {
+    let texts = texts_en();
+    let mut snapshot = snapshot_json(&Fixture::healthy());
+    snapshot["route-policy"]
+        .as_object_mut()
+        .expect("fixture policy")
+        .remove("secondary");
+    let rows = snapshot["adapters"]["rows"]
+        .as_array_mut()
+        .expect("fixture rows");
+    let tap = &mut rows[1];
+    tap["availability"] = json!("unavailable");
+    tap["kind"] = json!("tunnel");
+    tap["gateway"] = json!("-");
+    tap["interface-description"] = json!("TAP-Windows Adapter V9");
+    tap["derived-assessment"]["vpn-tunnel-likelihood"] = json!("likely");
+    tap["derived-assessment"]["classification"] = json!("vpn-tunnel");
+    tap["recommendation"]["class"] = json!("preferred-secondary");
+    let mut copy = rows[1].clone();
+    copy["persistent-id"] = json!("{00000000-0000-0000-0000-000000000003}");
+    copy["adapter-name"] = copy["persistent-id"].clone();
+    copy["name"] = json!("Ethernet 3");
+    copy["interface-description"] = json!("TAP-Windows Adapter V9 #2");
+    rows.push(copy);
+    let mut vendor = rows[1].clone();
+    vendor["persistent-id"] = json!("{00000000-0000-0000-0000-000000000004}");
+    vendor["adapter-name"] = vendor["persistent-id"].clone();
+    vendor["name"] = json!("Example VPN OpenVPN Adapter");
+    vendor["interface-description"] = json!("Example VPN 3.0 OpenVPN Adapter");
+    rows.push(vendor);
+    let fake = FakeService::new(ConnectionStatus::Connected);
+    fake.answer(
+        IpcOperationName::SnapshotInterfacesGet,
+        snapshot["adapters"].clone(),
+    );
+    let mut app = AppState::new(ScreenId::Status, false);
+    app.apply(BackendEvent::Link(Link::Connected), &texts, Instant::now());
+    app.apply(
+        BackendEvent::Snapshot(Box::new(serde_json::from_value(snapshot).expect("parses"))),
+        &texts,
+        Instant::now(),
+    );
+    app.outbox.take();
+    app.wizard.vpn_scan = example_vpn;
+    app.open(ScreenId::Wizard);
+    app.wizard.go(Step::Secondary);
+    run_jobs(&mut app, &fake);
+    let vendor_key = "{00000000-0000-0000-0000-000000000004}";
+    let all = actions(&app);
+    let listed: Vec<&Action> = all
+        .iter()
+        .filter(|a| matches!(a, Action::Assign(Route::Secondary, _)))
+        .collect();
+    assert_eq!(
+        listed,
+        vec![&Action::Assign(Route::Secondary, vendor_key.into())],
+        "only the vendor adapter is listed, never a dead stock copy",
+    );
+    assert_ne!(
+        actions(&app).get(app.wizard.cursor),
+        Some(&Action::Assign(Route::Secondary, vendor_key.into())),
+        "nothing is picked for the user while the VPN is off",
+    );
+    let said = summary(&app, &texts).join("\n");
+    assert!(
+        said.contains("Example VPN may use any of several connections"),
+        "{said}"
     );
 }

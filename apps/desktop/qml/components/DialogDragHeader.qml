@@ -24,8 +24,13 @@ Item {
     implicitWidth: 100
     implicitHeight: titleLabel.implicitHeight + 16
 
+    // Inside the dialog's frame, not over it: a bar painted over the frame
+    // reads as wider than the body below it.
     Rectangle {
         anchors.fill: parent
+        anchors.leftMargin: 1
+        anchors.rightMargin: 1
+        anchors.topMargin: 1
         color: bar.theme ? bar.theme.colorPanel : "#2b2b2b"
         Rectangle {
             anchors { left: parent.left; right: parent.right; bottom: parent.bottom }

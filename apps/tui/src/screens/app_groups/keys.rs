@@ -3,23 +3,23 @@
 
 use crate::i18n::{key, Key, Plural};
 
-pub const TITLE: Key = key("app-groups.title", "Application and device routes");
+pub const TITLE: Key = key("app-groups.title", "Connections for programs and devices");
 pub const SUBTITLE: Key = key("app-groups.subtitle", "detected on this computer");
 pub const INTRO: Key = key(
     "tui.app-groups.intro",
-    "A whole group of programs, or the machines of a hypervisor, can be sent over the main or the additional route at once. Changes go to your rules list, where you review and apply them.",
+    "A whole group of programs, or the machines of a hypervisor, can be sent over the main or the additional connection at once. Changes go to your rules list, where you review and apply them.",
 );
 pub const VM_NOTE: Key = key(
     "app-groups.vm-note",
-    "Virtual machine traffic follows the route assigned to its program. The default is the main route. A machine's local networks (host-to-guest access) always keep working, whichever route you pick.",
+    "Virtual machine traffic goes over the connection chosen for its program. The default is the main connection. A machine's local networks (host-to-guest access) always keep working, whichever connection you pick.",
 );
 pub const P2P_NOTE: Key = key(
     "app-groups.p2p-note",
-    "These programs are not blocked unless leak protection is on. The assigned route applies to their bulk connections; their peers are not added to zone rules.",
+    "These programs are not blocked unless leak protection is on. The chosen connection carries their bulk transfers; their peers are not added to zone rules.",
 );
 pub const KERNEL_NAT_NOTE: Key = key(
     "app-groups.kernel-nat-note",
-    "Traffic of WSL, Hyper-V, Docker, libvirt and other virtual machines does not belong to any program on this computer, so it cannot be given a route of its own. When it goes out through this computer, it follows the routes your rules set, as this computer's own traffic does; a machine bridged straight onto your network goes past them. Flexible routing for these environments is planned for the future.",
+    "Traffic of WSL, Hyper-V, Docker, libvirt and other virtual machines does not belong to any program on this computer, so it cannot be given a connection of its own. When it goes out through this computer, it follows your rules, as this computer's own traffic does; a machine bridged straight onto your network goes past them. Flexible routing for these environments is planned for the future.",
 );
 pub const LIST_TITLE: Key = key("tui.app-groups.list-title", "Groups and machines");
 pub const SCANNING: Key = key("app-groups.scanning", "Scanning…");
@@ -33,7 +33,7 @@ pub const FOOTER_NOTE: Key = key(
 );
 pub const NO_RULES: Key = key(
     "tui.app-groups.no-rules",
-    "Your rules have not been read yet, so a route cannot be assigned. Connect to the service first.",
+    "Your rules have not been read yet, so a connection cannot be chosen. Connect to the service first.",
 );
 pub const DISPLAY_ONLY: Key = key("app-groups.group-display-only-hint", "for information only");
 pub const ROUTE_LOCKED: Key = key("app-groups.route-locked", "Main");
@@ -47,10 +47,10 @@ pub const ROUTE_NONE: Key = key(
 pub const NO_MACHINES: Key = key("rules.vm.no-machines", "{hypervisor} has no machines yet.");
 pub const HYPERVISOR_VIRTUALBOX: Key = key("rules.vm.hypervisor.virtualbox", "VirtualBox");
 pub const HYPERVISOR_VMWARE: Key = key("rules.vm.hypervisor.vmware", "VMware");
-pub const ROUTE_PRIMARY: Key = key("label.primary", "Primary");
+pub const ROUTE_PRIMARY: Key = key("label.primary", "Main");
 pub const ROUTE_SECONDARY: Key = key("label.secondary", "Additional");
 pub const ROUTE_BLOCK: Key = key("label.block", "Denied");
-pub const ROUTE_MIXED: Key = key("tui.app-groups.route-mixed", "Different routes");
+pub const ROUTE_MIXED: Key = key("tui.app-groups.route-mixed", "Different connections");
 pub const MACHINES: Key = key("tui.app-groups.machines", "Machines");
 pub const UPDATED: Plural = Plural {
     stem: "app-groups.confirmed-status.",
@@ -71,7 +71,7 @@ pub const LIMIT_REACHED: Key = key(
 );
 pub const NOT_ASSIGNABLE: Key = key(
     "tui.app-groups.not-assignable",
-    "Item {n} cannot be given a route: no program rule reaches its traffic.",
+    "Item {n} cannot be given a connection: no program rule reaches its traffic.",
 );
 pub const NO_ITEM: Key = key("tui.app-groups.no-item", "There is no item {n}.");
 pub const LOCKED: Key = key(
@@ -84,7 +84,7 @@ pub const NOT_HYPERVISOR: Key = key(
 );
 pub const NO_TARGET: Key = key(
     "tui.app-groups.no-target",
-    "There is no adapter {n} that can be tied to a route.",
+    "There is no adapter {n} that can be tied to a connection.",
 );
 pub const PIN_BUSY: Key = key(
     "tui.app-groups.pin-busy",
@@ -107,7 +107,7 @@ pub const VM_NO_ADAPTERS: Key = key(
 pub const VM_ADAPTER_TITLE: Key = key("rules.vm.adapter-title", "Adapter {n}: {mode}");
 pub const VM_ROUTE_SCOPE: Key = key(
     "rules.vm.route-scope",
-    "{hypervisor} runs every machine as one program ({processes}), so a route applies to all of its machines.",
+    "{hypervisor} runs every machine as one program ({processes}), so the connection you choose applies to all of its machines.",
 );
 pub const VM_ROUTE_NOW: Key = key(
     "rules.vm.route-now",
@@ -115,7 +115,7 @@ pub const VM_ROUTE_NOW: Key = key(
 );
 pub const VM_ROUTE_NOW_MIXED: Key = key(
     "rules.vm.route-now-mixed",
-    "The rules send {hypervisor}'s programs over different routes.",
+    "The rules send {hypervisor}'s programs over different connections.",
 );
 pub const VM_ROUTE_NOW_BLOCK: Key = key(
     "rules.vm.route-now-block",
@@ -159,7 +159,7 @@ pub const VM_OTHER: Key = key(
 );
 pub const VM_PIN_RULES: Key = key(
     "rules.vm.pin.rules",
-    "This machine follows your rules: sites from the rules take their route, everything else goes over {route}.",
+    "This machine follows your rules: sites from the rules go over their own connections, everything else goes over {route}.",
 );
 pub const VM_PIN_ADDITIONAL: Key = key(
     "rules.vm.pin.additional",
@@ -209,7 +209,7 @@ pub const HELP_KEYS: &[Key] = &[
     ),
     key(
         "tui.app-groups.help.route",
-        "P sends the item over the main route, S over the additional one; Space switches between them",
+        "P sends the item over the main connection, S over the additional one; Space switches between them",
     ),
     key("tui.app-groups.help.scan", "R scans again"),
     key(
@@ -218,14 +218,14 @@ pub const HELP_KEYS: &[Key] = &[
     ),
     key(
         "tui.app-groups.help.pin",
-        "In the machines, A sends all traffic of the chosen VirtualBox NAT adapter over the additional route, F lets it follow the rules again",
+        "In the machines, A sends all traffic of the chosen VirtualBox NAT adapter over the additional connection, F lets it follow the rules again",
     ),
 ];
 
 pub const PLAIN_KEYS: &[Key] = &[
     key(
         "tui.app-groups.plain.route",
-        "p and an item number, for example p 2: send that item over the main route; s and a number: over the additional route",
+        "p and an item number, for example p 2: send that item over the main connection; s and a number: over the additional connection",
     ),
     key("tui.app-groups.plain.scan", "r: scan again"),
     key(
@@ -234,7 +234,7 @@ pub const PLAIN_KEYS: &[Key] = &[
     ),
     key(
         "tui.app-groups.plain.pin",
-        "with the machines shown, a and an adapter number: send all of its traffic over the additional route; f and a number: let it follow the rules again; p or s alone: the hypervisor's route",
+        "with the machines shown, a and an adapter number: send all of its traffic over the additional connection; f and a number: let it follow the rules again; p or s alone: the hypervisor's connection",
     ),
 ];
 

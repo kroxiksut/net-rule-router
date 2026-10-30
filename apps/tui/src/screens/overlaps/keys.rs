@@ -6,7 +6,7 @@ use crate::i18n::{key, Key, Plural};
 pub const TITLE: Key = key("rules.overlaps.nav-label", "Overlaps");
 pub const INTRO: Key = key(
     "rules.overlaps.intro",
-    "When rules of the two routes cover the same sites or addresses, the narrower rule wins: an exact name beats a wildcard, a wildcard beats a zone, a longer name beats a shorter one; an exact address beats a subnet or range, a smaller network beats a larger one. Check that each item below goes where you want it to: confirm it, or send it over the other route. Changes go to your rules list, where you review and apply them.",
+    "When rules of the two connections cover the same sites or addresses, the narrower rule wins: an exact name beats a wildcard, a wildcard beats a zone, a longer name beats a shorter one; an exact address beats a subnet or range, a smaller network beats a larger one. Check that each item below goes where you want it to: confirm it, or send it over the other connection. Changes go to your rules list, where you review and apply them.",
 );
 pub const PAIRS_TITLE: Key = key(
     "tui.overlaps.pairs-title",
@@ -22,7 +22,7 @@ pub const YES: Key = key("label.yes", "Yes");
 pub const NO: Key = key("label.no", "No");
 pub const EMPTY: Key = key(
     "rules.overlaps.empty",
-    "No rules of the two routes cover the same sites or addresses.",
+    "No rules of the two connections cover the same sites or addresses.",
 );
 pub const ALL_RESOLVED: Key = key("rules.overlaps.all-resolved", "Every overlap is resolved.");
 
@@ -33,7 +33,7 @@ pub const NESTED: Key = key(
 );
 pub const DUPLICATE: Key = key(
     "rules.overlaps.duplicate",
-    "{winner} is set on both routes. It goes over {winner-route}: on a tie the main route wins.",
+    "{winner} is set on both connections. It goes over {winner-route}: on a tie the main connection wins.",
 );
 pub const INTERSECTING: Key = key(
     "rules.overlaps.intersecting",
@@ -41,7 +41,7 @@ pub const INTERSECTING: Key = key(
 );
 pub const BLOCK_TIE: Key = key(
     "rules.overlaps.block-tie",
-    "{winner} names the same sites as {loser} on {loser-route}. They are denied: on a tie a deny wins over a route.",
+    "{winner} names the same sites as {loser} on {loser-route}. They are denied: on a tie a deny wins over a choice of connection.",
 );
 pub const BLOCK_TIE_WARNING: Key = key(
     "rules.overlaps.block-tie-warning",
@@ -49,13 +49,13 @@ pub const BLOCK_TIE_WARNING: Key = key(
 );
 pub const MAIN_STAYS: Key = key(
     "rules.overlaps.main-stays",
-    "Addresses of the main link inside this network stay on the main link even when the additional link is down. Leak protection does not block them.",
+    "Addresses of the main connection inside this network stay on the main connection even when the additional connection is down. Leak protection does not block them.",
 );
 pub const REASON_LABEL: Key = key("rules.overlaps.column.reason", "Why it wins");
 pub const REASON_NESTED: Key = key("rules.overlaps.reason.nested", "Narrower rule");
 pub const REASON_DUPLICATE: Key = key(
     "rules.overlaps.reason.duplicate",
-    "Same rule on both routes",
+    "Same rule on both connections",
 );
 pub const REASON_INTERSECTING: Key = key(
     "rules.overlaps.reason.intersecting",
@@ -65,7 +65,7 @@ pub const REASON_BLOCK_TIE: Key = key("rules.overlaps.reason.block-tie", "A deny
 pub const DECISION_LABEL: Key = key("rules.overlaps.column.decision", "Decision");
 pub const CONFIRMED: Key = key("rules.overlaps.confirmed", "Confirmed");
 pub const NOT_CONFIRMED: Key = key("tui.overlaps.not-confirmed", "Not confirmed");
-pub const SEND_OVER: Key = key("rules.overlaps.send-over", "Send over {route} instead");
+pub const SEND_OVER: Key = key("rules.action.send-over", "Send over {route}");
 pub const SEND_OVER_WHOLE: Key = key(
     "rules.overlaps.send-over-whole",
     "This moves the whole rule, including addresses the other rule does not cover.",
@@ -120,14 +120,14 @@ pub const CONFLICT_MORE: Key = key(
     "Addresses affected besides this one: {count}.",
 );
 
-pub const ROUTE_PRIMARY: Key = key("label.primary", "Primary");
+pub const ROUTE_PRIMARY: Key = key("label.primary", "Main");
 pub const ROUTE_SECONDARY: Key = key("label.secondary", "Additional");
 pub const ROUTE_BLOCK: Key = key("label.block", "Denied");
 pub const TYPE_DOMAIN: Key = key("rules.type.domain", "Domain");
 pub const TYPE_ZONE: Key = key("rules.type.zone", "Zone");
-pub const TYPE_EXACT_IP: Key = key("rules.type.exact-ip", "Exact IP");
-pub const TYPE_SUBNET: Key = key("rules.type.subnet", "Subnet (CIDR)");
-pub const TYPE_IP_RANGE: Key = key("rules.type.ip-range", "IP range");
+pub const TYPE_EXACT_IP: Key = key("rules.type.exact-ip", "IP address");
+pub const TYPE_SUBNET: Key = key("rules.type.subnet", "Subnet");
+pub const TYPE_IP_RANGE: Key = key("rules.type.ip-range", "Address range");
 
 pub const PREVIEW_NOTICE: Key = key(
     "rules.preview-notice",
@@ -152,7 +152,7 @@ pub const NO_ITEM: Key = key(
 );
 pub const CANNOT_SEND: Key = key(
     "tui.overlaps.cannot-send",
-    "Item {n} cannot be sent over the other route here; change it in the rules list.",
+    "Item {n} cannot be sent over the other connection here; change it in the rules list.",
 );
 pub const GONE: Key = key(
     "tui.overlaps.gone",
@@ -182,7 +182,7 @@ pub const HELP_KEYS: &[Key] = &[
     ),
     key(
         "tui.overlaps.help.send-over",
-        "o: send the chosen item's sites over the other route instead",
+        "o: send the chosen item's sites over the other connection instead",
     ),
     key(
         "tui.overlaps.help.show-resolved",
@@ -201,7 +201,7 @@ pub const PLAIN_KEYS: &[Key] = &[
     ),
     key(
         "tui.overlaps.plain.send-over",
-        "o and an item number: send that item's sites over the other route instead",
+        "o and an item number: send that item's sites over the other connection instead",
     ),
     key("tui.overlaps.plain.show-resolved", "s: show or hide confirmed items"),
 ];

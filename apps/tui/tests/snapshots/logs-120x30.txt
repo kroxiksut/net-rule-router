@@ -1,11 +1,11 @@
 Service: OK
-> Screens                  Operational logs
-  1 Status                 Level: All levels · Category: any · Event type: any · Time range: Current session
-  2 First run              Sorted by Time, descending
-  3 Interfaces and routes  > 1. 2026-10-06 12:00:00 +00:00 · Info · dns: DNS refresh: 12 of 14 names resolved
-  4 Rules                    2. 2026-10-06 11:59:59 +00:00 · Warning · service: Apply took long
-  5 Overlaps               Rows 1–2 of 2.
-  6 Suggested addresses    l: switch between diagnostics, the log and the audit trail
+> Screens                 Operational logs
+  1 Status                Level: All levels · Category: any · Event type: any · Time range: Current session
+  2 First run             Sorted by Time, descending
+  3 Connections           > 1. 2026-10-06 12:00:00 +00:00 · Info · dns: DNS refresh: 12 of 14 names resolved
+  4 Rules                   2. 2026-10-06 11:59:59 +00:00 · Warning · service: Apply took long
+  5 Overlaps              Rows 1–2 of 2.
+  6 Suggested addresses   l: switch between diagnostics, the log and the audit trail
   7 Connection trace
   8 Cache
 > 9 Diagnostics and logs

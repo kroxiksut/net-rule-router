@@ -424,3 +424,208 @@ fn removal_takes_the_agreement_record_with_it() {
         "the agreement record outlives the program: {removal}"
     );
 }
+
+/// A removal that went wrong is diagnosed from its log; Inno writes one only
+/// when asked, and the setup log alone says nothing about the uninstaller.
+#[test]
+fn installing_and_removing_both_leave_a_log() {
+    let script = installer_script();
+    for directive in ["SetupLogging=yes", "UninstallLogging=yes"] {
+        assert!(
+            script.lines().any(|line| line.trim() == directive),
+            "{directive} is missing: that run leaves no log"
+        );
+    }
+}
+
+/// The CustomMessage names `ShowStatus('<Name>')` calls name, each with the
+/// offset of the call.
+fn status_calls(body: &str) -> Vec<(usize, &str)> {
+    body.match_indices("ShowStatus('")
+        .filter_map(|(at, head)| {
+            let rest = &body[at + head.len()..];
+            Some((at, &rest[..rest.find('\'')?]))
+        })
+        .collect()
+}
+
+/// Setup sat on "Finishing installation" for the half minute it stopped,
+/// registered and started the service: nothing on screen said what it was
+/// doing, and a slow step read as a hang. Every step it runs says so first,
+/// in the wizard's language; the one after the wizard closed has no one to
+/// tell.
+#[test]
+fn every_step_setup_runs_tells_the_person_what_it_is_doing() {
+    let script = installer_script();
+    let code = &script[script.find("\n[Code]\n").expect("a [Code] section")..];
+    let mut seen = 0;
+    for (at, _) in code.match_indices("RunAction(") {
+        let head = &code[..at];
+        let routine_start = ["\nfunction ", "\nprocedure "]
+            .iter()
+            .filter_map(|kind| head.rfind(kind))
+            .max()
+            .expect("inside a routine");
+        let header = code[routine_start + 1..].lines().next().unwrap_or_default();
+        if header.contains("RunAction(const Script") || header.contains("DeinitializeSetup") {
+            continue;
+        }
+        seen += 1;
+        let body = &code[routine_start..at];
+        let previous_action = body.rfind("RunAction(").unwrap_or(0);
+        let shown = status_calls(body)
+            .into_iter()
+            .rfind(|(status_at, _)| *status_at >= previous_action);
+        let Some((_, name)) = shown else {
+            panic!(
+                "a step runs with no status shown first: {}",
+                &code[at..at + code[at..].find('\n').unwrap_or(0)]
+            );
+        };
+        for language in ["english", "russian"] {
+            assert!(
+                script.contains(&format!("\n{language}.{name}=")),
+                "status {name} has no {language} text"
+            );
+        }
+    }
+    assert!(seen >= 6, "only {seen} steps found");
+    let check = routine(&script, "CheckProvisioning");
+    let exec = check.find("Exec(").expect("the check runs");
+    assert!(
+        status_calls(&check[..exec]).last().is_some(),
+        "checking the given files shows no status: {check}"
+    );
+
+    let show = routine(&script, "ShowStatus");
+    for target in [
+        "WizardForm.PreparingLabel",
+        "WizardForm.StatusLabel",
+        "UninstallProgressForm.StatusLabel",
+    ] {
+        assert!(
+            show.contains(target),
+            "{target} never shows the status: {show}"
+        );
+    }
+}
+
+/// Asked to see what Setup did, the person had to know the log sits in %TEMP%
+/// under a dated name. The last page opens both logs: Inno's own, and the one
+/// of the service and data steps.
+#[test]
+fn the_last_page_opens_the_setup_logs() {
+    let script = installer_script();
+    assert!(script.lines().any(|line| line.trim() == "SetupLogging=yes"));
+    let open = routine(&script, "OpenSetupLogs");
+    assert!(
+        open.contains("ExpandConstant('{log}')") && open.contains("ActionLog()"),
+        "both logs are not opened: {open}"
+    );
+    // Setup runs elevated: an elevated editor would hand its file dialogs,
+    // and with them an administrator's rights, to whoever is at the keyboard.
+    assert!(
+        open.contains("ShellExecAsOriginalUser(") && !open.contains("ShellExec('"),
+        "a log opens elevated: {open}"
+    );
+    let page = routine(&script, "AddLogButton");
+    assert!(
+        page.contains("WizardForm.FinishedPage")
+            && page.contains("CustomMessage('ShowSetupLog')")
+            && page.contains("@OpenSetupLogsClick"),
+        "{page}"
+    );
+    assert!(
+        script.contains("CurPageID = wpFinished") && script.contains("AddLogButton"),
+        "the finished page never gets the button"
+    );
+}
+
+/// After "Remove the program", which keeps the rules and settings, the
+/// uninstaller's last word was Inno's stock "was completely removed from your
+/// computer": the person read their rules as gone. Its text is ours, true for
+/// both choices, and the progress line says which one is running.
+#[test]
+fn the_last_removal_message_does_not_claim_the_data_went_with_the_program() {
+    let script = installer_script();
+    for message in ["UninstalledAll", "UninstalledMost"] {
+        for language in ["english", "russian"] {
+            let line = script
+                .lines()
+                .find(|line| line.starts_with(&format!("{language}.{message}=")))
+                .unwrap_or_else(|| panic!("{language}.{message} is Inno's stock text"));
+            assert!(
+                !line.contains("полностью удалена") && !line.contains("successfully removed"),
+                "{line}"
+            );
+        }
+    }
+    let removal = routine(&script, "CurUninstallStepChanged");
+    let unregister = removal.find("'-Action Unregister'").expect("unregister");
+    let run = unregister
+        + removal[unregister..]
+            .find("RunAction(")
+            .expect("the removal step runs");
+    let before = &removal[..run];
+    assert!(
+        before.contains("ShowStatus('UninstallStatusKeep')")
+            && before.contains("ShowStatus('UninstallStatusComplete')"),
+        "the progress line does not say whether the data stays: {removal}"
+    );
+}
+
+/// Started as unins000.exe rather than from Settings > Apps, the uninstaller
+/// gets no /LOG and Inno writes no log of its own: the steps of a removal are
+/// then known only from the log of ours, which must name every one of them.
+#[test]
+fn a_removal_started_any_way_leaves_its_steps_in_our_log() {
+    let script = installer_script();
+    let removal = routine(&script, "CurUninstallStepChanged");
+    for step in ["usUninstall", "usPostUninstall"] {
+        let at = removal
+            .find(step)
+            .unwrap_or_else(|| panic!("{step} is not handled"));
+        assert!(
+            removal[at..].contains("NoteInActionLog("),
+            "{step} leaves nothing in our log: {removal}"
+        );
+    }
+    let note = routine(&script, "NoteInActionLog");
+    assert!(
+        note.contains("ActionLog()") && note.contains("True"),
+        "the note does not append to our log: {note}"
+    );
+    for (doc, heading) in [
+        ("docs/en/packaging-windows.md", "### Installer logs\n"),
+        ("docs/ru/packaging-windows.md", "### Журналы установщиков\n"),
+    ] {
+        let text = read(doc);
+        let section = text
+            .split(heading)
+            .nth(1)
+            .and_then(|rest| rest.split("\n#").next())
+            .unwrap_or_else(|| panic!("{doc} has no `{heading}`"));
+        assert!(
+            section.contains("unins000.exe") && section.contains("NetRuleRouter-setup.log"),
+            "{doc} does not say which log a removal started from unins000.exe leaves"
+        );
+    }
+}
+
+/// Inno reads any line of the script whose first non-blank character is `[` as
+/// a section tag, even inside `[Code]`: a Pascal array literal wrapped onto its
+/// own line aborts the build with "Invalid section tag".
+#[test]
+fn no_code_line_starts_with_a_bracket() {
+    let script = installer_script();
+    let code = &script[script.find("\n[Code]").expect("a [Code] section") + 1..];
+    let offending: Vec<&str> = code
+        .lines()
+        .skip(1)
+        .filter(|line| line.starts_with(char::is_whitespace) && line.trim_start().starts_with('['))
+        .collect();
+    assert!(
+        offending.is_empty(),
+        "Inno would read these as section tags: {offending:?}"
+    );
+}

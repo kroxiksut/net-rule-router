@@ -67,12 +67,12 @@ Window {
         var secB64 = secPath ? nrrNativeBridge.readFileBytes(secPath) : ""
         if (primPath && !primB64) {
             root.statusLine = root.tr("status.import-read-failed",
-                "Cannot read preset file. See logs for details.")
+                "Cannot read the rules file. See the logs for details.")
             return
         }
         if (secPath && !secB64) {
             root.statusLine = root.tr("status.import-read-failed",
-                "Cannot read preset file. See logs for details.")
+                "Cannot read the rules file. See the logs for details.")
             return
         }
         // The radio pair above is the whole point of this window; passing it on
@@ -113,9 +113,9 @@ Window {
         fileMode: FileDialog.OpenFile
         // Same folder every other rule-file dialog uses.
         title: root.tr("dialog.load-list.pick-primary-title",
-            "Choose primary route preset file")
+            "Choose the rules file for the main connection")
         nameFilters: [
-            root.tr("rules.dialog.preset-filter", "Preset files (*.txt)"),
+            root.tr("rules.dialog.preset-filter", "Rules files (*.txt)"),
             root.tr("rules.dialog.all-filter", "All files (*)")
         ]
         onAccepted: loadListWindow.pickedPrimaryPath =
@@ -125,9 +125,9 @@ Window {
         id: loadListSecondaryDialog
         fileMode: FileDialog.OpenFile
         title: root.tr("dialog.load-list.pick-secondary-title",
-            "Choose additional route preset file")
+            "Choose the rules file for the additional connection")
         nameFilters: [
-            root.tr("rules.dialog.preset-filter", "Preset files (*.txt)"),
+            root.tr("rules.dialog.preset-filter", "Rules files (*.txt)"),
             root.tr("rules.dialog.all-filter", "All files (*)")
         ]
         onAccepted: loadListWindow.pickedSecondaryPath =
@@ -149,7 +149,7 @@ Window {
             wrapMode: Text.WordWrap
             color: root.mutedTextColor
             text: root.tr("dialog.load-list.intro",
-                "Pick one or two preset .txt files — one per route. Leaving a slot empty keeps that route's current rules untouched.")
+                "Pick one or two rules files (.txt) — one per connection. Leaving a slot empty keeps that connection's rules as they are.")
         }
 
         // Replace / Merge mode selector. Applied
@@ -179,7 +179,7 @@ Window {
                 wrapMode: Text.WordWrap
                 font.pixelSize: root.uiTheme.baseFontSizePx - 1
                 text: root.tr("dialog.load-list.mode-replace-description",
-                    "Existing rules for the imported route(s) are cleared first.")
+                    "The previous rules of these connections are removed first.")
             }
             ThemedRadioButton {
                 theme: root.uiTheme
@@ -196,7 +196,7 @@ Window {
                 wrapMode: Text.WordWrap
                 font.pixelSize: root.uiTheme.baseFontSizePx - 1
                 text: root.tr("dialog.load-list.mode-merge-description",
-                    "Keeps current rules (with your manual edits and comments). Imported rules with the same type, value and route are skipped.")
+                    "Keeps current rules (with your manual edits and comments). Imported rules with the same type, value and connection are skipped.")
             }
         }
 
@@ -214,7 +214,7 @@ Window {
             Accessible.description: ToolTip.text
             ToolTip.visible: hovered
             ToolTip.text: root.tr("rules.import-only-active.tooltip",
-                "When loading a preset, skip rules that are turned off in it (for example application rules, which can't route yet). Default comes from Settings → {page} → {group}; changing it here applies to imports this session only.")
+                "When loading a file, skip the rules that are turned off in it. The default comes from Settings → {page} → {group}; changing it here lasts only until you close the program.")
                 .replace("{page}", root.tr("settings.category.application", "Application"))
                 .replace("{group}", root.tr("settings.group.general", "General"))
             contentItem: Text {
@@ -317,7 +317,7 @@ Window {
             color: root.uiTheme.colorDanger
             visible: loadListWindow._sameFileConflict()
             text: root.tr("dialog.load-list.same-file-conflict",
-                "The same file cannot be selected for both the primary and the additional route at the same time.")
+                "The same file cannot be chosen for both the main and the additional connection at the same time.")
         }
 
         Item { Layout.fillHeight: true }

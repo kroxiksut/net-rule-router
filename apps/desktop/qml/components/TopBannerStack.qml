@@ -228,7 +228,7 @@ Item {
                     color: root.uiTheme.bannerText
                     text: root._serviceRulesEmpty
                         ? root.tr("status.drift-banner-empty-service",
-                            "The service has none of your rules — nothing is being routed yet.")
+                            "The service has none of your rules — they are not working yet.")
                         : root.tr("status.drift-banner",
                             "Rules in the file, the app, and the service do not all agree.")
                     verticalAlignment: Text.AlignVCenter
@@ -311,10 +311,10 @@ Item {
                     text: root.uiRevision >= 0
                         ? (root.secondaryReconfirmVisible
                             ? root.tr("status.secondary-reconfirm",
-                                "Your additional adapter \"{name}\" looks reinstalled (new ID). Re-confirm it so the stored binding matches.")
+                                "Your additional connection \"{name}\" looks reinstalled. Confirm it again so your rules keep going through it.")
                                 .replace("{name}", Pure.displayText(root.prefs.selectedSecondaryInterfaceName))
                             : root.tr("status.secondary-unresolved",
-                                "The additional adapter \"{name}\" assigned to your rules isn't available right now — start it, or choose a different adapter in Interfaces and routes. While it's missing, matching traffic is blocked (leak protection) instead of leaking over your main connection.")
+                                "Your additional connection \"{name}\" is not available right now — turn it on (for example, connect your VPN) or choose another one in Connections. Until then, what your rules send through it is blocked (leak protection) instead of leaking over your main connection.")
                                 .replace("{name}", Pure.displayText(root.prefs.selectedSecondaryInterfaceName)))
                         : ""
                     textFormat: Text.PlainText
@@ -331,14 +331,14 @@ Item {
                     visible: topBannerStack.combinedAmberExpanded
                     text: root.secondaryReconfirmVisible
                         ? root.tr("status.secondary-reconfirm-button", "Re-confirm adapter")
-                        : root.tr("status.secondary-unresolved-button", "Open Interfaces and routes")
+                        : root.tr("status.secondary-unresolved-button", "Open Connections")
                     Accessible.role: Accessible.Button
                     Accessible.name: text
                     Accessible.description: root.secondaryReconfirmVisible
                         ? root.tr("status.secondary-reconfirm-button-description",
                             "Update the stored additional adapter binding to the reinstalled adapter.")
                         : root.tr("status.secondary-unresolved-button-description",
-                            "Open Interfaces and routes to start or re-select the additional adapter.")
+                            "Open Connections to turn on or choose the additional connection again.")
                     onClicked: {
                         if (root.secondaryReconfirmVisible)
                             root.interfacesRolesController._reconfirmSecondaryBinding()
@@ -418,7 +418,7 @@ Item {
                 // when the real state was simply "nothing applied yet".
                 text: root._serviceRulesEmpty
                     ? root.tr("status.drift-banner-empty-service",
-                        "The service has none of your rules — nothing is being routed yet.")
+                        "The service has none of your rules — they are not working yet.")
                     : root.tr("status.drift-banner",
                         "Rules in the file, the app, and the service do not all agree.")
                 verticalAlignment: Text.AlignVCenter
@@ -623,11 +623,11 @@ Item {
                 text: root.uiRevision >= 0
                     ? (root.secondaryReconfirmVisible
                         ? root.tr("status.secondary-reconfirm",
-                            "Your additional adapter \"{name}\" looks reinstalled (new ID). Re-confirm it so the stored binding matches.")
+                            "Your additional connection \"{name}\" looks reinstalled. Confirm it again so your rules keep going through it.")
                             .replace("{name}", Pure.displayText(root.prefs.selectedSecondaryInterfaceName))
                         : (root.secondaryUnresolvedVisible
                             ? root.tr("status.secondary-unresolved",
-                                "The additional adapter \"{name}\" assigned to your rules isn't available right now — start it, or choose a different adapter in Interfaces and routes. While it's missing, matching traffic is blocked (leak protection) instead of leaking over your main connection.")
+                                "Your additional connection \"{name}\" is not available right now — turn it on (for example, connect your VPN) or choose another one in Connections. Until then, what your rules send through it is blocked (leak protection) instead of leaking over your main connection.")
                                 .replace("{name}", Pure.displayText(root.prefs.selectedSecondaryInterfaceName))
                             : Plurals.counted(root.tr, "status.vpn-split-conflict.",
                                 root.interfacesRolesController._enabledSecondaryRuleCount(),
@@ -650,14 +650,14 @@ Item {
                 visible: root.secondaryReconfirmVisible || root.secondaryUnresolvedVisible
                 text: root.secondaryReconfirmVisible
                     ? root.tr("status.secondary-reconfirm-button", "Re-confirm adapter")
-                    : root.tr("status.secondary-unresolved-button", "Open Interfaces and routes")
+                    : root.tr("status.secondary-unresolved-button", "Open Connections")
                 Accessible.role: Accessible.Button
                 Accessible.name: text
                 Accessible.description: root.secondaryReconfirmVisible
                     ? root.tr("status.secondary-reconfirm-button-description",
                         "Update the stored additional adapter binding to the reinstalled adapter.")
                     : root.tr("status.secondary-unresolved-button-description",
-                        "Open Interfaces and routes to start or re-select the additional adapter.")
+                        "Open Connections to turn on or choose the additional connection again.")
                 onClicked: {
                     if (root.secondaryReconfirmVisible) root.interfacesRolesController._reconfirmSecondaryBinding()
                     else root.section = "interfaces-routes"
@@ -773,7 +773,7 @@ Item {
                     ? root.tr("status.unapplied-rules-banner",
                         "The app has rules that aren't applied yet — the service is enforcing none. Apply them now.")
                     : root.tr("status.empty-rules-banner",
-                        "No rules are active — the service isn't routing anything. The rule set is empty (it may have been reset). Add rules or import a preset.")
+                        "There are no rules — nothing is being sent anywhere special. Add rules or load a ready-made set.")
                 verticalAlignment: Text.AlignVCenter
                 wrapMode: Text.WordWrap
                 Accessible.role: Accessible.StaticText
@@ -805,7 +805,7 @@ Item {
                 Accessible.name: text
                 Accessible.description: root.tr(
                     "status.empty-rules-banner-button-description",
-                    "Open the Rules section to add rules or import a preset.")
+                    "Open the Rules section to add rules or load a ready-made set.")
                 onClicked: root.section = "rules"
             }
         }
@@ -945,9 +945,9 @@ Item {
                         "The service is running, but your rules are not being applied: it never received which adapter to send them through. Send it now.")
                     : (root.policyInactiveKillSwitchBlocking
                         ? root.tr("status.policy-inactive-kill-switch-blocking",
-                            "Leak protection is on and no additional adapter is assigned, so everything your rules send that way is being blocked. Assign an adapter in Interfaces and routes, or turn leak protection off.")
+                            "Leak protection is on and no additional connection is chosen, so everything your rules send there is being blocked. Choose one in Connections, or turn leak protection off.")
                         : root.tr("status.policy-inactive-no-adapter",
-                            "The service is running, but your rules are not being applied: no additional adapter is assigned to them yet, so there is nowhere to route them. Assign one in Interfaces and routes."))
+                            "The service is running, but your rules are not working: no additional connection is chosen yet, so there is nowhere to send them. Choose one in Connections."))
                 verticalAlignment: Text.AlignVCenter
                 wrapMode: Text.WordWrap
                 Accessible.role: Accessible.StaticText
@@ -957,12 +957,12 @@ Item {
                 theme: root.uiTheme
                 visible: root.policyInactiveActionable
                 highlighted: true
-                text: root.tr("status.policy-inactive-send", "Send adapter to the service")
+                text: root.tr("status.policy-inactive-send", "Send the choice to the service")
                 Accessible.role: Accessible.Button
                 Accessible.name: text
                 Accessible.description: root.tr(
                     "status.policy-inactive-send-description",
-                    "Send the additional adapter selected in the app to the background service so your rules start being routed.")
+                    "Send the additional connection chosen in the program to the background service so your rules start working.")
                 onClicked: root.resendRouteBindingToService()
             }
         }
@@ -1011,11 +1011,11 @@ Item {
             }
             ThemedButton {
                 theme: root.uiTheme
-                text: root.tr("status.secondary-unresolved-button", "Open Interfaces and routes")
+                text: root.tr("status.secondary-unresolved-button", "Open Connections")
                 Accessible.role: Accessible.Button
                 Accessible.name: text
                 Accessible.description: root.tr("status.secondary-unresolved-button-description",
-                    "Open Interfaces and routes to start or re-select the additional adapter.")
+                    "Open Connections to turn on or choose the additional connection again.")
                 onClicked: root.section = "interfaces-routes"
             }
             ToolButton {
@@ -1288,7 +1288,7 @@ Item {
             }
             ThemedButton {
                 theme: root.uiTheme
-                text: root.tr("app-groups.open-button", "Set up routes")
+                text: root.tr("app-groups.open-button", "Programs and devices…")
                 Accessible.role: Accessible.Button
                 Accessible.name: text
                 onClicked: root.openAppGroupRouting()

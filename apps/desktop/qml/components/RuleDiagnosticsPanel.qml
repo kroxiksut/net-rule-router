@@ -63,13 +63,13 @@ Frame {
     function _isIpv6(s) { return s.indexOf(":") >= 0 && /^[0-9a-fA-F:]+$/.test(s) }
     function _explainRouteLabel(route) {
         if (route === "" || route === "none")
-            return root.tr("diag.explain.route.none", "no route")
+            return root.tr("diag.explain.route.none", "no connection")
         if (route === "blocked")
             return root.tr("diag.explain.route.blocked", "blocked")
         if (route === "primary")
-            return root.tr("diag.explain.route.primary", "primary route")
+            return root.tr("diag.explain.route.primary", "main connection")
         if (route === "secondary")
-            return root.tr("diag.explain.route.secondary", "additional route")
+            return root.tr("diag.explain.route.secondary", "additional connection")
         return route
     }
     // Main probe verdict, spoken as a "route — status" pair
@@ -87,7 +87,7 @@ Frame {
         if (route !== "primary" && route !== "secondary")
             return panel._explainRouteLabel(route)
         var routeWord = route === "primary"
-            ? root.tr("label.primary", "Primary")
+            ? root.tr("label.primary", "Main")
             : root.tr("label.secondary", "Additional")
         // Only genuinely-blocking caveats flip the status:
         // the smart-exempt and risk slugs describe a caveat on an ALLOWED flow.
@@ -199,7 +199,7 @@ Frame {
         anchors.fill: parent
         spacing: root.uiTheme.spacingSm - root.uiTheme.spacingXxs
         Label {
-            text: root.tr("diag.explain.title", "Explain sample")
+            text: root.tr("diag.explain.title", "Which rule applies to a site")
             color: root.textColor
             font.bold: true
         }
@@ -215,7 +215,7 @@ Frame {
             spacing: root.uiTheme.spacingSm
             ThemedTextField {
                 id: probeInput
-                accessibleLabel: root.tr("diag.explain.title", "Explain sample")
+                accessibleLabel: root.tr("diag.explain.title", "Which rule applies to a site")
                 theme: root.uiTheme
                 Layout.fillWidth: true
                 placeholderText: root.tr("diag.explain.probe-placeholder",

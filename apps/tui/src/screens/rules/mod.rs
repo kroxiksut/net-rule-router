@@ -362,6 +362,11 @@ pub struct RulesState {
     /// A rule set just loaded and on its way to the service, with its rule
     /// count: its outcome is told in the feed. Cleared by any other apply.
     loading_set: Option<(crate::rule_set_load::SetName, usize)>,
+    /// The next set load was asked by its name (the "no rules yet" offer):
+    /// it is applied without the review. Any question on the way drops it.
+    unreviewed_next: bool,
+    /// The preview on its way is of such a set.
+    unreviewed_preview: bool,
 }
 
 impl RulesState {
@@ -990,6 +995,7 @@ fn rebase_edits(app: &mut AppState) {
 fn previewed(app: &mut AppState, previewed: Previewed) {
     let rules = &mut app.rules;
     rules.busy = None;
+    let unreviewed = std::mem::take(&mut rules.unreviewed_preview);
     if rules.resetting {
         match previewed {
             Previewed::Review(review) => rules.mode = Mode::Review(review),
@@ -1010,6 +1016,9 @@ fn previewed(app: &mut AppState, previewed: Previewed) {
         rules.loading_set = None;
     }
     match previewed {
+        // A set picked by its name goes on as if Apply were pressed; a
+        // critical one still shows its review.
+        Previewed::Review(review) if unreviewed => confirm(app, review),
         Previewed::Review(review) => rules.mode = Mode::Review(review),
         Previewed::NothingToApply => {
             // The service already applies exactly this set.
@@ -1161,12 +1170,13 @@ fn start_apply(app: &mut AppState) {
 /// A loaded set goes to the service in the same action: a stopped service is
 /// started first, and the review follows once it answers.
 fn apply_loaded_set(app: &mut AppState, name: crate::rule_set_load::SetName, count: usize) {
+    let unreviewed = std::mem::take(&mut app.rules.unreviewed_next);
     if refuse_when_admin_locked(app) {
         return;
     }
     app.rules.loading_set = Some((name.clone(), count));
     if app.link.is_connected() {
-        send_loaded_set(app);
+        send_loaded_set(app, unreviewed);
         return;
     }
     app.rules.busy = Some(Busy::Previewing);
@@ -1175,7 +1185,7 @@ fn apply_loaded_set(app: &mut AppState, name: crate::rule_set_load::SetName, cou
         move |app, result| {
             app.rules.busy = None;
             match result {
-                Ok(()) => send_loaded_set(app),
+                Ok(()) => send_loaded_set(app, unreviewed),
                 Err(why) => {
                     // The set stays in the list as edits not yet applied.
                     app.rules.loading_set = None;
@@ -1188,9 +1198,10 @@ fn apply_loaded_set(app: &mut AppState, name: crate::rule_set_load::SetName, cou
 
 /// The import's own note (its count, a section written twice) stays up
 /// while the review is asked for.
-fn send_loaded_set(app: &mut AppState) {
+fn send_loaded_set(app: &mut AppState, unreviewed: bool) {
     let note = app.rules.note.take();
     send_apply(app);
+    app.rules.unreviewed_preview = unreviewed && app.rules.busy == Some(Busy::Previewing);
     if app.rules.note.is_none() {
         app.rules.note = note;
     }
@@ -1313,6 +1324,7 @@ fn refile_row(row: &mut table::Row) -> bool {
 }
 
 fn ask(app: &mut AppState, purpose: ChoicePurpose) {
+    app.rules.unreviewed_next = false;
     let cursor = match &purpose {
         ChoicePurpose::Filter => RouteFilter::ALL
             .iter()
@@ -1665,9 +1677,12 @@ fn import(app: &mut AppState, set: RuleSet, path: String, replace: bool) {
     if replace {
         table.passthrough = set.passthrough;
     } else {
-        // A merge keeps the list's sections; one the set also holds is the set's.
+        // A merge keeps the list's sections; the set's lines go after the
+        // user's in a section both hold, as the window keeps them.
         for (held, read) in table.passthrough.iter_mut().zip(set.passthrough) {
-            held.extend(read);
+            let blocks: Vec<(String, String)> =
+                std::mem::take(held).into_iter().chain(read).collect();
+            *held = nrr_client_logic::passthrough::merge_passthrough_blocks(&blocks);
         }
     }
     table.clear_filters();

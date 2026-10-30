@@ -159,6 +159,8 @@ pub(super) fn load(app: &mut AppState) -> bool {
     match files::read_set(&set.dir) {
         Err((file, error)) => app.rules.note = Some(super::read_failed(&file, error)),
         Ok(read) => {
+            // Load on the named set is the user's choice: no second review.
+            app.rules.unreviewed_next = true;
             super::offer_import(app, read, set.label.clone());
             super::remember_set(app, &set);
         }

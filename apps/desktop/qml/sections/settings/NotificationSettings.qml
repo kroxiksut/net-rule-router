@@ -287,7 +287,7 @@ GroupBox {
             Layout.leftMargin: root.uiTheme.spacingLg
             enabled: root.prefs.showNotifications !== false
             text: root.tr("settings.field.notify-rule-duplicates",
-                "Tell me when a rule is set on both routes")
+                "Tell me when a rule is set on both connections")
             checked: root.prefs.notifyRuleDuplicates !== false
             onToggled: { root.updatePrefs({ notifyRuleDuplicates: checked }); root.emitPrefs() }
         }

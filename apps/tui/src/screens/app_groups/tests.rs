@@ -110,7 +110,7 @@ fn machines_lead_and_every_group_shows_its_route() {
     let vbox = shown.find("VirtualBox").expect("hypervisor");
     let torrent = shown.find("qBittorrent").expect("torrent client");
     assert!(vbox < torrent, "{shown}");
-    assert!(shown.contains("1. VirtualBox \u{2014} Primary"), "{shown}");
+    assert!(shown.contains("1. VirtualBox \u{2014} Main"), "{shown}");
     assert!(shown.contains("Machines: Lab"), "{shown}");
     assert!(
         shown.contains("2. WSL \u{2014} Main"),
@@ -135,7 +135,10 @@ fn a_route_is_an_edit_of_the_rules_list_not_an_apply() {
     assert!(app.rules.table.is_dirty());
     assert!(fake.sent(IpcOperationName::MutationSubmit).is_empty());
     let shown = text(&app);
-    assert!(shown.contains("Routes updated for 2 programs."), "{shown}");
+    assert!(
+        shown.contains("Connection chosen for 2 programs."),
+        "{shown}"
+    );
     assert!(
         shown.contains("1. VirtualBox \u{2014} Additional"),
         "{shown}"
@@ -268,7 +271,7 @@ fn a_kernel_network_cannot_be_given_a_route() {
     let (mut app, _) = on_screen();
     screen(ScreenId::AppGroups).on_line(&mut app, "s 2");
     assert!(app_rules(&app).is_empty());
-    assert!(text(&app).contains("Item 2 cannot be given a route"));
+    assert!(text(&app).contains("Item 2 cannot be given a connection"));
 }
 
 #[test]

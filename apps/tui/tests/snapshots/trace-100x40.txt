@@ -1,38 +1,38 @@
 Service: OK
-> Screens                  Connection trace
-  1 Status                 Shown: 12 of 14.
-  2 First run              Show blocked: No · Show local connections: No · IPv6 only: No
-  3 Interfaces and routes  Group: No grouping
-  4 Rules                  Connections
-  5 Overlaps               > 1. browser.exe → 203.0.113.1:443 · site.example — Primary · Allowed
-  6 Suggested addresses      2. browser.exe → 203.0.113.2:443 · site.example — Additional (VPN) ·
-> 7 Connection trace       Allowed
-  8 Cache                    3. browser.exe → 203.0.113.3:443 · site.example — Primary · Allowed
-  9 Diagnostics and logs     4. browser.exe → 203.0.113.4:443 · site.example — Additional (VPN) ·
-  0 Settings               Allowed
-                             5. browser.exe → 203.0.113.5:443 · site.example — Primary · Allowed
-                             6. browser.exe → 203.0.113.6:443 · site.example — Additional (VPN) ·
-                           Allowed
-                             7. browser.exe → 203.0.113.7:443 · site.example — Primary · Allowed
-                             8. browser.exe → 203.0.113.8:443 · site.example — Additional (VPN) ·
-                           Allowed
-                             9. browser.exe → 203.0.113.9:443 · site.example — Primary · Allowed
-                             10. browser.exe → 203.0.113.10:443 · site.example — Additional (VPN) ·
-                           Allowed
-                           Rows 1–10 of 12.
+> Screens                 Connection trace
+  1 Status                Shown: 12 of 14.
+  2 First run             Show blocked: No · Show local connections: No · IPv6 only: No
+  3 Connections           Group: No grouping
+  4 Rules                 Connections
+  5 Overlaps              > 1. browser.exe → 203.0.113.1:443 · site.example — Main · Allowed
+  6 Suggested addresses     2. browser.exe → 203.0.113.2:443 · site.example — Additional (VPN) ·
+> 7 Connection trace      Allowed
+  8 Cache                   3. browser.exe → 203.0.113.3:443 · site.example — Main · Allowed
+  9 Diagnostics and logs    4. browser.exe → 203.0.113.4:443 · site.example — Additional (VPN) ·
+  0 Settings              Allowed
+                            5. browser.exe → 203.0.113.5:443 · site.example — Main · Allowed
+                            6. browser.exe → 203.0.113.6:443 · site.example — Additional (VPN) ·
+                          Allowed
+                            7. browser.exe → 203.0.113.7:443 · site.example — Main · Allowed
+                            8. browser.exe → 203.0.113.8:443 · site.example — Additional (VPN) ·
+                          Allowed
+                            9. browser.exe → 203.0.113.9:443 · site.example — Main · Allowed
+                            10. browser.exe → 203.0.113.10:443 · site.example — Additional (VPN) ·
+                          Allowed
+                          Rows 1–10 of 12.
 
 
 
 
 
-                           Selected connection
-                           Process: browser.exe
-                           Remote: 203.0.113.1:443 · site.example
-                           Names this address was answered for (1): site.example
-                           Egress: Primary
-                           Verdict: Allowed
-                           TCP · from 192.0.2.10:50000 · 2026-10-06 12:00
-                           Enter / e: Why this route?
+                          Selected connection
+                          Process: browser.exe
+                          Remote: 203.0.113.1:443 · site.example
+                          Names this address was answered for (1): site.example
+                          Egress: Main
+                          Verdict: Allowed
+                          TCP · from 192.0.2.10:50000 · 2026-10-06 12:00
+                          Enter / e: Why this connection?
 
 
 

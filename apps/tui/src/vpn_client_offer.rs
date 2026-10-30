@@ -16,7 +16,7 @@ use crate::state::{AppState, Effect, NoticeLevel};
 pub const TITLE: Key = key("notifications.vpn-client-trust.title", "Is this your VPN?");
 pub const BODY: Key = key(
     "notifications.vpn-client-offer.body",
-    "Looks like your VPN is {name}. Use it as your VPN client, so it keeps working over your main link while leak protection is on? Programs: {apps}",
+    "Looks like your VPN is {name}. Use it as your VPN client, so it keeps working over your main connection while leak protection is on? Programs: {apps}",
 );
 
 #[derive(Debug, Default)]

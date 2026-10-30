@@ -12,7 +12,9 @@ fn repo_file(relative: &str) -> String {
     let path: PathBuf = Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../../..")
         .join(relative);
-    std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()))
+    std::fs::read_to_string(&path)
+        .unwrap_or_else(|e| panic!("read {}: {e}", path.display()))
+        .replace("\r\n", "\n")
 }
 
 fn wizard() -> String {
@@ -211,7 +213,7 @@ fn finish_stays_in_view_outside_the_scrolling_area() {
 }
 
 /// Nothing showed that more settings sat below the fold: the scrollbar is
-/// drawn for as long as the content is taller than the window.
+/// drawn for as long as the content is taller than the window, and only then.
 #[test]
 fn the_scrollbar_is_shown_while_the_content_overflows() {
     let source = wizard().replace("\r\n", "\n");
@@ -221,7 +223,8 @@ fn the_scrollbar_is_shown_while_the_content_overflows() {
         .expect("an explicit vertical scrollbar");
     let bar = &scroller[bar..];
     assert!(
-        bar.contains("contentHeight > wizardScroller.height") && bar.contains("ScrollBar.AlwaysOn"),
+        bar.contains("visible: wizardScroller.contentHeight > wizardScroller.availableHeight")
+            && bar.contains("ScrollBar.AlwaysOn"),
         "{bar}"
     );
 }
@@ -351,7 +354,7 @@ fn a_starting_set_that_fails_at_finish_says_so() {
     let starter = &starter[..starter.find("\n    }\n").expect("end")];
     // Both imports go out with the options, which are not hydration.
     assert!(
-        starter.contains("var opts = { label: c.label }"),
+        starter.contains("var opts = { label: c.label, confirmed: true }"),
         "{starter}"
     );
     assert_eq!(starter.matches(", opts)").count(), 2, "{starter}");

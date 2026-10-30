@@ -291,6 +291,82 @@ function Get-SystemTool {
     return (Join-Path ([Environment]::SystemDirectory) $Name)
 }
 
+# The service's signing key folder in its own profile (default_systemprofile in
+# platform/windows key_store.rs); Sysnative reaches it from a 32-bit host.
+function Get-NrrKeyStoreDir {
+    $system = if ([Environment]::Is64BitProcess -or -not [Environment]::Is64BitOperatingSystem) { 'System32' } else { 'Sysnative' }
+    return Join-Path ([Environment]::GetFolderPath('Windows')) "$system\config\systemprofile\AppData\Local\$NrrProductName"
+}
+
+# The record of the rules in force and the re-sign marker (RULES_ANCHOR_FILE_NAME,
+# RESIGN_MARKER_FILE_NAME in key_store.rs). The key is not listed: the audit
+# trail's seals are derived from it.
+$NrrKeyCompanionNames = @('db-mac-rules-anchor.bin', 'db-mac-resign-pending.bin')
+
+# Removes the files beside the key, never through a link. One result per file:
+# Path, State (absent, would-remove, removed, failed) and Reason.
+function Remove-KeyCompanions {
+    param([string] $KeyDir = (Get-NrrKeyStoreDir), [switch] $DryRun)
+    foreach ($name in $NrrKeyCompanionNames) {
+        $path = Join-Path $KeyDir $name
+        # Get-Item, not Test-Path: a link whose target is gone is still there.
+        if (-not (Get-Item -LiteralPath $path -Force -ErrorAction SilentlyContinue)) {
+            [pscustomobject]@{ Path = $path; State = 'absent'; Reason = $null }
+            continue
+        }
+        if ($DryRun) {
+            [pscustomobject]@{ Path = $path; State = 'would-remove'; Reason = $null }
+            continue
+        }
+        try {
+            if ((Test-ReparsePoint (Get-Item -LiteralPath $KeyDir -Force -ErrorAction Stop)) -or
+                (Test-ReparsePoint (Get-Item -LiteralPath $path -Force -ErrorAction Stop))) {
+                throw 'a link; left alone'
+            }
+            try {
+                [System.IO.File]::Delete($path)
+            }
+            catch {
+                # Open to the service account alone: an administrator takes it over first.
+                $null = & (Get-SystemTool 'takeown.exe') /F $path /A
+                $null = & (Get-SystemTool 'icacls.exe') $path /grant '*S-1-5-32-544:F'
+                [System.IO.File]::Delete($path)
+            }
+            [pscustomobject]@{ Path = $path; State = 'removed'; Reason = $null }
+        }
+        catch {
+            [pscustomobject]@{ Path = $path; State = 'failed'; Reason = $_.Exception.Message }
+        }
+    }
+}
+
+# The state database the service opens (state_db_path in storage profile.rs).
+$NrrStateDbName = 'nrr_service_state.db'
+
+# Install time, before the service first starts: with no state database the
+# store starts empty, and a record left beside the key by an earlier complete
+# removal would read as a rolled-back store and block the rules. Only
+# administrators can remove the database and the installer runs elevated, so
+# this is a removal's leftover, not something an ordinary account can stage;
+# the service's own check stays as strict. An existing database (an upgrade)
+# leaves everything as it is.
+function Clear-NrrOrphanedKeyCompanions {
+    param([string] $DataRoot, [string] $KeyDir = (Get-NrrKeyStoreDir))
+    if (-not $PSBoundParameters.ContainsKey('DataRoot')) {
+        $programData = [Environment]::GetFolderPath('CommonApplicationData')
+        if ($programData) { $DataRoot = Join-Path $programData $NrrProductName }
+    }
+    if (-not $DataRoot) { return }
+    if (Get-Item -LiteralPath (Join-Path $DataRoot $NrrStateDbName) -Force -ErrorAction SilentlyContinue) { return }
+    foreach ($result in @(Remove-KeyCompanions -KeyDir $KeyDir)) {
+        switch ($result.State) {
+            'removed' { Write-Host "    removed $($result.Path): no state database, so it described a removed one" }
+            'failed' { Write-Host "    $($result.Path) was not removed: $($result.Reason)" }
+        }
+        $result
+    }
+}
+
 # The Mode-B DNS redirect as the service writes it into the NRPT table. Must
 # match `dns_redirect.rs::NRPT_MARKER`, `NRPT_EXEMPT_MARKER` and `NRPT_RULE_KEY`:
 # the sweep below reproduces the binary's own, and a drifted value would either

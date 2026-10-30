@@ -203,7 +203,7 @@ Window {
     modality: Qt.ApplicationModal
     flags: Qt.Dialog
     color: ownerRoot ? ownerRoot.panelColor : "#202020"
-    title: tr("app-groups.title", "Application and device routes")
+    title: tr("app-groups.title", "Connections for programs and devices")
     transientParent: ownerRoot ? ownerRoot : null
 
     onVisibleChanged: {
@@ -251,7 +251,7 @@ Window {
                         ? root.tr("app-groups.group-display-only-hint",
                             "for information only")
                         : root.tr("app-groups.group-assignable-hint",
-                            "route can be assigned"))
+                            "a connection can be chosen"))
                 }
                 Item { Layout.fillWidth: true }
             }
@@ -274,8 +274,8 @@ Window {
                     color: root.ownerRoot ? root.ownerRoot.mutedTextColor : "gray"
                     text: root.tr("app-groups.kernel-nat-note",
                         "Traffic of WSL, Hyper-V, Docker, libvirt and other virtual machines does not belong to any "
-                        + "program on this computer, so it cannot be given a route of its own. When it goes out "
-                        + "through this computer, it follows the routes your rules set, as this computer's own "
+                        + "program on this computer, so it cannot be given a connection of its own. When it goes out "
+                        + "through this computer, it follows your rules, as this computer's own "
                         + "traffic does; a machine bridged straight onto your network goes past them. "
                         + "Flexible routing for these environments is planned for the future.")
                 }
@@ -393,14 +393,14 @@ Window {
             font.bold: true
             font.pixelSize: 15
             color: root.ownerRoot ? root.ownerRoot.textColor : "white"
-            text: root.tr("app-groups.title", "Application and device routes")
+            text: root.tr("app-groups.title", "Connections for programs and devices")
         }
         Label {
             Layout.fillWidth: true
             wrapMode: Text.WordWrap
             color: root.ownerRoot ? root.ownerRoot.mutedTextColor : "gray"
             text: root.tr("app-groups.entry-note",
-                "Assign a route to the virtual machines, emulators and "
+                "Choose the connection for the virtual machines, emulators and "
                 + "peer-to-peer apps found on this computer.")
         }
 
@@ -467,9 +467,7 @@ Window {
                         wrapMode: Text.WordWrap
                         color: root.ownerRoot ? root.ownerRoot.mutedTextColor : "gray"
                         text: root.tr("app-groups.vm-note",
-                            "Virtual machine traffic follows the route assigned to its "
-                            + "program. The default is the main route. A machine's local "
-                            + "networks (host-to-guest access) always keep working, whichever route you pick.")
+                            "Virtual machine traffic goes over the connection chosen for its program. The default is the main connection. A machine's local networks (host-to-guest access) always keep working, whichever connection you pick.")
                     }
                     Repeater {
                         model: root._virtualizationKinds
@@ -493,8 +491,8 @@ Window {
                         color: root.ownerRoot ? root.ownerRoot.mutedTextColor : "gray"
                         text: root.tr("app-groups.p2p-note",
                             "These programs are not blocked unless leak protection "
-                            + "is on. The assigned route applies to their "
-                            + "bulk connections; their peers are not added to zone rules.")
+                            + "is on. The chosen connection carries their "
+                            + "bulk transfers; their peers are not added to zone rules.")
                     }
                     Repeater {
                         model: root._peerToPeerKinds

@@ -681,6 +681,8 @@ fn a_former_default_stored_by_an_old_build_counts_as_not_renamed() {
         "Additional",
         "Основной",
         "Дополнительный",
+        "Основное",
+        "Дополнительное",
     ] {
         let parsed = parse_preferences(&format!(
             "language=en\nroute_primary_label={legacy}\nroute_secondary_label={legacy}\n"

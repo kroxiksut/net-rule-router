@@ -1465,7 +1465,7 @@ fn the_control_channel_and_the_cache_refresh_are_set_from_logs() {
     );
 }
 
-/// Under the smart shared-address mode the count is said and the addresses
+/// Under smart leak protection the count is said and the addresses
 /// open on demand; the strict mode and a zero count say nothing.
 #[test]
 fn the_shared_addresses_left_open_are_counted_and_listed_on_demand() {
@@ -1487,9 +1487,7 @@ fn the_shared_addresses_left_open_are_counted_and_listed_on_demand() {
     if !shown_routing_rows(&app).contains(&"kill-switch-strict-shared-ips") {
         return;
     }
-    assert!(!lines(&app)
-        .iter()
-        .any(|l| l.contains("strictness is reduced")));
+    assert!(!lines(&app).iter().any(|l| l.contains("less strict")));
 
     let snapshot = app.snapshot.as_mut().expect("snapshot");
     snapshot.kill_switch_shared_ip_exemptions = 2;
@@ -1499,7 +1497,7 @@ fn the_shared_addresses_left_open_are_counted_and_listed_on_demand() {
     assert!(
         shown
             .iter()
-            .any(|l| l.ends_with("excluded from blocking — 2")),
+            .any(|l| l.ends_with("addresses left unblocked: 2")),
         "{shown:?}"
     );
     assert!(!shown.iter().any(|l| l.contains("198.51.100.1")), "closed");
@@ -1507,7 +1505,10 @@ fn the_shared_addresses_left_open_are_counted_and_listed_on_demand() {
     let details = row_of(&app, Category::Routing, ItemId::SharedExemptionsDetails);
     answer(&mut app, &format!("i{details}"));
     let shown = lines(&app);
-    assert!(shown.iter().any(|l| l == "Excluded addresses"), "{shown:?}");
+    assert!(
+        shown.iter().any(|l| l == "Unblocked addresses"),
+        "{shown:?}"
+    );
     assert!(
         shown.iter().any(|l| l.trim() == "198.51.100.2"),
         "{shown:?}"
@@ -1525,9 +1526,7 @@ fn the_shared_addresses_left_open_are_counted_and_listed_on_demand() {
         json!({ "leak-protection": "sites", "kill-switch-strict-shared-ips": true }),
         json!({ "enforcement-mode": "resolver" }),
     );
-    assert!(!lines(&app)
-        .iter()
-        .any(|l| l.contains("strictness is reduced")));
+    assert!(!lines(&app).iter().any(|l| l.contains("less strict")));
 }
 
 /// Virtual-adapter rows recorded while the count was on stay in history but
@@ -1605,7 +1604,7 @@ fn traffic_names_each_route_answers_the_history_question_and_exports_csv() {
         .unwrap_or_else(|| panic!("{shown:?}"));
     let main = shown
         .iter()
-        .position(|l| l.contains("Through primary adapter — Ethernet"))
+        .position(|l| l.contains("Through the main adapter — Ethernet"))
         .unwrap_or_else(|| panic!("{shown:?}"));
     assert!(tunnel < main, "the additional route comes first: {shown:?}");
     assert!(
@@ -2175,16 +2174,13 @@ fn a_pause_says_since_when_and_how_long_is_left() {
     snapshot.routing_paused_at = Some(since_secs);
     snapshot.routing_pause_resumes_at_ms = Some(NOW_MS + 30 * 60_000);
     let text = section_text(&mut app, Category::Routing);
-    assert!(text.contains("Rules are disabled · 30 min left"), "{text}");
-    assert!(text.contains("Paused since 2023-11-14 21:13"), "{text}");
+    assert!(text.contains("Rules are off · 30 min left"), "{text}");
+    assert!(text.contains("Off since 2023-11-14 21:13"), "{text}");
 
     let snapshot = app.snapshot.as_mut().expect("snapshot");
     snapshot.routing_pause_until_restart = true;
     let text = section_text(&mut app, Category::Routing);
-    assert!(
-        text.contains("Rules are disabled · until restart"),
-        "{text}"
-    );
+    assert!(text.contains("Rules are off · until restart"), "{text}");
 
     let texts = texts_en();
     let push = |app: &mut AppState, paused: bool, paused_at: Option<u64>| {
@@ -2205,11 +2201,11 @@ fn a_pause_says_since_when_and_how_long_is_left() {
     push(&mut app, false, None);
     push(&mut app, true, Some(since_secs + 60));
     let text = section_text(&mut app, Category::Routing);
-    assert!(text.contains("Paused since 2023-11-14 21:14"), "{text}");
+    assert!(text.contains("Off since 2023-11-14 21:14"), "{text}");
     push(&mut app, false, None);
     let text = section_text(&mut app, Category::Routing);
     assert!(!text.contains("Paused since"), "{text}");
-    assert!(!text.contains("Rules are disabled"), "{text}");
+    assert!(!text.contains("Rules are off"), "{text}");
 }
 
 /// The default route explains the route chosen, and what routing by address

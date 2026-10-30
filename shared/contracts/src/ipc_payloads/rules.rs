@@ -177,6 +177,12 @@ pub struct HostsOverrideDto {
 /// - At least one of the two byte fields must be `Some`; an empty payload
 ///   is rejected with `payload-invalid`.
 ///
+/// # Replace only
+///
+/// The routes the file covers are replaced. A merge never comes here: the
+/// client adds the set to its own table and sends that as a rules update, so a
+/// service of any age reads it the same way.
+///
 /// # Byte encoding
 ///
 /// File bytes are base64-encoded (RFC 4648 standard alphabet, padding

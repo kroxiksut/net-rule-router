@@ -59,7 +59,7 @@ GroupBox {
                 Label {
                     Layout.fillWidth: true
                     text: root.tr("settings.experimental.detailed-mode.note",
-                        "Shows extra fine-tuning switches under Settings → Routing. Off by default: without it, NetRuleRouter uses sensible defaults for them. The main routing switches stay visible either way.")
+                        "Shows extra fine-tuning switches under Settings → Routing behavior. Off by default: without it, NetRuleRouter uses sensible defaults for them. The main routing switches stay visible either way.")
                     color: root.mutedTextColor
                     wrapMode: Text.WordWrap
                 }
@@ -117,7 +117,7 @@ GroupBox {
                 Label {
                     Layout.fillWidth: true
                     text: root.tr("settings.experimental.vm-section.note",
-                        "Adds a Virtual machines screen under Rules that sends a hypervisor's traffic over the route you pick. Not verified on real hardware yet: the screen may be incomplete and the route may not apply to every machine.")
+                        "Adds a Virtual machines screen under Rules that sends a hypervisor's traffic over the connection you pick. Not verified on real hardware yet: the screen may be incomplete and the choice may not apply to every machine.")
                     color: root.mutedTextColor
                     wrapMode: Text.WordWrap
                 }

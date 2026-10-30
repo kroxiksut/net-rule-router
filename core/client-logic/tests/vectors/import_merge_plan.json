@@ -1,0 +1,105 @@
+{
+  "description": "rules.js importMergePlan: a rule set merged into the user's rules. Every own row stays; an imported row is added unless one with its mergeKey is there; a plain copy drops the `?` of its twin.",
+  "cases": [
+    {
+      "name": "nothing of the user's, everything of the set",
+      "input": { "existing": [], "imported": [
+        { "ruleType": "domain", "matchValue": "a.example", "targetRoute": "primary", "enabled": true },
+        { "ruleType": "domain", "matchValue": "b.example", "targetRoute": "secondary", "enabled": true }
+      ] },
+      "expected": { "add": [0, 1], "plain": [], "plainAdded": [] }
+    },
+    {
+      "name": "an empty set adds nothing and touches nothing",
+      "input": { "existing": [
+        { "ruleType": "domain", "matchValue": "mine.example", "targetRoute": "primary", "enabled": true, "verify": true }
+      ], "imported": [] },
+      "expected": { "add": [], "plain": [], "plainAdded": [] }
+    },
+    {
+      "name": "a rule the user has is skipped, a new one added",
+      "input": { "existing": [
+        { "ruleType": "domain", "matchValue": "mine.example", "targetRoute": "primary", "enabled": false, "comment": "mine" }
+      ], "imported": [
+        { "ruleType": "domain", "matchValue": "mine.example", "targetRoute": "primary", "enabled": true, "comment": "theirs" },
+        { "ruleType": "domain", "matchValue": "new.example", "targetRoute": "primary", "enabled": true }
+      ] },
+      "expected": { "add": [1], "plain": [], "plainAdded": [] }
+    },
+    {
+      "name": "case and the folded type do not make a second rule",
+      "input": { "existing": [
+        { "ruleType": "suffix-domain", "matchValue": "Mine.Example", "targetRoute": "secondary", "enabled": true },
+        { "ruleType": "exact-ipv4", "matchValue": "192.0.2.7", "targetRoute": "primary", "enabled": true }
+      ], "imported": [
+        { "ruleType": "domain", "matchValue": "mine.example", "targetRoute": "secondary", "enabled": true },
+        { "ruleType": "exact-ip", "matchValue": "192.0.2.7", "targetRoute": "primary", "enabled": true }
+      ] },
+      "expected": { "add": [], "plain": [], "plainAdded": [] }
+    },
+    {
+      "name": "the same value on the other route is another rule",
+      "input": { "existing": [
+        { "ruleType": "domain", "matchValue": "mine.example", "targetRoute": "primary", "enabled": true }
+      ], "imported": [
+        { "ruleType": "domain", "matchValue": "mine.example", "targetRoute": "secondary", "enabled": true }
+      ] },
+      "expected": { "add": [0], "plain": [], "plainAdded": [] }
+    },
+    {
+      "name": "a block of an address the user routes is added beside it",
+      "input": { "existing": [
+        { "ruleType": "exact-ip", "matchValue": "192.0.2.1", "targetRoute": "secondary", "enabled": true }
+      ], "imported": [
+        { "ruleType": "exact-ip", "matchValue": "192.0.2.1", "targetRoute": "block", "enabled": true }
+      ] },
+      "expected": { "add": [0], "plain": [], "plainAdded": [] }
+    },
+    {
+      "name": "the set names plainly what the user marked to check: the plain one wins",
+      "input": { "existing": [
+        { "ruleType": "domain", "matchValue": "mine.example", "targetRoute": "primary", "enabled": true, "verify": true }
+      ], "imported": [
+        { "ruleType": "domain", "matchValue": "mine.example", "targetRoute": "primary", "enabled": true }
+      ] },
+      "expected": { "add": [], "plain": [0], "plainAdded": [] }
+    },
+    {
+      "name": "a `?` in the set leaves the user's plain rule alone",
+      "input": { "existing": [
+        { "ruleType": "domain", "matchValue": "mine.example", "targetRoute": "primary", "enabled": true }
+      ], "imported": [
+        { "ruleType": "domain", "matchValue": "mine.example", "targetRoute": "primary", "enabled": true, "verify": true }
+      ] },
+      "expected": { "add": [], "plain": [], "plainAdded": [] }
+    },
+    {
+      "name": "a `?` that means nothing on a block is not a `?` to drop",
+      "input": { "existing": [
+        { "ruleType": "domain", "matchValue": "mine.example", "targetRoute": "block", "enabled": true, "verify": true }
+      ], "imported": [
+        { "ruleType": "domain", "matchValue": "mine.example", "targetRoute": "block", "enabled": true }
+      ] },
+      "expected": { "add": [], "plain": [], "plainAdded": [] }
+    },
+    {
+      "name": "within the set, a later plain copy drops the `?` of the added one",
+      "input": { "existing": [], "imported": [
+        { "ruleType": "domain", "matchValue": "set.example", "targetRoute": "primary", "enabled": true, "verify": true },
+        { "ruleType": "domain", "matchValue": "SET.example", "targetRoute": "primary", "enabled": true },
+        { "ruleType": "domain", "matchValue": "set.example", "targetRoute": "primary", "enabled": true }
+      ] },
+      "expected": { "add": [0], "plain": [], "plainAdded": [0] }
+    },
+    {
+      "name": "programs merge by name, case aside",
+      "input": { "existing": [
+        { "ruleType": "application", "matchValue": "Telegram.exe", "targetRoute": "secondary", "enabled": true }
+      ], "imported": [
+        { "ruleType": "application", "matchValue": "telegram.exe", "targetRoute": "secondary", "enabled": true },
+        { "ruleType": "application", "matchValue": "codex.exe", "targetRoute": "secondary", "enabled": true }
+      ] },
+      "expected": { "add": [1], "plain": [], "plainAdded": [] }
+    }
+  ]
+}

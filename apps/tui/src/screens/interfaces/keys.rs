@@ -8,7 +8,7 @@ pub const DETAILS_TITLE: Key = key("tui.interfaces.details-title", "Chosen adapt
 pub const RESULT_TITLE: Key = key("tui.interfaces.result-title", "Last action");
 pub const ROLE_EXPLANATION: Key = key(
     "interfaces.role-explanation",
-    "The primary route uses the default interface; the additional route carries the traffic your rules send to it.",
+    "The main connection is your usual internet. The additional connection (e.g. VPN) carries what your rules send to it.",
 );
 pub const NO_ADAPTERS: Key = key(
     "tui.interfaces.no-adapters",
@@ -21,7 +21,7 @@ pub const PLACEHOLDER_TITLE: Key = key(
 );
 pub const PLACEHOLDER_BODY: Key = key(
     "interfaces.placeholder-rows.banner-body",
-    "The list below did not come from this machine — the background service could not enumerate the adapters, so example rows are shown. Assigning a route here would bind it to an adapter that does not exist, so the buttons stay disabled until a real list arrives.",
+    "The list below did not come from this machine — the background service could not enumerate the adapters, so example rows are shown. Assigning a role here would bind it to an adapter that does not exist, so the buttons stay disabled until a real list arrives.",
 );
 pub const FAIL_CLOSED_TITLE: Key = key(
     "interfaces.fail-closed.banner-title",
@@ -29,15 +29,15 @@ pub const FAIL_CLOSED_TITLE: Key = key(
 );
 pub const FAIL_CLOSED_BODY: Key = key(
     "interfaces.fail-closed.banner-body",
-    "Additional route is unavailable. Matched traffic is being blocked instead of leaking to the primary.",
+    "The additional connection is unavailable. What your rules send through it is blocked for now instead of leaking through the main connection.",
 );
 pub const ABSENT_TITLE: Key = key(
     "interfaces.secondary-absent.banner-title",
-    "The additional route is not available",
+    "The additional connection is not available",
 );
 pub const ABSENT_BODY: Key = key(
     "interfaces.secondary-absent.banner-body",
-    "The adapter you bound as the additional route is not present right now. Traffic your rules send there is blocked rather than leaked to the main route. Bring the connection back up, or assign another adapter to the role below.",
+    "The connection you chose as additional is not there right now. What your rules send through it is blocked rather than leaked to the main connection. Turn it back on (for example, connect your VPN) or choose another connection in the list below.",
 );
 pub const REMEMBERED: Key = key(
     "interfaces.remembered.badge",
@@ -46,7 +46,7 @@ pub const REMEMBERED: Key = key(
 
 pub const EXCLUSIVE_NOTE: Key = key(
     "interfaces.role.exclusive-note",
-    "One adapter cannot carry both routes: to use it for the other one, unassign its current role first.",
+    "One connection cannot be both main and additional: to use it for the other role, unassign its current one first.",
 );
 pub const DRIVER_SIBLING_LIVE: Key = key(
     "interfaces.role.driver-sibling-live",
@@ -56,10 +56,10 @@ pub const DRIVER_SIBLING_IDLE: Key = key(
     "interfaces.role.driver-sibling-idle",
     "This adapter is not connected, and other adapters of the same kind are on this computer. Your VPN program may use one of them: connect the VPN first, then choose the adapter that comes up.",
 );
-pub const UNASSIGN_PRIMARY: Key = key("interfaces.action.unassign-primary", "Unassign primary");
+pub const UNASSIGN_PRIMARY: Key = key("interfaces.action.unassign-primary", "No longer main");
 pub const UNASSIGN_SECONDARY: Key = key(
     "interfaces.action.unassign-secondary",
-    "Unassign additional",
+    "No longer additional",
 );
 pub const ROW_SUMMARY: Key = key("interfaces.row.summary", "Type: %1 | IP: %2 | Gateway: %3");
 pub const ROW_SUMMARY_2: Key = key("interfaces.row.summary-2", "DNS: %1 | Default route: %2");
@@ -90,10 +90,7 @@ pub const READ_FAILED: Key = key(
     "Could not read the current routing settings, so nothing was changed: {error}",
 );
 pub const ROLE_SET: Key = key("tui.interfaces.role-set", "{role}: {name}.");
-pub const ROLE_UNASSIGNED: Key = key(
-    "status.role-unassigned",
-    "{role} unassigned from this adapter.",
-);
+pub const ROLE_UNASSIGNED: Key = key("status.role-unassigned", "Choice cleared: {role}.");
 pub const CANCELLED: Key = key("tui.interfaces.cancelled", "Nothing was changed.");
 pub const SETUP_FINISHED: Key = key(
     "tui.interfaces.setup-finished",
@@ -101,7 +98,7 @@ pub const SETUP_FINISHED: Key = key(
 );
 pub const IMPORT_DONE: Key = key(
     "status.preset-import-completed",
-    "Preset imported and activated ({count} rules).",
+    "Rules loaded from the file and applied ({count} rules).",
 );
 pub const ERROR_UNKNOWN: Key = key("errors.unknown", "Unknown error");
 
@@ -127,7 +124,7 @@ pub const UNROUTABLE_ADAPTER: Key = key(
 );
 pub const UNROUTABLE_BODY: Key = key(
     "dialog.unroutable-secondary.body-assign",
-    "You are about to assign it as your additional route.",
+    "You are about to assign it as your additional connection.",
 );
 pub const UNROUTABLE_BODY_PRIMARY: Key = key(
     "dialog.unroutable-secondary.body-assign-primary",
@@ -135,7 +132,7 @@ pub const UNROUTABLE_BODY_PRIMARY: Key = key(
 );
 pub const UNROUTABLE_EFFECT: Key = key(
     "dialog.unroutable-secondary.effect-routing",
-    "Rules that point at the additional route will not be routed through it.",
+    "Rules that point at the additional connection will not be routed through it.",
 );
 pub const UNROUTABLE_EFFECT_PRIMARY: Key = key(
     "dialog.unroutable-secondary.effect-routing-primary",
@@ -231,7 +228,7 @@ pub const SWITCHED_OFF_HINT: Key = key(
 );
 pub const RECOVERY_HINT: Key = key(
     "interfaces.remembered.recovery-hint",
-    "If the connection is back up, send the binding to the service again. Otherwise assign another adapter to this role in the list below.",
+    "If the connection works again, send your choice to the service once more. Otherwise choose another connection for this role in the list below.",
 );
 pub const RESENT: Key = key(
     "tui.interfaces.resent",

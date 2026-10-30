@@ -12,6 +12,10 @@ ThemedButton {
     property var shell: null
     property string glyph: ""
     property int glyphPixelSize: 0
+    // The focus ring follows the keyboard: a click leaves focus here without
+    // drawing it, unless the user asked for focus to show always.
+    readonly property bool focusShown: visualFocus
+        || (activeFocus && shell.prefs.enhancedFocus === true)
 
     theme: shell.uiTheme
     ToolTip.visible: hovered
@@ -23,8 +27,8 @@ ThemedButton {
         theme: control.theme
         cornerRadius: control.theme.radiusSm
         color: control.hovered ? control.theme.stateHoverFill : control.shell.panelColor
-        border.width: control.activeFocus ? control.theme.focusBorderWidth : control.theme.borderWidth
-        border.color: control.activeFocus ? control.theme.stateFocusedBorder : control.theme.stateDefaultBorder
+        border.width: control.focusShown ? control.theme.focusBorderWidth : control.theme.borderWidth
+        border.color: control.focusShown ? control.theme.colorButtonOutline : control.theme.stateDefaultBorder
     }
     contentItem: Label {
         text: control.glyph

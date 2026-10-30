@@ -6,7 +6,7 @@ use crate::i18n::{key, Key};
 pub const TITLE: Key = key("rules.suggestions.inbox.title", "Addresses your sites need");
 pub const INTRO: Key = key(
     "rules.suggestions.inbox.intro",
-    "These addresses were pulled in by sites you route. Adding one sends it through the additional route together with the site that needs it. Anything you leave alone keeps going through the main route.",
+    "These addresses were pulled in by sites you route. Adding one sends it through the additional connection together with the site that needs it. Anything you leave alone keeps going through the main connection.",
 );
 pub const LIST_TITLE: Key = key("rules.suggestions.inbox.nav-label", "Suggested addresses");
 /// The count the tray menu and the window's sidebar show, from the same number.
@@ -31,7 +31,7 @@ pub const NO: Key = key("label.no", "No");
 pub const SORT: Key = key("rules.suggestions.inbox.sort", "Sort");
 pub const SORT_MAIN_ROUTE: Key = key(
     "rules.suggestions.inbox.sort-main-route",
-    "What the main route can't reach first",
+    "What the main connection can't reach first",
 );
 pub const SORT_NEWEST: Key = key("rules.suggestions.inbox.sort-newest", "Newest first");
 pub const SORT_CONSUMERS: Key = key(
@@ -58,7 +58,7 @@ pub const EMPTY_ANSWERED: Key = key(
 );
 pub const EMPTY_INERT: Key = key(
     "rules.suggestions.inbox.empty-all-inert",
-    "The service saw {count} addresses beside your sites, but each already travels the route it would be sent to — a rule would change nothing. For example: {sample}.",
+    "The service saw {count} addresses beside your sites, but each already goes over the connection it would be sent to — a rule would change nothing. For example: {sample}.",
 );
 pub const EMPTY_SERVED: Key = key(
     "rules.suggestions.inbox.empty-served-by-main-link",
@@ -80,7 +80,7 @@ pub const REACH: Key = key(
 );
 pub const REACH_APP: Key = key(
     "rules.suggestions.inbox.reach-app",
-    "The rule sends every connection of {app} through the additional route.",
+    "The rule sends every connection of {app} through the additional connection.",
 );
 pub const REACH_SEEN: Key = key(
     "rules.suggestions.inbox.reach-seen",
@@ -88,19 +88,19 @@ pub const REACH_SEEN: Key = key(
 );
 pub const BEHAVIOR_RESPONDS: Key = key(
     "rules.suggestions.inbox.behavior-responds",
-    "the main route reaches it",
+    "the main connection reaches it",
 );
 pub const BEHAVIOR_RESPONDS_REFUSING: Key = key(
     "rules.suggestions.inbox.behavior-responds-refusing",
-    "the main route reaches it, but the site refuses addresses there",
+    "the main connection reaches it, but the site refuses addresses there",
 );
 pub const BEHAVIOR_STALLS: Key = key(
     "rules.suggestions.inbox.behavior-stalls",
-    "connections to it stall on the main route",
+    "connections to it stall on the main connection",
 );
 pub const BEHAVIOR_UNKNOWN: Key = key(
     "rules.suggestions.inbox.behavior-unknown",
-    "not checked on the main route",
+    "not checked on the main connection",
 );
 pub const OWNERSHIP_THIRD_PARTY: Key = key(
     "rules.suggestions.inbox.ownership-third-party",
@@ -123,15 +123,15 @@ pub const AFFINITY: Key = key(
 pub const ADDITIONAL_REACH: [Key; 3] = [
     key(
         "tray.auto-rules.reach.confirmed",
-        "it opens over the additional route",
+        "it opens over the additional connection",
     ),
     key(
         "tray.auto-rules.reach.unconfirmed",
-        "the additional route may help",
+        "the additional connection may help",
     ),
     key(
         "tray.auto-rules.reach.unreachable",
-        "it does not open over the additional route either",
+        "it does not open over the additional connection either",
     ),
 ];
 pub const SIGNALS: [Key; 7] = [
@@ -150,11 +150,11 @@ pub const SIGNALS: [Key; 7] = [
     ),
     key(
         "tray.auto-rules.signal.app-main-link-blocked",
-        "most of the addresses it reached for on the main route kept failing, and none of its traffic goes over the additional route yet",
+        "most of the addresses it reached for on the main connection kept failing, and none of its traffic goes over the additional connection yet",
     ),
     key(
         "tray.auto-rules.signal.main-link-blocked",
-        "connections to it kept failing on the main route and none went through",
+        "connections to it kept failing on the main connection and none went through",
     ),
     key(
         "tray.auto-rules.signal.app-own-resolver",
@@ -183,7 +183,7 @@ pub const CHECK_NOTHING: Key = key(
 );
 pub const RELOAD_PAGE: Key = key(
     "rules.suggestions.accept.reload-page",
-    "The rule is applied. Reload the page you were on (F5) so it picks up the new route.",
+    "The rule is applied. Reload the page you were on (F5) so it takes effect.",
 );
 pub const AUTO_TITLE: Key = key(
     "dialog.auto-rules-mode.title",
@@ -203,19 +203,19 @@ pub const NOTICE_BODY: Key = key(
 /// per `nrr_client_logic::auto_rules::NoticeKind`, the tray's words.
 pub const NOTICE_TITLE_SITES_BLOCKED: Key = key(
     "tray.auto-rules.title-blocked",
-    "Sites the main route will not carry",
+    "Sites the main connection will not carry",
 );
 pub const NOTICE_BODY_SITES_BLOCKED: Key = key(
     "tray.auto-rules.body-blocked",
-    "Connections to {name} keep failing on the main route.",
+    "Connections to {name} keep failing on the main connection.",
 );
 pub const NOTICE_TITLE_APP_BLOCKED: Key = key(
     "tray.auto-rules.title-app-blocked",
-    "Programs the main route will not carry",
+    "Programs the main connection will not carry",
 );
 pub const NOTICE_BODY_APP_BLOCKED: Key = key(
     "tray.auto-rules.body-app-blocked",
-    "No connection of {name} goes through on the main route.",
+    "Most connections of {name} fail on the main connection.",
 );
 pub const NOTICE_TITLE_APP_OWN_RESOLVER: Key = key(
     "tray.auto-rules.title-app-own-resolver",
@@ -223,15 +223,15 @@ pub const NOTICE_TITLE_APP_OWN_RESOLVER: Key = key(
 );
 pub const NOTICE_BODY_APP_OWN_RESOLVER: Key = key(
     "tray.auto-rules.body-app-own-resolver",
-    "{name} looks up site names on its own, so rules by site name do not apply to it. A rule for the program sends all of its connections over the additional route.",
+    "{name} looks up site names on its own, so rules by site name do not apply to it. A rule for the program sends all of its connections over the additional connection.",
 );
 pub const NOTICE_TITLE_MIXED_BLOCKED: Key = key(
     "tray.auto-rules.title-mixed-blocked",
-    "Not getting through on the main route",
+    "Not getting through on the main connection",
 );
 pub const NOTICE_BODY_MIXED_BLOCKED: Key = key(
     "tray.auto-rules.body-mixed-blocked",
-    "The programs and sites below keep failing on the main route.",
+    "The programs and sites below keep failing on the main connection.",
 );
 pub const NOTICE_TITLE_ASSORTED: Key = key("tray.auto-rules.title-assorted", "Suggested rules");
 pub const NOTICE_BODY_ASSORTED: Key = key(
@@ -310,7 +310,7 @@ pub const HELP_KEYS: &[Key] = &[
     ),
     key(
         "tui.suggestions.help.add",
-        "a: add the chosen item to the additional route",
+        "a: add the chosen item to the additional connection",
     ),
     key(
         "tui.suggestions.help.any-zone",
@@ -361,7 +361,7 @@ pub const HELP_KEYS: &[Key] = &[
 pub const PLAIN_KEYS: &[Key] = &[
     key(
         "tui.suggestions.plain.add",
-        "a and an item number, for example a 2: add that item to the additional route",
+        "a and an item number, for example a 2: add that item to the additional connection",
     ),
     key(
         "tui.suggestions.plain.any-zone",

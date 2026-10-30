@@ -598,6 +598,66 @@ pub fn app_kill_switch_filters_for(
     filters
 }
 
+/// Withdrawn destinations one pinned app gets main-link permits for. An app
+/// keeps at most [`crate::app_observation_lookup::APP_IP_CAP`] destinations; it
+/// loses no more than that many either.
+pub(crate) const APP_WITHDRAWN_MAX_PER_APP: usize = crate::app_observation_lookup::APP_IP_CAP;
+
+/// Main-link permits for the destinations withdrawn from each pinned app
+/// ([`crate::app_observation_lookup::AppObservationStore::retract`]): the app
+/// may not relearn them this session, so without these its own block drops
+/// them until the service restarts.
+///
+/// Keyed on the app AND the addresses, with no interface condition, in the app
+/// permit's band: above the app block in either band, below the exemptions and
+/// the user's Blocks. That band also outranks the per-destination pins, so the
+/// caller passes only addresses no additional-link rule holds. Emitted exactly
+/// when [`app_kill_switch_filters_for`] arms the pair.
+pub fn app_withdrawn_permits(
+    sid: &str,
+    app_patterns: &[String],
+    withdrawn: impl Fn(&str) -> Vec<IpAddr>,
+    secondary_luid: u64,
+    protocols: KillSwitchProtocols,
+) -> Vec<WfpFilterSpec> {
+    if secondary_luid == 0 || !protocols.wants_ale_block() {
+        return Vec::new();
+    }
+    let mut filters = Vec::new();
+    for (idx, pattern) in app_patterns
+        .iter()
+        .take(APP_KILLSWITCH_MAX_APPS)
+        .enumerate()
+    {
+        let chunks = pack_both(
+            withdrawn(pattern)
+                .into_iter()
+                .filter(|ip| !is_exempt_from_blocking(*ip))
+                .take(APP_WITHDRAWN_MAX_PER_APP),
+        );
+        for chunk in &chunks {
+            let id = filter_id_for(
+                sid,
+                KILLSWITCH_ROLE,
+                pattern,
+                "ks-app-withdrawn",
+                &chunk.id_seg(),
+            );
+            let mut spec = crate::wfp_codegen::chunk_spec(
+                chunk,
+                crate::wfp_codegen::ale_layer(chunk),
+                WfpAction::Permit,
+                KILLSWITCH_PERMIT_BASE + idx as u64,
+                id,
+            );
+            spec.user_sid = Some(sid.to_string());
+            spec.app_pattern = Some(pattern.clone());
+            filters.push(spec);
+        }
+    }
+    filters
+}
+
 /// Per-app `Permit` half: allow `pattern`'s process **only while** its flow
 /// egresses `secondary_luid`. Sits in the same weight band as the
 /// per-destination permit, above the unconditional per-process Permit

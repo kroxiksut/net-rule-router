@@ -75,12 +75,12 @@ ColumnLayout {
     function _episodeText() {
         if (!section._episode) {
             return root.tr("diag.outage-blocks.no-episode",
-                "The additional route has not been down since the service started.")
+                "The additional connection has not been down since the service started.")
         }
         var since = Pure.formatTimestamp(section._episode["since-unix-ms"])
         if (section._active) {
             return root.tr("diag.outage-blocks.episode-active",
-                "The additional route has been down since {since}.").replace("{since}", since)
+                "The additional connection has been down since {since}.").replace("{since}", since)
         }
         return root.tr("diag.outage-blocks.episode-ended",
             "The last outage lasted from {since} to {until}.")
@@ -105,7 +105,7 @@ ColumnLayout {
             color: root.textColor
             text: root.uiRevision >= 0
                 ? root.tr("diag.outage-blocks.intro",
-                    "What leak protection held back while the additional route was down. Your rules send these addresses there, so they were blocked instead of leaving through the main connection.")
+                    "What leak protection held back while the additional connection was down. Your rules send these addresses there, so they were blocked instead of leaving through the main connection.")
                 : ""
             Accessible.role: Accessible.StaticText
             Accessible.name: text
@@ -114,7 +114,7 @@ ColumnLayout {
             theme: root.uiTheme
             visible: section._active
             text: root.uiRevision >= 0
-                ? root.tr("diag.outage-blocks.open-routes", "Open interfaces and routes") : ""
+                ? root.tr("diag.outage-blocks.open-routes", "Open Connections") : ""
             Accessible.role: Accessible.Button
             Accessible.name: text
             onClicked: root.requestSectionChange("interfaces-routes")

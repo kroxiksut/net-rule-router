@@ -94,7 +94,7 @@ pub fn error_label(code: &str, args: &BTreeMap<String, String>, texts: &Texts) -
     if localised.is_empty() {
         slug
     } else {
-        localised
+        crate::screens::binding::with_alert_hint(&slug, localised, texts)
     }
 }
 

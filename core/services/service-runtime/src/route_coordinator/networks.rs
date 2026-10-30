@@ -400,6 +400,63 @@ impl SecondaryRouteCoordinator {
         }
     }
 
+    /// Move a binding off its dead adapter onto the live one the VPN came up
+    /// on — a copy of the same driver, or another driver's tunnel — saving
+    /// the move once per distinct pair and telling the user where their
+    /// additional connection went.
+    fn follow_vpn(
+        &self,
+        sid: &str,
+        role: &str,
+        binding: &PerSidBinding,
+        target: &AdapterInfo,
+        same_driver: bool,
+    ) {
+        let healed_id = format!(
+            "win-adapter:{}",
+            target.adapter_name.trim().to_ascii_lowercase()
+        );
+        if !self.note_heal_once(sid, role, &binding.stable_id, &healed_id) {
+            return;
+        }
+        let name = preferred_display_name(target);
+        if same_driver {
+            tracing::warn!(
+                target: "nrr::route-coordinator",
+                msg_key = "route-binding-moved-to-driver-copy",
+                sid = %sid,
+                role = role,
+                stale_id = %binding.stable_id,
+                healed_adapter = %name,
+                healed_id = %healed_id,
+                "bound adapter is off and the VPN came up on another copy of its driver — switched to that copy and saved it",
+            );
+        } else {
+            tracing::warn!(
+                target: "nrr::route-coordinator",
+                msg_key = "route-binding-moved-to-tunnel",
+                sid = %sid,
+                role = role,
+                stale_id = %binding.stable_id,
+                healed_adapter = %name,
+                healed_id = %healed_id,
+                "bound adapter is off and the only live tunnel is another adapter — switched the additional connection to it and saved it",
+            );
+        }
+        if let Some(persist) = self.binding_heal_persist.as_ref() {
+            persist(sid, role, &healed_id, name);
+        }
+        if let (Some(bus), "secondary") = (self.events.as_ref(), role) {
+            bus.publish_for(
+                sid,
+                nrr_shared::ipc_payloads::StatusUpdateEvent::AdditionalConnectionMoved {
+                    sid: sid.to_string(),
+                    adapter_name: name.to_string(),
+                },
+            );
+        }
+    }
+
     /// Resolve one route binding (primary or secondary) to a
     /// [`SecondaryRouteTarget`] against live `infos`. `None` when the bound
     /// adapter is missing, unusable, or has no gateway and no derivable
@@ -447,9 +504,10 @@ impl SecondaryRouteCoordinator {
                 // another tunnel-looking link is still not adopted on a guess.
                 let ours: Vec<u32> = by_id.map(|i| i.index).into_iter().collect();
                 let additional: &[u32] = if role == "secondary" { &ours } else { &[] };
-                let foreign: Vec<u32> = match self.routes_of(reading) {
+                let routes = self.routes_of(reading);
+                let foreign: Vec<u32> = match routes.as_deref() {
                     Some(routes) => {
-                        super::exemptions::foreign_tunnel_indexes(infos, &ours, additional, &routes)
+                        super::exemptions::foreign_tunnel_indexes(infos, &ours, additional, routes)
                     }
                     None => {
                         let mut kept = ours.clone();
@@ -495,8 +553,56 @@ impl SecondaryRouteCoordinator {
                         .collect();
                     self.publish_enforcement_status(sid, "adapter-choice-needed", role, candidates);
                 }
-                match first {
-                    Some(only) if !ambiguous => {
+                // Already asked above when names answered; a second status for
+                // the role would take turns with that one on every pass.
+                let mut asked = ambiguous || refused_only;
+                let other_routes_link = |i: &AdapterInfo| {
+                    other_role
+                        .is_some_and(|b| binding_matches_live(i, &b.stable_id, &b.known_stable_ids))
+                };
+                // A VPN client on a stock driver brings up whichever copy of it
+                // it likes: the one live copy of a dead bound adapter's driver
+                // is where the VPN went.
+                let copy = match (first, by_id) {
+                    (None, Some(down)) if !asked => {
+                        sole_live_driver_sibling(infos, down, other_routes_link)
+                    }
+                    _ => None,
+                };
+                // Failing that, the additional connection follows the VPN to
+                // the one live tunnel that is nobody else's, whatever driver
+                // it runs on; two leave the choice to the user. Only with the
+                // route table read: without it the uplink cannot be told apart.
+                let tunnels = match (first, copy, routes.as_deref()) {
+                    (None, None, Some(routes)) if role == "secondary" && !asked => {
+                        adoptable_tunnels(infos, &foreign, routes, other_routes_link)
+                    }
+                    _ => Vec::new(),
+                };
+                let tunnel = match tunnels.as_slice() {
+                    [only] => Some(*only),
+                    [] => None,
+                    several => {
+                        let candidates = several
+                            .iter()
+                            .map(|i| preferred_display_name(i).to_string())
+                            .collect();
+                        self.publish_enforcement_status(
+                            sid,
+                            "adapter-choice-needed",
+                            role,
+                            candidates,
+                        );
+                        asked = true;
+                        None
+                    }
+                };
+                match (first, copy.or(tunnel)) {
+                    (_, Some(moved)) => {
+                        self.follow_vpn(sid, role, binding, moved, copy.is_some());
+                        moved
+                    }
+                    (Some(only), None) if !ambiguous => {
                         let healed_id = format!(
                             "win-adapter:{}",
                             only.adapter_name.trim().to_ascii_lowercase()
@@ -534,23 +640,6 @@ impl SecondaryRouteCoordinator {
                         // sibling we could not uniquely identify.
                         match by_id {
                             Some(down) => {
-                                // Already asked above when names answered; a
-                                // second status for the role would take turns
-                                // with that one on every pass.
-                                let asked = ambiguous || refused_only;
-                                let sibling = if asked {
-                                    None
-                                } else {
-                                    sole_live_driver_sibling(infos, down, |i| {
-                                        other_role.is_some_and(|b| {
-                                            binding_matches_live(
-                                                i,
-                                                &b.stable_id,
-                                                &b.known_stable_ids,
-                                            )
-                                        })
-                                    })
-                                };
                                 if self.note_not_usable_once(sid, role, &binding.stable_id) {
                                     tracing::warn!(
                                         target: "nrr::route-coordinator",
@@ -564,38 +653,19 @@ impl SecondaryRouteCoordinator {
                                         name_match_ambiguous = ambiguous,
                                         name_matched = accepted.len() + refused.len(),
                                         refused_foreign = refused.len(),
-                                        sibling_adapter = sibling.map(preferred_display_name).unwrap_or(""),
                                         "bound adapter found but NOT usable (down / no IPv4 / excluded type) and no unique live same-name adapter to heal to — failing closed",
                                     );
                                 }
-                                // Steady "still not usable" state is silent by
-                                // design: a per-reconcile heartbeat here would
-                                // flood the log with near-identical lines. The
-                                // transition into the state warned above; the
-                                // transition out re-arms via `clear_not_usable`.
-                                //
-                                // The user, however, must not be left guessing:
-                                // failing closed here is what stops their rule
-                                // traffic, and until this push existed the only
-                                // trace was a log line. Deduped inside the
-                                // publisher, so the steady state stays quiet.
-                                // One live copy of the bound adapter's driver
-                                // is likely the one the VPN moved to: offered,
-                                // never adopted.
-                                match sibling {
-                                    _ if asked => {}
-                                    Some(only) => self.publish_enforcement_status(
-                                        sid,
-                                        "adapter-choice-needed",
-                                        role,
-                                        vec![preferred_display_name(only).to_string()],
-                                    ),
-                                    None => self.publish_enforcement_status(
+                                // The log warns on the transition only; the user
+                                // hears it too, since failing closed stops their
+                                // rule traffic. Deduped inside the publisher.
+                                if !asked {
+                                    self.publish_enforcement_status(
                                         sid,
                                         "secondary-down",
                                         role,
                                         Vec::new(),
-                                    ),
+                                    );
                                 }
                             }
                             None => {
@@ -614,7 +684,7 @@ impl SecondaryRouteCoordinator {
                                 // asked above, and publishing both leaves the
                                 // two statuses overwriting each other in the
                                 // per-role latch — an endless alternating push.
-                                if !ambiguous && !refused_only {
+                                if !asked {
                                     // "Removed", "switched off by the user" and
                                     // "its driver will not start" all arrive as
                                     // nothing, yet need different advice. Only

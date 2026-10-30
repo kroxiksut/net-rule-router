@@ -391,7 +391,8 @@ mod tests {
         assert!(yaml.contains("exported_at: \"2026-05-20T12:00:00Z\"\n"));
         assert!(yaml.contains("primary:\n      system_id: \"\"\n"));
         assert!(yaml.contains("route_mode: \"prefer-primary\"\n"));
-        assert!(yaml.contains("leak_protection: \"off\"\n"));
+        // A user who never chose has the default level, and the export says so.
+        assert!(yaml.contains("leak_protection: \"sites\"\n"));
         // The hash crosses IPC: fixed-width lowercase hex of the YAML bytes.
         let expected: String = Sha256::digest(yaml.as_bytes())
             .iter()
@@ -411,7 +412,7 @@ mod tests {
             .expect("export");
         assert_eq!(
             out.content_hash_hex,
-            "50d5d944925828998aa9a997ca3b72fcb5f59b58c2398851542b70f963561365"
+            "b48634613099682bcf434ac4a5ee830964eb357d25cc980aa836aa84daa62c5f"
         );
     }
 

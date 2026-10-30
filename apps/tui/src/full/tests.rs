@@ -121,7 +121,7 @@ fn status_screen_snapshot_healthy() {
     // Words are checked where no line wraps; the snapshot pins the 80x24 layout.
     let wide = render(&app, COLOUR, 140, 30, Instant::now());
     assert!(wide.contains("> 1 Status"), "{wide}");
-    assert!(wide.contains("Routing active"), "{wide}");
+    assert!(wide.contains("Rules are working"), "{wide}");
     assert!(wide.contains("Available — Rules applied"), "{wide}");
     assert_snapshot(
         "status-healthy-80x24",
@@ -133,7 +133,7 @@ fn status_screen_snapshot_healthy() {
 fn status_screen_snapshot_limited_with_notice() {
     let app = limited();
     let wide = render(&app, COLOUR, 140, 30, Instant::now());
-    assert!(wide.contains("Routing limited"), "{wide}");
+    assert!(wide.contains("Some rules not working"), "{wide}");
     assert!(wide.contains("Rules not applied"), "{wide}");
     assert!(
         wide.contains("The additional connection is not up"),

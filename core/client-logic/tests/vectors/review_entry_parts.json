@@ -1,0 +1,23 @@
+{
+  "description": "pure.js reviewEntryParts: a review row's rule taken apart from the service's English markers",
+  "cases": [
+    { "name": "a host", "input": { "display": "example.com" },
+      "expected": { "rule": "example.com", "app": false, "moved": null, "invalid": false } },
+    { "name": "an application", "input": { "display": "*vpn*.exe (app)" },
+      "expected": { "rule": "*vpn*.exe", "app": true, "moved": null, "invalid": false } },
+    { "name": "an address with an application", "input": { "display": "10.0.0.0/8 + chrome.exe (app)" },
+      "expected": { "rule": "10.0.0.0/8 + chrome.exe", "app": true, "moved": null, "invalid": false } },
+    { "name": "a moved host", "input": { "display": "*.corp.example.net (primary → secondary)" },
+      "expected": { "rule": "*.corp.example.net", "app": false, "moved": ["primary", "secondary"], "invalid": false } },
+    { "name": "a moved application", "input": { "display": "chrome.exe (app) (secondary → primary)" },
+      "expected": { "rule": "chrome.exe", "app": true, "moved": ["secondary", "primary"], "invalid": false } },
+    { "name": "a rule matching nothing", "input": { "display": "(no match — invalid rule)" },
+      "expected": { "rule": "(no match — invalid rule)", "app": false, "moved": null, "invalid": true } },
+    { "name": "brackets that are not a move", "input": { "display": "app (beta → stable)" },
+      "expected": { "rule": "app (beta → stable)", "app": false, "moved": null, "invalid": false } },
+    { "name": "only the marker", "input": { "display": " (app)" },
+      "expected": { "rule": " (app)", "app": false, "moved": null, "invalid": false } },
+    { "name": "empty", "input": { "display": "" },
+      "expected": { "rule": "", "app": false, "moved": null, "invalid": false } }
+  ]
+}

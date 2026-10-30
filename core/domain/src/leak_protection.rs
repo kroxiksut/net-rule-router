@@ -12,10 +12,11 @@ use crate::RouteBehaviorMode;
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub enum LeakProtection {
     /// Nothing is held back: a dropped tunnel falls back to the main link.
-    #[default]
     Off,
     /// What the rules send through the additional connection never leaves
-    /// over the main one; everything else keeps working.
+    /// over the main one; everything else keeps working. The default: a VPN
+    /// that is off, drops or starts late must not leak the sites meant for it.
+    #[default]
     Sites,
     /// Nothing leaves except through the additional connection, the local
     /// network and what the rules send over the main connection.
@@ -286,8 +287,14 @@ mod tests {
         }
     }
 
+    /// A user who never chose keeps what the rules send to the VPN off the
+    /// main link while it is down, and nothing else is held.
     #[test]
-    fn a_fresh_user_starts_unprotected() {
-        assert_eq!(LeakProtection::default(), LeakProtection::Off);
+    fn a_fresh_user_starts_with_routed_sites_protected() {
+        assert_eq!(LeakProtection::default(), LeakProtection::Sites);
+        assert_eq!(
+            protection_posture(Main, LeakProtection::default(), false),
+            BlockRuleDestinations
+        );
     }
 }

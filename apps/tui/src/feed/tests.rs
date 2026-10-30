@@ -422,7 +422,7 @@ fn v_asks_about_the_chosen_block() {
     arrive(&mut app, blocked("newer.example", "", "unattributed"));
     to_feed(&mut app);
     assert!(
-        feed_text(&app).contains("v: To additional route"),
+        feed_text(&app).contains("v: Through additional"),
         "{}",
         feed_text(&app)
     );

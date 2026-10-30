@@ -10,6 +10,8 @@ use nrr_shared::driver_family;
 use nrr_shared::ipc_payloads::{InterfaceRowDto, RouteBindingDto};
 use nrr_shared::product_identity::TUN_ADAPTER_NAME;
 
+use crate::vpn_client_trust::{link_tie_words, shares_a_word, strip_exe, PickerRow};
+use crate::vpn_gateway::program_file_name;
 use crate::{js, Route};
 
 /// A field as the window's mapped row has it: a missing address reads `-`.
@@ -298,6 +300,47 @@ pub fn first_run_suggestion(
     hits.next().is_none().then_some(first)
 }
 
+/// The adapter that came up since `before` (`firstRunJustConnected`): the
+/// first-run window names it as the VPN the user has just started. Connected
+/// now, absent or down then, holding no role, not the product's own tunnel and
+/// not `skip` (the main connection's pick); a tunnel wins over a link that came
+/// up with it.
+pub fn first_run_just_connected(
+    before: &[InterfaceRowDto],
+    now: &[InterfaceRowDto],
+    skip: Option<usize>,
+) -> Option<usize> {
+    let key = |row: &InterfaceRowDto| {
+        if row.persistent_id.is_empty() {
+            row.name.clone()
+        } else {
+            row.persistent_id.clone()
+        }
+    };
+    let was_up = |row: &InterfaceRowDto| {
+        let wanted = key(row);
+        before
+            .iter()
+            .any(|old| old.availability == "available" && key(old) == wanted)
+    };
+    let hits: Vec<usize> = now
+        .iter()
+        .enumerate()
+        .filter(|(index, row)| {
+            Some(*index) != skip
+                && row.availability == "available"
+                && !is_own_fake_ip_tun(row)
+                && row.selected_role.as_deref().is_none_or(str::is_empty)
+                && !was_up(row)
+        })
+        .map(|(index, _)| index)
+        .collect();
+    hits.iter()
+        .copied()
+        .find(|&index| looks_like_tunnel(&now[index]))
+        .or_else(|| hits.first().copied())
+}
+
 /// The role `row` holds other than `role`, if any (`adapterHeldOtherRole`).
 /// One adapter cannot carry both routes.
 pub fn held_other_role(row: &InterfaceRowDto, role: Route) -> Option<&str> {
@@ -401,4 +444,178 @@ pub fn driver_siblings(rows: &[InterfaceRowDto], index: usize, role: Route) -> D
         }
     }
     found
+}
+
+/// A VPN adapter that is not connected, offered for the additional route.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct IdleVpn {
+    /// Its row.
+    pub index: usize,
+    /// The found VPN program it most likely belongs to; empty when unsure.
+    pub program: String,
+}
+
+/// What the additional-connection step offers among adapters that are down.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct IdleVpns {
+    pub rows: Vec<IdleVpn>,
+    /// Picked for the user when it is the only one.
+    pub preselect: Option<usize>,
+    /// Programs whose adapter is one of several copies of a driver, all down:
+    /// which copy the VPN takes shows only once it is on, so none is offered
+    /// and the user is asked to turn it on. Empty label when unsure.
+    pub start_vpn_first: Vec<String>,
+}
+
+/// How a found program is called: its name, else its file name.
+fn program_label(program: &PickerRow) -> &str {
+    let name = js::trim(&program.display_name);
+    strip_exe(if name.is_empty() {
+        program_file_name(&program.exe_path)
+    } else {
+        name
+    })
+}
+
+/// For the down row `index`, whether other copies of its driver sit on the
+/// machine, and if so whether one of them is up. `None` for a lone copy.
+fn driver_pool(rows: &[InterfaceRowDto], index: usize, skip: Option<usize>) -> Option<bool> {
+    let family = driver_family(&rows.get(index)?.interface_description);
+    if family.is_empty() {
+        return None;
+    }
+    let mut copies = rows
+        .iter()
+        .enumerate()
+        .filter(|(i, row)| {
+            *i != index
+                && Some(*i) != skip
+                && offered_for_role(row, Route::Secondary)
+                && driver_family(&row.interface_description) == family
+        })
+        .peekable();
+    copies.peek()?;
+    Some(copies.any(|(_, row)| row.availability == "available"))
+}
+
+/// VPN adapters that are down, once a VPN program was found on the machine
+/// (`firstRunIdleVpns`): offered on the additional-connection step without
+/// the "show unavailable" box, since the VPN is simply not started yet. The
+/// adapters tied by a word (or by the interface discovery names) to a found
+/// program; with none tied, the untied ones. A copy of a driver with other
+/// copies beside it is never offered. Picked for the user only when it is the
+/// one down VPN adapter on the machine, or the one a program names as its
+/// link: a VPN client brings up whichever adapter it likes, of any driver, so
+/// among several the programs they may belong to land in `start_vpn_first`
+/// (unless a copy of that driver is already up) and the user is asked to turn
+/// the VPN on. `skip` is the main connection's pick.
+pub fn first_run_idle_vpns(
+    rows: &[InterfaceRowDto],
+    programs: &[PickerRow],
+    skip: Option<usize>,
+) -> IdleVpns {
+    let named: Vec<(&PickerRow, &str)> = programs
+        .iter()
+        .map(|p| (p, program_label(p)))
+        .filter(|(_, label)| !label.is_empty())
+        .collect();
+    let mut found = IdleVpns::default();
+    if named.is_empty() {
+        return found;
+    }
+    let mut distinct: Vec<&str> = Vec::new();
+    for (_, label) in &named {
+        if !distinct.contains(label) {
+            distinct.push(label);
+        }
+    }
+    let candidates = rows.iter().enumerate().filter(|(index, row)| {
+        Some(*index) != skip
+            && row.availability != "available"
+            && offered_for_role(row, Route::Secondary)
+            && looks_like_tunnel(row)
+    });
+    let mut seen: Vec<Candidate> = Vec::new();
+    for (index, row) in candidates {
+        let words = link_tie_words(&format!("{} {}", row.name, row.interface_description));
+        let names_link = |p: &PickerRow| {
+            !js::trim(&p.interface_name).is_empty()
+                && js::trim(&p.interface_name).eq_ignore_ascii_case(js::trim(&row.name))
+        };
+        let owner = named.iter().find(|(p, _)| {
+            shares_a_word(&words, &p.display_name)
+                || shares_a_word(&words, &p.exe_path)
+                || names_link(p)
+        });
+        let program = match (owner, distinct.as_slice()) {
+            (Some((_, label)), _) | (None, [label]) => (*label).to_owned(),
+            (None, _) => String::new(),
+        };
+        let named_link = named.iter().any(|(p, _)| names_link(p));
+        seen.push(Candidate {
+            index,
+            program,
+            tied: owner.is_some(),
+            named_link,
+            pooled: if named_link {
+                None
+            } else {
+                driver_pool(rows, index, skip)
+            },
+        });
+    }
+    // A program that names its link has said which adapter is the VPN's.
+    if seen.iter().any(|c| c.named_link) {
+        found.rows = seen
+            .iter()
+            .filter(|c| c.named_link)
+            .map(|c| c.idle())
+            .collect();
+        if let [only] = found.rows.as_slice() {
+            found.preselect = Some(only.index);
+        }
+        return found;
+    }
+    let by_tie = seen.iter().any(|c| c.tied);
+    found.rows = seen
+        .iter()
+        .filter(|c| c.tied == by_tie && c.pooled.is_none())
+        .map(|c| c.idle())
+        .collect();
+    if let ([only], [_]) = (found.rows.as_slice(), seen.as_slice()) {
+        found.preselect = Some(only.index);
+        return found;
+    }
+    // Several candidates: the programs they may belong to, named ones first;
+    // a driver with a copy already up is the VPN that is on, not one to start.
+    for c in seen.iter().filter(|c| c.pooled != Some(true)) {
+        if !found.start_vpn_first.contains(&c.program) {
+            found.start_vpn_first.push(c.program.clone());
+        }
+    }
+    if found.start_vpn_first.iter().any(|p| !p.is_empty()) {
+        found.start_vpn_first.retain(|p| !p.is_empty());
+    }
+    found
+}
+
+/// A down VPN adapter as the step weighs it.
+struct Candidate {
+    index: usize,
+    program: String,
+    /// Tied by a word to a found program.
+    tied: bool,
+    /// A program names this very link.
+    named_link: bool,
+    /// Other copies of its driver on the machine, and whether one is up.
+    pooled: Option<bool>,
+}
+
+impl Candidate {
+    fn idle(&self) -> IdleVpn {
+        IdleVpn {
+            index: self.index,
+            program: self.program.clone(),
+        }
+    }
 }

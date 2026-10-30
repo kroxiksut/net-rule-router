@@ -91,7 +91,7 @@ affected.
 Entries in the `hosts` file and local-network names ending in `.local` are
 answered on the computer itself, without a DNS query, so a rule for such a
 name does not see them. Route the address instead. On systems that run the
-name service cache (`nscd`, common on RED OS and the RHEL family) an answer it
+name service cache (`nscd`, common on the RHEL family, RED OS among it) an answer it
 already holds is used until it expires; NetRuleRouter clears that cache when
 it takes over name lookups and when it gives them back.
 
@@ -141,7 +141,7 @@ goes through a connection they did not choose. See
 
 ## Strict reverse-path filtering on Linux
 
-On Linux systems that turn on strict reverse-path filtering (common on RED OS
-and the RHEL family), a second signed-in user may get no replies from sites
+On Linux systems that turn on strict reverse-path filtering (common on the RHEL
+family, RED OS among it), a second signed-in user may get no replies from sites
 routed through the additional connection. This has not been checked on a live
 system yet.

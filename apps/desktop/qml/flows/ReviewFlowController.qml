@@ -229,8 +229,7 @@ QtObject {
                 root.showNotice(
                     root.tr("dialog.nothing-to-apply.title", "Nothing to apply"),
                     root.tr("dialog.nothing-to-apply.body",
-                        "There are no changes to apply — the current rules already "
-                        + "match what is active."))
+                        "Nothing to apply: the rules on screen are already in use."))
                 _resolveGuardRulesApply(false)
                 return
             }
@@ -438,18 +437,13 @@ QtObject {
             // Admin baseline edit succeeded.
             root.statusLine = root.tr("status.baseline-activate-completed",
                 "Baseline rules updated for all users on this computer.")
-            // This WAS an elevated mutation — a success while the GUI is
-            // non-elevated means the broker obtained admin approval.
-            if (!_isAppElevated()) root._brokerSessionElevated = true
+            // An elevated mutation: the broker says whether its session lives on.
+            if (!_isAppElevated()) root.refreshBackendStatus()
         } else {
             root.statusLine = root.tr("status.rules-activate-completed",
                 "Rules activated.")
         }
-        // A normal (per-principal) rules apply is
-        // user-scoped (non-elevated): success does NOT imply the broker
-        // engaged, so we do NOT flip `_brokerSessionElevated` for it
-        // (only the admin-baseline branch above + genuinely elevated
-        // service ops via `onBrokerSessionEstablished` do).
+        // A per-principal apply is non-elevated: the broker is not asked.
         // Successful submission of the
         // current rules state means the in-memory model now
         // matches what the service has. Drop the dirty flag so
@@ -488,6 +482,9 @@ QtObject {
                 })
             } })
         } else {
+            // A rule deleted and applied takes its comment with it; the shared
+            // baseline is not the user's own table.
+            if (!root.pendingReviewState.adminBaseline) root._gcSidecarCommentOrphans(true)
             root.boundFilesController._reconcileBoundFileDirty()
             // The linked .txt mirrors what is enforced: re-export the
             // just-activated rules so it never goes stale and the next

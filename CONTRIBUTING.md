@@ -1,7 +1,7 @@
 # Contributing
 
-NetRuleRouter is in alpha. Windows builds and runs today; Linux is in progress
-and macOS has not started. That shapes what is useful right now: a precise bug
+NetRuleRouter is in alpha. Windows and Linux build and run today; macOS has
+not started. That shapes what is useful right now: a precise bug
 report is worth more than a feature patch, and an issue before a pull request
 saves both of us the work of discovering that a change does not fit.
 

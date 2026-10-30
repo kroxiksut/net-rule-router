@@ -476,10 +476,16 @@ const IDENTITY_LEDGER_CAP: usize = 64;
 
 impl IdentityLedger {
     /// Record a pairing, evicting the oldest once the cap is reached.
-    fn remember(&mut self, name: String, id: String) {
+    /// `id_is_shared`: several adapters answer to `id` at once (one MAC on
+    /// two adapters of a card), so it names no single adapter to follow.
+    fn remember(&mut self, name: String, id: String, id_is_shared: bool) {
         let already = self.id_of_name.get(&name) == Some(&id);
         self.id_of_name.insert(name.clone(), id.clone());
-        self.name_of_id.insert(id.clone(), name.clone());
+        if id_is_shared {
+            self.name_of_id.remove(&id);
+        } else {
+            self.name_of_id.insert(id.clone(), name.clone());
+        }
         if already {
             return;
         }
@@ -614,16 +620,22 @@ impl AdapterMonitor {
     /// Returns the drifts observed this call, so a test can assert on them
     /// without reading the log.
     fn note_identity_drift(&self, infos: &[AdapterInfo]) -> Vec<IdentityDrift> {
-        let mut ledger = self.identity_seen.lock().unwrap();
-        let mut drifts = Vec::new();
-        for info in infos {
-            let name = info.friendly_name.trim();
-            let id = info.stable_id();
+        let named: Vec<(&str, String)> = infos
+            .iter()
+            .map(|info| (info.friendly_name.trim(), info.stable_id()))
             // A nameless adapter carries no pairing worth remembering: the
             // whole question is what happens to the name and the id TOGETHER.
-            if name.is_empty() || id.is_empty() {
-                continue;
-            }
+            .filter(|(name, id)| !name.is_empty() && !id.is_empty())
+            .collect();
+        let mut holders: HashMap<&str, usize> = HashMap::with_capacity(named.len());
+        for (_, id) in &named {
+            *holders.entry(id.as_str()).or_default() += 1;
+        }
+        let mut ledger = self.identity_seen.lock().unwrap();
+        let mut drifts = Vec::new();
+        for (name, id) in &named {
+            let id_is_shared = holders.get(id.as_str()).is_some_and(|n| *n > 1);
+            let (name, id) = (*name, id.clone());
             if let Some(previous) = ledger.id_of_name.get(name) {
                 if previous != &id {
                     drifts.push(IdentityDrift::SameNameNewIdentity {
@@ -633,7 +645,7 @@ impl AdapterMonitor {
                     });
                 }
             }
-            if let Some(previous) = ledger.name_of_id.get(&id) {
+            if let Some(previous) = ledger.name_of_id.get(&id).filter(|_| !id_is_shared) {
                 if previous != name {
                     drifts.push(IdentityDrift::SameIdentityNewName {
                         id: id.clone(),
@@ -642,7 +654,7 @@ impl AdapterMonitor {
                     });
                 }
             }
-            ledger.remember(name.to_string(), id);
+            ledger.remember(name.to_string(), id, id_is_shared);
         }
         for drift in &drifts {
             match drift {
@@ -956,6 +968,47 @@ mod tests {
         let monitor = monitor_with(Arc::clone(&source));
         source.set(vec![tun(30, "{SAME-GUID}", "examplevpn")]);
         for _ in 0..5 {
+            assert!(monitor
+                .note_identity_drift(&source.enumerate_all().unwrap())
+                .is_empty());
+        }
+    }
+
+    /// Field case: a laptop's wired port and a second adapter of the same card
+    /// report one MAC, so both carry one identity under two names. Nothing
+    /// changes, yet every tick logged each one as renamed to the other.
+    #[test]
+    fn two_adapters_sharing_one_identity_are_not_a_rename_every_tick() {
+        let source = Arc::new(MockAdapterEventSource::new());
+        let monitor = monitor_with(Arc::clone(&source));
+        let mut wired = tun(26, "{WIRED}", "Ethernet");
+        wired.mac = Some([0x18, 0x69, 0x45, 0x80, 0xca, 0x96]);
+        let mut twin = tun(10, "{TWIN}", "Ethernet 2");
+        twin.mac = wired.mac;
+        source.set(vec![wired, twin]);
+        for tick in 0..5 {
+            assert_eq!(
+                monitor.note_identity_drift(&source.enumerate_all().unwrap()),
+                Vec::new(),
+                "tick {tick}: an unchanged adapter set reports no drift"
+            );
+        }
+    }
+
+    #[test]
+    fn a_rename_is_reported_once_not_every_tick() {
+        let source = Arc::new(MockAdapterEventSource::new());
+        let monitor = monitor_with(Arc::clone(&source));
+        source.set(vec![tun(30, "{SAME-GUID}", "examplevpn")]);
+        monitor.note_identity_drift(&source.enumerate_all().unwrap());
+        source.set(vec![tun(30, "{SAME-GUID}", "examplevpn renamed")]);
+        assert_eq!(
+            monitor
+                .note_identity_drift(&source.enumerate_all().unwrap())
+                .len(),
+            1
+        );
+        for _ in 0..3 {
             assert!(monitor
                 .note_identity_drift(&source.enumerate_all().unwrap())
                 .is_empty());

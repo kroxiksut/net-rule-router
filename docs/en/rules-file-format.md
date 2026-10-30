@@ -973,7 +973,7 @@ Key properties:
 The settings export is a YAML file that keeps your routing setup in one
 place: which connections you use for the two routes, your rules for both of
 them, and how routing behaves. It is written when you choose
-"Export full settings (YAML)" in Settings → Presets and settings, or
+"Export full settings (YAML)" in Settings → Rules and settings files, or
 "Export full settings" in the settings of the terminal interface.
 
 There is no "Import settings" yet: neither the window nor the terminal

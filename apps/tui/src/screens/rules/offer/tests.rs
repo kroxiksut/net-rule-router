@@ -99,19 +99,32 @@ fn a_user_with_no_rules_is_offered_the_set_and_nothing_is_loaded_unasked() {
     );
 }
 
-/// `l` loads the set as picking it from the list does — on to the service's
-/// review — and answers the offer for both clients.
+/// `l` loads the set as picking it from the list does and applies it: the
+/// user asked for the set by its name, so the service's review is not asked
+/// again (the window's banner does the same). It answers the offer for both
+/// clients.
 #[test]
-fn l_loads_the_offered_set_into_the_review_and_answers_the_offer() {
+fn l_applies_the_offered_set_without_a_review_and_answers_the_offer() {
     let dir = Scratch::new("offer-load");
     let fake = service(Vec::new());
     let mut app = app(&dir, &fake, |_| {});
     assert!(press(&mut app, 'l'));
     drain(&mut app, &fake);
     assert!(
-        matches!(app.rules.mode, Mode::Review(_)),
-        "{:?}",
+        !matches!(app.rules.mode, Mode::Review(_)),
+        "the review was asked again: {:?}",
         app.rules.mode
+    );
+    let submits = fake.sent(IpcOperationName::MutationSubmit);
+    // The outcome is then read by a preview of what was confirmed.
+    assert_eq!(
+        submits
+            .iter()
+            .take(2)
+            .map(|s| s["dry-run"].as_bool())
+            .collect::<Vec<_>>(),
+        vec![Some(true), Some(false)],
+        "checked, then applied: {submits:#?}"
     );
     assert!(
         !app.rules.table.rows.is_empty(),

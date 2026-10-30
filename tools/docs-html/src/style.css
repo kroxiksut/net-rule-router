@@ -28,11 +28,12 @@ body {
 header.site, main { max-width: 60rem; margin: 0 auto; padding-left: 1rem; padding-right: 1rem; }
 header.site {
   display: flex; flex-wrap: wrap; gap: .5rem 1.5rem;
-  align-items: baseline; justify-content: space-between;
+  align-items: center; justify-content: space-between;
   padding-top: .75rem; padding-bottom: .75rem;
   border-bottom: 1px solid var(--border);
 }
 header.site .home { font-weight: 600; }
+header.site img.lockup { display: block; width: 16rem; max-width: 100%; height: auto; border: 0; border-radius: 0; }
 nav.languages a + a { margin-left: 1rem; }
 main { padding-bottom: 3rem; }
 a { color: var(--link); }

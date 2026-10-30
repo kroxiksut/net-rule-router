@@ -188,7 +188,11 @@ fn the_settings_reader_takes_the_exporters_own_output_and_ignores_its_adapters()
         .yaml_bytes_utf8;
     let facts = read_settings_export(yaml.as_bytes()).expect("read");
     assert_eq!(facts.route_mode, Some(BehaviorMode::PreferPrimary));
-    assert_eq!(facts.leak_protection, Some(nrr_domain::LeakProtection::Off));
+    // A user who never chose exports the default level.
+    assert_eq!(
+        facts.leak_protection,
+        Some(nrr_domain::LeakProtection::Sites)
+    );
 }
 
 #[test]

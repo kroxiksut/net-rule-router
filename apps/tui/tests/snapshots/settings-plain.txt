@@ -1,7 +1,7 @@
 Screens:
   1. Status
   2. First run
-  3. Interfaces and routes
+  3. Connections
   4. Rules
   5. Overlaps
   6. Suggested addresses
@@ -17,7 +17,7 @@ Settings sections:
     c2. Routing behavior
     c3. Apply failure policy
     c4. Service management
-    c5. Presets and settings
+    c5. Rules and settings files
     c6. Logs and diagnostics
     c7. Traffic statistics
     c8. About and updates
@@ -35,7 +35,7 @@ Settings sections:
     c2. Routing behavior
     c3. Apply failure policy
     c4. Service management
-    c5. Presets and settings
+    c5. Rules and settings files
     c6. Logs and diagnostics
     c7. Traffic statistics
     c8. About and updates
@@ -83,7 +83,7 @@ Settings sections:
     c2. Routing behavior
     c3. Apply failure policy
     c4. Service management
-    c5. Presets and settings
+    c5. Rules and settings files
     c6. Logs and diagnostics
     c7. Traffic statistics
     c8. About and updates

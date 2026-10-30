@@ -139,6 +139,13 @@ impl ConnectionObservationConsumer {
             .is_some_and(|(spec_id, check)| check(spec_id))
     }
 
+    /// Our own fake-address machinery dropped `rec`: UDP into the pool stays
+    /// closed while the relay carries TCP only, so QUIC falls back at once.
+    /// Nobody's block — no reason, no notice, no rule to offer.
+    pub(super) fn is_fake_pool_drop(&self, rec: &ConnectionTraceRecord) -> bool {
+        rec.blocked_by_nrr == Some(true) && self.fake_ip_pool.contains(rec.remote.ip())
+    }
+
     /// Which of our filters dropped `rec` — one reading for the block notice
     /// and the connection trace, so the two never name different causes.
     pub(super) fn reason_for_drop(
@@ -156,8 +163,13 @@ impl ConnectionObservationConsumer {
             .zip(self.ipv6_cut_drop_check.as_ref())
             .is_some_and(|(spec_id, check)| check(spec_id));
         let armed = self.fail_closed_armed.as_ref().is_some_and(|armed| armed());
+        // With the deny classifier wired a rule's filter was named above, so an
+        // identified filter that reaches the fallback is some other one of ours.
+        let rule_fallback = rec
+            .nrr_drop_spec_id
+            .filter(|_| self.rule_block_drop_check.is_none());
         block_reason_for(
-            rec.nrr_drop_spec_id,
+            rule_fallback,
             killswitch_verified,
             armed,
             ipv6_cut,
@@ -185,7 +197,8 @@ impl ConnectionObservationConsumer {
         if nrr_domain::address_class::is_local_housekeeping_endpoint(
             rec.remote.ip(),
             rec.remote.port(),
-        ) {
+        ) || self.is_fake_pool_drop(rec)
+        {
             return;
         }
         let reason = self.reason_for_drop(rec, killswitch_verified);

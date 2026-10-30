@@ -366,7 +366,10 @@ fn setting_name(setting: &str) -> Key {
     match setting {
         "primary" => keys::ROLE_PRIMARY,
         "secondary" => keys::ROLE_SECONDARY,
-        "mode" => key("settings.routing.default-route.title", "Default route"),
+        "mode" => key(
+            "settings.routing.default-route.title",
+            "Where everything else goes",
+        ),
         "leak-protection" => key("settings.routing.kill-switch.title", "Leak protection"),
         "kill-switch-protocols" => key(
             "settings.routing.kill-switch.protocols.label",

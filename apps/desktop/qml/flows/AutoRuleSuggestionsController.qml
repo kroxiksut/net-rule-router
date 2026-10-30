@@ -100,9 +100,9 @@ QtObject {
         if (anchor !== "" && Pure.autoRuleNoticeKind(rows) === "sites-blocked") {
             return {
                 "sitesBlocked": true,
-                "title": root.tr("tray.auto-rules.title-blocked", "Sites the main route will not carry"),
+                "title": root.tr("tray.auto-rules.title-blocked", "Sites the main connection will not carry"),
                 "body": root.tr("tray.auto-rules.body-blocked",
-                        "Connections to {name} keep failing on the main route.")
+                        "Connections to {name} keep failing on the main connection.")
                     .replace("{name}", Pure.displayText(anchor))
             }
         }

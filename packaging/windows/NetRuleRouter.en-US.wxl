@@ -38,4 +38,14 @@
   <String Id="NrrRemoveNote" Value="Keeping them lets a later installation pick up where you left off. Complete removal erases the service's data and your own NetRuleRouter settings; data of other Windows accounts is listed in the removal log, not deleted, and rule files you saved in your own folders are kept." />
   <String Id="NrrRemoveAudit" Value="Also erase the &amp;audit trail" />
   <String Id="NrrRemoveAuditNote" Value="The audit trail is the security record of every change made to routing on this computer. Keep it unless you are sure nobody will need it." />
+
+  <String Id="NrrExitLog" Value="The log of this installation, with every step it took: [MsiLogFileLocation]" />
+  <String Id="NrrProgressCloseApps" Value="Closing the NetRuleRouter window and tray icon" />
+  <String Id="NrrProgressMarkStop" Value="Preparing the background service to stop" />
+  <String Id="NrrProgressProvision" Value="Handing the given rule files to the background service" />
+  <String Id="NrrProgressRegister" Value="Registering and starting the background service" />
+  <String Id="NrrProgressRollback" Value="Undoing the background service changes" />
+  <String Id="NrrProgressConsoleLinks" Value="Adding the console tools" />
+  <String Id="NrrProgressRemoveUserData" Value="Erasing your NetRuleRouter settings" />
+  <String Id="NrrProgressUnregister" Value="Removing the background service and restoring the network settings" />
 </WixLocalization>

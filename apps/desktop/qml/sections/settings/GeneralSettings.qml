@@ -136,7 +136,7 @@ GroupBox {
             wrapMode: Text.WordWrap
             font.pixelSize: root.uiTheme.baseFontSizePx - 1
             text: root.tr("settings.general.show-welcome.description",
-                "Re-runs the first-launch flow: service install prompt (if not yet installed) and then the preset wizard. Useful when you want to import a different starter rule set.")
+                "Shows the first steps again: the offer to install the service (if it is not installed) and the choice of starting rules. Handy when you want to load a different starting rule set.")
         }
 
         Rectangle {
@@ -208,7 +208,7 @@ GroupBox {
         // (e.g. application rules left off pending per-process routing).
         Label {
             Layout.fillWidth: true
-            text: root.tr("settings.general.import-only-active.title", "Importing presets")
+            text: root.tr("settings.general.import-only-active.title", "Loading rules from a file")
             color: root.textColor
             font.bold: true
         }
@@ -227,7 +227,7 @@ GroupBox {
             wrapMode: Text.WordWrap
             font.pixelSize: root.uiTheme.baseFontSizePx - 1
             text: root.tr("settings.general.import-only-active.description",
-                "When on, rules that are turned off in the imported preset (for example application rules, which can't route yet) are skipped instead of added as disabled rows. Turn off to import everything.")
+                "When on, rules that are turned off in the file you load are skipped instead of added as turned-off rules. Turn it off to load everything.")
         }
         ThemedButton {
             theme: root.uiTheme

@@ -99,6 +99,7 @@ fn event_loop(
         if now.duration_since(followed_at) >= IDLE_REDRAW {
             followed_at = now;
             dirty |= crate::screens::rules::follow_settings_file(app);
+            crate::screens::wizard::poll_adapters(app, now);
         }
         if dirty || now.duration_since(drawn_at) >= IDLE_REDRAW {
             terminal.draw(|frame| draw(frame, app, texts, options, now))?;

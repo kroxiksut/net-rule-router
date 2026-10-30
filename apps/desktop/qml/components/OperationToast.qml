@@ -152,7 +152,7 @@ Rectangle {
                 color: dismissButton.hovered ? theme.stateHoverFill : "transparent"
                 radius: theme.radiusSm
                 border.width: dismissButton.visualFocus ? 2 : 0
-                border.color: theme.colorFocusRing
+                border.color: theme.colorButtonOutline
             }
             contentItem: Label {
                 text: dismissButton.text

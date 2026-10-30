@@ -1,0 +1,1119 @@
+{
+  "description": "firstRunIdleVpns / first_run_idle_vpns: once a VPN program is found on the machine, the additional-connection step offers its adapters that are down without the 'show unavailable' box. Adapters tied by a word (or by the interface the program names) to a found program; else the untied ones, named by the program when only one was found. A copy of a driver with other copies beside it (any state, among adapters the additional route may take) is never offered: the VPN brings up whichever copy it likes, so its program goes to `startVpnFirst` instead, unless a copy is up already or the program names that link. Nothing is picked unless the candidate is the one down VPN adapter on the machine (or the link a program names): a VPN client brings up whichever adapter it likes, of any driver, so among several the programs they may belong to go to `startVpnFirst`. `rows` are patches over `base-row`, `programs` are found programs, `skip` the main connection's pick; `expected.rows` lists `{index, program}`, `preselect` -1 for none.",
+  "base-row": {
+    "persistent-id": "{00000000-0000-0000-0000-000000000001}",
+    "adapter-name": "{00000000-0000-0000-0000-000000000001}",
+    "name": "Ethernet",
+    "interface-description": "Example Gigabit Network Connection",
+    "interface-type": "ethernet",
+    "kind": "ethernet",
+    "is-bluetooth-like": false,
+    "local-ip": "192.0.2.10",
+    "gateway": "192.0.2.1",
+    "dns-servers": "192.0.2.53",
+    "has-default-route": true,
+    "has-forwarding-path": true,
+    "availability": "available",
+    "route-state": "not-selected",
+    "observed-facts": {
+      "connectivity-state": "internet",
+      "external-ip-status": "unknown",
+      "external-ip": null,
+      "external-probe-attempted": false,
+      "external-probe-note": ""
+    },
+    "derived-assessment": {
+      "vpn-tunnel-likelihood": "unlikely",
+      "virtual-interface-likelihood": "unlikely",
+      "service-interface-likelihood": "unlikely",
+      "classification": "regular-interface",
+      "confidence-percent": 90,
+      "heuristic-only": true,
+      "signals": []
+    },
+    "recommendation": {
+      "class": "preferred-primary",
+      "confidence": "high",
+      "advisory-only": true,
+      "key-signals": [],
+      "excluded-alternatives": []
+    }
+  },
+  "cases": [
+    {
+      "name": "hidemy.name installed, three copies of its TAP driver all down: no copy is guessed, the user is asked to turn the VPN on",
+      "input": {
+        "rows": [
+          {
+            "selected-role": "primary"
+          },
+          {
+            "persistent-id": "{tap1}",
+            "adapter-name": "{tap1}",
+            "name": "Ethernet 2",
+            "interface-description": "TAP-Windows Adapter V9",
+            "kind": "tunnel",
+            "availability": "unavailable",
+            "gateway": "-",
+            "has-default-route": false,
+            "has-forwarding-path": false,
+            "derived-assessment": {
+              "vpn-tunnel-likelihood": "likely",
+              "classification": "vpn-tunnel"
+            },
+            "recommendation": {
+              "class": "preferred-secondary"
+            }
+          },
+          {
+            "persistent-id": "{tap2}",
+            "adapter-name": "{tap2}",
+            "name": "Ethernet 3",
+            "interface-description": "TAP-Windows Adapter V9 #2",
+            "kind": "tunnel",
+            "availability": "unavailable",
+            "gateway": "-",
+            "has-default-route": false,
+            "has-forwarding-path": false,
+            "derived-assessment": {
+              "vpn-tunnel-likelihood": "likely",
+              "classification": "vpn-tunnel"
+            },
+            "recommendation": {
+              "class": "preferred-secondary"
+            }
+          },
+          {
+            "persistent-id": "{tap3}",
+            "adapter-name": "{tap3}",
+            "name": "Ethernet 4",
+            "interface-description": "TAP-Windows Adapter V9 #3",
+            "kind": "tunnel",
+            "availability": "unavailable",
+            "gateway": "-",
+            "has-default-route": false,
+            "has-forwarding-path": false,
+            "derived-assessment": {
+              "vpn-tunnel-likelihood": "likely",
+              "classification": "vpn-tunnel"
+            },
+            "recommendation": {
+              "class": "preferred-secondary"
+            }
+          }
+        ],
+        "programs": [
+          {
+            "displayName": "hidemy.name VPN 3.0",
+            "exePath": "C:\\Program Files (x86)\\hidemy.name VPN 3.0\\hidemy.name VPN.exe",
+            "running": false,
+            "source": "installed",
+            "interfaceName": ""
+          }
+        ],
+        "skip": 0
+      },
+      "expected": {
+        "rows": [],
+        "preselect": -1,
+        "startVpnFirst": [
+          "hidemy.name VPN 3.0"
+        ]
+      }
+    },
+    {
+      "name": "no VPN program found: nothing is offered among the down adapters",
+      "input": {
+        "rows": [
+          {
+            "selected-role": "primary"
+          },
+          {
+            "persistent-id": "{tap1}",
+            "adapter-name": "{tap1}",
+            "name": "Ethernet 2",
+            "interface-description": "TAP-Windows Adapter V9",
+            "kind": "tunnel",
+            "availability": "unavailable",
+            "gateway": "-",
+            "has-default-route": false,
+            "has-forwarding-path": false,
+            "derived-assessment": {
+              "vpn-tunnel-likelihood": "likely",
+              "classification": "vpn-tunnel"
+            },
+            "recommendation": {
+              "class": "preferred-secondary"
+            }
+          }
+        ],
+        "programs": [],
+        "skip": 0
+      },
+      "expected": {
+        "rows": [],
+        "preselect": -1,
+        "startVpnFirst": []
+      }
+    },
+    {
+      "name": "an adapter tied by a word to the program is offered over an untied driver, but not picked: two candidates ask for the VPN to be turned on",
+      "input": {
+        "rows": [
+          {
+            "selected-role": "primary"
+          },
+          {
+            "persistent-id": "{tap1}",
+            "adapter-name": "{tap1}",
+            "name": "Ethernet 2",
+            "interface-description": "TAP-Windows Adapter V9",
+            "kind": "tunnel",
+            "availability": "unavailable",
+            "gateway": "-",
+            "has-default-route": false,
+            "has-forwarding-path": false,
+            "derived-assessment": {
+              "vpn-tunnel-likelihood": "likely",
+              "classification": "vpn-tunnel"
+            },
+            "recommendation": {
+              "class": "preferred-secondary"
+            }
+          },
+          {
+            "persistent-id": "{ExampleVPN}",
+            "adapter-name": "{ExampleVPN}",
+            "name": "ExampleVPN",
+            "interface-description": "Wintun Userspace Tunnel",
+            "kind": "tunnel",
+            "availability": "unavailable",
+            "gateway": "-",
+            "has-default-route": false,
+            "has-forwarding-path": false,
+            "derived-assessment": {
+              "vpn-tunnel-likelihood": "likely",
+              "classification": "vpn-tunnel"
+            },
+            "recommendation": {
+              "class": "preferred-secondary"
+            }
+          }
+        ],
+        "programs": [
+          {
+            "displayName": "",
+            "exePath": "C:\\Program Files\\ExampleVPN\\examplevpn.exe",
+            "running": false,
+            "source": "installed",
+            "interfaceName": ""
+          }
+        ],
+        "skip": 0
+      },
+      "expected": {
+        "rows": [
+          {
+            "index": 2,
+            "program": "examplevpn"
+          }
+        ],
+        "preselect": -1,
+        "startVpnFirst": ["examplevpn"]
+      }
+    },
+    {
+      "name": "two programs, each tied to its adapter: both offered, none picked, both named",
+      "input": {
+        "rows": [
+          {
+            "selected-role": "primary"
+          },
+          {
+            "persistent-id": "{ExampleVPN}",
+            "adapter-name": "{ExampleVPN}",
+            "name": "ExampleVPN",
+            "interface-description": "Wintun Userspace Tunnel",
+            "kind": "tunnel",
+            "availability": "unavailable",
+            "gateway": "-",
+            "has-default-route": false,
+            "has-forwarding-path": false,
+            "derived-assessment": {
+              "vpn-tunnel-likelihood": "likely",
+              "classification": "vpn-tunnel"
+            },
+            "recommendation": {
+              "class": "preferred-secondary"
+            }
+          },
+          {
+            "persistent-id": "{Other Secure}",
+            "adapter-name": "{Other Secure}",
+            "name": "Other Secure",
+            "interface-description": "Other Secure Tunnel Adapter",
+            "kind": "tunnel",
+            "availability": "unavailable",
+            "gateway": "-",
+            "has-default-route": false,
+            "has-forwarding-path": false,
+            "derived-assessment": {
+              "vpn-tunnel-likelihood": "likely",
+              "classification": "vpn-tunnel"
+            },
+            "recommendation": {
+              "class": "preferred-secondary"
+            }
+          }
+        ],
+        "programs": [
+          {
+            "displayName": "",
+            "exePath": "C:\\Program Files\\ExampleVPN\\examplevpn.exe",
+            "running": false,
+            "source": "installed",
+            "interfaceName": ""
+          },
+          {
+            "displayName": "Other Secure",
+            "exePath": "C:\\Program Files\\Other Secure\\other.exe",
+            "running": true,
+            "source": "process",
+            "interfaceName": ""
+          }
+        ],
+        "skip": 0
+      },
+      "expected": {
+        "rows": [
+          {
+            "index": 1,
+            "program": "examplevpn"
+          },
+          {
+            "index": 2,
+            "program": "Other Secure"
+          }
+        ],
+        "preselect": -1,
+        "startVpnFirst": [
+          "examplevpn",
+          "Other Secure"
+        ]
+      }
+    },
+    {
+      "name": "two programs and an untied driver: offered without guessing the program",
+      "input": {
+        "rows": [
+          {
+            "selected-role": "primary"
+          },
+          {
+            "persistent-id": "{tap1}",
+            "adapter-name": "{tap1}",
+            "name": "Ethernet 2",
+            "interface-description": "TAP-Windows Adapter V9",
+            "kind": "tunnel",
+            "availability": "unavailable",
+            "gateway": "-",
+            "has-default-route": false,
+            "has-forwarding-path": false,
+            "derived-assessment": {
+              "vpn-tunnel-likelihood": "likely",
+              "classification": "vpn-tunnel"
+            },
+            "recommendation": {
+              "class": "preferred-secondary"
+            }
+          }
+        ],
+        "programs": [
+          {
+            "displayName": "hidemy.name VPN 3.0",
+            "exePath": "C:\\Program Files (x86)\\hidemy.name VPN 3.0\\hidemy.name VPN.exe",
+            "running": false,
+            "source": "installed",
+            "interfaceName": ""
+          },
+          {
+            "displayName": "Other Secure",
+            "exePath": "C:\\Program Files\\Other Secure\\other.exe",
+            "running": true,
+            "source": "process",
+            "interfaceName": ""
+          }
+        ],
+        "skip": 0
+      },
+      "expected": {
+        "rows": [
+          {
+            "index": 1,
+            "program": ""
+          }
+        ],
+        "preselect": 1,
+        "startVpnFirst": []
+      }
+    },
+    {
+      "name": "a lone driver beside a pool of copies: the lone one is offered but not picked, the pool asks for the VPN to be turned on",
+      "input": {
+        "rows": [
+          {
+            "selected-role": "primary"
+          },
+          {
+            "persistent-id": "{tap1}",
+            "adapter-name": "{tap1}",
+            "name": "Ethernet 2",
+            "interface-description": "TAP-Windows Adapter V9",
+            "kind": "tunnel",
+            "availability": "unavailable",
+            "gateway": "-",
+            "has-default-route": false,
+            "has-forwarding-path": false,
+            "derived-assessment": {
+              "vpn-tunnel-likelihood": "likely",
+              "classification": "vpn-tunnel"
+            },
+            "recommendation": {
+              "class": "preferred-secondary"
+            }
+          },
+          {
+            "persistent-id": "{wg-home}",
+            "adapter-name": "{wg-home}",
+            "name": "wg-home",
+            "interface-description": "WireGuard Tunnel",
+            "kind": "tunnel",
+            "availability": "unavailable",
+            "gateway": "-",
+            "has-default-route": false,
+            "has-forwarding-path": false,
+            "derived-assessment": {
+              "vpn-tunnel-likelihood": "likely",
+              "classification": "vpn-tunnel"
+            },
+            "recommendation": {
+              "class": "preferred-secondary"
+            }
+          },
+          {
+            "persistent-id": "{tap2}",
+            "adapter-name": "{tap2}",
+            "name": "Ethernet 3",
+            "interface-description": "TAP-Windows Adapter V9 #2",
+            "kind": "tunnel",
+            "availability": "unavailable",
+            "gateway": "-",
+            "has-default-route": false,
+            "has-forwarding-path": false,
+            "derived-assessment": {
+              "vpn-tunnel-likelihood": "likely",
+              "classification": "vpn-tunnel"
+            },
+            "recommendation": {
+              "class": "preferred-secondary"
+            }
+          }
+        ],
+        "programs": [
+          {
+            "displayName": "hidemy.name VPN 3.0",
+            "exePath": "C:\\Program Files (x86)\\hidemy.name VPN 3.0\\hidemy.name VPN.exe",
+            "running": false,
+            "source": "installed",
+            "interfaceName": ""
+          }
+        ],
+        "skip": 0
+      },
+      "expected": {
+        "rows": [
+          {
+            "index": 2,
+            "program": "hidemy.name VPN 3.0"
+          }
+        ],
+        "preselect": -1,
+        "startVpnFirst": [
+          "hidemy.name VPN 3.0"
+        ]
+      }
+    },
+    {
+      "name": "the program names its interface: that copy is the one, even among copies",
+      "input": {
+        "rows": [
+          {
+            "selected-role": "primary"
+          },
+          {
+            "persistent-id": "{tap1}",
+            "adapter-name": "{tap1}",
+            "name": "Ethernet 2",
+            "interface-description": "TAP-Windows Adapter V9",
+            "kind": "tunnel",
+            "availability": "unavailable",
+            "gateway": "-",
+            "has-default-route": false,
+            "has-forwarding-path": false,
+            "derived-assessment": {
+              "vpn-tunnel-likelihood": "likely",
+              "classification": "vpn-tunnel"
+            },
+            "recommendation": {
+              "class": "preferred-secondary"
+            }
+          },
+          {
+            "persistent-id": "{tap2}",
+            "adapter-name": "{tap2}",
+            "name": "Ethernet 3",
+            "interface-description": "TAP-Windows Adapter V9 #2",
+            "kind": "tunnel",
+            "availability": "unavailable",
+            "gateway": "-",
+            "has-default-route": false,
+            "has-forwarding-path": false,
+            "derived-assessment": {
+              "vpn-tunnel-likelihood": "likely",
+              "classification": "vpn-tunnel"
+            },
+            "recommendation": {
+              "class": "preferred-secondary"
+            }
+          }
+        ],
+        "programs": [
+          {
+            "displayName": "Other Secure",
+            "exePath": "C:\\Program Files\\Other Secure\\other.exe",
+            "running": true,
+            "source": "process",
+            "interfaceName": "ethernet 3"
+          }
+        ],
+        "skip": 0
+      },
+      "expected": {
+        "rows": [
+          {
+            "index": 2,
+            "program": "Other Secure"
+          }
+        ],
+        "preselect": 2,
+        "startVpnFirst": []
+      }
+    },
+    {
+      "name": "a connected tunnel, the main pick, a down Ethernet and an adapter holding the main route are not offered",
+      "input": {
+        "rows": [
+          {
+            "persistent-id": "{eth2}",
+            "adapter-name": "{eth2}",
+            "name": "Ethernet 9",
+            "availability": "unavailable"
+          },
+          {
+            "persistent-id": "{tap1}",
+            "adapter-name": "{tap1}",
+            "name": "Ethernet 2",
+            "interface-description": "TAP-Windows Adapter V9",
+            "kind": "tunnel",
+            "availability": "available",
+            "gateway": "10.8.0.1",
+            "has-default-route": false,
+            "has-forwarding-path": false,
+            "derived-assessment": {
+              "vpn-tunnel-likelihood": "likely",
+              "classification": "vpn-tunnel"
+            },
+            "recommendation": {
+              "class": "preferred-secondary"
+            }
+          },
+          {
+            "persistent-id": "{tap2}",
+            "adapter-name": "{tap2}",
+            "name": "Ethernet 3",
+            "interface-description": "TAP-Windows Adapter V9 #2",
+            "kind": "tunnel",
+            "availability": "unavailable",
+            "gateway": "-",
+            "has-default-route": false,
+            "has-forwarding-path": false,
+            "derived-assessment": {
+              "vpn-tunnel-likelihood": "likely",
+              "classification": "vpn-tunnel"
+            },
+            "recommendation": {
+              "class": "preferred-secondary"
+            },
+            "selected-role": "primary"
+          },
+          {
+            "persistent-id": "{tap3}",
+            "adapter-name": "{tap3}",
+            "name": "Ethernet 4",
+            "interface-description": "TAP-Windows Adapter V9 #3",
+            "kind": "tunnel",
+            "availability": "unavailable",
+            "gateway": "-",
+            "has-default-route": false,
+            "has-forwarding-path": false,
+            "derived-assessment": {
+              "vpn-tunnel-likelihood": "likely",
+              "classification": "vpn-tunnel"
+            },
+            "recommendation": {
+              "class": "preferred-secondary"
+            }
+          }
+        ],
+        "programs": [
+          {
+            "displayName": "hidemy.name VPN 3.0",
+            "exePath": "C:\\Program Files (x86)\\hidemy.name VPN 3.0\\hidemy.name VPN.exe",
+            "running": false,
+            "source": "installed",
+            "interfaceName": ""
+          }
+        ],
+        "skip": 3
+      },
+      "expected": {
+        "rows": [],
+        "preselect": -1,
+        "startVpnFirst": []
+      }
+    },
+    {
+      "name": "one copy of the driver, down: offered and picked as before",
+      "input": {
+        "rows": [
+          {
+            "selected-role": "primary"
+          },
+          {
+            "persistent-id": "{tap1}",
+            "adapter-name": "{tap1}",
+            "name": "Ethernet 2",
+            "interface-description": "TAP-Windows Adapter V9",
+            "kind": "tunnel",
+            "availability": "unavailable",
+            "gateway": "-",
+            "has-default-route": false,
+            "has-forwarding-path": false,
+            "derived-assessment": {
+              "vpn-tunnel-likelihood": "likely",
+              "classification": "vpn-tunnel"
+            },
+            "recommendation": {
+              "class": "preferred-secondary"
+            }
+          }
+        ],
+        "programs": [
+          {
+            "displayName": "Example VPN",
+            "exePath": "C:Program FilesExample VPNexample.exe",
+            "running": false,
+            "source": "installed",
+            "interfaceName": ""
+          }
+        ],
+        "skip": 0
+      },
+      "expected": {
+        "rows": [
+          {
+            "index": 1,
+            "program": "Example VPN"
+          }
+        ],
+        "preselect": 1,
+        "startVpnFirst": []
+      }
+    },
+    {
+      "name": "a pool where one copy is tied to the program by its name: still not offered",
+      "input": {
+        "rows": [
+          {
+            "selected-role": "primary"
+          },
+          {
+            "persistent-id": "{tap1}",
+            "adapter-name": "{tap1}",
+            "name": "Example VPN",
+            "interface-description": "TAP-Windows Adapter V9",
+            "kind": "tunnel",
+            "availability": "unavailable",
+            "gateway": "-",
+            "has-default-route": false,
+            "has-forwarding-path": false,
+            "derived-assessment": {
+              "vpn-tunnel-likelihood": "likely",
+              "classification": "vpn-tunnel"
+            },
+            "recommendation": {
+              "class": "preferred-secondary"
+            }
+          },
+          {
+            "persistent-id": "{tap2}",
+            "adapter-name": "{tap2}",
+            "name": "Ethernet 3",
+            "interface-description": "TAP-Windows Adapter V9 #2",
+            "kind": "tunnel",
+            "availability": "unavailable",
+            "gateway": "-",
+            "has-default-route": false,
+            "has-forwarding-path": false,
+            "derived-assessment": {
+              "vpn-tunnel-likelihood": "likely",
+              "classification": "vpn-tunnel"
+            },
+            "recommendation": {
+              "class": "preferred-secondary"
+            }
+          },
+          {
+            "persistent-id": "{tap3}",
+            "adapter-name": "{tap3}",
+            "name": "Ethernet 4",
+            "interface-description": "TAP-Windows Adapter V9 #3",
+            "kind": "tunnel",
+            "availability": "unavailable",
+            "gateway": "-",
+            "has-default-route": false,
+            "has-forwarding-path": false,
+            "derived-assessment": {
+              "vpn-tunnel-likelihood": "likely",
+              "classification": "vpn-tunnel"
+            },
+            "recommendation": {
+              "class": "preferred-secondary"
+            }
+          }
+        ],
+        "programs": [
+          {
+            "displayName": "Example VPN",
+            "exePath": "C:Program FilesExample VPNexample.exe",
+            "running": false,
+            "source": "installed",
+            "interfaceName": ""
+          }
+        ],
+        "skip": 0
+      },
+      "expected": {
+        "rows": [],
+        "preselect": -1,
+        "startVpnFirst": [
+          "Example VPN"
+        ]
+      }
+    },
+    {
+      "name": "a pool tied to one program beside another program's lone adapter: the lone one is offered, not picked, both programs are named",
+      "input": {
+        "rows": [
+          {
+            "selected-role": "primary"
+          },
+          {
+            "persistent-id": "{tap1}",
+            "adapter-name": "{tap1}",
+            "name": "Example VPN",
+            "interface-description": "TAP-Windows Adapter V9",
+            "kind": "tunnel",
+            "availability": "unavailable",
+            "gateway": "-",
+            "has-default-route": false,
+            "has-forwarding-path": false,
+            "derived-assessment": {
+              "vpn-tunnel-likelihood": "likely",
+              "classification": "vpn-tunnel"
+            },
+            "recommendation": {
+              "class": "preferred-secondary"
+            }
+          },
+          {
+            "persistent-id": "{tap2}",
+            "adapter-name": "{tap2}",
+            "name": "Ethernet 3",
+            "interface-description": "TAP-Windows Adapter V9 #2",
+            "kind": "tunnel",
+            "availability": "unavailable",
+            "gateway": "-",
+            "has-default-route": false,
+            "has-forwarding-path": false,
+            "derived-assessment": {
+              "vpn-tunnel-likelihood": "likely",
+              "classification": "vpn-tunnel"
+            },
+            "recommendation": {
+              "class": "preferred-secondary"
+            }
+          },
+          {
+            "persistent-id": "{Other Secure}",
+            "adapter-name": "{Other Secure}",
+            "name": "Other Secure",
+            "interface-description": "Wintun Userspace Tunnel",
+            "kind": "tunnel",
+            "availability": "unavailable",
+            "gateway": "-",
+            "has-default-route": false,
+            "has-forwarding-path": false,
+            "derived-assessment": {
+              "vpn-tunnel-likelihood": "likely",
+              "classification": "vpn-tunnel"
+            },
+            "recommendation": {
+              "class": "preferred-secondary"
+            }
+          }
+        ],
+        "programs": [
+          {
+            "displayName": "Example VPN",
+            "exePath": "C:Program FilesExample VPNexample.exe",
+            "running": false,
+            "source": "installed",
+            "interfaceName": ""
+          },
+          {
+            "displayName": "Other Secure",
+            "exePath": "C:Program FilesOther Secureother.exe",
+            "running": true,
+            "source": "process",
+            "interfaceName": ""
+          }
+        ],
+        "skip": 0
+      },
+      "expected": {
+        "rows": [
+          {
+            "index": 3,
+            "program": "Other Secure"
+          }
+        ],
+        "preselect": -1,
+        "startVpnFirst": [
+          "Example VPN",
+          "Other Secure"
+        ]
+      }
+    },
+    {
+      "name": "a copy is up already: the down copies are not offered and nothing asks to turn the VPN on",
+      "input": {
+        "rows": [
+          {
+            "selected-role": "primary"
+          },
+          {
+            "persistent-id": "{tap1}",
+            "adapter-name": "{tap1}",
+            "name": "Ethernet 2",
+            "interface-description": "TAP-Windows Adapter V9",
+            "kind": "tunnel",
+            "availability": "available",
+            "gateway": "10.8.0.1",
+            "has-default-route": false,
+            "has-forwarding-path": false,
+            "derived-assessment": {
+              "vpn-tunnel-likelihood": "likely",
+              "classification": "vpn-tunnel"
+            },
+            "recommendation": {
+              "class": "preferred-secondary"
+            }
+          },
+          {
+            "persistent-id": "{tap2}",
+            "adapter-name": "{tap2}",
+            "name": "Ethernet 3",
+            "interface-description": "TAP-Windows Adapter V9 #2",
+            "kind": "tunnel",
+            "availability": "unavailable",
+            "gateway": "-",
+            "has-default-route": false,
+            "has-forwarding-path": false,
+            "derived-assessment": {
+              "vpn-tunnel-likelihood": "likely",
+              "classification": "vpn-tunnel"
+            },
+            "recommendation": {
+              "class": "preferred-secondary"
+            }
+          },
+          {
+            "persistent-id": "{tap3}",
+            "adapter-name": "{tap3}",
+            "name": "Ethernet 4",
+            "interface-description": "TAP-Windows Adapter V9 #3",
+            "kind": "tunnel",
+            "availability": "unavailable",
+            "gateway": "-",
+            "has-default-route": false,
+            "has-forwarding-path": false,
+            "derived-assessment": {
+              "vpn-tunnel-likelihood": "likely",
+              "classification": "vpn-tunnel"
+            },
+            "recommendation": {
+              "class": "preferred-secondary"
+            }
+          }
+        ],
+        "programs": [
+          {
+            "displayName": "Example VPN",
+            "exePath": "C:Program FilesExample VPNexample.exe",
+            "running": false,
+            "source": "installed",
+            "interfaceName": ""
+          }
+        ],
+        "skip": 0
+      },
+      "expected": {
+        "rows": [],
+        "preselect": -1,
+        "startVpnFirst": []
+      }
+    },
+    {
+      "name": "two programs and an untied pool: the hint names no program",
+      "input": {
+        "rows": [
+          {
+            "selected-role": "primary"
+          },
+          {
+            "persistent-id": "{tap1}",
+            "adapter-name": "{tap1}",
+            "name": "Ethernet 2",
+            "interface-description": "TAP-Windows Adapter V9",
+            "kind": "tunnel",
+            "availability": "unavailable",
+            "gateway": "-",
+            "has-default-route": false,
+            "has-forwarding-path": false,
+            "derived-assessment": {
+              "vpn-tunnel-likelihood": "likely",
+              "classification": "vpn-tunnel"
+            },
+            "recommendation": {
+              "class": "preferred-secondary"
+            }
+          },
+          {
+            "persistent-id": "{tap2}",
+            "adapter-name": "{tap2}",
+            "name": "Ethernet 3",
+            "interface-description": "TAP-Windows Adapter V9 #2",
+            "kind": "tunnel",
+            "availability": "unavailable",
+            "gateway": "-",
+            "has-default-route": false,
+            "has-forwarding-path": false,
+            "derived-assessment": {
+              "vpn-tunnel-likelihood": "likely",
+              "classification": "vpn-tunnel"
+            },
+            "recommendation": {
+              "class": "preferred-secondary"
+            }
+          }
+        ],
+        "programs": [
+          {
+            "displayName": "Example VPN",
+            "exePath": "C:Program FilesExample VPNexample.exe",
+            "running": false,
+            "source": "installed",
+            "interfaceName": ""
+          },
+          {
+            "displayName": "Other Secure",
+            "exePath": "C:Program FilesOther Secureother.exe",
+            "running": true,
+            "source": "process",
+            "interfaceName": ""
+          }
+        ],
+        "skip": 0
+      },
+      "expected": {
+        "rows": [],
+        "preselect": -1,
+        "startVpnFirst": [
+          ""
+        ]
+      }
+    },
+    {
+      "name": "the only other copy holds the main connection: the remaining copy is offered and picked",
+      "input": {
+        "rows": [
+          {},
+          {
+            "persistent-id": "{tap1}",
+            "adapter-name": "{tap1}",
+            "name": "Ethernet 2",
+            "interface-description": "TAP-Windows Adapter V9",
+            "kind": "tunnel",
+            "availability": "unavailable",
+            "gateway": "-",
+            "has-default-route": false,
+            "has-forwarding-path": false,
+            "derived-assessment": {
+              "vpn-tunnel-likelihood": "likely",
+              "classification": "vpn-tunnel"
+            },
+            "recommendation": {
+              "class": "preferred-secondary"
+            },
+            "selected-role": "primary"
+          },
+          {
+            "persistent-id": "{tap2}",
+            "adapter-name": "{tap2}",
+            "name": "Ethernet 3",
+            "interface-description": "TAP-Windows Adapter V9 #2",
+            "kind": "tunnel",
+            "availability": "unavailable",
+            "gateway": "-",
+            "has-default-route": false,
+            "has-forwarding-path": false,
+            "derived-assessment": {
+              "vpn-tunnel-likelihood": "likely",
+              "classification": "vpn-tunnel"
+            },
+            "recommendation": {
+              "class": "preferred-secondary"
+            }
+          }
+        ],
+        "programs": [
+          {
+            "displayName": "Example VPN",
+            "exePath": "C:Program FilesExample VPNexample.exe",
+            "running": false,
+            "source": "installed",
+            "interfaceName": ""
+          }
+        ],
+        "skip": 1
+      },
+      "expected": {
+        "rows": [
+          {
+            "index": 2,
+            "program": "Example VPN"
+          }
+        ],
+        "preselect": 2,
+        "startVpnFirst": []
+      }
+    },
+    {
+      "name": "the field machine: a pool of stock copies and the VPN's own adapter of another driver, all down; the VPN has come up on either kind, so the vendor adapter is listed but not picked and the program is asked for",
+      "input": {
+        "rows": [
+          {
+            "selected-role": "primary"
+          },
+          {
+            "persistent-id": "{tap1}",
+            "adapter-name": "{tap1}",
+            "name": "Ethernet 2",
+            "interface-description": "TAP-Windows Adapter V9",
+            "kind": "tunnel",
+            "availability": "unavailable",
+            "gateway": "-",
+            "has-default-route": false,
+            "has-forwarding-path": false,
+            "derived-assessment": {
+              "vpn-tunnel-likelihood": "likely",
+              "classification": "vpn-tunnel"
+            },
+            "recommendation": {
+              "class": "preferred-secondary"
+            }
+          },
+          {
+            "persistent-id": "{tap2}",
+            "adapter-name": "{tap2}",
+            "name": "Ethernet 3",
+            "interface-description": "TAP-Windows Adapter V9 #2",
+            "kind": "tunnel",
+            "availability": "unavailable",
+            "gateway": "-",
+            "has-default-route": false,
+            "has-forwarding-path": false,
+            "derived-assessment": {
+              "vpn-tunnel-likelihood": "likely",
+              "classification": "vpn-tunnel"
+            },
+            "recommendation": {
+              "class": "preferred-secondary"
+            }
+          },
+          {
+            "persistent-id": "{vendor}",
+            "adapter-name": "{vendor}",
+            "name": "Example VPN OpenVPN Adapter",
+            "interface-description": "Example VPN 3.0 OpenVPN Adapter",
+            "kind": "tunnel",
+            "availability": "unavailable",
+            "gateway": "-",
+            "has-default-route": false,
+            "has-forwarding-path": false,
+            "derived-assessment": {
+              "vpn-tunnel-likelihood": "likely",
+              "classification": "vpn-tunnel"
+            },
+            "recommendation": {
+              "class": "preferred-secondary"
+            }
+          }
+        ],
+        "programs": [
+          {
+            "displayName": "Example VPN 3.0",
+            "exePath": "C:\\Program Files\\Example VPN 3.0\\Example VPN.exe",
+            "running": false,
+            "source": "installed",
+            "interfaceName": ""
+          }
+        ],
+        "skip": 0
+      },
+      "expected": {
+        "rows": [
+          {
+            "index": 3,
+            "program": "Example VPN 3.0"
+          }
+        ],
+        "preselect": -1,
+        "startVpnFirst": [
+          "Example VPN 3.0"
+        ]
+      }
+    }
+  ]
+}

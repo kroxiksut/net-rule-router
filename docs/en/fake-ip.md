@@ -55,7 +55,7 @@ Fake-IP is deliberately not used for every connection:
 
 - **Some application groups** keep their real addresses and go over the main
   channel by default. You can give any of them a route of your own in
-  **Interfaces and routes → Set up routes**.
+  **Connections → Programs and devices…**.
 - **Addresses typed directly, and local or intranet names** — a bare IP
   address, `localhost`, single-label machine names, `.local` and the like —
   always use the real address, because they have no public destination to

@@ -15,7 +15,7 @@ import "../../lib/pure.js" as Pure
 GroupBox {
     id: group
     property var root
-    title: root.tr("settings.presets.title", "Presets and settings")
+    title: root.tr("settings.presets.title", "Rules and settings files")
     Layout.fillWidth: true
 
     ColumnLayout {
@@ -30,9 +30,7 @@ GroupBox {
             wrapMode: Text.WordWrap
             text: root.tr(
                 "settings.presets.description",
-                "Import or export rules in plain-text format. " +
-                "Each route has its own preset file; the other route's " +
-                "rules are carried over from the active revision on import.")
+                "Load and save rules as plain text files. Each connection has its own file; loading one keeps the other connection's rules as they are.")
         }
 
         // ── Per-route Import buttons (stacked so full RU labels fit) ──
@@ -44,7 +42,7 @@ GroupBox {
                 Layout.fillWidth: true
                 text: root.tr(
                     "settings.presets.import-primary",
-                    "Import primary route preset...")
+                    "Load main connection rules from a file…")
                 icon.source: root.uiIconSource("load-list")
                 enabled: !root.mutationsModel.hasInFlight
                 onClicked: {
@@ -57,7 +55,7 @@ GroupBox {
                 Layout.fillWidth: true
                 text: root.tr(
                     "settings.presets.import-secondary",
-                    "Import additional route preset...")
+                    "Load additional connection rules from a file…")
                 icon.source: root.uiIconSource("load-list")
                 enabled: !root.mutationsModel.hasInFlight
                 onClicked: {
@@ -76,7 +74,7 @@ GroupBox {
                 Layout.fillWidth: true
                 text: root.tr(
                     "settings.presets.export-primary",
-                    "Export primary route preset...")
+                    "Save main connection rules to a file…")
                 icon.source: root.uiIconSource("save")
                 onClicked: {
                     exportDialog.pendingSourceRoute = "primary"
@@ -88,7 +86,7 @@ GroupBox {
                 Layout.fillWidth: true
                 text: root.tr(
                     "settings.presets.export-secondary",
-                    "Export additional route preset...")
+                    "Save additional connection rules to a file…")
                 icon.source: root.uiIconSource("save")
                 onClicked: {
                     exportDialog.pendingSourceRoute = "secondary"
@@ -105,9 +103,9 @@ GroupBox {
             wrapMode: Text.WordWrap
             text: root.tr(
                 "settings.presets.full-settings-description",
-                "Export adapter bindings, your rules for both routes (those " +
+                "Export adapter bindings, your rules for both connections (those " +
                 "for other operating systems included), the paths of your " +
-                "rules files, the default route and leak protection as a " +
+                "rules files, where everything else goes, and leak protection as a " +
                 "single YAML file. Useful for backing up or transferring " +
                 "your settings.")
         }
@@ -117,7 +115,7 @@ GroupBox {
                 "settings.presets.export-full-settings",
                 "Export full settings (YAML)...")
             icon.source: root.uiIconSource("save")
-            onClicked: settingsExportDialog.open()
+            onClicked: root.settingsExportController.chooseAndExport()
         }
 
         // ── Bundled-preset row visibility ──
@@ -127,14 +125,14 @@ GroupBox {
         Label {
             Layout.fillWidth: true
             Layout.topMargin: root.uiTheme.spacingSm
-            text: root.tr("settings.presets.bundled-presets.title", "Bundled presets")
+            text: root.tr("settings.presets.bundled-presets.title", "Ready-made rule sets")
             color: root.textColor
             font.bold: true
         }
         CheckBox {
             Layout.fillWidth: true
             text: root.tr("settings.presets.bundled-presets.label",
-                "Show the bundled-preset quick-load row in Rules")
+                "Show ready-made rule sets above the rules list")
             // Default ON: undefined (older context) is treated as enabled.
             checked: root.prefs.showBundledPresets !== false
             onToggled: root.updatePrefs({ showBundledPresets: checked })
@@ -146,7 +144,7 @@ GroupBox {
             wrapMode: Text.WordWrap
             font.pixelSize: root.uiTheme.baseFontSizePx - 1
             text: root.tr("settings.presets.bundled-presets.description",
-                "Shows a quick-load dropdown of bundled country/demo presets above the rules table. The \"Hide\" button on that row also turns this off.")
+                "Shows a list of ready-made rule sets (by country, plus an example) above the rules list, to load one with a click. The \"Hide\" button on that row also turns this off.")
         }
 
         // ── Rule sets from a folder of the user's own ──
@@ -343,9 +341,9 @@ GroupBox {
         // Same folder every other rule-file dialog uses.
         title: root.tr(
             "settings.presets.import-dialog-title",
-            "Choose preset file to import")
+            "Choose a rules file")
         nameFilters: [
-            root.tr("rules.dialog.preset-filter", "Preset files (*.txt)"),
+            root.tr("rules.dialog.preset-filter", "Rules files (*.txt)"),
             root.tr("rules.dialog.all-filter", "All files (*)")
         ]
         property string pendingTargetRoute: ""
@@ -358,29 +356,15 @@ GroupBox {
         fileMode: FileDialog.SaveFile
         title: root.tr(
             "settings.presets.export-dialog-title",
-            "Save preset as...")
+            "Save rules as…")
         nameFilters: [
-            root.tr("rules.dialog.preset-filter", "Preset files (*.txt)"),
+            root.tr("rules.dialog.preset-filter", "Rules files (*.txt)"),
             root.tr("rules.dialog.all-filter", "All files (*)")
         ]
         defaultSuffix: "txt"
         property string pendingSourceRoute: ""
         onAccepted: group._handleExportChosen(
             pendingSourceRoute, _localPath(selectedFile))
-    }
-
-    FileDialog {
-        id: settingsExportDialog
-        fileMode: FileDialog.SaveFile
-        title: root.tr(
-            "settings.presets.full-settings-dialog-title",
-            "Save settings export as...")
-        nameFilters: [
-            root.tr("settings.presets.yaml-filter", "YAML files (*.yaml)"),
-            root.tr("rules.dialog.all-filter", "All files (*)")
-        ]
-        defaultSuffix: "yaml"
-        onAccepted: group._handleSettingsExportChosen(_localPath(selectedFile))
     }
 
     function _localPath(urlValue) {
@@ -511,7 +495,7 @@ GroupBox {
         if (!b64 || b64.length === 0) {
             root.statusLine = root.tr(
                 "status.import-read-failed",
-                "Cannot read preset file. See logs for details.")
+                "Cannot read the rules file. See the logs for details.")
             return
         }
         if (typeof root.presetImportController.startPresetImportReviewFlow === "function") {
@@ -527,57 +511,5 @@ GroupBox {
     // service stopped.
     function _handleExportChosen(route, path) {
         root.boundFilesController.exportRouteToPath(route, String(path))
-    }
-
-    function _handleSettingsExportChosen(path) {
-        if (typeof nrrNativeBridge === "undefined"
-                || !nrrNativeBridge
-                || typeof nrrNativeBridge.rpcSettingsExportFull !== "function") {
-            root.statusLine = root.tr(
-                "status.bridge-unavailable",
-                "Service bridge not connected.")
-            return
-        }
-        // The bound files and the sections of them this system does not apply
-        // live with us, not in the service: the export learns them from us,
-        // as "Save to file" does.
-        var writer = root.boundFilesController.writer
-        writer.readPassthroughSections("primary", function(primarySections) {
-            writer.readPassthroughSections("secondary", function(secondarySections) {
-                _requestSettingsExport(path, primarySections, secondarySections)
-            })
-        })
-    }
-
-    function _requestSettingsExport(path, primarySections, secondarySections) {
-        var corr = nrrNativeBridge.rpcSettingsExportFull(
-            String(root.prefs.lastSavedPathPrimary || ""),
-            String(root.prefs.lastSavedPathSecondary || ""),
-            primarySections || ({}),
-            secondarySections || ({}))
-        if (root.rpc && typeof root.rpc.registerRpcCallback === "function") {
-            root.rpc.registerRpcCallback(corr, function(ok, p, code, msg) {
-                if (!ok) {
-                    root.statusLine = root.tr(
-                        "status.export-rpc-failed",
-                        "Export failed: ") +
-                        ((typeof root.ipcErrorLabel === "function")
-                            ? root.ipcErrorLabel(String(code || "unknown"))
-                            : String(code || "unknown"))
-                    return
-                }
-                var b64 = (p && p["yaml-bytes-b64"]) || ""
-                var ok2 = nrrNativeBridge.writeFileBytes(path, b64)
-                if (!ok2) {
-                    root.statusLine = root.tr(
-                        "status.settings-export-write-failed",
-                        "Cannot write settings file to the chosen path.")
-                    return
-                }
-                root.statusLine = root.tr(
-                    "settings.presets.full-settings-exported",
-                    "Full settings exported.")
-            })
-        }
     }
 }

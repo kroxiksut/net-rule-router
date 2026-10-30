@@ -333,7 +333,7 @@ impl SecondaryRouteCoordinator {
                         target: "nrr::route-coordinator",
                         msg_key = "route-no-secondary-bound",
                         sid = %sid,
-                        "NO SECONDARY ADAPTER BOUND — assign primary+secondary in 'Interfaces & routes' and apply (needs elevation). Without a secondary target nothing is routed out the secondary NIC.",
+                        "NO SECONDARY ADAPTER BOUND — assign primary+secondary in 'Connections' and apply (needs elevation). Without a secondary target nothing is routed out the secondary NIC.",
                     );
                 }
                 self.offer_unassigned_tunnel(sid, infos);
@@ -390,7 +390,7 @@ impl SecondaryRouteCoordinator {
                             msg_key = "route-no-primary-derivable",
                             sid = %sid,
                             secondary_ifindex = sec.interface_index,
-                            "no primary adapter bound and no OS default route to derive one — in 'direct' mode unmatched traffic stays on the secondary (VPN). Bind a primary adapter in 'Interfaces & routes'.",
+                            "no primary adapter bound and no OS default route to derive one — in 'direct' mode unmatched traffic stays on the secondary (VPN). Bind a primary adapter in 'Connections'.",
                         );
                         // Nothing the service can do about this one: without a
                         // main link there is nowhere to send what the rules do

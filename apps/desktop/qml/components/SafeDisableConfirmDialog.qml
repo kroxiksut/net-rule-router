@@ -83,7 +83,7 @@ Dialog {
             Layout.fillWidth: true
             text: dialog.tr(
                 "dialog.safe-disable.body",
-                "Your routing and leak protection stop for the time you choose: the routes and filters NetRuleRouter keeps for you are removed, and they come back on their own when it is up. Other users of this computer keep theirs. The service stays running; you can turn the rules back on earlier. This action is audited."
+                "Your rules and leak protection stop for the time you choose, then come back on their own. Other users of this computer are not affected. You can turn the rules back on earlier. This action is recorded in the log."
             )
             wrapMode: Text.Wrap
             font.pixelSize: 13
@@ -110,7 +110,7 @@ Dialog {
                 Layout.fillWidth: true
                 placeholderText: dialog.tr(
                     "dialog.safe-disable.reason-placeholder",
-                    "Why are you disabling protection?")
+                    "Why are you turning the rules off?")
                 text: dialog.reasonText
                 onTextChanged: dialog.reasonText = text
                 Accessible.role: Accessible.EditableText
@@ -119,14 +119,14 @@ Dialog {
                     "Reason (required)")
                 Accessible.description: dialog.tr(
                     "dialog.safe-disable.reason-required",
-                    "Please describe the reason — it is recorded in the audit trail.")
+                    "Please give a reason — it is recorded in the log.")
             }
             Label {
                 Layout.fillWidth: true
                 visible: dialog.reasonText.trim() === ""
                 text: dialog.tr(
                     "dialog.safe-disable.reason-required",
-                    "Please describe the reason — it is recorded in the audit trail.")
+                    "Please give a reason — it is recorded in the log.")
                 font.pixelSize: 11
                 color: dialog.ownerRoot
                     ? dialog.ownerRoot.uiTheme.colorWarning
@@ -170,19 +170,19 @@ Dialog {
                 Accessible.name: text
                 Accessible.description: dialog.tr(
                     "dialog.safe-disable.cancel-description",
-                    "Dismiss the dialog and leave enforcement active")
+                    "Close this window and keep the rules on")
                 onClicked: { dialog.cancelled(); dialog.close() }
             }
             ThemedButton {
                 theme: dialog.ownerRoot ? dialog.ownerRoot.uiTheme : null
-                text: dialog.tr("dialog.safe-disable.confirm", "Disable now")
+                text: dialog.tr("dialog.safe-disable.confirm", "Turn off now")
                 highlighted: true
                 enabled: dialog.reasonText.trim() !== ""
                 Accessible.role: Accessible.Button
                 Accessible.name: text
                 Accessible.description: dialog.tr(
                     "dialog.safe-disable.confirm-description",
-                    "Temporarily disable enforcement with the provided reason")
+                    "Turn off the rules for the chosen time")
                 onClicked: {
                     var reason = dialog.reasonText.trim()
                     dialog.close()

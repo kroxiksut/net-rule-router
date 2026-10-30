@@ -68,7 +68,7 @@ Dialog {
             Layout.fillWidth: true
             text: dialog.tr(
                 "dialog.export-options.body",
-                "Customize what to include in the preset file.")
+                "Choose what to save to the file.")
             wrapMode: Text.Wrap
             font.pixelSize: 13
             color: dialog.ownerRoot ? dialog.ownerRoot.textColor : palette.text

@@ -64,7 +64,7 @@ QtObject {
                 var held = !ok && code === "rules-file-hand-edited"
                 if (!ok && !held) {
                     root.statusLine = root.tr("status.export-write-failed",
-                        "Cannot write preset file to the chosen path.") + " " + path
+                        "Cannot save the rules file to the chosen place.") + " " + path
                 }
                 done(ok, changed, held)
             }, undefined, overwrite === true)
@@ -265,7 +265,7 @@ QtObject {
         _writeTargets([{ route: route, path: String(path),
                          includeComments: includeComments }], false,
             function(ok) {
-                if (ok) root.statusLine = root.tr("status.export-completed", "Preset exported.")
+                if (ok) root.statusLine = root.tr("status.export-completed", "Rules saved to the file.")
             })
     }
 
@@ -679,7 +679,7 @@ QtObject {
         if (root.unsavedChangesRegistry && root.unsavedChangesRegistry["rules"]) {
             if (moved) {
                 root.statusLine = root.tr("status.verify-verdicts.moved",
-                    "Rules moved to the route where they work.")
+                    "Rules moved to the connection where they work.")
                 return
             }
             if (tidied) {
@@ -694,7 +694,7 @@ QtObject {
                 root.tr("status.auto-rules-added-unsaved-short",
                     "Addresses added — reload to see them"),
                 root.tr("status.auto-rules-added-unsaved",
-                    "Addresses a routed site needs were added to your rules. Save or discard your edits, then reload the rules to see them."))
+                    "Addresses a site in your rules needs were added to your rules. Save or discard your edits, then reload the rules to see them."))
             return
         }
         if (root.ruleDialog && root.ruleDialog.visible) {
@@ -722,12 +722,12 @@ QtObject {
             return
         }
         root.statusLine = moved
-            ? root.tr("status.verify-verdicts.moved", "Rules moved to the route where they work.")
+            ? root.tr("status.verify-verdicts.moved", "Rules moved to the connection where they work.")
             : tidied
             ? root.tr("status.rules-tidied",
                 "Duplicate subdomain rules the app had added were removed from your rules.")
             : root.tr("status.auto-rules-added",
-                "Addresses a routed site needs were added to your rules.")
+                "Addresses a site in your rules needs were added to your rules.")
     }
 
     /// The routes that BOTH have a linked file and no longer match it. That

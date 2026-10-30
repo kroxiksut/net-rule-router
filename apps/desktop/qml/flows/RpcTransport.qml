@@ -88,6 +88,18 @@ QtObject {
     // `IpcErrorCode::SecurityAlertUnacknowledged`, pinned by a test.
     readonly property string securityAlertGateCode: "security-alert-unacknowledged"
     signal securityAlertGateHit()
+    /// True while the callback of a call the alert gate refused runs: a notice
+    /// it raises offers the way to the alert.
+    property bool handlingAlertGate: false
+    function _settleRefusal(refusedByGate, settle) {
+        if (refusedByGate) securityAlertGateHit()
+        handlingAlertGate = refusedByGate
+        try {
+            settle()
+        } finally {
+            handlingAlertGate = false
+        }
+    }
 
     function answerDeadlineMs(operation) {
         var table = answerDeadlines
@@ -175,10 +187,11 @@ QtObject {
         }
         registerRpcCallback(corr, function(ok, status) {
             var failure = Pure.operationOutcome(ok, status)
-            if (failure === transport.securityAlertGateCode) transport.securityAlertGateHit()
-            if (failure === null) settleByState(done)
-            else if (failure === "") done("", null, (status && status.result) || null)
-            else done(failure, Pure.operationFailureArgs(status))
+            transport._settleRefusal(failure === transport.securityAlertGateCode, function() {
+                if (failure === null) settleByState(done)
+                else if (failure === "") done("", null, (status && status.result) || null)
+                else done(failure, Pure.operationFailureArgs(status))
+            })
         })
     }
 
@@ -516,12 +529,13 @@ QtObject {
         delete table[correlationId]
         pendingRpc = table
         _forgetLongRpc(correlationId)
-        if (!ok && String(errorCode || "") === securityAlertGateCode) securityAlertGateHit()
-        try {
-            entry.cb(ok, payload, errorCode, errorMessage)
-        } catch (e) {
-            console.log("rpc: callback exception", e)
-        }
+        _settleRefusal(!ok && String(errorCode || "") === securityAlertGateCode, function() {
+            try {
+                entry.cb(ok, payload, errorCode, errorMessage)
+            } catch (e) {
+                console.log("rpc: callback exception", e)
+            }
+        })
     }
 
     function gcPendingRpc() {

@@ -161,6 +161,22 @@ function Remove-DataRoot {
     $removed.Add("$dataRoot\* (audit kept)")
 }
 
+# The record of the rules in force and the re-sign marker live beside the
+# service's signing key, in its own profile. Left behind, they describe a
+# database that is gone, and the next install starts on a security alert. The
+# key stays, as on Linux: the audit trail's seals are derived from it.
+function Remove-KeyFolderLeftovers {
+    foreach ($result in @(Remove-KeyCompanions -DryRun:(-not $Yes))) {
+        $path = $result.Path
+        switch ($result.State) {
+            'absent' { Write-Host "  absent       $path" -ForegroundColor DarkGray; $absent.Add($path) }
+            'would-remove' { Write-Host "  would remove $path" -ForegroundColor Yellow }
+            'removed' { Write-Host "  removed      $path" -ForegroundColor Green; $removed.Add($path) }
+            default { Write-Host "  FAILED       $path : $($result.Reason)" -ForegroundColor Yellow; $failed.Add($path) }
+        }
+    }
+}
+
 # Take the service down before the data goes: a running service rewrites what
 # was just deleted, and a registered auto-start one recreates it at boot.
 function Invoke-ServiceUninstall {
@@ -279,6 +295,7 @@ if (-not $UserOnly) {
 
     Write-Host "==> machine-wide footprint" -ForegroundColor Cyan
     Remove-DataRoot
+    Remove-KeyFolderLeftovers
     # The default location only: a -StageDir of the caller's choosing is not known here.
     if ($NrrDevStageDir) { Remove-ProductPath -Path $NrrDevStageDir -Root $env:ProgramW6432 }
 }

@@ -121,6 +121,12 @@ sudo apt install ./netrulerouter_*.deb ./netrulerouter-gui_*.deb
 sudo dnf install ./netrulerouter-*.rpm ./netrulerouter-gui-*.rpm
 ```
 
+В Fedora `dnf` может остановиться с *Cannot download … openh264 … All mirrors
+were tried*: Qt окна тянет видеокодеки Fedora, а их отдельный репозиторий
+доступен не из любой сети. Поставьте с выключенным репозиторием — самой
+NetRuleRouter он не нужен:
+`sudo dnf install --disablerepo=fedora-cisco-openh264 ./netrulerouter-*.rpm ./netrulerouter-gui-*.rpm`.
+
 Служба запускается сразу, а потом при каждой загрузке. `nrr-cli`, `nrr-tui` и,
 с GUI, `netrulerouter` доступны по имени из любой оболочки, а в меню приложений
 появляется пункт NetRuleRouter. Пункт «Справка > Документация» в окне и раздел

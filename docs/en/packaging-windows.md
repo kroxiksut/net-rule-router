@@ -29,6 +29,7 @@ puts an archive of it beside the folder.
 | `-Full` | Ship the complete Qt runtime instead of the trimmed one. |
 | `-Zip` | Also produce `NetRuleRouter-windows-<arch>-<version>-portable.zip` and the symbols archive of the build. |
 | `-Installers` | Also build the EXE installer and the MSI, plus a checksum file for everything the run produced. |
+| `-NoSymbols` | Skip the symbols archive, for a test build. A release always has it. |
 | `-Exe` / `-Msi` | Build only one of the two installers. |
 | `-Headless` | Package without the window and the tray: the service, `nrr-cli` and `nrr-tui`, for servers and Windows without a desktop session. The folder is `NetRuleRouter-headless`, and every artifact name carries `-headless` after the version (`...-<version>-headless-portable.zip`). |
 | `-Force` | Replace a package folder left by a previous run. |
@@ -115,7 +116,8 @@ x64 Windows, the `arm64` one on Windows on ARM.
 
 The package and both installers carry no debug symbols, which keeps them
 about half the size. The symbols of the same build come as a separate
-`-symbols.zip`, produced with any archive or installer and attached to each
+`-symbols.zip`, produced with any archive or installer (a test build may skip
+it with `-NoSymbols`) and attached to each
 release, for x64 and for ARM64 alike. Users never need it: it is for
 developers reading a crash of exactly that build. Symbols from another build
 do not fit. The Linux symbols are a separate download as well, see
@@ -220,6 +222,23 @@ keep one.
 
 The script checks for these tools before it builds anything, so a missing one
 stops the run at once with the command that fixes it.
+
+### Installer logs
+
+Both installers keep a log of every run, installing and removing alike, in the
+`%TEMP%` folder of the account that ran them: the EXE as dated `.txt` logs
+plus `NetRuleRouter-setup.log` for its service steps, the MSI as
+`MSI….LOG` files. Attach the newest ones when an installation or a removal
+goes wrong.
+
+While they work, both wizards say which step is running: closing the
+program, stopping, registering and starting the service. On the last page the
+EXE offers **Show the installation log**, and the MSI names its log file.
+
+A removal started from Settings > Apps writes a dated `Uninstall Log ….txt`
+as well. One started by running `unins000.exe` directly leaves no log of
+Inno Setup's own; its steps, from the choice made to the end of the removal,
+are in `NetRuleRouter-setup.log`. Add `/LOG` to the command to get both.
 
 ## Installing the service from the portable folder
 

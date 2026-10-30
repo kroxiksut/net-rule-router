@@ -76,6 +76,8 @@
     <Property Id="ARPPRODUCTICON" Value="AppIcon" />
     <Property Id="ARPCOMMENTS" Value="Version $(var.DisplayVersion)" />
     <Property Id="ARPCONTACT" Value="fmalkov91@gmail.com" />
+    <!-- Every run keeps a log in %TEMP%, removal from Settings → Apps too. -->
+    <Property Id="MsiLogging" Value="voicewarmupx" />
     <!-- Windows removes a package's own Apps entry with no dialog at all, so
          that entry is hidden and AppsEntry lists one that opens the wizard. -->
     <Property Id="ARPSYSTEMCOMPONENT" Value="1" />
@@ -283,6 +285,10 @@
       <CustomAction Id="NrrLaunch" BinaryRef="Wix4UtilCA_$(sys.BUILDARCHSHORT)"
                     DllEntry="WixShellExec" Impersonate="yes" Return="ignore" />
     <?endif?>
+
+    <!-- The last page names the log Windows Installer keeps of this run. -->
+    <SetProperty Id="WIXUI_EXITDIALOGOPTIONALTEXT" Sequence="ui" After="CostFinalize"
+                 Condition="MsiLogFileLocation" Value="!(loc.NrrExitLog)" />
 
     <!-- Register: from the installed console, after the files are in place. -->
     <SetProperty Id="NrrRegister" Sequence="execute" Before="NrrRegister"
@@ -514,6 +520,17 @@
       <Property Id="DefaultUIFont" Value="WixUI_Font_Normal" />
       <Property Id="WIXUI_INSTALLDIR" Value="INSTALLFOLDER" />
       <Property Id="ARPNOMODIFY" Value="1" />
+
+      <!-- What each step of ours is doing, on the progress page. -->
+      <ProgressText Action="NrrCloseAppsUser" Message="!(loc.NrrProgressCloseApps)" />
+      <ProgressText Action="NrrCloseApps" Message="!(loc.NrrProgressCloseApps)" />
+      <ProgressText Action="NrrMarkStop" Message="!(loc.NrrProgressMarkStop)" />
+      <ProgressText Action="NrrProvision" Message="!(loc.NrrProgressProvision)" />
+      <ProgressText Action="NrrRegister" Message="!(loc.NrrProgressRegister)" />
+      <ProgressText Action="NrrRegisterRollback" Message="!(loc.NrrProgressRollback)" />
+      <ProgressText Action="NrrConsoleLinks" Message="!(loc.NrrProgressConsoleLinks)" />
+      <ProgressText Action="NrrRemoveUserData" Message="!(loc.NrrProgressRemoveUserData)" />
+      <ProgressText Action="NrrUnregister" Message="!(loc.NrrProgressUnregister)" />
 
       <DialogRef Id="BrowseDlg" />
       <DialogRef Id="DiskCostDlg" />

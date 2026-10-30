@@ -52,7 +52,7 @@ ColumnLayout {
         }, function() {
             pathField.text = ""
             return root.tr("vpn-onboarding.confirmed-status",
-                "NetRuleRouter will keep {name} working over your main link while leak protection is on.")
+                "NetRuleRouter will keep {name} working over your main connection while leak protection is on.")
                 .replace("{name}", Pure.displayText(panel._fileName(path)))
         })
     }
@@ -66,7 +66,7 @@ ColumnLayout {
             return Pure.vpnClientTrustRemovedApps(existing, path)
         }, function() {
             return root.tr("settings.routing.providers.removed",
-                "{name} was removed. Leak protection no longer keeps it working over your main link.")
+                "{name} was removed. Leak protection no longer keeps it working over your main connection.")
                 .replace("{name}", gone !== "" ? gone : Pure.displayText(panel._fileName(path)))
         }, function() { panel._confirming = "" })
     }
@@ -100,7 +100,7 @@ ColumnLayout {
         font.pixelSize: root.uiTheme.baseFontSizePx - 1
         text: root.uiRevision >= 0
             ? root.tr("settings.routing.providers.note",
-                "Programs that keep working over your main link while leak protection is on, such as your VPN client. Type a program's full path to add one.")
+                "Programs that keep working over your main connection while leak protection is on, such as your VPN client. Type a program's full path to add one.")
             : ""
     }
     Label {

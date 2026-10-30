@@ -64,14 +64,14 @@ impl AppSection {
 
     pub const fn title(self) -> &'static str {
         match self {
-            Self::InterfacesAndRoutes => "Interfaces and routes",
+            Self::InterfacesAndRoutes => "Connections",
             Self::Rules => "Rules",
             Self::RuleSuggestions => "Suggested addresses",
             Self::RuleOverlaps => "Overlaps",
             Self::VirtualMachines => "Virtual machines",
             Self::Diagnostics => "Diagnostics",
             Self::ConnectionTrace => "Connection trace",
-            Self::OutageBlocks => "Blocked while the route was down",
+            Self::OutageBlocks => "Blocked while the additional connection was down",
             Self::Cache => "Cache",
             Self::Logs => "Logs",
             Self::Settings => "Settings",
@@ -154,7 +154,7 @@ impl AppAction {
             Self::UpdateRulesFromFile => "Update rules from file",
             Self::ImportPreset => "Import preset...",
             Self::ExportCurrentRuleList => "Export current list...",
-            Self::RefreshInterfaces => "Refresh interfaces",
+            Self::RefreshInterfaces => "Refresh connections",
             Self::CheckServiceStatus => "Check service status",
             Self::SafeRollback => "Safe rollback",
             Self::TemporarilyDisableProductImpact => "Temporarily disable product impact",
@@ -610,7 +610,7 @@ impl UiSurfaceId {
         match self {
             Self::MainWindow => "Main window",
             Self::FirstRunWizard => "First-run wizard",
-            Self::InterfacesAndRoutesScreen => "Interfaces and routes",
+            Self::InterfacesAndRoutesScreen => "Connections",
             Self::RulesScreen => "Rules",
             Self::LoadListDialog => "Load list dialog",
             Self::EditListDialog => "Edit list dialog",

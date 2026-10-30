@@ -474,20 +474,39 @@ pub(super) fn build_conn_trace_pair(
                 // finding out, by measurement, that the main link will not
                 // carry this site. Only on the CHANGE: the register stays
                 // silent while the verdict holds.
-                if health.report.is_some_and(|r| {
+                let turned_to_stalls = health.report.is_some_and(|r| {
                     r.behavior == nrr_domain::companion_affinity::PrimaryBehavior::Stalls
-                }) {
-                    // Evidence for the threshold, recorded where the offer is
-                    // born.
-                    let reached = nrr_service_runtime::navigation_registry::global_navigation()
-                        .counts_of(health.owner, health.hostname);
+                });
+                // A host refused as pulled in is asked again on its next stall:
+                // the verdict holds, so nothing else would.
+                let asks_again = !turned_to_stalls
+                    && matches!(
+                        health.event,
+                        nrr_domain::companion_affinity::PrimaryHealthEvent::Stalled
+                    )
+                    && engine_health.awaits_main_link_recheck(health.sid, health.hostname);
+                if turned_to_stalls || asks_again {
+                    let nav = nrr_service_runtime::navigation_registry::global_navigation();
+                    // Bursts whose window has passed are settled before reading.
+                    nav.sweep(nrr_service_runtime::conn_observation_consumer::now_unix_ms());
+                    let reached = nav.counts_of(health.owner, health.hostname);
                     nrr_service_runtime::navigation_registry::log_counts(health.hostname, &reached);
-                    engine_health.note_main_link_blocked_host(
-                        health.sid,
-                        health.hostname,
-                        reached,
-                        std::time::SystemTime::now(),
-                    );
+                    let now = std::time::SystemTime::now();
+                    if asks_again {
+                        engine_health.recheck_main_link_blocked_host(
+                            health.sid,
+                            health.hostname,
+                            reached,
+                            now,
+                        );
+                    } else {
+                        engine_health.note_main_link_blocked_host(
+                            health.sid,
+                            health.hostname,
+                            reached,
+                            now,
+                        );
+                    }
                 }
             },
         ));

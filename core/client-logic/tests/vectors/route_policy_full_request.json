@@ -9,7 +9,7 @@
       },
       "expected": {
         "mode": "prefer-secondary",
-        "leak-protection": "off",
+        "leak-protection": "everything",
         "kill-switch-protocols": 127,
         "allow-dns-over-primary": true,
         "include-subdomains": true,
@@ -43,7 +43,7 @@
       },
       "expected": {
         "mode": "prefer-primary",
-        "leak-protection": "off",
+        "leak-protection": "sites",
         "kill-switch-protocols": 127,
         "allow-dns-over-primary": true,
         "include-subdomains": true,
@@ -78,7 +78,7 @@
       },
       "expected": {
         "mode": "prefer-primary",
-        "leak-protection": "off",
+        "leak-protection": "sites",
         "kill-switch-protocols": 127,
         "allow-dns-over-primary": true,
         "include-subdomains": true,
@@ -115,7 +115,7 @@
       },
       "expected": {
         "mode": "prefer-primary",
-        "leak-protection": "off",
+        "leak-protection": "sites",
         "kill-switch-protocols": 127,
         "allow-dns-over-primary": true,
         "include-subdomains": true,
@@ -152,7 +152,7 @@
       },
       "expected": {
         "mode": "prefer-secondary",
-        "leak-protection": "off",
+        "leak-protection": "everything",
         "kill-switch-protocols": 127,
         "allow-dns-over-primary": true,
         "include-subdomains": true,
@@ -189,7 +189,7 @@
       },
       "expected": {
         "mode": "prefer-secondary",
-        "leak-protection": "off",
+        "leak-protection": "everything",
         "kill-switch-protocols": 127,
         "allow-dns-over-primary": true,
         "include-subdomains": true,
@@ -277,7 +277,7 @@
       },
       "expected": {
         "mode": "prefer-primary",
-        "leak-protection": "off",
+        "leak-protection": "sites",
         "kill-switch-protocols": 127,
         "allow-dns-over-primary": true,
         "include-subdomains": true,
@@ -314,7 +314,7 @@
       },
       "expected": {
         "mode": "prefer-primary",
-        "leak-protection": "off",
+        "leak-protection": "sites",
         "kill-switch-protocols": 127,
         "allow-dns-over-primary": true,
         "include-subdomains": true,
@@ -350,7 +350,7 @@
       },
       "expected": {
         "mode": "prefer-primary",
-        "leak-protection": "off",
+        "leak-protection": "sites",
         "kill-switch-protocols": 127,
         "allow-dns-over-primary": true,
         "include-subdomains": true,
@@ -399,7 +399,7 @@
       },
       "expected": {
         "mode": "prefer-primary",
-        "leak-protection": "off",
+        "leak-protection": "sites",
         "kill-switch-protocols": 127,
         "allow-dns-over-primary": true,
         "include-subdomains": true,

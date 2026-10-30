@@ -10,13 +10,13 @@ A desktop network policy manager that routes your traffic across the
 interfaces you *already have*: primary internet, a VPN, a second provider, Wi-Fi,
 Ethernet. No tunnel of its own, no cloud, no account.
 
-Windows builds today; Linux is in progress, macOS next.
+Windows and Linux builds today; macOS next.
 
 [![License: MPL-2.0](https://img.shields.io/badge/license-MPL--2.0-blue.svg)](#license)
 [![windows-quality](https://github.com/kroxiksut/net-rule-router/actions/workflows/windows-quality.yml/badge.svg?branch=main)](https://github.com/kroxiksut/net-rule-router/actions/workflows/windows-quality.yml)
 [![linux-quality](https://github.com/kroxiksut/net-rule-router/actions/workflows/linux-quality.yml/badge.svg?branch=main)](https://github.com/kroxiksut/net-rule-router/actions/workflows/linux-quality.yml)
 ![Rust](https://img.shields.io/badge/dynamic/toml?url=https%3A%2F%2Fraw.githubusercontent.com%2Fkroxiksut%2Fnet-rule-router%2Fmain%2Frust-toolchain.toml&query=%24.toolchain.channel&label=rust&color=orange)
-![Platform: Windows, Linux in progress](https://img.shields.io/badge/platform-Windows%20%7C%20Linux%20(in%20progress)-0078D6.svg)
+![Platform: Windows, Linux](https://img.shields.io/badge/platform-Windows%20%7C%20Linux-0078D6.svg)
 ![Languages: English, Russian](https://img.shields.io/badge/languages-EN%20%7C%20RU-informational.svg)
 [![GUI: Qt 6 / QML](https://img.shields.io/badge/GUI-Qt%206%20%2F%20QML-41CD52.svg)](#quick-start)
 [![TUI: ratatui](https://img.shields.io/badge/TUI-ratatui-8A2BE2.svg)](#terminal-interface)
@@ -53,20 +53,20 @@ yourself — it doesn't create or hide them.
 
 ## Quick start
 
-1. **Unpack and run.** Unpack the archive anywhere — Desktop, the root of a
-   drive, a USB stick — start `NetRuleRouter.exe` and accept the licence
-   agreement. Ready-made archives are not published yet; `scripts/package-windows.ps1`
-   builds one that runs on a machine without Qt or Rust (see
-   [Build from source](#build-from-source)).
+1. **Download and run.** Take the installer (`…-setup.exe` or `.msi`) or the
+   portable `…-portable.zip` from [Releases](https://github.com/kroxiksut/net-rule-router/releases). Run the installer, or unpack
+   the archive anywhere — Desktop, the root of a drive, a USB stick — and start
+   `NetRuleRouter.exe`; accept the licence agreement. To build it yourself, see
+   [Build from source](#build-from-source).
 2. **Install the background service.** The welcome window offers *"Install and
    start the service"* — confirm the UAC prompt. Without the service the app
    runs in preview mode: rules can be edited, but nothing is applied.
-3. **Pick a starting rule set.** The first-run wizard offers a country preset,
-   a built-in demo set, two `.txt` files of your own, or an empty start.
-4. **Assign the two routes.** On the *Interfaces & routes* screen say which
-   adapter is the main route and which is the additional one (your VPN, a
+3. **Pick a starting rule set.** The first-run wizard offers the rule set for your region,
+   an example set, two `.txt` files of your own, or an empty start.
+4. **Assign the two routes.** On the *Connections* screen say which
+   adapter is the main connection and which is the additional one (your VPN, a
    second provider, a second Wi-Fi), and where traffic matching no rule goes.
-5. **Save the set as your own** — *Settings → Presets & settings → My rule
+5. **Save the set as your own** — *Settings → Rules and settings files → My rule
    sets*: point it at a folder of your own, then *"Save current rules as a
    set"*. Sets that stay in the application folder are replaced by the next
    update; a set in your own folder survives it.
@@ -82,6 +82,17 @@ yourself — it doesn't create or hide them.
 > rule-set folder. Then press **Apply**. You do this once — from then on the
 > list travels with your rule set.
 
+**How do I...?** Short answers first: [Questions and answers](docs/en/questions.md).
+
+- [Open a site through the VPN](docs/en/adding-rules.md)
+- [Change, switch off or delete a rule](docs/en/changing-rules.md)
+- [Save my rules, load a ready-made set for my country, or move my rules to another computer](docs/en/rule-sets.md)
+- [Choose or swap my main and additional connection, or change my VPN](docs/en/connections.md)
+- [Deal with "suggested addresses"](docs/en/suggested-addresses.md)
+- [Find out why a site does not open or is slow](docs/en/site-does-not-open.md)
+- [Turn protection on or off, or turn the rules off for a while](docs/en/pause-and-protection.md)
+- [Start over or remove the program](docs/en/start-over-or-remove.md)
+
 The full walkthrough, including what to do if you lose network access, is in
 [`docs/en/quickstart.md`](docs/en/quickstart.md). Questions while setting up:
 see [Help and community](#help-and-community).
@@ -92,8 +103,8 @@ see [Help and community](#help-and-community).
 |---|---|---|---|---|---|
 | Windows 10, 11 | x64 | portable ZIP, EXE installer, MSI | yes | yes | tested on Windows 10 and Windows 11 |
 | Windows 11 on ARM | ARM64 | portable ZIP, EXE installer, MSI | yes | yes | built, not tested yet |
-| Linux, `.deb`: Ubuntu 22.04+, Debian 11+, Astra Linux 1.7+ | x86_64, ARM64 | `.deb` | with Qt 6.6+: Ubuntu 24.10+, Debian 13, Astra Linux 1.8 | yes | tested on Ubuntu 26.04 LTS; on Astra Linux 1.7 and 1.8 without the window; the rest expected to work |
-| Linux, `.rpm`: RED OS 7.3+, Fedora, RHEL / AlmaLinux / Rocky Linux 8+ | x86_64, ARM64 | `.rpm` | with Qt 6.6+: Fedora, RHEL 10 family, RED OS 8 if its Qt is new enough | yes | tested on RED OS 8 without the window; the rest expected to work |
+| Linux, `.deb`: Ubuntu 22.04+, Debian 11+ and derivatives (Linux Mint, Astra Linux 1.7+) | x86_64, ARM64 | `.deb` | with Qt 6.6+: Ubuntu 24.10+, Debian 13, Astra Linux 1.8 | yes | tested on Ubuntu 26.04 LTS; on Astra Linux 1.7 and 1.8 without the window; the rest expected to work |
+| Linux, `.rpm`: Fedora, RHEL / AlmaLinux / Rocky Linux 8+ and relatives (e.g. RED OS 7.3+) | x86_64, ARM64 | `.rpm` | with Qt 6.6+: Fedora, RHEL 10 family, RED OS 8 if its Qt is new enough | yes | tested on a RHEL-family system (RED OS 8) without the window; Fedora and RHEL expected to work |
 | Other Linux with systemd, nftables and glibc 2.28+ (openSUSE, ALT and others) | x86_64, ARM64 | `.tar.gz` | with Qt 6.6+ | yes | expected to work, not tested yet |
 | 32-bit Windows | x86 | — | — | — | not supported |
 | macOS | — | — | — | — | not supported yet, planned after Linux |
@@ -136,7 +147,7 @@ check of the checksums, `SHA256SUMS` comes with the files:
 - **Seven ways to match traffic** — by exact domain, by domain with all its subdomains, by a site in every zone (`bank.*`), by exact IPv4 or IPv6 address, by subnet or address range, by domain zone (a TLD or internal suffix such as `.ru` or `.intra`), or by application (the program's name, or the file or folder it is installed in; on Windows and Linux a folder rule also covers the programs a later update puts there and the scripts kept in it).
 - **Traffic statistics** — how much went through each connection today, during the current session of the additional connection and over every day kept (you choose how many), with a CSV export for any period.
 - **Per-name routing** *(Windows, on by default for a new installation: Settings → Routing behavior, whatever leak protection is set to)* — sites that share one server address still go where their own rule says. Large platforms and CDNs put hundreds of names on a handful of addresses, and address-level routing cannot tell them apart; see [`docs/en/routing-modes.md`](docs/en/routing-modes.md).
-- **Leak protection** — one choice: **Off** (the default), **Routed sites** (what your rules send through the additional connection never goes out the main one while strict blocking of shared addresses is on, as it is by default; everything else keeps working, except sites that share an address with a routed one) or **Everything** (nothing leaves except through the additional connection, your local network and what your rules send over the main one; if the additional connection drops, the internet waits until it returns). A corporate VPN beside yours keeps its own networks in every mode.
+- **Leak protection** — one choice: **Off**, **Routed sites** (the default: if the VPN is off, drops or starts later than the computer, the sites you send through it wait instead of going out directly; what your rules send through the additional connection never goes out the main one while strict blocking of shared addresses is on, as it is by default; everything else keeps working, except sites that share an address with a routed one) or **Everything** (nothing leaves except through the additional connection, your local network and what your rules send over the main one; if the additional connection drops, the internet waits until it returns). A corporate VPN beside yours keeps its own networks in every mode.
 - **Deny** — a site, an address, a subnet or a program you deny is not let through any connection: put `!` before it in a rules file, or choose "Deny" when you add a rule in the window, the tray or the terminal interface. A deny by address or subnet does not depend on names; there are no block lists, only the rules you write.
 - **Protected system programs** — a deny or an additional-route rule cannot take what the computer needs to stay on the network (the system folder, `svchost.exe`, the network services, a folder many programs share): the app refuses it before it is saved. When you do mean it, `+override` in the rules file asks for your confirmation, for a time you choose, with administrator approval where it reaches past your own programs; see [`docs/en/rules-file-format.md`](docs/en/rules-file-format.md#116-applying-a-rule-despite-the-protection-override).
 - **Many rules at once, and recent changes** — paste a list of sites, addresses and programs as lines of a rules file and each line is checked before it is added; the *Recent* filter shows what you added, changed or deleted in the last hour, today or 7 days, and puts a deleted rule back in one click. In the window and in the terminal interface alike.
@@ -248,8 +259,8 @@ them, the app offers to move them. The full format is documented in
 ## Build from source
 
 > The commands below are for Windows. Every script has a `*.sh` counterpart
-> for Linux, where the port is in progress and not release-tested yet; macOS
-> comes after it.
+> for Linux, described in [Building on Linux](docs/en/building-linux.md);
+> macOS comes later.
 
 **Prerequisites:** a recent Rust toolchain, a Qt 6 development install, and CMake.
 `scripts/bootstrap.ps1` checks the environment and prepares your `.env`.
@@ -358,14 +369,13 @@ See [`SECURITY.md`](SECURITY.md) for the full trust model.
 
 ## Roadmap
 
-**Current:** two-route model, one active config per Windows user over a shared
+**Current:** two-route model, one active config per user over a shared
 administrator baseline, domain / zone / IP / network / app rules (apps by name,
 file or folder), deny rules, per-name routing, presets, explain mode, leak protection, suggested addresses, traffic
 statistics with CSV export, connection history, site check, timed pause of the rules, diagnostics archive, administrative console, terminal interface, RU/EN.
 
-**In progress:** Linux support (the platform-specific pieces sit behind one
-interface per capability, so the shared decision logic is already OS-neutral),
-then macOS.
+**Next:** macOS (the platform-specific pieces sit behind one interface per
+capability, so the shared decision logic is already OS-neutral).
 
 **In progress: full IPv6.** Rules already name IPv6 addresses and names that
 resolve to them, and route and protect them as they do IPv4; what remains is

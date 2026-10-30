@@ -200,19 +200,20 @@ fn a_site_that_does_not_open_is_worded_by_what_the_additional_route_did() {
             .join("\n")
     };
     assert!(
-        text_of("opens.example").contains("it opens over the additional route"),
+        text_of("opens.example").contains("it opens over the additional connection"),
         "{}",
         text_of("opens.example")
     );
     let unasked = text_of("unasked.example");
     assert!(
-        unasked.contains("the additional route may help"),
+        unasked.contains("the additional connection may help"),
         "{unasked}"
     );
     assert!(!unasked.contains("it opens over"), "{unasked}");
     let nowhere = text_of("nowhere.example");
     assert!(
-        nowhere.is_empty() || nowhere.contains("does not open over the additional route either"),
+        nowhere.is_empty()
+            || nowhere.contains("does not open over the additional connection either"),
         "{nowhere}"
     );
 }
@@ -248,11 +249,11 @@ fn the_list_groups_by_domain_with_the_main_route_verdict() {
     let other = wide.find("2. example.com").expect("then the rest");
     assert!(stalls < other, "{wide}");
     assert!(
-        wide.contains("connections to it stall on the main route"),
+        wide.contains("connections to it stall on the main connection"),
         "{wide}"
     );
     assert!(
-        wide.contains("the main route reaches it; a third-party"),
+        wide.contains("the main connection reaches it; a third-party"),
         "{wide}"
     );
     assert!(
@@ -517,7 +518,9 @@ fn a_less_certain_offer_shows_its_mark_and_basis() {
     let app = on_screen(&fake);
     let wide = render(&app, 160, 60);
     assert!(
-        wide.contains("*.login.news.test — Pending; not checked on the main route; less certain"),
+        wide.contains(
+            "*.login.news.test — Pending; not checked on the main connection; less certain"
+        ),
         "{wide}"
     );
     assert!(
@@ -821,7 +824,7 @@ fn a_site_that_did_not_open_while_away_is_named_as_one_when_the_list_was_unread(
         .filter(|n| n.body.contains("forum.talk.example"))
         .collect();
     assert_eq!(told.len(), 1, "told once");
-    assert_eq!(told[0].title, "Sites the main route will not carry");
+    assert_eq!(told[0].title, "Sites the main connection will not carry");
     assert!(
         !told[0].body.contains("will not work fully"),
         "{}",

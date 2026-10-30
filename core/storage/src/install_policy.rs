@@ -40,7 +40,7 @@ impl SecondaryUnset {
 }
 
 /// The singleton as stored; [`InstallPolicy::default`] when never written.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct InstallPolicy {
     pub secondary_unset: SecondaryUnset,
     /// The mode a user's first saved policy starts from; `None` leaves the
@@ -49,6 +49,18 @@ pub struct InstallPolicy {
     /// The weakest leak protection a user's first saved policy may hold; `Off`
     /// sets no floor.
     pub default_leak_protection: LeakProtection,
+}
+
+/// No floor: [`LeakProtection::default`] is where a user starts, never the
+/// least an unconfigured install lets them choose.
+impl Default for InstallPolicy {
+    fn default() -> Self {
+        Self {
+            secondary_unset: SecondaryUnset::default(),
+            default_route_mode: None,
+            default_leak_protection: LeakProtection::Off,
+        }
+    }
 }
 
 pub struct InstallPolicyRepository<'c> {
@@ -139,6 +151,19 @@ mod tests {
         let policy = InstallPolicyRepository::new(&conn).get().expect("get");
         assert_eq!(policy, InstallPolicy::default());
         assert_eq!(policy.secondary_unset, SecondaryUnset::Direct);
+    }
+
+    /// The default level is where a new user starts; an install nobody
+    /// configured must still let them choose "off".
+    #[test]
+    fn an_unconfigured_install_sets_no_protection_floor() {
+        let (_dir, conn) = migrated();
+        let policy = InstallPolicyRepository::new(&conn).get().expect("get");
+        assert_eq!(policy.default_leak_protection, LeakProtection::Off);
+        assert_eq!(
+            InstallPolicy::default().default_leak_protection,
+            LeakProtection::Off
+        );
     }
 
     #[test]

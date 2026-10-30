@@ -38,4 +38,14 @@
   <String Id="NrrRemoveNote" Value="Если их сохранить, после повторной установки всё продолжит работать как раньше. Полное удаление стирает данные службы и ваши собственные настройки NetRuleRouter; данные других учётных записей Windows перечисляются в журнале удаления, но не удаляются, а файлы правил, сохранённые вами в своих папках, останутся." />
   <String Id="NrrRemoveAudit" Value="Стереть и &amp;журнал аудита" />
   <String Id="NrrRemoveAuditNote" Value="Журнал аудита - это защищённая запись всех изменений маршрутизации на этом компьютере. Сохраните его, если не уверены, что он больше никому не понадобится." />
+
+  <String Id="NrrExitLog" Value="Журнал этой установки со всеми её шагами: [MsiLogFileLocation]" />
+  <String Id="NrrProgressCloseApps" Value="Закрываем окно и значок NetRuleRouter в трее" />
+  <String Id="NrrProgressMarkStop" Value="Готовим фоновую службу к остановке" />
+  <String Id="NrrProgressProvision" Value="Передаём фоновой службе указанные файлы правил" />
+  <String Id="NrrProgressRegister" Value="Регистрируем и запускаем фоновую службу" />
+  <String Id="NrrProgressRollback" Value="Отменяем изменения фоновой службы" />
+  <String Id="NrrProgressConsoleLinks" Value="Добавляем консольные инструменты" />
+  <String Id="NrrProgressRemoveUserData" Value="Стираем ваши настройки NetRuleRouter" />
+  <String Id="NrrProgressUnregister" Value="Удаляем фоновую службу и возвращаем сетевые настройки" />
 </WixLocalization>

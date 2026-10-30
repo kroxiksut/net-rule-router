@@ -14,14 +14,17 @@ use std::cell::OnceCell;
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use nrr_client_logic::adapters::{
-    adapter_passes_filter, display_name, first_run_suggestion, held_other_role, looks_like_tunnel,
-    offered_for_role, unroutable_reason,
+    adapter_passes_filter, display_name, driver_siblings, first_run_idle_vpns,
+    first_run_just_connected, first_run_suggestion, held_other_role, looks_like_tunnel,
+    offered_for_role, unroutable_reason, IdleVpns,
 };
 use nrr_client_logic::first_run::first_run_country;
 use nrr_client_logic::route_policy::{
     first_run_held_protection, first_run_writes, leak_protection_choices_at_least,
     leak_protection_holds_now, raise_leak_protection,
 };
+use nrr_client_logic::vpn_client_trust::PickerRow;
+use nrr_client_logic::vpn_gateway::program_file_name;
 use nrr_client_logic::Route;
 use nrr_shared::display_text::display_text;
 use nrr_shared::first_run_sheet::ProvisioningAnswers;
@@ -195,8 +198,27 @@ pub struct WizardState {
     /// The first look at the snapshot has been taken.
     seeded: bool,
     secondary_deferred: bool,
+    /// "Change" was taken on an answered connection step: its list is back.
+    changing: Option<Route>,
+    /// The answer on the rules step that made the current choice.
+    chosen_action: Option<Action>,
+    /// The adapters at the last look on the additional connection's step.
+    adapters_seen: Option<Vec<InterfaceRowDto>>,
+    /// The connection that came up there since: the VPN just started.
+    just_connected: Option<String>,
+    adapters_polled: Option<std::time::Instant>,
+    /// The starting set a security alert refused; it goes once the alert is
+    /// acknowledged, even after the setup closed.
+    held_for_alert: Option<Pending>,
+    alert_hold_told: Option<crate::rule_set_load::SetName>,
+    alert_retry: bool,
     /// The adapter lists include adapters that are not connected.
     show_all_adapters: bool,
+    /// The VPN programs found on this machine, once looked for this run.
+    vpn_programs: Option<Vec<PickerRow>>,
+    vpn_scanning: bool,
+    /// How they are looked for; tests give their own.
+    pub(crate) vpn_scan: fn() -> Vec<PickerRow>,
     question: Option<RoleChange>,
     busy: Option<Busy>,
     outcome: Option<Outcome>,
@@ -238,7 +260,23 @@ impl Default for WizardState {
             protection_written: None,
             seeded: false,
             secondary_deferred: false,
+            changing: None,
+            chosen_action: None,
+            adapters_seen: None,
+            just_connected: None,
+            adapters_polled: None,
+            held_for_alert: None,
+            alert_hold_told: None,
+            alert_retry: false,
             show_all_adapters: false,
+            vpn_programs: None,
+            vpn_scanning: false,
+            // A test never scans the machine it runs on.
+            vpn_scan: if cfg!(test) {
+                Vec::new
+            } else {
+                scan_vpn_programs
+            },
             question: None,
             busy: None,
             outcome: None,
@@ -297,6 +335,7 @@ impl WizardState {
         self.step = step;
         self.cursor = 0;
         self.outcome = None;
+        self.changing = None;
     }
 
     /// Back to the first question for the next run, keeping what start-up
@@ -308,6 +347,10 @@ impl WizardState {
             decided: true,
             sheet: self.sheet.take(),
             stability_notice: self.stability_notice.take(),
+            held_for_alert: self.held_for_alert.take(),
+            alert_hold_told: self.alert_hold_told.take(),
+            alert_retry: self.alert_retry,
+            vpn_scan: self.vpn_scan,
             languages: std::mem::take(&mut self.languages),
             packs: std::mem::take(&mut self.packs),
             ..Self::default()
@@ -325,11 +368,89 @@ pub fn needs_setup(snapshot: &SnapshotInitialResponse) -> bool {
         .is_none_or(|p| p.primary.is_none() && p.secondary.is_none())
 }
 
-pub use stability::announce;
+/// After every reply: a VPN that came up shows, and what the machine-wide
+/// write left to tell is told.
+pub fn announce(
+    app: &mut AppState,
+    texts: &Texts,
+    now: std::time::Instant,
+) -> Vec<crate::state::Effect> {
+    watch_adapters(app);
+    let mut effects = Vec::new();
+    if let Some(name) = app.wizard.alert_hold_told.take() {
+        let body = format!(
+            "{} {}",
+            texts.fill(k::RULES_WAIT_FOR_ALERT, &[("name", name.resolve(texts))]),
+            texts.get(crate::keys::ALERT_GATE_HINT)
+        );
+        effects.extend(app.notify(
+            crate::state::NoticeLevel::Warning,
+            texts.get(k::RULES_WAIT_FOR_ALERT_TITLE),
+            body,
+            now,
+        ));
+    }
+    effects.extend(stability::announce(app, texts, now));
+    effects
+}
+
+/// How often the adapters are read while the additional connection is asked.
+const ADAPTERS_POLL: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Called on the idle tick: a VPN started while the additional connection is
+/// asked shows without a press on Refresh. Only on that step, while choosing.
+pub fn poll_adapters(app: &mut AppState, now: std::time::Instant) {
+    if app.screen != ScreenId::Wizard
+        || app.wizard.step != Step::Secondary
+        || !choosing(app, Route::Secondary)
+        || !pickable(app)
+    {
+        return;
+    }
+    if app
+        .wizard
+        .adapters_polled
+        .is_some_and(|at| now.duration_since(at) < ADAPTERS_POLL)
+    {
+        return;
+    }
+    app.wizard.adapters_polled = Some(now);
+    app.outbox.push(adapters_read(false, |_, _| {}));
+}
+
+/// Compares the adapters with the last look on the additional connection's
+/// step; the one that came up is named as the VPN and offered first.
+fn watch_adapters(app: &mut AppState) {
+    if app.screen != ScreenId::Wizard || app.wizard.step != Step::Secondary || !rows_are_live(app) {
+        return;
+    }
+    let rows = adapters(app, false);
+    let came_up = app
+        .wizard
+        .adapters_seen
+        .as_deref()
+        .and_then(|before| first_run_just_connected(before, &rows, None))
+        .map(|index| super::binding::row_key(&rows[index]));
+    if let Some(key) = came_up {
+        if app.wizard.just_connected.as_deref() != Some(key.as_str()) {
+            app.wizard.just_connected = Some(key);
+            app.wizard.cursor = 0;
+        }
+    }
+    let still = app.wizard.just_connected.as_deref().is_some_and(|key| {
+        find(&rows, key)
+            .is_some_and(|row| row.availability == "available" && row.selected_role.is_none())
+    });
+    if !still {
+        app.wizard.just_connected = None;
+    }
+    app.wizard.adapters_seen = Some(rows);
+}
 
 /// The first snapshot decides, once, whether the setup opens by itself — and
 /// only while the user is still on the screen the program started on.
 pub fn snapshot_arrived(app: &mut AppState) {
+    watch_adapters(app);
     seed_protection(app);
     if app.wizard.decided || !app.link.is_connected() {
         return;
@@ -353,6 +474,8 @@ enum Action {
     Assign(Route, String),
     Later,
     ChooseNow,
+    Change(Route),
+    KeepCurrent(Route),
     Refresh,
     ShowAll,
     LeakProtection(&'static str),
@@ -412,22 +535,114 @@ fn secondary_row(app: &AppState) -> Option<InterfaceRowDto> {
         .find(|row| holds(row, Route::Secondary))
 }
 
-/// The adapters the setup offers for `route`: connected ones unless all were
-/// asked for, never the one holding the other route, the one that fits the
-/// role best first.
-fn offered_adapters(app: &AppState, route: Route) -> Vec<InterfaceRowDto> {
-    let mut rows: Vec<InterfaceRowDto> = adapters(app, false)
+fn scan_vpn_programs() -> Vec<PickerRow> {
+    crate::screens::settings::found_rows(
+        &crate::platform::vpn_discovery().discover_vpn_candidates(),
+    )
+}
+
+/// The VPN programs on this machine, looked for once a run: the additional
+/// step names them and offers their adapters that are down.
+fn look_for_vpn_programs(app: &mut AppState) {
+    let state = &mut app.wizard;
+    if state.vpn_programs.is_some() || state.vpn_scanning {
+        return;
+    }
+    state.vpn_scanning = true;
+    let scan = state.vpn_scan;
+    app.outbox
+        .push(Box::new(move |_client: &dyn nrr_ipc_client::IpcClient| {
+            let found = scan();
+            crate::backend::Reply::new(move |app| {
+                app.wizard.vpn_scanning = false;
+                app.wizard.vpn_programs = Some(found);
+            })
+        }));
+}
+
+/// The found VPN's adapters that are down, offered without "Show
+/// unavailable adapters", as in the window.
+fn idle_vpns(app: &AppState, rows: &[InterfaceRowDto]) -> IdleVpns {
+    let programs = app.wizard.vpn_programs.as_deref().unwrap_or_default();
+    first_run_idle_vpns(rows, programs, None)
+}
+
+/// The program an offered down VPN adapter belongs to (empty when unsure);
+/// `None` for an adapter not offered so.
+fn idle_vpn_program(app: &AppState, key: &str) -> Option<String> {
+    let rows = adapters(app, false);
+    idle_vpns(app, &rows)
+        .rows
         .into_iter()
-        .filter(|row| {
+        .find(|idle| super::binding::row_key(&rows[idle.index]) == key)
+        .map(|idle| idle.program)
+}
+
+/// The adapters the setup offers for `route`: connected ones unless all were
+/// asked for (and the one holding it, and the found VPN's that are down),
+/// never the one holding the other route; the VPN that just came up first,
+/// else the one that fits the role best, else the found VPN's.
+fn offered_adapters(app: &AppState, route: Route) -> Vec<InterfaceRowDto> {
+    let all = adapters(app, false);
+    let idle: Vec<String> = match route {
+        Route::Secondary => idle_vpns(app, &all)
+            .rows
+            .iter()
+            .map(|idle| super::binding::row_key(&all[idle.index]))
+            .collect(),
+        Route::Primary => Vec::new(),
+    };
+    let preselect = match route {
+        Route::Secondary => idle_vpns(app, &all)
+            .preselect
+            .map(|i| super::binding::row_key(&all[i])),
+        Route::Primary => None,
+    };
+    // A down copy of a driver with other copies on the machine is not set
+    // from here, as in the window: the VPN takes whichever copy it likes.
+    let pooled_down = |index: usize, row: &InterfaceRowDto| {
+        route == Route::Secondary
+            && row.availability != "available"
+            && !holds(row, route)
+            && !driver_siblings(&all, index, route).is_empty()
+    };
+    let mut rows: Vec<InterfaceRowDto> = all
+        .iter()
+        .enumerate()
+        .filter(|(index, row)| {
             offered_for_role(row, route)
-                && adapter_passes_filter(row, app.wizard.show_all_adapters, "")
+                && !pooled_down(*index, row)
+                && (adapter_passes_filter(row, app.wizard.show_all_adapters, "")
+                    || holds(row, route)
+                    || idle.contains(&super::binding::row_key(row)))
         })
+        .map(|(_, row)| row.clone())
         .collect();
-    if let Some(best) = first_run_suggestion(&rows, route, None) {
+    let first = match (&app.wizard.just_connected, route) {
+        (Some(key), Route::Secondary) => rows
+            .iter()
+            .position(|row| super::binding::row_key(row) == *key),
+        _ => None,
+    }
+    .or_else(|| first_run_suggestion(&rows, route, None))
+    .or_else(|| {
+        let key = preselect?;
+        rows.iter()
+            .position(|row| super::binding::row_key(row) == key)
+    });
+    if let Some(best) = first {
         let row = rows.remove(best);
         rows.insert(0, row);
     }
     rows
+}
+
+/// The step of `route` shows its list: unanswered, or "Change" was taken.
+fn choosing(app: &AppState, route: Route) -> bool {
+    let state = &app.wizard;
+    let held = assigned(app, route).is_some();
+    let deferred = route == Route::Secondary && state.secondary_deferred;
+    (!held && !deferred) || state.changing == Some(route)
 }
 
 fn pickable(app: &AppState) -> bool {
@@ -469,7 +684,7 @@ fn actions(app: &AppState) -> Vec<Action> {
             };
             let held = assigned(app, route).is_some();
             let deferred = !held && route == Route::Secondary && state.secondary_deferred;
-            if !held && !deferred {
+            if choosing(app, route) {
                 if pickable(app) {
                     actions.extend(
                         offered_adapters(app, route)
@@ -478,10 +693,17 @@ fn actions(app: &AppState) -> Vec<Action> {
                     );
                     actions.push(Action::ShowAll);
                 }
-                if route == Route::Secondary {
+                if route == Route::Secondary && !held {
                     actions.push(Action::Later);
+                }
+                if route == Route::Secondary {
                     actions.push(Action::Refresh);
                 }
+                if held {
+                    actions.push(Action::KeepCurrent(route));
+                }
+            } else if held {
+                actions.push(Action::Change(route));
             }
             if deferred {
                 actions.push(Action::ChooseNow);
@@ -511,7 +733,12 @@ fn actions(app: &AppState) -> Vec<Action> {
             if others {
                 actions.push(Action::OtherCountries);
             }
-            actions.extend([Action::OwnFiles, Action::StartEmpty, Action::Back]);
+            actions.extend([Action::OwnFiles, Action::StartEmpty]);
+            // A decision is asked for: Next only once something is chosen.
+            if state.chosen.is_some() {
+                actions.push(Action::Next);
+            }
+            actions.push(Action::Back);
         }
         Step::OtherCountries => {
             actions.extend((0..state.packs().len()).map(Action::Pack));
@@ -588,6 +815,28 @@ fn file_key(index: usize) -> Key {
     }
 }
 
+/// A found VPN's adapter that is down reads as that VPN, not connected now;
+/// any other as the pickers read it.
+fn adapter_label(app: &AppState, row: &InterfaceRowDto, route: Route, texts: &Texts) -> String {
+    let idle = match route {
+        Route::Secondary => idle_vpn_program(app, &super::binding::row_key(row)),
+        Route::Primary => None,
+    };
+    match idle {
+        Some(program) if program.is_empty() => {
+            texts.fill(k::IDLE_VPN, &[("name", display_name(row))])
+        }
+        Some(program) => texts.fill(
+            k::IDLE_VPN_PROGRAM,
+            &[
+                ("name", display_name(row)),
+                ("program", display_text(&program).into_owned()),
+            ],
+        ),
+        None => picker_label(row, route, texts),
+    }
+}
+
 fn label(action: &Action, app: &AppState, texts: &Texts) -> String {
     let state = &app.wizard;
     let yes_no = |on: bool| texts.get(if on { k::YES } else { k::NO });
@@ -610,10 +859,12 @@ fn label(action: &Action, app: &AppState, texts: &Texts) -> String {
         Action::Back => texts.get(k::BACK),
         Action::Close => texts.get(k::CLOSE),
         Action::Assign(route, key) => find(&adapters(app, false), key)
-            .map(|row| picker_label(row, *route, texts))
+            .map(|row| adapter_label(app, row, *route, texts))
             .unwrap_or_default(),
         Action::Later => texts.get(k::SECONDARY_LATER),
         Action::ChooseNow => texts.get(k::CHOOSE_NOW),
+        Action::Change(_) => texts.get(k::CHANGE),
+        Action::KeepCurrent(_) => texts.get(ik::CANCEL),
         Action::Refresh => texts.get(k::REFRESH),
         Action::ShowAll => texts.fill(
             k::SETTING,
@@ -658,15 +909,20 @@ fn label(action: &Action, app: &AppState, texts: &Texts) -> String {
                 ),
             ],
         ),
-        Action::Pack(index) => pack_label(
-            state.packs(),
-            *index,
-            state.step == Step::OtherCountries,
+        Action::Pack(index) => chosen_mark(
+            app,
+            action,
+            pack_label(
+                state.packs(),
+                *index,
+                state.step == Step::OtherCountries,
+                texts,
+            ),
             texts,
         ),
         Action::OtherCountries => texts.get(k::OTHER_COUNTRY),
         Action::OwnFiles => texts.get(k::OPEN_FILES),
-        Action::StartEmpty => texts.get(k::START_EMPTY),
+        Action::StartEmpty => chosen_mark(app, action, texts.get(k::START_EMPTY), texts),
         Action::EditPath(index) => {
             let path = match &state.editing {
                 Some((editing, typed)) if editing == index => format!("{typed}_"),
@@ -682,6 +938,32 @@ fn label(action: &Action, app: &AppState, texts: &Texts) -> String {
         Action::NextPage => texts.get(k::LICENCE_NEXT),
         Action::Accept => texts.get(k::LICENCE_ACCEPT),
         Action::Decline => texts.get(k::LICENCE_DECLINE),
+    }
+}
+
+/// The answer that made the current rules choice reads as current.
+fn chosen_mark(app: &AppState, action: &Action, label: String, texts: &Texts) -> String {
+    let state = &app.wizard;
+    if state.chosen.is_some() && state.chosen_action.as_ref() == Some(action) {
+        texts.fill(k::CURRENT, &[("name", label)])
+    } else {
+        label
+    }
+}
+
+/// Puts the cursor on `wanted` when it is among the answers.
+fn cursor_on(app: &mut AppState, wanted: &Action) {
+    if let Some(at) = actions(app).iter().position(|a| a == wanted) {
+        app.wizard.cursor = at;
+    }
+}
+
+/// Back on the rules step, the cursor starts on the choice made there.
+fn cursor_on_choice(app: &mut AppState) {
+    if app.wizard.step == Step::Rules && app.wizard.chosen.is_some() {
+        if let Some(wanted) = app.wizard.chosen_action.clone() {
+            cursor_on(app, &wanted);
+        }
     }
 }
 
@@ -707,6 +989,7 @@ fn perform(app: &mut AppState, action: Action) {
             let previous = app.wizard.step.previous();
             app.wizard.go(previous);
             preselect(app);
+            cursor_on_choice(app);
         }
         Action::PreviousPage => {
             app.wizard.licence_page = app.wizard.licence_page.saturating_sub(1);
@@ -721,6 +1004,7 @@ fn perform(app: &mut AppState, action: Action) {
         Action::Close => finish(app),
         Action::StartEmpty => {
             app.wizard.chosen = Some(Chosen::Empty);
+            app.wizard.chosen_action = Some(Action::StartEmpty);
             app.wizard.go(Step::Protection);
         }
         Action::Assign(route, key) => assign(app, route, &key),
@@ -730,6 +1014,23 @@ fn perform(app: &mut AppState, action: Action) {
         }
         Action::ChooseNow => {
             app.wizard.secondary_deferred = false;
+            app.wizard.cursor = 0;
+        }
+        Action::Change(route) => {
+            app.wizard.changing = Some(route);
+            app.wizard.secondary_deferred = false;
+            app.wizard.outcome = None;
+            app.wizard.cursor = 0;
+            let held = adapters(app, false)
+                .iter()
+                .find(|row| holds(row, route))
+                .map(super::binding::row_key);
+            if let Some(key) = held {
+                cursor_on(app, &Action::Assign(route, key));
+            }
+        }
+        Action::KeepCurrent(_) => {
+            app.wizard.changing = None;
             app.wizard.cursor = 0;
         }
         Action::Refresh => app.outbox.push(adapters_read(false, |_, _| {})),
@@ -759,6 +1060,7 @@ fn perform(app: &mut AppState, action: Action) {
                 return;
             };
             let [primary, secondary] = pack.files();
+            app.wizard.chosen_action = Some(Action::Pack(index));
             preview_files(app, [primary, secondary], pack_name(&pack));
         }
         Action::OtherCountries => app.wizard.go(Step::OtherCountries),
@@ -777,6 +1079,7 @@ fn perform(app: &mut AppState, action: Action) {
                 .next()
                 .map(|p| crate::rule_set_load::SetName::of_path(p));
             if let Some(name) = name {
+                app.wizard.chosen_action = Some(Action::OwnFiles);
                 preview_files(app, paths, name);
             }
         }
@@ -936,13 +1239,21 @@ fn start_role(app: &mut AppState, change: RoleChange) {
     app.wizard.busy = Some(Busy::Saving);
     app.wizard.outcome = None;
     app.outbox.push(role_write(change, |app, change, result| {
-        let state = &mut app.wizard;
-        state.busy = None;
-        state.cursor = 0;
-        state.outcome = Some(match result {
-            Ok(()) => Outcome::Role(change.clone()),
+        app.wizard.busy = None;
+        app.wizard.cursor = 0;
+        let outcome = match result {
+            Ok(()) => {
+                app.wizard.changing = None;
+                // "Set as main" answers its step; the setup goes on.
+                if change.route() == Route::Primary && app.wizard.step == Step::Primary {
+                    app.wizard.go(Step::Secondary);
+                    preselect(app);
+                }
+                Outcome::Role(change.clone())
+            }
             Err(failure) => Outcome::RoleFailed(failure),
-        });
+        };
+        app.wizard.outcome = Some(outcome);
     }));
 }
 
@@ -1159,6 +1470,9 @@ fn preview_files(
     paths: [Option<std::path::PathBuf>; 2],
     name: crate::rule_set_load::SetName,
 ) {
+    // A choice that could not be read is no choice: the one the user moved
+    // away from must not be applied as the setup closes.
+    app.wizard.chosen = None;
     let mut files: [Option<RulesFile>; 2] = Default::default();
     for (slot, path) in files.iter_mut().zip(paths) {
         let Some(path) = path else { continue };
@@ -1212,7 +1526,9 @@ fn send_preview(app: &mut AppState, payload: Value) {
         state.busy = None;
         match result {
             Ok(preview) => {
-                if !preview.empty && preview.refused.is_none() {
+                // A set already in force is still the user's answer; closing
+                // finds nothing to change and says so.
+                if preview.refused.is_none() {
                     state.chosen = state.pending.clone().map(|p| Chosen::Set(Box::new(p)));
                 }
                 state.preview = Some(preview);
@@ -1229,15 +1545,16 @@ fn send_preview(app: &mut AppState, payload: Value) {
 fn apply_rules(app: &mut AppState, pending: Pending) {
     let rules: usize = pending.files.iter().flatten().map(|f| f.rules).sum();
     let payload = import::renewed(&pending.payload);
-    let name = pending.name;
+    let name = pending.name.clone();
+    let kept = pending.clone();
     app.outbox
         .push(import::preview_job(payload.clone(), move |app, result| {
             let preview = match result {
                 Ok(preview) => preview,
-                Err(code) => return crate::rule_set_load::refused(app, name, Refusal::Code(code)),
+                Err(code) => return refused(app, kept, code),
             };
             if let Some(code) = preview.refused {
-                return crate::rule_set_load::refused(app, name, Refusal::Code(code));
+                return refused(app, kept, code);
             }
             if preview.empty {
                 return crate::rule_set_load::applied(app, name, rules);
@@ -1247,10 +1564,34 @@ fn apply_rules(app: &mut AppState, pending: Pending) {
                 preview.token,
                 move |app, result| match result {
                     Ok(()) => crate::rule_set_load::applied(app, name, rules),
-                    Err(code) => crate::rule_set_load::refused(app, name, Refusal::Code(code)),
+                    Err(code) => refused(app, kept, code),
                 },
             ));
         }));
+}
+
+/// A starting set refused until a security alert is acknowledged is kept and
+/// goes by itself once the alert is answered, as in the window; any other
+/// refusal is told.
+fn refused(app: &mut AppState, pending: Pending, code: String) {
+    if code != nrr_shared::ipc_transport::SECURITY_ALERT_UNACKNOWLEDGED_CLIENT_SLUG {
+        return crate::rule_set_load::refused(app, pending.name, Refusal::Code(code));
+    }
+    // Told once: a retry the alert still holds stays quiet.
+    let retry = app.wizard.alert_retry;
+    app.wizard.alert_retry = false;
+    if !retry {
+        app.wizard.alert_hold_told = Some(pending.name.clone());
+    }
+    app.wizard.held_for_alert = Some(pending);
+}
+
+/// The security alerts changed: a set held for one is tried again.
+pub fn alerts_changed(app: &mut AppState) {
+    if let Some(pending) = app.wizard.held_for_alert.take() {
+        app.wizard.alert_retry = true;
+        apply_rules(app, pending);
+    }
 }
 
 /// The screen the GUI's first-run contract opens when the setup is done.
@@ -1352,6 +1693,7 @@ impl Screen for WizardScreen {
         if app.link.is_connected() {
             app.outbox.push(adapters_read(false, |_, _| {}));
         }
+        look_for_vpn_programs(app);
     }
 
     fn takes_focus(&self) -> bool {
@@ -1450,6 +1792,36 @@ impl Screen for WizardScreen {
 /// tunnel, by the kind the OS decided, else by the classification.
 /// The connected adapter that reads as the VPN; an idle one a VPN client left
 /// behind is not it.
+/// Up to three found VPN programs by name, as the window names them.
+fn vpn_program_names(app: &AppState) -> Vec<String> {
+    let mut names: Vec<String> = Vec::new();
+    for program in app.wizard.vpn_programs.as_deref().unwrap_or_default() {
+        let name = program.display_name.trim();
+        let name = if name.is_empty() {
+            program_file_name(&program.exe_path)
+        } else {
+            name
+        };
+        let name = display_text(name).into_owned();
+        if !name.is_empty() && !names.contains(&name) && names.len() < 3 {
+            names.push(name);
+        }
+    }
+    names
+}
+
+/// Asks to turn the VPN on when its adapter is one of several identical
+/// copies, all down: which one it takes shows only once it is on.
+fn start_vpn_first(idle: &IdleVpns, texts: &Texts) -> String {
+    match idle.start_vpn_first.as_slice() {
+        [program] if !program.is_empty() => texts.fill(
+            k::START_VPN_FIRST_PROGRAM,
+            &[("program", display_text(program))],
+        ),
+        _ => texts.get(k::START_VPN_FIRST),
+    }
+}
+
 fn tunnel_candidate(rows: &[InterfaceRowDto]) -> Option<String> {
     rows.iter()
         .filter(|row| !holds(row, Route::Primary) && row.availability == "available")
@@ -1506,9 +1878,19 @@ fn step_lines(app: &AppState, texts: &Texts) -> Vec<ViewLine> {
             None => {
                 lines.push(texts.get(k::SECONDARY_DESCRIPTION));
                 let rows = adapters(app, false);
-                lines.push(match tunnel_candidate(&rows) {
-                    Some(name) => texts.fill(k::VPN_HINT, &[("name", name)]),
-                    None => texts.get(k::VPN_NONE),
+                let programs = vpn_program_names(app);
+                let idle = idle_vpns(app, &rows);
+                lines.push(match (just_connected_name(app), tunnel_candidate(&rows)) {
+                    (Some(name), _) => texts.fill(k::JUST_CONNECTED, &[("name", name)]),
+                    (None, Some(name)) => texts.fill(k::VPN_HINT, &[("name", name)]),
+                    (None, None) if !idle.start_vpn_first.is_empty() => {
+                        start_vpn_first(&idle, texts)
+                    }
+                    (None, None) if !idle.rows.is_empty() => texts.get(k::IDLE_VPN_LATER),
+                    (None, None) if !programs.is_empty() => {
+                        texts.fill(k::VPN_INSTALLED, &[("names", programs.join(", "))])
+                    }
+                    (None, None) => texts.get(k::VPN_NONE),
                 });
                 if !pickable(app) || rows.is_empty() {
                     lines.push(texts.get(k::NO_ADAPTERS));
@@ -1527,9 +1909,23 @@ fn step_lines(app: &AppState, texts: &Texts) -> Vec<ViewLine> {
         }
         Step::Rules | Step::OtherCountries => {
             lines.push(texts.get(k::RULES_DESCRIPTION));
-            if state.step == Step::Rules && regional_indexes(app).is_empty() {
+            if state.step == Step::OtherCountries {
+                lines.push(texts.get(k::OTHER_COUNTRIES_HINT));
+            } else if let Some(country) = region(app).filter(|_| !regional_indexes(app).is_empty())
+            {
+                lines.push(texts.fill(
+                    k::COUNTRY_PRESET_HINT,
+                    &[("country", country_name(&country, texts))],
+                ));
+            } else {
                 lines.push(texts.get(k::NO_COUNTRY_PRESET));
             }
+            lines.push(match &state.chosen {
+                Some(chosen) => {
+                    texts.fill(k::REVIEW_RULES, &[("name", chosen_name(chosen, texts))])
+                }
+                None => texts.get(k::RULE_SET_NONE),
+            });
         }
         Step::Files => lines.push(texts.get(k::OPEN_FILES_DESCRIPTION)),
         Step::Review => lines.extend(review_lines(app, texts)),
@@ -1603,8 +1999,7 @@ fn summary_lines(app: &AppState, texts: &Texts) -> Vec<String> {
     });
     lines.push(named(k::REVIEW_SECONDARY, secondary));
     let rules = match &state.chosen {
-        Some(Chosen::Set(pending)) => pending.name.resolve(texts),
-        Some(Chosen::Empty) => texts.get(k::RULE_SET_EMPTY_NAME),
+        Some(chosen) => chosen_name(chosen, texts),
         None => texts.get(k::REVIEW_RULES_CURRENT),
     };
     lines.push(named(k::REVIEW_RULES, rules));
@@ -1615,6 +2010,19 @@ fn summary_lines(app: &AppState, texts: &Texts) -> Vec<String> {
     };
     lines.push(named(leak, texts.get(level_label(shown_level(app)))));
     lines
+}
+
+fn chosen_name(chosen: &Chosen, texts: &Texts) -> String {
+    match chosen {
+        Chosen::Set(pending) => pending.name.resolve(texts),
+        Chosen::Empty => texts.get(k::RULE_SET_EMPTY_NAME),
+    }
+}
+
+/// The connection that came up on the additional step, as the list names it.
+fn just_connected_name(app: &AppState) -> Option<String> {
+    let key = app.wizard.just_connected.as_deref()?;
+    find(&adapters(app, false), key).map(|row| display_text(&display_name(row)).into_owned())
 }
 
 fn status_line(app: &AppState, texts: &Texts) -> Option<String> {

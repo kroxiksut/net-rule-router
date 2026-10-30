@@ -52,6 +52,7 @@ pub fn capture_process_error_stream(path: &Path) {
     if port.error_stream_is_interactive() {
         return;
     }
+    prepare_log_dir(path);
     match port.redirect_to_file(path) {
         Ok(()) => {
             CAPTURED.store(true, Ordering::Release);
@@ -62,6 +63,14 @@ pub fn capture_process_error_stream(path: &Path) {
                 path.display()
             );
         }
+    }
+}
+
+/// On a first run nothing has created the log folder yet; without it the
+/// redirect fails and the first session's diagnostics are lost.
+fn prepare_log_dir(path: &Path) {
+    if let Some(dir) = path.parent() {
+        let _ = nrr_shared::user_paths::ensure_own_dir(dir);
     }
 }
 
@@ -86,5 +95,26 @@ fn error_stream_port() -> Option<Box<dyn ProcessErrorStreamPort>> {
     #[cfg(not(any(windows, unix)))]
     {
         None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_first_run_creates_the_folder_its_log_goes_to() {
+        let root = tempfile::tempdir().expect("temp dir");
+        let log = root
+            .path()
+            .join("state")
+            .join("netrulerouter")
+            .join("launcher-main.log");
+        prepare_log_dir(&log);
+        assert!(
+            log.parent().is_some_and(Path::is_dir),
+            "no folder for {}",
+            log.display()
+        );
     }
 }

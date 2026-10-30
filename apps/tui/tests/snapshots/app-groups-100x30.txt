@@ -1,30 +1,30 @@
 Service: OK
-╭Screens─────────────────────────────╮╭Application and device routes — +4 more rows────────────────╮
-│  1 Status                          ││A whole group of programs, or the machines of a hypervisor, │
-│  2 First run                       ││can be sent over the main or the additional route at once.  │
-│  3 Interfaces and routes           ││Changes go to your rules list, where you review and apply   │
-│  4 Rules                           ││them.                                                       │
-│>     Application and device routes ││detected on this computer                                   │
-│  5 Overlaps                        ││Virtual machine traffic follows the route assigned to its   │
-│  6 Suggested addresses             ││program. The default is the main route. A machine's local   │
-│  7 Connection trace                ││networks (host-to-guest access) always keep working,        │
-│  8 Cache                           ││whichever route you pick.                                   │
-│  9 Diagnostics and logs            ││These programs are not blocked unless leak protection is on.│
-│  0 Settings                        ││The assigned route applies to their bulk connections; their │
-│                                    ││peers are not added to zone rules.                          │
-│                                    ││Traffic of WSL, Hyper-V, Docker, libvirt and other virtual  │
-│                                    ││machines does not belong to any program on this computer, so│
-│                                    ││it cannot be given a route of its own. When it goes out     │
-│                                    ││through this computer, it follows the routes your rules set,│
-│                                    ││as this computer's own traffic does; a machine bridged      │
-│                                    ││straight onto your network goes past them. Flexible routing │
-│                                    ││for these environments is planned for the future.           │
-│                                    ││Can't find your program? Add it as an ordinary application  │
-│                                    ││rule, or tell us through any channel — the dictionary keeps │
-│                                    ││growing.                                                    │
-│                                    ││                                                            │
-│                                    │╰────────────────────────────────────────────────────────────╯
-│                                    │╭> Groups and machines───────────────────────────────────────╮
-│                                    ││> 1. VirtualBox — Primary                                   │
-╰────────────────────────────────────╯╰────────────────────────────────────────────────────────────╯
+╭Screens───────────────────────────────╮╭Connections for programs and devices — +4 more rows───────╮
+│  1 Status                            ││A whole group of programs, or the machines of a           │
+│  2 First run                         ││hypervisor, can be sent over the main or the additional   │
+│  3 Connections                       ││connection at once. Changes go to your rules list, where  │
+│  4 Rules                             ││you review and apply them.                                │
+│>     Connections for programs and    ││detected on this computer                                 │
+│devices                               ││Virtual machine traffic goes over the connection chosen   │
+│  5 Overlaps                          ││for its program. The default is the main connection. A    │
+│  6 Suggested addresses               ││machine's local networks (host-to-guest access) always    │
+│  7 Connection trace                  ││keep working, whichever connection you pick.              │
+│  8 Cache                             ││These programs are not blocked unless leak protection is  │
+│  9 Diagnostics and logs              ││on. The chosen connection carries their bulk transfers;   │
+│  0 Settings                          ││their peers are not added to zone rules.                  │
+│                                      ││Traffic of WSL, Hyper-V, Docker, libvirt and other virtual│
+│                                      ││machines does not belong to any program on this computer, │
+│                                      ││so it cannot be given a connection of its own. When it    │
+│                                      ││goes out through this computer, it follows your rules, as │
+│                                      ││this computer's own traffic does; a machine bridged       │
+│                                      ││straight onto your network goes past them. Flexible       │
+│                                      ││routing for these environments is planned for the future. │
+│                                      ││Can't find your program? Add it as an ordinary application│
+│                                      ││rule, or tell us through any channel — the dictionary     │
+│                                      ││keeps growing.                                            │
+│                                      ││                                                          │
+│                                      │╰──────────────────────────────────────────────────────────╯
+│                                      │╭> Groups and machines─────────────────────────────────────╮
+│                                      ││> 1. VirtualBox — Main                                    │
+╰──────────────────────────────────────╯╰──────────────────────────────────────────────────────────╯
 F1: help   q: quit

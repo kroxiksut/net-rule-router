@@ -14,13 +14,13 @@ use crate::state::{AppState, Effect, NoticeLevel};
 
 pub const OFFER: Key = key(
     "status.app-groups-offer",
-    "Found programs that can be given their own route: {names}.",
+    "Found programs that can be given their own connection: {names}.",
 );
 pub const MORE: Key = key("status.local-network-offer-more", "{count} more found.");
-pub const TITLE: Key = key("app-groups.title", "Application and device routes");
+pub const TITLE: Key = key("app-groups.title", "Connections for programs and devices");
 pub const HOW: Key = key(
     "tui.app-groups-offer.how",
-    "To give them a route, press g on the Rules screen.",
+    "To choose a connection for them, press g on the Rules screen.",
 );
 
 /// Names told in the sentence; the rest are counted.

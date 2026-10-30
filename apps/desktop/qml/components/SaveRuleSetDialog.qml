@@ -70,7 +70,7 @@ Dialog {
             wrapMode: Text.WordWrap
             color: saveRuleSetDialog.root.textColor
             text: saveRuleSetDialog.root.tr("settings.presets.save-as-set.prompt",
-                "The current rules of both routes are saved as a new set in your folder. Name it so you can tell it apart later, for example \"work\" or \"home\".")
+                "The current rules of both connections are saved as a new set in your folder. Name it so you can tell it apart later, for example \"work\" or \"home\".")
         }
         ThemedTextField {
             id: nameField

@@ -343,7 +343,9 @@ impl PerSidApplyOrchestrator {
                 }
             }
             if !unresolved_apps.is_empty() {
-                tracing::warn!(
+                // Info: a shared rule set naming programs this machine lacks is the
+                // normal case, not a fault, and the GUI banner already lists them.
+                tracing::info!(
                     target: "nrr::app-resolver",
                     msg_key = "persid-plan-app-rules-unresolved",
                     sid = %sid,
@@ -442,6 +444,17 @@ impl PerSidApplyOrchestrator {
         // rules-only egress, which is what they asked for.
         let protection = policy.leak_protection;
         let leak_guard_armed = protection.is_on();
+        // Read by the kill switch as well as by the lockdown below.
+        let doh_lockdown = crate::doh_lockdown_policy::doh_lockdown_active(
+            policy.doh_lockdown_auto,
+            policy.doh_lockdown_enabled,
+            policy.doh_lockdown_scope,
+            protection.is_on(),
+            crate::rule_book_facts::needs_names_seen(
+                &rules.rule_book,
+                policy.mode == super::PerSidBehaviorMode::PreferSecondaryWhenAvailable,
+            ),
+        );
         // whether THIS compute produced a blanket set (feeds the arming-edge
         // OS resolver-cache flush at the end of the function; per-destination
         // pins never flush).
@@ -891,6 +904,39 @@ impl PerSidApplyOrchestrator {
                         );
                         app_block_emitted |= !app_pair.is_empty();
                         ks.extend(app_pair);
+                        // A destination withdrawn from an app is the main link's,
+                        // that app's included. What a tunnel rule or the DoH
+                        // lockdown holds stays held: the permit would outrank it.
+                        let held: std::collections::HashSet<std::net::IpAddr> = ks_dest_ips
+                            .iter()
+                            .copied()
+                            .chain(
+                                policy
+                                    .doh_resolver_ips
+                                    .iter()
+                                    .copied()
+                                    .filter(|_| doh_lockdown),
+                            )
+                            .collect();
+                        ks.extend(crate::killswitch_codegen::app_withdrawn_permits(
+                            sid,
+                            &codegen_out.secondary_app_patterns,
+                            |app| {
+                                observations
+                                    .withdrawn_from(app)
+                                    .into_iter()
+                                    .filter(|ip| {
+                                        !held.contains(ip)
+                                            && !ownership.named_by(
+                                                *ip,
+                                                crate::address_ownership::Link::Additional,
+                                            )
+                                    })
+                                    .collect()
+                            },
+                            resolution.secondary_luid,
+                            protocols,
+                        ));
                         ks
                     };
                     // Under the blanket through the tunnel, what the machine
@@ -1248,16 +1294,7 @@ impl PerSidApplyOrchestrator {
         // rule permits but below the exemptions, so they never break the tunnel or
         // a primary-routed app. The resolver IPs are already resolved by the
         // composition root (host entries via the FQDN cache).
-        if crate::doh_lockdown_policy::doh_lockdown_active(
-            policy.doh_lockdown_auto,
-            policy.doh_lockdown_enabled,
-            policy.doh_lockdown_scope,
-            protection.is_on(),
-            crate::rule_book_facts::needs_names_seen(
-                &rules.rule_book,
-                policy.mode == super::PerSidBehaviorMode::PreferSecondaryWhenAvailable,
-            ),
-        ) {
+        if doh_lockdown {
             let doh = crate::killswitch_codegen::doh_dot_block_filters(
                 sid,
                 &policy.doh_resolver_ips,
