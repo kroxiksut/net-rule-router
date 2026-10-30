@@ -65,6 +65,10 @@ const DNS_TYPE_AAAA_U16: u16 = 28;
 /// guards against a corrupted `pNext`.
 const MAX_CACHE_ENTRIES: usize = 8192;
 
+/// The free walk must release what the OS allocated whatever the read cap is;
+/// this bound only stops a cyclic list.
+const FREE_WALK_SAFETY_BOUND: usize = 1 << 24;
+
 /// Undocumented `dnsapi.dll` cache-entry node. Layout is stable across
 /// Windows versions (matched by `Get-DnsClientCache`, Wine, ReactOS): a forward
 /// link, the wide hostname, the record type, its data length, and flags.
@@ -289,23 +293,35 @@ unsafe fn wide_to_string(ptr: *const u16) -> Option<String> {
 /// # Safety
 ///
 /// `head` must be the non-null list returned by `DnsGetCacheDataTable`, not yet
-/// freed. Each node is freed exactly once; `p_next` is captured before the node
-/// is released so the walk never touches freed memory.
+/// freed.
 unsafe fn free_cache_table(head: *mut DnsCacheEntry) {
+    // SAFETY: forwarded contract; `DnsFreeFlat` is the release for both the
+    // node and its name allocation.
+    unsafe {
+        free_list(head, FREE_WALK_SAFETY_BOUND, &mut |p| {
+            DnsFree(Some(p), DnsFreeFlat)
+        })
+    };
+}
+
+/// Walk the whole list and hand every name and node allocation to `free`, once
+/// each. `p_next` is captured before the node is released.
+///
+/// # Safety
+///
+/// `head` must be null or a valid list whose nodes and names `free` may release.
+unsafe fn free_list(head: *mut DnsCacheEntry, bound: usize, free: &mut dyn FnMut(*const c_void)) {
     let mut current = head;
     let mut visited = 0usize;
-    while !current.is_null() && visited < MAX_CACHE_ENTRIES {
-        // SAFETY: `current` is a live node; capture `p_next` and `psz_name`
-        // before freeing so nothing is read after release.
+    while !current.is_null() && visited < bound {
+        // SAFETY: `current` is a live node; read its fields before releasing.
         let node = unsafe { &*current };
         let next = node.p_next;
         let name = node.psz_name;
         if !name.is_null() {
-            // SAFETY: `name` was allocated by the DNS API for this node.
-            unsafe { DnsFree(Some(name as *const c_void), DnsFreeFlat) };
+            free(name as *const c_void);
         }
-        // SAFETY: free the node allocation itself; not dereferenced afterward.
-        unsafe { DnsFree(Some(current as *const c_void), DnsFreeFlat) };
+        free(current as *const c_void);
         current = next;
         visited += 1;
     }
@@ -334,6 +350,30 @@ mod tests {
             }
             Err(DnsCacheReadError::Failed { .. }) | Err(DnsCacheReadError::Unsupported { .. }) => {}
         }
+    }
+
+    #[test]
+    fn free_walk_releases_every_node_past_the_read_cap() {
+        static NAME: [u16; 2] = [b'a' as u16, 0];
+        let total = MAX_CACHE_ENTRIES + 500;
+        let mut nodes: Vec<DnsCacheEntry> = (0..total)
+            .map(|_| DnsCacheEntry {
+                p_next: std::ptr::null_mut(),
+                psz_name: NAME.as_ptr(),
+                w_type: DNS_TYPE_A_U16,
+                w_data_length: 0,
+                dw_flags: 0,
+            })
+            .collect();
+        let base = nodes.as_mut_ptr();
+        for i in 0..total - 1 {
+            // SAFETY: both indexes are within `nodes`.
+            unsafe { (*base.add(i)).p_next = base.add(i + 1) };
+        }
+        let mut freed = 0usize;
+        // SAFETY: the callback only counts; nothing is released.
+        unsafe { free_list(base, FREE_WALK_SAFETY_BOUND, &mut |_| freed += 1) };
+        assert_eq!(freed, total * 2, "every node and its name must be freed");
     }
 
     #[test]

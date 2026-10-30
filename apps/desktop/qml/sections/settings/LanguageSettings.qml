@@ -32,18 +32,8 @@ GroupBox {
             popup.width: root.comboPopupWidth(languageCombo, languageCombo.model, "",
                 function(item) { return root.languageLabel(item) })
             onActivated: {
-                var nextLanguage = root.resolveLanguageId(model[currentIndex])
-                var nextPrimary = root.prefs.routePrimaryLabel === root.defaultRouteLabel("primary")
-                    ? root.localeTextForLanguage(nextLanguage, "label.primary", "Primary")
-                    : root.prefs.routePrimaryLabel
-                var nextSecondary = root.prefs.routeSecondaryLabel === root.defaultRouteLabel("secondary")
-                    ? root.localeTextForLanguage(nextLanguage, "label.secondary", "Secondary")
-                    : root.prefs.routeSecondaryLabel
-                root.updatePrefs({
-                    language: nextLanguage,
-                    routePrimaryLabel: nextPrimary,
-                    routeSecondaryLabel: nextSecondary
-                })
+                // Route names the user never renamed are stored empty and follow the language.
+                root.updatePrefs({ language: root.resolveLanguageId(model[currentIndex]) })
                 // Persist before the tray restarts — it reads the language
                 // fresh from disk on spawn, not from this process's memory.
                 root.emitPrefs()

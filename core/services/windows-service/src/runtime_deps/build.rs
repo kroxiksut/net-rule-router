@@ -394,6 +394,7 @@ pub(crate) fn build_supervised_runtime_deps(
         conn_trace_ndjson,
         conn_trace_ring,
         auto_probe_wiring,
+        adapters_snapshot,
         registry,
     } = ipc_surface::build(ipc_surface::IpcSurfaceInputs {
         artifacts,
@@ -924,7 +925,7 @@ pub(crate) fn build_supervised_runtime_deps(
         .as_ref()
         .zip(settings_conn.as_ref())
         .map(|(coord, conn)| {
-            let announcer = Arc::new(
+            let mut announcer =
                 nrr_service_runtime::secondary_external_address::ExternalAddressAnnouncer::new(
                     Arc::clone(&event_bus),
                     Arc::new(|source| {
@@ -932,8 +933,18 @@ pub(crate) fn build_supervised_runtime_deps(
                             .first()
                             .and_then(|outcome| outcome.address())
                     }),
-                ),
-            );
+                );
+            // The interfaces screens show what the check found, unasked.
+            if let Some(rows) = adapters_snapshot.as_ref() {
+                let rows = Arc::clone(rows);
+                announcer = announcer.with_observed_sink(Arc::new(
+                    move |link: &nrr_service_runtime::secondary_external_address::SecondaryLink,
+                          address: std::net::Ipv4Addr| {
+                        rows.remember_observed_external(&link.sid, link.source_ipv4, address)
+                    },
+                ));
+            }
+            let announcer = Arc::new(announcer);
             let served: nrr_service_runtime::secondary_external_address::ServedSidsFn = {
                 let coord = Arc::clone(coord);
                 let registry = Arc::clone(&sid_registry);

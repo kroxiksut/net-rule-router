@@ -343,6 +343,85 @@ pub fn enforcement(status: &str, role: &str) -> crate::backend::BackendEvent {
     )))
 }
 
+/// A service manager holding a stopped service; a start does what `start`
+/// says.
+pub struct StoppedService {
+    pub start: Result<(), nrr_platform_api::service_control::ServiceControlError>,
+}
+
+impl nrr_platform_api::service_control::ServiceControlPort for StoppedService {
+    fn install(
+        &self,
+        _spec: &nrr_platform_api::service_control::ServiceInstallSpec,
+    ) -> Result<
+        nrr_platform_api::service_control::ServiceInstallReport,
+        nrr_platform_api::service_control::ServiceControlError,
+    > {
+        Err(
+            nrr_platform_api::service_control::ServiceControlError::Unsupported {
+                operation: "install",
+            },
+        )
+    }
+
+    fn uninstall(
+        &self,
+        _spec: &nrr_platform_api::service_control::ServiceUninstallSpec,
+    ) -> Result<
+        nrr_platform_api::service_control::ServiceUninstallReport,
+        nrr_platform_api::service_control::ServiceControlError,
+    > {
+        Err(
+            nrr_platform_api::service_control::ServiceControlError::Unsupported {
+                operation: "uninstall",
+            },
+        )
+    }
+
+    fn start(
+        &self,
+        _timeout: Duration,
+    ) -> Result<(), nrr_platform_api::service_control::ServiceControlError> {
+        self.start.clone()
+    }
+
+    fn stop(
+        &self,
+        _timeout: Duration,
+    ) -> Result<(), nrr_platform_api::service_control::ServiceControlError> {
+        Ok(())
+    }
+
+    fn query(
+        &self,
+    ) -> Result<
+        Option<nrr_platform_api::service_control::ServiceStatusReport>,
+        nrr_platform_api::service_control::ServiceControlError,
+    > {
+        Ok(Some(
+            nrr_platform_api::service_control::ServiceStatusReport {
+                run_state: nrr_platform_api::service_control::ServiceRunState::Stopped,
+                start_mode: None,
+                binary_path: None,
+                running_since: None,
+            },
+        ))
+    }
+}
+
+/// A probe finding a stopped service that starts.
+pub fn stopped_service() -> Option<Box<dyn nrr_platform_api::service_control::ServiceControlPort>> {
+    Some(Box::new(StoppedService { start: Ok(()) }))
+}
+
+/// A probe finding a stopped service whose start is refused for want of rights.
+pub fn stopped_service_refusing(
+) -> Option<Box<dyn nrr_platform_api::service_control::ServiceControlPort>> {
+    Some(Box::new(StoppedService {
+        start: Err(nrr_platform_api::service_control::ServiceControlError::AccessDenied),
+    }))
+}
+
 /// The ids of `keys` that either locale file lacks, as `lang:id`.
 pub fn missing_from_locales(keys: &[crate::i18n::Key]) -> Vec<String> {
     let mut missing = Vec::new();

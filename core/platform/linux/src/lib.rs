@@ -15,6 +15,8 @@
 //! dev host too; only the syscalls and the `nft`/`loginctl` calls sit behind
 //! `#[cfg(target_os = "linux")]`.
 
+/// No installer here records an accepted agreement.
+pub mod installer_agreement;
 /// Linux implementation of the system display-language probe.
 pub mod system_locale;
 /// Linux implementation of the system light/dark probe.

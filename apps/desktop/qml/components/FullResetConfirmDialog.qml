@@ -40,7 +40,11 @@ Dialog {
     modal: true
     popupType: Popup.Item
     anchors.centerIn: parent
-    width: 480
+    // Grows with the text scale, never past the window; a short window scrolls
+    // the text while the buttons stay in view.
+    readonly property int _fontPx: ownerRoot && ownerRoot.uiTheme ? ownerRoot.uiTheme.baseFontSizePx : 14
+    width: Math.min(parent ? parent.width - 32 : 560, Math.max(480, _fontPx * 38))
+    height: Math.min(implicitHeight, parent ? parent.height - 32 : implicitHeight)
     standardButtons: Dialog.NoButton
     closePolicy: Popup.NoAutoClose
     header: DialogDragHeader {
@@ -58,71 +62,96 @@ Dialog {
     }
     contentItem: ColumnLayout {
         spacing: 12
-        Label {
+        ScrollView {
+            id: bodyScroll
             Layout.fillWidth: true
-            wrapMode: Text.Wrap
-            color: root.ownerRoot ? root.ownerRoot.textColor : palette.text
-            text: root.tr("dialog.full-reset.body",
-                "This resets ALL application settings to defaults, deletes the rules "
-                + "the service keeps for you (back to a post-install state), wipes saved "
-                + "comments and logs, and stops the background service. Your own rules "
-                + "files on disk are left untouched, and the background service is NOT "
-                + "uninstalled. This cannot be undone.")
-        }
-        // Only asked when someone else's routing is actually stored here.
-        ColumnLayout {
-            Layout.fillWidth: true
-            spacing: 4
-            visible: root.otherPrincipals > 0
-            Label {
-                Layout.fillWidth: true
-                wrapMode: Text.Wrap
-                color: root.ownerRoot ? root.ownerRoot.textColor : palette.text
-                text: root.tr("dialog.full-reset.other-users",
-                    "Other users of this computer have rules here too ({count}). What should be cleared?")
-                    .replace("{count}", String(root.otherPrincipals))
-            }
-            // A click writes `checked`, which destroys a plain binding to it.
-            // On a destructive dialog that is not cosmetic: the pair then shows
-            // one scope while `confirmed(scope)` sends the other, so the reset
-            // that runs is not the one the user read.
-            ThemedRadioButton {
-                id: scopeMineRadio
-                theme: root.ownerRoot ? root.ownerRoot.uiTheme : null
-                Binding {
-                    target: scopeMineRadio
-                    property: "checked"
-                    value: !root._allPrincipals
+            Layout.fillHeight: true
+            Layout.preferredHeight: bodyColumn.implicitHeight
+            Layout.minimumHeight: Math.min(bodyColumn.implicitHeight, 96)
+            clip: true
+            contentWidth: availableWidth
+            ScrollBar.horizontal.policy: ScrollBar.AlwaysOff
+            ColumnLayout {
+                id: bodyColumn
+                width: bodyScroll.availableWidth
+                spacing: 12
+                Label {
+                    Layout.fillWidth: true
+                    wrapMode: Text.Wrap
+                    color: root.ownerRoot ? root.ownerRoot.textColor : palette.text
+                    text: root.tr("dialog.full-reset.body",
+                        "This resets ALL application settings to defaults, deletes the rules "
+                        + "the service keeps for you (back to a post-install state), wipes saved "
+                        + "comments and logs, and restarts the background service clean, so "
+                        + "routing and protection start again as after a fresh install. Your own "
+                        + "rules files on disk are left untouched, and the background service is "
+                        + "NOT uninstalled. This cannot be undone.")
                 }
-                text: root.tr("dialog.full-reset.scope-mine", "Only my data")
-                onToggled: if (checked) root._allPrincipals = false
-            }
-            ThemedRadioButton {
-                id: scopeEveryoneRadio
-                theme: root.ownerRoot ? root.ownerRoot.uiTheme : null
-                Binding {
-                    target: scopeEveryoneRadio
-                    property: "checked"
-                    value: root._allPrincipals
+                // Only asked when someone else's routing is actually stored here.
+                ColumnLayout {
+                    Layout.fillWidth: true
+                    spacing: 4
+                    visible: root.otherPrincipals > 0
+                    Label {
+                        Layout.fillWidth: true
+                        wrapMode: Text.Wrap
+                        color: root.ownerRoot ? root.ownerRoot.textColor : palette.text
+                        text: root.tr("dialog.full-reset.other-users",
+                            "Other users of this computer have rules here too ({count}). What should be cleared?")
+                            .replace("{count}", String(root.otherPrincipals))
+                    }
+                    // A click writes `checked`, which destroys a plain binding to it.
+                    // On a destructive dialog that is not cosmetic: the pair then shows
+                    // one scope while `confirmed(scope)` sends the other, so the reset
+                    // that runs is not the one the user read.
+                    ThemedRadioButton {
+                        id: scopeMineRadio
+                        Layout.fillWidth: true
+                        theme: root.ownerRoot ? root.ownerRoot.uiTheme : null
+                        Binding {
+                            target: scopeMineRadio
+                            property: "checked"
+                            value: !root._allPrincipals
+                        }
+                        text: root.tr("dialog.full-reset.scope-mine", "Only my data")
+                        onToggled: if (checked) root._allPrincipals = false
+                    }
+                    ThemedRadioButton {
+                        id: scopeEveryoneRadio
+                        Layout.fillWidth: true
+                        theme: root.ownerRoot ? root.ownerRoot.uiTheme : null
+                        Binding {
+                            target: scopeEveryoneRadio
+                            property: "checked"
+                            value: root._allPrincipals
+                        }
+                        text: root.tr("dialog.full-reset.scope-everyone",
+                            "Every user on this computer (asks for administrator approval)")
+                        onToggled: if (checked) root._allPrincipals = true
+                    }
                 }
-                text: root.tr("dialog.full-reset.scope-everyone",
-                    "Every user on this computer (asks for administrator approval)")
-                onToggled: if (checked) root._allPrincipals = true
+                CheckBox {
+                    id: fullResetAck
+                    Layout.fillWidth: true
+                    Binding {
+                        target: fullResetAck
+                        property: "checked"
+                        value: root._ack
+                    }
+                    onToggled: root._ack = checked
+                    text: root.tr("dialog.full-reset.ack",
+                        "I understand this erases all settings and applied rules")
+                    contentItem: Label {
+                        text: fullResetAck.text
+                        leftPadding: fullResetAck.indicator.width + fullResetAck.spacing
+                        color: root.ownerRoot ? root.ownerRoot.textColor : palette.text
+                        wrapMode: Text.WordWrap
+                        verticalAlignment: Text.AlignVCenter
+                    }
+                    Accessible.role: Accessible.CheckBox
+                    Accessible.name: text
+                }
             }
-        }
-        CheckBox {
-            id: fullResetAck
-            Layout.fillWidth: true
-            Binding {
-                target: fullResetAck
-                property: "checked"
-                value: root._ack
-            }
-            onToggled: root._ack = checked
-            text: root.tr("dialog.full-reset.ack",
-                "I understand this erases all settings and applied rules")
-            Accessible.role: Accessible.CheckBox
-            Accessible.name: text
         }
         RowLayout {
             Layout.fillWidth: true

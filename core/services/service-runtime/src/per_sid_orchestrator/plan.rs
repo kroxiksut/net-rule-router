@@ -94,18 +94,9 @@ impl PerSidApplyOrchestrator {
             RulesRead::Unreadable(reason) => {
                 return Err(OrchestratorError::RulesUnreadable(reason));
             }
-            RulesRead::NoPolicy => {
-                if intent.publishes() {
-                    self.clear_app_enforcement_status(sid);
-                    self.clear_pending_vpn_clients(sid);
-                    // rules gone ⇒ any block-all is disarming.
-                    let flushed = self.note_block_all_state(sid, false);
-                    self.note_fail_closed_state(sid, false, flushed);
-                    self.note_machine_wide_cut(sid, false);
-                    self.update_killswitch_registry(sid, KillswitchBlockIds::default());
-                }
-                return Ok(ComputedFilterSet::NoActiveRules);
-            }
+            // Settings but no revision: protection asks nothing of the rules,
+            // so it holds exactly as over an emptied book.
+            RulesRead::NoPolicy => ActiveRulesSnapshot::default(),
         };
         // surface the DELIVERED app-match patterns (exactly what
         // reached this SID's ACTIVE rule set). A "no exe matched" report can then

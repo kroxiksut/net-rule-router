@@ -1,8 +1,8 @@
 #![allow(clippy::expect_used)]
 
 //! The order dpkg and rpm see between builds. A build that sorts below the one
-//! installed is refused as a downgrade, so the alpha would never replace a
-//! pre-alpha install, nor beta an alpha.
+//! installed is refused as a downgrade, so alpha.2 would never replace an
+//! alpha.1 install, nor beta an alpha.
 //!
 //! The version mapping is the shell function the packager calls; the stage
 //! order is the Windows installers' rank, so both platforms agree on it. The
@@ -259,13 +259,13 @@ fn package_version(arms: &[(String, usize)], pre: &str) -> String {
 }
 
 /// Every later build upgrades every earlier one in dpkg and rpm alike: the
-/// alpha over a pre-alpha install, a beta over the alpha, the release over all.
+/// alpha over a dev install, a beta over the alpha, the release over all.
 #[test]
 fn a_later_build_upgrades_every_earlier_one() {
     let arms = mapping_arms();
     let builds = [
-        "prealpha", "dev", "alpha", "alpha.1", "alpha.2", "alpha.10", "beta", "beta.1", "rc",
-        "rc.1", "rc.2", "",
+        "dev", "alpha", "alpha.1", "alpha.2", "alpha.10", "beta", "beta.1", "rc", "rc.1", "rc.2",
+        "",
     ];
     for older in builds {
         for newer in builds {

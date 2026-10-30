@@ -185,7 +185,7 @@ Cross-cutting rules:
 - Baseline: `ru` and `en`. Validation: accepted / accepted-with-warnings / rejected.
 - Runtime env overrides: `NRR_BUNDLED_LOCALES_DIR`, `NRR_USER_LOCALES_DIR`.
 - **Language policy (settled):**
-  - A language is a locale file, never a build: a schema-valid `<id>.json` dropped into the bundled or user locales dir appears in the picker after an app restart. Nothing may enumerate languages in code or QML.
+  - A language is a locale file, never a build: a schema-valid `<id>.json` dropped into the bundled or user locales dir appears in the picker after an app restart. Nothing may enumerate languages in code or QML. Its optional `tray/<id>.json` holds the words only the tray shows (the tray gets those plus the shared words it lists in `WINDOW_WORDS`, for its language and English only) and never adds a language by itself.
   - A missing key falls back to English, per key, never per file. Only an unreadable file or broken metadata may drop a whole locale.
   - English-only surfaces: `nrr-cli`, the diagnostics archive, and every log or audit export. They are read by whoever triages, so they never follow the GUI language; `nrr-diagnostics` stays free of the locale catalog.
   - Documentation: `docs/en/` is canonical and complete; another language is optional, and where a page is missing the English one is the answer.

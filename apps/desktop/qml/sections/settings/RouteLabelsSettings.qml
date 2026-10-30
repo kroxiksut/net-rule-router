@@ -31,7 +31,7 @@ GroupBox {
             text: root.prefs.routePrimaryLabel
             placeholderText: root.defaultRouteLabel("primary")
             onEditingFinished: root.updatePrefs({
-                routePrimaryLabel: text.trim() !== "" ? text.trim() : root.defaultRouteLabel("primary")
+                routePrimaryLabel: text.trim() === root.defaultRouteLabel("primary") ? "" : text.trim()
             })
         }
         Label {
@@ -47,7 +47,7 @@ GroupBox {
             text: root.prefs.routeSecondaryLabel
             placeholderText: root.defaultRouteLabel("secondary")
             onEditingFinished: root.updatePrefs({
-                routeSecondaryLabel: text.trim() !== "" ? text.trim() : root.defaultRouteLabel("secondary")
+                routeSecondaryLabel: text.trim() === root.defaultRouteLabel("secondary") ? "" : text.trim()
             })
         }
     }

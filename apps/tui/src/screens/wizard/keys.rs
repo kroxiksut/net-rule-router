@@ -48,6 +48,10 @@ pub const SECONDARY_ASSIGNED: Key = key(
     "dialog.first-run-wizard.secondary-adapter-assigned",
     "Additional connection: {name}. You can change it later in Interfaces and routes.",
 );
+pub const SECONDARY_ASSIGNED_DOWN: Key = key(
+    "dialog.first-run-wizard.secondary-adapter-assigned-down",
+    "Additional connection: {name} — chosen, not connected yet. Your rules use it as soon as it connects. You can change it later in Interfaces and routes.",
+);
 pub const SECONDARY_LATER: Key = key(
     "dialog.first-run-wizard.secondary-adapter-later",
     "I will choose it later",
@@ -58,15 +62,18 @@ pub const SECONDARY_DEFERRED: Key = key(
 );
 pub const VPN_HINT: Key = key(
     "dialog.first-run-wizard.secondary-adapter-vpn-hint",
-    "{name} looks like a VPN connection — choose it above to make it the additional route.",
+    "{name} looks like a VPN connection. We recommend it as the additional route: choose it above and press \"Set as additional\".",
 );
 pub const VPN_NONE: Key = key(
     "dialog.first-run-wizard.secondary-adapter-vpn-none",
-    "No VPN connection found yet. Install your VPN and connect it, then come back here.",
+    "No VPN connection found yet. Start your VPN and connect first: its connection then shows up in the list above as connected and is easy to pick. Then press \"Refresh interfaces\".",
 );
 pub const REFRESH: Key = key("action.refresh-interfaces", "Refresh interfaces");
+pub const SHOW_ALL_ADAPTERS: Key = key(
+    "interfaces.toggle.show-unavailable-adapters",
+    "Show unavailable adapters",
+);
 
-pub const PROTECTION_TITLE: Key = key("dialog.first-run-wizard.protection-title", "Protection");
 pub const PROTECTION_DESCRIPTION: Key = key(
     "dialog.first-run-wizard.protection-description",
     "Recommended for everyone. Each of these can be changed later in Settings.",
@@ -155,18 +162,65 @@ pub const PROTECTION_FAILED: Key = key(
     "Could not update leak protection: ",
 );
 
-pub const RULES_TITLE: Key = key("tui.wizard.rules-title", "Starting rules");
+pub const RULES_STEP: Key = key("dialog.first-run-wizard.step-rules", "Starting rules");
+pub const OPTIONS_STEP: Key = key(
+    "dialog.first-run-wizard.step-options",
+    "Protection and options",
+);
+pub const SUMMARY_STEP: Key = key("dialog.first-run-wizard.step-review", "Ready to finish");
+pub const CHOOSE_NOW: Key = key(
+    "dialog.first-run-wizard.primary-adapter-placeholder",
+    "Choose a connection",
+);
+pub const REVIEW_DESCRIPTION: Key = key(
+    "dialog.first-run-wizard.review-description",
+    "Check your choices. Finish applies them; Back returns to any step. Each of them can be changed later.",
+);
+pub const REVIEW_PRIMARY: Key = key(
+    "dialog.first-run-wizard.review-primary",
+    "Main connection: {name}",
+);
+pub const REVIEW_NO_PRIMARY: Key = key(
+    "dialog.first-run-wizard.review-no-primary",
+    "Your rules are not applied until a main connection is chosen. You can choose it later in Interfaces and routes.",
+);
+pub const REVIEW_SECONDARY: Key = key(
+    "dialog.first-run-wizard.review-secondary",
+    "Additional connection: {name}",
+);
+pub const REVIEW_RULES: Key = key(
+    "dialog.first-run-wizard.review-rules",
+    "Starting rules: {name}",
+);
+pub const REVIEW_RULES_CURRENT: Key = key(
+    "dialog.first-run-wizard.review-rules-current",
+    "the rules already applied to you",
+);
+pub const RULE_SET_EMPTY_NAME: Key = key(
+    "dialog.first-run-wizard.rule-set-empty-name",
+    "none, an empty start",
+);
+pub const REVIEW_LEAK_IN_FORCE: Key = key(
+    "dialog.first-run-wizard.review-leak-in-force",
+    "Leak protection: {name} — in force.",
+);
+pub const REVIEW_LEAK_NOT_YET: Key = key(
+    "dialog.first-run-wizard.review-leak-not-yet",
+    "Leak protection: {name} — not in force yet.",
+);
+pub const REVIEW_LATER: Key = key("dialog.first-run-wizard.review-later", "later");
+pub const REVIEW_NOT_CHOSEN: Key = key("dialog.first-run-wizard.review-not-chosen", "not chosen");
 pub const RULES_DESCRIPTION: Key = key(
     "dialog.first-run-wizard.description",
     "Choose how to populate your initial rule set. You can change it later from the Rules toolbar or in Settings → Presets and settings.",
 );
 pub const COUNTRY_PRESET: Key = key(
     "dialog.first-run-wizard.option-country-preset",
-    "Load country preset ({country})",
+    "Use the preset for your region ({country})",
 );
 pub const COUNTRY_PRESET_ABROAD: Key = key(
     "dialog.first-run-wizard.option-country-preset-abroad",
-    "Load access preset ({country})",
+    "Use the access preset ({country})",
 );
 pub const NO_COUNTRY_PRESET: Key = key(
     "dialog.first-run-wizard.option-country-not-available",
@@ -193,7 +247,7 @@ pub const NO_FILE: Key = key(
 );
 pub const IMPORT_FILES: Key = key(
     "dialog.first-run-wizard.import-button",
-    "Import selected files",
+    "Use the selected files",
 );
 pub const PATH_PROMPT: Key = key(
     "tui.wizard.path-prompt",
@@ -226,7 +280,6 @@ pub const PREVIEWING: Key = key(
     "tui.wizard.previewing",
     "Asking the service what these rules would change…",
 );
-pub const APPLYING: Key = key("tui.wizard.applying", "Applying the rules…");
 pub const SAVING: Key = key("tui.interfaces.saving", "Saving…");
 pub const IMPORT_FAILED: Key = key("status.preset-import-failed", "Failed to import preset: ");
 pub const NEEDS_SERVICE: Key = key(
@@ -235,8 +288,8 @@ pub const NEEDS_SERVICE: Key = key(
 );
 
 pub const NEXT: Key = key("action.next", "Next");
+pub const FINISH: Key = key("action.finish", "Finish");
 pub const BACK: Key = key("action.back", "Back");
-pub const APPLY: Key = key("action.apply", "Apply");
 pub const CLOSE: Key = key("tui.wizard.close", "Close the setup");
 
 pub const HELP_CHOOSE: Key = key(
@@ -278,12 +331,13 @@ pub const ALL: &[Key] = &[
     NO_ADAPTERS,
     SECONDARY_DESCRIPTION,
     SECONDARY_ASSIGNED,
+    SECONDARY_ASSIGNED_DOWN,
     SECONDARY_LATER,
     SECONDARY_DEFERRED,
     VPN_HINT,
     VPN_NONE,
     REFRESH,
-    PROTECTION_TITLE,
+    SHOW_ALL_ADAPTERS,
     PROTECTION_DESCRIPTION,
     LEAK_PROTECTION,
     LEAK_OFF,
@@ -310,7 +364,21 @@ pub const ALL: &[Key] = &[
     NO,
     PROTECTION_SAVED,
     PROTECTION_FAILED,
-    RULES_TITLE,
+    RULES_STEP,
+    OPTIONS_STEP,
+    SUMMARY_STEP,
+    CHOOSE_NOW,
+    REVIEW_DESCRIPTION,
+    REVIEW_PRIMARY,
+    REVIEW_NO_PRIMARY,
+    REVIEW_SECONDARY,
+    REVIEW_RULES,
+    REVIEW_RULES_CURRENT,
+    RULE_SET_EMPTY_NAME,
+    REVIEW_LEAK_IN_FORCE,
+    REVIEW_LEAK_NOT_YET,
+    REVIEW_LATER,
+    REVIEW_NOT_CHOSEN,
     RULES_DESCRIPTION,
     COUNTRY_PRESET,
     COUNTRY_PRESET_ABROAD,
@@ -332,13 +400,12 @@ pub const ALL: &[Key] = &[
     REVIEW_COUNTS,
     NOTHING_TO_APPLY,
     PREVIEWING,
-    APPLYING,
     SAVING,
     IMPORT_FAILED,
     NEEDS_SERVICE,
     NEXT,
+    FINISH,
     BACK,
-    APPLY,
     CLOSE,
     HELP_CHOOSE,
     HELP_TYPE,

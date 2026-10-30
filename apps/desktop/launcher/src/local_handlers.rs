@@ -1028,7 +1028,7 @@ mod tests {
         assert!(version_is_older("0.1.9", "0.2.0"));
         assert!(version_is_older("1.2.3", "1.2.4"));
         // A prerelease is behind its own release, as the update offer orders it.
-        assert!(version_is_older("0.2.0-prealpha", "0.2.0"));
+        assert!(version_is_older("0.2.0-alpha.1", "0.2.0"));
         assert!(version_is_older("0.2.0-alpha", "0.2.0-beta"));
     }
 

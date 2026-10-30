@@ -107,6 +107,9 @@ pub(crate) struct IpcSurface {
     pub override_grants: Arc<nrr_service_runtime::override_grants::OverrideGrants>,
     /// Ends the pauses whose term ran out.
     pub routing_pause_terms: Arc<nrr_service_runtime::routing_pause::RoutingPauseTerms>,
+    /// The rows the interfaces screens read; the connect-time address check
+    /// files what it observes there.
+    pub adapters_snapshot: Arc<MonitoredAdaptersSnapshotProvider>,
 }
 
 /// Turns an approved revision into kernel state by running one enforcement pass.
@@ -487,6 +490,17 @@ pub(crate) fn build_ipc_surface(
     let seed_cache = Arc::clone(&cache_store);
     let probe_cache = Arc::clone(&cache_store);
 
+    let adapters_snapshot = Arc::new(
+        MonitoredAdaptersSnapshotProvider::new(
+            route_table,
+            Arc::new(nrr_platform_linux::interface_rows::LinuxInterfaceRows),
+        )
+        .with_caller_bindings(
+            nrr_service_runtime::production_handlers_misc::stored_caller_bindings(Arc::clone(
+                &state_conn,
+            )),
+        ),
+    );
     let deps = IpcHandlerDeps::new(
         Arc::clone(&audit),
         health,
@@ -494,17 +508,7 @@ pub(crate) fn build_ipc_surface(
             Arc::clone(&coordinator),
             Arc::clone(&state_conn),
         )),
-        Arc::new(
-            MonitoredAdaptersSnapshotProvider::new(
-                route_table,
-                Arc::new(nrr_platform_linux::interface_rows::LinuxInterfaceRows),
-            )
-            .with_caller_bindings(
-                nrr_service_runtime::production_handlers_misc::stored_caller_bindings(Arc::clone(
-                    &state_conn,
-                )),
-            ),
-        ),
+        Arc::clone(&adapters_snapshot) as Arc<dyn nrr_service_runtime::AdaptersSnapshotProvider>,
         Arc::new(
             ProductionRulesSnapshotProvider::new(Arc::clone(&state_conn))
                 .with_main_route_verdicts(Arc::clone(&main_route_verdicts)),
@@ -813,6 +817,7 @@ pub(crate) fn build_ipc_surface(
         auto_probe,
         override_grants,
         routing_pause_terms,
+        adapters_snapshot,
     }
 }
 

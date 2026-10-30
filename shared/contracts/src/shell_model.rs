@@ -419,6 +419,7 @@ const SETTINGS_CONTRACT: SettingsContract = SettingsContract {
 
 const ABOUT_CONTRACT: AboutContract = AboutContract {
     project_url: "https://github.com/kroxiksut/net-rule-router",
+    community_url: "https://t.me/netrulerouter",
     build_channel: "development",
     author: "Fyodor Malkov (kroxiksut)",
     author_email: "fmalkov91@gmail.com",

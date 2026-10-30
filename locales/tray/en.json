@@ -1,0 +1,269 @@
+{
+  "metadata": {
+    "language": "en",
+    "label": "English",
+    "nativeLabel": "English",
+    "version": "1.0",
+    "fallbacks": [
+      "en"
+    ]
+  },
+  "routing": {
+    "status": {
+      "tray-tooltip-paused": "Rules disabled — click to enable"
+    }
+  },
+  "a11y": {
+    "tray": {
+      "status-text": {
+        "preview-mode": "First-run setup is not finished: your rules are not applied yet.",
+        "checking-status": "Checking whether the service is reachable and whether your rules are being applied.",
+        "no-active-policy": "Your rules are not being applied right now.",
+        "service-unavailable": "The background service is not reachable: rules cannot be applied or changed until it is back."
+      },
+      "setup-state": {
+        "allowed": "Action is available in the current setup state.",
+        "soft-guided": "Available; finishing the first-run setup first is recommended.",
+        "blocked-until-wizard-completion": "Available once the first-run setup is finished."
+      },
+      "preview-only-note": "This action is not available yet.",
+      "action-label": {
+        "open-main-window": "Open NetRuleRouter",
+        "interfaces-routes": "Interfaces and routes",
+        "rules": "Rules",
+        "diagnostics": "Diagnostics",
+        "logs": "Logs",
+        "settings": "Settings",
+        "open-about-window": "About",
+        "open-license-window": "License",
+        "open-logs-folder": "Open logs folder",
+        "exit-application": "Exit",
+        "refresh-interfaces": "Refresh interfaces",
+        "check-service-status": "Check service status",
+        "safe-rollback": "Safe rollback",
+        "temporary-disable-product-impact": "Temporarily disable product impact",
+        "check-for-updates": "Check for updates"
+      },
+      "action-description": {
+        "open-main-window": "Open the main NetRuleRouter window.",
+        "interfaces-routes": "Open interfaces and routes screen.",
+        "rules": "Open rules screen.",
+        "diagnostics": "Open diagnostics screen.",
+        "logs": "Open logs screen.",
+        "settings": "Open settings screen.",
+        "open-about-window": "Open About window.",
+        "open-license-window": "Open license window.",
+        "open-logs-folder": "Open the logs folder.",
+        "exit-application": "Exit the application.",
+        "refresh-interfaces": "Refresh network interface snapshot.",
+        "check-service-status": "Check service status.",
+        "safe-rollback": "Trigger safe rollback flow.",
+        "temporary-disable-product-impact": "Temporarily disable product impact.",
+        "check-for-updates": "Check for application updates."
+      }
+    }
+  },
+  "tray": {
+    "menu": {
+      "open": "Open",
+      "add-rule": "Add rule…",
+      "suggestions": "Suggested addresses",
+      "start-service": "Start service",
+      "stop-service": "Stop service",
+      "pause-rules": "Turn off rules…"
+    },
+    "add-rule": {
+      "title": "Add rule",
+      "saving": "Adding the rule…",
+      "load-failed": "Could not read your rules from the service, so nothing was added. Check that the service is running.",
+      "on-other-route": "{value} is already in your rules, on the route {route}.",
+      "on-other-route-many": "{count} of these are already in your rules, on another route.",
+      "already-denied": "{value} is already denied in your rules.",
+      "already-denied-many": "{count} of these are already denied in your rules.",
+      "on-a-route-many": "{count} of these are already in your rules, on a route.",
+      "on-other-route-or-denied-many": "{count} of these are already in your rules, on the other route or denied.",
+      "added": "Rule added: {value} → {route}",
+      "added-awaits-confirmation": "Rule added: {value} → {route}. It is not applied yet: the protection of system programs holds it until you confirm it in the rules list.",
+      "added-disabled": "Rule added, switched off: {value} → {route}. It does not route anything until you switch it on.",
+      "added-deny": "Rule added: {value} denied.",
+      "added-deny-many": "Deny rules added: {count}.",
+      "added-deny-disabled": "Rule added, switched off: deny {value}. It does not deny anything until you switch it on.",
+      "moved": "Rule moved: {value} → {route}",
+      "moved-count": "Moved to this route: {count}.",
+      "moved-deny": "Rule changed: {value} is now denied.",
+      "now-denied-count": "Now denied: {count}.",
+      "deny-lifted": "Deny lifted: {value} → {route}",
+      "deny-lifted-count": "Deny lifted, now over {route}: {count}.",
+      "changed-elsewhere": "Your rules were changed elsewhere in the meantime, so nothing was added. Open the main window and add the rule there.",
+      "undoing": "Undoing…",
+      "undo-load-failed": "Could not read your rules from the service, so nothing was undone. Check that the service is running.",
+      "undo-changed": "The rule has been changed since, so nothing was undone.",
+      "undone": "Undone: the rules are as they were."
+    },
+    "external": {
+      "label": "External IP",
+      "main-route": "Main route",
+      "additional-route": "Additional route",
+      "checking": "checking…",
+      "unknown": "check",
+      "last-known": "last known {when}"
+    },
+    "suggestions": {
+      "silence": "Do not suggest addresses",
+      "silence-menu": "Do not suggest addresses…",
+      "silence-body": "New addresses will not be offered for as long as you choose. They keep collecting under Suggested addresses.",
+      "for-30-minutes": "For 30 minutes",
+      "for-2-hours": "For 2 hours",
+      "for-4-hours": "For 4 hours",
+      "for-8-hours": "For 8 hours",
+      "until-restart": "Until restart",
+      "resume": "Suggest addresses again",
+      "stop-automatic": "Stop adding automatically"
+    },
+    "status": {
+      "preview-mode": "Setup not finished",
+      "checking-status": "Checking status...",
+      "no-active-policy": "No active policy application",
+      "service-unavailable": "Service unavailable"
+    },
+    "action": {
+      "open-window": "Open window"
+    },
+    "tooltip": {
+      "service-running": "NetRuleRouter — Service running",
+      "service-stopped": "Service stopped — click to start",
+      "service-pending": "Service changing state...",
+      "service-not-installed": "Service not installed — click to install",
+      "service-unknown": "Cannot read service status",
+      "no-updates": "The service is running, but this app is not receiving updates from it",
+      "rules-applied": "NetRuleRouter — your rules are being applied",
+      "no-rules-applied": "NetRuleRouter — no rules are being applied yet",
+      "contract-skew": "App and service builds differ — changes are off"
+    },
+    "auto-rules": {
+      "body-multi": "Found addresses that {count} of the sites you routed need.",
+      "item-companion-short": "← {name}",
+      "route-line-primary": "They will be added to the main route.",
+      "route-line-secondary": "They will be added to the additional route.",
+      "empty": "No addresses to suggest right now.",
+      "none-pending": "Nothing is waiting to be added right now.",
+      "list-accessible-name": "Suggested addresses",
+      "unchecked-declined": "Unchecked rows will be declined; you can bring them back later in the app.",
+      "detail-match-kind": {
+        "exact": "this address only",
+        "suffix": "this address and its subdomains"
+      },
+      "action": {
+        "accept": "Add checked",
+        "always": "Add automatically from now on",
+        "dismiss": "Never suggest checked"
+      },
+      "body-blocked-multi": "Connections to {count} sites keep failing on the main route.",
+      "reload": {
+        "title": "Rule applied"
+      }
+    },
+    "auto-rules-mode-confirm": {
+      "title": "Turn on “Apply automatically”?",
+      "body": "From now on NetRuleRouter will add suggested addresses to your rules files by itself, without asking. You can undo this anytime in Settings → Routing, by switching back to “Suggest only”.",
+      "confirm": "Turn on"
+    },
+    "rules-drift": {
+      "body": "The rules saved in your files are not the ones being applied right now. Apply the files, or open the app to see the difference.",
+      "list-accessible-name": "Rule files that differ",
+      "action": {
+        "compare": "Open and compare",
+        "apply-files": "Apply the files"
+      }
+    },
+    "block-notice": {
+      "title-route-down": "Additional route is unavailable",
+      "merged": {
+        "title": "{count} connections blocked",
+        "body": "Check the addresses to send over the additional route.",
+        "list-accessible-name": "Blocked connections"
+      },
+      "attempts": "{count} attempts",
+      "reason": {
+        "route-unavailable": "The route these addresses are bound to is down right now, so none of them open. This is one notice for the whole route.",
+        "blocked-by-rule": "A rule denies this address directly.",
+        "ipv6-blocked": "With leak protection set to Everything, IPv6 goes out only through the additional connection, and this IPv6 address could not. No rule blocked it — the switch is in Settings.",
+        "dns-lockdown": "This app tried to reach a public DNS resolver of its own instead of the one NetRuleRouter provides, and encrypted-DNS blocking closed it. No rule blocked it — the switch is in Settings, under Routing.",
+        "unattributed": "NetRuleRouter blocked this address, but could not identify which filter did it.",
+        "unspecified": "No further detail available."
+      },
+      "reason-short": {
+        "route-unavailable": "Route is down",
+        "blocked-by-rule": "Denied by a rule",
+        "ipv6-blocked": "IPv6 held by leak protection",
+        "dns-lockdown": "Own encrypted DNS",
+        "unattributed": "Blocked, filter unknown",
+        "unspecified": "Blocked"
+      },
+      "action": {
+        "open-routes": "Open routes"
+      },
+      "route-confirm": {
+        "title-many": "Route {count} addresses via the additional link?"
+      },
+      "snooze": {
+        "body-many": "Stop asking about these {count} addresses for a while."
+      },
+      "mute": {
+        "these-hosts": "Only these {count} addresses",
+        "these-apps": "All from these {count} programs"
+      },
+      "launched-by": "launched by {name}",
+      "count": {
+        "dns-lockdown": {
+          "one": "{count} DNS server",
+          "other": "{count} DNS servers"
+        },
+        "ipv6-blocked": {
+          "one": "{count} IPv6 address",
+          "other": "{count} IPv6 addresses"
+        },
+        "address": {
+          "one": "{count} address",
+          "other": "{count} addresses"
+        }
+      }
+    },
+    "site-not-opening": {
+      "add": "Add rule",
+      "mute": "Don't report again"
+    },
+    "settings-lost": {
+      "body": "This happens after the service was reinstalled or its data was reset. Settings missing: {count}."
+    },
+    "settings-restore-failed": "Your settings could not be restored. Open the app to try again.",
+    "pause": {
+      "title": "Turn off rules",
+      "body": "Your routing and leak protection stop for the time you choose and come back on their own.",
+      "failed": "Could not turn the rules off: "
+    }
+  },
+  "notifications": {
+    "verify-verdicts": {
+      "list": "Rules and the route they would move to"
+    },
+    "local-networks": {
+      "body": "{cidr} on {adapter} stays reachable while routed traffic is blocked. Keep it that way?",
+      "body-open": "Your home network's IPv6 addresses {cidr} on {adapter} are closed while routed traffic is blocked. Open them to devices on this network?"
+    },
+    "enforcement": {
+      "no-policy": {
+        "choose-other": "Choose another"
+      }
+    },
+    "vpn-client-trust": {
+      "tray-body": "{apps} looks like a VPN client, but it is not installed in a protected program folder. Open NetRuleRouter to confirm it, or leak protection keeps blocking it while the additional route is down."
+    },
+    "vpn-gateway-trust": {
+      "tray-body": "A VPN is waiting for your answer in the NetRuleRouter window: leak protection stopped it from reaching its server {addresses}."
+    },
+    "service-lost": {
+      "body": "The NetRuleRouter service stopped unexpectedly, so your rules are not applied. Start it again, or restore network access if the connection is cut."
+    }
+  }
+}

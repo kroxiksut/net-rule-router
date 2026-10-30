@@ -614,6 +614,7 @@ ColumnLayout {
         ColumnLayout {
             spacing: root.uiTheme.spacingSm
             Label {
+                Layout.fillWidth: true
                 Layout.preferredWidth: 400
                 wrapMode: Text.WordWrap
                 color: root.textColor

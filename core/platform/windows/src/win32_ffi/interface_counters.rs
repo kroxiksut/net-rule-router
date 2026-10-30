@@ -44,7 +44,7 @@ const IF_OPER_STATUS_UP: i32 = 1;
 
 /// Enumerate every interface's cumulative octet counters.
 pub fn read_interface_counters() -> Result<Vec<InterfaceCounters>, PlatformError> {
-    walk_if_table(decode_row)
+    walk_if_table(decode_row).map(|rows| rows.into_iter().flatten().collect())
 }
 
 /// What the OS says each interface is, keyed by lowercase `{GUID}` — the
@@ -67,6 +67,10 @@ pub fn read_interface_kind_facts(
 
 /// `HardwareInterface`, bit 0 of `InterfaceAndOperStatusFlags`.
 const HARDWARE_INTERFACE: u8 = 0x1;
+
+/// `FilterInterface`, bit 1: a per-adapter NDIS filter-driver instance that
+/// repeats its parent adapter's octets.
+const FILTER_INTERFACE: u8 = 0x2;
 
 fn guid_key(guid: &windows::core::GUID) -> String {
     let d = guid.data4;
@@ -130,8 +134,12 @@ unsafe fn read_table<T>(table: *const MIB_IF_TABLE2, decode: impl Fn(&MIB_IF_ROW
     out
 }
 
-/// Decode one `MIB_IF_ROW2` into a neutral [`InterfaceCounters`].
-fn decode_row(row: &MIB_IF_ROW2) -> InterfaceCounters {
+/// Decode one `MIB_IF_ROW2` into a neutral [`InterfaceCounters`]; `None` for
+/// an NDIS filter instance, whose bytes the parent adapter already carries.
+fn decode_row(row: &MIB_IF_ROW2) -> Option<InterfaceCounters> {
+    if row.InterfaceAndOperStatusFlags._bitfield & FILTER_INTERFACE != 0 {
+        return None;
+    }
     // SAFETY: `Alias` / `Description` are fixed `[u16; 257]` arrays that Win32
     // null-terminates; `pwstr_lossy` scans to the terminator (bounded).
     let alias = unsafe { pwstr_lossy(row.Alias.as_ptr()) };
@@ -150,7 +158,7 @@ fn decode_row(row: &MIB_IF_ROW2) -> InterfaceCounters {
     let is_tunnel = matches!(interface_type, InterfaceType::Tunnel)
         || text_indicates_vpn_tunnel(&format!("{stable_name} {description}"));
 
-    InterfaceCounters {
+    Some(InterfaceCounters {
         display_name: stable_name.clone(),
         stable_name,
         interface_type,
@@ -159,7 +167,7 @@ fn decode_row(row: &MIB_IF_ROW2) -> InterfaceCounters {
         is_up: row.OperStatus.0 == IF_OPER_STATUS_UP,
         in_octets: row.InOctets,
         out_octets: row.OutOctets,
-    }
+    })
 }
 
 #[cfg(test)]
@@ -170,6 +178,24 @@ mod tests {
     fn guid_key_matches_the_adapter_name_spelling() {
         let guid = windows::core::GUID::from_u128(0x0123_4567_89ab_cdef_0123_4567_89ab_cdef);
         assert_eq!(guid_key(&guid), "{01234567-89ab-cdef-0123-456789abcdef}");
+    }
+
+    fn row_with(flags: u8, alias: &str) -> MIB_IF_ROW2 {
+        let mut row = MIB_IF_ROW2::default();
+        row.InterfaceAndOperStatusFlags._bitfield = flags;
+        for (i, unit) in alias.encode_utf16().enumerate() {
+            row.Alias[i] = unit;
+        }
+        row.InOctets = 1000;
+        row
+    }
+
+    #[test]
+    fn an_ndis_filter_row_is_never_counted() {
+        let filter = row_with(FILTER_INTERFACE, "Ethernet-QoS Packet Scheduler-0000");
+        assert!(decode_row(&filter).is_none());
+        let real = row_with(HARDWARE_INTERFACE, "Ethernet");
+        assert_eq!(decode_row(&real).map(|c| c.in_octets), Some(1000));
     }
 
     #[test]

@@ -410,6 +410,7 @@ impl SecondaryRouteCoordinator {
         &self,
         sid: &str,
         binding: &PerSidBinding,
+        other_role: Option<&PerSidBinding>,
         infos: &[AdapterInfo],
         role: &str,
         reading: Option<&MachineReading>,
@@ -533,6 +534,23 @@ impl SecondaryRouteCoordinator {
                         // sibling we could not uniquely identify.
                         match by_id {
                             Some(down) => {
+                                // Already asked above when names answered; a
+                                // second status for the role would take turns
+                                // with that one on every pass.
+                                let asked = ambiguous || refused_only;
+                                let sibling = if asked {
+                                    None
+                                } else {
+                                    sole_live_driver_sibling(infos, down, |i| {
+                                        other_role.is_some_and(|b| {
+                                            binding_matches_live(
+                                                i,
+                                                &b.stable_id,
+                                                &b.known_stable_ids,
+                                            )
+                                        })
+                                    })
+                                };
                                 if self.note_not_usable_once(sid, role, &binding.stable_id) {
                                     tracing::warn!(
                                         target: "nrr::route-coordinator",
@@ -544,6 +562,9 @@ impl SecondaryRouteCoordinator {
                                         oper_status = ?down.oper_status,
                                         has_ipv4 = down.has_ipv4_address(),
                                         name_match_ambiguous = ambiguous,
+                                        name_matched = accepted.len() + refused.len(),
+                                        refused_foreign = refused.len(),
+                                        sibling_adapter = sibling.map(preferred_display_name).unwrap_or(""),
                                         "bound adapter found but NOT usable (down / no IPv4 / excluded type) and no unique live same-name adapter to heal to — failing closed",
                                     );
                                 }
@@ -558,13 +579,23 @@ impl SecondaryRouteCoordinator {
                                 // traffic, and until this push existed the only
                                 // trace was a log line. Deduped inside the
                                 // publisher, so the steady state stays quiet.
-                                if !refused_only {
-                                    self.publish_enforcement_status(
+                                // One live copy of the bound adapter's driver
+                                // is likely the one the VPN moved to: offered,
+                                // never adopted.
+                                match sibling {
+                                    _ if asked => {}
+                                    Some(only) => self.publish_enforcement_status(
+                                        sid,
+                                        "adapter-choice-needed",
+                                        role,
+                                        vec![preferred_display_name(only).to_string()],
+                                    ),
+                                    None => self.publish_enforcement_status(
                                         sid,
                                         "secondary-down",
                                         role,
                                         Vec::new(),
-                                    );
+                                    ),
                                 }
                             }
                             None => {

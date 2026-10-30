@@ -16,9 +16,9 @@ use super::*;
 /// the newest and lose every contested route to whoever stayed.
 const RANK_MEMORY: Duration = Duration::from_secs(120);
 
-/// How long a session enumeration answers the hot readers (a DNS answer, a
-/// connection batch). A pass asks afresh, so a sign-in is never missed by the
-/// recompute it triggers.
+/// How long a session enumeration and the routing scope answer the hot
+/// readers (a DNS answer, a connection batch). A pass asks afresh, so a
+/// sign-in or a scope change is never missed by the recompute that follows.
 const SESSION_LOOKUP_TTL: Duration = Duration::from_secs(1);
 
 #[derive(Default)]
@@ -160,7 +160,7 @@ impl SecondaryRouteCoordinator {
                 present.push(sid.clone());
             }
         }
-        if (self.rule_scope_service_driven)() {
+        if self.rule_scope(fresh) {
             for sid in self.signed_in_users(fresh) {
                 if !present.contains(&sid) {
                     present.push(sid);
@@ -179,6 +179,22 @@ impl SecondaryRouteCoordinator {
             ordered,
             &self.sign_in_times.lock().unwrap_or_else(|p| p.into_inner()),
         )
+    }
+
+    /// The routing scope, kept for the hot readers like the session list: the
+    /// setting lives in the store, which they must not query per answer.
+    fn rule_scope(&self, fresh: bool) -> bool {
+        let seen = || self.scope_seen.lock().unwrap_or_else(|p| p.into_inner());
+        if !fresh {
+            if let Some((at, scope)) = *seen() {
+                if at.elapsed() < SESSION_LOOKUP_TTL {
+                    return scope;
+                }
+            }
+        }
+        let scope = (self.rule_scope_service_driven)();
+        *seen() = Some((Instant::now(), scope));
+        scope
     }
 
     fn signed_in_users(&self, fresh: bool) -> Vec<String> {

@@ -106,26 +106,6 @@ pub fn packs(root: &Path) -> Vec<Pack> {
     packs
 }
 
-/// The country the system is set to, as the GUI reads it: the region of the
-/// first locale (`ru_RU` → `ru`), else its language.
-pub fn region(candidates: &[String]) -> Option<String> {
-    let tag = candidates
-        .first()?
-        .split(['.', '@'])
-        .next()
-        .unwrap_or_default()
-        .trim()
-        .to_ascii_lowercase()
-        .replace('_', "-");
-    if tag.is_empty() || tag == "c" || tag == "posix" {
-        return None;
-    }
-    let mut parts = tag.split('-');
-    let language = parts.next().unwrap_or_default();
-    let country = parts.next().unwrap_or(language);
-    (!country.is_empty()).then(|| country.to_string())
-}
-
 /// The sets for the system's country, as the GUI offers them: its first own
 /// set, then the one for abroad.
 pub fn regional<'a>(packs: &'a [Pack], country: Option<&str>) -> Vec<&'a Pack> {
@@ -197,15 +177,6 @@ mod tests {
             .nth(2)
             .map(Path::to_path_buf)
             .unwrap_or_default()
-    }
-
-    #[test]
-    fn the_region_is_the_country_half_of_the_locale() {
-        assert_eq!(region(&["ru_RU.UTF-8".into()]).as_deref(), Some("ru"));
-        assert_eq!(region(&["en-US".into()]).as_deref(), Some("us"));
-        assert_eq!(region(&["kk".into()]).as_deref(), Some("kk"));
-        assert_eq!(region(&["C".into()]), None);
-        assert_eq!(region(&[]), None);
     }
 
     #[test]

@@ -1,11 +1,14 @@
 #![no_main]
 //! A preset file as imported: the byte-level validation pipeline and the
-//! canonical-text parser the clients and the service share, and the rules
-//! a table reads out of another OS's section.
+//! canonical-text parser the clients and the service share, the rules a
+//! table reads out of another OS's section, and the carry of those sections
+//! into the text that replaces the file.
 
 use libfuzzer_sys::fuzz_target;
 use nrr_domain::preset_validation::validate_preset_bytes;
-use nrr_shared::preset_parser::{other_os_app_rules, parse_canonical_rules};
+use nrr_shared::preset_parser::{
+    other_os_app_rules, parse_canonical_rules, passthrough_sections, with_passthrough_sections,
+};
 
 const MAX_FILE: usize = 1024 * 1024;
 
@@ -20,4 +23,8 @@ fuzz_target!(|data: &[u8]| {
     for block in &parsed.passthrough {
         let _ = other_os_app_rules(&block.section_name, &block.raw_text);
     }
+    // A rewrite keeps every section the file held, each once.
+    let sections = passthrough_sections(&text);
+    let carried = with_passthrough_sections(&text, &sections);
+    assert_eq!(passthrough_sections(&carried), sections);
 });

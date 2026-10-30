@@ -64,7 +64,7 @@ pub const FIELD_DEFAULTS: [(&str, FieldDefault); 25] = [
     ("short-name-suffix", FieldDefault::Text("")),
     ("app-rules-take-all-addresses", FieldDefault::Bool(false)),
     ("forwarded-outage", FieldDefault::Text("")),
-    ("external-address-auto-check", FieldDefault::Bool(false)),
+    ("external-address-auto-check", FieldDefault::Bool(true)),
 ];
 
 /// Keys the snapshot carries but the request has no field for: each is
@@ -83,7 +83,7 @@ pub const DEFAULT_ROUTES: [&str; 2] = [DEFAULT_ROUTE_MAIN, "prefer-secondary-whe
 pub const LEAK_PROTECTION_KEY: &str = "leak-protection";
 const LEAK_PROTECTION_OFF: &str = "off";
 const LEAK_PROTECTION_SITES: &str = "sites";
-const LEAK_PROTECTION_EVERYTHING: &str = "everything";
+pub(crate) const LEAK_PROTECTION_EVERYTHING: &str = "everything";
 /// Every leak-protection level, weakest first.
 pub const LEAK_PROTECTION_LEVELS: [&str; 3] = [
     LEAK_PROTECTION_OFF,

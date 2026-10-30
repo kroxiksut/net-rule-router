@@ -3,88 +3,92 @@
 //! setup. The window starts from what the service holds and writes only what
 //! changed, through the decision it shares with the terminal setup
 //! (`route_policy::first_run_writes`, vectors in `first_run_writes.json`).
+//! Runs the window's own functions against a stand-in window.
 #![allow(clippy::expect_used)]
 
-use std::path::Path;
+#[path = "support/first_run.rs"]
+mod first_run;
 
-fn qml(relative: &str) -> String {
-    let path = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../qml")
-        .join(relative);
-    std::fs::read_to_string(&path)
-        .unwrap_or_else(|e| panic!("read {}: {e}", path.display()))
-        .replace("\r\n", "\n")
-}
+/// Set up in the terminal: everything held, browser lockdown off.
+const SET_UP: &str = "rows = [wire('eth', 'Ethernet', {})];\n\
+    rows[0].selectedRole = 'primary';\n\
+    root._serviceRoutePolicy = { 'leak-protection': 'everything',\n\
+        'doh-lockdown-auto': false, 'doh-lockdown-enabled': false };\n\
+    _seedProtection();";
 
-fn function_body<'a>(source: &'a str, name: &str) -> &'a str {
-    let start = source
-        .find(&format!("function {name}("))
-        .unwrap_or_else(|| panic!("{name} is defined"));
-    let rest = &source[start..];
-    let end = rest[1..]
-        .find("\n    function ")
-        .map_or(rest.len(), |i| i + 1);
-    &rest[..end]
+#[test]
+fn the_wizard_starts_from_what_the_service_holds_and_closing_lowers_nothing() {
+    let output = first_run::run(&format!(
+        "{SET_UP}\n\
+         console.log('shown ' + leakProtectionChoice + ' ' + wantDohLockdown);\n\
+         step = 4;\n\
+         _saveProtection();\n\
+         _commitRun();"
+    ));
+    assert!(output.contains("shown everything false"), "{output}");
+    assert!(
+        !output.contains("protection "),
+        "closing the window rewrote the protection set elsewhere:\n{output}"
+    );
+    assert!(!output.contains("stability "), "{output}");
 }
 
 #[test]
-fn the_wizard_writes_only_what_the_shared_decision_allows() {
-    let wizard = qml("components/FirstRunWindow.qml");
-    let write = function_body(&wizard, "_writeServiceChoices");
-    let decision = write
-        .find("Pure.firstRunWrites(")
-        .expect("the write asks the shared decision");
-    let protection = write
-        .find("applyFirstRunProtections(")
-        .expect("protection is written here");
-    let stability = write
-        .find("applyFirstRunStability(")
-        .expect("the answers are written here");
-    assert!(decision < protection && decision < stability);
-    assert!(write.contains("if (writes.protection"));
-    assert!(write.contains("if (!writes.stability) return"));
-
-    let close = function_body(&wizard, "_applyProtectionChoices");
-    assert!(
-        !close.contains("applyFirstRunProtections(") && !close.contains("applyFirstRunStability("),
-        "closing never writes past the decision"
-    );
-    assert!(
-        close.contains("_serviceWritePending = true"),
-        "before the service answered, the write waits for it"
-    );
+fn a_choice_made_here_is_written() {
+    let output = first_run::run(&format!(
+        "{SET_UP}\n\
+         _protectionTouched = true; wantLeakProtection = 'sites';\n\
+         _commitRun();"
+    ));
+    assert!(output.contains("protection sites false"), "{output}");
 }
 
 /// A user already set up who changes only the log window must not have
 /// fake-IP switched on by the window's offer.
 #[test]
 fn fake_ip_is_written_only_when_the_shared_decision_says_so() {
-    let wizard = qml("components/FirstRunWindow.qml");
-    let write = function_body(&wizard, "_writeServiceChoices");
-    assert!(write.contains("_stabilityTouched, _fakeIpTouched)"));
-    assert!(write.contains("if (writes.fakeIp) patch[\"fake-ip-enabled\"] = wantFakeIp"));
-    assert!(!write.contains("{ \"fake-ip-enabled\": wantFakeIp }"));
-    let seed = function_body(&wizard, "_seedFakeIp");
-    assert!(
-        seed.contains("!_fakeIpTouched"),
-        "a choice made here stands"
+    let output = first_run::run(&format!(
+        "{SET_UP}\n\
+         _stabilityTouched = true; wantDiagnosticLogs = true;\n\
+         _commitRun();"
+    ));
+    let stability = output
+        .lines()
+        .find(|l| l.starts_with("stability "))
+        .expect("the log window was written");
+    assert!(stability.contains("verbose-logging-change"), "{stability}");
+    assert!(!stability.contains("fake-ip-enabled"), "{stability}");
+
+    // A new user gets the offer: fake-IP on, protection written.
+    let output = first_run::run(
+        "rows = [wire('eth', 'Ethernet', {})];\n\
+         _seedProtection();\n\
+         _commitRun();",
     );
+    assert!(output.contains("protection sites true"), "{output}");
+    assert!(output.contains("\"fake-ip-enabled\":true"), "{output}");
 }
 
+/// Before the service answered, a user already set up cannot be told from a
+/// new one: nothing is written until its first policy read.
 #[test]
-fn the_wizard_starts_from_what_the_service_holds() {
-    let wizard = qml("components/FirstRunWindow.qml");
-    let seed = function_body(&wizard, "_seedProtection");
-    assert!(seed.contains("root._serviceRoutePolicy"));
-    assert!(seed.contains("Pure.firstRunHeldProtection("));
-    assert!(
-        seed.contains("!_protectionTouched"),
-        "a choice made before the read stands"
+fn before_the_service_answers_the_write_waits_for_it() {
+    let output = first_run::run(
+        "rows = [wire('eth', 'Ethernet', {})];\n\
+         root._servicePolicyRead = false;\n\
+         _commitRun();\n\
+         console.log('-- read');\n\
+         root._servicePolicyRead = true;\n\
+         root._serviceRoutePolicy = { 'leak-protection': 'everything' };\n\
+         _onServicePolicyRead();",
     );
-    let main = qml("Main.qml");
-    let note = function_body(&main, "_noteServicePolicy");
-    assert!(note.contains("_serviceRoutePolicy = rpRaw || null"));
-    let pure = qml("lib/pure.js");
-    assert!(pure.contains("function firstRunHeldProtection("));
-    assert!(pure.contains("function firstRunWrites("));
+    let read = output.find("-- read").expect("marker");
+    assert!(
+        !output[..read].contains("protection ") && !output[..read].contains("stability "),
+        "{output}"
+    );
+    assert!(
+        !output.contains("protection sites"),
+        "the offer was written over the service's policy:\n{output}"
+    );
 }

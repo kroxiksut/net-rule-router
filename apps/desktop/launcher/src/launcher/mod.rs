@@ -15,6 +15,7 @@ use std::process::{Command, ExitCode, Stdio};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
+use nrr_platform_api::installer_agreement::InstallerAgreementPort;
 use nrr_shared::product_identity::BinaryRole;
 
 use nrr_desktop_gui::app_shell::{parse_launch_request_arguments, LaunchRequest};
@@ -846,6 +847,23 @@ fn install_system_locale_port() {
     ));
 }
 
+/// Where the installer recorded the agreement accepted on its licence page.
+#[cfg(windows)]
+fn installer_agreement() -> Box<dyn InstallerAgreementPort> {
+    Box::new(nrr_platform_windows::installer_agreement::WindowsInstallerAgreement)
+}
+
+/// The Linux packages show no agreement: never a record.
+#[cfg(target_os = "linux")]
+fn installer_agreement() -> Box<dyn InstallerAgreementPort> {
+    Box::new(nrr_platform_linux::installer_agreement::LinuxInstallerAgreement)
+}
+
+#[cfg(not(any(windows, target_os = "linux")))]
+fn installer_agreement() -> Box<dyn InstallerAgreementPort> {
+    Box::new(nrr_platform_api::installer_agreement::NoInstallerAgreement)
+}
+
 /// How long to wait for the primary to answer, decided by whether it is still
 /// there to answer at all.
 fn activation_ack_budget(instance_key: &str) -> Duration {
@@ -966,6 +984,12 @@ fn load_preferences_with_fallback() -> (
     Option<UserSettingsMirror>,
 ) {
     let (store, mut preferences) = load_ui_preferences();
+    if crate::user_settings_bridge::adopt_installer_acceptance(
+        &mut preferences,
+        installer_agreement().as_ref(),
+    ) {
+        eprintln!("nrr-launcher: the agreement was accepted in the installer by this account");
+    }
     let user_settings =
         crate::user_settings_bridge::open_session(&mut preferences, store.is_some());
     (store, preferences, user_settings)

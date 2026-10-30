@@ -43,8 +43,8 @@ nrr_package_version() {
     *) return 1 ;;
   esac
   case "$stage" in
-    # Two tildes: letter by letter `prealpha` would sort after `alpha`.
-    dev | prealpha) [ -z "$number" ] || return 1; printf '%s~~%s' "$base" "$pre" ;;
+    # Two tildes: letter by letter `dev` would sort after `alpha`.
+    dev) [ -z "$number" ] || return 1; printf '%s~~%s' "$base" "$pre" ;;
     alpha | beta | rc) printf '%s~%s' "$base" "$pre" ;;
     *) return 1 ;;
   esac

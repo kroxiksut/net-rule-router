@@ -6,6 +6,7 @@
 //! [`held_other_role`] or [`offered_for_role`].
 
 use nrr_shared::display_text::display_text;
+use nrr_shared::driver_family;
 use nrr_shared::ipc_payloads::{InterfaceRowDto, RouteBindingDto};
 use nrr_shared::product_identity::TUN_ADAPTER_NAME;
 
@@ -254,6 +255,49 @@ pub fn role_hint(row: &InterfaceRowDto) -> Option<RoleHint> {
     }
 }
 
+/// Whether `row` reads as a tunnel (`adapterLooksLikeTunnel`): a kind the OS
+/// decided outranks the name, since a bridged tap is a VM's port; "other"
+/// decides nothing.
+pub fn looks_like_tunnel(row: &InterfaceRowDto) -> bool {
+    let by_kind = if !row.kind.is_empty() && row.kind != "other" {
+        row.kind == "tunnel"
+    } else {
+        row.derived_assessment
+            .classification
+            .to_lowercase()
+            .contains("vpn")
+    };
+    by_kind || role_hint(row) == Some(RoleHint::LooksVpn)
+}
+
+/// The adapter the first-run window offers for `role` before anything is
+/// picked (`firstRunSuggestion`): the one connected adapter that looks like
+/// the main link, or like a tunnel for the additional route. `None` when no
+/// row or more than one answers: choosing between two is the user's call.
+/// `skip` is the row the other route is picked for: one adapter never
+/// carries both, and a tunnel holding the only default route answers both.
+pub fn first_run_suggestion(
+    rows: &[InterfaceRowDto],
+    role: Route,
+    skip: Option<usize>,
+) -> Option<usize> {
+    let mut hits = rows
+        .iter()
+        .enumerate()
+        .filter(|(index, row)| {
+            Some(*index) != skip
+                && row.availability == "available"
+                && offered_for_role(row, role)
+                && match role {
+                    Route::Primary => role_hint(row) == Some(RoleHint::LooksPrimary),
+                    Route::Secondary => looks_like_tunnel(row),
+                }
+        })
+        .map(|(index, _)| index);
+    let first = hits.next()?;
+    hits.next().is_none().then_some(first)
+}
+
 /// The role `row` holds other than `role`, if any (`adapterHeldOtherRole`).
 /// One adapter cannot carry both routes.
 pub fn held_other_role(row: &InterfaceRowDto, role: Route) -> Option<&str> {
@@ -312,4 +356,49 @@ pub fn suggested_primary_binding(rows: &[InterfaceRowDto], name: &str) -> Option
         user_confirmed: true,
         known_stable_ids: Vec::new(),
     })
+}
+
+/// Other adapters of a picked adapter's driver (`adapterDriverSiblings`).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct DriverSiblings {
+    /// Connected ones a picker for the role may offer, by row index.
+    pub live: Vec<usize>,
+    /// How many more are on the machine, not connected.
+    pub idle: usize,
+}
+
+impl DriverSiblings {
+    /// Nothing worth a warning.
+    pub fn is_empty(&self) -> bool {
+        self.live.is_empty() && self.idle == 0
+    }
+}
+
+/// For a picked adapter that is not connected, the other copies of its driver
+/// (`adapterDriverSiblings`). A VPN client on a stock driver brings up
+/// whichever copy it likes, so a dead one bound to a route may never come back
+/// while its sibling carries the tunnel. Empty for a connected pick.
+pub fn driver_siblings(rows: &[InterfaceRowDto], index: usize, role: Route) -> DriverSiblings {
+    let mut found = DriverSiblings::default();
+    let Some(picked) = rows.get(index) else {
+        return found;
+    };
+    let family = driver_family(&picked.interface_description);
+    if picked.availability == "available" || family.is_empty() {
+        return found;
+    }
+    for (i, row) in rows.iter().enumerate() {
+        if i == index
+            || !offered_for_role(row, role)
+            || driver_family(&row.interface_description) != family
+        {
+            continue;
+        }
+        if row.availability == "available" {
+            found.live.push(i);
+        } else {
+            found.idle += 1;
+        }
+    }
+    found
 }

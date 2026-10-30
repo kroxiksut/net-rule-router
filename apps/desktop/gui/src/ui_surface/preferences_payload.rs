@@ -71,11 +71,14 @@ impl QtPreferencesPayload {
         if let Some(language_id) = self.language.as_deref().and_then(canonicalize_language_id) {
             current.language = language_id;
         }
-        if let Some(label) = self.route_primary_label.filter(|l| !l.trim().is_empty()) {
-            current.route_primary_label = label;
+        // Empty is "never renamed": the window names that route in its language.
+        if let Some(label) = self.route_primary_label {
+            current.route_primary_label =
+                nrr_ui_support::ui_preferences::route_label_as_stored(&label);
         }
-        if let Some(label) = self.route_secondary_label.filter(|l| !l.trim().is_empty()) {
-            current.route_secondary_label = label;
+        if let Some(label) = self.route_secondary_label {
+            current.route_secondary_label =
+                nrr_ui_support::ui_preferences::route_label_as_stored(&label);
         }
         if let Some(id) = self.selected_primary_interface_id {
             current.selected_primary_interface_id = id;
@@ -190,6 +193,9 @@ impl QtPreferencesPayload {
         if let Some(v) = self.app_groups_offer_dismissed {
             current.app_groups_offer_dismissed = v;
         }
+        if let Some(v) = self.rule_set_offer_answered {
+            current.rule_set_offer_answered = v;
+        }
         if let Some(v) = self.show_remembered_adapters {
             current.show_remembered_adapters = v;
         }
@@ -219,6 +225,9 @@ impl QtPreferencesPayload {
             nrr_ui_support::ui_preferences::TRAFFIC_EXPORT_UNITS.contains(&unit.as_str())
         }) {
             current.traffic_export_unit = unit;
+        }
+        if let Some(include) = self.traffic_export_include_virtual {
+            current.traffic_export_include_virtual = include;
         }
         if let Some(grouping) = self.conn_trace_group_by {
             current.conn_trace_group_by = allowed_slug_or(

@@ -59,11 +59,13 @@
 
 use serde::{Deserialize, Serialize};
 
+mod carry;
 mod rule_line;
 mod sections;
 mod state;
 mod types;
 
+pub use carry::*;
 pub use rule_line::*;
 pub use sections::*;
 use state::*;

@@ -97,8 +97,6 @@ pub(super) enum ComputedFilterSet {
     Install(ComputedPlan),
     /// The SID has no per-SID policy row → installs nothing.
     NoPolicy,
-    /// The SID has a policy but no active rule revision → installs nothing.
-    NoActiveRules,
 }
 
 /// What one compute produced: the filter set, plus the facts a caller would

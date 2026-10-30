@@ -110,6 +110,34 @@ fn rules_file_folder_matches_js() {
 }
 
 #[test]
+fn first_run_country_matches_js() {
+    check(
+        "first_run_country",
+        &mut JsLib::pure(),
+        |input| {
+            format!(
+                "firstRunCountry({}, {})",
+                arg(input, "region"),
+                arg(input, "locales")
+            )
+        },
+        |input| {
+            let locales: Vec<String> = input
+                .get("locales")
+                .and_then(Value::as_array)
+                .map_or(&[][..], Vec::as_slice)
+                .iter()
+                .filter_map(|l| l.as_str().map(str::to_owned))
+                .collect();
+            json!(nrr_client_logic::first_run::first_run_country(
+                text(input, "region"),
+                &locales
+            ))
+        },
+    );
+}
+
+#[test]
 fn security_alerts_unreadable_matches_js() {
     check(
         "security_alerts_unreadable",

@@ -203,7 +203,7 @@ Window {
         // "import only active rules" toggle,
         // contextual to importing (moved here from the Rules toolbar,
         // where it was clutter). Defaults to the saved value in
-        // Settings → General; ticking it affects this import only.
+        // Settings → Application → General; ticking it affects this import only.
         CheckBox {
             id: loadListOnlyActiveCheck
             Layout.fillWidth: true
@@ -214,7 +214,9 @@ Window {
             Accessible.description: ToolTip.text
             ToolTip.visible: hovered
             ToolTip.text: root.tr("rules.import-only-active.tooltip",
-                "When loading a preset, skip rules that are turned off in it (for example application rules, which can't route yet). Default comes from Settings → General; changing it here applies to imports this session only.")
+                "When loading a preset, skip rules that are turned off in it (for example application rules, which can't route yet). Default comes from Settings → {page} → {group}; changing it here applies to imports this session only.")
+                .replace("{page}", root.tr("settings.category.application", "Application"))
+                .replace("{group}", root.tr("settings.group.general", "General"))
             contentItem: Text {
                 leftPadding: loadListOnlyActiveCheck.indicator.width + loadListOnlyActiveCheck.spacing
                 text: root.tr("rules.import-only-active.label", "Import only active rules")

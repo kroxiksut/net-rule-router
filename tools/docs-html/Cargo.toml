@@ -1,0 +1,28 @@
+[package]
+name = "nrr-docs-html"
+version.workspace = true
+edition = "2021"
+rust-version = "1.94.1"
+publish = false
+license = "MPL-2.0"
+
+# Build-time tool: turns the user documentation under `docs/` into the offline
+# HTML the packages carry. Nothing in the product depends on it.
+[[bin]]
+name = "nrr-docs-html"
+path = "src/main.rs"
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+# Where the package keeps the pages and the project URL links outside `docs/` go to.
+nrr-shared = { path = "../../shared/contracts" }
+# Without `getopts`: that feature only serves the crate's own command line.
+pulldown-cmark = { version = "0.13.5", default-features = false, features = ["html"] }
+
+[dev-dependencies]
+tempfile = "3"
+
+[lints]
+workspace = true

@@ -21,10 +21,8 @@ pub(super) fn parse_preferences_with(
     preferences.forward_compat.newer_schema_version =
         declared.filter(|v| *v > CURRENT_UI_PREFS_SCHEMA_VERSION);
     let carry_unknown = declared.is_some_and(|v| v >= CURRENT_UI_PREFS_SCHEMA_VERSION);
-    // Language and labels are settled after the loop, from what the file held.
+    // The language is settled after the loop, from what the file held.
     let mut language_seen = false;
-    let mut primary_label_seen = false;
-    let mut secondary_label_seen = false;
 
     for raw_line in content.lines() {
         let line = raw_line.trim();
@@ -147,16 +145,10 @@ pub(super) fn parse_preferences_with(
                 }
             }
             "route_primary_label" => {
-                if !value.is_empty() {
-                    preferences.route_primary_label = value.to_string();
-                    primary_label_seen = true;
-                }
+                preferences.route_primary_label = route_label_as_stored(value);
             }
             "route_secondary_label" => {
-                if !value.is_empty() {
-                    preferences.route_secondary_label = value.to_string();
-                    secondary_label_seen = true;
-                }
+                preferences.route_secondary_label = route_label_as_stored(value);
             }
             "show_bluetooth_adapters" => {
                 if let Some(parsed) = parse_bool(value) {
@@ -209,6 +201,11 @@ pub(super) fn parse_preferences_with(
                     preferences.app_groups_offer_dismissed = parsed;
                 }
             }
+            "rule_set_offer_answered" => {
+                if let Some(parsed) = parse_bool(value) {
+                    preferences.rule_set_offer_answered = parsed;
+                }
+            }
             "show_remembered_adapters" => {
                 if let Some(parsed) = parse_bool(value) {
                     preferences.show_remembered_adapters = parsed;
@@ -254,6 +251,11 @@ pub(super) fn parse_preferences_with(
             "traffic_export_unit" => {
                 if TRAFFIC_EXPORT_UNITS.contains(&value) {
                     preferences.traffic_export_unit = value.to_string();
+                }
+            }
+            "traffic_export_include_virtual" => {
+                if let Some(parsed) = parse_bool(value) {
+                    preferences.traffic_export_include_virtual = parsed;
                 }
             }
             "conn_trace_group_by" => {
@@ -574,15 +576,6 @@ pub(super) fn parse_preferences_with(
     if !language_seen {
         preferences.language = system_language();
     }
-    // A missing label follows the language the user runs, not the system's:
-    // otherwise a Russian-UI user of an old file gets "Primary"/"Secondary".
-    let (primary, secondary) = default_route_labels(&preferences.language);
-    if !primary_label_seen {
-        preferences.route_primary_label = primary;
-    }
-    if !secondary_label_seen {
-        preferences.route_secondary_label = secondary;
-    }
 
     normalize_theme_preferences(&mut preferences);
     preferences
@@ -683,6 +676,7 @@ pub(super) fn format_preferences(preferences: &UiPreferences) -> String {
             "routing_detailed_mode={}\n",
             "show_virtual_machines_section={}\n",
             "app_groups_offer_dismissed={}\n",
+            "rule_set_offer_answered={}\n",
             "show_remembered_adapters={}\n",
             "selected_primary_interface_id={}\n",
             "selected_primary_interface_name={}\n",
@@ -716,6 +710,7 @@ pub(super) fn format_preferences(preferences: &UiPreferences) -> String {
             "missing_secondary_banner_acknowledged={}\n",
             "traffic_stats_period={}\n",
             "traffic_export_unit={}\n",
+            "traffic_export_include_virtual={}\n",
             "conn_trace_group_by={}\n",
             "diagnostics_archive_redaction_level={}\n",
             "diagnostics_archive_session_only={}\n",
@@ -776,6 +771,7 @@ pub(super) fn format_preferences(preferences: &UiPreferences) -> String {
         one_line(&preferences.routing_detailed_mode),
         one_line(&preferences.show_virtual_machines_section),
         one_line(&preferences.app_groups_offer_dismissed),
+        one_line(&preferences.rule_set_offer_answered),
         one_line(&preferences.show_remembered_adapters),
         one_line(&preferences.selected_primary_interface_id),
         one_line(&preferences.selected_primary_interface_name),
@@ -809,6 +805,7 @@ pub(super) fn format_preferences(preferences: &UiPreferences) -> String {
         one_line(&preferences.missing_secondary_banner_acknowledged),
         one_line(&preferences.traffic_stats_period),
         one_line(&preferences.traffic_export_unit),
+        one_line(&preferences.traffic_export_include_virtual),
         one_line(&preferences.conn_trace_group_by),
         one_line(&preferences.diagnostics_archive_redaction_level),
         one_line(&preferences.diagnostics_archive_session_only),

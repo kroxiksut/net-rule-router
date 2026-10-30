@@ -54,196 +54,207 @@ Window {
         requestActivate()
     }
 
-    onVisibleChanged: if (visible) { root.centerChildWindow(licenseWindow); root.applyTitleBarTo(licenseWindow) }
-    ColumnLayout {
+    // The content is built on the first show and kept: the license texts are
+    // laid out documents a session that never opens this window would hold.
+    property bool contentBuilt: false
+
+    onVisibleChanged: if (visible) { contentBuilt = true; root.centerChildWindow(licenseWindow); root.applyTitleBarTo(licenseWindow) }
+    Loader {
         anchors.fill: parent
         anchors.margins: root.uiTheme.spacingLg
-        spacing: root.uiTheme.spacingMd
-        RowLayout {
-            Layout.fillWidth: true
-            spacing: root.uiTheme.spacingSm
-            ThemedButton {
-                theme: root.uiTheme
-                text: root.tr("label.license", "License")
-                highlighted: licenseWindow.activeTab === "mpl"
-                Accessible.role: Accessible.Button
-                Accessible.name: text
-                onClicked: licenseWindow.activeTab = "mpl"
-            }
-            ThemedButton {
-                theme: root.uiTheme
-                text: root.tr("dialog.eula.title", "License agreement") + " (EULA)"
-                highlighted: licenseWindow.activeTab === "eula"
-                Accessible.role: Accessible.Button
-                Accessible.name: text
-                onClicked: licenseWindow.activeTab = "eula"
-            }
-            // Attribution + live integrity of the components shipped from
-            // other authors.
-            ThemedButton {
-                theme: root.uiTheme
-                text: root.tr("dialog.third-party.tab", "Third-party components")
-                highlighted: licenseWindow.activeTab === "third-party"
-                Accessible.role: Accessible.Button
-                Accessible.name: text
-                onClicked: {
-                    licenseWindow.activeTab = "third-party"
-                    thirdPartyPanel.reload()
-                }
-            }
-            Item { Layout.fillWidth: true }
-        }
-        ScrollView {
-            Layout.fillWidth: true
-            Layout.fillHeight: true
-            clip: true
-            visible: licenseWindow.activeTab === "third-party"
-            ScrollBar.vertical.policy: ScrollBar.AsNeeded
-            ThirdPartyComponentsPanel {
-                id: thirdPartyPanel
-                root: licenseWindow.root
-                width: parent.width
-            }
-        }
-        ScrollView {
-            Layout.fillWidth: true
-            Layout.fillHeight: true
-            clip: true
-            visible: licenseWindow.activeTab === "mpl"
-            ScrollBar.vertical.policy: ScrollBar.AsNeeded
-            ThemedTextArea {
-                theme: root.uiTheme
-                readOnly: true
-                activeFocusOnTab: true
-                wrapMode: TextArea.Wrap
-                text: (root.context.about || {}).licenseText || ""
-                color: root.textColor
-                selectionColor: root.accentColor
-                selectedTextColor: palette.highlightedText
-                // Reached by Tab; the tab button's label names what is read here.
-                Accessible.role: Accessible.StaticText
-                Accessible.name: root.tr("label.license", "License")
-            }
-        }
-        ScrollView {
-            Layout.fillWidth: true
-            Layout.fillHeight: true
-            clip: true
-            visible: licenseWindow.activeTab === "eula"
-            ScrollBar.vertical.policy: ScrollBar.AsNeeded
-            ThemedTextArea {
-                theme: root.uiTheme
-                readOnly: true
-                activeFocusOnTab: true
-                wrapMode: TextArea.Wrap
-                textFormat: TextArea.MarkdownText
-                // Same bilingual source as `eulaAgreementWindow`
-                // (`context.eula.{text,textRu,textEn}`), rendered in the
-                // app's CURRENT language rather than the accepted one —
-                // this is a read-only viewer, not the acceptance gate.
-                text: {
-                    var eula = (root.context || {}).eula || {}
-                    var lang = licenseWindow.eulaLanguage
-                    var localized = lang === "ru" ? eula.textRu : eula.textEn
-                    return (localized && String(localized).length > 0)
-                        ? localized : String(eula.text || "")
-                }
-                color: root.textColor
-                selectionColor: root.accentColor
-                selectedTextColor: palette.highlightedText
-                Accessible.role: Accessible.StaticText
-                Accessible.name: root.tr("dialog.eula.text-accessible-name",
-                    "License agreement text")
-            }
-        }
-        // The agreement points at the emergency reset script; a path the reader
-        // has to hunt for is not a way out of a machine with no network. The
-        // in-app "Restore network" button is still the ordinary route — this is
-        // for the case where the app itself will not start.
+        active: licenseWindow.contentBuilt
+        sourceComponent: licenseContentComponent
+    }
+    Component {
+        id: licenseContentComponent
         ColumnLayout {
-            id: resetScriptStrip
-            Layout.fillWidth: true
-            spacing: root.uiTheme.spacingXxs
-            readonly property string scriptPath:
-                String(((root.context || {}).about || {}).resetScriptPath || "")
-            readonly property string scriptCommand:
-                String(((root.context || {}).about || {}).resetScriptCommand || "")
-            visible: licenseWindow.activeTab === "eula" && scriptPath !== ""
-
-            Label {
-                Layout.fillWidth: true
-                color: root.textColor
-                font.bold: true
-                wrapMode: Text.WordWrap
-                text: root.tr("dialog.eula.reset-script.title",
-                    "Emergency network reset script")
-            }
-            Label {
-                Layout.fillWidth: true
-                color: root.mutedTextColor
-                wrapMode: Text.WordWrap
-                text: root.tr("dialog.eula.reset-script.hint",
-                    "Only needed when the application will not start. The ordinary route is Settings -> Service management -> Restore network.")
-            }
-            Label {
-                Layout.fillWidth: true
-                color: root.mutedTextColor
-                wrapMode: Text.WrapAnywhere
-                font.family: "Consolas, monospace"
-                text: resetScriptStrip.scriptPath
-            }
+            spacing: root.uiTheme.spacingMd
             RowLayout {
                 Layout.fillWidth: true
                 spacing: root.uiTheme.spacingSm
                 ThemedButton {
                     theme: root.uiTheme
-                    text: root.tr("action.open-folder", "Open folder")
+                    text: root.tr("label.license", "License")
+                    highlighted: licenseWindow.activeTab === "mpl"
                     Accessible.role: Accessible.Button
                     Accessible.name: text
-                    onClicked: {
-                        if (typeof nrrNativeBridge !== "undefined"
-                                && typeof nrrNativeBridge.openContainingFolder === "function") {
-                            nrrNativeBridge.openContainingFolder(resetScriptStrip.scriptPath)
-                        }
-                    }
+                    onClicked: licenseWindow.activeTab = "mpl"
                 }
                 ThemedButton {
                     theme: root.uiTheme
-                    visible: resetScriptStrip.scriptCommand !== ""
-                    text: root.tr("dialog.eula.reset-script.copy-command", "Copy command")
+                    text: root.tr("dialog.eula.title", "License agreement") + " (EULA)"
+                    highlighted: licenseWindow.activeTab === "eula"
+                    Accessible.role: Accessible.Button
+                    Accessible.name: text
+                    onClicked: licenseWindow.activeTab = "eula"
+                }
+                // Attribution + live integrity of the components shipped from
+                // other authors.
+                ThemedButton {
+                    theme: root.uiTheme
+                    text: root.tr("dialog.third-party.tab", "Third-party components")
+                    highlighted: licenseWindow.activeTab === "third-party"
                     Accessible.role: Accessible.Button
                     Accessible.name: text
                     onClicked: {
-                        if (typeof nrrNativeBridge !== "undefined"
-                                && typeof nrrNativeBridge.copyToClipboard === "function") {
-                            nrrNativeBridge.copyToClipboard(resetScriptStrip.scriptCommand)
-                            root.statusLine = root.tr("status.copied-to-clipboard",
-                                "Copied to clipboard.")
-                        }
+                        licenseWindow.activeTab = "third-party"
+                        thirdPartyPanel.reload()
                     }
                 }
                 Item { Layout.fillWidth: true }
             }
-        }
-        RowLayout {
-            Layout.fillWidth: true
-            // Same bilingual switch the acceptance window offers, so the
-            // agreement reads the same way wherever it is opened.
-            ThemedButton {
-                theme: root.uiTheme
-                visible: licenseWindow.activeTab === "eula"
-                    && String(((root.context || {}).eula || {}).textRu || "").length > 0
-                    && String(((root.context || {}).eula || {}).textEn || "").length > 0
-                text: licenseWindow.eulaLanguage === "ru"
-                    ? root.tr("dialog.eula.switch-to-english", "English")
-                    : root.tr("dialog.eula.switch-to-russian", "Русский")
-                Accessible.role: Accessible.Button
-                Accessible.name: text
-                onClicked: licenseWindow.eulaLanguageOverride =
-                    (licenseWindow.eulaLanguage === "ru") ? "en" : "ru"
+            ScrollView {
+                Layout.fillWidth: true
+                Layout.fillHeight: true
+                clip: true
+                visible: licenseWindow.activeTab === "third-party"
+                ScrollBar.vertical.policy: ScrollBar.AsNeeded
+                ThirdPartyComponentsPanel {
+                    id: thirdPartyPanel
+                    root: licenseWindow.root
+                    width: parent.width
+                }
             }
-            Item { Layout.fillWidth: true }
-            ThemedButton { theme: root.uiTheme; text: root.tr("action.close", "Close"); onClicked: licenseWindow.close() }
+            ScrollView {
+                Layout.fillWidth: true
+                Layout.fillHeight: true
+                clip: true
+                visible: licenseWindow.activeTab === "mpl"
+                ScrollBar.vertical.policy: ScrollBar.AsNeeded
+                ThemedTextArea {
+                    theme: root.uiTheme
+                    readOnly: true
+                    activeFocusOnTab: true
+                    wrapMode: TextArea.Wrap
+                    text: (root.context.about || {}).licenseText || ""
+                    color: root.textColor
+                    selectionColor: root.accentColor
+                    selectedTextColor: palette.highlightedText
+                    // Reached by Tab; the tab button's label names what is read here.
+                    Accessible.role: Accessible.StaticText
+                    Accessible.name: root.tr("label.license", "License")
+                }
+            }
+            ScrollView {
+                Layout.fillWidth: true
+                Layout.fillHeight: true
+                clip: true
+                visible: licenseWindow.activeTab === "eula"
+                ScrollBar.vertical.policy: ScrollBar.AsNeeded
+                ThemedTextArea {
+                    theme: root.uiTheme
+                    readOnly: true
+                    activeFocusOnTab: true
+                    wrapMode: TextArea.Wrap
+                    textFormat: TextArea.MarkdownText
+                    // Same bilingual source as `eulaAgreementWindow`
+                    // (`context.eula.{text,textRu,textEn}`), rendered in the
+                    // app's CURRENT language rather than the accepted one —
+                    // this is a read-only viewer, not the acceptance gate.
+                    text: {
+                        var eula = (root.context || {}).eula || {}
+                        var lang = licenseWindow.eulaLanguage
+                        var localized = lang === "ru" ? eula.textRu : eula.textEn
+                        return (localized && String(localized).length > 0)
+                            ? localized : String(eula.text || "")
+                    }
+                    color: root.textColor
+                    selectionColor: root.accentColor
+                    selectedTextColor: palette.highlightedText
+                    Accessible.role: Accessible.StaticText
+                    Accessible.name: root.tr("dialog.eula.text-accessible-name",
+                        "License agreement text")
+                }
+            }
+            // The agreement points at the emergency reset script; a path the reader
+            // has to hunt for is not a way out of a machine with no network. The
+            // in-app "Restore network" button is still the ordinary route — this is
+            // for the case where the app itself will not start.
+            ColumnLayout {
+                id: resetScriptStrip
+                Layout.fillWidth: true
+                spacing: root.uiTheme.spacingXxs
+                readonly property string scriptPath:
+                    String(((root.context || {}).about || {}).resetScriptPath || "")
+                readonly property string scriptCommand:
+                    String(((root.context || {}).about || {}).resetScriptCommand || "")
+                visible: licenseWindow.activeTab === "eula" && scriptPath !== ""
+
+                Label {
+                    Layout.fillWidth: true
+                    color: root.textColor
+                    font.bold: true
+                    wrapMode: Text.WordWrap
+                    text: root.tr("dialog.eula.reset-script.title",
+                        "Emergency network reset script")
+                }
+                Label {
+                    Layout.fillWidth: true
+                    color: root.mutedTextColor
+                    wrapMode: Text.WordWrap
+                    text: root.tr("dialog.eula.reset-script.hint",
+                        "Only needed when the application will not start. The ordinary route is Settings -> Service management -> Restore network.")
+                }
+                Label {
+                    Layout.fillWidth: true
+                    color: root.mutedTextColor
+                    wrapMode: Text.WrapAnywhere
+                    font.family: "Consolas, monospace"
+                    text: resetScriptStrip.scriptPath
+                }
+                RowLayout {
+                    Layout.fillWidth: true
+                    spacing: root.uiTheme.spacingSm
+                    ThemedButton {
+                        theme: root.uiTheme
+                        text: root.tr("action.open-folder", "Open folder")
+                        Accessible.role: Accessible.Button
+                        Accessible.name: text
+                        onClicked: {
+                            if (typeof nrrNativeBridge !== "undefined"
+                                    && typeof nrrNativeBridge.openContainingFolder === "function") {
+                                nrrNativeBridge.openContainingFolder(resetScriptStrip.scriptPath)
+                            }
+                        }
+                    }
+                    ThemedButton {
+                        theme: root.uiTheme
+                        visible: resetScriptStrip.scriptCommand !== ""
+                        text: root.tr("dialog.eula.reset-script.copy-command", "Copy command")
+                        Accessible.role: Accessible.Button
+                        Accessible.name: text
+                        onClicked: {
+                            if (typeof nrrNativeBridge !== "undefined"
+                                    && typeof nrrNativeBridge.copyToClipboard === "function") {
+                                nrrNativeBridge.copyToClipboard(resetScriptStrip.scriptCommand)
+                                root.statusLine = root.tr("status.copied-to-clipboard",
+                                    "Copied to clipboard.")
+                            }
+                        }
+                    }
+                    Item { Layout.fillWidth: true }
+                }
+            }
+            RowLayout {
+                Layout.fillWidth: true
+                // Same bilingual switch the acceptance window offers, so the
+                // agreement reads the same way wherever it is opened.
+                ThemedButton {
+                    theme: root.uiTheme
+                    visible: licenseWindow.activeTab === "eula"
+                        && String(((root.context || {}).eula || {}).textRu || "").length > 0
+                        && String(((root.context || {}).eula || {}).textEn || "").length > 0
+                    text: licenseWindow.eulaLanguage === "ru"
+                        ? root.tr("dialog.eula.switch-to-english", "English")
+                        : root.tr("dialog.eula.switch-to-russian", "Русский")
+                    Accessible.role: Accessible.Button
+                    Accessible.name: text
+                    onClicked: licenseWindow.eulaLanguageOverride =
+                        (licenseWindow.eulaLanguage === "ru") ? "en" : "ru"
+                }
+                Item { Layout.fillWidth: true }
+                ThemedButton { theme: root.uiTheme; text: root.tr("action.close", "Close"); onClicked: licenseWindow.close() }
+            }
         }
     }
 }

@@ -103,6 +103,20 @@ printf '# Agreement\n\nNo header here.\n' >"$work/root/docs/legal/eula.en.md"
 case_name="agreement without a dated header"; FAKE_RUNS="$ok" \
   expect 1 "no agreement date in the header of docs/legal/eula.en.md" --tag v1.2.3-alpha
 make_root
+sed -i 's/applies to alpha builds/applies to beta builds/' "$work/root/docs/legal/eula.en.md"
+sed -i 's/стадии альфа/стадии бета/' "$work/root/docs/legal/eula.ru.md"
+case_name="agreement written for another stage"; FAKE_RUNS="$ok" \
+  expect 1 "the agreement applies to beta builds, but v1.2.3-alpha is of stage alpha" --tag v1.2.3-alpha
+case_name="agreement of another stage, branch run"; FAKE_RUNS="$ok" expect 0 "Release guard passed"
+make_root
+sed -i 's/стадии альфа/стадии бета/' "$work/root/docs/legal/eula.ru.md"
+case_name="the two languages name different stages"; FAKE_RUNS="$ok" \
+  expect 1 "docs/legal/eula.ru.md applies to бета builds, but v1.2.3-alpha is of stage альфа" --tag v1.2.3-alpha
+make_root
+sed -i 's/1.2.3-alpha/1.2.3-alpha.2/' "$work/root/Cargo.toml"
+case_name="a numbered alpha is of stage alpha"; FAKE_RUNS="$ok" \
+  expect 0 "Agreement written for alpha builds." --tag v1.2.3-alpha.2
+make_root
 commit_args=()
 case_name="commit date unreadable"; FAKE_RUNS="$ok" expect 1 "could not read the date of commit abc" --tag v1.2.3-alpha
 commit_args=(--commit-time "$commit_time")

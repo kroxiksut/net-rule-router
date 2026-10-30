@@ -327,25 +327,10 @@ pub(super) fn build(inputs: PerSidApplyInputs<'_>) -> PerSidApplyStack {
                 ));
             // Build the route coordinator with cloned providers BEFORE
             // the orchestrator moves them.
-            // Live routing-scope read for the
-            // coordinator: service-driven (default) vs app-driven. Reads
-            // the SAME settings connection the rules provider uses, so it
-            // is only ever locked outside a recompute (no re-entrancy).
-            let rule_scope_provider: nrr_service_runtime::route_coordinator::RuleScopeProvider = {
-                let scope_conn = Arc::clone(state_conn);
-                Arc::new(move || {
-                    scope_conn
-                                .lock()
-                                .ok()
-                                .and_then(|g| {
-                                    nrr_storage::service_stability_config::ServiceStabilityConfigRepository::new(&g)
-                                        .get_or_default()
-                                        .ok()
-                                })
-                                .map(|r| r.rule_scope_service_driven)
-                                .unwrap_or(true)
-                })
-            };
+            // Routing scope (service- vs app-driven) for the coordinator,
+            // read without waiting: DNS answers and relayed flows ask it.
+            let rule_scope_provider =
+                nrr_service_runtime::route_coordinator::rule_scope_from_store(state_conn);
             // Persist an auto-healed secondary/primary binding
             // (autosave the healed binding + banner).
             // When the coordinator matches a stale stored id to exactly

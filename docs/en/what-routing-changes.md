@@ -23,7 +23,7 @@ after a rule sends that site through the additional connection.
 | The site you open | Your provider's IP address, the full address of the page, your cookies, your signed-in account, your browser's characteristics | The **additional connection's** IP address. Everything else is unchanged: same cookies, same account, same browser |
 | Your internet provider | That you connected to that site's server, when, and how much data moved | That you connected to the additional connection's endpoint. Which sites went through it is no longer visible to them |
 | Whoever operates the additional connection | Nothing — it is not in the path | Your real IP address, and every destination you send through it. This party replaces your provider as the observer for routed traffic |
-| The DNS resolver answering your lookups | Which names you look up, and from which IP | Unchanged by routing alone. It moves only if you also turn on **DNS through the tunnel** (Settings → Routing) |
+| The DNS resolver answering your lookups | Which names you look up, and from which IP | The names of sites your rules send through the additional connection are looked up through that connection, at a public resolver (Quad9), so your provider's resolver no longer sees them. Every other lookup still goes to your provider's resolver; **DNS through the tunnel** (Settings → Routing behavior) moves NetRuleRouter's own lookups for your other rules as well — see [DNS through the tunnel](dns-via-secondary.md) |
 | Cookies and signed-in accounts | Identify you across visits | **Unchanged.** A different exit address does not sign you out and does not separate you from your history on that site |
 | Your browser's characteristics | Identify your browser across visits, even without cookies | **Unchanged.** Nothing NetRuleRouter does touches the browser |
 | Other apps on the same PC | Use your main connection | Use your main connection, unless a rule of yours covers them too |
@@ -41,7 +41,7 @@ NetRuleRouter actually does about them.
 | What you want | What actually changes |
 |---|---|
 | A specific site should reach me over a different connection while everything else stays fast and direct | Exactly what a rule does. See the [Quick start](quickstart.md) |
-| My provider should not see, or interfere with, which sites I look up | Turn on **DNS through the tunnel**. See [DNS through the tunnel](dns-via-secondary.md) |
+| My provider should not see, or interfere with, which sites I look up | Send those sites through the additional connection: their names are then looked up there as well. **DNS through the tunnel** also moves the lookups NetRuleRouter makes for your other rules; your programs' lookups of sites outside your rules for the additional connection stay with your provider. See [DNS through the tunnel](dns-via-secondary.md) |
 | Nothing should ever slip onto the main connection, even briefly | Send the default route through the additional connection and set leak protection to **Everything**. Per-rule routing is precise, not airtight; both choices are explained in the [Quick start](quickstart.md#first-setup) |
 | A site should see me as coming from another country | It will see the additional connection's address. Whether that reads as another country depends on that connection, not on NetRuleRouter — and your account and browser still identify you |
 | A site should stop recognising me between visits | NetRuleRouter does not do this. Sign out, clear the site's data, or use a separate browser profile |
@@ -59,7 +59,7 @@ protection has less to work with.
 This is a real trade-off, not a detail: encrypted DNS in the browser and
 name-based routing want the same information. So NetRuleRouter blocks browser
 DoH/DoT on its own as soon as your rules route or block sites by name, and
-tells you so in Settings → Routing; there you can switch the blocking off or
+tells you so in Settings → Routing behavior; there you can switch the blocking off or
 set it by hand. It closes the known encrypted-DNS services over both IPv4 and
 IPv6. The built-in list of those services grows
 with new versions of the app, and an update adds the new entries without

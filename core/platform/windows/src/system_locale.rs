@@ -25,6 +25,39 @@ impl SystemLocalePort for WindowsSystemLocale {
             Vec::new()
         }
     }
+
+    /// Settings → "Country or region" first, then the regional format's
+    /// territory: neither follows the display language.
+    fn region(&self) -> Option<String> {
+        #[cfg(target_os = "windows")]
+        {
+            home_location().or_else(regional_locale)
+        }
+        #[cfg(not(target_os = "windows"))]
+        {
+            None
+        }
+    }
+}
+
+/// The ISO code of the user's home location. `GetUserDefaultGeoName` would do
+/// it in one call but is missing before Windows 10 1709, and a missing import
+/// stops the process from starting at all.
+#[cfg(target_os = "windows")]
+#[allow(unsafe_code)]
+fn home_location() -> Option<String> {
+    use windows::Win32::Globalization::{GetGeoInfoW, GetUserGeoID, GEOCLASS_NATION, GEO_ISO2};
+
+    // SAFETY: no pointers; returns a GEOID by value, -1 when none is set.
+    let geo_id = unsafe { GetUserGeoID(GEOCLASS_NATION) };
+    if geo_id == -1 {
+        return None;
+    }
+    let mut buffer = [0u16; 8];
+    // SAFETY: the slice is the destination and its length is the capacity the
+    // binding passes.
+    let written = unsafe { GetGeoInfoW(geo_id, GEO_ISO2, Some(buffer.as_mut_slice()), 0) };
+    locale_name(&buffer, written)
 }
 
 /// `LOCALE_NAME_MAX_LENGTH`, terminator included.

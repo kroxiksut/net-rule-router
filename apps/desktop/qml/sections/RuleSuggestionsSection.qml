@@ -1002,7 +1002,7 @@ ColumnLayout {
                                     theme: root.uiTheme
                                     highlighted: true
                                     visible: modelData.pendingIds.length > 0
-                                    text: root.tr("rules.suggestions.inbox.action-add", "Add to the additional route")
+                                    text: root.tr("rules.action.send-over", "Send over {route}").replace("{route}", root.routeLabel("secondary"))
                                     Accessible.role: Accessible.Button
                                     Accessible.name: text
                                     onClicked: section._acceptIds(modelData.pendingIds)
@@ -1250,7 +1250,7 @@ ColumnLayout {
                 id: addSelectedButton
                 theme: root.uiTheme
                 highlighted: true
-                text: root.tr("rules.suggestions.inbox.action-add", "Add to the additional route")
+                text: root.tr("rules.action.send-over", "Send over {route}").replace("{route}", root.routeLabel("secondary"))
                 Accessible.role: Accessible.Button
                 Accessible.name: text
                 onClicked: section._acceptIds(section._checkedPendingIds())

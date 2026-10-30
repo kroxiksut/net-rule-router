@@ -124,7 +124,17 @@ function formatStorageBytes(bytes) {
     if (n < 1024) return n + " B"
     if (n < 1024 * 1024) return (n / 1024).toFixed(1) + " KiB"
     if (n < 1024 * 1024 * 1024) return (n / (1024 * 1024)).toFixed(1) + " MiB"
-    return (n / (1024 * 1024 * 1024)).toFixed(2) + " GiB"
+    var gib = 1024 * 1024 * 1024
+    if (n < gib * 1024) return (n / gib).toFixed(2) + " GiB"
+    if (n < gib * 1024 * 1024) return (n / (gib * 1024)).toFixed(2) + " TiB"
+    return (n / (gib * 1024 * 1024)).toFixed(2) + " PiB"
+}
+
+// Twin of `nrr_client_logic::traffic_rows::visible_traffic_rows`.
+function visibleTrafficRows(rows, countVirtual) {
+    var a = rows || []
+    if (countVirtual === true) return a
+    return a.filter(function(r) { return !r || r["role"] !== "virtual" })
 }
 
 // ---- recent rule changes ----
@@ -243,8 +253,30 @@ function isOpenableExternalUrl(url) {
     return false
 }
 
-function openExternalUrl(url) {
-    if (isOpenableExternalUrl(url)) Qt.openUrlExternally(String(url))
+// The start page of the offline documentation the launcher found beside the
+// program: a local `.html` page under a `docs` folder, which the OS opener
+// hands to the browser. No share, query, fragment or parent step.
+function isOwnDocsPageUrl(url) {
+    var s = String(url || "")
+    if (s.toLowerCase().indexOf("file:///") !== 0) return false
+    var path = s.substring(8)
+    return path !== "" && path.charAt(0) !== "/" && path.charAt(0) !== "\\"
+        && path.indexOf("?") < 0 && path.indexOf("#") < 0 && path.indexOf("\\") < 0
+        && ("/" + path + "/").indexOf("/../") < 0
+        && /\/docs\/[a-z]+\/index\.html$/.test(path)
+}
+
+// `allowOwnDocsPage` lets Help > Documentation through the same one door.
+function openExternalUrl(url, allowOwnDocsPage) {
+    if (isOpenableExternalUrl(url) || (allowOwnDocsPage === true && isOwnDocsPageUrl(url)))
+        Qt.openUrlExternally(String(url))
+}
+
+// The documentation start page for `language` among the launcher's
+// `{ <language>: url }`, English where that language has none.
+function docsPageUrl(urls, language) {
+    var known = urls || {}
+    return String(known[language] || known.en || "")
 }
 
 // A local folder URL the window computed itself, never one from a payload or
@@ -410,7 +442,7 @@ var USER_SETTINGS_PREF_KEYS = [
     "userPresetsDir", "selectedPresetSet", "mergeConflictPolicy",
     "lastSavedPathPrimary", "lastSavedPathSecondary",
     "lastLoadedPathPrimary", "lastLoadedPathSecondary",
-    "serviceIntentJson", "acceptedEulaVersion"
+    "serviceIntentJson", "acceptedEulaVersion", "ruleSetOfferAnswered"
 ]
 
 // The id of the "settings file damaged" card after one follow answer;
@@ -542,6 +574,22 @@ function numberedSetName(base, hasFiles) {
     for (var n = 2; n < 100 && hasFiles(name); n += 1)
         name = String(base || "") + " (" + n + ")"
     return name
+}
+
+// Offer the rule set `state.setName` to a user who has no rules: the first run
+// is behind them (`firstRunDone`, finished before this launch), no rules file
+// of theirs is bound, nothing is on screen (`localRules`), the offer was never
+// answered, rule editing is not locked (`editsLocked`), and the service either
+// answered that it holds none (`service` "running", `serviceRules` 0; -1 until
+// it answers) or is not running ("stopped"). Twin of `rule_set_offer_due`.
+function ruleSetOfferDue(state) {
+    var s = state || {}
+    if (s.firstRunDone !== true || s.answered === true || s.userBound === true
+            || s.editsLocked === true) return false
+    if (String(s.setName || "").trim() === "" || Number(s.localRules) > 0) return false
+    var held = Number(s.serviceRules)
+    if (s.service === "running") return held === 0
+    return s.service === "stopped" && !(held > 0)
 }
 
 // ---- file URLs ----
@@ -1292,7 +1340,11 @@ function connTraceLearnedRoutes(rows) {
 // already re-matched ("x_VPN" vs "x VPN OpenVPN Adapter").
 var ADAPTER_GENERIC_NAME_TOKENS = [
     "vpn", "adapter", "tunnel", "client", "network", "connection",
-    "ethernet", "wireless", "virtual", "tap", "wintun"
+    "ethernet", "wireless", "virtual", "tap", "wintun",
+    "local", "area", "wi", "fi", "bluetooth", "lan",
+    "подключение", "подключения", "по", "локальной", "сети", "сеть",
+    "сетевое", "сетевой", "беспроводная", "беспроводное", "адаптер",
+    "туннель", "клиент", "виртуальный", "виртуальная"
 ]
 
 function storedNameMatchesLive(storedName, liveText) {
@@ -1300,7 +1352,7 @@ function storedNameMatchesLive(storedName, liveText) {
         var out = []
         var parts = String(s || "").toLowerCase().split(/[\s_-]+/)
         for (var i = 0; i < parts.length; i += 1) {
-            var t = parts[i]
+            var t = parts[i].replace(/^\*+|\*+$/g, "")
             if (t === "") continue
             var stripped = t.replace(/^v+/, "")
             if (stripped !== "" && /^[0-9.]+$/.test(stripped)) continue
@@ -1614,6 +1666,68 @@ function adapterRoleHintSlug(row) {
     if (vpn === "likely" || (vpn === "possible" && cls === "preferred-secondary"))
         return "looks-vpn"
     return ""
+}
+
+// `nrr_client_logic::adapters::looks_like_tunnel`: a kind the OS decided
+// outranks the name (a bridged tap is a VM's port); "other" decides nothing.
+function adapterLooksLikeTunnel(row) {
+    if (!row) return false
+    var kind = String(row.kind || "")
+    var byKind = kind !== "" && kind !== "other"
+        ? kind === "tunnel"
+        : String((row.derivedAssessment || {}).classification || "").toLowerCase().indexOf("vpn") >= 0
+    return byKind || adapterRoleHintSlug(row) === "looks-vpn"
+}
+
+// `nrr_client_logic::adapters::first_run_suggestion`: the index of the one
+// connected adapter that looks like the main link (or a tunnel, for
+// "secondary"), -1 when none or several do. `skipIndex` is the row the other
+// route is picked for (-1 for none): one adapter never carries both.
+function firstRunSuggestion(rows, role, skipIndex) {
+    var skip = typeof skipIndex === "number" ? skipIndex : -1
+    var found = -1
+    for (var i = 0; i < (rows || []).length; i += 1) {
+        var row = rows[i]
+        if (i === skip) continue
+        if (!row || String(row.availability || "") !== "available") continue
+        if (isOwnFakeIpTunRow(row) || adapterHeldOtherRole(row, role) !== "") continue
+        var fits = role === "primary"
+            ? adapterRoleHintSlug(row) === "looks-primary"
+            : adapterLooksLikeTunnel(row)
+        if (!fits) continue
+        if (found >= 0) return -1
+        found = i
+    }
+    return found
+}
+
+// For a picked adapter that is not connected, the other copies of its driver:
+// connected ones by index, the rest counted. Twin of
+// `nrr_client_logic::adapters::driver_siblings`.
+function adapterDriverSiblings(rows, index, role) {
+    var found = { live: [], idle: 0 }
+    var list = rows || []
+    var picked = index >= 0 && index < list.length ? list[index] : null
+    if (!picked) return found
+    var family = adapterDriverFamily(picked.description)
+    if (String(picked.availability || "") === "available" || family === "") return found
+    for (var i = 0; i < list.length; i += 1) {
+        var row = list[i]
+        if (i === index || !row) continue
+        if (isOwnFakeIpTunRow(row) || adapterHeldOtherRole(row, role) !== "") continue
+        if (adapterDriverFamily(row.description) !== family) continue
+        if (String(row.availability || "") === "available") found.live.push(i)
+        else found.idle += 1
+    }
+    return found
+}
+
+// The driver a description names, without the ` #N` Windows appends to every
+// copy after the first. Twin of `nrr_shared::driver_family`.
+function adapterDriverFamily(description) {
+    var d = String(description || "").trim()
+    var m = /^(.*\s)#([0-9]+)$/.exec(d)
+    return (m ? m[1].trim() : d).toLowerCase()
 }
 
 // The role this adapter holds other than `role`, or "". One adapter cannot
@@ -2131,6 +2245,14 @@ function enforcementSecondaryDownBodyKey(leakProtection) {
     return "notifications.enforcement.secondary-down.body"
 }
 
+// The body of an adapter-choice notice naming `count` adapters. Twin of
+// `nrr_client_logic::enforcement_notice::adapter_choice_body_key`.
+function enforcementAdapterChoiceBodyKey(count) {
+    return Number(count) === 1
+        ? "notifications.enforcement.adapter-choice.body-one"
+        : "notifications.enforcement.adapter-choice.body"
+}
+
 // One reading of the service manager's state for a client that watched the
 // service run: a stop nobody asked for raises the notice once and offers the
 // recoveries; a stop the user made stays silent. Twin of
@@ -2605,7 +2727,7 @@ var ROUTE_POLICY_FIELD_DEFAULTS = {
     "short-name-suffix": "",
     "app-rules-take-all-addresses": false,
     "forwarded-outage": "",
-    "external-address-auto-check": false
+    "external-address-auto-check": true
 }
 
 // Keys the policy SNAPSHOT carries but the update REQUEST must not: they are
@@ -2725,6 +2847,56 @@ function raiseLeakProtection(defaultRoute, level, floor) {
     var least = coerceLeakProtection(defaultRoute, floor)
     return LEAK_PROTECTION_LEVELS.indexOf(least) > LEAK_PROTECTION_LEVELS.indexOf(held)
         ? least : held
+}
+
+// The country whose rule set the first-run setup offers first, lowercase
+// ("ru"), or "" when nothing names one. `region` (what the system is set to)
+// outranks the language: an English system set to Russia is in Russia. Twin of
+// `first_run::first_run_country`.
+function firstRunCountry(region, locales) {
+    function normalized(tag) {
+        var t = String(tag || "").split(/[.@]/)[0].trim().toLowerCase().replace(/_/g, "-")
+        return (t === "" || t === "c" || t === "posix") ? "" : t
+    }
+    function isCountry(part) { return /^[a-z]{2}$/.test(part) }
+    function territoryOf(t) {
+        var parts = t.split("-")
+        for (var i = 1; i < parts.length; i += 1)
+            if (isCountry(parts[i])) return parts[i]
+        return ""
+    }
+    var r = normalized(region)
+    if (r !== "") {
+        if (isCountry(r)) return r
+        var rt = territoryOf(r)
+        if (rt !== "") return rt
+    }
+    var list = locales || []
+    if (list.length === 0) return ""
+    var l = normalized(list[0])
+    if (l === "") return ""
+    return territoryOf(l) || l.split("-")[0]
+}
+
+// The row a first-run pick for `role` commits when the window closes, -1 for
+// none. `pickKey` is the picked adapter's id (its name when it has none), so a
+// list rebuilt since still finds it. Availability is not asked: a VPN adapter
+// is down until its client connects, and choosing it then is the usual case.
+// Nothing is committed over a role already held or onto an adapter holding
+// the other one.
+function firstRunPickToCommit(rows, role, pickKey) {
+    var key = String(pickKey || "")
+    var list = rows || []
+    if (key === "") return -1
+    var found = -1
+    for (var i = 0; i < list.length; i += 1) {
+        var row = list[i] || {}
+        if (String(row.selectedRole || "") === role) return -1
+        var id = String(row.persistentId || "")
+        if (found < 0 && (id !== "" ? id : String(row.name || "")) === key) found = i
+    }
+    if (found < 0 || adapterHeldOtherRole(list[found], role) !== "") return -1
+    return found
 }
 
 // The protection a user already set up holds, as the first-run setup starts
@@ -3012,6 +3184,9 @@ function _protectionStrengthened(key, mine, service) {
     var mode = routePolicyEffective(service, "mode")
     var wanted = coerceLeakProtection(mode, routePolicyCoerce(key, mine))
     var held = coerceLeakProtection(mode, routePolicyEffective(service, key))
+    // With no additional adapter bound "Everything" closes the internet: that
+    // goes only on the user's answer, offered with the binding.
+    if (wanted === "everything" && _bindingId(service["secondary"]) === "") return undefined
     return LEAK_PROTECTION_LEVELS.indexOf(wanted) > LEAK_PROTECTION_LEVELS.indexOf(held)
         ? wanted : undefined
 }
@@ -4007,6 +4182,90 @@ function vpnPickerResultApps(rows, selected, stored) {
     return out
 }
 
+// `nrr_client_logic::vpn_client_trust::picker_link_offer`: the running
+// programs tied by a distinctive word to the additional link's adapter name.
+var _LINK_TIE_GENERIC_WORDS = [
+    "adapter", "and", "app", "appdata", "applications", "apps", "bin", "channel",
+    "client", "connection", "contents", "data", "driver", "ethernet", "exe", "files",
+    "for", "gui", "interface", "lib", "local", "macos", "miniport", "network",
+    "offload", "opt", "program", "programs", "roaming", "sbin", "service", "share",
+    "system32", "tap", "the", "tun", "tunnel", "users", "usr", "virtual", "vpn", "windows",
+    "wintun", "x64", "x86"
+]
+
+function _linkTieWords(raw) {
+    var lowered = String(raw || "").replace(/[A-Z]+/g, function (m) { return m.toLowerCase() })
+    if (lowered.length >= 4 && lowered.slice(-4) === ".exe") lowered = lowered.slice(0, -4)
+    var parts = lowered.split(/[ \t\\\/\-_()\[\],:—–]/)
+    var words = []
+    for (var i = 0; i < parts.length; i += 1) {
+        var word = parts[i].replace(/^\.+|\.+$/g, "")
+        if (word.length < 3 || /^[0-9.]+$/.test(word)
+                || _LINK_TIE_GENERIC_WORDS.indexOf(word) >= 0 || words.indexOf(word) >= 0) continue
+        words.push(word)
+    }
+    return words
+}
+
+function _linkTieShares(words, raw) {
+    var own = _linkTieWords(raw)
+    for (var i = 0; i < own.length; i += 1) {
+        if (words.indexOf(own[i]) >= 0) return true
+    }
+    return false
+}
+
+function _linkTieStripExe(name) {
+    var s = String(name || "")
+    return s.length >= 4 && s.slice(-4).toLowerCase() === ".exe" ? s.slice(0, -4) : s
+}
+
+// `local.vpn.discover` candidates as the picker's found rows.
+function vpnDiscoveredRows(candidates) {
+    var out = []
+    for (var i = 0; i < (candidates || []).length; i += 1) {
+        var c = candidates[i] || {}
+        var exe = c.exePath || c["exe-path"] || null
+        out.push({
+            displayName: String(c.displayName || c["display-name"] || ""),
+            exePath: (exe === null || exe === undefined) ? "" : String(exe),
+            running: c.running === true,
+            source: String(c.source || ""),
+            interfaceName: String(c["interface"] || "")
+        })
+    }
+    return out
+}
+
+// Ledger id of the "is this your VPN?" offer for one additional adapter: the
+// window and the tray share it, so an answer on one silences both.
+function vpnClientOfferNoticeId(linkName) {
+    return "vpn-client-offer:" + String(linkName || "").trim().toLowerCase()
+}
+
+function vpnPickerLinkOffer(rows, linkName) {
+    var words = _linkTieWords(linkName)
+    var paths = []
+    var name = ""
+    if (words.length === 0) return { name: "", exePaths: [] }
+    for (var i = 0; i < (rows || []).length; i += 1) {
+        var row = rows[i] || {}
+        if (!vpnPickerTickable(row) || row.running !== true) continue
+        var path = String(row.exePath || "").trim()
+        var ownName = String(row.displayName || "").trim()
+        if (!_linkTieShares(words, path) && !_linkTieShares(words, ownName)) continue
+        var repeat = false
+        for (var k = 0; k < paths.length; k += 1) {
+            if (_vpnTrustSamePath(paths[k], path)) repeat = true
+        }
+        if (repeat) continue
+        paths.push(path)
+        if (name === "" && _linkTieShares(words, ownName)) name = _linkTieStripExe(ownName)
+    }
+    if (name === "" && paths.length > 0) name = _linkTieStripExe(_vpnTrustFileName(paths[0]))
+    return { name: name, exePaths: paths }
+}
+
 // `nrr_client_logic::vpn_gateway_trust`: the question asked when leak
 // protection stopped another VPN reaching its gateway, and the list an answer
 // writes (`route.vpn-gateways.set` replaces it whole).
@@ -4282,22 +4541,23 @@ function groupRouteOf(rules, programs) {
     return first
 }
 
-// The order of a full reset. The service is stopped last: every earlier step
-// needs it answering. No step writes a rule book: after the purge the user
-// reads the baseline, like a new one.
+// The order of a full reset. The service is restarted last: every earlier
+// step needs it answering, and a reset ends as a fresh install does, with the
+// service running. No step writes a rule book: after the purge the user reads
+// the baseline, like a new one.
 var FULL_RESET_ORDER = ["clear-logs", "reset-sidecar", "purge-principal-data",
-    "stop-service"]
+    "restart-service"]
 
 // What a full reset does after the steps done so far. `done` is a list of
 // { step, result } in the order run, result "ok" | "failed" | "forbidden" |
 // "skipped". A failed step does not abort the next ones, except a refused
 // purge when the client cannot elevate by itself: the flow stops
-// ("needs-elevation") instead of stopping a service whose rules are still in
-// place. Otherwise { action: "run", step } or, after the last step,
-// { action: "finish", cleared } (purge and stop both "ok").
+// ("needs-elevation") before the service is touched. Otherwise
+// { action: "run", step } or, after the last step,
+// { action: "finish", cleared, restarted } (purge "ok", restart "ok").
 function fullResetNext(canElevate, done) {
     var list = done || []
-    var out = { action: "", step: "", cleared: false, why: "" }
+    var out = { action: "", step: "", cleared: false, restarted: false, why: "" }
     if (list.length > 0) {
         var last = list[list.length - 1]
         if (last.result === "forbidden" && canElevate !== true
@@ -4320,6 +4580,7 @@ function fullResetNext(canElevate, done) {
         return false
     }
     out.action = "finish"
-    out.cleared = ok("purge-principal-data") && ok("stop-service")
+    out.cleared = ok("purge-principal-data")
+    out.restarted = ok("restart-service")
     return out
 }

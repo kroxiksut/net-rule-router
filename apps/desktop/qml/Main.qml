@@ -66,7 +66,7 @@ ApplicationWindow {
             "This is not available on your operating system yet, so the controls here stay off. "
             + "Nothing here is sent to the background service.")
         : ""
-    property var prefs: ({ launchWindowOnStartup: true, minimizeToTrayInsteadOfClose: true, showNotifications: true, notifySuggestionChanges: true, notifyBlockNotices: true, notifyRuleDuplicates: true, hideBlockNoticeAddresses: false, trayNoticeOpacityPercent: 100, routingDetailedMode: false, showVirtualMachinesSection: false, appGroupsOfferDismissed: false, reopenLastSectionOnStartup: true, firstRunCompleted: false, acceptedEulaVersion: 0, themeMode: "system", effectiveThemeMode: "light", accessibilityHighContrast: false, fontScalePercent: 100, systemFont: "system-default", enhancedFocus: false, simplifiedLabels: false, tooltipsEnabled: true, language: Qt.locale().name, routePrimaryLabel: "Primary", routeSecondaryLabel: "Secondary", selectedPrimaryInterfaceId: "", selectedPrimaryInterfaceName: "", primaryRoleUserConfirmed: false, selectedSecondaryInterfaceId: "", selectedSecondaryInterfaceName: "", secondaryRoleUserConfirmed: false, routeBehaviorMode: "prefer-primary", routeIncludeSubdomains: true, routeSharedIpPolicy: "majority-of-ip", routeEnforcementMode: "resolver", showBluetoothAdapters: false, showRememberedAdapters: true, autoConfirmAdapterIdChange: true, warnKillSwitchBlockAll: true, killSwitchBannerAcknowledged: false, missingSecondaryBannerAcknowledged: false, trafficStatsPeriod: "today", trafficExportUnit: "mb", connTraceGroupBy: "program", diagnosticsArchiveRedactionLevel: "standard", diagnosticsArchiveSessionOnly: true, archiveLogBudgetMib: 0, updateCheckEnabled: true, updateCheckIntervalDays: 14, userPresetsDir: "", selectedPresetSet: "", serviceBackedMirrorJson: "", serviceIntentJson: "", lastOpenedSection: "interfaces-routes" })
+    property var prefs: ({ launchWindowOnStartup: true, minimizeToTrayInsteadOfClose: true, showNotifications: true, notifySuggestionChanges: true, notifyBlockNotices: true, notifyRuleDuplicates: true, hideBlockNoticeAddresses: false, trayNoticeOpacityPercent: 100, routingDetailedMode: false, showVirtualMachinesSection: false, appGroupsOfferDismissed: false, reopenLastSectionOnStartup: true, firstRunCompleted: false, acceptedEulaVersion: 0, themeMode: "system", effectiveThemeMode: "light", accessibilityHighContrast: false, fontScalePercent: 100, systemFont: "system-default", enhancedFocus: false, simplifiedLabels: false, tooltipsEnabled: true, language: Qt.locale().name, routePrimaryLabel: "", routeSecondaryLabel: "", selectedPrimaryInterfaceId: "", selectedPrimaryInterfaceName: "", primaryRoleUserConfirmed: false, selectedSecondaryInterfaceId: "", selectedSecondaryInterfaceName: "", secondaryRoleUserConfirmed: false, routeBehaviorMode: "prefer-primary", routeIncludeSubdomains: true, routeSharedIpPolicy: "majority-of-ip", routeEnforcementMode: "resolver", showBluetoothAdapters: false, showRememberedAdapters: true, autoConfirmAdapterIdChange: true, warnKillSwitchBlockAll: true, killSwitchBannerAcknowledged: false, missingSecondaryBannerAcknowledged: false, trafficStatsPeriod: "today", trafficExportUnit: "mb", connTraceGroupBy: "program", diagnosticsArchiveRedactionLevel: "standard", diagnosticsArchiveSessionOnly: true, archiveLogBudgetMib: 0, updateCheckEnabled: true, updateCheckIntervalDays: 14, userPresetsDir: "", selectedPresetSet: "", serviceBackedMirrorJson: "", serviceIntentJson: "", lastOpenedSection: "interfaces-routes" })
     property string section: "interfaces-routes"
     // The section open at launch loads synchronously: an asynchronous first
     // load could stall with an empty pane until the user clicked something.
@@ -235,9 +235,11 @@ ApplicationWindow {
     /// last applied), null until known. Every rules write names it, so a write
     /// over rules that changed elsewhere is refused instead of undoing them.
     property var rulesBaseRevision: null
+    // The offer of a rule set says the same and offers the way out.
     readonly property bool emptyRulesBannerVisible:
         !!backendStatus && backendStatus.kind === "connected"
         && _serviceRuleCount === 0
+        && !ruleSetOfferVisible
     // SERVICE has 0 rules but the APP already holds local rules
     // (imported/added but not yet applied — the F10 "only PresetImport reached the
     // service" case): switch the banner to an "apply now" prompt with an "Apply app
@@ -693,7 +695,11 @@ ApplicationWindow {
         secondaryReconfirmVisible
         || (secondaryUnresolvedVisible && prefs.missingSecondaryBannerAcknowledged !== true
             && !notificationsController.secondaryDownMuted)
-        || (vpnSplitConflictBannerVisible && !interfacesRolesController._vpnSplitAcked())
+        || (vpnSplitConflictBannerVisible && !interfacesRolesController._vpnSplitAcked()
+            && _vpnSplitShownFor !== interfacesRolesController._vpnConflictSecondaryDisplayName())
+    // The blue explainer asks nothing, so it leaves by itself once read (see
+    // `TopBannerStack`) and stays away for that adapter until the app restarts.
+    property string _vpnSplitShownFor: ""
     // The secondary-adapter banner in its AMBER (problem) flavour, as opposed
     // to the blue VPN-split explainer.
     readonly property bool secondaryAmberBannerVisible:
@@ -929,9 +935,6 @@ ApplicationWindow {
     }
     function routeRoleOptions() {
         return Rules.routeRoleOptions(true, routeLabel, tr)
-    }
-    function localeTextForLanguage(languageId, key, fallbackText) {
-        return resolveCatalogText(languageId, key, fallbackText)
     }
     // Memoized in the support object, keyed by slug, dropped on a language switch.
     function ruleTypeLabel(id) {
@@ -1458,6 +1461,7 @@ ApplicationWindow {
         "doh-lockdown": "routing",
         "leak-protection": "routing",
         "forwarded-traffic": "routing",
+        "vpn-client": "routing",
         "restore-network": "service"
     })
 
@@ -1586,6 +1590,8 @@ ApplicationWindow {
             serial: Number(settingsFocusRequest.serial || 0) + 1
         }
         openSettingsCategory(category)
+        // The tray's "Choose…" on its VPN client offer: the picker itself.
+        if (id === "vpn-client") Qt.callLater(openVpnOnboarding)
         return true
     }
 
@@ -1725,6 +1731,7 @@ ApplicationWindow {
         // (default off). Only an explicit true opts in.
         normalized.showVirtualMachinesSection = !!normalized.showVirtualMachinesSection
         normalized.appGroupsOfferDismissed = !!normalized.appGroupsOfferDismissed
+        normalized.ruleSetOfferAnswered = normalized.ruleSetOfferAnswered === true
         // "remembered but absent" ghost-row display toggle. Default ON
         // (a missing value coerces to true) so the user can see a remembered
         // binding at a glance; only an explicit false turns it off.
@@ -1753,8 +1760,9 @@ ApplicationWindow {
         // Remembered CSV export unit. Coerce to a known slug so the combo box
         // can index the model directly; unknown / missing → "mb" (the default).
         normalized.trafficExportUnit =
-            (["bytes", "kb", "mb", "gb"].indexOf(String(normalized.trafficExportUnit)) >= 0)
+            (["bytes", "kb", "mb", "gb", "tb"].indexOf(String(normalized.trafficExportUnit)) >= 0)
                 ? String(normalized.trafficExportUnit) : "mb"
+        normalized.trafficExportIncludeVirtual = normalized.trafficExportIncludeVirtual === true
         normalized.connTraceGroupBy = Pure.connTraceGroupingOrDefault(normalized.connTraceGroupBy)
         // Support-archive privacy tier. Coerce to a known slug so both export
         // surfaces can trust it; unknown / missing → "standard" (the default).
@@ -2947,6 +2955,13 @@ ApplicationWindow {
         id: fullResetController
         root: window
     }
+    // Start or restart the service and wait until it answers: the full reset
+    // and the rule-set load both end on a running service.
+    property alias serviceStarter: serviceStarter
+    ServiceStarter {
+        id: serviceStarter
+        root: window
+    }
     // Post-connect backlog: the ONE question covering everything parked while
     // the service was down. The dialog stays here; the collection does not.
     property alias offlineBacklogCollector: offlineBacklogCollector
@@ -3214,6 +3229,74 @@ ApplicationWindow {
         if (!started) return
         notificationsController._dropPushNotice(String(noticeId || ""))
         delete _pendingVpnOffers[String(noticeId || "")]
+    }
+
+    // "Looks like your VPN is X": with no VPN client set, the running programs
+    // tied by name to the additional adapter that just came up are offered,
+    // never confirmed silently — a wrong guess would let a program past leak
+    // protection. Asked once per adapter a session; "Not now" (the close box)
+    // goes into the shared ledger, so neither surface asks again.
+    property var _vpnClientOfferAskedFor: ({})
+    property var _vpnClientOffers: ({})
+    function _maybeOfferVpnClient() {
+        if (((backendStatus || {}).kind) !== "connected" || !linkProviderAppsKnown) return
+        if (linkProviderApps.length > 0) return
+        var link = interfacesRolesController._secondaryUpLinkName()
+        if (link.trim() === "") return
+        // Keyed on the stored binding name, which the tray reads too.
+        var id = Pure.vpnClientOfferNoticeId(String(prefs.selectedSecondaryInterfaceName || ""))
+        if (_vpnClientOfferAskedFor[id] || noticeLedger.isDecided(id)) return
+        if (!rpc || typeof rpc.rpcVpnDiscover !== "function") return
+        var asked = Object.assign({}, _vpnClientOfferAskedFor)
+        asked[id] = true
+        _vpnClientOfferAskedFor = asked
+        var corr = rpc.rpcVpnDiscover()
+        if (!corr) return
+        rpcTransport.registerRpcCallback(corr, function(ok, payload) {
+            if (!ok || !payload || linkProviderApps.length > 0) return
+            var rows = Pure.vpnPickerRows(Pure.vpnDiscoveredRows(payload.candidates || []), [])
+            var offer = Pure.vpnPickerLinkOffer(rows, link)
+            if (offer.exePaths.length === 0) return
+            var offers = Object.assign({}, _vpnClientOffers)
+            offers[id] = { rows: rows, exePaths: offer.exePaths, name: offer.name }
+            _vpnClientOffers = offers
+            notificationsController._addPushNotice({
+                "id": id,
+                "severity": "info",
+                "dismissible": true,
+                "kind": "vpn-client-offer",
+                "title": tr("notifications.vpn-client-trust.title", "Is this your VPN?"),
+                "body": tr("notifications.vpn-client-offer.body",
+                        "Looks like your VPN is {name}. Use it as your VPN client, so it keeps working over your main link while leak protection is on? Programs: {apps}")
+                    .replace("{name}", Pure.displayText(offer.name))
+                    .replace("{apps}", Pure.displayTextList(offer.exePaths.map(function(p) {
+                        return Pure.vpnProviderNames([{ "exe-path": p, "display-name": "" }])[0]
+                    })).join(", ")),
+                "actionKey": "vpn-client-offer-use",
+                "actionText": tr("notifications.vpn-client-offer.use", "Use it"),
+                "secondaryActionKey": "vpn-client-offer-choose",
+                "secondaryActionText": tr("notifications.vpn-client-offer.choose", "Choose…"),
+                "actionArg": id
+            })
+        })
+    }
+    function _answerVpnClientOffer(noticeId, use) {
+        var id = String(noticeId || "")
+        var offer = _vpnClientOffers[id]
+        notificationsController._dropPushNotice(id)
+        if (!use || !offer) {
+            openVpnOnboarding()
+            return
+        }
+        _replaceLinkProviders(function(existing) {
+            return Pure.vpnPickerResultApps(offer.rows, offer.exePaths, existing)
+        }, function(stored) {
+            return tr("vpn-onboarding.confirmed-status",
+                "NetRuleRouter will keep {name} working over your main link while leak protection is on.")
+                .replace("{name}", Pure.listSummary(
+                    Pure.displayTextList(Pure.vpnProviderNames(stored)),
+                    tr("status.app-unresolved-more", "+{n} more")))
+        })
     }
 
     // The confirmed link providers as the service last reported them: what
@@ -4227,9 +4310,13 @@ ApplicationWindow {
                 break
             case "secondary-external-address-observed":
                 _onSecondaryExternalAddress(event)
+                // The service filed the address on the adapter's row before
+                // pushing: the interfaces page follows without a manual check.
+                if (bridgeAvailable) Qt.callLater(interfacesRolesController.refreshInterfacesFromService)
                 break
             case "secondary-external-address-cleared":
                 _withdrawSecondaryExternalAddress()
+                if (bridgeAvailable) Qt.callLater(interfacesRolesController.refreshInterfacesFromService)
                 break
             case "block-notice-raised":
                 _onBlockNoticeRaised(event, eventId)
@@ -4621,8 +4708,11 @@ ApplicationWindow {
         var title = enforcementStatusTitle(role, status)
         var body = ""
         if (status === "adapter-choice-needed") {
-            body = tr("notifications.enforcement.adapter-choice.body",
-                    "Several adapters answer to the saved name, so your rules are not being applied. Pick the one to use: {list}")
+            body = (Pure.enforcementAdapterChoiceBodyKey(candidates.length) === "notifications.enforcement.adapter-choice.body-one"
+                    ? tr("notifications.enforcement.adapter-choice.body-one",
+                        "The saved adapter is not up, but another adapter of the same kind is: {list}. If your VPN now uses that one, choose it; until then your rules are not being applied.")
+                    : tr("notifications.enforcement.adapter-choice.body",
+                        "Several adapters answer to the saved name, so your rules are not being applied. Pick the one to use: {list}"))
                 .replace("{list}", Pure.displayTextList(candidates).join(", "))
         } else if (status === "adapter-gone") {
             // A vendor that replaced its adapter outright, a driver that no
@@ -5214,6 +5304,7 @@ ApplicationWindow {
         availableLanguages = context.availableLanguages || []
         platformProfile = context.platformProfile || platformProfile
         prefs = normalizePrefs(Object.assign({}, prefs, context.preferences || {}))
+        _firstRunDoneAtLaunch = prefs.firstRunCompleted === true
         currentLanguage = prefs.language
         backendStatus = context.backendStatus || { kind: "connected" }
         backendServiceBacked = context.backendServiceBacked !== false
@@ -5375,6 +5466,7 @@ ApplicationWindow {
                 return
             }
             _recordLinkProvidersFrom(p)
+            vpnOnboardingDialog.linkName = interfacesRolesController._secondaryUpLinkName()
             vpnOnboardingDialog.open(currentLinkProviders())
         })
     }
@@ -6720,8 +6812,8 @@ ApplicationWindow {
             simplifiedLabels: false,
             tooltipsEnabled: true,
             language: systemLanguage(),
-            routePrimaryLabel: defaultRouteLabel("primary"),
-            routeSecondaryLabel: defaultRouteLabel("secondary"),
+            routePrimaryLabel: "",
+            routeSecondaryLabel: "",
             selectedPrimaryInterfaceId: "",
             selectedPrimaryInterfaceName: "",
             primaryRoleUserConfirmed: false,
@@ -6972,9 +7064,12 @@ ApplicationWindow {
     /// nothing" loaded the bound .txt over a live revision and offered to
     /// delete from the service every rule the file lagged behind on.
     /// `_serviceRuleCount` is the authoritative answer (−1 until a fetch lands).
-    function _coldStartRulesFetch() {
+    /// `tableOnly`: fill the table and nothing else — under the first-run
+    /// window, whose choice is the only way a first rule set is loaded.
+    function _coldStartRulesFetch(tableOnly) {
         _refreshRulesFromService({ silent: true, onComplete: function(ok) {
             if (prefs.autoLoadRulesOnLaunch === false) return
+            if (ok && tableOnly === true) return
             if (ok) {
                 // Answered, and it really holds nothing (fresh install, wiped
                 // state DB): the table would sit empty under a selected rule
@@ -6985,6 +7080,7 @@ ApplicationWindow {
                 else boundFilesController.askAboutHandEditedFiles()
                 return
             }
+            _coldStartRulesRetryTimer.tableOnly = tableOnly === true
             _coldStartRulesRetryTimer.restart()
         } })
     }
@@ -6997,10 +7093,11 @@ ApplicationWindow {
         interval: 1000
         repeat: false
         property int tries: 0
+        property bool tableOnly: false
         onTriggered: {
             if (window._serviceRuleCount >= 0 || tries >= 20) return
             tries += 1
-            window._coldStartRulesFetch()
+            window._coldStartRulesFetch(tableOnly)
         }
     }
 
@@ -7020,10 +7117,9 @@ ApplicationWindow {
         }
     }
 
-    /// Which file backs `route` ("primary" | "secondary") — the single source of
-    /// truth shared by the cold-start hydration below and the "Source:" row
-    /// above the rules table, so what is shown can never disagree with what is
-    /// loaded. Priority:
+    /// Which file the "Source:" row above the rules table names for `route`
+    /// ("primary" | "secondary"); cold-start hydration reads only steps 1–4.
+    /// Priority:
     ///   1. a remembered path INSIDE the user's own rule-set folder. Once the
     ///      user keeps sets of their own, those win over anything shipped with
     ///      the app — the save target first (that is where they put work), then
@@ -7034,8 +7130,7 @@ ApplicationWindow {
     ///      whose path is display-only and never a save target;
     ///   4. the save-target binding, for prefs written before (3) existed.
     ///   5. nothing remembered at all → the rule set the quick-load dropdown is
-    ///      pointing at (`defaultRuleSetPathFor`), so a first launch — or one
-    ///      whose bindings were lost — shows rules instead of an empty table.
+    ///      pointing at (`defaultRuleSetPathFor`): what a load would pull in.
     /// Only when even that resolves to nothing (no set anywhere to name) does
     /// the file row above the table disappear.
     function rulesSourcePathFor(route) {
@@ -7097,6 +7192,50 @@ ApplicationWindow {
             || _rememberedRulesPathFor("secondary") !== ""
     }
 
+    // A user left with no rules is offered the set the quick-load points at,
+    // and never has it loaded unasked. Either answer, in either client, closes
+    // the offer until a full reset. The launch that ran the first-run window
+    // does not offer it: "start empty" there is not questioned at once.
+    property bool _firstRunDoneAtLaunch: false
+    readonly property string ruleSetOfferName: uiRevision >= 0 ? ruleSetOfferSetName() : ""
+    readonly property bool ruleSetOfferVisible: uiRevision >= 0 ? ruleSetOfferDueNow() : false
+
+    function ruleSetOfferSetName() {
+        return ruleSetCatalog.ruleSetDisplayName(ruleSetCatalog.defaultRuleSetIndex())
+    }
+
+    function ruleSetOfferDueNow() {
+        var kind = String((backendStatus || {}).kind || "")
+        var service = kind === "connected" ? "running"
+            : (kind === "service-stopped" || kind === "service-not-installed") ? "stopped"
+            : "unknown"
+        return Pure.ruleSetOfferDue({
+            firstRunDone: _firstRunDoneAtLaunch && prefs.firstRunCompleted === true,
+            service: service,
+            serviceRules: _serviceRuleCount,
+            localRules: rulesModel ? rulesModel.count : 0,
+            userBound: rulesSourceIsUserBound(),
+            setName: ruleSetOfferSetName(),
+            answered: prefs.ruleSetOfferAnswered === true,
+            editsLocked: ruleEditsLocked === true
+        })
+    }
+
+    /// The offered set, loaded as the quick-load's Load would load it. Taking
+    /// it answers the offer.
+    function loadOfferedRuleSet() {
+        if (ruleEditsLocked === true) return
+        var index = ruleSetCatalog.defaultRuleSetIndex()
+        if (index < 0) return
+        answerRuleSetOffer()
+        ruleSetCatalog.loadRuleSetAt(index)
+    }
+
+    function answerRuleSetOffer() {
+        if (prefs.ruleSetOfferAnswered === true) return
+        commitPrefs({ ruleSetOfferAnswered: true })
+    }
+
     /// Enumerated rule sets — the ONE list behind both the quick-load dropdown
     /// and the cold-start hydration, so the set shown at the top of the Rules
     /// section is always the set whose rules appear below it.
@@ -7114,13 +7253,11 @@ ApplicationWindow {
                 || typeof nrrNativeBridge.readFileBytes !== "function") {
             return
         }
-        // Explicit "open on next launch" opt-in still wins, but fall
-        // back to the most-recent import/export path so any selection
-        // the user made in the GUI is restored automatically on the
-        // next launch — no need for a
-        // separate checkbox to enable this behaviour.
-        var primaryPath = rulesSourcePathFor("primary")
-        var secondaryPath = rulesSourcePathFor("secondary")
+        // Only a set the user's own load or save put on record: the set the
+        // quick-load merely points at was never chosen, and an empty start is
+        // a choice this must not overrule on every launch.
+        var primaryPath = _rememberedRulesPathFor("primary")
+        var secondaryPath = _rememberedRulesPathFor("secondary")
         if (primaryPath === "" && secondaryPath === "") return
 
         var primB64 = ""
@@ -7549,9 +7686,18 @@ ApplicationWindow {
         running: typeof nrrNativeBridge !== "undefined" && !!nrrNativeBridge && !!nrrNativeBridge.consumeApplicationShutdownRequest
         repeat: true
         onTriggered: {
-            if (nrrNativeBridge.consumeApplicationShutdownRequest()) {
-                window.windDownApplication()
+            if (!nrrNativeBridge.consumeApplicationShutdownRequest()) return
+            // Unsaved rules are not dropped silently: the exit asks as File → Exit does.
+            if (window.hasAnyUnsavedChanges()
+                    || boundFilesController._filesSyncDivergenceExists()) {
+                window.show()
+                window.raise()
+                window.requestActivate()
+                window.exitRequested = true
+                window.close()
+                return
             }
+            window.windDownApplication()
         }
     }
 
@@ -7743,13 +7889,18 @@ ApplicationWindow {
             implicitWidth: menuPopupWidth([
                 Pure.menuActionText(aboutAction.text, "F1"),
                 Pure.menuActionText(licenseAction.text, "Ctrl+Shift+L"),
-                Pure.menuActionText(logsFolderAction.text, "Ctrl+Shift+O")
+                Pure.menuActionText(logsFolderAction.text, "Ctrl+Shift+O"),
+                tr("action.open-documentation", "Documentation"),
+                tr("action.open-telegram-channel", "Telegram channel (help and news)")
             ].concat(window.updateCheckAvailable
                 ? [Pure.menuActionText(tr("action.check-for-updates", "Check for updates"), "Ctrl+U")]
                 : []))
             ShortcutMenuItem { theme: uiTheme; labelText: aboutAction.text; shortcutText: "F1"; onTriggered: aboutAction.trigger() }
             ShortcutMenuItem { theme: uiTheme; labelText: licenseAction.text; shortcutText: "Ctrl+Shift+L"; onTriggered: licenseAction.trigger() }
             ShortcutMenuItem { theme: uiTheme; labelText: logsFolderAction.text; shortcutText: "Ctrl+Shift+O"; onTriggered: logsFolderAction.trigger() }
+            // The offline page beside the program in the UI language, else English, else online.
+            ShortcutMenuItem { theme: uiTheme; labelText: tr("action.open-documentation", "Documentation"); onTriggered: Pure.openExternalUrl(Pure.docsPageUrl((context.about || {}).docsUrls, resolveLanguageId(currentLanguage)), true) }
+            ShortcutMenuItem { theme: uiTheme; labelText: tr("action.open-telegram-channel", "Telegram channel (help and news)"); onTriggered: Pure.openExternalUrl((context.about || {}).communityUrl || "") }
             // A hidden menu row still takes its height unless told otherwise.
             ShortcutMenuItem { theme: uiTheme; labelText: checkForUpdatesAction.text; shortcutText: "Ctrl+U"; visible: window.updateCheckAvailable; height: visible ? implicitHeight : 0; onTriggered: checkForUpdatesAction.trigger() }
         }
@@ -7768,7 +7919,8 @@ ApplicationWindow {
                 id: progressPill
                 visible: window.lastProgressMessage !== ""
                 Layout.preferredHeight: 24
-                Layout.maximumWidth: 260
+                // Room for a long translation of the line; the status text beside it keeps the rest.
+                Layout.maximumWidth: Math.max(260, window.width * 0.4)
                 implicitWidth: progressPillRow.implicitWidth + uiTheme.spacingSm * 2
                 radius: uiTheme.radiusSm
                 color: startupLogPopup.visible ? uiTheme.stateHoverFill : "transparent"
@@ -7786,6 +7938,7 @@ ApplicationWindow {
                         color: window.progressKindColor(window.lastProgressKind)
                     }
                     Label {
+                        id: progressPillLabel
                         Layout.fillWidth: true
                         text: window.lastProgressMessage
                         color: textColor
@@ -7801,7 +7954,11 @@ ApplicationWindow {
                 MouseArea {
                     anchors.fill: parent
                     cursorShape: Qt.PointingHandCursor
+                    hoverEnabled: true
                     onClicked: progressPill.toggle()
+                    ToolTip.visible: containsMouse && progressPillLabel.truncated
+                    ToolTip.delay: 400
+                    ToolTip.text: window.lastProgressMessage
                 }
                 activeFocusOnTab: visible
                 Keys.onSpacePressed: progressPill.toggle()

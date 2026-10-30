@@ -108,6 +108,22 @@ fn every_about_field_is_read_by_the_context_emitter() {
     }
 }
 
+/// The terminal's About tells the same facts as the window's: a link added for
+/// the window alone leaves terminal users without it.
+#[test]
+fn every_about_field_is_read_by_the_terminal_about() {
+    let items = repo_file("../../apps/tui/src/screens/settings/items.rs");
+    let text = repo_file("../../apps/tui/src/screens/settings/text.rs");
+    let fields = declared_fields("AboutContract");
+    assert!(!fields.is_empty(), "the contract declares nothing at all");
+    for field in fields {
+        assert!(
+            items.contains(&format!("shell.{field}")) || text.contains(&format!("about.{field}")),
+            "AboutContract::{field} reaches the window but not the terminal's About"
+        );
+    }
+}
+
 /// The contracts that described the rules table and the interfaces screen were
 /// removed for having no reader. Re-adding one is a decision, not an accident:
 /// this fails until the reader exists on the other side.

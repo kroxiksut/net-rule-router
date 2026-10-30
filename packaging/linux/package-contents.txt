@@ -19,6 +19,10 @@
 base     @libexec@/build-info.json
 base     @libexec@/scripts/reset-network.sh
 base     @libexec@/scripts/lib/service-paths.sh
+# The offline documentation the window's Help and nrr-tui's About point to.
+base     @libexec@/docs/style.css
+base     @libexec@/docs/en/index.html
+base     @libexec@/docs/ru/index.html
 # The notices MIT and Apache-2.0 ask to travel with the binaries, and the
 # texts of each vendored crate compiled in, as <crate>-<file>.
 base     @libexec@/licenses/THIRD_PARTY_LICENSES.md

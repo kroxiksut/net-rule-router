@@ -204,10 +204,22 @@ fn killswitch_registry_clears_when_leak_guard_disarms() {
         .collect();
     assert!(!armed_ids.is_empty());
 
-    // Active rules withdrawn (e.g. the revision was cleared) → the
-    // compute takes the `NoActiveRules` path, which must retract this
-    // SID's entry rather than leaving its Block ids published forever.
+    // A cleared revision is an empty book: "Everything" still waits for the
+    // tunnel, so its guard stays armed and registered.
     rules.clear();
+    orch.install_for_sid("S-1-5-21-A").unwrap();
+    assert!(orch.any_block_all_armed(), "no revision dropped the guard");
+
+    // The guard itself switched off → its Block ids must leave the registry.
+    src.set(
+        "S-1-5-21-A",
+        snap_with(
+            "Wi-Fi",
+            "TAP",
+            PerSidBehaviorMode::PreferSecondaryWhenAvailable,
+            nrr_domain::LeakProtection::Off,
+        ),
+    );
     orch.install_for_sid("S-1-5-21-A").unwrap();
     for id in &armed_ids {
         assert!(
@@ -1533,6 +1545,46 @@ fn every_cell_of_the_protection_table_behaves_as_promised() {
                 "{cell}: protection off blocks nothing"
             );
         }
+    }
+}
+
+/// "Start empty" or a reset with no baseline leaves a user with settings but
+/// no rule revision at all. "Everything" asks nothing of the rules, so it
+/// must hold exactly as over an emptied book: the internet waits for the
+/// tunnel, and the whole guard does not come off.
+#[test]
+fn everything_with_no_rule_revision_still_waits_for_the_tunnel() {
+    use nrr_domain::LeakProtection::Everything;
+    use PerSidBehaviorMode::{PreferPrimary as Main, PreferSecondaryWhenAvailable as Additional};
+    const ANY_HOST: Ipv4Addr = Ipv4Addr::new(203, 0, 113, 50);
+    for mode in [Main, Additional] {
+        let (api, orch, src, rules) = fixture_with_resolution(None);
+        rules.clear();
+        src.set("S-1-5-21-A", snap_with("Wi-Fi", "TAP", mode, Everything));
+
+        let filters = match orch
+            .compute_filters_for_sid("S-1-5-21-A", false, None, ComputeIntent::Apply)
+            .unwrap()
+        {
+            ComputedFilterSet::Install(plan) => plan.filters,
+            _ => panic!("{mode:?}: no rule revision dropped the whole guard"),
+        };
+        assert!(
+            !connect_allowed(&filters, ANY_HOST, PRIMARY_LUID),
+            "{mode:?}: the main link carries traffic while the tunnel is down"
+        );
+
+        orch.install_for_sid("S-1-5-21-A").unwrap();
+        assert!(orch.any_block_all_armed(), "{mode:?}: blanket latch");
+        assert!(orch.any_fail_closed_armed(), "{mode:?}: tunnel-down latch");
+        assert!(
+            api.wfp_filters
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|f| f.action == WfpAction::Block),
+            "{mode:?}: nothing blocks in the engine"
+        );
     }
 }
 

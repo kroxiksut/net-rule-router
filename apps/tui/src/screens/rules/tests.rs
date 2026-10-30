@@ -433,6 +433,129 @@ fn imported_rules_are_not_confirmed_for_the_user() {
     assert!(overlaps.contains("1 overlap not confirmed"), "{overlaps}");
 }
 
+fn one_rule_set() -> RuleSet {
+    RuleSet {
+        rows: vec![RuleRow {
+            id: String::new(),
+            enabled: true,
+            rule_type: RuleType::Domain,
+            match_value: "news.example.com".into(),
+            target_route: TargetRoute::Secondary,
+            verify: false,
+            comment: String::new(),
+            origin: None,
+        }],
+        files: 1,
+        ..Default::default()
+    }
+}
+
+fn previews_one_added(fake: &FakeService) {
+    fake.answer(
+        IpcOperationName::MutationSubmit,
+        json!({
+            "confirmation-token": "t",
+            "review-summary": {
+                "diff-summary": "",
+                "provenance": "",
+                "risk-level": "low",
+                "requires-review": false,
+                "changed-fields": ["rules"]
+            }
+        }),
+    );
+}
+
+/// Loading a set only filled the list, and the user had to find the apply:
+/// a loaded set goes to the service's review in the same action.
+#[test]
+fn a_loaded_set_goes_to_the_review_at_once() {
+    let fake = service(Vec::new());
+    previews_one_added(&fake);
+    let mut app = on_rules(&fake);
+    super::import(&mut app, one_rule_set(), "ru_home".into(), true);
+    drain(&mut app, &fake);
+    assert!(
+        matches!(app.rules.mode, Mode::Review(_)),
+        "{:?}",
+        app.rules.mode
+    );
+}
+
+/// Over a stopped service the load said "not connected" and stopped there:
+/// the service is started first and the review follows once it answers.
+#[test]
+fn a_loaded_set_over_a_stopped_service_starts_it_first() {
+    let fake = service(Vec::new());
+    previews_one_added(&fake);
+    fake.answer(
+        IpcOperationName::PrincipalDataCount,
+        json!({ "other-principals": 0 }),
+    );
+    let mut app = on_rules(&fake);
+    app.link = Link::Stopped;
+    app.settings.service_probe = crate::testing::stopped_service;
+    super::import(&mut app, one_rule_set(), "ru_home".into(), true);
+    drain(&mut app, &fake);
+    assert!(
+        matches!(app.rules.mode, Mode::Review(_)),
+        "{:?}",
+        app.rules.mode
+    );
+}
+
+#[test]
+fn a_loaded_set_whose_service_cannot_start_is_kept_and_told() {
+    let fake = service(Vec::new());
+    let mut app = on_rules(&fake);
+    app.link = Link::Stopped;
+    app.settings.service_probe = crate::testing::stopped_service_refusing;
+    super::import(&mut app, one_rule_set(), "ru_home".into(), true);
+    drain(&mut app, &fake);
+    assert!(app.rules.busy.is_none());
+    assert!(
+        app.rules
+            .table
+            .rules()
+            .any(|r| r.match_value == "news.example.com"),
+        "the set stays in the list"
+    );
+    let told = app.notices.last().expect("told in the feed");
+    assert_eq!(
+        told.title,
+        texts_en().get(crate::rule_set_load::NOT_APPLIED_TITLE)
+    );
+}
+
+/// The applied set is told in the feed with its rule count; an apply of the
+/// user's own edits afterwards is not called a rule set.
+#[test]
+fn an_applied_set_is_told_once_in_the_feed() {
+    let fake = service(Vec::new());
+    previews_one_added(&fake);
+    let mut app = on_rules(&fake);
+    super::import(&mut app, one_rule_set(), "ru_home".into(), true);
+    drain(&mut app, &fake);
+    let tell = |app: &mut AppState| {
+        drain(app, &fake);
+        crate::rule_set_load::announce(app, &texts_en(), std::time::Instant::now());
+    };
+    super::finished(&mut app, apply::Finished::Applied { base: None });
+    tell(&mut app);
+    let applied = |app: &AppState| {
+        app.notices
+            .iter()
+            .filter(|n| n.title == texts_en().get(crate::rule_set_load::APPLIED_TITLE))
+            .count()
+    };
+    assert_eq!(applied(&app), 1);
+    let told = app.notices.last().expect("told");
+    assert!(told.body.contains("1 rule is now in use"), "{}", told.body);
+    super::finished(&mut app, apply::Finished::Applied { base: None });
+    tell(&mut app);
+    assert_eq!(applied(&app), 1, "a later apply is not the set again");
+}
+
 // ── Discarding edits ─────────────────────────────────────────────────────────
 
 /// "Show the rules the service applies" really drops the edits on screen.
@@ -1665,6 +1788,78 @@ old.example
         );
     }
 
+    /// "Take the file" on a hand-edited bound file of its own name reads that
+    /// file: not the standard files beside it, which are neither imported nor
+    /// bound, and the sections it holds that this build does not apply stay
+    /// when it is merged into the list.
+    #[test]
+    fn taking_a_hand_edited_file_reads_exactly_that_file() {
+        use nrr_client_logic::Route;
+        let dir = Scratch::new("take-hand-edited");
+        let (mut app, sets) = rules_with_settings(&dir, one_rule());
+        let other_os = if cfg!(target_os = "linux") {
+            "MacOS"
+        } else {
+            "Linux"
+        };
+        let primary = sets.join("home.txt");
+        std::fs::write(
+            &primary,
+            format!("--- Domains\nmine.example\n\n--- {other_os}\nfirefox\n"),
+        )
+        .expect("bound file");
+        let secondary = dir.path().join("elsewhere").join("tunnel.txt");
+        std::fs::create_dir_all(secondary.parent().expect("folder")).expect("folder");
+        std::fs::write(&secondary, "--- Domains\ntunnel.example\n").expect("bound file");
+        std::fs::write(
+            sets.join("rules_primary.txt"),
+            "--- Domains\nother.example\n",
+        )
+        .expect("a standard file beside it");
+        std::fs::write(
+            sets.join("rules_secondary.txt"),
+            "--- Domains\nother2.example\n",
+        )
+        .expect("a standard file beside it");
+        seed(&app, |s| {
+            s.set_primary_file(&path_text(&primary));
+            s.set_secondary_file(&path_text(&secondary));
+        });
+        app.rules.table.passthrough[1].insert("Geo".to_string(), "kept\n".to_string());
+
+        let held = vec![
+            (Route::Primary, primary.clone()),
+            (Route::Secondary, secondary.clone()),
+        ];
+        super::super::take_hand_edited(&mut app, &held);
+        let mode = std::mem::replace(&mut app.rules.mode, super::super::Mode::List);
+        let super::super::Mode::Choice(super::super::Choice {
+            purpose: super::super::ChoicePurpose::ImportMode { set, path },
+            ..
+        }) = mode
+        else {
+            panic!("the merge question was not asked");
+        };
+        let read: Vec<_> = set.rows.iter().map(|r| r.match_value.clone()).collect();
+        assert_eq!(read, ["mine.example", "tunnel.example"]);
+        assert_eq!(set.paths, [Some(primary.clone()), Some(secondary.clone())]);
+
+        super::super::import(&mut app, *set, path, false);
+        assert!(
+            app.rules.table.passthrough[0].contains_key(other_os),
+            "another system's programs were dropped: {:?}",
+            app.rules.table.passthrough
+        );
+        assert!(
+            app.rules.table.passthrough[1].contains_key("Geo"),
+            "a merge dropped a section of the list: {:?}",
+            app.rules.table.passthrough
+        );
+        let bound = settings(&app).rules_files;
+        assert_eq!(bound.primary, path_text(&primary));
+        assert_eq!(bound.secondary, path_text(&secondary));
+    }
+
     /// The user sees where the rules are saved, including files the window
     /// bound meanwhile; a file name is shown, never obeyed as terminal codes.
     #[test]
@@ -1723,6 +1918,9 @@ old.example
         let first = set_in(&sets, "first");
         let second = set_in(&sets, "second");
         answer(&mut app, &["i", &first]);
+        // A loaded set goes to the review at once; the user leaves it.
+        app.outbox.take();
+        app.rules.busy = None;
         answer(&mut app, &["i", &second]);
         if matches!(app.rules.mode, super::super::Mode::Choice(_)) {
             answer(&mut app, &["1"]);

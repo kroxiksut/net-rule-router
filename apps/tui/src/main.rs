@@ -25,12 +25,14 @@ mod plain;
 mod platform;
 mod primary_suggestion;
 mod restore;
+mod rule_set_load;
 mod screens;
 mod site_notices;
 mod state;
 #[cfg(test)]
 mod testing;
 mod view;
+mod vpn_client_offer;
 mod vpn_gateway_trust;
 mod vpn_trust;
 mod window_parked;
@@ -189,14 +191,20 @@ fn run(
             .ok()
             .map(|store| store.path().to_path_buf());
     }
-    // The setup offers the rule set of the region the system is set to.
-    app.wizard.locale = platform::system_locale()
-        .map(|port| port.ui_language_candidates())
-        .unwrap_or_default();
+    // The setup offers the rule set of the country the system is set to, the
+    // locale standing in only when the system does not say.
+    if let Some(port) = platform::system_locale() {
+        app.wizard.locale = port.ui_language_candidates();
+        app.wizard.region = port.region();
+    }
     if options.wizard {
         app.wizard.opened_by_request();
     }
     start_licence_and_sheet(&mut app, texts);
+    if app.screen == ScreenId::Wizard {
+        screens::rules::offer::setup_shown(&mut app);
+    }
+    screens::rules::read_offer(&mut app);
     app.delivery_gaps = delivery_gaps();
     app.rules_need_a_sign_in = platform::rules_need_a_windows_sign_in();
     let result = if options.plain {
@@ -252,6 +260,11 @@ fn start_licence_and_sheet(app: &mut AppState, texts: &Texts) {
         .and_then(Result::ok)
         .flatten()
         .map_or(0, |settings| settings.accepted_eula);
+    let accepted = screens::wizard::accepted_with_installer(
+        app.rules.settings_file.as_deref(),
+        accepted,
+        platform::installer_agreement().as_ref(),
+    );
     let executable = std::env::current_exe().ok();
     let candidates = nrr_platform_api::paths::first_run_sheet_candidates(
         executable.as_deref().and_then(std::path::Path::parent),

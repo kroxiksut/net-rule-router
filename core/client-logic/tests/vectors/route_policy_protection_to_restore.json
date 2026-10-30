@@ -79,7 +79,8 @@
         },
         "service": {
           "mode": "prefer-primary",
-          "leak-protection": "sites"
+          "leak-protection": "sites",
+          "secondary": { "stable-id": "B", "display-name": "Tunnel" }
         }
       },
       "expected": [
@@ -94,7 +95,8 @@
         },
         "service": {
           "mode": "prefer-secondary-when-available",
-          "leak-protection": "off"
+          "leak-protection": "off",
+          "secondary": { "stable-id": "B", "display-name": "Tunnel" }
         }
       },
       "expected": [
@@ -119,7 +121,7 @@
           "kill-switch-enabled": true,
           "kill-switch-block-all": true
         },
-        "service": {}
+        "service": { "secondary": { "stable-id": "B", "display-name": "Tunnel" } }
       },
       "expected": [
         "leak-protection"
@@ -147,7 +149,8 @@
           "doh-lockdown-enabled": true
         },
         "service": { "kill-switch-strict-shared-ips": false,
-          "doh-lockdown-enabled": false
+          "doh-lockdown-enabled": false,
+          "secondary": { "stable-id": "B", "display-name": "Tunnel" }
         }
       },
       "expected": [
@@ -157,13 +160,42 @@
       ]
     },
     {
+      "name": "everything is not raised unasked while the service has no additional adapter bound: it would close the internet",
+      "input": {
+        "intent": {
+          "leak-protection": "everything",
+          "secondary": { "stable-id": "B", "display-name": "Tunnel", "user-confirmed": true }
+        },
+        "service": {}
+      },
+      "expected": []
+    },
+    {
+      "name": "routed sites under the additional route are not raised to everything with no additional adapter bound",
+      "input": {
+        "intent": {
+          "leak-protection": "sites",
+          "doh-lockdown-enabled": true
+        },
+        "service": {
+          "mode": "prefer-secondary-when-available",
+          "leak-protection": "off",
+          "secondary": null
+        }
+      },
+      "expected": [
+        "doh-lockdown-enabled"
+      ]
+    },
+    {
       "name": "the strict mode of an earlier build restores everything",
       "input": {
         "intent": {
           "mode": "strict-secondary-fail-closed"
         },
         "service": {
-          "leak-protection": "sites"
+          "leak-protection": "sites",
+          "secondary": { "stable-id": "B", "display-name": "Tunnel" }
         }
       },
       "expected": [

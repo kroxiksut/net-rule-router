@@ -32,7 +32,7 @@
         "short-name-suffix": "",
         "app-rules-take-all-addresses": false,
         "forwarded-outage": "",
-        "external-address-auto-check": false,
+        "external-address-auto-check": true,
         "binding-source": "user-assigned"
       }
     },
@@ -66,7 +66,7 @@
         "short-name-suffix": "",
         "app-rules-take-all-addresses": false,
         "forwarded-outage": "",
-        "external-address-auto-check": false,
+        "external-address-auto-check": true,
         "binding-source": "user-assigned"
       }
     },
@@ -101,7 +101,7 @@
         "short-name-suffix": "",
         "app-rules-take-all-addresses": false,
         "forwarded-outage": "",
-        "external-address-auto-check": false,
+        "external-address-auto-check": true,
         "binding-source": "user-assigned"
       }
     },
@@ -138,7 +138,7 @@
         "short-name-suffix": "",
         "app-rules-take-all-addresses": false,
         "forwarded-outage": "",
-        "external-address-auto-check": false,
+        "external-address-auto-check": true,
         "binding-source": "user-assigned"
       }
     },
@@ -175,7 +175,7 @@
         "short-name-suffix": "",
         "app-rules-take-all-addresses": false,
         "forwarded-outage": "",
-        "external-address-auto-check": false,
+        "external-address-auto-check": true,
         "binding-source": "user-assigned"
       }
     },
@@ -212,7 +212,7 @@
         "short-name-suffix": "",
         "app-rules-take-all-addresses": false,
         "forwarded-outage": "",
-        "external-address-auto-check": false,
+        "external-address-auto-check": true,
         "binding-source": "user-assigned"
       }
     },
@@ -255,7 +255,7 @@
         "short-name-suffix": "",
         "app-rules-take-all-addresses": false,
         "forwarded-outage": "",
-        "external-address-auto-check": false,
+        "external-address-auto-check": true,
         "binding-source": "user-assigned",
         "future-field": {
           "nested": [
@@ -300,7 +300,7 @@
         "short-name-suffix": "",
         "app-rules-take-all-addresses": false,
         "forwarded-outage": "",
-        "external-address-auto-check": false,
+        "external-address-auto-check": true,
         "binding-source": "user-assigned"
       }
     },
@@ -337,7 +337,7 @@
         "short-name-suffix": "",
         "app-rules-take-all-addresses": false,
         "forwarded-outage": "",
-        "external-address-auto-check": false,
+        "external-address-auto-check": true,
         "binding-source": "user-assigned"
       }
     },
@@ -373,7 +373,7 @@
         "short-name-suffix": "",
         "app-rules-take-all-addresses": false,
         "forwarded-outage": "",
-        "external-address-auto-check": false,
+        "external-address-auto-check": true,
         "binding-source": "user-assigned"
       }
     },
@@ -422,7 +422,7 @@
         "short-name-suffix": "",
         "app-rules-take-all-addresses": false,
         "forwarded-outage": "",
-        "external-address-auto-check": false,
+        "external-address-auto-check": true,
         "binding-source": "user-assigned",
         "primary": {
           "stable-id": "id-1",
@@ -476,7 +476,7 @@
         "short-name-suffix": "7",
         "app-rules-take-all-addresses": false,
         "forwarded-outage": "",
-        "external-address-auto-check": false,
+        "external-address-auto-check": true,
         "binding-source": "user-assigned"
       }
     },
@@ -506,7 +506,7 @@
           "short-name-completion": true,
           "short-name-suffix": "corp.example",
           "app-rules-take-all-addresses": true,
-          "external-address-auto-check": true,
+          "external-address-auto-check": false,
           "binding-source": "user-assigned"
         },
         "modeFallback": "prefer-primary"
@@ -536,7 +536,7 @@
         "short-name-suffix": "corp.example",
         "app-rules-take-all-addresses": true,
         "forwarded-outage": "",
-        "external-address-auto-check": true,
+        "external-address-auto-check": false,
         "binding-source": "user-assigned"
       }
     },
@@ -573,7 +573,7 @@
         "short-name-suffix": "",
         "app-rules-take-all-addresses": false,
         "forwarded-outage": "",
-        "external-address-auto-check": false,
+        "external-address-auto-check": true,
         "binding-source": "user-assigned"
       }
     },
@@ -610,7 +610,7 @@
         "short-name-suffix": "",
         "app-rules-take-all-addresses": false,
         "forwarded-outage": "",
-        "external-address-auto-check": false,
+        "external-address-auto-check": true,
         "binding-source": "user-assigned"
       }
     },
@@ -647,7 +647,7 @@
         "short-name-suffix": "",
         "app-rules-take-all-addresses": false,
         "forwarded-outage": "",
-        "external-address-auto-check": false,
+        "external-address-auto-check": true,
         "binding-source": "user-assigned"
       }
     }

@@ -15,6 +15,9 @@ ComboBox {
     // be picked with the mouse. Keyboard stepping still lands on it, so the
     // caller also gates whatever acts on the selection.
     property var itemEnabledResolver: null
+    // Optional `function(item) -> bool`: an item it rejects takes no room in
+    // the popup; indexes stay those of the model.
+    property var itemVisibleResolver: null
 
     // The visible label beside the box. A screen reader hears it with the
     // value ("Theme: Dark"); the value alone does not say which box it is.
@@ -44,6 +47,41 @@ ComboBox {
     }
     function _itemEnabled(item) {
         return typeof itemEnabledResolver === "function" ? !!itemEnabledResolver(item) : true
+    }
+    function _itemVisible(item) {
+        return typeof itemVisibleResolver === "function" ? !!itemVisibleResolver(item) : true
+    }
+    function _rowAt(i) {
+        if (!model) return undefined
+        if (typeof model.get === "function") return model.get(i)
+        return Array.isArray(model) ? model[i] : undefined
+    }
+    /// The next row the popup shows from `from` in direction `step`, -1 for none.
+    function _shownIndexFrom(from, step) {
+        for (var i = from + step; i >= 0 && i < count; i += step)
+            if (_itemVisible(_rowAt(i))) return i
+        return -1
+    }
+
+    // With rows hidden from the popup, Up and Down step over them too: the
+    // stock stepping lands on a row nobody sees and picks it.
+    Keys.onPressed: function(event) {
+        if (typeof itemVisibleResolver !== "function") return
+        if (event.key !== Qt.Key_Up && event.key !== Qt.Key_Down) return
+        event.accepted = true
+        var step = event.key === Qt.Key_Down ? 1 : -1
+        var next = _shownIndexFrom(popup.visible ? highlightedIndex : currentIndex, step)
+        if (next < 0) return
+        if (!popup.visible) {
+            currentIndex = next
+            activated(next)
+            return
+        }
+        // `highlightedIndex` is read-only: walk the stock stepping onto the row.
+        for (var guard = 0; highlightedIndex !== next && guard < count; guard += 1) {
+            if (step > 0) incrementCurrentIndex()
+            else decrementCurrentIndex()
+        }
     }
 
     contentItem: Text {
@@ -87,6 +125,8 @@ ComboBox {
         id: themedDelegate
         width: ListView.view ? ListView.view.width : root.popup.width
         enabled: root._itemEnabled(root._delegateItem(typeof modelData !== "undefined" ? modelData : undefined, model))
+        visible: root._itemVisible(root._delegateItem(typeof modelData !== "undefined" ? modelData : undefined, model))
+        height: visible ? implicitHeight : 0
         highlighted: root.highlightedIndex === index
         background: Rectangle {
             color: highlighted ? theme.colorAccent : theme.colorPanel

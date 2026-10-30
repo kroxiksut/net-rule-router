@@ -167,6 +167,49 @@ QtObject {
         return ruleSetFilePath(defaultRuleSetIndex(), route)
     }
 
+    /// The set at `index` as the user reads it: a shipped set by its locale
+    /// name (its label is a folder slug), one of the user's own as named.
+    function ruleSetDisplayName(index) {
+        var label = ruleSetLabelAt(index)
+        if (label === "" || _ruleSetEnum().userOwned) return label
+        return root.tr("rules.bundled-preset.name." + label.replace("_", "-"), label)
+    }
+
+    /// Load the set at `index` as the quick-load's Load does: remembered as
+    /// the user's pick, then the import review a user asks for, which starts
+    /// a stopped service and says what was applied. `false` when nothing was
+    /// read.
+    function loadRuleSetAt(index) {
+        if (index < 0 || index >= _ruleSetEnum().entries.length) return false
+        if (typeof nrrNativeBridge === "undefined" || !nrrNativeBridge
+                || typeof nrrNativeBridge.resolvePresetPath !== "function"
+                || typeof nrrNativeBridge.readFileBytes !== "function") {
+            root.statusLine = root.tr("status.bridge-unavailable",
+                "Service bridge not connected.")
+            return false
+        }
+        // Loading confirms the set as the user's choice even when they never
+        // touched the dropdown.
+        var key = ruleSetSelectionKey(index)
+        if (key !== "" && key !== String(root.prefs.selectedPresetSet || "")) {
+            root.updatePrefs({ selectedPresetSet: key })
+            root.emitPrefs()
+        }
+        // Absolute paths, so the remembered binding resolves on the next launch.
+        var primAbs = ruleSetFilePath(index, "primary")
+        var secAbs = ruleSetFilePath(index, "secondary")
+        var primB64 = primAbs ? String(nrrNativeBridge.readFileBytes(primAbs) || "") : ""
+        var secB64 = secAbs ? String(nrrNativeBridge.readFileBytes(secAbs) || "") : ""
+        if (!primB64 && !secB64) {
+            root.statusLine = root.tr("status.bundled-preset-empty",
+                "Could not read the selected bundled preset.")
+            return false
+        }
+        root.presetImportController.startBothRoutesPresetImportReviewFlow(
+            primB64, secB64, primAbs, secAbs, { label: ruleSetDisplayName(index) })
+        return true
+    }
+
     /// Index of the rule set `path` belongs to, or -1 for a file outside every
     /// known set (a rules .txt the user opened from somewhere of their own).
     /// Windows paths compare case-insensitively and separator-agnostically.

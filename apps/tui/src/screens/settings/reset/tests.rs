@@ -67,9 +67,14 @@ impl IpcClient for Script {
     fn force_reconnect(&self) {}
 }
 
-fn stopped() -> Outcome {
+fn restarted() -> Outcome {
     Outcome::Ok
 }
+
+const DONE_AND_UP: Next = Next::Finish {
+    cleared: true,
+    restarted: true,
+};
 
 #[test]
 fn every_key_is_in_both_locale_files() {
@@ -78,24 +83,24 @@ fn every_key_is_in_both_locale_files() {
 }
 
 #[test]
-fn the_steps_run_in_the_windows_order_and_the_service_stops_last() {
+fn the_steps_run_in_the_windows_order_and_the_service_restarts_last() {
     let client = Script::new(&[]);
-    let stops = Cell::new(0);
+    let restarts = Cell::new(0);
     let end = drive(&client, false, &|| {
-        // Every service-side step has already run when the stop comes, and
+        // Every service-side step has already run when the restart comes, and
         // none wrote a rule book: the user is left reading the baseline.
         assert_eq!(client.ops(), [Op::LogsClear, Op::PrincipalDataPurge]);
-        stops.set(stops.get() + 1);
-        stopped()
+        restarts.set(restarts.get() + 1);
+        restarted()
     });
-    assert_eq!(end, Next::Finish { cleared: true });
-    assert_eq!(stops.get(), 1);
+    assert_eq!(end, DONE_AND_UP);
+    assert_eq!(restarts.get(), 1);
 }
 
 #[test]
 fn the_purge_takes_the_rules_history_and_only_the_callers_own_data_by_default() {
     let client = Script::new(&[]);
-    drive(&client, false, &stopped);
+    drive(&client, false, &restarted);
     let purge = client.payload(Op::PrincipalDataPurge);
     assert_eq!(purge["include-rules-history"], json!(true));
     assert_eq!(purge["all-principals"], json!(false));
@@ -107,7 +112,7 @@ fn the_purge_takes_the_rules_history_and_only_the_callers_own_data_by_default() 
 #[test]
 fn clearing_everyones_data_is_asked_for_in_the_request() {
     let client = Script::new(&[]);
-    drive(&client, true, &stopped);
+    drive(&client, true, &restarted);
     assert_eq!(
         client.payload(Op::PrincipalDataPurge)["all-principals"],
         json!(true)
@@ -117,7 +122,9 @@ fn clearing_everyones_data_is_asked_for_in_the_request() {
 #[test]
 fn a_refused_purge_stops_before_the_rules_and_the_service_are_touched() {
     let client = Script::new(&[Op::PrincipalDataPurge]);
-    let end = drive(&client, true, &|| panic!("the service must not be stopped"));
+    let end = drive(&client, true, &|| {
+        panic!("the service must not be restarted")
+    });
     assert_eq!(
         end,
         Next::NeedsElevation {
@@ -130,15 +137,17 @@ fn a_refused_purge_stops_before_the_rules_and_the_service_are_touched() {
 #[test]
 fn a_refused_purge_of_everyones_data_erases_nothing_first() {
     let client = Script::new(&[Op::PrincipalDataPurge]);
-    drive(&client, true, &|| panic!("the service must not be stopped"));
+    drive(&client, true, &|| {
+        panic!("the service must not be restarted")
+    });
     assert_eq!(client.ops(), [Op::PrincipalDataPurge], "no log was cleared");
 }
 
 #[test]
 fn everyones_data_is_purged_once() {
     let client = Script::new(&[]);
-    let end = drive(&client, true, &stopped);
-    assert_eq!(end, Next::Finish { cleared: true });
+    let end = drive(&client, true, &restarted);
+    assert_eq!(end, DONE_AND_UP);
     let purges = client
         .ops()
         .into_iter()
@@ -166,18 +175,19 @@ fn a_reset_stopped_for_rights_keeps_the_shared_settings_file() {
 #[test]
 fn a_refused_log_clear_does_not_stop_the_reset() {
     let client = Script::new(&[Op::LogsClear]);
-    let end = drive(&client, false, &stopped);
-    assert_eq!(end, Next::Finish { cleared: true });
+    let end = drive(&client, false, &restarted);
+    assert_eq!(end, DONE_AND_UP);
 }
 
 fn no_manager() -> Option<Box<dyn nrr_platform_api::service_control::ServiceControlPort>> {
     None
 }
 
-/// A service manager holding one service in `state`, counting starts.
+/// A service manager holding one service in `state`, counting starts and stops.
 struct Manager {
     state: ServiceRunState,
     starts: Cell<u32>,
+    stops: Cell<u32>,
 }
 
 impl Manager {
@@ -185,6 +195,7 @@ impl Manager {
         Self {
             state,
             starts: Cell::new(0),
+            stops: Cell::new(0),
         }
     }
 }
@@ -215,6 +226,7 @@ impl ServiceControlPort for Manager {
     }
 
     fn stop(&self, _timeout: Duration) -> Result<(), ServiceControlError> {
+        self.stops.set(self.stops.get() + 1);
         Ok(())
     }
 
@@ -282,6 +294,7 @@ fn the_shared_settings_file_goes_back_to_a_fresh_install() {
             s.set_primary_file("/home/me/p.txt");
             s.selected_set = "user:mine".into();
             s.accepted_eula = 1;
+            s.rule_set_offer_answered = true;
             s.service_intent
                 .insert("route-policy".into(), json!({ "a": 1 }));
         })
@@ -295,6 +308,10 @@ fn the_shared_settings_file_goes_back_to_a_fresh_install() {
     assert!(after.rules_files.primary.is_empty());
     assert!(after.service_intent.is_empty());
     assert_eq!(after.accepted_eula, UserSettings::default().accepted_eula);
+    assert!(
+        !after.rule_set_offer_answered,
+        "a reset user is not offered a rule set again"
+    );
     assert!(clear_user_settings(None), "no file is nothing to clear");
 }
 
@@ -307,10 +324,35 @@ fn a_damaged_settings_file_is_left_alone_and_reported() {
     assert_eq!(std::fs::read_to_string(&file).expect("read"), "{ not json");
 }
 
+/// The reset used to end on a stopped service: no routing and no protection
+/// until the user found the service controls. It ends started again, and
+/// answering, before it calls itself done.
 #[test]
-fn a_service_that_cannot_be_stopped_is_reported_as_not_fully_cleared() {
+fn the_last_step_restarts_the_service_and_waits_for_its_answer() {
+    let manager = Manager::holding(ServiceRunState::Running);
+    let client = Script::new(&[]);
+    assert!(restart_service(Some(&manager), &client, Duration::ZERO).is_ok());
+    assert_eq!((manager.stops.get(), manager.starts.get()), (1, 1));
+    assert_eq!(client.ops(), [Op::PrincipalDataCount]);
+}
+
+#[test]
+fn a_restarted_service_that_never_answers_is_not_called_back() {
+    let manager = Manager::holding(ServiceRunState::Running);
+    let client = Script::new(&[Op::PrincipalDataCount]);
+    assert!(restart_service(Some(&manager), &client, Duration::ZERO).is_err());
+}
+
+#[test]
+fn a_service_that_did_not_come_back_is_told_with_where_to_start_it() {
     let said = run_on_screen(&Script::new(&[]), false);
-    assert_eq!(said, texts_en().get(PARTIAL));
+    let words = texts_en().get(RESTART_FAILED);
+    let (head, _) = words.split_once("{error}").expect("the reason slot");
+    assert!(said.starts_with(head), "{said}");
+    assert!(
+        said.contains(&texts_en().get(crate::screens::settings::text::SERVICE_NO_MANAGER)),
+        "{said}"
+    );
 }
 
 #[test]

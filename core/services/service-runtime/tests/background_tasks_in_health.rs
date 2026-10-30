@@ -292,6 +292,14 @@ const THREADS: &[(&str, &str, usize, Verdict)] = &[
         ),
     ),
     (
+        "service-runtime/src/dns_resolver_ports.rs",
+        "nrr-dns-book-refresh",
+        1,
+        Verdict::Bounded(
+            "one re-read of a user's rule book at a time; queries answer from the remembered book meanwhile",
+        ),
+    ),
+    (
         "service-runtime/src/dns_upstream.rs",
         "nrr-dns-upstream-refresh",
         1,

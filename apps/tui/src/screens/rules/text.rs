@@ -583,6 +583,16 @@ pub const LOCKED_BODY: Key = key(
     "rules.locked.banner-body",
     "Changing rules is turned off on this computer. You can still view, search, filter and export them.",
 );
+pub const RULE_SET_OFFER: Key = key(
+    "status.rule-set-offer",
+    "No rules yet. Load the rule set «{name}»? You can change it or remove it at any time.",
+);
+pub const RULE_SET_OFFER_KEYS: Key = key("tui.rule-set-offer.keys", "l: Load. n: Not now.");
+pub const RULE_SET_OFFER_HOW: Key = key(
+    "tui.rule-set-offer.how",
+    "To load it, press l on the Rules screen; n there means Not now.",
+);
+pub const RULE_SET_LOAD: Key = key("rules.empty.load-set", "Load the rule set «{name}»");
 pub const FOLDER_OFFER_TITLE: Key = key("tui.rules.folder-offer.title", "Your rule-set folder");
 pub const FOLDER_OFFER: Key = key(
     "status.rules-folder-suggestion",
@@ -1511,6 +1521,10 @@ pub const ALL: &[Key] = &[
     FOLDER_OFFER_TITLE,
     FOLDER_OFFER,
     FOLDER_OFFER_HOW,
+    RULE_SET_OFFER,
+    RULE_SET_OFFER_KEYS,
+    RULE_SET_OFFER_HOW,
+    RULE_SET_LOAD,
     OVERRIDE_GRANTED_MARK,
     OVERRIDE_PENDING_MARK,
     OVERRIDE_TITLE,

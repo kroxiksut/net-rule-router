@@ -16,6 +16,8 @@ mod reset;
 mod tests;
 mod text;
 
+pub(crate) use providers::found_rows;
+
 use std::io;
 use std::path::PathBuf;
 
@@ -369,6 +371,8 @@ pub struct SettingsState {
     /// Where the traffic CSV goes, and the unit of its byte columns.
     pub traffic_export_path: String,
     pub traffic_export_unit: &'static str,
+    /// Whether virtual-adapter rows go into the export; off, as in the window.
+    pub traffic_export_include_virtual: bool,
     /// Why protection is being switched off, kept in the audit trail.
     pub safe_disable_reason: String,
     /// The term picked for the next safe disable.
@@ -402,6 +406,10 @@ pub struct SettingsState {
     pub merge_policy: MergePolicyDto,
     pub reset: reset::ResetState,
     pub providers: providers::ProvidersState,
+    /// Each documentation language's start page, offline beside this terminal
+    /// or online; About names the one in `docs_language`.
+    pub docs: Vec<(String, nrr_shared::docs_location::DocsIndex)>,
+    pub docs_language: String,
 }
 
 impl Default for SettingsState {
@@ -422,6 +430,7 @@ impl Default for SettingsState {
             export_path: String::new(),
             traffic_export_path: String::new(),
             traffic_export_unit: "mb",
+            traffic_export_include_virtual: false,
             safe_disable_reason: String::new(),
             safe_disable_term: "until-restart",
             pause_term: "until-resumed",
@@ -441,12 +450,30 @@ impl Default for SettingsState {
             merge_policy: MergePolicyDto::Union,
             reset: reset::ResetState::default(),
             providers: providers::ProvidersState::default(),
+            docs: documentation(),
+            docs_language: nrr_shared::docs_location::DOCS_CANONICAL_LANGUAGE.to_owned(),
         }
     }
 }
 
 /// The service binary beside this executable: only the sibling counts, as
 /// for the window.
+/// The offline pages beside this terminal, as the package installs them, else online.
+fn documentation() -> Vec<(String, nrr_shared::docs_location::DocsIndex)> {
+    let dir = std::env::current_exe()
+        .ok()
+        .and_then(|exe| exe.parent().map(std::path::Path::to_path_buf));
+    nrr_shared::docs_location::docs_indexes(
+        dir.as_deref(),
+        nrr_shared::gui_shell_v1().about.project_url,
+    )
+}
+
+/// The texts were loaded or changed language.
+pub fn on_texts(app: &mut crate::state::AppState, texts: &Texts) {
+    app.settings.docs_language = texts.language().to_owned();
+}
+
 fn sibling_service_binary() -> Option<PathBuf> {
     let exe = std::env::current_exe().ok()?;
     let path = exe
@@ -1315,6 +1342,7 @@ fn needs_service(id: ItemId) -> bool {
             | ItemId::MergePolicy
             | ItemId::TrafficExportPath
             | ItemId::TrafficExportUnit
+            | ItemId::TrafficExportIncludeVirtual
             | ItemId::SafeDisableReason
             | ItemId::SafeDisableTerm
             | ItemId::RulesPauseTerm
@@ -1670,6 +1698,10 @@ fn activate(app: &mut AppState, item: &Item, input: Input) {
             app.settings.traffic_export_unit = unit;
             None
         }
+        (ItemId::TrafficExportIncludeVirtual, Input::Toggle) => {
+            app.settings.traffic_export_include_virtual = toggled;
+            None
+        }
         (ItemId::TrafficExport, Input::Run) => {
             let path = app.settings.traffic_export_path.trim().to_owned();
             if path.is_empty() {
@@ -1688,6 +1720,7 @@ fn activate(app: &mut AppState, item: &Item, input: Input) {
                 day - retention,
                 day,
                 app.settings.traffic_export_unit,
+                app.settings.traffic_export_include_virtual,
             ))
         }
         (ItemId::TrafficReset, Input::Run) => {

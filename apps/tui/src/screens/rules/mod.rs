@@ -15,6 +15,7 @@ mod form;
 mod gateway;
 mod main_route;
 mod merge;
+pub mod offer;
 pub mod overrides;
 pub(crate) mod own_settings;
 mod recent;
@@ -309,6 +310,8 @@ pub struct RulesState {
     pub settings_stamp: String,
     /// The rule-set folder was offered this run.
     pub folder_offered: bool,
+    /// The rule set offered while the user has no rules.
+    pub offer: offer::Offer,
     /// The demo rules are read in Russian.
     pub demo_russian: bool,
     /// The two routes' names in the reader's language, main first.
@@ -356,6 +359,9 @@ pub struct RulesState {
     /// The bound files and the texts that merge was built from: once it is in
     /// force, those versions are the program's to follow.
     merged_from: Vec<(PathBuf, String)>,
+    /// A rule set just loaded and on its way to the service, with its rule
+    /// count: its outcome is told in the feed. Cleared by any other apply.
+    loading_set: Option<(crate::rule_set_load::SetName, usize)>,
 }
 
 impl RulesState {
@@ -371,6 +377,7 @@ impl RulesState {
 /// The texts were loaded or changed language.
 pub fn on_texts(app: &mut AppState, texts: &Texts) {
     super::app_groups::on_texts(app, texts);
+    super::settings::on_texts(app, texts);
     app.rules.my_rules = texts.get(text::MY_RULES);
     app.rules.gateway_comment = texts.get(text::GATEWAY_COMMENT);
     app.rules.demo_russian = texts.language().starts_with("ru");
@@ -613,7 +620,10 @@ fn line_in_mode(app: &mut AppState, line: &str) -> bool {
         Mode::Review(mut review) => {
             match line {
                 "y" | "Y" => confirm(app, review),
-                "n" | "N" => app.rules.quit_after_apply = false,
+                "n" | "N" => {
+                    app.rules.quit_after_apply = false;
+                    app.rules.loading_set = None;
+                }
                 "c" | "C" if review.is_critical() => {
                     review.understood = !review.understood;
                     app.rules.mode = Mode::Review(review);
@@ -838,7 +848,7 @@ fn refuse_when_admin_locked(app: &mut AppState) -> bool {
 fn changes_rules(command: &str) -> bool {
     const CHANGING: &[&str] = &[
         "a", "e", "d", "s", "i", "p", "m", "v", "F", "C", "T", "M", "A", "U", "P", "L", "W", "Z",
-        "B",
+        "B", "l",
     ];
     CHANGING.contains(&command)
 }
@@ -857,6 +867,7 @@ pub fn follow_settings_file(app: &mut AppState) -> bool {
     app.rules.settings_stamp = stamp;
     let settings = own_settings::read(&file);
     app.rules.bound_paths = bound_paths_of(Some(&settings));
+    offer::refresh(app, Some(&settings));
     if let Ok(settings) = &settings {
         app.settings.merge_policy = MergePolicyDto::from_slug(&settings.merge_policy);
     }
@@ -868,6 +879,14 @@ pub fn follow_settings_file(app: &mut AppState) -> bool {
 fn refresh_bound_paths(app: &mut AppState) {
     let settings = app.rules.settings_file.as_deref().map(own_settings::read);
     app.rules.bound_paths = bound_paths_of(settings.as_ref());
+    offer::refresh(app, settings.as_ref());
+}
+
+/// What the rule-set offer needs from the settings file, read at start-up
+/// before any screen asks.
+pub fn read_offer(app: &mut AppState) {
+    let settings = app.rules.settings_file.as_deref().map(own_settings::read);
+    offer::refresh(app, settings.as_ref());
 }
 
 /// Each route's sections this build does not apply, as its bound file holds
@@ -988,6 +1007,7 @@ fn previewed(app: &mut AppState, previewed: Previewed) {
     if !matches!(previewed, Previewed::Review(_)) {
         rules.reload_after_apply = false;
         rules.merged_from.clear();
+        rules.loading_set = None;
     }
     match previewed {
         Previewed::Review(review) => rules.mode = Mode::Review(review),
@@ -1027,6 +1047,10 @@ fn finished(app: &mut AppState, finished: Finished) {
             let _ = own_settings::note_taken(file, &merged_from);
         }
     }
+    if let (true, Some((name, count))) = (applied, rules.loading_set.take()) {
+        crate::rule_set_load::applied(app, name, count);
+    }
+    let rules = &mut app.rules;
     rules.note = Some(match finished {
         Finished::Applied { base } => {
             // The next apply is built on what this one left in force.
@@ -1122,6 +1146,7 @@ fn locked(app: &mut AppState) -> bool {
 }
 
 fn start_apply(app: &mut AppState) {
+    app.rules.loading_set = None;
     if locked(app) || refuse_when_admin_locked(app) {
         return;
     }
@@ -1130,6 +1155,48 @@ fn start_apply(app: &mut AppState) {
         app.rules.note = Some(Note::new(text::APPLY_OFFLINE));
         return;
     }
+    send_apply(app);
+}
+
+/// A loaded set goes to the service in the same action: a stopped service is
+/// started first, and the review follows once it answers.
+fn apply_loaded_set(app: &mut AppState, name: crate::rule_set_load::SetName, count: usize) {
+    if refuse_when_admin_locked(app) {
+        return;
+    }
+    app.rules.loading_set = Some((name.clone(), count));
+    if app.link.is_connected() {
+        send_loaded_set(app);
+        return;
+    }
+    app.rules.busy = Some(Busy::Previewing);
+    app.outbox.push(crate::rule_set_load::start_then(
+        app.settings.service_probe,
+        move |app, result| {
+            app.rules.busy = None;
+            match result {
+                Ok(()) => send_loaded_set(app),
+                Err(why) => {
+                    // The set stays in the list as edits not yet applied.
+                    app.rules.loading_set = None;
+                    crate::rule_set_load::not_applied(app, name, why);
+                }
+            }
+        },
+    ));
+}
+
+/// The import's own note (its count, a section written twice) stays up
+/// while the review is asked for.
+fn send_loaded_set(app: &mut AppState) {
+    let note = app.rules.note.take();
+    send_apply(app);
+    if app.rules.note.is_none() {
+        app.rules.note = note;
+    }
+}
+
+fn send_apply(app: &mut AppState) {
     let pending = match apply::pending_from(
         &app.rules.table,
         app.rules.baseline,
@@ -1282,13 +1349,13 @@ fn ask_about_hand_edited(app: &mut AppState, held: Vec<(nrr_client_logic::Route,
     ask(app, ChoicePurpose::HandEdited(held));
 }
 
-/// "Take the file": its folder is read like any rule set, and the import
-/// question decides how it meets the list; the apply then reviews it.
+/// "Take the file": the files asked about are read like any rule set, and the
+/// import question decides how they meet the list; the apply then reviews it.
 fn take_hand_edited(app: &mut AppState, held: &[(nrr_client_logic::Route, PathBuf)]) {
     let Some(dir) = held.first().and_then(|(_, path)| path.parent()) else {
         return;
     };
-    match files::read_set(dir) {
+    match files::read_files(held) {
         Err((file, error)) => app.rules.note = Some(read_failed(&file, error)),
         Ok(set) => offer_import(app, set, dir.display().to_string()),
     }
@@ -1385,7 +1452,14 @@ fn set_list(settings_file: Option<&Path>) -> SetList {
         Some(Ok(settings)) => (settings, None),
         Some(Err(error)) => (Default::default(), Some(error.to_string())),
     };
-    let own = own_settings::own_folder(&settings);
+    SetList {
+        settings_error,
+        ..set_list_of(&settings)
+    }
+}
+
+fn set_list_of(settings: &UserSettings) -> SetList {
+    let own = own_settings::own_folder(settings);
     if let Some(folder) = own.as_ref() {
         let sets = files::user_sets(folder);
         if !sets.is_empty() {
@@ -1393,8 +1467,8 @@ fn set_list(settings_file: Option<&Path>) -> SetList {
                 sets,
                 folder: own,
                 empty_own_folder: None,
-                settings_error,
-                selected: settings.selected_set,
+                settings_error: None,
+                selected: settings.selected_set.clone(),
             };
         }
     }
@@ -1406,8 +1480,8 @@ fn set_list(settings_file: Option<&Path>) -> SetList {
             .unwrap_or_default(),
         folder: shipped,
         empty_own_folder: own,
-        settings_error,
-        selected: settings.selected_set,
+        settings_error: None,
+        selected: settings.selected_set.clone(),
     }
 }
 
@@ -1588,9 +1662,17 @@ fn import(app: &mut AppState, set: RuleSet, path: String, replace: bool) {
     let dir = PathBuf::from(&path);
     let table = &mut app.rules.table;
     let added = table.import(set.rows, replace);
-    table.passthrough = set.passthrough;
+    if replace {
+        table.passthrough = set.passthrough;
+    } else {
+        // A merge keeps the list's sections; one the set also holds is the set's.
+        for (held, read) in table.passthrough.iter_mut().zip(set.passthrough) {
+            held.extend(read);
+        }
+    }
     table.clear_filters();
     table.set_cursor(0);
+    let name = loaded_set_name(&path);
     let mut note = Note::with(
         text::IMPORTED,
         vec![("count", added.to_string()), ("path", path)],
@@ -1614,6 +1696,20 @@ fn import(app: &mut AppState, set: RuleSet, path: String, replace: bool) {
     app.rules.note = Some(note);
     refresh_bound_paths(app);
     folder::offer(app, &dir);
+    // Loading a set is applying it: the review the service shows comes next.
+    apply_loaded_set(app, name, added);
+}
+
+/// `shown` is a set's label (`ru_<pack>`, or the name of one of the user's
+/// own) or the folder typed; a shipped label has the window's locale name.
+fn loaded_set_name(shown: &str) -> crate::rule_set_load::SetName {
+    if shown.contains(['/', '\\']) {
+        return crate::rule_set_load::SetName::of_path(std::path::Path::new(shown));
+    }
+    crate::rule_set_load::SetName::keyed(
+        format!("rules.bundled-preset.name.{}", shown.replacen('_', "-", 1)),
+        shown.to_owned(),
+    )
 }
 
 /// The files read become where the rules come from and, outside the shipped
@@ -2001,7 +2097,9 @@ fn list_key(app: &mut AppState, key: KeyEvent) -> bool {
             'p' => presets(app),
             'o' => start_folder_input(app),
             'm' => return verdicts::move_all(app),
-            'n' => return verdicts::not_now(app),
+            // The verdicts' question needs rules, the offer needs none.
+            'n' => return verdicts::not_now(app) || offer::not_now(app),
+            'l' => return offer::load(app),
             'c' => return main_route::start(app),
             'v' => return gateway::start(app),
             'g' => app.open(ScreenId::AppGroups),
@@ -2227,6 +2325,7 @@ fn review_key(app: &mut AppState, mut review: Box<Review>, key: KeyEvent) -> boo
     match key.code {
         KeyCode::Esc => {
             app.rules.quit_after_apply = false;
+            app.rules.loading_set = None;
             return true;
         }
         KeyCode::Enter => {
@@ -2340,7 +2439,8 @@ fn list_line(app: &mut AppState, line: &str) -> bool {
         "p" => presets(app),
         "o" => start_folder_input(app),
         "m" => return verdicts::move_all(app),
-        "n" => return verdicts::not_now(app),
+        "n" => return verdicts::not_now(app) || offer::not_now(app),
+        "l" => return offer::load(app),
         "c" => return main_route::start(app),
         "v" => return gateway::start(app),
         "g" => app.open(ScreenId::AppGroups),

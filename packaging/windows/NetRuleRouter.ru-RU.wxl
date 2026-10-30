@@ -1,0 +1,41 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- The MSI's own texts in Russian; NetRuleRouter.en-US.wxl holds the same Ids. -->
+<WixLocalization Culture="ru-RU" Codepage="1251" Language="1049" xmlns="http://wixtoolset.org/schemas/v4/wxl">
+  <String Id="NrrLanguage" Value="1049" />
+  <String Id="NrrNewerInstalled" Value="Уже установлена более новая версия NetRuleRouter." />
+  <String Id="NrrExeInstalled" Value="NetRuleRouter уже установлена программой установки EXE. Сначала удалите эту установку (при удалении только программы настройки и правила сохранятся), затем запустите этот пакет снова." />
+  <String Id="NrrFolderRefused" Value="NetRuleRouter устанавливается только в папку внутри [ProgramFiles64Folder]: её фоновая служба работает с правами системы, поэтому может запускаться только из папки, которую могут изменять лишь администраторы. Выберите папку там." />
+  <String Id="NrrLaunch" Value="Запустить NetRuleRouter" />
+
+  <String Id="NrrFolderTitle" Value="Папка установки" />
+  <String Id="NrrFolderDescription" Value="Куда установить NetRuleRouter?" />
+  <String Id="NrrFolderLabel" Value="Папка должна находиться внутри [ProgramFiles64Folder]. Фоновая служба работает с правами системы, поэтому может запускаться только из папки, которую могут изменять лишь администраторы." />
+
+  <String Id="NrrOptionsTitle" Value="Компоненты и ярлыки" />
+  <String Id="NrrOptionsDescription" Value="Выберите, что установить и какие ярлыки добавить." />
+  <String Id="NrrAlwaysFull" Value="Устанавливаются всегда: окно, значок в трее, фоновая служба и консоль (nrr-cli), через которую выполняются удаление и восстановление NetRuleRouter." />
+  <String Id="NrrAlwaysHeadless" Value="Устанавливаются всегда: фоновая служба и консоль (nrr-cli), через которую выполняются удаление и восстановление NetRuleRouter." />
+  <String Id="NrrTui" Value="&amp;Терминальный интерфейс (nrr-tui): правила, маршруты и настройки в терминале" />
+  <String Id="NrrDocs" Value="&amp;Документация (офлайн, HTML): открывается из меню «Справка > Документация»" />
+  <String Id="NrrDesktop" Value="Создать ярлык на &amp;рабочем столе" />
+  <String Id="NrrPath" Value="Добавить консольные инструменты в &amp;PATH" />
+  <String Id="NrrPathNote" Value="Для всех пользователей этого компьютера: nrr-cli, а также nrr-tui, если он установлен, будут запускаться из любого нового терминала. Добавляются только эти две команды, а не папка программы." />
+  <String Id="NrrPathNoteMe" Value="Только для вас: nrr-cli, а также nrr-tui, если он установлен, будут запускаться из любого нового терминала, который вы откроете. Добавляются только эти две команды, а не папка программы." />
+
+  <String Id="NrrInstallForTitle" Value="Для кого установить" />
+  <String Id="NrrInstallForDescription" Value="У кого NetRuleRouter появится в меню «Пуск»?" />
+  <String Id="NrrInstallForText" Value="NetRuleRouter устанавливается один раз на весь компьютер, и её фоновая служба направляет трафик всех учётных записей Windows при любом выборе. Выбор определяет только, в чьём меню «Пуск» и на чьём рабочем столе появятся ярлыки NetRuleRouter и в чей PATH попадут консольные инструменты, если вы их добавите." />
+  <String Id="NrrInstallForAll" Value="&amp;Все пользователи этого компьютера" />
+  <String Id="NrrInstallForMe" Value="Только &amp;я" />
+  <String Id="NrrInstallForAccount" Value="«Только я» - это учётная запись Windows [LogonUser], которая запустила эту установку, даже если её подтверждает администратор." />
+  <String Id="NrrInstallForRefused" Value="Значение NRR_INSTALL_FOR=[NRR_INSTALL_FOR] не распознано: укажите all или me. Ничего не установлено." />
+
+  <String Id="NrrRemoveTitle" Value="Как удалить NetRuleRouter?" />
+  <String Id="NrrRemoveDescription" Value="Выберите, что сохранить." />
+  <String Id="NrrRemoveIntro" Value="В обоих случаях фоновая служба удаляется, а изменённые ею сетевые настройки возвращаются в исходное состояние." />
+  <String Id="NrrRemoveProgram" Value="Удалить только программу (&amp;сохранить настройки и правила)" />
+  <String Id="NrrRemoveComplete" Value="Удалить &amp;полностью (стереть также настройки, правила и данные службы)" />
+  <String Id="NrrRemoveNote" Value="Если их сохранить, после повторной установки всё продолжит работать как раньше. Полное удаление стирает данные службы и ваши собственные настройки NetRuleRouter; данные других учётных записей Windows перечисляются в журнале удаления, но не удаляются, а файлы правил, сохранённые вами в своих папках, останутся." />
+  <String Id="NrrRemoveAudit" Value="Стереть и &amp;журнал аудита" />
+  <String Id="NrrRemoveAuditNote" Value="Журнал аудита - это защищённая запись всех изменений маршрутизации на этом компьютере. Сохраните его, если не уверены, что он больше никому не понадобится." />
+</WixLocalization>

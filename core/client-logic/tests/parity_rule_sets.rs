@@ -9,7 +9,8 @@ mod js_harness;
 
 use js_harness::{arg, check, text, JsLib};
 use nrr_client_logic::rule_sets::{
-    adopted_set_name, numbered_set_name, rules_live_in_folder, RouteFiles,
+    adopted_set_name, numbered_set_name, rule_set_offer_due, rules_live_in_folder, RouteFiles,
+    RuleSetOffer, ServiceState,
 };
 use serde_json::Value;
 
@@ -96,6 +97,30 @@ fn numbered_set_name_matches_js() {
                 .collect();
             let name = numbered_set_name(text(input, "base"), |n| all || taken.contains(&n));
             Value::from(name)
+        },
+    );
+}
+
+#[test]
+fn rule_set_offer_due_matches_js() {
+    check(
+        "rule_set_offer_due",
+        &mut JsLib::pure(),
+        |input| format!("ruleSetOfferDue({})", arg(input, "state")),
+        |input| {
+            let state = &input["state"];
+            let flag = |key: &str| state[key].as_bool().expect(key);
+            let count = |key: &str| state[key].as_i64().expect(key);
+            Value::from(rule_set_offer_due(&RuleSetOffer {
+                first_run_done: flag("firstRunDone"),
+                service: ServiceState::from_slug(text(state, "service")),
+                service_rules: usize::try_from(count("serviceRules")).ok(),
+                local_rules: usize::try_from(count("localRules")).expect("localRules"),
+                user_bound: flag("userBound"),
+                set_name: text(state, "setName"),
+                answered: flag("answered"),
+                edits_locked: flag("editsLocked"),
+            }))
         },
     );
 }

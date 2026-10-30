@@ -45,17 +45,14 @@ Window {
     // Guards the quit-on-close behaviour: set true just before we close after
     // an explicit Accept, so `onClosing` does not treat it as a decline.
     property bool _accepted: false
+    // The acknowledgement tick; "Accept" stays disabled until it is set.
+    property bool acknowledged: false
+    // The content is built on the first show and kept: almost every session
+    // never shows this window, and the agreement is a laid-out document.
+    property bool contentBuilt: false
 
     signal accepted()
     signal declined()
-
-    // Reset the scroll position to the top whenever the shown language changes,
-    // so the user starts reading the freshly-switched text from the beginning.
-    onSelectedLanguageChanged: {
-        if (agreementScroll && agreementScroll.contentItem) {
-            agreementScroll.contentItem.contentY = 0
-        }
-    }
 
     function tr(key, fallback) {
         return ownerRoot && typeof ownerRoot.tr === "function"
@@ -64,7 +61,7 @@ Window {
     }
 
     // API-compatible with the other modal child windows in Main.qml.
-    function open() { _accepted = false; acknowledgeCheckbox.checked = false; visible = true }
+    function open() { _accepted = false; acknowledged = false; visible = true }
 
     width: 820
     height: 640
@@ -78,6 +75,9 @@ Window {
     transientParent: ownerRoot ? ownerRoot : null
 
     onVisibleChanged: {
+        if (visible) {
+            contentBuilt = true
+        }
         if (visible && ownerRoot) {
             if (typeof ownerRoot.centerChildWindow === "function") {
                 ownerRoot.centerChildWindow(root)
@@ -95,124 +95,153 @@ Window {
         }
     }
 
-    ColumnLayout {
+    Loader {
         anchors.fill: parent
         anchors.margins: 18
-        spacing: 12
+        active: root.contentBuilt
+        sourceComponent: agreementContentComponent
+    }
+    Component {
+        id: agreementContentComponent
+        ColumnLayout {
+            spacing: 12
 
-        Label {
-            Layout.fillWidth: true
-            wrapMode: Text.WordWrap
-            font.bold: true
-            font.pixelSize: 15
-            color: root.ownerRoot ? root.ownerRoot.textColor : "white"
-            text: root.tr("dialog.eula.heading",
-                "Please read and accept the agreement to continue")
-        }
-        Label {
-            Layout.fillWidth: true
-            wrapMode: Text.WordWrap
-            color: root.ownerRoot ? root.ownerRoot.mutedTextColor : "gray"
-            text: root.tr("dialog.eula.subheading",
-                "Installing, running, or using NetRuleRouter means you accept the terms below.")
-        }
-
-        ScrollView {
-            id: agreementScroll
-            Layout.fillWidth: true
-            Layout.fillHeight: true
-            clip: true
-            ScrollBar.vertical.policy: ScrollBar.AsNeeded
-            ThemedTextArea {
-                id: agreementArea
-                theme: root.ownerRoot ? root.ownerRoot.uiTheme : null
-                readOnly: true
-                activeFocusOnTab: true
-                wrapMode: TextArea.Wrap
-                textFormat: TextArea.MarkdownText
-                text: root.effectiveText
-                color: root.ownerRoot ? root.ownerRoot.textColor : "white"
-                selectionColor: root.ownerRoot ? root.ownerRoot.accentColor : "#3d6fb4"
-                selectedTextColor: root.ownerRoot ? root.ownerRoot.textColor : "white"
-                Accessible.role: Accessible.StaticText
-                Accessible.name: root.tr("dialog.eula.text-accessible-name",
-                    "License agreement text")
-            }
-        }
-
-        CheckBox {
-            id: acknowledgeCheckbox
-            Layout.fillWidth: true
-            text: root.tr("dialog.eula.acknowledge",
-                "I have read and accept the terms of the agreement")
-            contentItem: Text {
-                text: acknowledgeCheckbox.text
-                leftPadding: acknowledgeCheckbox.indicator.width + acknowledgeCheckbox.spacing
-                verticalAlignment: Text.AlignVCenter
-                wrapMode: Text.WordWrap
-                color: root.ownerRoot ? root.ownerRoot.textColor : "white"
-            }
-            Accessible.role: Accessible.CheckBox
-            Accessible.name: text
-            Accessible.description: root.tr("dialog.eula.acknowledge-description",
-                "Required acknowledgement before you can accept the agreement and use the program")
-        }
-
-        // Action row: language switch on the left (visually secondary),
-        // accept / decline on the right.
-        RowLayout {
-            Layout.fillWidth: true
-            Layout.topMargin: 4
-            spacing: 8
-
-            // Bilingual switch — the label names the TARGET language, in that
-            // language. Only meaningful when a second translation is present.
-            ThemedButton {
-                theme: root.ownerRoot ? root.ownerRoot.uiTheme : null
-                visible: root.textRu.length > 0 && root.textEn.length > 0
-                text: root.effectiveLanguage === "ru"
-                    ? root.tr("dialog.eula.switch-to-english", "English")
-                    : root.tr("dialog.eula.switch-to-russian", "Русский")
-                Accessible.role: Accessible.Button
-                Accessible.name: text
-                onClicked: {
-                    root.selectedLanguage =
-                        (root.effectiveLanguage === "ru") ? "en" : "ru"
+            // Reset the scroll position to the top whenever the shown language
+            // changes, so the freshly-switched text is read from the beginning.
+            Connections {
+                target: root
+                function onSelectedLanguageChanged() {
+                    if (agreementScroll.contentItem) {
+                        agreementScroll.contentItem.contentY = 0
+                    }
                 }
             }
 
-            // Accept / decline take the rest of the row, right-aligned, and wrap
-            // on narrow displays.
-            Item {
+            Label {
                 Layout.fillWidth: true
-                Layout.preferredHeight: decisionFlow.height
-                Flow {
-                    id: decisionFlow
-                    anchors.left: parent.left
-                    anchors.right: parent.right
-                    spacing: 8
-                    layoutDirection: Qt.RightToLeft
-                    ThemedButton {
-                        theme: root.ownerRoot ? root.ownerRoot.uiTheme : null
-                        text: root.tr("dialog.eula.accept", "Accept and continue")
-                        highlighted: true
-                        enabled: acknowledgeCheckbox.checked
-                        Accessible.role: Accessible.Button
-                        Accessible.name: text
-                        onClicked: {
-                            root._accepted = true
-                            root.accepted()
-                            root.close()
-                        }
+                wrapMode: Text.WordWrap
+                font.bold: true
+                font.pixelSize: 15
+                color: root.ownerRoot ? root.ownerRoot.textColor : "white"
+                text: root.tr("dialog.eula.heading",
+                    "Please read and accept the agreement to continue")
+            }
+            Label {
+                Layout.fillWidth: true
+                wrapMode: Text.WordWrap
+                color: root.ownerRoot ? root.ownerRoot.mutedTextColor : "gray"
+                text: root.tr("dialog.eula.subheading",
+                    "Installing, running, or using NetRuleRouter means you accept the terms below.")
+            }
+
+            ScrollView {
+                id: agreementScroll
+                Layout.fillWidth: true
+                Layout.fillHeight: true
+                clip: true
+                ScrollBar.vertical.policy: ScrollBar.AsNeeded
+                ThemedTextArea {
+                    theme: root.ownerRoot ? root.ownerRoot.uiTheme : null
+                    readOnly: true
+                    activeFocusOnTab: true
+                    wrapMode: TextArea.Wrap
+                    textFormat: TextArea.MarkdownText
+                    text: root.effectiveText
+                    color: root.ownerRoot ? root.ownerRoot.textColor : "white"
+                    selectionColor: root.ownerRoot ? root.ownerRoot.accentColor : "#3d6fb4"
+                    selectedTextColor: root.ownerRoot ? root.ownerRoot.textColor : "white"
+                    Accessible.role: Accessible.StaticText
+                    Accessible.name: root.tr("dialog.eula.text-accessible-name",
+                        "License agreement text")
+                }
+            }
+
+            CheckBox {
+                id: acknowledgeCheckbox
+                Layout.fillWidth: true
+                // A C++ toggle keeps this binding, so `open()` clearing
+                // `acknowledged` also clears a tick left from an earlier show.
+                checked: root.acknowledged
+                onToggled: root.acknowledged = checked
+                text: root.tr("dialog.eula.acknowledge",
+                    "I have read and accept the terms of the agreement")
+                // Until it is ticked, a red frame shows what holds "Accept" back.
+                padding: 6
+                background: Rectangle {
+                    color: "transparent"
+                    radius: 4
+                    border.width: acknowledgeCheckbox.checked ? 0 : 2
+                    border.color: root.ownerRoot ? root.ownerRoot.uiTheme.colorDanger : "#d32f2f"
+                }
+                contentItem: Text {
+                    text: acknowledgeCheckbox.text
+                    leftPadding: acknowledgeCheckbox.indicator.width + acknowledgeCheckbox.spacing
+                    verticalAlignment: Text.AlignVCenter
+                    wrapMode: Text.WordWrap
+                    color: root.ownerRoot ? root.ownerRoot.textColor : "white"
+                }
+                Accessible.role: Accessible.CheckBox
+                Accessible.name: text
+                Accessible.description: root.tr("dialog.eula.acknowledge-description",
+                    "Required acknowledgement before you can accept the agreement and use the program")
+            }
+
+            // Action row: language switch on the left (visually secondary),
+            // accept / decline on the right.
+            RowLayout {
+                Layout.fillWidth: true
+                Layout.topMargin: 4
+                spacing: 8
+
+                // Bilingual switch — the label names the TARGET language, in that
+                // language. Only meaningful when a second translation is present.
+                ThemedButton {
+                    theme: root.ownerRoot ? root.ownerRoot.uiTheme : null
+                    visible: root.textRu.length > 0 && root.textEn.length > 0
+                    text: root.effectiveLanguage === "ru"
+                        ? root.tr("dialog.eula.switch-to-english", "English")
+                        : root.tr("dialog.eula.switch-to-russian", "Русский")
+                    Accessible.role: Accessible.Button
+                    Accessible.name: text
+                    onClicked: {
+                        root.selectedLanguage =
+                            (root.effectiveLanguage === "ru") ? "en" : "ru"
                     }
-                    ThemedButton {
-                        theme: root.ownerRoot ? root.ownerRoot.uiTheme : null
-                        text: root.tr("dialog.eula.decline", "Decline and exit")
-                        Accessible.role: Accessible.Button
-                        Accessible.name: text
-                        // Just close; `onClosing` emits `declined()` exactly once,
-                        // covering both this button and the title-bar X.
-                        onClicked: root.close()
+                }
+
+                // Accept / decline take the rest of the row, right-aligned, and wrap
+                // on narrow displays.
+                Item {
+                    Layout.fillWidth: true
+                    Layout.preferredHeight: decisionFlow.height
+                    Flow {
+                        id: decisionFlow
+                        anchors.left: parent.left
+                        anchors.right: parent.right
+                        spacing: 8
+                        layoutDirection: Qt.RightToLeft
+                        ThemedButton {
+                            theme: root.ownerRoot ? root.ownerRoot.uiTheme : null
+                            text: root.tr("dialog.eula.accept", "Accept and continue")
+                            highlighted: true
+                            enabled: root.acknowledged
+                            Accessible.role: Accessible.Button
+                            Accessible.name: text
+                            onClicked: {
+                                root._accepted = true
+                                root.accepted()
+                                root.close()
+                            }
+                        }
+                        ThemedButton {
+                            theme: root.ownerRoot ? root.ownerRoot.uiTheme : null
+                            text: root.tr("dialog.eula.decline", "Decline and exit")
+                            Accessible.role: Accessible.Button
+                            Accessible.name: text
+                            // Just close; `onClosing` emits `declined()` exactly once,
+                            // covering both this button and the title-bar X.
+                            onClicked: root.close()
+                        }
                     }
                 }
             }

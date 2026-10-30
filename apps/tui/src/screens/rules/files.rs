@@ -9,7 +9,9 @@ use nrr_client_logic::passthrough::add_passthrough_block;
 use nrr_client_logic::rules_table::{build_rules_file_text, RuleRow, RulesFileOptions};
 use nrr_client_logic::Route;
 use nrr_shared::platform_profile::PlatformProfile;
-use nrr_shared::preset_parser::{app_section_os_label, parse_canonical_rules};
+use nrr_shared::preset_parser::{
+    app_section_os_label, canonical_rules_body, parse_canonical_rules, passthrough_sections,
+};
 
 use super::table::{row_from_parsed, Table};
 
@@ -155,9 +157,14 @@ pub fn read_text(path: &Path) -> Result<Option<String>, ReadError> {
 /// Both files of `dir`; a missing one is not an error, a set with neither is
 /// an empty one.
 pub fn read_set(dir: &Path) -> Result<RuleSet, (PathBuf, ReadError)> {
+    read_files(&Route::ALL.map(|route| (route, dir.join(file_name(route)))))
+}
+
+/// Exactly the files named, each for its route, whatever they are called.
+pub fn read_files(files: &[(Route, PathBuf)]) -> Result<RuleSet, (PathBuf, ReadError)> {
     let mut set = RuleSet::default();
-    for route in Route::ALL {
-        let path = dir.join(file_name(route));
+    for (route, path) in files {
+        let (route, path) = (*route, path.clone());
         let Some(text) = read_text(&path).map_err(|e| (path.clone(), e))? else {
             continue;
         };
@@ -213,11 +220,7 @@ pub fn read_set(dir: &Path) -> Result<RuleSet, (PathBuf, ReadError)> {
 /// A missing or unreadable file leaves the ones in memory.
 pub fn take_passthrough_from(table: &mut Table, route: Route, path: &Path) {
     if let Ok(Some(text)) = read_text(path) {
-        let mut passthrough = BTreeMap::new();
-        for block in parse_canonical_rules(&text).passthrough {
-            add_block(&mut passthrough, block.section_name, &block.raw_text);
-        }
-        table.passthrough[route_index(route)] = passthrough;
+        table.passthrough[route_index(route)] = passthrough_sections(&text);
     }
 }
 
@@ -300,25 +303,12 @@ fn route_text(route: Route, table: &Table, hint: &[String], exported_at: &str) -
 pub fn route_differs(path: &Path, route: Route, table: &Table, hint: &[String]) -> bool {
     match read_text(path) {
         Ok(Some(on_disk)) => {
-            rules_body(&on_disk) != rules_body(&route_text(route, table, hint, ""))
+            canonical_rules_body(&on_disk)
+                != canonical_rules_body(&route_text(route, table, hint, ""))
         }
         Ok(None) => false,
         Err(_) => true,
     }
-}
-
-/// Past the leading blank and `#` lines, trailing blank lines dropped.
-fn rules_body(text: &str) -> String {
-    let lines: Vec<&str> = text.lines().map(str::trim_end).collect();
-    let start = lines
-        .iter()
-        .position(|line| !line.is_empty() && !line.starts_with('#'))
-        .unwrap_or(lines.len());
-    let end = lines
-        .iter()
-        .rposition(|line| !line.is_empty())
-        .map_or(start, |last| (last + 1).max(start));
-    lines[start..end].join("\n")
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

@@ -177,7 +177,7 @@ mod tests {
             html_url: "https://github.com/kroxiksut/net-rule-router/releases/tag/v0.2.0".into(),
             ..UpdateCheckCache::default()
         };
-        let hit = update_available_from(&cache, "0.1.0-prealpha").expect("newer");
+        let hit = update_available_from(&cache, "0.1.0-alpha.1").expect("newer");
         assert_eq!(hit.0, "0.2.0");
         assert_eq!(hit.1, cache.html_url);
         assert!(update_available_from(&cache, "0.2.0").is_none());

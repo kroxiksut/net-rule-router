@@ -18,8 +18,9 @@ SystemTrayIcon {
     property string statusAccessibilityKey: ""
     property string statusLine: "NetRuleRouter"
     property string statusAccessibilityText: ""
-    property string routePrimaryLabel: "Primary"
-    property string routeSecondaryLabel: "Secondary"
+    // Empty: the user never renamed the route, so `routeLabel` names it in the tray's language.
+    property string routePrimaryLabel: ""
+    property string routeSecondaryLabel: ""
     property string iconFileUrl: ""
     property var theme: ({ selectedMode: "system", effectiveMode: "light", systemMode: "light", systemModeDetected: false })
     // OS capability descriptor, mirrored from the main GUI context. The tray
@@ -122,18 +123,27 @@ SystemTrayIcon {
     // buttons, so every tray notification that needs a decision is rendered
     // by this window. It is content-free — the caller injects the strings and
     // the action ids, and gets one `actionTriggered` back.
-    property var promptWindow: TrayPromptWindow {
-        theme: tray.uiTheme
-        // Localized once, on the shared instance: the corner close box belongs
-        // to the window, not to whichever notification is occupying it.
-        closeAccessibleText: tray.tr("action.close", "Close")
-        copyLabel: tray.tr("action.copy", "Copy")
-        opacityPercent: tray.noticeOpacityPercent
-        copiedLabel: tray.tr("action.copied", "Copied")
-        onActionTriggered: function(actionId, selectedIndexes) {
-            tray._onPromptAction(actionId, selectedIndexes)
+    // Built on the first notice and kept: an idle tray that never built a window
+    // never loads the system font collection (~20 MB). Null until then.
+    property var promptWindow: null
+    property Component _promptWindowComponent: Component {
+        TrayPromptWindow {
+            theme: tray.uiTheme
+            // Localized once, on the shared instance: the corner close box belongs
+            // to the window, not to whichever notification is occupying it.
+            closeAccessibleText: tray.tr("action.close", "Close")
+            copyLabel: tray.tr("action.copy", "Copy")
+            opacityPercent: tray.noticeOpacityPercent
+            copiedLabel: tray.tr("action.copied", "Copied")
+            onActionTriggered: function(actionId, selectedIndexes) {
+                tray._onPromptAction(actionId, selectedIndexes)
+            }
+            onRetired: tray._onPromptRetired()
         }
-        onRetired: tray._onPromptRetired()
+    }
+    function _presentPrompt(config) {
+        if (!promptWindow) promptWindow = _promptWindowComponent.createObject(tray)
+        promptWindow.present(config)
     }
 
     // ── One window, several things wanting it ────────────────────────────────
@@ -287,7 +297,7 @@ SystemTrayIcon {
 
     function _showNoticeMuteChoice(kind, name) {
         _noticeMuteKind = kind
-        promptWindow.present({
+        _presentPrompt({
             titleText: tr("tray.notice-mute.title", "Stop showing this notification?"),
             bodyText: tr("tray.notice-mute.body",
                     "\"{name}\" will not appear for as long as you choose.")
@@ -572,7 +582,7 @@ SystemTrayIcon {
         _presentOrQueue("site-not-opening", function() {
             tray._noticeShown = true
             tray._recordSitesShown([tray._noticeSite])
-            promptWindow.present({
+            _presentPrompt({
                 titleText: tr("tray.site-not-opening.title", "A site does not open"),
                 bodyText: tray._siteNoticeBody(tray._noticeSite, reach),
                 primaryAction: {
@@ -643,7 +653,7 @@ SystemTrayIcon {
         var canUndo = !!undo && ((undo.added || []).length + (undo.moved || []).length) > 0
         _presentOrQueue("tray-add-rule", function() {
             tray._addRuleUndo = canUndo ? undo : null
-            promptWindow.present({
+            _presentPrompt({
                 titleText: tr("tray.add-rule.title", "Add rule"),
                 bodyText: bodyText,
                 primaryAction: canUndo
@@ -794,6 +804,7 @@ SystemTrayIcon {
                 break
             case "adapters-changed":
                 _checkForwarded()
+                _maybeOfferVpnClient()
                 break
             case "app-rule-learning-destinations":
                 _onAppRuleLearning(event)
@@ -1168,7 +1179,7 @@ SystemTrayIcon {
             // an explicit request always gets an answer.
             if (_autoRuleShowAll) {
                 _autoRuleShowAll = false
-                promptWindow.present({
+                _presentPrompt({
                     titleText: tr("tray.auto-rules.title", "Addresses a site needs"),
                     bodyText: tr("tray.auto-rules.none-pending",
                         "Nothing is waiting to be added right now."),
@@ -1264,7 +1275,7 @@ SystemTrayIcon {
         }
         bodyText = bodyText + "\n" + tr("tray.auto-rules.unchecked-declined",
             "Unchecked rows will be declined; you can bring them back later in the app.")
-        promptWindow.present({
+        _presentPrompt({
             titleText: titleText,
             bodyText: bodyText,
             items: items,
@@ -1318,14 +1329,202 @@ SystemTrayIcon {
     readonly property int _infoNoticeMs: 10000
 
     function _onSecondaryExternalAddress(event) {
-        // Listed, not announced: a reconnect is routine, and the menu shows
-        // the address for whoever wants it.
         var observed = String(event["external-address"] || "")
-        if (observed !== "") {
-            _externalSecondary = observed
-            _externalSecondaryCachedAtMs = 0
-            _secondaryExternalWithdrawn = false
+        if (observed === "") return
+        _externalSecondary = observed
+        _externalSecondaryCachedAtMs = 0
+        _secondaryExternalWithdrawn = false
+        // A reconnect inside the service's quiet period refreshes the menu only.
+        if (event.quiet === true) return
+        var line = tr("tray.external-address.body",
+                "External address of the additional route: {address}")
+            .replace("{address}", observed)
+        var adapter = String(event["adapter-name"] || "")
+        // One event, one notice: the "routing is working again" notice still
+        // on screen carries the address instead of a second window over it.
+        // That notice was offered moments ago, so the mute list is fresh.
+        if (_restoredNoticeOnScreen() && !_noticeMutedNow("external-address")) {
+            var cfg = Object.assign({}, _restoredNoticeConfig)
+            cfg.bodyText = String(cfg.bodyText || "") + "\n" + line
+            // The offer to check each time has just been answered by the check.
+            cfg.tertiaryAction = null
+            promptWindow.replaceContent(cfg)
+            return
         }
+        if (!showNotifications) return
+        // Raised with the window open too: its card waits in a list, while the
+        // user who has just connected is looking for the address now.
+        var body = adapter === "" ? line : line + "\n" + tr("tray.external-address.adapter",
+            "Adapter: {name}").replace("{name}", Pure.displayText(adapter))
+        _offerNotice("external-address", "external-address", function() {
+            tray._presentPrompt({
+                titleText: tray.tr("tray.external-address.title", "Additional route connected"),
+                bodyText: body,
+                secondaryAction: tray._noticeMuteAction("external-address"),
+                dismissActionId: "external-address-dismiss",
+                autoRetireMs: tray._infoNoticeMs
+            })
+        })
+    }
+
+    /// The "routing is working again" notice on screen, for the address that
+    /// follows it to join; -1 when none was shown.
+    property int _restoredNoticeSerial: -1
+    property var _restoredNoticeConfig: null
+    function _restoredNoticeOnScreen() {
+        return _restoredNoticeConfig !== null && !!promptWindow && promptWindow.visible
+            && promptWindow.presentationSerial === _restoredNoticeSerial
+    }
+
+    /// The user's automatic-check setting, as last read; null unread. The
+    /// offer to switch it on shows only once it reads off.
+    property var _externalAutoCheck: null
+
+    /// "Check it each time" from the notice: the full policy write with only
+    /// the opt-in changed. Switching it on while connected counts as a
+    /// connection, so the service answers with the address shortly.
+    function _turnOnExternalAddressCheck() {
+        if (!bridgeAvailable || typeof nrrNativeBridge === "undefined"
+                || nrrNativeBridge === null
+                || typeof nrrNativeBridge.rpcSnapshotInitialGet !== "function"
+                || typeof nrrNativeBridge.rpcRoutePolicyUpdate !== "function") return
+        var readCorr = nrrNativeBridge.rpcSnapshotInitialGet()
+        if (!readCorr) return
+        rpc.registerRpcCallback(readCorr, function(ok, snapshot, code, msg) {
+            if (!ok) {
+                console.warn("tray external-address opt-in: policy read failed:", code, msg)
+                return
+            }
+            var cur = (snapshot && (snapshot["route-policy"] || snapshot.routePolicy)) || {}
+            var req = tray._buildFullRoutePolicyReq(cur)
+            req["external-address-auto-check"] = true
+            req["apply-only"] = ["external-address-auto-check"]
+            var writeCorr = nrrNativeBridge.rpcRoutePolicyUpdate(req)
+            if (!writeCorr) return
+            tray.rpc.registerRpcCallback(writeCorr, function(ok2, p2, code2, msg2) {
+                if (!ok2) {
+                    console.warn("tray external-address opt-in: write failed:", code2, msg2)
+                    return
+                }
+                tray._externalAutoCheck = true
+                tray._recordIntent({ "namespace": "route-policy",
+                                     "merge": { "external-address-auto-check": true } })
+            })
+        })
+    }
+
+    // ── "Is this your VPN?" when the additional link comes up ────────────────
+    //
+    // With no VPN client set, the running programs tied by name to the bound
+    // additional adapter are offered — never confirmed silently, since a wrong
+    // guess would let a program past leak protection. The window shows the
+    // same offer as a card; the shared ledger id makes one answer do for both.
+
+    /// Confirmed link providers as last read; -1 unread.
+    property int _linkProviderCount: -1
+    /// The bound additional adapter's stored name; "" when none is bound.
+    property string _secondaryBindingName: ""
+    property var _vpnClientOfferAsked: ({})
+    property var _vpnClientOffer: null
+
+    function _readLinkPolicy(policy) {
+        var apps = (policy || {})["secondary-link-provider-apps"]
+        if (Array.isArray(apps)) _linkProviderCount = apps.length
+        var secondary = (policy || {}).secondary || null
+        _secondaryBindingName = secondary ? String(secondary["display-name"] || "") : ""
+        var auto = Pure.routePolicyEffective(policy || {}, "external-address-auto-check")
+        if (auto === true || auto === false) _externalAutoCheck = auto
+    }
+
+    property bool _vpnClientOfferChecking: false
+    /// Read the policy afresh (the set may have been filled in the window),
+    /// then decide.
+    function _maybeOfferVpnClient() {
+        if (_vpnClientOfferChecking || !showNotifications || _windowOnScreen()) return
+        if (!bridgeAvailable || typeof nrrNativeBridge === "undefined" || nrrNativeBridge === null
+                || typeof nrrNativeBridge.rpcSnapshotInitialGet !== "function") return
+        var corr = nrrNativeBridge.rpcSnapshotInitialGet()
+        if (!corr) return
+        _vpnClientOfferChecking = true
+        rpc.registerRpcCallback(corr, function(ok, payload) {
+            tray._vpnClientOfferChecking = false
+            if (!ok || !payload) return
+            tray._readLinkPolicy(payload["route-policy"] || {})
+            tray._offerVpnClientIfDue()
+        })
+    }
+
+    function _offerVpnClientIfDue() {
+        if (_linkProviderCount !== 0 || _secondaryBindingName === "") return
+        if (_enforcementDownRoles.indexOf("secondary") >= 0) return
+        var id = Pure.vpnClientOfferNoticeId(_secondaryBindingName)
+        if (_vpnClientOfferAsked[id] || noticeLedger.isDecided(id)) return
+        if (!rpc || typeof rpc.rpcVpnDiscover !== "function") return
+        var asked = Object.assign({}, _vpnClientOfferAsked)
+        asked[id] = true
+        _vpnClientOfferAsked = asked
+        var link = _secondaryBindingName
+        var corr = rpc.rpcVpnDiscover()
+        if (!corr) return
+        rpc.registerRpcCallback(corr, function(ok, payload) {
+            if (!ok || !payload) return
+            var rows = Pure.vpnPickerRows(Pure.vpnDiscoveredRows(payload.candidates || []), [])
+            var offer = Pure.vpnPickerLinkOffer(rows, link)
+            if (offer.exePaths.length === 0) return
+            tray._presentOrQueue("vpn-client-offer", function() {
+                tray._vpnClientOffer = { id: id, rows: rows, exePaths: offer.exePaths }
+                var names = Pure.displayTextList(offer.exePaths.map(function(p) {
+                    return Pure.vpnProviderNames([{ "exe-path": p, "display-name": "" }])[0]
+                }))
+                tray._presentPrompt({
+                    titleText: tray.tr("notifications.vpn-client-trust.title", "Is this your VPN?"),
+                    bodyText: tray.tr("notifications.vpn-client-offer.body",
+                            "Looks like your VPN is {name}. Use it as your VPN client, so it keeps working over your main link while leak protection is on? Programs: {apps}")
+                        .replace("{name}", Pure.displayText(offer.name))
+                        .replace("{apps}", names.join(", ")),
+                    primaryAction: {
+                        label: tray.tr("notifications.vpn-client-offer.use", "Use it"),
+                        actionId: "vpn-client-offer-use",
+                        accent: true
+                    },
+                    secondaryAction: {
+                        label: tray.tr("notifications.vpn-client-offer.choose", "Choose…"),
+                        actionId: "vpn-client-offer-choose"
+                    },
+                    dismissAction: {
+                        label: tray.tr("action.not-now", "Not now"),
+                        actionId: "vpn-client-offer-later"
+                    },
+                    dismissActionId: "vpn-client-offer-close",
+                    autoRetireMs: tray._promptAutoRetireMs
+                })
+            })
+        })
+    }
+
+    /// "Use it": the offered programs added over a fresh read of the set,
+    /// the same result the window's picker writes.
+    function _useVpnClientOffer(offer) {
+        if (!offer || !bridgeAvailable || typeof nrrNativeBridge.rpcSnapshotInitialGet !== "function"
+                || typeof rpc.rpcRouteLinkProviderSet !== "function") return
+        var readCorr = nrrNativeBridge.rpcSnapshotInitialGet()
+        if (!readCorr) return
+        rpc.registerRpcCallback(readCorr, function(ok, snapshot) {
+            if (!ok) return
+            var cur = (snapshot && (snapshot["route-policy"] || snapshot.routePolicy)) || {}
+            var existing = cur["secondary-link-provider-apps"] || []
+            var apps = Pure.vpnPickerResultApps(offer.rows, offer.exePaths, existing)
+            var writeCorr = tray.rpc.rpcRouteLinkProviderSet(
+                { "role": "secondary", "link-provider-apps": apps })
+            if (!writeCorr) return
+            tray.rpc.registerRpcCallback(writeCorr, function(ok2, p2, code2, msg2) {
+                if (!ok2) {
+                    console.warn("tray vpn-client offer: write failed:", code2, msg2)
+                    return
+                }
+                tray._linkProviderCount = ((p2 && p2["link-provider-apps"]) || apps).length
+            })
+        })
     }
 
     /// The additional link went down or changed: the exit it had is not its
@@ -1359,7 +1558,7 @@ SystemTrayIcon {
         var notice = verifyVerdicts.notice
         if (!notice) {
             _verifyVerdictShownIds = []
-            if (_verifyVerdictOnScreen && promptWindow.visible) promptWindow.retire()
+            if (_verifyVerdictOnScreen && promptWindow && promptWindow.visible) promptWindow.retire()
             _verifyVerdictOnScreen = false
             return
         }
@@ -1383,8 +1582,7 @@ SystemTrayIcon {
         for (var i = 0; i < notice.shown.length; i += 1) {
             items.push({
                 primaryText: notice.shown[i].value,
-                secondaryText: notice.shown[i].to === "secondary"
-                    ? routeSecondaryLabel : routePrimaryLabel
+                secondaryText: routeLabel(notice.shown[i].to === "secondary" ? "secondary" : "primary")
             })
         }
         var body = tr("notifications.verify-verdicts.body",
@@ -1395,7 +1593,7 @@ SystemTrayIcon {
         }
         _verifyVerdictOnScreen = true
         _verifyVerdictOnScreenIds = notice.ids.slice()
-        promptWindow.present({
+        _presentPrompt({
             titleText: tr("notifications.verify-verdicts.title",
                     "Addresses that do not open where they are written: {count}")
                 .replace("{count}", String(notice.ids.length)),
@@ -1497,14 +1695,13 @@ SystemTrayIcon {
         for (var i = 0; i < routes.length; i += 1) {
             var r = routes[i] || {}
             items.push({
-                primaryText: String(r.route) === "secondary"
-                    ? routeSecondaryLabel : routePrimaryLabel,
+                primaryText: routeLabel(String(r.route) === "secondary" ? "secondary" : "primary"),
                 secondaryText: String(r.path || "")
             })
         }
         _rulesDriftNoticeId = noticeId
         _activeNoticeId = noticeId
-        promptWindow.present({
+        _presentPrompt({
             titleText: tr("tray.rules-drift.title",
                 "Your rule files differ from what is applied"),
             bodyText: tr("tray.rules-drift.body",
@@ -1757,7 +1954,7 @@ SystemTrayIcon {
             config.preCheckedKeys = carriedKeys || []
             promptWindow.replaceContent(config)
         } else {
-            promptWindow.present(config)
+            _presentPrompt(config)
         }
         _blockNoticeListSerial = promptWindow.presentationSerial
     }
@@ -2259,6 +2456,16 @@ SystemTrayIcon {
         nrrNativeBridge.openMainGuiFocused("settings", focus.id, JSON.stringify(focus.context))
     }
 
+    /// "Choose…" on the VPN client offer: the window's picker.
+    function _openVpnClientPicker() {
+        if (typeof nrrNativeBridge === "undefined" || !nrrNativeBridge
+                || typeof nrrNativeBridge.openMainGuiFocused !== "function") {
+            triggerAction("settings")
+            return
+        }
+        nrrNativeBridge.openMainGuiFocused("settings", "vpn-client", "{}")
+    }
+
     /// The switch most of the shown blocks point at, and the blocks behind it.
     function _blockNoticeSettingFocus() {
         var counts = { "dns-lockdown": 0, "ipv6-blocked": 0 }
@@ -2332,12 +2539,12 @@ SystemTrayIcon {
 
     /// The channel carries the rules again. The browser will not say so: a page
     /// refused while the channel was down keeps its error until it is reloaded.
-    function _noteEnforcementRestored() {
+    function _noteEnforcementRestored(role) {
         if (!showNotifications) return
         var presence = guiPresence ? guiPresence.read() : { windowActive: false }
         if (presence.windowActive) return
         _offerNotice("enforcement-restored", "enforcement-restored", function() {
-            promptWindow.present({
+            var config = {
                 titleText: tray.tr("notifications.enforcement.restored.title",
                     "Routing is working again"),
                 bodyText: tray.tr("notifications.enforcement.restored.body",
@@ -2347,9 +2554,20 @@ SystemTrayIcon {
                     actionId: "enforcement-restored-outage-list"
                 },
                 secondaryAction: tray._noticeMuteAction("enforcement-restored"),
+                // The additional route came back and nobody asked for its
+                // address: the check is offered here, where the question arises.
+                // Off by default, since the request leaves through the tunnel.
+                tertiaryAction: (role === "secondary" && tray._externalAutoCheck === false)
+                    ? { label: tray.tr("tray.external-address.offer-auto",
+                            "Show its external address each time"),
+                        actionId: "external-address-auto-on" }
+                    : null,
                 dismissActionId: "enforcement-restored-dismiss",
                 autoRetireMs: tray._infoNoticeMs
-            })
+            }
+            _presentPrompt(config)
+            tray._restoredNoticeConfig = config
+            tray._restoredNoticeSerial = promptWindow.presentationSerial
         })
     }
 
@@ -2457,7 +2675,7 @@ SystemTrayIcon {
         var names = []
         for (var i = 0; i < keys.length; i += 1) names.push(_protectionSettingName(keys[i]))
         _presentOrQueue("protection-restored", function() {
-            promptWindow.present({
+            _presentPrompt({
                 titleText: tray.tr("notifications.protection-restored.title",
                     "Protection restored after a service failure"),
                 bodyText: tray.tr("notifications.protection-restored.body",
@@ -2481,7 +2699,7 @@ SystemTrayIcon {
             var count = keys.length + (mutes.length > 0 ? 1 : 0)
             if (count === 0) return
             tray._presentOrQueue("settings-lost", function() {
-                promptWindow.present({
+                _presentPrompt({
                     titleText: tray.tr("notifications.settings-lost.title",
                         "The service does not have your settings"),
                     bodyText: tray.tr("tray.settings-lost.body",
@@ -2563,7 +2781,7 @@ SystemTrayIcon {
                 .replace("{name}", Pure.displayTextList(missing).join(", "))
         }
         tray._presentOrQueue("settings-restored", function() {
-            promptWindow.present({
+            _presentPrompt({
                 titleText: tray.tr("notifications.settings-lost.action", "Restore my settings"),
                 bodyText: body,
                 dismissActionId: "settings-restored-dismiss",
@@ -2576,7 +2794,7 @@ SystemTrayIcon {
     /// connections — only a reload moves it onto the new route.
     function _noteReloadAfterAccept() {
         _presentOrQueue("auto-rules-reload", function() {
-            promptWindow.present({
+            _presentPrompt({
                 titleText: tray.tr("tray.auto-rules.reload.title", "Rule applied"),
                 bodyText: tray.tr("rules.suggestions.accept.reload-page",
                     "The rule is applied. Reload the page you were on (F5) so it picks up the new route."),
@@ -2631,7 +2849,7 @@ SystemTrayIcon {
                 .replace("{cidr}", String(first.cidr || ""))
                 .replace("{adapter}", Pure.displayText(first.adapter))
             tray._offerNotice("local-networks", "local-networks", function() {
-                promptWindow.present({
+                _presentPrompt({
                     titleText: tray.tr("notifications.local-networks.title",
                         "A local network was found"),
                     bodyText: body,
@@ -2671,7 +2889,7 @@ SystemTrayIcon {
         var presence = guiPresence ? guiPresence.read() : { windowActive: false }
         if (presence.windowActive) return
         tray._presentOrQueue("local-network-too-wide", function() {
-            promptWindow.present({
+            _presentPrompt({
                 titleText: tr("notifications.local-network-too-wide.title",
                     "This network looks suspicious"),
                 bodyText: tr("notifications.local-network-too-wide.body",
@@ -2697,7 +2915,7 @@ SystemTrayIcon {
         var presence = guiPresence ? guiPresence.read() : { windowActive: false }
         if (presence.windowActive) return
         _offerNotice("unassigned-tunnel", "unassigned-tunnel", function() {
-            promptWindow.present({
+            _presentPrompt({
                 titleText: tr("notifications.unassigned-tunnel.title",
                     "The additional route is not assigned"),
                 bodyText: tr("notifications.unassigned-tunnel.body",
@@ -2732,7 +2950,7 @@ SystemTrayIcon {
         _systemDnsNoticeRaised = step.raised
         if (!step.raise || !showNotifications || _windowOnScreen()) return
         _presentOrQueue("system-dns-not-restored", function() {
-            promptWindow.present({
+            _presentPrompt({
                 titleText: tr("notifications.system-dns-not-restored.title",
                     "Sites may not open by name"),
                 bodyText: tr("notifications.system-dns-not-restored.body",
@@ -2765,7 +2983,7 @@ SystemTrayIcon {
                 tray._scheduleDrain()
                 return
             }
-            promptWindow.present({
+            _presentPrompt({
                 titleText: tr("notifications.rules-book-unreadable.title",
                     "Your saved rules cannot be read"),
                 bodyText: tr("notifications.rules-book-unreadable.body",
@@ -2797,6 +3015,7 @@ SystemTrayIcon {
             var policy = payload["route-policy"] || {}
             var level = Pure.routePolicyEffective(policy, "leak-protection")
             if (level) tray._leakProtection = level
+            tray._readLinkPolicy(policy)
             tray._onVpnClientAwaitingConfirmation(
                 { clients: payload["pending-vpn-clients"] || [] })
             tray._onVpnGatewayAwaitingConfirmation(
@@ -2812,7 +3031,7 @@ SystemTrayIcon {
         _dnsForeignNoticeRaised = step.raised
         if (!step.raise || !showNotifications || _windowOnScreen()) return
         _presentOrQueue("dns-foreign-only", function() {
-            promptWindow.present({
+            _presentPrompt({
                 titleText: tr("notifications.dns-foreign-only.title",
                     "Name handling is paused by your VPN"),
                 bodyText: tr("notifications.dns-foreign-only.body",
@@ -2861,7 +3080,7 @@ SystemTrayIcon {
                     actionId: "service-lost-restore"
                 }
             }
-            promptWindow.present(config)
+            _presentPrompt(config)
         })
     }
 
@@ -2898,7 +3117,7 @@ SystemTrayIcon {
         _forwardedNoticeRaised = step.raised
         if (!step.raise || !showNotifications || _windowOnScreen()) return
         _presentOrQueue("forwarded-traffic", function() {
-            promptWindow.present({
+            _presentPrompt({
                 titleText: tr("notifications.forwarded-traffic.title", "WSL or containers are running"),
                 bodyText: tr("notifications.forwarded-traffic.body",
                     "Choose what WSL, containers and virtual machines get when the additional route goes down. Until you choose, they are protected like this computer."),
@@ -2931,7 +3150,7 @@ SystemTrayIcon {
         if (_windowOnScreen()) return
         var sample = String(event.sample || "")
         _presentOrQueue("rule-duplicates", function() {
-            promptWindow.present({
+            _presentPrompt({
                 titleText: tr("notifications.rule-duplicates.title",
                     "A rule is set on both routes"),
                 bodyText: tr("notifications.rule-duplicates.body",
@@ -2964,7 +3183,7 @@ SystemTrayIcon {
         if ((ended.length === 0 && !withdrawn) || !showNotifications) return
         if (_windowOnScreen()) return
         _presentOrQueue("rule-override-ended", function() {
-            promptWindow.present({
+            _presentPrompt({
                 titleText: withdrawn
                     ? tr("notifications.rule-override-withdrawn.title",
                         "Confirmations were withdrawn")
@@ -3005,7 +3224,7 @@ SystemTrayIcon {
         if (apps.length === 0 || !showNotifications) return
         if (_windowOnScreen()) return
         _presentOrQueue("app-rule-learning", function() {
-            promptWindow.present({
+            _presentPrompt({
                 titleText: tr("notifications.app-rule-learning.title",
                     "New application rule is settling in"),
                 bodyText: tr("notifications.app-rule-learning.body",
@@ -3031,7 +3250,7 @@ SystemTrayIcon {
         var names = []
         for (var i = 0; i < offers.length; i += 1) names.push(Pure.displayText(offers[i].name))
         _presentOrQueue("vpn-client-trust", function() {
-            promptWindow.present({
+            _presentPrompt({
                 titleText: tr("notifications.vpn-client-trust.title", "Is this your VPN?"),
                 bodyText: tr("notifications.vpn-client-trust.tray-body",
                         "{apps} looks like a VPN client, but it is not installed in a protected program folder. Open NetRuleRouter to confirm it, or leak protection keeps blocking it while the additional route is down.")
@@ -3060,7 +3279,7 @@ SystemTrayIcon {
         var addresses = []
         for (var i = 0; i < offers.length; i += 1) addresses.push(Pure.displayText(offers[i].address))
         _presentOrQueue("vpn-gateway-trust", function() {
-            promptWindow.present({
+            _presentPrompt({
                 titleText: tr("notifications.vpn-gateway-trust.title", "Let this VPN connect?"),
                 bodyText: tr("notifications.vpn-gateway-trust.tray-body",
                         "A VPN is waiting for your answer in the NetRuleRouter window: leak protection stopped it from reaching its server {addresses}.")
@@ -3088,7 +3307,7 @@ SystemTrayIcon {
         if (!showNotifications) return
         if (_windowOnScreen()) return
         _presentOrQueue("protection-coverage", function() {
-            promptWindow.present({
+            _presentPrompt({
                 titleText: tr("notifications.protection-coverage.title",
                     "Leak protection coverage changed"),
                 bodyText: body,
@@ -3191,7 +3410,7 @@ SystemTrayIcon {
                 tray._scheduleDrain()
                 return
             }
-            promptWindow.present({
+            _presentPrompt({
                 titleText: tr("notifications.routes-held.title",
                     "Some addresses follow another user's route"),
                 bodyText: tr("notifications.routes-held.body",
@@ -3240,7 +3459,7 @@ SystemTrayIcon {
                     .replace("{link}", function() { return link })
                 : tr("notifications.traffic-carried.body-unnamed",
                     "Another user of this computer signed in earlier and sends all their traffic through their tunnel. This computer has one route table for everyone, so whatever your rules do not send to your additional connection goes through that tunnel too. To avoid this, sign in before that user, or ask them to send only chosen sites through their tunnel.")
-            promptWindow.present({
+            _presentPrompt({
                 titleText: tr("notifications.traffic-carried.title",
                     "Your traffic goes through another user's tunnel"),
                 bodyText: body,
@@ -3262,7 +3481,7 @@ SystemTrayIcon {
         if (presence.windowActive) return
         var role = String(event.role || "")
         _offerNotice("link-keeps-dropping", "link-keeps-dropping:" + role, function() {
-            promptWindow.present({
+            _presentPrompt({
                 titleText: role === "primary"
                     ? tr("notifications.link-keeps-dropping.title-primary",
                         "The main connection keeps dropping")
@@ -3294,7 +3513,8 @@ SystemTrayIcon {
             if (wasDown) {
                 _enforcementDownRoles = _enforcementDownRoles.filter(
                     function(r) { return r !== role })
-                if (Pure.enforcementRestoreIsNews(previous)) _noteEnforcementRestored()
+                if (Pure.enforcementRestoreIsNews(previous)) _noteEnforcementRestored(role)
+                if (role === "secondary") _maybeOfferVpnClient()
             }
             return
         }
@@ -3325,8 +3545,11 @@ SystemTrayIcon {
         if (status === "adapter-choice-needed") {
             title = tr("notifications.enforcement.adapter-choice.title",
                 "Choose which adapter to use")
-            body = tr("notifications.enforcement.adapter-choice.body",
-                    "Several adapters answer to the saved name, so your rules are not being applied. Pick the one to use: {list}")
+            body = (Pure.enforcementAdapterChoiceBodyKey(candidates.length) === "notifications.enforcement.adapter-choice.body-one"
+                    ? tr("notifications.enforcement.adapter-choice.body-one",
+                        "The saved adapter is not up, but another adapter of the same kind is: {list}. If your VPN now uses that one, choose it; until then your rules are not being applied.")
+                    : tr("notifications.enforcement.adapter-choice.body",
+                        "Several adapters answer to the saved name, so your rules are not being applied. Pick the one to use: {list}"))
                 .replace("{list}", Pure.displayTextList(candidates).join(", "))
         } else if (status === "adapter-gone") {
             // A vendor that replaced its adapter outright, a driver that no
@@ -3420,7 +3643,7 @@ SystemTrayIcon {
         var show = function() {
             tray._enforcementNoticeKind = queueKind
             tray._suggestedPrimaryName = suggestedPrimary
-            promptWindow.present({
+            _presentPrompt({
                 titleText: title,
                 bodyText: body,
                 primaryAction: suggestedPrimary !== ""
@@ -3509,7 +3732,7 @@ SystemTrayIcon {
             console.log("tray block-notice: route pressed with nothing checked")
             return
         }
-        promptWindow.present({
+        _presentPrompt({
             titleText: targets.length === 1
                 ? tr("tray.block-notice.route-confirm.title",
                     "Route {name} via the additional link?")
@@ -3546,7 +3769,7 @@ SystemTrayIcon {
     }
 
     function _showBlockNoticeSnoozeChoice() {
-        promptWindow.present({
+        _presentPrompt({
             titleText: tr("tray.block-notice.snooze.title", "Snooze this notice"),
             bodyText: _blockNoticeHosts().length > 1
                 ? tr("tray.block-notice.snooze.body-many",
@@ -3648,7 +3871,7 @@ SystemTrayIcon {
             label: tr("tray.block-notice.mute.all", "All blocks: any host, any app"),
             actionId: "block-notice-mute-all"
         })
-        promptWindow.present({
+        _presentPrompt({
             titleText: tr("tray.block-notice.mute.title", "What should stop appearing?"),
             bodyText: tr("tray.mute.lift-hint",
                 "Mutes can be lifted later in Settings, Notifications."),
@@ -3952,7 +4175,24 @@ SystemTrayIcon {
             _scheduleDrain()
             return
         }
+        if (action === "external-address-auto-on") {
+            _turnOnExternalAddressCheck()
+            _scheduleDrain()
+            return
+        }
+        if (action === "vpn-client-offer-use" || action === "vpn-client-offer-choose"
+                || action === "vpn-client-offer-later" || action === "vpn-client-offer-close") {
+            var vpnOffer = _vpnClientOffer
+            _vpnClientOffer = null
+            // Closing the window answers nothing; the three buttons do.
+            if (vpnOffer && action !== "vpn-client-offer-close") noticeLedger.record(vpnOffer.id)
+            if (action === "vpn-client-offer-use") _useVpnClientOffer(vpnOffer)
+            else if (action === "vpn-client-offer-choose") _openVpnClientPicker()
+            _scheduleDrain()
+            return
+        }
         if (action === "enforcement-restored-dismiss"
+                || action === "external-address-dismiss"
                 || action === "auto-rules-mode-failed-dismiss"
                 || action === "leak-protection-failed-dismiss"
                 || action === "pause-failed-dismiss") {
@@ -4268,7 +4508,7 @@ SystemTrayIcon {
                 "Could not update the auto-rules setting: ")
             + Pure.ipcErrorLabel(code, null, tray.tr)
         tray._presentOrQueue("auto-rules-mode-failed", function() {
-            promptWindow.present({
+            _presentPrompt({
                 titleText: tray.tr("tray.auto-rules.title", "Addresses a site needs"),
                 bodyText: body,
                 dismissActionId: "auto-rules-mode-failed-dismiss",
@@ -4292,7 +4532,7 @@ SystemTrayIcon {
     /// the screen corner.
     function _confirmAutoRulesAlways(ids) {
         _autoRulesModePendingIds = ids
-        promptWindow.present({
+        _presentPrompt({
             titleText: tr("tray.auto-rules-mode-confirm.title",
                 "Turn on “Apply automatically”?"),
             bodyText: tr("tray.auto-rules-mode-confirm.body",
@@ -4476,6 +4716,7 @@ SystemTrayIcon {
             }
             tray._routeMode = Pure.routePolicyEffective(policy, "mode")
             tray._leakProtection = Pure.routePolicyEffective(policy, "leak-protection")
+            tray._readLinkPolicy(policy)
             tray._syncLeakMenu()
         })
     }
@@ -4568,7 +4809,7 @@ SystemTrayIcon {
         var body = tray.tr("status.kill-switch-enabled-failed", "Could not update leak protection: ")
             + Pure.ipcErrorLabel(code, null, tray.tr)
         tray._presentOrQueue("leak-protection-failed", function() {
-            promptWindow.present({
+            _presentPrompt({
                 titleText: tray.tr("settings.routing.kill-switch.title", "Leak protection"),
                 bodyText: body,
                 dismissActionId: "leak-protection-failed-dismiss",
@@ -4599,7 +4840,7 @@ SystemTrayIcon {
                     "Once leak protection is on, those destinations are BLOCKED instead: the sites behind those rules stop loading.")
         _presentOrQueue("leak-protection-confirm", function() {
             tray._leakConfirmLevel = level
-            promptWindow.present({
+            _presentPrompt({
                 titleText: holdsNow
                     ? tr("dialog.leak-holds-now.title", "The additional connection is not available")
                     : tr("dialog.unroutable-secondary.title", "This adapter cannot carry traffic out"),
@@ -4753,7 +4994,7 @@ SystemTrayIcon {
     /// it in place; anything else on screen keeps its turn.
     function _showSuggestionsSilenceChoice() {
         var show = function() {
-            promptWindow.present({
+            _presentPrompt({
                 titleText: tr("tray.suggestions.silence", "Do not suggest addresses"),
                 bodyText: tr("tray.suggestions.silence-body",
                     "New addresses will not be offered for as long as you choose. "
@@ -4797,7 +5038,7 @@ SystemTrayIcon {
     /// suggestions pause asks (the tray cannot carry a submenu).
     function _showPauseChoice() {
         _presentOrQueue("pause-term", function() {
-            promptWindow.present({
+            _presentPrompt({
                 titleText: tr("tray.pause.title", "Turn off rules"),
                 bodyText: tr("tray.pause.body",
                     "Your routing and leak protection stop for the time you choose and come back on their own."),
@@ -4851,7 +5092,7 @@ SystemTrayIcon {
         var body = tray.tr("tray.pause.failed", "Could not turn the rules off: ")
             + Pure.ipcErrorLabel(code, null, tray.tr)
         tray._presentOrQueue("pause-failed", function() {
-            promptWindow.present({
+            _presentPrompt({
                 titleText: tray.tr("tray.pause.title", "Turn off rules"),
                 bodyText: body,
                 dismissActionId: "pause-failed-dismiss",
@@ -4879,6 +5120,10 @@ SystemTrayIcon {
                 .concat(_noticeQueue.filter(function(n) { return n.kind !== "auto-rules" }))
         }
         _scheduleDrain()
+    }
+
+    function routeLabel(role) {
+        return Rules.routeDisplayLabel(role, routePrimaryLabel, routeSecondaryLabel, tr)
     }
 
     function tr(key, fallbackText) {
@@ -4943,8 +5188,8 @@ SystemTrayIcon {
         statusAccessibilityKey = context.statusAccessibilityKey || ""
         statusLine = context.statusLine || statusLine
         statusAccessibilityText = context.statusAccessibilityText || ""
-        routePrimaryLabel = context.routePrimaryLabel || routePrimaryLabel
-        routeSecondaryLabel = context.routeSecondaryLabel || routeSecondaryLabel
+        routePrimaryLabel = String(context.routePrimaryLabel || "")
+        routeSecondaryLabel = String(context.routeSecondaryLabel || "")
         iconFileUrl = context.iconFileUrl || ""
         assetsRootUrl = String(context.assetsRootUrl || "")
         theme = context.theme || theme
@@ -5256,7 +5501,7 @@ SystemTrayIcon {
                 "Destinations: {list}.").replace("{list}", list)
         }
         _offerNotice("block-notice-backlog", "block-notice-backlog", function() {
-            promptWindow.present({
+            _presentPrompt({
                 titleText: tr("notifications.block-notice.backlog.title",
                     "Blocked while the app was closed"),
                 bodyText: body,

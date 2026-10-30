@@ -21,7 +21,8 @@ Windows builds today; Linux is in progress, macOS next.
 [![GUI: Qt 6 / QML](https://img.shields.io/badge/GUI-Qt%206%20%2F%20QML-41CD52.svg)](#quick-start)
 [![TUI: ratatui](https://img.shields.io/badge/TUI-ratatui-8A2BE2.svg)](#terminal-interface)
 [![CLI: nrr-cli](https://img.shields.io/badge/CLI-nrr--cli-555555.svg)](#administrative-console)
-![Status: pre-alpha](https://img.shields.io/badge/status-pre--alpha-red.svg)
+[![Telegram: netrulerouter](https://img.shields.io/badge/Telegram-netrulerouter-26A5E4.svg?logo=telegram)](https://t.me/netrulerouter)
+![Status: alpha](https://img.shields.io/badge/status-alpha-orange.svg)
 
 **English** · [Русский](README_RU.md)
 
@@ -82,9 +83,35 @@ yourself — it doesn't create or hide them.
 > list travels with your rule set.
 
 The full walkthrough, including what to do if you lose network access, is in
-[`docs/en/quickstart.md`](docs/en/quickstart.md). Which Windows and Linux
-versions it runs on, and which have been checked, is in
-[`docs/en/supported-systems.md`](docs/en/supported-systems.md).
+[`docs/en/quickstart.md`](docs/en/quickstart.md). Questions while setting up:
+see [Help and community](#help-and-community).
+
+## Supported systems
+
+| Platform | Architecture | Delivered as | Window and tray | Terminal UI | Status in this alpha |
+|---|---|---|---|---|---|
+| Windows 10, 11 | x64 | portable ZIP, EXE installer, MSI | yes | yes | tested on Windows 10 and Windows 11 |
+| Windows 11 on ARM | ARM64 | portable ZIP, EXE installer, MSI | yes | yes | built, not tested yet |
+| Linux, `.deb`: Ubuntu 22.04+, Debian 11+, Astra Linux 1.7+ | x86_64, ARM64 | `.deb` | with Qt 6.6+: Ubuntu 24.10+, Debian 13, Astra Linux 1.8 | yes | tested on Ubuntu 26.04 LTS; on Astra Linux 1.7 and 1.8 without the window; the rest expected to work |
+| Linux, `.rpm`: RED OS 7.3+, Fedora, RHEL / AlmaLinux / Rocky Linux 8+ | x86_64, ARM64 | `.rpm` | with Qt 6.6+: Fedora, RHEL 10 family, RED OS 8 if its Qt is new enough | yes | tested on RED OS 8 without the window; the rest expected to work |
+| Other Linux with systemd, nftables and glibc 2.28+ (openSUSE, ALT and others) | x86_64, ARM64 | `.tar.gz` | with Qt 6.6+ | yes | expected to work, not tested yet |
+| 32-bit Windows | x86 | — | — | — | not supported |
+| macOS | — | — | — | — | not supported yet, planned after Linux |
+
+- **Tested** means installed, used with real rules and removed again on that
+  system; **expected to work** means the system meets the requirements but has
+  not been checked on a real machine. The ARM64 builds have not been run on
+  real hardware yet.
+- On Linux the service, `nrr-cli` and `nrr-tui` need systemd, nftables 0.9.6
+  or newer and glibc 2.28 or newer. The window needs the system's own Qt 6.6
+  or newer; where Qt is older, everything else works without the window.
+- Where the window does not run, the terminal UI covers the same features
+  from a terminal.
+- Besides the checks above, the automated test suite runs on every change on
+  GitHub's Windows Server 2025 and Ubuntu runners.
+
+Per-version detail, including systems checked only against their own
+documentation: [`docs/en/supported-systems.md`](docs/en/supported-systems.md).
 
 ## Verifying a download
 
@@ -128,7 +155,7 @@ check of the checksums, `SHA256SUMS` comes with the files:
 - **Native desktop app** — a Qt/QML GUI plus a tray for daily control, and a background service that applies policy at startup. The tray menu and its notices are still being shaped ahead of the first release; what they contain and how they look may change between builds.
 - **Accessibility as a baseline** — screen-reader support, keyboard navigation, scalable fonts, a dedicated high-contrast theme; see [`docs/en/accessibility.md`](docs/en/accessibility.md).
 - **RU / EN out of the box**, with drop-in community locales (no rebuild needed).
-- **Local-first & private** — no mandatory login and no telemetry. The few requests the app makes of its own (looking up the sites your rules name, checking the additional connection and the address it exits from, trying the `?` rules of sites you open, an optional update check) are listed in [SECURITY.md](SECURITY.md), with what each one gives you and how to turn it off where it can be.
+- **Local-first & private** — no mandatory login and no telemetry. The few requests the app makes of its own (looking up the sites your rules name, checking the additional connection and the address it exits from, trying the `?` rules of sites you open) are listed in [SECURITY.md](SECURITY.md), with what each one gives you and how to turn it off where it can be.
 
 ## How routing decisions are made
 
@@ -271,7 +298,7 @@ powershell -ExecutionPolicy Bypass -File .\scripts\package-windows.ps1 -Zip
 ```
 
 The package lands in `C:\temp\NetRuleRouter\dist\NetRuleRouter`; `-Zip` puts
-`NetRuleRouter-windows-x64-<version>+<commit>.zip` beside it. It carries the
+`NetRuleRouter-windows-x64-<version>-portable.zip` beside it. It carries the
 GUI, tray, service, console, terminal interface, the Qt runtime, and the QML / locale / preset /
 config tree, plus a `build-info.json` stamp (version, revision, build time)
 and short `README.txt` / `README.ru.txt` notes for whoever unpacks it.
@@ -307,11 +334,27 @@ for your own rules. It runs only interactively — scripts use `nrr-cli`. See
 ## Security & privacy
 
 - No mandatory login for core local routing.
-- There is no telemetry. Besides your routed traffic, the app looks up the host names in your rules and keeps their addresses fresh, asks your connection's DNS server which site an address belongs to while rule suggestions or leak protection are on (never for a site your own deny rule blocks), checks that the additional connection is alive and, if you turn it on, asks a public STUN service which address it exits from each time it connects, tries the `?` rules of sites you open, and (after the first release) can check for a newer version. With suggestions and leak protection off there are no such address lookups; the update check can be turned off in Settings. The full list is in [SECURITY.md](SECURITY.md).
+- There is no telemetry. Besides your routed traffic, the app looks up the host names in your rules and keeps their addresses fresh, asks your connection's DNS server which site an address belongs to while rule suggestions or leak protection are on (never for a site your own deny rule blocks), checks that the additional connection is alive and, if you turn it on, asks a public STUN service which address it exits from each time it connects, and tries the `?` rules of sites you open. With suggestions and leak protection off there are no such address lookups. The full list is in [SECURITY.md](SECURITY.md).
+- Public DNS servers get some of your rules' names. While the additional connection is up, the host names in your rules for that connection are looked up through it at Quad9's public DNS server (149.112.112.112), so your provider neither sees nor changes their answers; nothing else of your DNS goes to that address. A name in your rules that your provider answers with an address that looks blocked is asked again of Cloudflare, Google and Quad9. **DNS through the tunnel** (off by default) sends all of the app's own lookups through the additional connection to those three. Your programs' lookups of sites outside your rules for the additional connection stay with your provider either way. Which names go where: [`docs/en/dns-via-secondary.md`](docs/en/dns-via-secondary.md).
 - Privileged policy changes go over a local, DACL-protected named-pipe IPC boundary — there is no localhost HTTP control plane for privileged mutations.
-- Until the first release is published the app does not check for updates at all. From then on, every N days (14 by default, adjustable in Settings) it asks the project's official release page whether a newer version is out and, if so, shows a notice. It never downloads, installs or changes routing, and you can turn the check off in Settings. Help → Check for updates asks the same question on demand, even with the automatic check off.
+- The app does not check for updates. New versions appear on the [releases page](https://github.com/kroxiksut/net-rule-router/releases) and are announced in the Telegram channel [t.me/netrulerouter](https://t.me/netrulerouter); to update, install the new version over the old one.
 
 See [`SECURITY.md`](SECURITY.md) for the full trust model.
+
+## Help and community
+
+- **Questions, discussion and announcements** — the Telegram channel
+  [t.me/netrulerouter](https://t.me/netrulerouter), in English and Russian.
+  Ask how to set something up, tell how it went on your system, suggest an
+  idea, and hear about new builds first. Not sure whether something is a bug?
+  Ask there.
+- **Bugs and feature requests to be tracked** —
+  [GitHub Issues](https://github.com/kroxiksut/net-rule-router/issues). A bug
+  report with the diagnostic archive attached is the fastest way to a fix; what
+  to include is in [CONTRIBUTING.md](CONTRIBUTING.md#reporting-a-bug). Attach
+  the archive to the issue rather than posting it in the chat.
+- **Vulnerabilities** — never in the channel or in a public issue: report them
+  privately as [SECURITY.md](SECURITY.md) describes.
 
 ## Roadmap
 

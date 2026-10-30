@@ -297,6 +297,14 @@ GroupBox {
                 Layout.fillWidth: true
                 text: root.tr("settings.presets.bundled-write-warning.dont-ask",
                     "I understand — do not ask again")
+                contentItem: Label {
+                    text: bundledWarningAckCheck.text
+                    leftPadding: bundledWarningAckCheck.indicator.width + bundledWarningAckCheck.spacing
+                    color: root.textColor
+                    wrapMode: Text.WordWrap
+                    verticalAlignment: Text.AlignVCenter
+                }
+                Accessible.name: text
                 checked: bundledFolderWarningDialog.dontAskAgain
                 onToggled: bundledFolderWarningDialog.dontAskAgain = checked
             }

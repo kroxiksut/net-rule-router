@@ -673,6 +673,112 @@ fn adapter_eligibility_matches_js() {
 }
 
 #[test]
+fn first_run_suggestion_matches_js() {
+    let (document, cases) = load_vectors("first_run_suggestion");
+    let base = &document["base-row"];
+    let cases: Vec<Case> = cases
+        .into_iter()
+        .map(|case| Case {
+            input: json!({
+                "role": case.input["role"],
+                "skip": case.input.get("skip").cloned().unwrap_or(json!(-1)),
+                "rows": case.input["rows"]
+                    .as_array()
+                    .map_or(&[][..], Vec::as_slice)
+                    .iter()
+                    .map(|patch| merged(base, patch))
+                    .collect::<Vec<Value>>(),
+            }),
+            ..case
+        })
+        .collect();
+    check_cases(
+        "first_run_suggestion",
+        &cases,
+        &mut JsLib::pure(),
+        |input| {
+            format!(
+                "(function (i) {{
+                    var rows = i.rows.map(function (w) {{
+                        var row = mapWireInterfaceRow(w);
+                        row.selectedRole = w[\"selected-role\"] || \"\";
+                        return row;
+                    }});
+                    return firstRunSuggestion(rows, i.role, i.skip);
+                }})({})",
+                lit(input)
+            )
+        },
+        |input| {
+            let rows: Vec<InterfaceRowDto> = serde_json::from_value(input["rows"].clone())
+                .expect("vector rows are InterfaceRowDto");
+            let role = if input["role"] == "primary" {
+                Route::Primary
+            } else {
+                Route::Secondary
+            };
+            let skip = input["skip"].as_u64().and_then(|i| usize::try_from(i).ok());
+            json!(adapters::first_run_suggestion(&rows, role, skip)
+                .map_or(-1, |i| i64::try_from(i).unwrap_or(-1)))
+        },
+    );
+}
+
+#[test]
+fn adapter_driver_siblings_match_js() {
+    let (document, cases) = load_vectors("adapter_driver_siblings");
+    let base = &document["base-row"];
+    let cases: Vec<Case> = cases
+        .into_iter()
+        .map(|case| Case {
+            input: json!({
+                "role": case.input["role"],
+                "index": case.input["index"],
+                "rows": case.input["rows"]
+                    .as_array()
+                    .map_or(&[][..], Vec::as_slice)
+                    .iter()
+                    .map(|patch| merged(base, patch))
+                    .collect::<Vec<Value>>(),
+            }),
+            ..case
+        })
+        .collect();
+    check_cases(
+        "adapter_driver_siblings",
+        &cases,
+        &mut JsLib::pure(),
+        |input| {
+            format!(
+                "(function (i) {{
+                    var rows = i.rows.map(function (w) {{
+                        var row = mapWireInterfaceRow(w);
+                        row.selectedRole = w[\"selected-role\"] || \"\";
+                        return row;
+                    }});
+                    return adapterDriverSiblings(rows, i.index, i.role);
+                }})({})",
+                lit(input)
+            )
+        },
+        |input| {
+            let rows: Vec<InterfaceRowDto> = serde_json::from_value(input["rows"].clone())
+                .expect("vector rows are InterfaceRowDto");
+            let role = if input["role"] == "primary" {
+                Route::Primary
+            } else {
+                Route::Secondary
+            };
+            let index = input["index"]
+                .as_u64()
+                .map_or(usize::MAX, |i| usize::try_from(i).unwrap_or(usize::MAX));
+            let found = adapters::driver_siblings(&rows, index, role);
+            json!({ "live": found.live, "idle": found.idle })
+        },
+    );
+}
+
+#[test]
 fn adapter_filter_and_sort_rank_match_js() {
     let (document, cases) = load_vectors("adapter_view");
     let base = &document["base-row"];

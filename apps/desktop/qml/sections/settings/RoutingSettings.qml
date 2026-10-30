@@ -84,9 +84,9 @@ ColumnLayout {
     property bool appRulesTakeAllAddresses: false
     /// What forwarded traffic gets while the tunnel is down; "" until answered.
     property string forwardedOutage: ""
-    // Ask for the additional route's external address on every connect. Off by
-    // default: the request leaves through the tunnel.
-    property bool externalAddressAutoCheck: false
+    // Ask for the additional route's external address on every connect. On by
+    // default: a couple of tiny requests through the tunnel per connect.
+    property bool externalAddressAutoCheck: true
     // A clicked radio no longer follows its `checked:` binding.
     onForwardedOutageChanged: {
         forwardedAsComputerRadio.checked = forwardedOutage === "as-computer"
@@ -1057,9 +1057,9 @@ ColumnLayout {
                 panel.dnsViaSecondary = v
                 root.statusLine = v
                     ? root.tr("status.dns-via-secondary-on",
-                        "DNS now goes through the tunnel.")
+                        "NetRuleRouter's own lookups now go through the tunnel.")
                     : root.tr("status.dns-via-secondary-off",
-                        "DNS goes through the main connection again.")
+                        "Only the names in your rules for the additional connection go through the tunnel now.")
                 return
             }
             root.statusLine = root.tr("status.dns-via-secondary-failed",
@@ -1960,7 +1960,7 @@ ColumnLayout {
                 font.pixelSize: root.uiTheme.baseFontSizePx - 1
                 text: root.uiRevision >= 0
                     ? root.tr("settings.routing.vpn-client.external-address-auto-note",
-                        "Once per connection, asks a public address server through the additional route which address the internet sees, and shows it in a notice. Off by default: the request leaves through your VPN. The “Check external address” button works either way.")
+                        "Once per connection, asks a public address server through the additional route which address the internet sees, and shows it in a notice and under Interfaces and routes. On by default: it costs a couple of tiny requests through your VPN. The “Check external address” button works either way.")
                     : ""
             }
         }
@@ -2550,11 +2550,12 @@ ColumnLayout {
                 color: root.mutedTextColor
                 wrapMode: Text.WordWrap
                 text: root.tr("settings.routing.dns-via-secondary.note",
-                    "Site names are looked up through the additional connection instead of your "
-                    + "provider's resolver, so the provider can neither see nor alter the answers. "
-                    + "Some providers return a wrong or empty address for certain sites, which makes "
-                    + "those sites fail to load even when routing is correct. If the additional "
-                    + "connection is not available, lookups fall back to the main one. Off by default.")
+                    "The names in your rules for the additional connection are always looked up "
+                    + "through it while it is up. With this on, the rest of NetRuleRouter's own "
+                    + "lookups go through it too, to public DNS services (Cloudflare, Google, Quad9), "
+                    + "so your provider neither sees nor alters those answers. Your programs' lookups "
+                    + "of other sites still go to your provider's resolver. If the additional "
+                    + "connection is not available, lookups go through the main one. Off by default.")
             }
             Item {
                 visible: panel.offered.indexOf("dns-fast-answers") >= 0

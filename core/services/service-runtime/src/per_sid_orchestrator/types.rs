@@ -134,7 +134,7 @@ pub trait RoutePolicySource: Send + Sync {
 /// Snapshot of the currently-active rules revision. Fed into the WFP
 /// codegen on every install / recompile pass; the behaviour mode comes
 /// from the per-user policy, not from here.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct ActiveRulesSnapshot {
     pub rule_book: CanonicalRuleBook,
 }

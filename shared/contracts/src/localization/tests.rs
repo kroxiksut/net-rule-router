@@ -2,9 +2,9 @@ use super::{
     add_missing_baseline_coverage_warnings, build_effective_locale_bundles, bundled_locales_dir_in,
     fill_candidate, normalize_locale_id, read_locale_candidate, reject_fallback_cycles,
     require_metadata_string, resolve_catalog_text, sorted_unique_descriptors, strip_utf8_bom,
-    validate_candidate_root, validate_cross_locale_rules, LocaleCandidate, LocaleDescriptor,
-    LocaleLoadStatus, LocaleSource, MAX_LOCALE_FALLBACKS, MAX_LOCALE_FILE_BYTES,
-    MAX_LOCALE_KEY_BYTES, MAX_LOCALE_WARNINGS,
+    tray_catalog_from, validate_candidate_root, validate_cross_locale_rules,
+    validate_tray_candidates, LocaleCandidate, LocaleDescriptor, LocaleLoadStatus, LocaleSource,
+    MAX_LOCALE_FALLBACKS, MAX_LOCALE_FILE_BYTES, MAX_LOCALE_KEY_BYTES, MAX_LOCALE_WARNINGS,
 };
 
 use serde_json::json;
@@ -438,6 +438,8 @@ fn shipped_locales_and_the_translator_example_pass_the_validator_clean() {
     for path in [
         repo.join("locales/en.json"),
         repo.join("locales/ru.json"),
+        repo.join("locales/tray/en.json"),
+        repo.join("locales/tray/ru.json"),
         example,
     ] {
         let candidate = read_locale_candidate(&path, LocaleSource::Bundled)
@@ -583,4 +585,110 @@ fn shipped_locales_stay_well_under_the_size_bound() {
             "{name} is {len} bytes, half the bound is {bound}"
         );
     }
+}
+
+fn tray_fixture() -> (Vec<LocaleCandidate>, Vec<LocaleCandidate>) {
+    let main = vec![
+        candidate(
+            "en",
+            &[],
+            &[("action.close", "Close"), ("settings.title", "Settings")],
+        ),
+        candidate(
+            "ru",
+            &["en"],
+            &[("action.close", "Закрыть"), ("settings.title", "Настройки")],
+        ),
+        candidate("de", &["en"], &[("action.close", "Schließen")]),
+    ];
+    let tray = vec![
+        candidate("en", &[], &[("tray.menu.title", "Menu")]),
+        candidate("ru", &["en"], &[("tray.menu.title", "Меню")]),
+    ];
+    (main, tray)
+}
+
+/// The tray is handed its own language and English, never the window's other
+/// words or another language: each one costs the tray process memory.
+#[test]
+fn the_tray_catalogue_holds_its_language_and_english_only() {
+    let (main, tray) = tray_fixture();
+    let catalog = tray_catalog_from(&main, &tray, "ru_RU.UTF-8", &["action."]);
+    assert_eq!(
+        catalog.keys().map(String::as_str).collect::<Vec<_>>(),
+        ["en", "ru"]
+    );
+    let ru = &catalog["ru"];
+    assert_eq!(ru.get("tray.menu.title").map(String::as_str), Some("Меню"));
+    assert_eq!(ru.get("action.close").map(String::as_str), Some("Закрыть"));
+    assert!(!ru.contains_key("settings.title"), "{ru:?}");
+    assert!(!catalog["en"].contains_key("settings.title"));
+    assert_eq!(
+        catalog["en"].get("tray.menu.title").map(String::as_str),
+        Some("Menu")
+    );
+
+    let english_only = tray_catalog_from(&main, &tray, "en", &["action."]);
+    assert_eq!(english_only.keys().collect::<Vec<_>>(), ["en"]);
+    let unknown = tray_catalog_from(&main, &tray, "fr", &["action."]);
+    assert_eq!(unknown.keys().collect::<Vec<_>>(), ["en"]);
+}
+
+/// A language without a tray file still shows the window's words in itself,
+/// and the tray's own words in English through the per-key fallback.
+#[test]
+fn a_language_without_a_tray_file_shows_the_tray_words_in_english() {
+    let (main, tray) = tray_fixture();
+    let catalog = tray_catalog_from(&main, &tray, "de", &["action.close"]);
+    let de = &catalog["de"];
+    assert_eq!(
+        de.get("action.close").map(String::as_str),
+        Some("Schließen")
+    );
+    assert!(!de.contains_key("tray.menu.title"));
+    assert_eq!(
+        resolve_catalog_text(&catalog, "de", "tray.menu.title", "raw"),
+        "Menu"
+    );
+}
+
+/// The user's tray file outranks the shipped one key by key, as the main
+/// files do; keys it does not name keep the shipped text.
+#[test]
+fn a_user_tray_file_outranks_the_shipped_one_per_key() {
+    let (main, mut tray) = tray_fixture();
+    tray[1]
+        .entries
+        .insert("tray.menu.quit".to_string(), "Выход".to_string());
+    tray.push(candidate_with_source(
+        "ru",
+        LocaleSource::User,
+        &["en"],
+        &[("tray.menu.title", "Моё меню")],
+    ));
+    let catalog = tray_catalog_from(&main, &tray, "ru", &[]);
+    assert_eq!(
+        catalog["ru"].get("tray.menu.title").map(String::as_str),
+        Some("Моё меню")
+    );
+    assert_eq!(
+        catalog["ru"].get("tray.menu.quit").map(String::as_str),
+        Some("Выход")
+    );
+}
+
+/// A language is found by its main file only: a tray file alone adds none.
+#[test]
+fn a_tray_file_without_its_main_file_is_not_used() {
+    let (main, mut tray) = tray_fixture();
+    tray.push(candidate("fr", &["en"], &[("tray.menu.title", "Menu FR")]));
+    validate_tray_candidates(&mut tray, &main);
+    let french = tray.iter().find(|c| c.id == "fr").expect("fr");
+    assert_eq!(french.status(), LocaleLoadStatus::Rejected);
+    let catalog = tray_catalog_from(&main, &tray, "fr", &[]);
+    assert_eq!(catalog.keys().collect::<Vec<_>>(), ["en"]);
+    assert!(tray
+        .iter()
+        .filter(|c| c.id != "fr")
+        .all(|c| c.errors.is_empty()));
 }

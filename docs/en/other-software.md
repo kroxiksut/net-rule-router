@@ -24,4 +24,6 @@ have not watched it happen.
 | Browser with its own encrypted DNS | It hides names from the rules. | Keep the setting that blocks it, or give the browser a rule of its own. See [Known limitations](known-limitations.md). | Checked |
 
 Found a combination that misbehaves? Open an issue with the name and version of
-the other program; the table grows from such reports.
+the other program; the table grows from such reports. Not sure it is the other
+program? Ask in the Telegram channel [t.me/netrulerouter](https://t.me/netrulerouter)
+first.

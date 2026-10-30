@@ -1036,6 +1036,10 @@ pub const TRAFFIC_MERGE_DIFFERENT: Key = key(
 );
 pub const TRAFFIC_EXPORT: Key = key("settings.traffic.export-csv", "Export CSV");
 pub const TRAFFIC_EXPORT_UNIT: Key = key("settings.traffic.export-unit", "Export units");
+pub const TRAFFIC_EXPORT_INCLUDE_VIRTUAL: Key = key(
+    "settings.traffic.export-include-virtual",
+    "Include virtual adapters in export",
+);
 pub const TRAFFIC_CSV_WRITTEN: Key = key(
     "tui.settings.traffic.csv-written",
     "Traffic statistics exported to {path}.",
@@ -1044,6 +1048,7 @@ pub const UNIT_BYTES: Key = key("diag.retention.size-unit.bytes", "Bytes");
 pub const UNIT_KB: Key = key("diag.retention.size-unit.kb", "KB");
 pub const UNIT_MB: Key = key("diag.retention.size-unit.mb", "MB");
 pub const UNIT_GB: Key = key("diag.retention.size-unit.gb", "GB");
+pub const UNIT_TB: Key = key("diag.retention.size-unit.tb", "TB");
 pub const TRAFFIC_RESET_DONE: Key = key(
     "tui.settings.traffic.reset-done",
     "Traffic statistics were reset.",
@@ -1058,6 +1063,8 @@ pub const AUTHOR: Key = key("label.author", "Author");
 pub const AUTHOR_NAME: Key = key("label.author-name", nrr_shared::gui_shell_v1().about.author);
 pub const AUTHOR_EMAIL: Key = key("label.author-email", "E-mail");
 pub const PROJECT: Key = key("label.project-url", "Project");
+pub const TELEGRAM_CHANNEL: Key = key("label.telegram-channel", "Telegram channel");
+pub const DOCUMENTATION: Key = key("action.open-documentation", "Documentation");
 pub const BUILD_CHANNEL: Key = key("label.build-channel", "Build channel");
 pub const THIRD_PARTY: Key = key("dialog.third-party.tab", "Third-party components");
 pub const VERDICT_GENUINE: Key = key("dialog.third-party.verdict-genuine", "Genuine");
@@ -1461,6 +1468,8 @@ pub fn all() -> Vec<Key> {
         AUTHOR_NAME,
         AUTHOR_EMAIL,
         PROJECT,
+        TELEGRAM_CHANNEL,
+        DOCUMENTATION,
         BUILD_CHANNEL,
         THIRD_PARTY,
         VERDICT_GENUINE,
@@ -1807,11 +1816,13 @@ pub fn all() -> Vec<Key> {
         TRAFFIC_MERGE_DIFFERENT,
         TRAFFIC_EXPORT,
         TRAFFIC_EXPORT_UNIT,
+        TRAFFIC_EXPORT_INCLUDE_VIRTUAL,
         TRAFFIC_CSV_WRITTEN,
         UNIT_BYTES,
         UNIT_KB,
         UNIT_MB,
         UNIT_GB,
+        UNIT_TB,
         TRAFFIC_TODAY,
         TRAFFIC_SESSION,
         TRAFFIC_ALL_TIME,

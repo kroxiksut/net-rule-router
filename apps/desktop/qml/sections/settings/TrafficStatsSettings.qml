@@ -41,9 +41,11 @@ GroupBox {
     /// carry the same per-adapter shape with a `role`, so one rendering serves
     /// whichever is selected.
     readonly property var rows: !ctrl ? []
-                              : (period === "session") ? ctrl.sessionRows
-                              : (period === "all-time") ? ctrl.allTimeRows
-                              : ctrl.todayRows
+        : Pure.visibleTrafficRows(
+            (period === "session") ? ctrl.sessionRows
+            : (period === "all-time") ? ctrl.allTimeRows
+            : ctrl.todayRows,
+            ctrl.settings.countVirtual)
 
     /// `rows` folded into one block per role — see `_buildGroups`.
     readonly property var groups: root.uiRevision >= 0 ? group._buildGroups(rows) : []
@@ -87,6 +89,7 @@ GroupBox {
         if (unit === "kb") return root.tr("diag.retention.size-unit.kb", "KB")
         if (unit === "mb") return root.tr("diag.retention.size-unit.mb", "MB")
         if (unit === "gb") return root.tr("diag.retention.size-unit.gb", "GB")
+        if (unit === "tb") return root.tr("diag.retention.size-unit.tb", "TB")
         return unit
     }
 
@@ -424,6 +427,7 @@ GroupBox {
                             spacing: root.uiTheme.spacingMd
                             Label {
                                 Layout.fillWidth: true
+                                Layout.preferredWidth: 0
                                 color: root.textColor
                                 font.bold: true
                                 elide: Text.ElideRight
@@ -447,6 +451,7 @@ GroupBox {
 
                         Label {
                             Layout.fillWidth: true
+                            Layout.preferredWidth: 0
                             Layout.leftMargin: root.uiTheme.spacingSm
                             visible: roleBlock.g.collapsed
                             color: root.mutedTextColor
@@ -458,6 +463,7 @@ GroupBox {
                         }
                         Label {
                             Layout.fillWidth: true
+                            Layout.preferredWidth: 0
                             Layout.leftMargin: root.uiTheme.spacingSm
                             visible: roleBlock.g.collapsed
                                 && group._addressLine(roleBlock.g.adapters[0]) !== ""
@@ -481,6 +487,7 @@ GroupBox {
                                     spacing: root.uiTheme.spacingSm
                                     Label {
                                         Layout.fillWidth: true
+                                        Layout.preferredWidth: 0
                                         color: root.textColor
                                         elide: Text.ElideRight
                                         textFormat: Text.PlainText
@@ -507,6 +514,7 @@ GroupBox {
                                 // until the user has probed at least once.
                                 Label {
                                     Layout.fillWidth: true
+                                    Layout.preferredWidth: 0
                                     visible: group._addressLine(adapterRow.a) !== ""
                                     color: root.mutedTextColor
                                     font.pixelSize: root.uiTheme.baseFontSizePx - 1
@@ -530,6 +538,7 @@ GroupBox {
                     spacing: root.uiTheme.spacingMd
                     Label {
                         Layout.fillWidth: true
+                        Layout.preferredWidth: 0
                         color: root.textColor
                         elide: Text.ElideRight
                         text: root.tr("settings.traffic.total-period", "Total for the period")
@@ -637,7 +646,7 @@ GroupBox {
                 theme: root.uiTheme
                 Layout.preferredWidth: 120
                 Layout.minimumWidth: 120
-                model: [ "bytes", "kb", "mb", "gb" ]
+                model: [ "bytes", "kb", "mb", "gb", "tb" ]
                 // A declarative `currentIndex` binding would be destroyed by the
                 // first pick, so a later external change (reset, prefs reload)
                 // would stop being reflected. A Binding element keeps
@@ -665,6 +674,24 @@ GroupBox {
                 Accessible.role: Accessible.ComboBox
                 Accessible.name: root.tr("settings.traffic.export-unit", "Export units")
             }
+            // Off by default, so the file matches the screen; remembered.
+            CheckBox {
+                id: exportVirtualCheck
+                text: root.tr("settings.traffic.export-include-virtual",
+                    "Include virtual adapters in export")
+                Binding {
+                    target: exportVirtualCheck
+                    property: "checked"
+                    value: root.uiRevision >= 0
+                        && root.prefs.trafficExportIncludeVirtual === true
+                }
+                onToggled: {
+                    root.updatePrefs({ trafficExportIncludeVirtual: checked })
+                    root.emitPrefs()
+                }
+                Accessible.name: root.tr("settings.traffic.export-include-virtual",
+                    "Include virtual adapters in export")
+            }
             Item { Layout.fillWidth: true }
             ThemedButton {
                 theme: root.uiTheme
@@ -691,7 +718,8 @@ GroupBox {
                 // Read the remembered unit rather than the combo's index: the
                 // preference is the source of truth and survives a reload.
                 var unit = String(root.prefs.trafficExportUnit || "mb")
-                group.ctrl.requestExport(from, today, unit, function(csv) {
+                var withVirtual = root.prefs.trafficExportIncludeVirtual === true
+                group.ctrl.requestExport(from, today, unit, withVirtual, function(csv) {
                     if (csv && csv !== ""
                         && typeof nrrNativeBridge !== "undefined" && nrrNativeBridge
                         && typeof nrrNativeBridge.writeTextFile === "function") {

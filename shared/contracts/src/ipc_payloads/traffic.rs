@@ -48,10 +48,14 @@ pub struct TrafficStatsGetRequest {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub export_to_day: Option<i64>,
     /// Byte-count unit slug for the exported received/sent columns — `bytes`
-    /// (default) / `kb` / `mb` / `gb`. Absent or unrecognised exports raw
+    /// (default) / `kb` / `mb` / `gb` / `tb`. Absent or unrecognised exports raw
     /// bytes, so an export is never silently mislabelled.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub export_unit: Option<String>,
+    /// Whether `virtual` rows go into the export. Absent means yes: a client
+    /// that predates the flag keeps getting the full export.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub export_include_virtual: Option<bool>,
 }
 
 /// `traffic-stats.get` response — today + session totals, current settings, and

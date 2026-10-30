@@ -20,8 +20,8 @@ pub const REVIEW_PAGE: usize = 12;
 /// Overlaps the form spells out before it counts the rest.
 const FORM_OVERLAPS: usize = 3;
 use super::{
-    bulk, gateway, main_route, merge, overrides, recent, spare, text, verdicts, Busy, Choice,
-    ChoicePurpose, Input, InputPurpose, Mode, Phase, SaveTarget, SetList,
+    bulk, gateway, main_route, merge, offer, overrides, recent, spare, text, verdicts, Busy,
+    Choice, ChoicePurpose, Input, InputPurpose, Mode, Phase, SaveTarget, SetList,
 };
 use crate::i18n::Texts;
 use crate::keys;
@@ -179,6 +179,9 @@ fn state_lines(app: &AppState, texts: &Texts) -> Vec<ViewLine> {
         lines.push(ViewLine::text(
             texts.fill(text::LOAD_FAILED, &[("error", failure.text(texts))]),
         ));
+    }
+    if let Some(line) = offer::state_line(app, texts) {
+        lines.push(line);
     }
     if matches!(rules.mode, Mode::List) && rules.busy.is_none() {
         let count = spare::spare_rules(app).len();
@@ -466,13 +469,15 @@ fn pinned_lines(row: &Row, texts: &Texts) -> Vec<String> {
 fn list_lines(app: &AppState, texts: &Texts) -> Vec<ViewLine> {
     let table = &app.rules.table;
     if table.rows.is_empty() {
+        let load = offer::empty_line(app, texts);
         if !table.is_loaded() {
-            return Vec::new();
+            return load.into_iter().collect();
         }
-        let mut lines = vec![
-            ViewLine::new(vec![Segment::strong(texts.get(text::EMPTY_TITLE))]),
-            ViewLine::text(texts.get(text::EMPTY_BODY)),
-        ];
+        let mut lines = vec![ViewLine::new(vec![Segment::strong(
+            texts.get(text::EMPTY_TITLE),
+        )])];
+        lines.extend(load);
+        lines.push(ViewLine::text(texts.get(text::EMPTY_BODY)));
         lines.extend(other_os_lines(table, texts));
         lines.extend(recent::extra_lines(app, texts));
         return lines;

@@ -37,15 +37,17 @@ fn full_reset_next_matches_js() {
                 .collect();
             let out = next(input["canElevate"] == Value::Bool(true), &done);
             match out {
-                Next::Run(step) => {
-                    json!({ "action": "run", "step": step.as_str(), "cleared": false, "why": "" })
-                }
-                Next::Finish { cleared } => {
-                    json!({ "action": "finish", "step": "", "cleared": cleared, "why": "" })
-                }
+                Next::Run(step) => json!({
+                    "action": "run", "step": step.as_str(), "cleared": false,
+                    "restarted": false, "why": ""
+                }),
+                Next::Finish { cleared, restarted } => json!({
+                    "action": "finish", "step": "", "cleared": cleared,
+                    "restarted": restarted, "why": ""
+                }),
                 Next::NeedsElevation { step } => json!({
                     "action": "stop", "step": step.as_str(), "cleared": false,
-                    "why": "needs-elevation"
+                    "restarted": false, "why": "needs-elevation"
                 }),
             }
         },

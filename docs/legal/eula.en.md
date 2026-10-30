@@ -1,6 +1,6 @@
 # NetRuleRouter End-User License Agreement
 
-Agreement revision 1 · 2026-07-16 · applies to pre-alpha builds (0.1.x)
+Agreement revision 1 · 2026-10-30 · applies to alpha builds (0.1.x)
 
 This agreement is made between you (the "User") and the rights holder of
 the NetRuleRouter software — **Fyodor Malkov (kroxiksut)**, the author and owner of the
@@ -35,7 +35,7 @@ third-party components, their licenses, and how to verify them is in the
 `THIRD_PARTY_LICENSES.md` file shipped with the software and in the
 "Licenses → Third-party components" window inside the application.
 
-## 3. Pre-alpha status
+## 3. Alpha status
 
 You are using an **early test version**. This means:
 
@@ -127,9 +127,10 @@ created by the software are removed as well.
 
 ## 10. Contact
 
-Bug reports and questions: the project page
-<https://github.com/kroxiksut/net-rule-router> (Issues section)
-or e-mail <fmalkov91@gmail.com>.
+Help, questions and news: the Telegram channel
+<https://t.me/netrulerouter>, in English and Russian. Bug reports: the
+project page <https://github.com/kroxiksut/net-rule-router> (Issues
+section) or e-mail [fmalkov91@gmail.com](mailto:fmalkov91@gmail.com).
 
 ---
 

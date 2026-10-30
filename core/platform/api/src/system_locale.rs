@@ -13,4 +13,13 @@ pub trait SystemLocalePort: Send + Sync {
     /// one this build has a translation for — that decision stays with the
     /// caller, which is the one place that knows the bundled catalogue.
     fn ui_language_candidates(&self) -> Vec<String>;
+
+    /// The country the user set the system to, as the host spells it
+    /// (`RU`, or a locale tag such as `en_RU.UTF-8` whose territory names it),
+    /// independent of the display language: an English system set to Russia
+    /// answers Russia. `None` when the host does not say. Every OS port
+    /// answers it; the default serves test doubles.
+    fn region(&self) -> Option<String> {
+        None
+    }
 }

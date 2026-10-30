@@ -7,7 +7,9 @@
 mod js_harness;
 
 use js_harness::{arg, check, JsLib};
-use nrr_client_logic::enforcement_notice::{restore_is_news, secondary_down_body_key};
+use nrr_client_logic::enforcement_notice::{
+    adapter_choice_body_key, restore_is_news, secondary_down_body_key,
+};
 use serde_json::json;
 
 #[test]
@@ -29,6 +31,22 @@ fn enforcement_secondary_down_body_key_matches_js() {
         |input| {
             json!(secondary_down_body_key(
                 input["level"].as_str().unwrap_or("")
+            ))
+        },
+    );
+}
+
+#[test]
+fn enforcement_adapter_choice_body_key_matches_js() {
+    check(
+        "enforcement_adapter_choice_body_key",
+        &mut JsLib::pure(),
+        |input| format!("enforcementAdapterChoiceBodyKey({})", arg(input, "count")),
+        |input| {
+            json!(adapter_choice_body_key(
+                input["count"]
+                    .as_u64()
+                    .map_or(0, |n| usize::try_from(n).unwrap_or(usize::MAX))
             ))
         },
     );

@@ -102,8 +102,8 @@ is honestly **best-effort**: both are young, fast-moving browsers whose
 on-disk layout changes faster than it gets documented, so the paths above can
 go stale after an update. If your Arc or Comet stops contributing hosts to
 the cache, please tell us through any channel that suits you — the project's
-GitHub Issues (<https://github.com/kroxiksut/net-rule-router/issues>) or any
-other feedback route the project publishes. The service log line
+GitHub Issues (<https://github.com/kroxiksut/net-rule-router/issues>) or the
+Telegram channel (<https://t.me/netrulerouter>). The service log line
 `browser-history discovery finished` lists which sources were actually
 found on your machine, and that line is the evidence to attach.
 

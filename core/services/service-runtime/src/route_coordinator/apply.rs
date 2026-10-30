@@ -77,6 +77,10 @@ impl SecondaryRouteCoordinator {
         });
         let own = Self::additional_links(policy.as_ref(), resolution, &adapters);
         self.publish_foreign_tunnel_networks(table.as_deref().ok(), &adapters, &[foreign], &own);
+        // Last pass's contribution stays with the routes it describes.
+        if plan.hold {
+            return Ok(RouteReconcileDelta::default());
+        }
         self.publish_served_alone(sid, &plan);
         let (Some(secondary), true) = (plan.secondary, plan.planned) else {
             return self.reconciler.clear();

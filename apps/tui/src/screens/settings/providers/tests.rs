@@ -329,3 +329,65 @@ fn the_scan_row_is_there_before_any_scan() {
         .any(|i| i.id == ItemId::Provider(ProviderRow::Scan)));
     assert!(app.settings.providers.found.is_none());
 }
+
+const LINK_CLIENT: &str = r"C:\Program Files\Example.net VPN 3.0\Example.net VPN 3.0.exe";
+const LINK_HELPER: &str = r"C:\Program Files\Example.net VPN 3.0\OpenVPN\openvpn.exe";
+
+fn running(path: &str, name: &str) -> VpnCandidate {
+    VpnCandidate {
+        running: true,
+        source: VpnCandidateSource::RunningProcess,
+        ..found(path, name)
+    }
+}
+
+/// The bound additional adapter is the one a running VPN raised.
+fn with_link(apps: &[(&str, &str)]) -> AppState {
+    let mut app = with_found(
+        apps,
+        &[
+            running(LINK_CLIENT, "Example.net VPN 3.0.exe"),
+            running(LINK_HELPER, "openvpn.exe"),
+            running(r"C:\Apps\Other\othervpn.exe", "othervpn.exe"),
+        ],
+    );
+    if let Loadable::Ready(policy) = &mut app.settings.data.policy {
+        policy.insert(
+            "secondary".to_owned(),
+            json!({ "stable-id": "id-1", "display-name": "Example.net VPN OpenVPN Adapter" }),
+        );
+    }
+    app
+}
+
+#[test]
+fn with_no_vpn_client_set_the_programs_of_the_link_that_is_up_are_offered_and_written_together() {
+    let fake = service(&[]);
+    let mut app = with_link(&[]);
+    assert!(
+        items(&app, Category::Routing)
+            .iter()
+            .any(|i| i.id == ItemId::Provider(ProviderRow::UseOffer)),
+        "the client and its helper are offered as one answer"
+    );
+    let job = activate(&mut app, ProviderRow::UseOffer, Input::Run).expect("a write");
+    app.outbox.push(job);
+    run(&mut app, &fake);
+    let sent = fake.sent(Op::RouteLinkProviderSet);
+    assert_eq!(
+        sent[0]["link-provider-apps"],
+        json!([
+            { "exe-path": LINK_CLIENT, "display-name": "Example.net VPN 3.0.exe" },
+            { "exe-path": LINK_HELPER, "display-name": "openvpn.exe" }
+        ]),
+        "another vendor's running VPN must not ride along"
+    );
+}
+
+#[test]
+fn no_offer_once_a_vpn_client_is_set() {
+    let app = with_link(&[(FIRST, "Alpha")]);
+    assert!(!items(&app, Category::Routing)
+        .iter()
+        .any(|i| i.id == ItemId::Provider(ProviderRow::UseOffer)));
+}

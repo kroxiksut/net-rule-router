@@ -53,6 +53,7 @@ QtObject {
         if (!root._routingBackendConnected()) {
             for (var i = 0; i < keys.length; i += 1)
                 root._recordOfflineRoutingIntent("route-policy", keys[i], changes[keys[i]])
+            if (o.onParked) o.onParked()
             return
         }
         if (!root.bridgeAvailable
@@ -64,6 +65,7 @@ QtObject {
             // local pref mirror, so a silent return dropped the rest outright.
             for (var j = 0; j < keys.length; j += 1)
                 root._recordOfflineRoutingIntent("route-policy", keys[j], changes[keys[j]])
+            if (o.onParked) o.onParked()
             return
         }
         mutateRoutePolicy(function(cur) {
@@ -86,6 +88,7 @@ QtObject {
                 root.statusLine = root.tr("status.route-policy-read-failed",
                     "Could not read the current routing policy, so nothing was "
                     + "changed. The setting is saved and will be sent again: ") + readLabel
+                if (o.onNotWritten) o.onNotWritten(code)
                 return
             }
             if (ok) {
@@ -109,6 +112,7 @@ QtObject {
                 root.statusLine = o.failPrefix + label
             }
             if (o.onFailed) o.onFailed(code)
+            if (o.onNotWritten) o.onNotWritten(code)
         }, o.origin || "user:routing-settings")
     }
 
@@ -610,10 +614,21 @@ QtObject {
     /// same row. `leakProtection` is a level slug.
     /// `origin` names who answered: the wizard is the user's own choice, an
     /// answer sheet is the administrator's and is not recorded as theirs.
-    function applyFirstRunProtections(leakProtection, dohLockdown, origin) {
+    /// `outcome` (optional): `onApplied`, `onNotWritten(code)` and `onParked`
+    /// for a caller that must not go on before the protection is in force.
+    function applyFirstRunProtections(leakProtection, dohLockdown, origin, outcome) {
         var level = Pure.routePolicyCoerce("leak-protection", leakProtection)
         var o = _leakProtectionMessages(level)
         o.origin = origin || "user:first-run"
+        if (outcome) {
+            var applied = o.onApplied
+            o.onApplied = function(changes) {
+                if (applied) applied(changes)
+                if (outcome.onApplied) outcome.onApplied()
+            }
+            o.onNotWritten = outcome.onNotWritten
+            o.onParked = outcome.onParked
+        }
         // "Yes" is the automatic posture; "no" is a choice that holds.
         _applyRoutePolicyKeys({
             "leak-protection": level,

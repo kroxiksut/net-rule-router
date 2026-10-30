@@ -1,5 +1,5 @@
 Service: OK
-╭> Screens─────────────────╮╭Step 1 of 5: Language─────────────────────────────╮
+╭> Screens─────────────────╮╭Language──────────────────────────────────────────╮
 │  1 Status                ││The language of this terminal session. To start in│
 │> 2 First run             ││it every time, run the program with --lang.       │
 │  3 Interfaces and routes ││                                                  │

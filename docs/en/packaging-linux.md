@@ -16,6 +16,7 @@ themselves is on [Building from source (Linux)](building-linux.md).
 | `netrulerouter-gui_<version>_amd64.deb`, `netrulerouter-gui-<version>.x86_64.rpm` | The window and the tray icon, with the menu entry; requires `netrulerouter` of the same version |
 | `netrulerouter-<version>-linux-x86_64.tar.gz` | Everything, for systems that take neither package format |
 | `netrulerouter-headless-<version>-linux-x86_64.tar.gz` | The same without the window and the tray |
+| `netrulerouter-<version>-linux-x86_64-symbols.tar.xz`, `netrulerouter-headless-<version>-linux-x86_64-symbols.tar.xz` | The debug symbols of the matching archive; see [Debug symbols](#debug-symbols) |
 | `SHA256SUMS` | Checksums of all of the above |
 
 The names above are those of an x86_64 build. Packages for 64-bit ARM carry
@@ -26,6 +27,29 @@ So the **full** installation is `netrulerouter` plus `netrulerouter-gui`, and
 the installation **without a GUI** is `netrulerouter` alone. Adding or removing
 the window later is installing or removing one package; the service and its
 data are not touched.
+
+## Debug symbols
+
+The packages and archives carry no debug symbols, which keeps them small. The
+symbols of the same build come as a separate `-symbols.tar.xz` per
+architecture (x86_64 and aarch64), attached to each release. You never need
+one to install or run the product: it is for reading a crash or stepping
+through the program in a debugger.
+
+- It fits only the build it was taken from. Take the one with the same version
+  and architecture as the archive or the packages you installed; the
+  `netrulerouter-headless-` one matches the service, `nrr-cli` and `nrr-tui`,
+  the other one also the window and the tray.
+- To use it, unpack it over the system; `gdb` then finds the files under
+  `/usr/lib/debug` by itself:
+
+```sh
+sudo tar -xJf netrulerouter-<version>-linux-x86_64-symbols.tar.xz --strip-components=1 -C /
+gdb /usr/libexec/netrulerouter/nrr-service
+```
+
+- To remove them, delete `/usr/lib/debug/usr/libexec/netrulerouter` and the
+  `.build-id` files the archive listed.
 
 ## Building the packages
 
@@ -39,6 +63,9 @@ The script needs a few tools from your distribution's own repositories:
 
 A tool that is missing is named in the error, together with the package that
 provides it. `--formats` leaves out a format you cannot or do not want to build.
+Rust (`cargo`) is needed even when packaging an existing build: every package
+carries these pages as offline HTML, and the script builds them. A page that
+links to something that is not there stops the run.
 
 Full set, on a system with Qt 6.6 or newer (Ubuntu 24.10 and later, Debian 13,
 Astra 1.8, Fedora):
@@ -98,7 +125,8 @@ sudo dnf install ./netrulerouter-*.rpm ./netrulerouter-gui-*.rpm
 
 The service starts right away and then with every boot. `nrr-cli`, `nrr-tui`
 and, with the GUI, `netrulerouter` are available by name from any shell, and
-the application menu has a NetRuleRouter entry.
+the application menu has a NetRuleRouter entry. Help > Documentation in the
+window, and About in `nrr-tui`, point to these pages installed offline.
 
 If the system's Qt is older than 6.6, the package manager refuses
 `netrulerouter-gui` and names the Qt packages it lacks. Then either install a

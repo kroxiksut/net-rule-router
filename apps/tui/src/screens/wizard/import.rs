@@ -55,6 +55,18 @@ pub fn payload(
     payload
 }
 
+/// The same import under a fresh correlation id, for a dry run of its own.
+pub fn renewed(payload: &Value) -> Value {
+    let mut again = payload.clone();
+    if let Some(fields) = again.as_object_mut() {
+        fields.insert(
+            "correlation-id".into(),
+            Value::from(correlation_id("first-run")),
+        );
+    }
+    again
+}
+
 fn correlation_id(what: &str) -> String {
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)

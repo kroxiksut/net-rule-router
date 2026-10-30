@@ -4,7 +4,7 @@
 # printed commands by hand (the AUR key never lives in CI).
 #
 # Usage:
-#   ./scripts/aur-update.sh v0.1.0-prealpha path/to/SHA256SUMS [--out DIR]
+#   ./scripts/aur-update.sh v0.1.0-alpha.1 path/to/SHA256SUMS [--out DIR]
 #
 # SHA256SUMS is the checksum file of the GitHub release; the lines of the two
 # full archives (linux-x86_64 and linux-aarch64) are taken from it.
@@ -31,7 +31,7 @@ done
 
 case "$tag" in
   v[0-9]*) ;;
-  *) die "the tag must look like v0.1.0 or v0.1.0-prealpha, got '$tag'" ;;
+  *) die "the tag must look like v0.1.0 or v0.1.0-alpha.1, got '$tag'" ;;
 esac
 [ -f "$sums" ] || die "no checksum file at $sums"
 

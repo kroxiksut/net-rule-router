@@ -251,20 +251,20 @@ fn app_rules_take_all_addresses_travels_as_kebab_case_and_defaults_off() {
 }
 
 #[test]
-fn external_address_auto_check_travels_as_kebab_case_and_defaults_off() {
-    let mut on = route_policy_update_request_sample("suggest");
-    on.external_address_auto_check = true;
-    let json = serde_json::to_value(&on).expect("serialise");
-    assert_eq!(json["external-address-auto-check"], true);
+fn external_address_auto_check_travels_as_kebab_case_and_defaults_on() {
+    let mut off = route_policy_update_request_sample("suggest");
+    off.external_address_auto_check = false;
+    let json = serde_json::to_value(&off).expect("serialise");
+    assert_eq!(json["external-address-auto-check"], false);
 
-    // The check sends a request through the tunnel: a peer that predates the
-    // field never turns it on.
+    // On by default: a peer that predates the field must not switch it off
+    // by saving some other setting.
     let mut json = json;
     let obj = json.as_object_mut().expect("object payload");
     obj.remove("external-address-auto-check");
     let parsed: RoutePolicyUpdateRequest =
         serde_json::from_value(json).expect("deserialise pre-field payload");
-    assert!(!parsed.external_address_auto_check);
+    assert!(parsed.external_address_auto_check);
 }
 
 /// Every push event a client can receive, one sample per variant.

@@ -62,6 +62,9 @@ pub(super) struct IpcSurface {
     /// Filled while the handlers are wired (the probe runner is built there)
     /// and read when the supervised tasks are assembled.
     pub auto_probe_wiring: Option<nrr_service_runtime::service_tasks::AutoProbeWiring>,
+    /// The rows the interfaces screens read; the connect-time address check
+    /// files what it observes there.
+    pub adapters_snapshot: Option<Arc<MonitoredAdaptersSnapshotProvider>>,
     pub registry: IpcHandlerRegistry,
 }
 
@@ -144,6 +147,7 @@ pub(super) fn build(inputs: IpcSurfaceInputs<'_>) -> IpcSurface {
     // Filled while the IPC handlers are wired (the probe runner is built
     // there) and read when the supervised tasks are assembled below.
     let mut auto_probe_wiring: Option<nrr_service_runtime::service_tasks::AutoProbeWiring> = None;
+    let mut adapters_snapshot: Option<Arc<MonitoredAdaptersSnapshotProvider>> = None;
     let mut registry = IpcHandlerRegistry::new();
     if let (Some(conn), Some(coord)) = (settings_conn.as_ref(), pause_coordinator.as_ref()) {
         let cache_db_path = artifacts.topology.cache_db_path.clone();
@@ -395,11 +399,13 @@ pub(super) fn build(inputs: IpcSurfaceInputs<'_>) -> IpcSurface {
             writer
         });
 
+        let adapters_snapshot_provider = Arc::new(adapters_snapshot_provider);
+        adapters_snapshot = Some(Arc::clone(&adapters_snapshot_provider));
         let mut deps = IpcHandlerDeps::new(
             Arc::new(NoopIpcAuditEmitter) as Arc<dyn nrr_service_runtime::IpcAuditEmitter>,
             health,
             policy,
-            Arc::new(adapters_snapshot_provider) as Arc<dyn AdaptersSnapshotProvider>,
+            adapters_snapshot_provider as Arc<dyn AdaptersSnapshotProvider>,
             Arc::new(
                 ProductionRulesSnapshotProvider::new(Arc::clone(conn))
                     .with_main_route_verdicts(Arc::clone(&main_route_verdicts))
@@ -1103,6 +1109,7 @@ pub(super) fn build(inputs: IpcSurfaceInputs<'_>) -> IpcSurface {
         conn_trace_ndjson,
         conn_trace_ring,
         auto_probe_wiring,
+        adapters_snapshot,
         registry,
     }
 }

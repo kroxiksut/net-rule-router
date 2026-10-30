@@ -609,8 +609,12 @@ GroupBox {
             color: root.mutedTextColor
             wrapMode: Text.WordWrap
             font.pixelSize: root.uiTheme.baseFontSizePx - 1
+            // Names the setting and its page from their own keys, so a renamed page cannot leave this text behind.
             text: root.tr("settings.service.launch-tray.description",
-                "The service starts at boot before anyone logs in and cannot open the tray itself. This starts the tray icon when you sign in — the same setting as “Start the tray automatically at sign-in” in General.")
+                "The service starts at boot before anyone logs in and cannot open the tray itself. This starts the tray icon when you sign in — the same setting as “{setting}” in Settings → {page} → {group}.")
+                .replace("{setting}", root.tr("settings.general.autostart.label", "Start NetRuleRouter tray automatically at sign-in"))
+                .replace("{page}", root.tr("settings.category.application", "Application"))
+                .replace("{group}", root.tr("settings.group.general", "General"))
         }
 
         // The offer to install the service can be turned off from the offer

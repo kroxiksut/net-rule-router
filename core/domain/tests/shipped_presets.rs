@@ -2,18 +2,23 @@
 //! plus canonicalization, on each host platform. The lighter parser check in
 //! `nrr-shared` only proves the text does not crash the parser.
 
-#![allow(clippy::expect_used)]
+#![allow(clippy::expect_used, clippy::panic)]
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
 use nrr_domain::{
+    canonical::{CanonicalRuleBook, CanonicalRuleSet},
     preset_canonicalize::canonicalize_preset_rules,
     preset_validation::validate_preset_bytes,
     rules_file::{HostPlatform, ParseOutcome},
+    rules_json_codec::encode,
+    rules_revision::RulesRevisionContent,
     validation::ValidationWarning,
 };
+use nrr_shared::rules_json::CanonicalRulesJsonV1;
+use nrr_shared::rules_overlap::find_route_overlaps;
 use nrr_shared::RouteRole;
 
 fn presets_root() -> PathBuf {
@@ -171,4 +176,99 @@ fn the_sharing_check_sees_through_headers_and_comments() {
     };
     assert_eq!(content(&a), content(&b));
     assert_ne!(content(&a), content(&c), "a disabled rule routes nothing");
+}
+
+/// Every folder holding a pair of rules files the program offers to load: the
+/// country packs, the examples and the demo set behind "Load demo rules".
+fn shipped_pairs() -> Vec<PathBuf> {
+    let demo = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../configs/presets/builtin-demo");
+    let mut dirs: BTreeSet<PathBuf> = shipped_rules_files()
+        .iter()
+        .filter_map(|p| p.parent().map(Path::to_path_buf))
+        .collect();
+    dirs.extend([demo.clone(), demo.join("ru")]);
+    dirs.into_iter().collect()
+}
+
+/// The pair as the overlaps screen reads it after a load: both files through
+/// the real import, joined into one rule book.
+fn loaded_pair(dir: &Path, platform: HostPlatform) -> CanonicalRulesJsonV1 {
+    let route = |role: RouteRole, name: &str| {
+        let path = dir.join(name);
+        let Ok(bytes) = fs::read(&path) else {
+            return CanonicalRuleSet::from_rules(Vec::new());
+        };
+        let outcome = validate_preset_bytes(&bytes);
+        let parsed = outcome
+            .parse_outcome()
+            .unwrap_or_else(|| panic!("{} is refused: {outcome:?}", path.display()));
+        canonicalize_preset_rules(parsed, role, platform, false)
+            .rule_set()
+            .unwrap_or_else(|| panic!("{} does not canonicalize", path.display()))
+            .clone()
+    };
+    encode(&RulesRevisionContent::new(CanonicalRuleBook {
+        primary: route(RouteRole::Primary, "rules_primary.txt"),
+        secondary: route(RouteRole::Secondary, "rules_secondary.txt"),
+    }))
+}
+
+// A fresh user who loads a factory set must not be met with questions about
+// it: every overlap of the two routes waits on the Overlaps screen until it is
+// confirmed, and a confirmation lives in the user's preferences, not in the set.
+#[test]
+fn no_factory_set_leaves_an_overlap_to_decide() {
+    let dirs = shipped_pairs();
+    let mut found = Vec::new();
+    for dir in &dirs {
+        assert!(
+            dir.join("rules_primary.txt").is_file() || dir.join("rules_secondary.txt").is_file(),
+            "{} holds no rules file",
+            dir.display()
+        );
+        for platform in [HostPlatform::Windows, HostPlatform::Linux] {
+            let book = loaded_pair(dir, platform);
+            // Both settings of "Also cover subdomains for domain rules".
+            for include_subdomains in [true, false] {
+                for o in find_route_overlaps(&book, include_subdomains) {
+                    found.push(format!(
+                        "{} ({platform:?}, subdomains {include_subdomains}): {} {} via {} over {} {} via {}",
+                        shown(dir),
+                        o.winner.rule_type,
+                        o.winner.value,
+                        o.winner.route,
+                        o.loser.rule_type,
+                        o.loser.value,
+                        o.loser.route
+                    ));
+                }
+            }
+        }
+    }
+    assert!(
+        found.is_empty(),
+        "factory sets with overlaps waiting for a decision:\n  {}",
+        found.join("\n  ")
+    );
+}
+
+// A loader that missed one file of the pair would pass the check above for
+// every set.
+#[test]
+fn the_overlap_check_reads_both_files_of_a_pair() {
+    let dir = std::env::temp_dir().join(format!("nrr-preset-pair-{}", std::process::id()));
+    fs::create_dir_all(&dir).expect("temp dir");
+    fs::write(
+        dir.join("rules_primary.txt"),
+        "--- Domains\n*.example.com\n",
+    )
+    .expect("write");
+    fs::write(
+        dir.join("rules_secondary.txt"),
+        "--- Domains\nmail.example.com\n",
+    )
+    .expect("write");
+    let book = loaded_pair(&dir, HostPlatform::Windows);
+    let _ = fs::remove_dir_all(&dir);
+    assert_eq!(find_route_overlaps(&book, true).len(), 1, "{book:?}");
 }

@@ -218,10 +218,13 @@ pub struct AppState {
     pub primary_suggestion: crate::primary_suggestion::PrimarySuggestionState,
     /// Blocks kept while no surface was open, read on connect.
     pub block_backlog: crate::block_backlog::BlockBacklogState,
+    /// Rule-set loads applied or not, told in the feed on the next tick.
+    pub rule_set_load: crate::rule_set_load::RuleSetLoadState,
     /// Blocked sites offered "To additional route", and the question asked.
     pub block_route: crate::block_route::BlockRouteState,
     pub local_network_offer: crate::local_network_offer::LocalNetworkOfferState,
     pub app_groups_offer: crate::app_groups_offer::AppGroupsOfferState,
+    pub vpn_client_offer: crate::vpn_client_offer::VpnClientOfferState,
     /// When the feed last told that a site does not open, and of which.
     pub site_notices: crate::site_notices::SiteNoticeLog,
     /// What the window holds for a service that was not running.
@@ -279,9 +282,11 @@ impl AppState {
             vpn_gateway_trust: Default::default(),
             primary_suggestion: crate::primary_suggestion::PrimarySuggestionState::default(),
             block_backlog: Default::default(),
+            rule_set_load: Default::default(),
             block_route: Default::default(),
             local_network_offer: Default::default(),
             app_groups_offer: Default::default(),
+            vpn_client_offer: Default::default(),
             site_notices: Default::default(),
             window_parked: None,
             forwarded_traffic: Default::default(),
@@ -327,6 +332,9 @@ impl AppState {
         if self.screen != screen {
             self.screen = screen;
             self.scroll = 0;
+            if screen == ScreenId::Wizard {
+                crate::screens::rules::offer::setup_shown(self);
+            }
             crate::screens::screen(screen).on_show(self);
         }
         self.help_open = false;
@@ -369,11 +377,13 @@ impl AppState {
                     .chain(crate::vpn_gateway_trust::announce(self, texts, now))
                     .chain(crate::primary_suggestion::announce(self, texts, now))
                     .chain(crate::block_backlog::announce(self, texts, now))
+                    .chain(crate::rule_set_load::announce(self, texts, now))
                     .chain(crate::screens::suggestions::announce(self, texts))
                     .chain(crate::block_route::announce(self, texts, now))
                     .chain(crate::feed::announce(self, texts, now))
                     .chain(crate::local_network_offer::announce(self, texts, now))
                     .chain(crate::app_groups_offer::announce(self, texts, now))
+                    .chain(crate::vpn_client_offer::announce(self, texts, now))
                     .chain(crate::screens::wizard::announce(self, texts, now));
                 if std::mem::take(&mut self.snapshot_refresh_due) {
                     effects.push(Effect::Refresh);
@@ -543,10 +553,11 @@ impl AppState {
                 .about(About::Kind("link-keeps-dropping"));
                 self.post(notice, Some(now))
             }
-            // A reconnect inside the service's quiet period is not announced.
-            StatusUpdateEvent::SecondaryExternalAddressObserved { quiet: true, .. } => Vec::new(),
-            // The interfaces list reads the address off the rows: re-read them.
-            StatusUpdateEvent::SecondaryExternalAddressCleared { .. } => vec![Effect::Refresh],
+            // The interfaces list reads the address off the rows, where the
+            // service filed it before pushing: re-read them. A reconnect inside
+            // the service's quiet period is not announced.
+            StatusUpdateEvent::SecondaryExternalAddressObserved { quiet: true, .. }
+            | StatusUpdateEvent::SecondaryExternalAddressCleared { .. } => vec![Effect::Refresh],
             StatusUpdateEvent::SecondaryExternalAddressObserved {
                 adapter_name,
                 external_address,
@@ -563,8 +574,9 @@ impl AppState {
                         &[("name", display_text(&adapter_name))],
                     ));
                 }
+                // A muted notice still leaves the rows to follow.
                 if crate::notice_mutes::muted(self, "external-address") {
-                    return Vec::new();
+                    return vec![Effect::Refresh];
                 }
                 let notice = Notice::new(
                     NoticeLevel::Info,
@@ -572,7 +584,11 @@ impl AppState {
                     body,
                 )
                 .about(About::Kind("external-address"));
-                self.post(notice, None)
+                let mut effects = self.post(notice, None);
+                if !effects.contains(&Effect::Refresh) {
+                    effects.push(Effect::Refresh);
+                }
+                effects
             }
             StatusUpdateEvent::AdaptersChanged { .. } => vec![Effect::Refresh],
             StatusUpdateEvent::AutoRuleCandidatesChanged {
@@ -1050,6 +1066,10 @@ impl AppState {
         now: Instant,
     ) -> Vec<Effect> {
         if status.is_empty() || status == "ok" {
+            // The additional link just came up: its VPN client may be unset.
+            if role == "secondary" && self.enforcement_down.contains_key(&role) {
+                crate::vpn_client_offer::check(self);
+            }
             if self.enforcement_down.remove(&role).is_some_and(|down| {
                 !down.quiet && nrr_client_logic::enforcement_notice::restore_is_news(&down.status)
             }) && !crate::notice_mutes::muted(self, "enforcement-restored")
@@ -1205,7 +1225,17 @@ pub fn enforcement_text_for(
     match status {
         "adapter-choice-needed" => (
             texts.get(keys::ENF_CHOICE_TITLE),
-            texts.fill(keys::ENF_CHOICE_BODY, &[("list", &list)]),
+            texts.fill(
+                match nrr_client_logic::enforcement_notice::adapter_choice_body_key(
+                    candidates.len(),
+                ) {
+                    "notifications.enforcement.adapter-choice.body-one" => {
+                        keys::ENF_CHOICE_BODY_ONE
+                    }
+                    _ => keys::ENF_CHOICE_BODY,
+                },
+                &[("list", &list)],
+            ),
         ),
         "adapter-gone" => with_list(
             keys::ENF_GONE_TITLE,
@@ -1325,6 +1355,34 @@ mod tests {
         assert!(notice.body.contains("several times"), "{}", notice.body);
     }
 
+    /// The interfaces list reads the external address off the rows, and the
+    /// service files what the connect-time check found before it pushes: the
+    /// list follows without a manual check, a quiet refill included.
+    #[test]
+    fn an_observed_external_address_reaches_the_interfaces_list() {
+        let fixture = Fixture::healthy();
+        let mut app = connected(&fixture);
+        let t = texts();
+        for quiet in [false, true] {
+            let effects = app.apply(
+                BackendEvent::Push(PushEvent::Status(Box::new(
+                    StatusUpdateEvent::SecondaryExternalAddressObserved {
+                        sid: "S".into(),
+                        adapter_name: "Tunnel".into(),
+                        external_address: "203.0.113.9".into(),
+                        quiet,
+                    },
+                ))),
+                &t,
+                Instant::now(),
+            );
+            assert!(
+                effects.contains(&Effect::Refresh),
+                "quiet={quiet}: the rows are not re-read"
+            );
+        }
+    }
+
     #[test]
     fn a_route_not_up_yet_at_start_is_shown_but_not_announced() {
         let fixture = Fixture::healthy();
@@ -1390,6 +1448,21 @@ mod tests {
         let before = app.notices.len();
         app.apply(enforcement("ok", "primary"), &t, Instant::now());
         assert_eq!(app.notices.len(), before + 1, "a real outage ended");
+    }
+
+    /// One adapter named while the saved one is down is a sibling to consider;
+    /// "several answer to the saved name" would send the user looking for a
+    /// second one that is not there.
+    #[test]
+    fn one_adapter_to_choose_is_not_called_several() {
+        let t = texts();
+        let one = ["Ethernet 5".to_owned()];
+        let (_, body) = enforcement_text("adapter-choice-needed", "secondary", &one, &t);
+        assert!(body.contains("Ethernet 5"), "{body}");
+        assert!(!body.contains("Several"), "{body}");
+        let two = ["A".to_owned(), "B".to_owned()];
+        let (_, body) = enforcement_text("adapter-choice-needed", "secondary", &two, &t);
+        assert!(body.contains("Several"), "{body}");
     }
 
     #[test]

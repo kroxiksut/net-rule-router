@@ -203,9 +203,10 @@ QtObject {
             }
             // The wizard may be closed unanswered, and a new user already
             // follows the administrator's baseline: the table shows what the
-            // service applies from the start, not "no rules".
+            // service applies from the start, not "no rules". Only the table:
+            // an empty service must not pull in a rule set nobody picked.
             if (((root.backendStatus || {}).kind) === "connected") {
-                root._coldStartRulesFetch()
+                root._coldStartRulesFetch(true)
             }
         } else {
             // Auto-open-on-launch. When the user has

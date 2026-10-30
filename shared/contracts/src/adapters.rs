@@ -23,6 +23,30 @@ pub fn is_linux_bridge_name(name: &str) -> bool {
     LINUX_BRIDGE_PREFIXES.iter().any(|p| name.starts_with(p))
 }
 
+/// The driver an adapter description names, without the instance number
+/// Windows appends to every copy after the first ("TAP-Windows Adapter V9 #3"),
+/// lower-cased. Empty when the description names nothing.
+pub fn driver_family(description: &str) -> String {
+    let trimmed = description.trim();
+    let base = match trimmed.rsplit_once('#') {
+        Some((head, number))
+            if !number.is_empty()
+                && number.bytes().all(|b| b.is_ascii_digit())
+                && head.ends_with(char::is_whitespace) =>
+        {
+            head.trim_end()
+        }
+        _ => trimmed,
+    };
+    base.to_lowercase()
+}
+
+/// Whether two adapter descriptions name copies of one driver.
+pub fn same_driver(a: &str, b: &str) -> bool {
+    let family = driver_family(a);
+    !family.is_empty() && family == driver_family(b)
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum ConnectivityState {
     Available,

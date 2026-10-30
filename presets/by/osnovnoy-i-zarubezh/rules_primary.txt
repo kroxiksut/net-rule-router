@@ -34,7 +34,7 @@ yandex.*  # Yandex and related infrastructure on global TLDs
 *.kaspersky.com  # Security and utility services on global TLDs
 *.drweb.com  # Security and utility services on global TLDs
 
-*.google.com  # Google services stay on the main route; the AI hosts are routed separately
+# *.google.com  # Google already takes the main route; turn on with the default route "Additional connection — exceptions through the main one"
 
 ?*.proton.me  # Foreign messengers and communication tools
 ?*.protonmail.com  # Foreign messengers and communication tools

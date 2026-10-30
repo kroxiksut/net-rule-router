@@ -1,4 +1,4 @@
-# Quick start (pre-alpha)
+# Quick start (alpha)
 
 **English** · [Русский](../ru/quickstart.md)
 
@@ -7,7 +7,7 @@ IP address, or application. It works with connections you already have
 (main internet + VPN, two providers, Wi-Fi + Ethernet), and is not a VPN
 client, proxy, or anonymity tool.
 
-> **This is pre-alpha.** Leak protection, its **Everything** setting above
+> **This is an alpha.** Leak protection, its **Everything** setting above
 > all, has not yet passed full testing and may work
 > incorrectly — up to a complete loss of network access until it is set
 > back to **Off**. It is available in settings, but turning it on is at your
@@ -35,7 +35,7 @@ client, proxy, or anonymity tool.
    ![The licence agreement, shown once at first launch](images/first-run-eula.png)
 
 4. Install the background service. The welcome window offers it right
-   away — **"Install and start the service"**; confirm the UAC prompt for
+   away — **"Install and start service (recommended)"**; confirm the UAC prompt for
    administrator rights. The same actions live in **Settings → Service
    management**, where the service can also be started, stopped, and
    removed.
@@ -51,6 +51,8 @@ routing does not apply.
    first-run wizard offers four options: a country preset, a built-in
    demo set, two `.txt` files of your own, or an empty start. Whatever
    you pick lands in the rules for review before anything is applied.
+   After an empty start, the next launch offers your country's rule set
+   with one click; load it or decline, and it is not offered again.
    It also offers to start the tray icon at sign-in (on by default), so
    after a restart the state is in sight without opening the window.
 
@@ -277,7 +279,7 @@ route (for example, install a VPN).
 
 If you want traffic from such rules to be **blocked instead of using the
 main channel**, set leak protection to **Routed sites** — but read the
-warning at the beginning of this document: in pre-alpha leak protection is
+warning at the beginning of this document: in the alpha leak protection is
 turned on at your own risk.
 
 If you do use a VPN, tell the app which program it is — its client keeps
@@ -388,6 +390,11 @@ For anything else:
    archive attached and a description: what you did, what you expected,
    what happened.
 
+Questions that are not a bug — how to set something up, whether a setup
+should work — are welcome in the Telegram channel
+[t.me/netrulerouter](https://t.me/netrulerouter), in English and Russian.
+Attach a diagnostic archive to an issue, not to a chat message.
+
 ## Lost internet? How to reset everything
 
 A normal stop of the service hands the network back: its routes, blocking
@@ -396,8 +403,8 @@ filters and DNS redirect go with it. With leak protection set to
 computer alone does not lift it. If after experimenting with rules you lost
 network access, proceed step by step:
 
-1. **Set leak protection to Off** in the app settings
-   and apply the changes.
+1. **Set leak protection to Off** in Settings → Routing behavior. The
+   change takes effect as soon as you pick it; there is nothing to apply.
 2. **Stop the service** — Settings → Service management → Stop service.
    When the service stops, it removes its routes and protection, every
    connection returns to the main channel. A connection that was open at
@@ -433,16 +440,17 @@ To see the current routing table for diagnostics, use
 
 ## Updating
 
-Once the first release is out, the app tells you when a newer version is
-available, but it never downloads or installs anything: you take the new
-version from the [releases page](https://github.com/kroxiksut/net-rule-router/releases)
-yourself. An update keeps your rules, settings, connection history and the
+The app does not check for updates. New versions appear on the
+[releases page](https://github.com/kroxiksut/net-rule-router/releases) and are
+announced in the Telegram channel [t.me/netrulerouter](https://t.me/netrulerouter);
+updating is manual: you install the new version over the old one. An update keeps your rules, settings, connection history and the
 audit trail. Rule sets kept in the program folder are replaced by the new
 version's, which is why your own set belongs in a folder of your own.
 
 - **Installed with the EXE or the MSI.** Run the installer of the new version
-  of the same kind: EXE over EXE, MSI over MSI. It stops the service, replaces
-  the program and starts the service again. To move from one kind to the
+  of the same kind: EXE over EXE, MSI over MSI. It closes the window and the
+  tray, stops the service, replaces the program and starts the service again,
+  keeping the folder and the options chosen before. To move from one kind to the
   other, remove the first in the default mode, which keeps your data, then
   install the other.
 - **Portable copy.** Close the window and choose **Exit** in the tray menu,
@@ -459,7 +467,25 @@ is missing, run the installer of the new version again.
 
 ## Removal
 
-1. Remove the service: **Settings → Service management → Remove service**
+**Installed with the EXE or the MSI.** Remove NetRuleRouter in Windows
+Settings → Apps (**Installed apps** on Windows 11, **Apps & features** on
+Windows 10). There is nothing to close first: the removal closes the window,
+the tray and the terminal tools itself. Either way the service is removed and
+the network settings it changed are put back.
+
+Both installers ask how to remove it; the **MSI** opens its window first,
+where you choose **Remove**. **Remove the program** keeps your settings,
+rules and the service's data, so installing again picks up where you left
+off. **Remove completely** also erases the service's data and your own
+NetRuleRouter settings; whether to erase the audit trail too is asked
+separately. Rule files you saved in your own folders are kept either way, and
+the settings of other Windows accounts are listed, not deleted. The commands
+for a silent removal are in
+[Packaging NetRuleRouter for Windows](packaging-windows.md#removing-an-installed-copy).
+
+**Portable copy.**
+
+1. Remove the service: **Settings → Service management → Uninstall service**
    (or from an administrator terminal: `nrr-cli uninstall`; add `--purge`
    to delete the data the service owns as well). When the service is
    removed, it clears the installed routing rules.

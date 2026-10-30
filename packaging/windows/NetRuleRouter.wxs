@@ -4,11 +4,17 @@
   package folder it has just produced; see docs/en/packaging-windows.md.
 
   Bind path "pkg": the package folder. Preprocessor variables (wix build -d):
-  Version (numeric a.b.c), DisplayVersion, LicenseRtf, optional Variant
+  Version (numeric a.b.c), DisplayVersion, ProductCode (one per run: every
+  culture's build shares it), LicenseRtf (the agreement in the build's
+  culture), AgreementVersion (its revision), BannerBmp, DialogBmp,
+  EstimatedSizeKb, optional Variant
   (full | headless). The processor comes from wix build -arch: x64 or arm64.
+  Texts come from NetRuleRouter.<culture>.wxl (wix build -culture -loc); the
+  package script embeds the ru-RU build as a language transform.
 
-  Removal keeps all data, including from Apps & Features. Complete removal:
-    msiexec /x <package.msi or product code> REMOVEALLDATA=1 [REMOVEAUDIT=1]
+  Settings > Apps lists the entry AppsEntry writes, which opens the wizard:
+  its Remove asks whether to keep the data. Silent removal keeps it unless
+    msiexec /x <package.msi or product code> /qn REMOVEALLDATA=1 [REMOVEAUDIT=1]
   REMOVEAUDIT=1 erases the audit trail and only counts together with REMOVEALLDATA=1.
   Complete removal erases the service's data and that of the user running msiexec;
   other Windows accounts' data is listed in the log, never deleted.
@@ -23,9 +29,19 @@
 
   Service and data steps run through scripts\setup-actions.ps1, which reuses the
   console and the user scripts; the package registers no service itself.
+
+  Choices, on the command line as in the wizard (1 or 0); an upgrade keeps the
+  earlier ones unless they are given again:
+    INSTALLFOLDER=<folder inside Program Files>
+    NRR_TUI=0            leave out the terminal interface (installed by default)
+    NRR_DOCS=0           leave out the offline documentation (installed by default)
+    NRR_DESKTOP_SHORTCUT=1   desktop shortcut (full package)
+    NRR_ADD_TO_PATH=1    nrr-cli and nrr-tui on PATH
+    NRR_INSTALL_FOR=all|me   whose Start menu, desktop and PATH get them (full
+                         package): every account's (default) or only the one
+                         running msiexec; another value fails the installation
 -->
-<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs"
-     xmlns:ui="http://wixtoolset.org/schemas/v4/wxs/ui">
+<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs">
 
   <?ifndef Variant ?>
     <?define Variant = "full" ?>
@@ -39,46 +55,234 @@
   <!-- UpgradeCode never changes: an upgrade finds the previous installation by it. -->
   <Package Name="NetRuleRouter" Manufacturer="NetRuleRouter" Version="$(var.Version)"
            UpgradeCode="32814437-D697-4AC1-B07C-BD46DE72F89C" Scope="perMachine"
-           Language="1033">
+           ProductCode="$(var.ProductCode)" Language="!(loc.NrrLanguage)">
     <!-- The pre-release is in the third field, so an older one is a downgrade;
-         builds of one pre-release share a version and each replaces the last. -->
-    <MajorUpgrade AllowSameVersionUpgrades="yes"
-                  DowngradeErrorMessage="A newer version of NetRuleRouter is already installed." />
+         builds of one pre-release share a version and each replaces the last.
+         Any language: the display language may change between the two. -->
+    <MajorUpgrade AllowSameVersionUpgrades="yes" IgnoreLanguage="yes"
+                  DowngradeErrorMessage="!(loc.NrrNewerInstalled)" />
     <MediaTemplate EmbedCab="yes" CompressionLevel="high" />
 
-    <!-- The EXE installs into the same folder; over it, files of an equal version
-         would stay as they are. Its uninstall key is the EXE's AppId plus "_is1". -->
+    <!-- Both install the one service, and the EXE's default folder is this one's;
+         over it, files of an equal version would stay as they are. Its
+         uninstall key is the EXE's AppId plus "_is1". -->
     <Property Id="NRR_EXE_INSTALLED">
       <RegistrySearch Id="NrrExeInstalled" Root="HKLM" Type="raw" Name="UninstallString"
                       Key="SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\{A7629E15-413C-4ACE-BD45-FE227D6CDEA1}_is1" />
     </Property>
-    <Launch Condition="Installed OR NOT NRR_EXE_INSTALLED"
-            Message="NetRuleRouter is already installed by its EXE setup into the same folder. Remove that installation first (removing only the program keeps settings and rules), then run this package again." />
+    <Launch Condition="Installed OR NOT NRR_EXE_INSTALLED" Message="!(loc.NrrExeInstalled)" />
 
     <Icon Id="AppIcon" SourceFile="!(bindpath.pkg)\assets\icons\app\app.ico" />
     <Property Id="ARPPRODUCTICON" Value="AppIcon" />
     <Property Id="ARPCOMMENTS" Value="Version $(var.DisplayVersion)" />
     <Property Id="ARPCONTACT" Value="fmalkov91@gmail.com" />
+    <!-- Windows removes a package's own Apps entry with no dialog at all, so
+         that entry is hidden and AppsEntry lists one that opens the wizard. -->
+    <Property Id="ARPSYSTEMCOMPONENT" Value="1" />
 
     <Property Id="REMOVEALLDATA" Secure="yes" />
     <Property Id="REMOVEAUDIT" Secure="yes" />
+    <!-- The removal page's choice, set from REMOVEALLDATA/REMOVEAUDIT when
+         given with the wizard. -->
+    <Property Id="NRR_REMOVE_MODE" Value="program" />
+    <SetProperty Id="NRR_REMOVE_MODE" Sequence="ui" After="AppSearch" Value="complete"
+                 Condition="REMOVEALLDATA=&quot;1&quot;" />
+    <SetProperty Id="NRR_REMOVE_AUDIT" Sequence="ui" After="AppSearch" Value="1"
+                 Condition="REMOVEAUDIT=&quot;1&quot;" />
     <Property Id="PROVISION" Secure="yes" />
     <Property Id="PROVISION_SECONDARY" Secure="yes" />
     <Property Id="PROVISION_SETTINGS" Secure="yes" />
     <Property Id="SECONDARY_UNSET" Secure="yes" />
 
-    <ui:WixUI Id="WixUI_Minimal" />
-    <WixVariable Id="WixUILicenseRtf" Value="$(var.LicenseRtf)" />
+    <!-- The account whose wizard accepted the licence page ([UserSID], the
+         one that started msiexec). Set by that page alone: a value from the
+         command line is dropped, and a silent install shows no page. -->
+    <Property Id="NRR_AGREEMENT_ACCEPTED_BY" Secure="yes" />
+    <SetProperty Id="NRR_AGREEMENT_ACCEPTED_BY" Action="ClearNrrAgreementUi" Sequence="ui"
+                 Before="AppSearch" Value="[NRR_UNSET]" />
+    <SetProperty Id="NRR_AGREEMENT_ACCEPTED_BY" Action="ClearNrrAgreementQuiet" Sequence="execute"
+                 Before="AppSearch" Condition="UILevel &lt; 5" Value="[NRR_UNSET]" />
 
-    <!-- The service runs as LocalSystem from here and refuses a folder an
-         ordinary user can write to, so no folder choice is offered. -->
+    <UIRef Id="NrrUI" />
+    <WixVariable Id="WixUILicenseRtf" Value="$(var.LicenseRtf)" />
+    <WixVariable Id="WixUIBannerBmp" Value="$(var.BannerBmp)" />
+    <WixVariable Id="WixUIDialogBmp" Value="$(var.DialogBmp)" />
+
+    <!-- The service runs as LocalSystem from here, and the steps below run
+         elevated from here at removal: the folder must be one only
+         administrators can change. Inside Program Files every folder above it
+         is, and Register gives the folder itself a protected DACL. -->
     <StandardDirectory Id="ProgramFiles6432Folder">
       <Directory Id="INSTALLFOLDER" Name="NetRuleRouter" />
+    </StandardDirectory>
+    <StandardDirectory Id="DesktopFolder" />
+    <!-- The installing person's own Start menu and desktop, for "only me":
+         with ALLUSERS=1 the two folders above are every account's. -->
+    <StandardDirectory Id="TARGETDIR">
+      <Directory Id="NRRUSERPROGRAMS" Name="NrrUserPrograms" />
+      <Directory Id="NRRUSERDESKTOP" Name="NrrUserDesktop" />
     </StandardDirectory>
 
     <Feature Id="Main" Title="NetRuleRouter">
       <ComponentGroupRef Id="PackageFiles" />
+      <!-- Written by scripts\package-windows.ps1 from the package's docs folder. -->
+      <ComponentGroupRef Id="DocsFiles" />
     </Feature>
+
+    <!-- The choices of the installation this one replaces, as SetupChoices
+         wrote them ("state1" or "state"). -->
+    <Property Id="NRR_PREV_FOLDER">
+      <RegistrySearch Id="NrrPrevFolder" Root="HKLM" Key="SOFTWARE\NetRuleRouter\Setup" Name="Folder" Type="raw" />
+    </Property>
+    <Property Id="NRR_PREV_TUI">
+      <RegistrySearch Id="NrrPrevTui" Root="HKLM" Key="SOFTWARE\NetRuleRouter\Setup" Name="Tui" Type="raw" />
+    </Property>
+    <Property Id="NRR_PREV_DOCS">
+      <RegistrySearch Id="NrrPrevDocs" Root="HKLM" Key="SOFTWARE\NetRuleRouter\Setup" Name="Docs" Type="raw" />
+    </Property>
+    <Property Id="NRR_PREV_DESKTOP">
+      <RegistrySearch Id="NrrPrevDesktop" Root="HKLM" Key="SOFTWARE\NetRuleRouter\Setup" Name="Desktop" Type="raw" />
+    </Property>
+    <Property Id="NRR_PREV_PATH">
+      <RegistrySearch Id="NrrPrevPath" Root="HKLM" Key="SOFTWARE\NetRuleRouter\Setup" Name="Path" Type="raw" />
+    </Property>
+    <Property Id="NRR_PREV_INSTALL_FOR">
+      <RegistrySearch Id="NrrPrevInstallFor" Root="HKLM" Key="SOFTWARE\NetRuleRouter\Setup" Name="InstallFor" Type="raw" />
+    </Property>
+    <Property Id="NRR_PREV_USER_PROGRAMS">
+      <RegistrySearch Id="NrrPrevUserPrograms" Root="HKLM" Key="SOFTWARE\NetRuleRouter\Setup" Name="UserPrograms" Type="raw" />
+    </Property>
+    <Property Id="NRR_PREV_USER_DESKTOP">
+      <RegistrySearch Id="NrrPrevUserDesktop" Root="HKLM" Key="SOFTWARE\NetRuleRouter\Setup" Name="UserDesktop" Type="raw" />
+    </Property>
+    <!-- Explorer's expanded paths of the installing person's folders, a
+         OneDrive desktop included. -->
+    <Property Id="NRR_HKCU_PROGRAMS">
+      <RegistrySearch Id="NrrHkcuPrograms" Root="HKCU" Key="Software\Microsoft\Windows\CurrentVersion\Explorer\Shell Folders" Name="Programs" Type="raw" />
+    </Property>
+    <Property Id="NRR_HKCU_DESKTOP">
+      <RegistrySearch Id="NrrHkcuDesktop" Root="HKCU" Key="Software\Microsoft\Windows\CurrentVersion\Explorer\Shell Folders" Name="Desktop" Type="raw" />
+    </Property>
+    <!-- Windows Installer keeps per-user parts with the account that started
+         msiexec even when an administrator's credentials elevated it, so "me"
+         is that account, and the wizard names it ([LogonUser]). -->
+    <Property Id="NRR_INSTALL_FOR" Secure="yes" />
+    <Property Id="NRR_USER_PROGRAMS" Secure="yes" />
+    <Property Id="NRR_USER_DESKTOP" Secure="yes" />
+    <Property Id="NRR_TUI" Secure="yes" />
+    <Property Id="NRR_DOCS" Secure="yes" />
+    <Property Id="NRR_DESKTOP_SHORTCUT" Secure="yes" />
+    <Property Id="NRR_ADD_TO_PATH" Secure="yes" />
+    <!-- Set once the wizard has run: its unticked boxes reach the elevated
+         half as unset properties, which must not read as "not given". -->
+    <Property Id="NRR_UI_RAN" Secure="yes" />
+
+    <!-- A choice not given takes the earlier installation's, else its default;
+         0 then means unset, as an unticked box leaves it. [NRR_UNSET] is never
+         set: it formats to nothing, which removes the property. -->
+    <SetProperty Id="INSTALLFOLDER" Action="SetNrrFolderFromPrev" Sequence="both" After="AppSearch"
+                 Condition="NRR_PREV_FOLDER AND NOT INSTALLFOLDER AND NOT NRR_UI_RAN" Value="[NRR_PREV_FOLDER]" />
+    <SetProperty Id="NRR_TUI" Action="SetNrrTuiDefault" Sequence="both" After="SetNrrFolderFromPrev"
+                 Condition="NOT NRR_TUI AND NOT NRR_UI_RAN AND (NOT NRR_PREV_TUI OR NRR_PREV_TUI=&quot;state1&quot;)" Value="1" />
+    <SetProperty Id="NRR_DOCS" Action="SetNrrDocsDefault" Sequence="both" After="SetNrrTuiDefault"
+                 Condition="NOT NRR_DOCS AND NOT NRR_UI_RAN AND (NOT NRR_PREV_DOCS OR NRR_PREV_DOCS=&quot;state1&quot;)" Value="1" />
+    <SetProperty Id="NRR_DESKTOP_SHORTCUT" Action="SetNrrDesktopDefault" Sequence="both" After="SetNrrDocsDefault"
+                 Condition="NOT NRR_DESKTOP_SHORTCUT AND NOT NRR_UI_RAN AND NRR_PREV_DESKTOP=&quot;state1&quot;" Value="1" />
+    <SetProperty Id="NRR_ADD_TO_PATH" Action="SetNrrPathDefault" Sequence="both" After="SetNrrDesktopDefault"
+                 Condition="NOT NRR_ADD_TO_PATH AND NOT NRR_UI_RAN AND NRR_PREV_PATH=&quot;state1&quot;" Value="1" />
+    <SetProperty Id="NRR_TUI" Action="SetNrrTuiOff" Sequence="both" After="SetNrrPathDefault"
+                 Condition="NRR_TUI=&quot;0&quot;" Value="[NRR_UNSET]" />
+    <SetProperty Id="NRR_DOCS" Action="SetNrrDocsOff" Sequence="both" After="SetNrrTuiOff"
+                 Condition="NRR_DOCS=&quot;0&quot;" Value="[NRR_UNSET]" />
+    <SetProperty Id="NRR_DESKTOP_SHORTCUT" Action="SetNrrDesktopOff" Sequence="both" After="SetNrrDocsOff"
+                 Condition="NRR_DESKTOP_SHORTCUT=&quot;0&quot;" Value="[NRR_UNSET]" />
+    <SetProperty Id="NRR_ADD_TO_PATH" Action="SetNrrPathOff" Sequence="both" After="SetNrrDesktopOff"
+                 Condition="NRR_ADD_TO_PATH=&quot;0&quot;" Value="[NRR_UNSET]" />
+    <SetProperty Id="NRR_UI_RAN" Sequence="ui" Before="ExecuteAction" Value="1" />
+
+    <!-- "all" unless given or chosen before; any spelling of all or me. -->
+    <SetProperty Id="NRR_INSTALL_FOR" Action="SetNrrInstallForFromPrev" Sequence="both" After="SetNrrPathOff"
+                 Condition="NOT NRR_INSTALL_FOR AND NOT NRR_UI_RAN AND NRR_PREV_INSTALL_FOR" Value="[NRR_PREV_INSTALL_FOR]" />
+    <SetProperty Id="NRR_INSTALL_FOR" Action="SetNrrInstallForAll" Sequence="both" After="SetNrrInstallForFromPrev"
+                 Condition="NOT NRR_INSTALL_FOR OR NRR_INSTALL_FOR~=&quot;all&quot;" Value="all" />
+    <SetProperty Id="NRR_INSTALL_FOR" Action="SetNrrInstallForMe" Sequence="both" After="SetNrrInstallForAll"
+                 Condition="NRR_INSTALL_FOR~=&quot;me&quot;" Value="me" />
+    <?if $(var.Variant) = "full" ?>
+      <!-- The page's radio buttons need a listed default (ICE34), so they hold
+           a copy that its Next hands back. -->
+      <Property Id="NRR_INSTALL_FOR_CHOICE" Value="all" />
+      <SetProperty Id="NRR_INSTALL_FOR_CHOICE" Sequence="ui" After="SetNrrInstallForMe"
+                   Condition="NRR_INSTALL_FOR=&quot;me&quot;" Value="me" />
+    <?else?>
+      <!-- No shortcuts, and the PATH entry is the machine's, as in the EXE. -->
+      <SetProperty Id="NRR_INSTALL_FOR" Action="SetNrrInstallForHeadless" Sequence="both" After="SetNrrInstallForMe"
+                   Condition="NRR_INSTALL_FOR=&quot;me&quot;" Value="all" />
+    <?endif?>
+    <!-- Removal goes back to the folders the shortcuts were made in, whoever
+         removes; the wizard's own lookup, made as the installing person, wins
+         over the elevated half's. -->
+    <SetProperty Id="NRR_USER_PROGRAMS" Action="SetNrrUserProgramsFromPrev" Sequence="both" After="SetNrrInstallForMe"
+                 Condition="Installed AND NRR_PREV_USER_PROGRAMS" Value="[NRR_PREV_USER_PROGRAMS]" />
+    <SetProperty Id="NRR_USER_PROGRAMS" Action="SetNrrUserProgramsFound" Sequence="both" After="SetNrrUserProgramsFromPrev"
+                 Condition="NOT NRR_USER_PROGRAMS AND NRR_HKCU_PROGRAMS" Value="[NRR_HKCU_PROGRAMS]" />
+    <SetProperty Id="NRR_USER_PROGRAMS" Action="SetNrrUserProgramsDefault" Sequence="both" After="SetNrrUserProgramsFound"
+                 Condition="NOT NRR_USER_PROGRAMS" Value="[AppDataFolder]Microsoft\Windows\Start Menu\Programs" />
+    <SetProperty Id="NRR_USER_DESKTOP" Action="SetNrrUserDesktopFromPrev" Sequence="both" After="SetNrrUserProgramsDefault"
+                 Condition="Installed AND NRR_PREV_USER_DESKTOP" Value="[NRR_PREV_USER_DESKTOP]" />
+    <SetProperty Id="NRR_USER_DESKTOP" Action="SetNrrUserDesktopFound" Sequence="both" After="SetNrrUserDesktopFromPrev"
+                 Condition="NOT NRR_USER_DESKTOP AND NRR_HKCU_DESKTOP" Value="[NRR_HKCU_DESKTOP]" />
+    <SetDirectory Id="NRRUSERPROGRAMS" Sequence="both" Value="[NRR_USER_PROGRAMS]\" />
+    <SetDirectory Id="NRRUSERDESKTOP" Sequence="both" Condition="NRR_USER_DESKTOP" Value="[NRR_USER_DESKTOP]\" />
+    <CustomAction Id="NrrInstallForRefused" Error="!(loc.NrrInstallForRefused)" />
+
+    <!-- Inside Program Files and below it, never Program Files itself nor the
+         folder a portable install copies the service to. -->
+    <SetProperty Id="NRR_SERVICE_COPY_FOLDER" Sequence="both" After="SetNrrUserDesktopFound"
+                 Value="[ProgramFiles64Folder]NetRuleRouter Service\" />
+    <!-- A processing instruction is not unescaped: the operators stay raw. "\.."
+         would climb out of Program Files. -->
+    <?define FolderRefused = "NOT ((INSTALLFOLDER ~<< ProgramFiles64Folder AND NOT INSTALLFOLDER ~= ProgramFiles64Folder) OR (INSTALLFOLDER ~<< ProgramFilesFolder AND NOT INSTALLFOLDER ~= ProgramFilesFolder)) OR INSTALLFOLDER ~= NRR_SERVICE_COPY_FOLDER OR INSTALLFOLDER >< NRR_PARENT_STEP" ?>
+    <Property Id="NRR_PARENT_STEP" Value="\.." />
+    <CustomAction Id="NrrFolderRefused" Error="!(loc.NrrFolderRefused)" />
+
+    <!-- Restart Manager cannot close the window's and the tray's launchers,
+         which have no window, nor a service that restarts after an unasked
+         stop, so it would stop and ask. The steps below close them instead. -->
+    <Property Id="MSIRESTARTMANAGERCONTROL" Value="Disable" />
+
+    <!-- Before the files-in-use check, as the installing user: that user's
+         window and tray, from the installed script. -->
+    <SetProperty Id="WixQuietExecCmdLine" Action="SetNrrCloseAppsUser" Sequence="execute" Before="NrrCloseAppsUser"
+                 Condition="Installed OR WIX_UPGRADE_DETECTED"
+                 Value="&quot;$(var.SysDir)WindowsPowerShell\v1.0\powershell.exe&quot; -NoProfile -NonInteractive -ExecutionPolicy Bypass -File &quot;[INSTALLFOLDER]scripts\setup-actions.ps1&quot; -Action CloseApps" />
+    <CustomAction Id="NrrCloseAppsUser" BinaryRef="Wix4UtilCA_$(sys.BUILDARCHSHORT)"
+                  DllEntry="WixQuietExec" Execute="immediate" Return="ignore" />
+    <!-- Elevated, before the service stops and the files go: every session's. -->
+    <SetProperty Id="NrrCloseApps" Sequence="execute" Before="NrrCloseApps"
+                 Condition="REMOVE~=&quot;ALL&quot;"
+                 Value="&quot;$(var.SysDir)WindowsPowerShell\v1.0\powershell.exe&quot; -NoProfile -NonInteractive -ExecutionPolicy Bypass -File &quot;[INSTALLFOLDER]scripts\setup-actions.ps1&quot; -Action CloseApps" />
+    <CustomAction Id="NrrCloseApps" BinaryRef="Wix4UtilCA_$(sys.BUILDARCHSHORT)"
+                  DllEntry="WixQuietExec" Execute="deferred" Impersonate="no" Return="ignore" />
+
+    <!-- The PATH entry names bin, which holds links to the console and the
+         terminal interface only: the program folder's DLLs stay off PATH.
+         The links are made whatever NRR_ADD_TO_PATH says: the app's own
+         "add to PATH" setting registers bin too. -->
+    <SetProperty Id="NrrConsoleLinks" Sequence="execute" Before="NrrConsoleLinks"
+                 Condition="NOT (REMOVE~=&quot;ALL&quot;)"
+                 Value="&quot;$(var.SysDir)WindowsPowerShell\v1.0\powershell.exe&quot; -NoProfile -NonInteractive -ExecutionPolicy Bypass -File &quot;[INSTALLFOLDER]scripts\setup-actions.ps1&quot; -Action ConsoleLinks -Links" />
+    <CustomAction Id="NrrConsoleLinks" BinaryRef="Wix4UtilCA_$(sys.BUILDARCHSHORT)"
+                  DllEntry="WixQuietExec" Execute="deferred" Impersonate="no" Return="ignore" />
+
+    <?if $(var.Variant) = "full" ?>
+      <!-- From the wizard's last page, in the unelevated process that shows
+           it: the window runs as the person who installed, never elevated. -->
+      <Property Id="WIXUI_EXITDIALOGOPTIONALCHECKBOXTEXT" Value="!(loc.NrrLaunch)" />
+      <Property Id="WIXUI_EXITDIALOGOPTIONALCHECKBOX" Value="1" />
+      <Property Id="WixShellExecTarget" Value="[#NetRuleRouterExe]" />
+      <CustomAction Id="NrrLaunch" BinaryRef="Wix4UtilCA_$(sys.BUILDARCHSHORT)"
+                    DllEntry="WixShellExec" Impersonate="yes" Return="ignore" />
+    <?endif?>
 
     <!-- Register: from the installed console, after the files are in place. -->
     <SetProperty Id="NrrRegister" Sequence="execute" Before="NrrRegister"
@@ -149,7 +353,14 @@
                   DllEntry="WixQuietExec" Execute="deferred" Impersonate="yes" Return="ignore" />
 
     <InstallExecuteSequence>
+      <Custom Action="NrrFolderRefused" After="CostFinalize"
+              Condition="NOT Installed AND ($(var.FolderRefused))" />
+      <Custom Action="NrrInstallForRefused" Before="NrrFolderRefused"
+              Condition="NOT Installed AND NOT (NRR_INSTALL_FOR=&quot;all&quot; OR NRR_INSTALL_FOR=&quot;me&quot;)" />
+      <Custom Action="NrrCloseAppsUser" After="NrrFolderRefused" Condition="Installed OR WIX_UPGRADE_DETECTED" />
+      <Custom Action="NrrCloseApps" After="InstallInitialize" Condition="REMOVE~=&quot;ALL&quot;" />
       <Custom Action="NrrMarkStop" Before="StopServices" Condition="Installed" />
+      <Custom Action="NrrConsoleLinks" After="NrrRegister" Condition="NOT (REMOVE~=&quot;ALL&quot;)" />
       <Custom Action="NrrRegisterRollback" Before="NrrRegister"
               Condition="NOT (REMOVE~=&quot;ALL&quot;)" />
       <Custom Action="NrrProvision" After="InstallFiles"
@@ -168,6 +379,8 @@
       <Files Include="!(bindpath.pkg)\**">
         <Exclude Files="!(bindpath.pkg)\.nrr-package" />
         <Exclude Files="!(bindpath.pkg)\nrr-service.exe" />
+        <Exclude Files="!(bindpath.pkg)\nrr-tui.exe" />
+        <Exclude Files="!(bindpath.pkg)\docs\**" />
         <?if $(var.Variant) = "full" ?>
           <Exclude Files="!(bindpath.pkg)\NetRuleRouter.exe" />
         <?endif?>
@@ -179,18 +392,323 @@
         <ServiceControl Id="StopNrrService" Name="NetRuleRouter" Stop="both" Wait="yes" />
       </Component>
 
+      <!-- The console stays: removal, repair and network recovery run it. -->
+      <Component Id="TerminalInterface" Condition="NRR_TUI=&quot;1&quot;">
+        <File Id="NrrTuiExe" Source="!(bindpath.pkg)\nrr-tui.exe" KeyPath="yes" />
+      </Component>
+
       <?if $(var.Variant) = "full" ?>
         <Component>
-          <File Source="!(bindpath.pkg)\NetRuleRouter.exe" KeyPath="yes">
-            <Shortcut Id="StartMenuShortcut" Directory="ProgramMenuFolder" Name="NetRuleRouter"
-                      WorkingDirectory="INSTALLFOLDER" Advertise="no" />
-          </File>
+          <File Id="NetRuleRouterExe" Source="!(bindpath.pkg)\NetRuleRouter.exe" KeyPath="yes" />
+        </Component>
+
+        <!-- Shortcuts and the PATH entry follow NRR_INSTALL_FOR: every
+             account's, kept by an HKLM value, or the installing person's,
+             kept by an HKCU one. An upgrade removes the earlier product
+             first, so a changed choice moves them. ICE38/43/57 take every
+             account's folders for a profile under ALLUSERS=1 too: HKLM is
+             right there. The per-user folders sit under TARGETDIR in the
+             tables so that no RemoveFolder can ever take an empty desktop. -->
+        <Component Id="StartMenuShortcut" Directory="ProgramMenuFolder"
+                   Condition="NOT (NRR_INSTALL_FOR=&quot;me&quot;)">
+          <Shortcut Id="StartMenuShortcut" Name="NetRuleRouter" Target="[#NetRuleRouterExe]"
+                    WorkingDirectory="INSTALLFOLDER" />
+          <RegistryValue Root="HKLM" Key="SOFTWARE\NetRuleRouter\Setup" Name="StartMenuShortcut"
+                         Type="integer" Value="1" KeyPath="yes" />
+        </Component>
+
+        <Component Id="DesktopShortcut" Directory="DesktopFolder"
+                   Condition="NRR_DESKTOP_SHORTCUT=&quot;1&quot; AND NOT (NRR_INSTALL_FOR=&quot;me&quot;)">
+          <Shortcut Id="DesktopShortcut" Name="NetRuleRouter" Target="[#NetRuleRouterExe]"
+                    WorkingDirectory="INSTALLFOLDER" />
+          <RegistryValue Root="HKLM" Key="SOFTWARE\NetRuleRouter\Setup" Name="DesktopShortcut"
+                         Type="integer" Value="1" KeyPath="yes" />
+        </Component>
+
+        <Component Id="UserStartMenuShortcut" Directory="NRRUSERPROGRAMS"
+                   Condition="NRR_INSTALL_FOR=&quot;me&quot;">
+          <Shortcut Id="UserStartMenuShortcut" Name="NetRuleRouter" Target="[#NetRuleRouterExe]"
+                    WorkingDirectory="INSTALLFOLDER" />
+          <RegistryValue Root="HKCU" Key="Software\NetRuleRouter\Setup" Name="StartMenuShortcut"
+                         Type="integer" Value="1" KeyPath="yes" />
+        </Component>
+
+        <Component Id="UserDesktopShortcut" Directory="NRRUSERDESKTOP"
+                   Condition="NRR_DESKTOP_SHORTCUT=&quot;1&quot; AND NRR_INSTALL_FOR=&quot;me&quot; AND NRR_USER_DESKTOP">
+          <Shortcut Id="UserDesktopShortcut" Name="NetRuleRouter" Target="[#NetRuleRouterExe]"
+                    WorkingDirectory="INSTALLFOLDER" />
+          <RegistryValue Root="HKCU" Key="Software\NetRuleRouter\Setup" Name="DesktopShortcut"
+                         Type="integer" Value="1" KeyPath="yes" />
         </Component>
       <?endif?>
+
+      <Component Id="ConsoleOnPath" Condition="NRR_ADD_TO_PATH=&quot;1&quot; AND NOT (NRR_INSTALL_FOR=&quot;me&quot;)">
+        <Environment Id="NrrPath" Name="PATH" Value="[INSTALLFOLDER]bin" Part="last" Action="set"
+                     System="yes" Permanent="no" />
+        <RegistryValue Root="HKLM" Key="SOFTWARE\NetRuleRouter\Setup" Name="ConsoleOnPath"
+                       Type="integer" Value="1" KeyPath="yes" />
+      </Component>
+
+      <Component Id="ConsoleOnUserPath" Condition="NRR_ADD_TO_PATH=&quot;1&quot; AND NRR_INSTALL_FOR=&quot;me&quot;">
+        <Environment Id="NrrUserPath" Name="PATH" Value="[INSTALLFOLDER]bin" Part="last" Action="set"
+                     System="no" Permanent="no" />
+        <RegistryValue Root="HKCU" Key="Software\NetRuleRouter\Setup" Name="ConsoleOnPath"
+                       Type="integer" Value="1" KeyPath="yes" />
+      </Component>
+
+      <!-- Read by the app at an account's first start: that account accepted
+           this revision in the wizard and is not asked again. -->
+      <Component Id="AgreementAcceptance" Condition="NRR_AGREEMENT_ACCEPTED_BY">
+        <RegistryKey Root="HKLM" Key="SOFTWARE\NetRuleRouter\Agreement" ForceDeleteOnUninstall="yes">
+          <RegistryValue Name="Version" Type="integer" Value="$(var.AgreementVersion)" KeyPath="yes" />
+          <RegistryValue Name="AcceptedBy" Type="string" Value="[NRR_AGREEMENT_ACCEPTED_BY]" />
+        </RegistryKey>
+      </Component>
+
+      <!-- Read back by the next installation (NRR_PREV_*). -->
+      <Component Id="SetupChoices">
+        <RegistryKey Root="HKLM" Key="SOFTWARE\NetRuleRouter\Setup" ForceDeleteOnUninstall="yes">
+          <RegistryValue Name="Folder" Type="string" Value="[INSTALLFOLDER]" KeyPath="yes" />
+          <RegistryValue Name="Tui" Type="string" Value="state[NRR_TUI]" />
+          <RegistryValue Name="Docs" Type="string" Value="state[NRR_DOCS]" />
+          <RegistryValue Name="Desktop" Type="string" Value="state[NRR_DESKTOP_SHORTCUT]" />
+          <RegistryValue Name="Path" Type="string" Value="state[NRR_ADD_TO_PATH]" />
+          <RegistryValue Name="InstallFor" Type="string" Value="[NRR_INSTALL_FOR]" />
+          <RegistryValue Name="UserPrograms" Type="string" Value="[NRR_USER_PROGRAMS]" />
+          <RegistryValue Name="UserDesktop" Type="string" Value="[NRR_USER_DESKTOP]" />
+        </RegistryKey>
+      </Component>
+
+      <!-- The Apps entry in place of the hidden one: /I opens the wizard on an
+           installed product, and its Remove asks whether to keep the data. -->
+      <Component Id="AppsEntry">
+        <RegistryKey Root="HKLM" Key="SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\NetRuleRouter_msi"
+                     ForceDeleteOnUninstall="yes">
+          <RegistryValue Name="DisplayName" Type="string" Value="NetRuleRouter" KeyPath="yes" />
+          <RegistryValue Name="DisplayVersion" Type="string" Value="$(var.DisplayVersion)" />
+          <RegistryValue Name="Publisher" Type="string" Value="NetRuleRouter" />
+          <RegistryValue Name="Contact" Type="string" Value="fmalkov91@gmail.com" />
+          <RegistryValue Name="DisplayIcon" Type="string" Value="[INSTALLFOLDER]assets\icons\app\app.ico" />
+          <RegistryValue Name="InstallLocation" Type="string" Value="[INSTALLFOLDER]" />
+          <RegistryValue Name="EstimatedSize" Type="integer" Value="$(var.EstimatedSizeKb)" />
+          <RegistryValue Name="UninstallString" Type="string" Value="MsiExec.exe /I[ProductCode]" />
+          <RegistryValue Name="QuietUninstallString" Type="string" Value="MsiExec.exe /X[ProductCode] /qn" />
+          <RegistryValue Name="NoModify" Type="integer" Value="1" />
+          <RegistryValue Name="NoRepair" Type="integer" Value="1" />
+        </RegistryKey>
+      </Component>
 
       <Component Subdirectory="scripts">
         <File Source="$(sys.SOURCEFILEDIR)setup-actions.ps1" KeyPath="yes" />
       </Component>
     </ComponentGroup>
+  </Fragment>
+
+  <!-- WixUI_InstallDir's flow, with its folder page replaced by one that keeps
+       to Program Files and an options page after it. -->
+  <Fragment>
+    <UI Id="NrrUI">
+      <TextStyle Id="WixUI_Font_Normal" FaceName="Tahoma" Size="8" />
+      <TextStyle Id="WixUI_Font_Bigger" FaceName="Tahoma" Size="12" />
+      <TextStyle Id="WixUI_Font_Title" FaceName="Tahoma" Size="9" Bold="yes" />
+      <Property Id="DefaultUIFont" Value="WixUI_Font_Normal" />
+      <Property Id="WIXUI_INSTALLDIR" Value="INSTALLFOLDER" />
+      <Property Id="ARPNOMODIFY" Value="1" />
+
+      <DialogRef Id="BrowseDlg" />
+      <DialogRef Id="DiskCostDlg" />
+      <DialogRef Id="ErrorDlg" />
+      <DialogRef Id="FatalError" />
+      <DialogRef Id="FilesInUse" />
+      <DialogRef Id="MsiRMFilesInUse" />
+      <DialogRef Id="PrepareDlg" />
+      <DialogRef Id="ProgressDlg" />
+      <DialogRef Id="ResumeDlg" />
+      <DialogRef Id="UserExit" />
+
+      <Dialog Id="NrrFolderDlg" Width="370" Height="270" Title="!(loc.InstallDirDlg_Title)">
+        <Control Id="Next" Type="PushButton" X="236" Y="243" Width="56" Height="17" Default="yes" Text="!(loc.WixUINext)" />
+        <Control Id="Back" Type="PushButton" X="180" Y="243" Width="56" Height="17" Text="!(loc.WixUIBack)" />
+        <Control Id="Cancel" Type="PushButton" X="304" Y="243" Width="56" Height="17" Cancel="yes" Text="!(loc.WixUICancel)">
+          <Publish Event="SpawnDialog" Value="CancelDlg" />
+        </Control>
+        <Control Id="Description" Type="Text" X="25" Y="23" Width="280" Height="15" Transparent="yes" NoPrefix="yes"
+                 Text="!(loc.NrrFolderDescription)" />
+        <Control Id="Title" Type="Text" X="15" Y="6" Width="200" Height="15" Transparent="yes" NoPrefix="yes"
+                 Text="{\WixUI_Font_Title}!(loc.NrrFolderTitle)" />
+        <Control Id="BannerBitmap" Type="Bitmap" X="0" Y="0" Width="370" Height="44" TabSkip="no" Text="!(loc.InstallDirDlgBannerBitmap)" />
+        <Control Id="BannerLine" Type="Line" X="0" Y="44" Width="370" Height="0" />
+        <Control Id="BottomLine" Type="Line" X="0" Y="234" Width="370" Height="0" />
+        <Control Id="FolderLabel" Type="Text" X="20" Y="54" Width="330" Height="44" NoPrefix="yes"
+                 Text="!(loc.NrrFolderLabel)" />
+        <Control Id="Folder" Type="PathEdit" X="20" Y="102" Width="320" Height="18" Property="WIXUI_INSTALLDIR" Indirect="yes" />
+        <Control Id="ChangeFolder" Type="PushButton" X="20" Y="124" Width="56" Height="17" Text="!(loc.InstallDirDlgChange)" />
+      </Dialog>
+
+      <?if $(var.Variant) = "full" ?>
+        <Dialog Id="NrrInstallForDlg" Width="370" Height="270" Title="!(loc.InstallDirDlg_Title)">
+          <Control Id="Next" Type="PushButton" X="236" Y="243" Width="56" Height="17" Default="yes" Text="!(loc.WixUINext)" />
+          <Control Id="Back" Type="PushButton" X="180" Y="243" Width="56" Height="17" Text="!(loc.WixUIBack)" />
+          <Control Id="Cancel" Type="PushButton" X="304" Y="243" Width="56" Height="17" Cancel="yes" Text="!(loc.WixUICancel)">
+            <Publish Event="SpawnDialog" Value="CancelDlg" />
+          </Control>
+          <Control Id="Description" Type="Text" X="25" Y="23" Width="280" Height="15" Transparent="yes" NoPrefix="yes"
+                   Text="!(loc.NrrInstallForDescription)" />
+          <Control Id="Title" Type="Text" X="15" Y="6" Width="200" Height="15" Transparent="yes" NoPrefix="yes"
+                   Text="{\WixUI_Font_Title}!(loc.NrrInstallForTitle)" />
+          <Control Id="BannerBitmap" Type="Bitmap" X="0" Y="0" Width="370" Height="44" TabSkip="no" Text="!(loc.InstallDirDlgBannerBitmap)" />
+          <Control Id="BannerLine" Type="Line" X="0" Y="44" Width="370" Height="0" />
+          <Control Id="BottomLine" Type="Line" X="0" Y="234" Width="370" Height="0" />
+          <Control Id="Intro" Type="Text" X="20" Y="52" Width="330" Height="56" NoPrefix="yes"
+                   Text="!(loc.NrrInstallForText)" />
+          <Control Id="Scope" Type="RadioButtonGroup" X="20" Y="112" Width="330" Height="40" Property="NRR_INSTALL_FOR_CHOICE">
+            <RadioButtonGroup Property="NRR_INSTALL_FOR_CHOICE">
+              <RadioButton Value="all" X="0" Y="0" Width="330" Height="17" Text="!(loc.NrrInstallForAll)" />
+              <RadioButton Value="me" X="0" Y="22" Width="330" Height="17" Text="!(loc.NrrInstallForMe)" />
+            </RadioButtonGroup>
+          </Control>
+          <Control Id="Account" Type="Text" X="33" Y="156" Width="317" Height="40" NoPrefix="yes"
+                   Text="!(loc.NrrInstallForAccount)" />
+        </Dialog>
+      <?endif?>
+
+      <Dialog Id="NrrOptionsDlg" Width="370" Height="270" Title="!(loc.InstallDirDlg_Title)">
+        <Control Id="Next" Type="PushButton" X="236" Y="243" Width="56" Height="17" Default="yes" Text="!(loc.WixUINext)" />
+        <Control Id="Back" Type="PushButton" X="180" Y="243" Width="56" Height="17" Text="!(loc.WixUIBack)" />
+        <Control Id="Cancel" Type="PushButton" X="304" Y="243" Width="56" Height="17" Cancel="yes" Text="!(loc.WixUICancel)">
+          <Publish Event="SpawnDialog" Value="CancelDlg" />
+        </Control>
+        <Control Id="Description" Type="Text" X="25" Y="23" Width="280" Height="15" Transparent="yes" NoPrefix="yes"
+                 Text="!(loc.NrrOptionsDescription)" />
+        <Control Id="Title" Type="Text" X="15" Y="6" Width="200" Height="15" Transparent="yes" NoPrefix="yes"
+                 Text="{\WixUI_Font_Title}!(loc.NrrOptionsTitle)" />
+        <Control Id="BannerBitmap" Type="Bitmap" X="0" Y="0" Width="370" Height="44" TabSkip="no" Text="!(loc.InstallDirDlgBannerBitmap)" />
+        <Control Id="BannerLine" Type="Line" X="0" Y="44" Width="370" Height="0" />
+        <Control Id="BottomLine" Type="Line" X="0" Y="234" Width="370" Height="0" />
+        <?if $(var.Variant) = "full" ?>
+          <Control Id="Always" Type="Text" X="20" Y="54" Width="330" Height="30" NoPrefix="yes"
+                   Text="!(loc.NrrAlwaysFull)" />
+        <?else?>
+          <Control Id="Always" Type="Text" X="20" Y="54" Width="330" Height="30" NoPrefix="yes"
+                   Text="!(loc.NrrAlwaysHeadless)" />
+        <?endif?>
+        <Control Id="Tui" Type="CheckBox" X="20" Y="88" Width="330" Height="17" Property="NRR_TUI" CheckBoxValue="1"
+                 Text="!(loc.NrrTui)" />
+        <Control Id="Docs" Type="CheckBox" X="20" Y="108" Width="330" Height="17" Property="NRR_DOCS" CheckBoxValue="1"
+                 Text="!(loc.NrrDocs)" />
+        <?if $(var.Variant) = "full" ?>
+          <Control Id="Desktop" Type="CheckBox" X="20" Y="128" Width="330" Height="17" Property="NRR_DESKTOP_SHORTCUT" CheckBoxValue="1"
+                   Text="!(loc.NrrDesktop)" />
+        <?endif?>
+        <Control Id="Path" Type="CheckBox" X="20" Y="148" Width="330" Height="17" Property="NRR_ADD_TO_PATH" CheckBoxValue="1"
+                 Text="!(loc.NrrPath)" />
+        <Control Id="PathNote" Type="Text" X="33" Y="166" Width="317" Height="40" NoPrefix="yes"
+                 Text="!(loc.NrrPathNote)"
+                 ShowCondition="NOT (NRR_INSTALL_FOR = &quot;me&quot;)" HideCondition="NRR_INSTALL_FOR = &quot;me&quot;" />
+        <Control Id="PathNoteMe" Type="Text" X="33" Y="166" Width="317" Height="40" NoPrefix="yes"
+                 Text="!(loc.NrrPathNoteMe)"
+                 ShowCondition="NRR_INSTALL_FOR = &quot;me&quot;" HideCondition="NOT (NRR_INSTALL_FOR = &quot;me&quot;)" />
+      </Dialog>
+
+      <!-- Removal from the Apps entry: the default keeps the data, as a silent
+           removal does; the complete choice runs the REMOVEALLDATA steps. -->
+      <Dialog Id="NrrRemoveDlg" Width="370" Height="270" Title="!(loc.InstallDirDlg_Title)">
+        <Control Id="Next" Type="PushButton" X="236" Y="243" Width="56" Height="17" Default="yes" Text="!(loc.WixUINext)" />
+        <Control Id="Back" Type="PushButton" X="180" Y="243" Width="56" Height="17" Text="!(loc.WixUIBack)" />
+        <Control Id="Cancel" Type="PushButton" X="304" Y="243" Width="56" Height="17" Cancel="yes" Text="!(loc.WixUICancel)">
+          <Publish Event="SpawnDialog" Value="CancelDlg" />
+        </Control>
+        <Control Id="Description" Type="Text" X="25" Y="23" Width="280" Height="15" Transparent="yes" NoPrefix="yes"
+                 Text="!(loc.NrrRemoveDescription)" />
+        <Control Id="Title" Type="Text" X="15" Y="6" Width="300" Height="15" Transparent="yes" NoPrefix="yes"
+                 Text="{\WixUI_Font_Title}!(loc.NrrRemoveTitle)" />
+        <Control Id="BannerBitmap" Type="Bitmap" X="0" Y="0" Width="370" Height="44" TabSkip="no" Text="!(loc.InstallDirDlgBannerBitmap)" />
+        <Control Id="BannerLine" Type="Line" X="0" Y="44" Width="370" Height="0" />
+        <Control Id="BottomLine" Type="Line" X="0" Y="234" Width="370" Height="0" />
+        <Control Id="Intro" Type="Text" X="20" Y="52" Width="330" Height="24" NoPrefix="yes"
+                 Text="!(loc.NrrRemoveIntro)" />
+        <Control Id="Mode" Type="RadioButtonGroup" X="20" Y="80" Width="330" Height="40" Property="NRR_REMOVE_MODE">
+          <RadioButtonGroup Property="NRR_REMOVE_MODE">
+            <RadioButton Value="program" X="0" Y="0" Width="330" Height="17" Text="!(loc.NrrRemoveProgram)" />
+            <RadioButton Value="complete" X="0" Y="22" Width="330" Height="17" Text="!(loc.NrrRemoveComplete)" />
+          </RadioButtonGroup>
+        </Control>
+        <Control Id="Note" Type="Text" X="20" Y="124" Width="330" Height="50" NoPrefix="yes"
+                 Text="!(loc.NrrRemoveNote)" />
+        <Control Id="Audit" Type="CheckBox" X="20" Y="178" Width="330" Height="17" Property="NRR_REMOVE_AUDIT" CheckBoxValue="1"
+                 Text="!(loc.NrrRemoveAudit)"
+                 EnableCondition="NRR_REMOVE_MODE = &quot;complete&quot;"
+                 DisableCondition="NRR_REMOVE_MODE &lt;&gt; &quot;complete&quot;" />
+        <Control Id="AuditNote" Type="Text" X="33" Y="196" Width="317" Height="30" NoPrefix="yes"
+                 Text="!(loc.NrrRemoveAuditNote)" />
+      </Dialog>
+
+      <Dialog Id="NrrFolderRefusedDlg" Width="260" Height="110" Title="!(loc.InstallDirDlg_Title)">
+        <Control Id="OK" Type="PushButton" X="102" Y="85" Width="56" Height="17" Default="yes" Cancel="yes" Text="!(loc.WixUIOK)">
+          <Publish Event="EndDialog" Value="Return" />
+        </Control>
+        <Control Id="Text" Type="Text" X="15" Y="12" Width="230" Height="66" NoPrefix="yes" Text="!(loc.NrrFolderRefused)" />
+      </Dialog>
+
+      <Publish Dialog="ExitDialog" Control="Finish" Event="EndDialog" Value="Return" Order="999" />
+      <?if $(var.Variant) = "full" ?>
+        <Publish Dialog="ExitDialog" Control="Finish" Event="DoAction" Value="NrrLaunch" Order="1"
+                 Condition="WIXUI_EXITDIALOGOPTIONALCHECKBOX = 1 AND NOT Installed" />
+      <?endif?>
+
+      <Publish Dialog="WelcomeDlg" Control="Next" Event="NewDialog" Value="LicenseAgreementDlg" Condition="NOT Installed" />
+      <Publish Dialog="WelcomeDlg" Control="Next" Event="NewDialog" Value="VerifyReadyDlg" Condition="Installed AND PATCH" />
+
+      <Publish Dialog="LicenseAgreementDlg" Control="Print" Event="DoAction" Value="WixUIPrintEula_$(sys.BUILDARCHSHORT)" />
+      <Publish Dialog="LicenseAgreementDlg" Control="Back" Event="NewDialog" Value="WelcomeDlg" />
+      <Publish Dialog="LicenseAgreementDlg" Control="Next" Event="NewDialog" Value="NrrFolderDlg" Order="2" Condition="LicenseAccepted = &quot;1&quot;" />
+      <Publish Dialog="LicenseAgreementDlg" Control="Next" Property="NRR_AGREEMENT_ACCEPTED_BY" Value="[UserSID]" Order="1" Condition="LicenseAccepted = &quot;1&quot;" />
+
+      <Publish Dialog="NrrFolderDlg" Control="Back" Event="NewDialog" Value="LicenseAgreementDlg" />
+      <Publish Dialog="NrrFolderDlg" Control="Next" Event="SetTargetPath" Value="[WIXUI_INSTALLDIR]" Order="1" />
+      <Publish Dialog="NrrFolderDlg" Control="Next" Event="SpawnDialog" Value="NrrFolderRefusedDlg" Order="2"
+               Condition="$(var.FolderRefused)" />
+      <?if $(var.Variant) = "full" ?>
+        <Publish Dialog="NrrFolderDlg" Control="Next" Event="NewDialog" Value="NrrInstallForDlg" Order="3"
+                 Condition="NOT ($(var.FolderRefused))" />
+        <Publish Dialog="NrrInstallForDlg" Control="Back" Event="NewDialog" Value="NrrFolderDlg" />
+        <Publish Dialog="NrrInstallForDlg" Control="Next" Property="NRR_INSTALL_FOR" Value="[NRR_INSTALL_FOR_CHOICE]" Order="1" />
+        <Publish Dialog="NrrInstallForDlg" Control="Next" Event="NewDialog" Value="NrrOptionsDlg" Order="2" />
+        <Publish Dialog="NrrOptionsDlg" Control="Back" Event="NewDialog" Value="NrrInstallForDlg" />
+      <?else?>
+        <Publish Dialog="NrrFolderDlg" Control="Next" Event="NewDialog" Value="NrrOptionsDlg" Order="3"
+                 Condition="NOT ($(var.FolderRefused))" />
+        <Publish Dialog="NrrOptionsDlg" Control="Back" Event="NewDialog" Value="NrrFolderDlg" />
+      <?endif?>
+      <Publish Dialog="NrrFolderDlg" Control="ChangeFolder" Property="_BrowseProperty" Value="[WIXUI_INSTALLDIR]" Order="1" />
+      <Publish Dialog="NrrFolderDlg" Control="ChangeFolder" Event="SpawnDialog" Value="BrowseDlg" Order="2" />
+
+      <Publish Dialog="NrrOptionsDlg" Control="Next" Event="NewDialog" Value="VerifyReadyDlg" />
+
+      <Publish Dialog="VerifyReadyDlg" Control="Back" Event="NewDialog" Value="NrrOptionsDlg" Order="1" Condition="NOT Installed" />
+      <Publish Dialog="VerifyReadyDlg" Control="Back" Event="NewDialog" Value="MaintenanceTypeDlg" Order="2"
+               Condition="Installed AND NOT PATCH AND NOT (WixUI_InstallMode = &quot;Remove&quot;)" />
+      <Publish Dialog="VerifyReadyDlg" Control="Back" Event="NewDialog" Value="NrrRemoveDlg" Order="2"
+               Condition="Installed AND NOT PATCH AND WixUI_InstallMode = &quot;Remove&quot;" />
+      <Publish Dialog="VerifyReadyDlg" Control="Back" Event="NewDialog" Value="WelcomeDlg" Order="2" Condition="Installed AND PATCH" />
+
+      <Publish Dialog="MaintenanceWelcomeDlg" Control="Next" Event="NewDialog" Value="MaintenanceTypeDlg" />
+      <Publish Dialog="MaintenanceTypeDlg" Control="RepairButton" Event="NewDialog" Value="VerifyReadyDlg" />
+      <Publish Dialog="MaintenanceTypeDlg" Control="RemoveButton" Event="NewDialog" Value="NrrRemoveDlg" />
+      <Publish Dialog="MaintenanceTypeDlg" Control="Back" Event="NewDialog" Value="MaintenanceWelcomeDlg" />
+
+      <!-- "{}" clears a property: going back and choosing again undoes the earlier choice. -->
+      <Publish Dialog="NrrRemoveDlg" Control="Back" Event="NewDialog" Value="MaintenanceTypeDlg" />
+      <Publish Dialog="NrrRemoveDlg" Control="Next" Property="REMOVEALLDATA" Value="1" Order="1"
+               Condition="NRR_REMOVE_MODE = &quot;complete&quot;" />
+      <Publish Dialog="NrrRemoveDlg" Control="Next" Property="REMOVEALLDATA" Value="{}" Order="2"
+               Condition="NOT (NRR_REMOVE_MODE = &quot;complete&quot;)" />
+      <Publish Dialog="NrrRemoveDlg" Control="Next" Property="REMOVEAUDIT" Value="1" Order="3"
+               Condition="NRR_REMOVE_MODE = &quot;complete&quot; AND NRR_REMOVE_AUDIT = &quot;1&quot;" />
+      <Publish Dialog="NrrRemoveDlg" Control="Next" Property="REMOVEAUDIT" Value="{}" Order="4"
+               Condition="NOT (NRR_REMOVE_MODE = &quot;complete&quot; AND NRR_REMOVE_AUDIT = &quot;1&quot;)" />
+      <Publish Dialog="NrrRemoveDlg" Control="Next" Event="NewDialog" Value="VerifyReadyDlg" Order="5" />
+    </UI>
+    <UIRef Id="WixUI_Common" />
   </Fragment>
 </Wix>

@@ -120,13 +120,15 @@ pub(crate) struct RememberedBooks {
     rules_provider: Arc<dyn RulesProvider>,
     /// Moves whenever an input the books are made of moves.
     books_stamp: Arc<dyn Fn() -> u64 + Send + Sync>,
-    books: Mutex<HashMap<String, BookMemo>>,
+    books: Arc<Mutex<HashMap<String, BookMemo>>>,
 }
 
 struct BookMemo {
     stamp: u64,
     read_at: Instant,
     book: Option<Arc<RememberedBook>>,
+    /// A safety re-read runs beside the queries; at most one per user.
+    refreshing: bool,
 }
 
 /// One user's book, its secondary rules indexed by name once per change.
@@ -164,7 +166,8 @@ impl RememberedBook {
 }
 
 /// How long a remembered book is trusted with no event: a change that moves
-/// no counter (a setting written beside the books) shows within this.
+/// no counter (a setting written beside the books) shows within this plus
+/// one read of the store.
 const BOOK_MEMO_TTL: Duration = Duration::from_secs(2);
 
 impl RememberedBooks {
@@ -172,32 +175,44 @@ impl RememberedBooks {
         Self {
             rules_provider,
             books_stamp: Arc::new(crate::production_rules_provider::books_stamp),
-            books: Mutex::new(HashMap::new()),
+            books: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
     pub(crate) fn set_books_stamp(&mut self, stamp: Arc<dyn Fn() -> u64 + Send + Sync>) {
         self.books_stamp = stamp;
         self.books
-            .get_mut()
+            .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .clear();
     }
 
-    /// `principal`'s book: remembered while the stamp holds and the memo is
-    /// young, else read once and remembered.
+    /// `principal`'s book: remembered while the stamp holds, else read once
+    /// and remembered. A memo past its age still answers while it is re-read
+    /// beside the query: the read waits on the store's lock.
     pub(crate) fn book_of(&self, principal: &str) -> Option<Arc<RememberedBook>> {
+        self.book_of_at(principal, Instant::now())
+    }
+
+    fn book_of_at(&self, principal: &str, now: Instant) -> Option<Arc<RememberedBook>> {
         let stamp = (self.books_stamp)();
-        let now = Instant::now();
-        if let Some(memo) = self
-            .books
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .get(principal)
-        {
-            if memo.stamp == stamp && now.duration_since(memo.read_at) < BOOK_MEMO_TTL {
-                return memo.book.clone();
+        let refresh = {
+            let mut books = self.books.lock().unwrap_or_else(PoisonError::into_inner);
+            match books.get_mut(principal) {
+                Some(memo) if memo.stamp == stamp => {
+                    let due = now.saturating_duration_since(memo.read_at) >= BOOK_MEMO_TTL
+                        && !memo.refreshing;
+                    memo.refreshing |= due;
+                    Some((memo.book.clone(), due))
+                }
+                _ => None,
             }
+        };
+        if let Some((book, due)) = refresh {
+            if due {
+                self.refresh_in_background(principal, stamp, now);
+            }
+            return book;
         }
         // Read with the memo unlocked: a hit for another user does not wait
         // on this read.
@@ -216,9 +231,63 @@ impl RememberedBooks {
                 stamp,
                 read_at: now,
                 book: book.clone(),
+                refreshing: false,
             },
         );
         book
+    }
+
+    /// Re-read `principal`'s book as of `asked` on a worker. The memo is
+    /// replaced only if nothing newer took its place meanwhile.
+    fn refresh_in_background(&self, principal: &str, stamp: u64, asked: Instant) {
+        /// Clears the flag however the worker ends: left set, the book would
+        /// never be re-read again until the stamp moves.
+        struct Done {
+            books: Arc<Mutex<HashMap<String, BookMemo>>>,
+            principal: String,
+            stamp: u64,
+        }
+        impl Drop for Done {
+            fn drop(&mut self) {
+                let mut books = self.books.lock().unwrap_or_else(PoisonError::into_inner);
+                if let Some(memo) = books.get_mut(&self.principal) {
+                    if memo.stamp == self.stamp {
+                        memo.refreshing = false;
+                    }
+                }
+            }
+        }
+        let rules_provider = Arc::clone(&self.rules_provider);
+        let done = Done {
+            books: Arc::clone(&self.books),
+            principal: principal.to_owned(),
+            stamp,
+        };
+        let spawned = std::thread::Builder::new()
+            .name("nrr-dns-book-refresh".into())
+            .spawn(move || {
+                let book = rules_provider
+                    .active_rules_for(&done.principal)
+                    .map(|s| Arc::new(RememberedBook::new(s.rule_book)));
+                let mut books = done.books.lock().unwrap_or_else(PoisonError::into_inner);
+                if let Some(memo) = books.get_mut(&done.principal) {
+                    if memo.stamp == done.stamp && memo.read_at < asked {
+                        memo.book = book;
+                        memo.read_at = asked;
+                    }
+                }
+                drop(books);
+                drop(done);
+            });
+        // A failed spawn drops the closure and its `Done`: the next query
+        // tries again, answered by the remembered book meanwhile.
+        if let Err(e) = spawned {
+            tracing::warn!(
+                target: "nrr::dns-resolver",
+                error = %e,
+                "could not start the rule-book re-read; the remembered book stays in use",
+            );
+        }
     }
 }
 

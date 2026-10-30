@@ -685,15 +685,16 @@ fn raw_locale_map(locale: &str) -> BTreeMap<String, String> {
             }
         }
     }
-    let path = workspace_root()
-        .join("locales")
-        .join(format!("{locale}.json"));
-    let raw = fs::read_to_string(&path)
-        .unwrap_or_else(|error| panic!("failed to read '{}': {error}", path.display()));
-    let parsed = serde_json::from_str::<Value>(raw.trim_start_matches('\u{feff}'))
-        .unwrap_or_else(|error| panic!("failed to parse '{}': {error}", path.display()));
+    // The tray file is part of the language: the window reads both.
     let mut map = BTreeMap::new();
-    flatten(&parsed, "", &mut map);
+    for file in [format!("{locale}.json"), format!("tray/{locale}.json")] {
+        let path = workspace_root().join("locales").join(file);
+        let raw = fs::read_to_string(&path)
+            .unwrap_or_else(|error| panic!("failed to read '{}': {error}", path.display()));
+        let parsed = serde_json::from_str::<Value>(raw.trim_start_matches('\u{feff}'))
+            .unwrap_or_else(|error| panic!("failed to parse '{}': {error}", path.display()));
+        flatten(&parsed, "", &mut map);
+    }
     map
 }
 
@@ -1003,14 +1004,18 @@ fn visit_locale_node(
     }
 }
 
+/// The main locale files and the tray files beside them.
 fn locale_files() -> Vec<PathBuf> {
-    let directory = workspace_root().join("locales");
-    let mut files = fs::read_dir(&directory)
-        .unwrap_or_else(|error| {
-            panic!(
-                "failed to read locales directory '{}': {error}",
-                directory.display()
-            )
+    let main = workspace_root().join("locales");
+    let mut files = [main.clone(), main.join("tray")]
+        .iter()
+        .flat_map(|directory| {
+            fs::read_dir(directory).unwrap_or_else(|error| {
+                panic!(
+                    "failed to read locales directory '{}': {error}",
+                    directory.display()
+                )
+            })
         })
         .filter_map(Result::ok)
         .map(|entry| entry.path())

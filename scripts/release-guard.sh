@@ -99,6 +99,24 @@ if [ -n "$tag" ]; then
       echo "Agreement dated $en_date, the release day."
     fi
   fi
+  case "$version" in
+    *-alpha | *-alpha.*) stage_en="alpha"; stage_ru="альфа" ;;
+    *-beta | *-beta.*) stage_en="beta"; stage_ru="бета" ;;
+    *) stage_en=""; stage_ru="" ;;
+  esac
+  en_stage="$(sed 's/\r$//' "$root/docs/legal/eula.en.md" 2>/dev/null |
+    sed -nE '/^Agreement revision [0-9]+ /{s/.* applies to (.*) builds \(.*/\1/p;q}')"
+  ru_stage="$(sed 's/\r$//' "$root/docs/legal/eula.ru.md" 2>/dev/null |
+    sed -nE '/^Редакция соглашения [0-9]+ /{s/.* стадии (.*) \(.*/\1/p;q}')"
+  if [ -z "$stage_en" ]; then
+    problem "no agreement stage is known for version $version: name it in scripts/release-guard.sh."
+  elif [ "$en_stage" != "$stage_en" ]; then
+    problem "the agreement applies to ${en_stage:-no} builds, but $tag is of stage $stage_en: put the release stage into the headers of docs/legal/eula.en.md and eula.ru.md."
+  elif [ "$ru_stage" != "$stage_ru" ]; then
+    problem "docs/legal/eula.ru.md applies to ${ru_stage:-no} builds, but $tag is of stage $stage_ru: put the release stage into its header."
+  else
+    echo "Agreement written for $stage_en builds."
+  fi
 fi
 
 # ── Which workflows are CI ───────────────────────────────────────────────────

@@ -1611,6 +1611,12 @@ pub const STATE_DB_V82_DDL: &[&str] = &["CREATE TABLE IF NOT EXISTS vpn_gateway_
 pub const STATE_DB_V84_DDL: &[&str] =
     &["UPDATE secondary_block_policy SET kill_switch_strict_shared_ips = 1"];
 
+/// The automatic external-address check is on by default. A stored off cannot
+/// tell a user who switched it off from one who never chose, so every row
+/// turns on once; the user may switch it off again.
+pub const STATE_DB_V85_DDL: &[&str] =
+    &["UPDATE secondary_block_policy SET external_address_auto_check = 1"];
+
 pub const STATE_DB_V83_DDL: &[&str] = &[
     "ALTER TABLE routing_pause_state ADD COLUMN resumes_at_ms INTEGER",
     "ALTER TABLE routing_pause_state ADD COLUMN until_restart INTEGER NOT NULL DEFAULT 0 CHECK(until_restart IN (0, 1))",

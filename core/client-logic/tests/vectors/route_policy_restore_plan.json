@@ -301,7 +301,7 @@
           "leak-protection": "everything",
           "mode": "prefer-secondary-when-available"
         },
-        "service": {},
+        "service": { "secondary": { "stable-id": "B", "display-name": "Tunnel" } },
         "present": []
       },
       "expected": {
@@ -314,6 +314,42 @@
         },
         "applyOnly": [
           "mode"
+        ]
+      }
+    },
+    {
+      "name": "everything with no additional adapter bound is offered together with the binding",
+      "input": {
+        "intent": {
+          "leak-protection": "everything",
+          "secondary": {
+            "stable-id": "B",
+            "display-name": "Tunnel",
+            "user-confirmed": true
+          }
+        },
+        "service": {},
+        "present": [
+          "B"
+        ]
+      },
+      "expected": {
+        "keys": [
+          "leak-protection",
+          "secondary"
+        ],
+        "missing": [],
+        "values": {
+          "leak-protection": "everything",
+          "secondary": {
+            "stable-id": "B",
+            "display-name": "Tunnel",
+            "user-confirmed": true
+          }
+        },
+        "applyOnly": [
+          "leak-protection",
+          "secondary"
         ]
       }
     },
@@ -421,7 +457,7 @@
           "mode": "strict-secondary-fail-closed",
           "kill-switch-enabled": true
         },
-        "service": {},
+        "service": { "secondary": { "stable-id": "B", "display-name": "Tunnel" } },
         "present": []
       },
       "expected": {

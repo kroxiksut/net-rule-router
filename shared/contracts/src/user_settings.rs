@@ -51,6 +51,7 @@ const KEY_SERVICE_INTENT: &str = "service-intent";
 const KEY_ACCEPTED_EULA: &str = "accepted-eula";
 const KEY_MERGE_POLICY: &str = "merge-policy";
 const KEY_WINDOW_PARKED: &str = "window-parked";
+const KEY_RULE_SET_OFFER_ANSWERED: &str = "rule-set-offer-answered";
 const KEY_PRIMARY: &str = "primary";
 const KEY_SECONDARY: &str = "secondary";
 const KEY_WRITTEN: &str = "written";
@@ -103,6 +104,9 @@ pub struct UserSettings {
     /// window parked it (`route-policy`, `stability`, `binding`, the time it
     /// was parked). Only the window writes it; the terminal client shows it.
     pub window_parked: Map<String, Value>,
+    /// The user answered the offer of a rule set made while they had no
+    /// rules, in either client; a full reset clears it.
+    pub rule_set_offer_answered: bool,
     /// Top-level keys this build does not know, written back unchanged.
     pub other: Map<String, Value>,
 }
@@ -118,6 +122,7 @@ impl Default for UserSettings {
             accepted_eula: crate::eula::EULA_NOT_ACCEPTED,
             merge_policy: String::new(),
             window_parked: Map::new(),
+            rule_set_offer_answered: false,
             other: Map::new(),
         }
     }
@@ -257,6 +262,12 @@ impl UserSettings {
             &mine.window_parked,
             &mut changed,
         );
+        adopt(
+            &mut self.rule_set_offer_answered,
+            &base.rule_set_offer_answered,
+            &mine.rule_set_offer_answered,
+            &mut changed,
+        );
         changed |= adopt_map(
             &mut self.service_intent,
             &base.service_intent,
@@ -391,6 +402,12 @@ pub fn parse_user_settings(text: &str) -> Result<UserSettings, String> {
         Some(Value::Object(parked)) => parked,
         Some(_) => return Err(wrong_type(KEY_WINDOW_PARKED, "an object")),
     };
+    // Unlike the keys above, a wrong type here loses nothing worth keeping:
+    // the offer is simply made again.
+    let rule_set_offer_answered = matches!(
+        object.remove(KEY_RULE_SET_OFFER_ANSWERED),
+        Some(Value::Bool(true))
+    );
     let accepted_eula = match object.remove(KEY_ACCEPTED_EULA) {
         None | Some(Value::Null) => crate::eula::EULA_NOT_ACCEPTED,
         Some(value) => value
@@ -407,6 +424,7 @@ pub fn parse_user_settings(text: &str) -> Result<UserSettings, String> {
         accepted_eula,
         merge_policy,
         window_parked,
+        rule_set_offer_answered,
         other: object,
     })
 }
@@ -469,6 +487,9 @@ pub fn format_user_settings(settings: &UserSettings) -> serde_json::Result<Strin
             KEY_WINDOW_PARKED.to_string(),
             Value::Object(settings.window_parked.clone()),
         );
+    }
+    if settings.rule_set_offer_answered {
+        object.insert(KEY_RULE_SET_OFFER_ANSWERED.to_string(), Value::Bool(true));
     }
     // A known key wins over a same-named entry a caller put among the others.
     for (key, value) in &settings.other {
@@ -984,6 +1005,60 @@ mod tests {
         assert_eq!(parse_user_settings(&text).expect("parse").accepted_eula, 2);
         assert!(parse_user_settings(r#"{"accepted-eula":"yes"}"#).is_err());
         assert!(parse_user_settings(r#"{"accepted-eula":-1}"#).is_err());
+    }
+
+    /// The offer of a rule set to a user with no rules is answered once for
+    /// both clients; a value no client writes reads as "not answered", so it
+    /// neither damages the file nor silences the offer.
+    #[test]
+    fn the_rule_set_offer_answer_round_trips_and_garbage_reads_as_unanswered() {
+        let answered = UserSettings {
+            rule_set_offer_answered: true,
+            ..UserSettings::default()
+        };
+        let text = format_user_settings(&answered).expect("format");
+        assert!(
+            parse_user_settings(&text)
+                .expect("parse")
+                .rule_set_offer_answered
+        );
+        assert!(rewritten(&UserSettings::default())
+            .get("rule-set-offer-answered")
+            .is_none());
+        for garbage in [
+            r#""yes""#,
+            "1",
+            "null",
+            "[true]",
+            "{}",
+            "false",
+            r#""true""#,
+        ] {
+            let text =
+                format!(r#"{{"selected-set":"user:home","rule-set-offer-answered":{garbage}}}"#);
+            let read = parse_user_settings(&text)
+                .unwrap_or_else(|e| panic!("{garbage}: the file became unreadable: {e}"));
+            assert!(!read.rule_set_offer_answered, "{garbage}");
+            assert_eq!(read.selected_set, "user:home", "{garbage}");
+        }
+    }
+
+    /// One client answers, another resets: each reaches the file, and a
+    /// client that carried the old value does not undo either.
+    #[test]
+    fn the_rule_set_offer_answer_and_its_reset_both_reach_the_file() {
+        let unanswered = UserSettings::default();
+        let answered = UserSettings {
+            rule_set_offer_answered: true,
+            ..UserSettings::default()
+        };
+        let mut file = unanswered.clone();
+        assert!(file.adopt_changes(&unanswered, &answered));
+        assert!(file.rule_set_offer_answered);
+        assert!(!file.adopt_changes(&unanswered, &unanswered));
+        assert!(file.rule_set_offer_answered);
+        assert!(file.adopt_changes(&answered, &unanswered));
+        assert!(!file.rule_set_offer_answered);
     }
 
     #[test]

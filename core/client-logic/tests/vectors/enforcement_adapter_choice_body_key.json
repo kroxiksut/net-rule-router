@@ -1,0 +1,61 @@
+{
+  "description": "pure.js enforcementAdapterChoiceBodyKey: an adapter-choice notice naming one adapter reads as a sibling to consider, not as several to choose between",
+  "cases": [
+    {
+      "name": "one similar adapter is up",
+      "input": {
+        "count": 1
+      },
+      "expected": "notifications.enforcement.adapter-choice.body-one"
+    },
+    {
+      "name": "several answer to the saved name",
+      "input": {
+        "count": 2
+      },
+      "expected": "notifications.enforcement.adapter-choice.body"
+    },
+    {
+      "name": "many",
+      "input": {
+        "count": 7
+      },
+      "expected": "notifications.enforcement.adapter-choice.body"
+    },
+    {
+      "name": "none named keeps the general wording",
+      "input": {
+        "count": 0
+      },
+      "expected": "notifications.enforcement.adapter-choice.body"
+    },
+    {
+      "name": "three answering",
+      "input": {
+        "count": 3
+      },
+      "expected": "notifications.enforcement.adapter-choice.body"
+    },
+    {
+      "name": "a hundred answering",
+      "input": {
+        "count": 100
+      },
+      "expected": "notifications.enforcement.adapter-choice.body"
+    },
+    {
+      "name": "a foreign tunnel refused alone is still one to consider",
+      "input": {
+        "count": 1
+      },
+      "expected": "notifications.enforcement.adapter-choice.body-one"
+    },
+    {
+      "name": "a large count is not one",
+      "input": {
+        "count": 1001
+      },
+      "expected": "notifications.enforcement.adapter-choice.body"
+    }
+  ]
+}

@@ -1,0 +1,104 @@
+{
+  "description": "pure.js vpnPickerLinkOffer: which running programs are offered as the client of the additional link that just came up, tied to it by a distinctive word of its adapter name",
+  "cases": [
+    {
+      "name": "a VPN client and its helper under one install folder are both tied to its adapter",
+      "input": {
+        "linkName": "Example.net VPN OpenVPN Adapter \u2014 TAP-Windows Adapter V9",
+        "rows": [
+          { "displayName": "Example.net VPN 3.0.exe", "exePath": "C:\\Program Files\\Example.net VPN 3.0\\Example.net VPN 3.0.exe", "running": true, "source": "running-process" },
+          { "displayName": "openvpn.exe", "exePath": "C:\\Program Files\\Example.net VPN 3.0\\OpenVPN\\openvpn.exe", "running": true, "source": "running-process" }
+        ]
+      },
+      "expected": {
+        "name": "Example.net VPN 3.0",
+        "exePaths": [
+          "C:\\Program Files\\Example.net VPN 3.0\\Example.net VPN 3.0.exe",
+          "C:\\Program Files\\Example.net VPN 3.0\\OpenVPN\\openvpn.exe"
+        ]
+      }
+    },
+    {
+      "name": "another vendor's running VPN is not tied: sharing only the word VPN proves nothing",
+      "input": {
+        "linkName": "Example.net VPN Adapter",
+        "rows": [
+          { "displayName": "othervpn.exe", "exePath": "C:\\Program Files\\Other VPN\\othervpn.exe", "running": true, "source": "running-process" }
+        ]
+      },
+      "expected": { "name": "", "exePaths": [] }
+    },
+    {
+      "name": "an installed program that is not running did not raise the link",
+      "input": {
+        "linkName": "Example.net VPN Adapter",
+        "rows": [
+          { "displayName": "Example.net VPN", "exePath": "C:\\Program Files\\Example.net VPN\\client.exe", "running": false, "source": "installed-program" }
+        ]
+      },
+      "expected": { "name": "", "exePaths": [] }
+    },
+    {
+      "name": "an adapter named only by its driver ties nothing",
+      "input": {
+        "linkName": "TAP-Windows Adapter V9",
+        "rows": [
+          { "displayName": "openvpn.exe", "exePath": "C:\\Program Files\\Example.net VPN 3.0\\OpenVPN\\openvpn.exe", "running": true, "source": "running-process" }
+        ]
+      },
+      "expected": { "name": "", "exePaths": [] }
+    },
+    {
+      "name": "a row without a file or a kernel tunnel is never offered",
+      "input": {
+        "linkName": "Example.net Tunnel",
+        "rows": [
+          { "displayName": "Example.net", "exePath": "", "running": true, "source": "installed-program" },
+          { "displayName": "Example.net", "exePath": "C:\\Example.net\\x.exe", "running": true, "source": "kernel-tunnel" }
+        ]
+      },
+      "expected": { "name": "", "exePaths": [] }
+    },
+    {
+      "name": "tied by the folder only, the offer names the program by its file",
+      "input": {
+        "linkName": "Corpsecure Tunnel",
+        "rows": [
+          { "displayName": "helper.EXE", "exePath": " C:\\Program Files\\CorpSecure\\bin\\helper.EXE ", "running": true, "source": "running-process" },
+          { "displayName": "helper.exe", "exePath": "c:\\program files\\corpsecure\\bin\\HELPER.exe", "running": true, "source": "running-process" }
+        ]
+      },
+      "expected": { "name": "helper", "exePaths": [ "C:\\Program Files\\CorpSecure\\bin\\helper.EXE" ] }
+    },
+    {
+      "name": "the tunnel software's own name ties its client to its adapter",
+      "input": {
+        "linkName": "OpenVPN Data Channel Offload",
+        "rows": [
+          { "displayName": "OpenVPNConnect.exe", "exePath": "C:\\Program Files\\OpenVPN Connect\\OpenVPNConnect.exe", "running": true, "source": "running-process" }
+        ]
+      },
+      "expected": { "name": "OpenVPNConnect", "exePaths": [ "C:\\Program Files\\OpenVPN Connect\\OpenVPNConnect.exe" ] }
+    },
+    {
+      "name": "the word tunnel ties nothing",
+      "input": {
+        "linkName": "Example Tunnel",
+        "rows": [
+          { "displayName": "other.exe", "exePath": "C:\\Program Files\\Other Tunnel\\other.exe", "running": true, "source": "running-process" }
+        ]
+      },
+      "expected": { "name": "", "exePaths": [] }
+    },
+    {
+      "name": "no adapter name, no offer",
+      "input": {
+        "linkName": "",
+        "rows": [
+          { "displayName": "client.exe", "exePath": "C:\\Example\\client.exe", "running": true, "source": "running-process" }
+        ]
+      },
+      "expected": { "name": "", "exePaths": [] }
+    }
+  ]
+}

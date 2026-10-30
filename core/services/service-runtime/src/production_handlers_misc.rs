@@ -1593,6 +1593,58 @@ impl MonitoredAdaptersSnapshotProvider {
         self
     }
 
+    /// File an exit the automatic connect-time check observed for `sid`, on
+    /// the adapter holding `local_ip`, exactly as their own check would: the
+    /// next read of the interfaces screens shows it. Runs on the probe's
+    /// thread, once per probe; an address no live adapter holds files nothing.
+    pub fn remember_observed_external(
+        &self,
+        sid: &str,
+        local_ip: std::net::Ipv4Addr,
+        external_ip: std::net::Ipv4Addr,
+    ) {
+        let (source, rows) = self.interface_rows.collect_rows(false);
+        if !source.is_live() {
+            return;
+        }
+        let Some(row) = rows
+            .iter()
+            .find(|row| row.local_ip.trim().parse::<std::net::Ipv4Addr>().ok() == Some(local_ip))
+        else {
+            return;
+        };
+        let Ok(mut cache) = self.last_external.lock() else {
+            return;
+        };
+        self.file_fresh_external(&mut cache, row, &external_ip.to_string(), sid);
+    }
+
+    /// Remember a fresh result for `row` under whoever obtained it, and keep
+    /// it on disk for the traffic screen.
+    fn file_fresh_external(
+        &self,
+        cache: &mut std::collections::HashMap<String, CachedExternalAddress>,
+        row: &nrr_platform_api::InterfaceRouteRow,
+        external_ip: &str,
+        probed_by: &str,
+    ) {
+        cache.insert(
+            external_cache_key(row).to_owned(),
+            CachedExternalAddress {
+                external_ip: external_ip.to_owned(),
+                local_ip: row.local_ip.clone(),
+                probed_by: probed_by.to_owned(),
+            },
+        );
+        // Keyed by `row.name`, the OS friendly name the traffic ledger also
+        // keys on, never by `adapter_name` (a GUID on Windows).
+        if let Some(recorder) = &self.address_recorder {
+            if !row.name.is_empty() && !row.local_ip.is_empty() {
+                recorder.record(&row.name, &row.local_ip, external_ip, now_ms());
+            }
+        }
+    }
+
     /// Learn fresh probe results and replay remembered ones into rows that
     /// have no external address of their own. The replayed note says so —
     /// the row never claims a fresh observation it did not make.
@@ -1629,23 +1681,8 @@ impl MonitoredAdaptersSnapshotProvider {
             }
             let key = external_cache_key(row).to_owned();
             if let Some(ip) = row.observed_facts.external_ip.clone() {
-                cache.insert(
-                    key,
-                    CachedExternalAddress {
-                        external_ip: ip.clone(),
-                        local_ip: row.local_ip.clone(),
-                        probed_by: viewer.unwrap_or_default().to_owned(),
-                    },
-                );
-                // Only a FRESH resolution is persisted. Keyed by `row.name`,
-                // the OS friendly name the traffic ledger also keys on, never
-                // by `adapter_name` (a GUID on Windows); a rename race between
-                // the two enumerations leaves the row unannotated this round.
-                if let Some(recorder) = &self.address_recorder {
-                    if !row.name.is_empty() && !row.local_ip.is_empty() {
-                        recorder.record(&row.name, &row.local_ip, &ip, now_ms());
-                    }
-                }
+                // Only a FRESH resolution is persisted.
+                self.file_fresh_external(&mut cache, row, &ip, viewer.unwrap_or_default());
                 continue;
             }
             // The pair on DISK is what feeds the traffic screen, and it

@@ -149,6 +149,11 @@ need_tool() {
 for tool in tar gzip sha256sum find sort comm awk sed install; do
   need_tool "$tool" "coreutils/findutils/tar/gzip/sed/gawk from the distribution"
 done
+objcopy_bin="${NRR_OBJCOPY:-objcopy}"
+strip_bin="${NRR_STRIP:-strip}"
+need_tool "$objcopy_bin" "Debian/Ubuntu/Astra: apt install binutils (for another architecture: NRR_OBJCOPY)"
+need_tool "$strip_bin" "Debian/Ubuntu/Astra: apt install binutils (for another architecture: NRR_STRIP)"
+need_tool xz "Debian/Ubuntu/Astra: apt install xz-utils; RHEL-like/RED OS: dnf install xz"
 need_tool readelf "Debian/Ubuntu/Astra: apt install binutils; RHEL-like/RED OS: dnf install binutils"
 if [ "$want_deb" -eq 1 ]; then
   need_tool dpkg-deb "apt install dpkg-dev"
@@ -158,9 +163,8 @@ if [ "$want_rpm" -eq 1 ]; then
   need_tool rpmbuild "Debian/Ubuntu/Astra: apt install rpm; RHEL-like/RED OS: dnf install rpm-build"
   need_tool rpm "Debian/Ubuntu/Astra: apt install rpm; RHEL-like/RED OS: dnf install rpm"
 fi
-if [ "$do_build" -eq 1 ]; then
-  need_tool cargo "install Rust through rustup (see docs/en/building-linux.md)"
-fi
+# Always: the offline documentation is built by a workspace tool.
+need_tool cargo "install Rust through rustup (see docs/en/building-linux.md)"
 if [ "${#missing[@]}" -gt 0 ]; then
   echo "package-linux.sh: missing tools:" >&2
   printf '  %s\n' "${missing[@]}" >&2
@@ -180,7 +184,7 @@ case "$version" in
   *[!A-Za-z0-9.+-]*) die "version '$version' has characters a package version cannot carry" ;;
 esac
 package_version="$(nrr_package_version "$version")" ||
-  die "version '$version': dpkg and rpm cannot order its pre-release; use dev, prealpha, alpha[.N], beta[.N] or rc[.N]"
+  die "version '$version': dpkg and rpm cannot order its pre-release; use dev, alpha[.N], beta[.N] or rc[.N]"
 deb_version="$package_version-$release"
 
 commit="unknown"
@@ -285,6 +289,15 @@ $missing"
   nrr_gray "    $artifact: contents checked"
 }
 
+# Debug symbols travel in the symbols archive only: a package that lists them
+# has grown by what no user needs.
+refuse_symbols() {
+  local artifact="$1" listing="$2" found
+  found="$(printf '%s\n' "$listing" | grep -E '(^|/)usr/lib/debug(/|$)|\.debug$' || true)"
+  [ -z "$found" ] || die "$artifact carries debug symbols (they belong in the -symbols archive):
+$found"
+}
+
 # A .deb or .rpm of package $2 holding the sets $4...; $3 is its unit directory.
 check_package() {
   local file="$1" package="$2" unit_dir="$3" listing expected
@@ -294,6 +307,7 @@ check_package() {
     *.rpm) listing="$(rpm -qlp "$file")" ;;
   esac || die "could not list the files of $file"
   expected="$(expected_paths "$unit_dir" "$@")" || die "could not work out what $file must hold"
+  refuse_symbols "$(basename "$file")" "$listing"
   require_contents "$(basename "$file")" "$listing" "$expected
 /usr/share/doc/$package/copyright
 /usr/share/doc/$package/THIRD_PARTY_LICENSES.md"
@@ -304,6 +318,7 @@ check_tarball() {
   local file="$1" stem="$2" listing top expected
   shift 2
   listing="$(tar -tzf "$file" | sed -e "s|^$stem/||" -e 's|/$||')" || die "could not list the files of $file"
+  refuse_symbols "$(basename "$file")" "$listing"
   top="$(expected_paths "" archive)" || die "could not work out what $file must hold"
   expected="$(expected_paths "" "$@")" || die "could not work out what $file must hold"
   require_contents "$(basename "$file")" "$listing" "$top
@@ -441,6 +456,32 @@ normalize_modes() {
   find "$1" -type f ! -perm -u+x -exec chmod 0644 {} +
 }
 
+# Moves the debug info of every executable staged in $1 into the tree $2, where
+# gdb looks for it (usr/lib/debug/<install path>/<name>.debug, and by build id
+# when the linker wrote one), and leaves a link to it in the executable.
+split_symbols() {
+  local root="$1" symbols="$2" file name dest id
+  dest="$symbols/usr/lib/debug$libexec"
+  mkdir -p "$dest"
+  for file in "$root$libexec"/*; do
+    [ -f "$file" ] && [ ! -L "$file" ] || continue
+    readelf -h "$file" >/dev/null 2>&1 || continue
+    name="${file##*/}"
+    "$objcopy_bin" --only-keep-debug "$file" "$dest/$name.debug"
+    "$strip_bin" --strip-debug "$file"
+    "$objcopy_bin" --add-gnu-debuglink="$dest/$name.debug" "$file"
+    chmod 0644 "$dest/$name.debug"
+    if readelf -S -W "$file" | grep -q ' \.debug_'; then
+      die "$file still carries debug info after the split"
+    fi
+    id="$(readelf -n "$file" | sed -n 's/.*Build ID: *\([0-9a-f]\{4,\}\).*/\1/p' | head -n 1)"
+    if [ -n "$id" ]; then
+      mkdir -p "$symbols/usr/lib/debug/.build-id/${id:0:2}"
+      ln -f "$dest/$name.debug" "$symbols/usr/lib/debug/.build-id/${id:0:2}/${id:2}.debug"
+    fi
+  done
+}
+
 write_build_info() {
   cat >"$1" <<EOF
 {
@@ -483,6 +524,8 @@ stage_base() {
     install -m 0644 -T "$text" "$root$libexec/licenses/tappers-${text##*/}"
   done
   write_build_info "$root$libexec/build-info.json"
+  # Beside the binaries, where the window and nrr-tui look for it.
+  cp -R -- "$docs_out" "$root$libexec/docs"
 }
 
 # The window and the tray under their Unix names (BinaryRole::unix_file_name):
@@ -533,14 +576,25 @@ add_package_footprint() {
     die "$unit does not start $NRR_STAGED_SERVICE_BINARY: lib/service-paths.sh and systemd.rs disagree"
 }
 
+# docs/<language>/index.html, for this machine whatever --arch is: the
+# converter runs here. A link that reaches nothing fails the run.
+docs_out="$work/docs"
+nrr_cyan "==> offline documentation"
+(cd "$repo_root" && cargo run --release --locked --quiet -p nrr-docs-html -- --repo "$repo_root" --out "$docs_out") ||
+  die "the offline documentation did not build: a page links to something that is not there (named above)"
+
 base_root="$work/base"
 stage_base "$base_root"
+symbols_base="$work/symbols-base"
+split_symbols "$base_root" "$symbols_base"
 normalize_modes "$base_root"
 staged_roots=("$base_root")
 gui_root=""
 if [ "$headless" -eq 0 ]; then
   gui_root="$work/gui"
   stage_gui "$gui_root"
+  symbols_gui="$work/symbols-gui"
+  split_symbols "$gui_root" "$symbols_gui"
   normalize_modes "$gui_root"
   staged_roots+=("$gui_root")
 fi
@@ -758,8 +812,8 @@ build_rpm() {
   local spec="$work/$package.spec" topdir="$work/rpmbuild-$package" dependency
   mkdir -p "$topdir/tmp"
   {
-    # No debuginfo split and no build-id links: both packages would carry
-    # links for the same binaries. xz, which every supported rpm reads.
+    # No rpm debuginfo package and no build-id links (the symbols archive
+    # holds them; both packages would link the same binaries). xz, which every supported rpm reads.
     echo '%global debug_package %{nil}'
     echo '%global _build_id_links none'
     echo '%global _binary_payload w9.xzdio'
@@ -868,6 +922,11 @@ polkit is recommended: without it only root can make privileged changes.
 
 If the service left this machine without network:
     sudo $libexec/scripts/reset-network.sh
+
+Questions and news (English and Russian): https://t.me/netrulerouter
+Bugs: https://github.com/kroxiksut/net-rule-router/issues - attach the archive
+from nrr-cli diag export. Never report a vulnerability in public; see
+SECURITY.md in the repository.
 EOF
 }
 
@@ -890,6 +949,11 @@ $libexec/build-info.json; приложите этот файл к сообщен
 
 Если служба оставила машину без сети:
     sudo $libexec/scripts/reset-network.sh
+
+Вопросы и новости (на русском и английском): https://t.me/netrulerouter
+Ошибки: https://github.com/kroxiksut/net-rule-router/issues - приложите архив
+из nrr-cli diag export. Об уязвимостях не пишите публично; см. SECURITY.md
+в репозитории.
 EOF
 }
 
@@ -947,6 +1011,42 @@ if [ "$want_tar" -eq 1 ]; then
     check_tarball "$out_dir/$NRR_PRODUCT_NAME_UNIX-$version-linux-$arch.tar.gz" \
       "$NRR_PRODUCT_NAME_UNIX-$version-linux-$arch" base gui
   fi
+fi
+
+# ── Symbols archives ─────────────────────────────────────────────────────────
+
+# One per archive flavour, named after it: the symbols fit only the build whose
+# executables they were taken from.
+build_symbols_archive() {
+  local stem="$1" fits="$2"
+  shift 2
+  local top="$work/symtar/$stem" part file listing
+  mkdir -p "$top"
+  for part in "$@"; do
+    cp -a "$part/." "$top/"
+  done
+  cat >"$top/README.txt" <<TXT
+$NRR_PRODUCT_NAME $version ($arch): debug symbols of the build at revision $commit.
+Not needed to run anything; they only make a crash or a debugger session readable.
+They fit this exact build and no other: $fits.
+
+Install:   sudo tar -xJf <this file> --strip-components=1 -C /
+gdb then finds them under /usr/lib/debug by itself.
+TXT
+  file="$stem.tar.xz"
+  (cd "$work/symtar" && tar --sort=name --owner=0 --group=0 --numeric-owner \
+    --mtime="@$SOURCE_DATE_EPOCH" -cf - "$stem") | xz -9 >"$out_dir/$file"
+  listing="$(tar -tJf "$out_dir/$file")" || die "could not list the files of $file"
+  printf '%s\n' "$listing" | grep -q "^$stem/usr/lib/debug$libexec/.*\.debug\$" ||
+    die "$file holds no symbol file"
+  artifacts+=("$file")
+  nrr_green "    $file"
+}
+
+nrr_cyan "==> symbols archives"
+build_symbols_archive "$NRR_PRODUCT_NAME_UNIX-headless-$version-linux-$arch-symbols"   "the headless archive and the base .deb/.rpm of $version for $arch" "$symbols_base"
+if [ "$headless" -eq 0 ]; then
+  build_symbols_archive "$NRR_PRODUCT_NAME_UNIX-$version-linux-$arch-symbols"     "the full archive and the GUI .deb/.rpm of $version for $arch" "$symbols_base" "$symbols_gui"
 fi
 
 # ── Checksums ────────────────────────────────────────────────────────────────

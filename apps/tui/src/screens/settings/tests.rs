@@ -432,10 +432,10 @@ fn programs_taking_all_their_traffic_is_a_routing_switch_off_by_default() {
     assert_eq!(sent[0]["app-rules-take-all-addresses"], json!(true));
 }
 
-/// The window's "check the external address on connect", off by default, and
-/// turning it on writes that key alone.
+/// The window's "check the external address on connect", on by default, and
+/// switching it off writes that key alone.
 #[test]
-fn the_external_address_check_on_connect_is_a_routing_switch_off_by_default() {
+fn the_external_address_check_on_connect_is_a_routing_switch_on_by_default() {
     let fake = service();
     let mut app = on_settings();
     answer(&mut app, "c2");
@@ -446,7 +446,7 @@ fn the_external_address_check_on_connect_is_a_routing_switch_off_by_default() {
         .into_iter()
         .find(|item| item.id == id)
         .expect("the switch is listed");
-    assert_eq!(item.kind, items::Kind::Toggle(false));
+    assert_eq!(item.kind, items::Kind::Toggle(true));
     answer(&mut app, &format!("i{row}"));
     drain(&mut app, &fake);
 
@@ -456,7 +456,7 @@ fn the_external_address_check_on_connect_is_a_routing_switch_off_by_default() {
         sent[0]["apply-only"],
         json!(["external-address-auto-check"])
     );
-    assert_eq!(sent[0]["external-address-auto-check"], json!(true));
+    assert_eq!(sent[0]["external-address-auto-check"], json!(false));
 }
 
 /// The row is there whatever the adapters are called, says so when
@@ -1069,6 +1069,31 @@ fn the_routing_rows_are_the_shared_decision() {
     }
 }
 
+/// About says where the documentation is, as the window's Help opens it: the
+/// offline page in the reader's language, English where that language has none.
+#[test]
+fn about_points_to_the_documentation_in_the_readers_language() {
+    use nrr_shared::docs_location::DocsIndex;
+    let mut app = on_settings();
+    let texts = texts_en();
+    let en = std::path::PathBuf::from("/opt/nrr/docs/en/index.html");
+    let ru = std::path::PathBuf::from("/opt/nrr/docs/ru/index.html");
+    app.settings.docs = vec![
+        ("en".to_owned(), DocsIndex::Local(en.clone())),
+        ("ru".to_owned(), DocsIndex::Local(ru.clone())),
+    ];
+    let line = |app: &AppState| -> Option<String> {
+        items::items(app, Category::Updates)
+            .iter()
+            .map(|item| item.label.resolve(&texts))
+            .find(|l| l.starts_with("Documentation: "))
+    };
+    app.settings.docs_language = "ru".to_owned();
+    assert_eq!(line(&app), Some(format!("Documentation: {}", ru.display())));
+    app.settings.docs_language = "de".to_owned();
+    assert_eq!(line(&app), Some(format!("Documentation: {}", en.display())));
+}
+
 /// The window's About in words, and the third-party list with each verdict;
 /// a list with nothing shipped shows no heading at all.
 #[test]
@@ -1505,6 +1530,44 @@ fn the_shared_addresses_left_open_are_counted_and_listed_on_demand() {
         .any(|l| l.contains("strictness is reduced")));
 }
 
+/// Virtual-adapter rows recorded while the count was on stay in history but
+/// are neither listed nor summed while it is off.
+#[test]
+fn traffic_hides_virtual_rows_while_the_count_is_off() {
+    let row = |name: &str, role: &str| {
+        json!({ "adapter-key": name, "display-name": name, "role": role,
+                "in-bytes": 4096, "out-bytes": 2048 })
+    };
+    let stats = |count_virtual: bool| {
+        json!({
+            "today": [row("Ethernet", "primary"), row("VMnet8", "virtual")],
+            "session": [], "all-time": [],
+            "settings": { "enabled": true, "count-loopback": false,
+                          "count-virtual": count_virtual, "retention-days": 30 }
+        })
+    };
+    let shown = |count_virtual: bool| {
+        let fake = service();
+        fake.answer(IpcOperationName::TrafficStatsGet, stats(count_virtual));
+        let mut app = on_settings();
+        answer(&mut app, "c7");
+        drain(&mut app, &fake);
+        items::items(&app, Category::Traffic)
+            .iter()
+            .map(|item| item.label.resolve(&texts_en()))
+            .collect::<Vec<_>>()
+            .join(" | ")
+    };
+    let off = shown(false);
+    assert!(!off.contains("VMnet8"), "{off}");
+    assert!(off.contains("Received 4.0 KiB"), "{off}");
+    let on = shown(true);
+    assert!(
+        on.contains("VMnet8") && on.contains("Received 8.0 KiB"),
+        "{on}"
+    );
+}
+
 /// Traffic by route and adapter, the one-time history question answered by
 /// its keys, and the CSV written to a new file only.
 #[test]
@@ -1580,6 +1643,11 @@ fn traffic_names_each_route_answers_the_history_question_and_exports_csv() {
     let last = asked.last().expect("an export read");
     assert_eq!(last["export-unit"], json!("gb"));
     assert_eq!(
+        last["export-include-virtual"],
+        json!(false),
+        "virtual rows stay out of the export unless asked for"
+    );
+    assert_eq!(
         last["export-to-day"].as_i64().unwrap_or_default()
             - last["export-from-day"].as_i64().unwrap_or_default(),
         30,
@@ -1589,6 +1657,16 @@ fn traffic_names_each_route_answers_the_history_question_and_exports_csv() {
     answer(&mut app, &format!("i{export}"));
     drain(&mut app, &fake);
     assert!(said(&app).contains("already exists"), "{}", said(&app));
+
+    let include = row_of(&app, Category::Traffic, ItemId::TrafficExportIncludeVirtual);
+    answer(&mut app, &format!("i{include}"));
+    answer(&mut app, &format!("i{export}"));
+    drain(&mut app, &fake);
+    let asked = fake.sent(IpcOperationName::TrafficStatsGet);
+    assert_eq!(
+        asked.last().expect("an export read")["export-include-virtual"],
+        json!(true)
+    );
 }
 
 /// The DoH/DoT resolver list opens on demand and every change sends the

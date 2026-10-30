@@ -490,6 +490,7 @@ pub(crate) fn build_runtime_deps(
                 Arc::clone(&adapter_source)
                     as Arc<dyn nrr_platform_api::adapters::AdapterEventSource>,
                 liveness.clone(),
+                ipc.adapters_snapshot.clone(),
             )),
             _ => None,
         },
@@ -593,6 +594,11 @@ pub(crate) struct IpcServerParts {
     pub auto_probe: Option<nrr_service_runtime::service_tasks::AutoProbeWiring>,
     /// Ends timed pauses; `None` on the handshake-only fallback.
     pub routing_pause_terms: Option<Arc<nrr_service_runtime::routing_pause::RoutingPauseTerms>>,
+    /// The rows the interfaces screens read; `None` on the handshake-only
+    /// fallback.
+    pub adapters_snapshot: Option<
+        Arc<nrr_service_runtime::production_handlers_misc::MonitoredAdaptersSnapshotProvider>,
+    >,
 }
 
 pub(crate) fn build_ipc_server(
@@ -611,6 +617,7 @@ pub(crate) fn build_ipc_server(
         revision_watch,
         auto_probe,
         routing_pause_terms,
+        adapters_snapshot,
     ) = match stack {
         Some(stack) => {
             let surface = crate::ipc_deps::build_ipc_surface(
@@ -690,6 +697,7 @@ pub(crate) fn build_ipc_server(
                 surface.revision_watch,
                 surface.auto_probe,
                 Some(surface.routing_pause_terms),
+                Some(surface.adapters_snapshot),
             )
         }
         None => {
@@ -706,6 +714,7 @@ pub(crate) fn build_ipc_server(
                 crate::run::serving_registry_with(health, Arc::clone(&event_bus)),
                 Arc::new(nrr_service_runtime::NoopIpcAuditEmitter)
                     as Arc<dyn nrr_service_runtime::IpcAuditEmitter>,
+                None,
                 None,
                 None,
                 None,
@@ -736,6 +745,7 @@ pub(crate) fn build_ipc_server(
         revision_watch,
         auto_probe,
         routing_pause_terms,
+        adapters_snapshot,
     }
 }
 
@@ -899,19 +909,31 @@ fn secondary_external_address(
     served: nrr_service_runtime::secondary_external_address::ServedSidsFn,
     adapters: Arc<dyn nrr_platform_api::adapters::AdapterEventSource>,
     liveness: Option<Arc<SecondaryLivenessTracker>>,
+    interface_rows: Option<
+        Arc<nrr_service_runtime::production_handlers_misc::MonitoredAdaptersSnapshotProvider>,
+    >,
 ) -> nrr_service_runtime::secondary_external_address::ExternalAddressWiring {
     use nrr_service_runtime::secondary_external_address::{
         bound_secondary_link, stored_opt_in, ExternalAddressAnnouncer, ExternalAddressWiring,
-        SecondaryLinkOfFn,
+        SecondaryLink, SecondaryLinkOfFn,
     };
-    let announcer = Arc::new(ExternalAddressAnnouncer::new(
+    let mut announcer = ExternalAddressAnnouncer::new(
         Arc::clone(event_bus),
         Arc::new(|source| {
             nrr_platform_api::probe_external_ipv4_batch(&[source])
                 .first()
                 .and_then(|outcome| outcome.address())
         }),
-    ));
+    );
+    // The interfaces screens show what the check found, unasked.
+    if let Some(rows) = interface_rows {
+        announcer = announcer.with_observed_sink(Arc::new(
+            move |link: &SecondaryLink, address: std::net::Ipv4Addr| {
+                rows.remember_observed_external(&link.sid, link.source_ipv4, address)
+            },
+        ));
+    }
+    let announcer = Arc::new(announcer);
     let link_of: SecondaryLinkOfFn = {
         let conn = Arc::clone(state_conn);
         Arc::new(move |sid: &str| {

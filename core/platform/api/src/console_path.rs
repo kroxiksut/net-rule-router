@@ -146,11 +146,16 @@ pub fn unregister(
 
 /// The folder of `exe`, accepted only with the console beside it: registering
 /// a folder that never gains the program would leave the user a change to
-/// find and undo by hand.
+/// find and undo by hand. An installed copy's `bin` (links to the console and
+/// the terminal UI only) wins: every folder on PATH is a DLL search location.
 pub fn console_directory_beside(exe: &Path) -> Result<PathBuf, String> {
     let dir = exe
         .parent()
         .ok_or_else(|| "the running executable has no parent directory".to_string())?;
+    let links = dir.join("bin");
+    if verify_console_present(&links).is_ok() {
+        return Ok(links);
+    }
     verify_console_present(dir)?;
     Ok(dir.to_path_buf())
 }
@@ -301,5 +306,17 @@ mod tests {
         assert!(err.contains(BinaryRole::Console.host_file_name()), "{err}");
         let found = console_directory_beside(&private.join("nrr-tui")).expect("console there");
         assert_eq!(found, private);
+    }
+
+    /// An installed copy keeps its libraries beside the program; a folder on
+    /// PATH is searched for DLLs by every program, so only `bin` may go there.
+    #[test]
+    fn the_links_folder_is_registered_instead_of_the_program_folder() {
+        let (_root, private) = layout(&[]);
+        let bin = private.join("bin");
+        std::fs::create_dir(&bin).expect("bin dir");
+        std::fs::write(bin.join(BinaryRole::Console.host_file_name()), b"link").expect("link");
+        let found = console_directory_beside(&private.join("nrr-tui")).expect("console there");
+        assert_eq!(found, bin);
     }
 }

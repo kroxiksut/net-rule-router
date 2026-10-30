@@ -151,6 +151,9 @@ pub mod single_instance;
 // tears down TCP flows a restart left pointing at now-dead fake addresses.
 pub mod stale_flows;
 // Local civil-time offset (traffic ledger keys rows by the user's local day).
+/// The agreement accepted on an installer's licence page, as the installer
+/// recorded it.
+pub mod installer_agreement;
 pub mod local_time;
 // A child's missing-DLL failure as an exit code rather than the system's box,
 // and the parent's own error box.

@@ -140,7 +140,7 @@ pub const CONN_TRACE_GROUPING_DEFAULT: &str = "program";
 
 /// Accepted byte units for the traffic CSV export, and the default. Megabytes
 /// read best for a monthly report; the exporter still accepts every slug here.
-pub const TRAFFIC_EXPORT_UNITS: [&str; 4] = ["bytes", "kb", "mb", "gb"];
+pub const TRAFFIC_EXPORT_UNITS: [&str; 5] = ["bytes", "kb", "mb", "gb", "tb"];
 pub const TRAFFIC_EXPORT_UNIT_DEFAULT: &str = "mb";
 
 /// Accepted privacy tiers for the diagnostics support archive, and the
@@ -239,6 +239,9 @@ pub struct UiPreferences {
     /// The one-time offer to route found virtual machines, emulators and
     /// peer-to-peer programs was answered or closed.
     pub app_groups_offer_dismissed: bool,
+    /// The offer of a rule set made while the user had no rules was answered.
+    /// Shared with the terminal client through `user-settings.json`.
+    pub rule_set_offer_answered: bool,
     /// Display toggle: show "remembered but currently absent" ghost rows in
     /// the Interfaces section for confirmed primary/secondary bindings whose
     /// adapter is not among the live adapters (e.g. a VPN TAP that removes
@@ -277,10 +280,13 @@ pub struct UiPreferences {
     /// [`TRAFFIC_STATS_PERIODS`]. Pure device-local UI display state.
     pub traffic_stats_period: String,
     /// Byte unit the traffic CSV export was last written in: `"bytes"`,
-    /// `"kb"`, `"mb"` (default) or `"gb"`. Remembered so a user who works in
+    /// `"kb"`, `"mb"` (default), `"gb"` or `"tb"`. Remembered so a user who works in
     /// one unit does not re-pick it on every export. Pure device-local UI
     /// state; the exporter re-validates the slug and falls back on its own.
     pub traffic_export_unit: String,
+    /// Whether the traffic CSV export carries virtual-adapter rows. Default
+    /// `false`: the export matches what the screen shows. Device-local UI state.
+    pub traffic_export_include_virtual: bool,
     /// How the connection trace list is grouped, one of
     /// [`CONN_TRACE_GROUPINGS`]. Pure device-local UI display state.
     pub conn_trace_group_by: String,

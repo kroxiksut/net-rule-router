@@ -115,6 +115,13 @@ Dialog {
                 "dialog.confirm-activate.checkbox-understand",
                 "I understand the risk and want to proceed"
             )
+            contentItem: Label {
+                text: understandCheckbox.text
+                leftPadding: understandCheckbox.indicator.width + understandCheckbox.spacing
+                color: root.ownerRoot ? root.ownerRoot.textColor : palette.text
+                wrapMode: Text.WordWrap
+                verticalAlignment: Text.AlignVCenter
+            }
             Layout.fillWidth: true
             Accessible.role: Accessible.CheckBox
             Accessible.name: text

@@ -4,6 +4,7 @@
 
 use nrr_client_logic::notice_mutes::{notice_kind_row, MUTABLE_NOTICE_KINDS};
 use nrr_client_logic::routing_settings::{self, RoutingContext};
+use nrr_client_logic::traffic_rows::visible_traffic_rows;
 use nrr_client_logic::units::format_storage_bytes;
 use nrr_client_logic::{route_policy, stability};
 use nrr_platform_api::service_control::{ServiceRunState, ServiceStartMode};
@@ -271,6 +272,7 @@ pub enum ItemId {
     TrafficMerge(bool),
     TrafficExportPath,
     TrafficExportUnit,
+    TrafficExportIncludeVirtual,
     TrafficExport,
     /// The caller's own connection history.
     HistoryEnabled,
@@ -1797,6 +1799,13 @@ fn provider_rows(
         } else {
             v.push(info(Words::Key(p::FOUND_HINT)));
         }
+        if let Some(offer) = p::link_offer(policy, found) {
+            v.push(Item::new(
+                ItemId::Provider(p::ProviderRow::UseOffer),
+                p::offer_label(&offer),
+                Kind::Action { confirm: false },
+            ));
+        }
         for (index, row) in found.iter().enumerate() {
             v.push(
                 if nrr_client_logic::vpn_client_trust::picker_tickable(row) {
@@ -2149,11 +2158,13 @@ fn traffic(app: &AppState) -> Vec<Item> {
             return v;
         }
     };
+    let count_virtual = stats.settings.count_virtual;
     let periods = [
         (t::TRAFFIC_TODAY, &stats.today),
         (t::TRAFFIC_SESSION, &stats.session),
         (t::TRAFFIC_ALL_TIME, &stats.all_time),
-    ];
+    ]
+    .map(|(period, rows)| (period, visible_traffic_rows(rows, count_virtual)));
     if periods.iter().all(|(_, rows)| rows.is_empty()) {
         v.push(info(Words::Key(t::TRAFFIC_NO_DATA)));
     }
@@ -2220,6 +2231,11 @@ fn traffic(app: &AppState) -> Vec<Item> {
         traffic_export_units(),
         app.settings.traffic_export_unit,
     ));
+    v.push(toggle(
+        ItemId::TrafficExportIncludeVirtual,
+        t::TRAFFIC_EXPORT_INCLUDE_VIRTUAL,
+        app.settings.traffic_export_include_virtual,
+    ));
     v.push(action(ItemId::TrafficExport, t::TRAFFIC_EXPORT, false));
     v.push(action(ItemId::TrafficReset, t::TRAFFIC_RESET, true));
     v
@@ -2232,6 +2248,7 @@ pub fn traffic_export_units() -> Vec<Opt> {
         opt("kb", t::UNIT_KB),
         opt("mb", t::UNIT_MB),
         opt("gb", t::UNIT_GB),
+        opt("tb", t::UNIT_TB),
     ]
 }
 
@@ -2284,9 +2301,18 @@ fn about(app: &AppState) -> Vec<Item> {
         fact(t::AUTHOR, Words::Key(t::AUTHOR_NAME)),
         fact(t::AUTHOR_EMAIL, raw(shell.author_email)),
         fact(t::PROJECT, raw(shell.project_url)),
+        fact(t::TELEGRAM_CHANNEL, raw(shell.community_url)),
+    ];
+    // The page the window's Help > Documentation opens, offline when installed.
+    if let Some(docs) =
+        nrr_shared::docs_location::docs_index_in(&app.settings.docs, &app.settings.docs_language)
+    {
+        v.push(fact(t::DOCUMENTATION, raw(display_text(&docs.display()))));
+    }
+    v.extend([
         fact(t::BUILD_CHANNEL, raw(shell.build_channel)),
         info(Words::Key(t::UPDATES_NOTE)),
-    ];
+    ]);
     match &app.settings.data.third_party {
         Loadable::Ready(list) if list.components.is_empty() => {}
         Loadable::Ready(list) => {

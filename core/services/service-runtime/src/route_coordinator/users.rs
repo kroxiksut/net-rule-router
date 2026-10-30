@@ -17,6 +17,8 @@ pub(super) struct UserRoutePlan {
     pub secondary: Option<SecondaryRouteTarget>,
     /// `false` when the plan stopped early: no usable secondary, or no rules.
     pub planned: bool,
+    /// The book did not read: the routes in place stay, whatever they are.
+    pub hold: bool,
     /// The user's foreign tunnels, when the plan read the machine to name them.
     pub foreign: Option<Vec<u32>>,
 }
@@ -45,10 +47,34 @@ impl SecondaryRouteCoordinator {
                 routes: Vec::new(),
                 secondary: None,
                 planned: false,
+                hold: false,
                 foreign: None,
             };
         };
-        let Some(snapshot) = self.rules_provider.active_rules_for(sid) else {
+        use crate::per_sid_orchestrator::RulesRead;
+        let read = match self.rules_provider.rules_read_for(sid) {
+            RulesRead::Rules(snapshot) => Some(snapshot),
+            // Settings but no revision route as an emptied book.
+            RulesRead::NoPolicy if policy.is_some() => {
+                Some(crate::per_sid_orchestrator::ActiveRulesSnapshot::default())
+            }
+            RulesRead::NoPolicy => None,
+            // The last decoded book, if any; with none the owned routes stay
+            // until it reads, as the filters do.
+            RulesRead::Unreadable(_) => match self.rules_provider.active_rules_for(sid) {
+                Some(snapshot) => Some(snapshot),
+                None => {
+                    return UserRoutePlan {
+                        routes: Vec::new(),
+                        secondary: Some(secondary),
+                        planned: false,
+                        hold: true,
+                        foreign: None,
+                    }
+                }
+            },
+        };
+        let Some(snapshot) = read else {
             tracing::info!(
                 target: "nrr::route-coordinator",
                 msg_key = "route-no-active-rules",
@@ -59,6 +85,7 @@ impl SecondaryRouteCoordinator {
                 routes: Vec::new(),
                 secondary: Some(secondary),
                 planned: false,
+                hold: false,
                 foreign: None,
             };
         };
@@ -166,6 +193,7 @@ impl SecondaryRouteCoordinator {
             routes: out.routes,
             secondary: Some(secondary),
             planned: true,
+            hold: false,
             foreign,
         }
     }
@@ -236,7 +264,11 @@ impl SecondaryRouteCoordinator {
                         );
                     }
                     links.push((sid.clone(), plan.secondary.map(|s| s.interface_index)));
-                    plan.routes
+                    if plan.hold {
+                        self.contribution_of(sid)
+                    } else {
+                        plan.routes
+                    }
                 }
                 PausedRouteDisposition::ClearAll => {
                     links.push((sid.clone(), None));

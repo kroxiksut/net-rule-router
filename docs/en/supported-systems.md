@@ -21,16 +21,18 @@ The "Checked" column says how we know it works:
 - **not yet** — should work for the reasons given, and a check on a real
   system is planned.
 
-If you run it somewhere not checked on a machine, an issue saying how it went
-helps more than anything else.
+If you run it somewhere not checked on a machine, a word on how it went helps
+more than anything else: in an
+[issue](https://github.com/kroxiksut/net-rule-router/issues) or in the
+Telegram channel [t.me/netrulerouter](https://t.me/netrulerouter).
 
 ## Windows
 
 | System | Architecture | Variant | Delivered as | Checked |
 |---|---|---|---|---|
 | Windows 11 | x64 | full, or without the window | portable ZIP, EXE installer, MSI | full: on a machine |
-| Windows 10 | x64 | full, or without the window | portable ZIP, EXE installer, MSI | not yet |
-| Windows 11 on ARM | ARM64 | full, or without the window | portable ZIP, EXE installer, MSI | not yet |
+| Windows 10 | x64 | full, or without the window | portable ZIP, EXE installer, MSI | full: on a machine |
+| Windows 11 on ARM | ARM64 | full, or without the window | portable ZIP | not yet |
 | 32-bit Windows | x86 | not supported | — | — |
 
 Installing the background service takes administrator rights once; everyday
@@ -66,8 +68,10 @@ without it.
 Where the system's Qt is older than 6.6, the package manager refuses the
 window's package and names what is missing; install a newer Qt from your
 distribution, or keep the variant without the window (see
-[Linux packages](packaging-linux.md)). The ARM64 packages have not been checked
-on a real system yet; every "on a machine" above is x86_64.
+[Linux packages](packaging-linux.md)). For ARM64 the release carries the
+`.tar.gz` archives only, full and without the window; `.deb` and `.rpm`
+packages for ARM64 come later. No ARM64 build has been checked on a real system
+yet; every "on a machine" above is x86_64.
 
 ## macOS
 

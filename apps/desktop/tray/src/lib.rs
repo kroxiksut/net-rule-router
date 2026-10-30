@@ -9,7 +9,8 @@
 
 use nrr_shared::launcher_rpc::HostAnswerDeadlines;
 use nrr_shared::{
-    load_locale_catalog, resolve_catalog_text, AppAction, FreeRuleType, SetupActionAvailability,
+    load_tray_locale_catalog, resolve_catalog_text, AppAction, FreeRuleType,
+    SetupActionAvailability,
 };
 use nrr_ui_support::theme::resolve_theme;
 use nrr_ui_support::tray::{TrayActionRuntime, TrayRuntimeSnapshot, TrayStatusKind};
@@ -172,6 +173,78 @@ pub struct TrayContextUrls {
     pub logs_folder_url: Option<String>,
 }
 
+/// Words of the main locale files the tray shows: a key, or a family when it
+/// ends in `.`. Words only the tray shows live in `locales/tray/<id>.json`.
+/// `tests/tray_words_resolve.rs` fails on a tray key neither place holds.
+pub const WINDOW_WORDS: &[&str] = &[
+    "action.",
+    "block-reason.",
+    "dialog.leak-holds-now.",
+    "dialog.nothing-to-apply.",
+    "dialog.rule.",
+    "dialog.safe-disable.term.",
+    "dialog.unroutable-secondary.",
+    "errors.",
+    "label.",
+    "mutations.",
+    "notifications.",
+    "risk.signal.invalid-rule-value",
+    "routing.pause.",
+    "rules.app-browse-filter-all",
+    "rules.app-browse-filter-exe",
+    "rules.app-browse-title",
+    "rules.application-folder-scripts",
+    "rules.application-folder-scripts-deny",
+    "rules.application-not-leakproof",
+    "rules.application-routing-note",
+    "rules.application-routing-note-linux",
+    "rules.comment.",
+    "rules.filter.route.",
+    "rules.hint.",
+    "rules.move-to-type.",
+    "rules.overlaps.",
+    "rules.override.left.",
+    "rules.paste.",
+    "rules.placeholder.",
+    "rules.preview-notice",
+    "rules.route.",
+    "rules.suggestions.accept.",
+    "rules.suggestions.inbox.any-zone",
+    "rules.suggestions.inbox.less-certain",
+    "rules.suggestions.less-certain.",
+    "rules.type.",
+    // Whole: the add-rule form shows verdict keys the launcher and the
+    // service name at run time, which no scan of the QML sees.
+    "rules.validation.",
+    "rules.value.",
+    "section.",
+    "settings.routing.doh-lockdown.label",
+    "settings.routing.kill-switch.shared-strict-label",
+    "settings.routing.kill-switch.title",
+    "settings.routing.leak-protection.",
+    "settings.service.recovery.",
+    "status.activate-uac-declined",
+    "status.auto-rules-failed",
+    "status.bridge-unavailable",
+    "status.kill-switch-enabled-failed",
+    "status.protection.",
+    "status.rules-activate-failed",
+    "status.rules-apply-unexpected-diff",
+    "status.rules-list-added",
+    "status.rules-list-moved",
+    "status.rules-serialize-failed",
+    "status.settings-restore-adapter-missing",
+    "status.settings-restore-nothing",
+    "status.settings-restored",
+    // What is left of the family in the main files: the window shows it too.
+    "tray.",
+];
+
+/// The tray's words in `language` and English.
+pub fn tray_locale_catalog(language: &str) -> BTreeMap<String, BTreeMap<String, String>> {
+    load_tray_locale_catalog(language, WINDOW_WORDS)
+}
+
 pub fn write_qt_tray_context_file(
     runtime: &TrayRuntimeSnapshot,
     language: &str,
@@ -180,7 +253,7 @@ pub fn write_qt_tray_context_file(
     rpc_answer_deadlines: HostAnswerDeadlines,
     supported_rule_types: &[FreeRuleType],
 ) -> Result<PathBuf, String> {
-    let locale_catalog = load_locale_catalog();
+    let locale_catalog = tray_locale_catalog(language);
     let status_slug = runtime.status_kind.slug();
     let theme = resolve_theme(preferences.theme_mode);
     let context = TrayContextPayload {
@@ -547,6 +620,116 @@ mod tests {
         let _ = std::fs::remove_file(&path);
         let parsed: serde_json::Value = serde_json::from_str(&raw).expect("context file is JSON");
         assert_eq!(parsed["assetsRootUrl"], "file:///C:/NetRuleRouter/assets");
+    }
+
+    /// The status line and the menu are worded here, from the tray's own
+    /// catalogue: a word the window has and the tray lacks would show raw.
+    #[test]
+    fn the_tray_catalogue_holds_every_word_the_menu_and_status_are_built_from() {
+        use super::*;
+        use nrr_ui_support::tray::{tray_runtime_snapshot, TrayServiceLink};
+
+        let window = nrr_shared::load_locale_state()
+            .catalog
+            .remove("en")
+            .expect("English");
+        let tray = tray_locale_catalog("en").remove("en").expect("English");
+        let shell = nrr_shared::gui_shell_v1();
+        let mut asked = vec![
+            "a11y.tray.preview-only-note".to_string(),
+            setup_state_accessibility_note_key(SetupActionAvailability::Allowed).to_string(),
+            setup_state_accessibility_note_key(SetupActionAvailability::SoftGuided).to_string(),
+            setup_state_accessibility_note_key(
+                SetupActionAvailability::BlockedUntilWizardCompletion,
+            )
+            .to_string(),
+        ];
+        for status in [
+            TrayStatusKind::PreviewMode,
+            TrayStatusKind::CheckingStatus,
+            TrayStatusKind::NoActivePolicy,
+            TrayStatusKind::ServiceUnavailable,
+        ] {
+            asked.push(format!("tray.status.{}", status.slug()));
+            asked.push(status_accessibility_key(status));
+            for first_run_completed in [true, false] {
+                let runtime = tray_runtime_snapshot(
+                    &shell,
+                    first_run_completed,
+                    Some(status),
+                    nrr_shared::ThemeMode::Light,
+                    TrayServiceLink::Reachable,
+                );
+                for item in runtime.primary_actions.iter().chain(&runtime.quick_actions) {
+                    asked.push(action_label_key(item.action));
+                    asked.push(action_accessibility_label_key(item.action));
+                    asked.push(action_accessibility_description_key(item.action));
+                }
+            }
+        }
+        let missing: Vec<&String> = asked
+            .iter()
+            .filter(|key| window.contains_key(*key) && !tray.contains_key(*key))
+            .collect();
+        assert!(missing.is_empty(), "{missing:?}");
+    }
+
+    /// The tray never switches language, so it carries its own language and
+    /// English for the keys a translation lacks, never the other languages or
+    /// the window's whole catalogue.
+    #[test]
+    fn tray_context_carries_only_its_language_and_english() {
+        use nrr_ui_support::theme::resolve_theme;
+        use nrr_ui_support::tray::tray_runtime_snapshot;
+        use nrr_ui_support::ui_preferences::UiPreferences;
+
+        let shell = nrr_shared::gui_shell_v1();
+        for (language, expected) in [("ru", vec!["en", "ru"]), ("en", vec!["en"])] {
+            let preferences = UiPreferences {
+                language: language.to_string(),
+                ..UiPreferences::default()
+            };
+            let theme = resolve_theme(preferences.theme_mode);
+            let runtime = tray_runtime_snapshot(
+                &shell,
+                true,
+                None,
+                theme.effective_mode,
+                nrr_ui_support::tray::TrayServiceLink::Unknown,
+            );
+            let path = super::write_qt_tray_context_file(
+                &runtime,
+                &preferences.language,
+                &preferences,
+                super::TrayContextUrls::default(),
+                super::HostAnswerDeadlines::default(),
+                &[],
+            )
+            .expect("context file is written to the temp dir");
+            let raw = std::fs::read_to_string(&path).expect("context file is readable");
+            let _ = std::fs::remove_file(&path);
+            let parsed: serde_json::Value =
+                serde_json::from_str(&raw).expect("context file is JSON");
+            let catalog = parsed["localeCatalog"]
+                .as_object()
+                .expect("a catalogue object");
+            let mut languages: Vec<&str> = catalog.keys().map(String::as_str).collect();
+            languages.sort_unstable();
+            assert_eq!(languages, expected, "for {language}");
+            for words in catalog.values() {
+                let words = words.as_object().expect("a language's words");
+                let foreign: Vec<&String> = words
+                    .keys()
+                    .filter(|key| key.starts_with("tui.") || key.starts_with("diag."))
+                    .take(5)
+                    .collect();
+                assert!(
+                    foreign.is_empty(),
+                    "words the tray never shows: {foreign:?}"
+                );
+                assert!(!words.is_empty());
+            }
+        }
     }
 
     /// The tray's add-rule window builds its type list from this field alone;

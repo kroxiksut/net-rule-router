@@ -50,7 +50,7 @@ mod notice_latches;
 use binding_resolver::{
     adapter_answers_to_saved_name, adapter_carries_only_the_saved_brand, binding_matches_live,
     derive_secondary_next_hop, derive_secondary_next_hop_v6, diagnostic_tally, has_own_way_out,
-    mac_anchor_id, preferred_display_name, replacement_candidates,
+    mac_anchor_id, preferred_display_name, replacement_candidates, sole_live_driver_sibling,
 };
 pub use binding_resolver::{
     adapter_binding_matches, adapter_entry_binding_matches, bound_adapter, bound_adapter_usable,
@@ -84,6 +84,33 @@ pub struct RouteResolution {
 /// `service_stability_config.rule_scope_service_driven` row so a settings
 /// change takes effect on the next recompute without a service restart.
 pub type RuleScopeProvider = Arc<dyn Fn() -> bool + Send + Sync>;
+
+/// The routing scope as stored on `conn`, never waiting for it: a DNS answer
+/// and a relayed flow ask who is served, and while a writer holds the store
+/// the value last read answers. Reads once at build, waiting, so the first
+/// answer is the saved one.
+pub fn rule_scope_from_store(conn: &Arc<Mutex<rusqlite::Connection>>) -> RuleScopeProvider {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::TryLockError;
+    fn read(conn: &rusqlite::Connection) -> bool {
+        nrr_storage::service_stability_config::ServiceStabilityConfigRepository::new(conn)
+            .get_or_default()
+            .map(|r| r.rule_scope_service_driven)
+            .unwrap_or(true)
+    }
+    let seed = conn.lock().map(|g| read(&g)).unwrap_or(true);
+    let last = AtomicBool::new(seed);
+    let scope_conn = Arc::clone(conn);
+    Arc::new(move || match scope_conn.try_lock() {
+        Ok(g) => {
+            let scope = read(&g);
+            last.store(scope, Ordering::Relaxed);
+            scope
+        }
+        Err(TryLockError::WouldBlock) => last.load(Ordering::Relaxed),
+        Err(TryLockError::Poisoned(_)) => true,
+    })
+}
 
 /// persist an auto-healed binding identity. Invoked by
 /// `resolve_binding_target` when the stored adapter id was stale (e.g. the VPN
@@ -327,6 +354,8 @@ pub struct SecondaryRouteCoordinator {
     /// live routing-scope read (service-driven vs
     /// app-driven). See [`RuleScopeProvider`].
     rule_scope_service_driven: RuleScopeProvider,
+    /// The last scope read and when, for the per-answer readers.
+    scope_seen: Mutex<Option<(std::time::Instant, bool)>>,
     /// optional callback to persist an auto-healed binding identity so
     /// the stale stored id does not resurface every restart. `None` in tests /
     /// degraded boot (heal stays in-memory only, as before). See

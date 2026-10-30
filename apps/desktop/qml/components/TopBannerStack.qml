@@ -26,7 +26,7 @@ Item {
         + backendBanner.height
         + combinedAmberBanner.height + driftBanner.height
         + mergeBanner.height + compatBanner.height + secondaryAdapterBanner.height
-        + emptyRulesBanner.height + policyInactiveBanner.height
+        + emptyRulesBanner.height + ruleSetOfferBanner.height + policyInactiveBanner.height
         + blockAllBanner.height
         + rulesFolderSuggestionBanner.height + revisionIntegrityBanner.height
         + localNetworkOfferBanner.height + appGroupsOfferBanner.height
@@ -581,6 +581,19 @@ Item {
         border.width: root.uiTheme.bannerBorderWidth
         border.color: root.uiTheme.bannerBorder
         z: 96
+        // The blue explainer is pure information: it goes after a short read,
+        // the countdown held while the pointer or keyboard focus is on it.
+        readonly property bool explainerShown: visible
+            && !root.secondaryReconfirmVisible && !root.secondaryUnresolvedVisible
+        HoverHandler { id: secondaryBannerHover }
+        Timer {
+            interval: 20000
+            // Counted only while the window is in front: unseen is not read.
+            running: secondaryAdapterBanner.explainerShown && root.visible && root.active
+                && !secondaryBannerHover.hovered && !vpnSplitCloseButton.activeFocus
+            onTriggered: root._vpnSplitShownFor =
+                root.interfacesRolesController._vpnConflictSecondaryDisplayName()
+        }
         RowLayout {
             id: secondaryBannerRow
             anchors.left: parent.left
@@ -655,6 +668,7 @@ Item {
             // dismissible; the actionable amber re-confirm variant keeps its
             // action button and no close affordance.
             ThemedButton {
+                id: vpnSplitCloseButton
                 theme: root.uiTheme
                 // Only the pure-explainer VPN-split banner is dismissible; the
                 // actionable re-confirm / not-found states keep their action
@@ -797,6 +811,90 @@ Item {
         }
     }
 
+    // No rules, and a set the user could start from: offered, never loaded
+    // unasked. Takes the empty-rules notice's place while it is up. Load,
+    // "Not now" and the close button are all answers; it does not come back.
+    Rectangle {
+        id: ruleSetOfferBanner
+        anchors.top: emptyRulesBanner.bottom
+        anchors.left: parent.left
+        anchors.right: parent.right
+        height: root.ruleSetOfferVisible
+            ? Math.max(36, ruleSetOfferRow.implicitHeight + 2 * root.uiTheme.spacingSm)
+            : 0
+        visible: root.ruleSetOfferVisible
+        color: root.uiTheme.bannerSuccessFill
+        border.width: root.uiTheme.bannerBorderWidth
+        border.color: root.uiTheme.bannerBorder
+        z: 95
+        RowLayout {
+            id: ruleSetOfferRow
+            anchors.left: parent.left
+            anchors.right: parent.right
+            anchors.verticalCenter: parent.verticalCenter
+            anchors.leftMargin: root.uiTheme.spacingMd
+            anchors.rightMargin: root.uiTheme.spacingMd
+            spacing: root.uiTheme.spacingSm
+            Label {
+                Layout.fillWidth: true
+                Layout.preferredWidth: 0
+                color: root.uiTheme.bannerText
+                text: root.uiRevision >= 0
+                    ? root.tr("status.rule-set-offer",
+                        "No rules yet. Load the rule set «{name}»? You can change it or remove it at any time.")
+                        .replace("{name}", Pure.displayText(root.ruleSetOfferName))
+                    : ""
+                textFormat: Text.PlainText
+                verticalAlignment: Text.AlignVCenter
+                wrapMode: Text.WordWrap
+                Accessible.role: Accessible.StaticText
+                Accessible.name: text
+            }
+            ThemedButton {
+                theme: root.uiTheme
+                highlighted: true
+                text: root.uiRevision >= 0 ? root.tr("rules.bundled-preset.load", "Load") : ""
+                Accessible.role: Accessible.Button
+                Accessible.name: text
+                onClicked: root.loadOfferedRuleSet()
+            }
+            ThemedButton {
+                theme: root.uiTheme
+                text: root.uiRevision >= 0 ? root.tr("action.not-now", "Not now") : ""
+                Accessible.role: Accessible.Button
+                Accessible.name: text
+                onClicked: root.answerRuleSetOffer()
+            }
+            ToolButton {
+                id: ruleSetOfferCloseButton
+                text: "✕"
+                implicitWidth: 24
+                implicitHeight: 24
+                font.pixelSize: 14
+                Layout.alignment: Qt.AlignTop
+                Accessible.role: Accessible.Button
+                Accessible.name: root.uiRevision >= 0 ? root.tr("action.close", "Close") : ""
+                ToolTip.visible: hovered && root.prefs.tooltipsEnabled
+                ToolTip.text: root.uiRevision >= 0 ? root.tr("action.close", "Close") : ""
+                onClicked: root.answerRuleSetOffer()
+                background: Rectangle {
+                    color: ruleSetOfferCloseButton.hovered
+                        ? Qt.rgba(1, 1, 1, 0.2) : "transparent"
+                    radius: root.uiTheme.radiusSm
+                    border.width: ruleSetOfferCloseButton.visualFocus ? 2 : 0
+                    border.color: root.uiTheme.bannerText
+                }
+                contentItem: Label {
+                    text: ruleSetOfferCloseButton.text
+                    color: root.uiTheme.bannerText
+                    font: ruleSetOfferCloseButton.font
+                    horizontalAlignment: Text.AlignHCenter
+                    verticalAlignment: Text.AlignVCenter
+                }
+            }
+        }
+    }
+
     // The former "app rules not enforced" amber banner was
     // removed from the top banner stack and relocated to the notifications
     // centre (footer bell chip + NotificationCenterPopup). See
@@ -810,7 +908,7 @@ Item {
     // already explains the same cause (see the window-side predicate).
     Rectangle {
         id: policyInactiveBanner
-        anchors.top: emptyRulesBanner.bottom
+        anchors.top: ruleSetOfferBanner.bottom
         anchors.left: parent.left
         anchors.right: parent.right
         height: root.policyInactiveBannerVisible

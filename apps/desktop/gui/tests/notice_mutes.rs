@@ -56,8 +56,9 @@ fn every_notice_kind_is_named_alike_in_the_service_and_the_windows() {
 }
 
 /// Kinds the tray lists in its menu and never raises as a notice: the window's
-/// card carries their "Don't show…".
-const LISTED_IN_TRAY_MENU_ONLY: [&str; 1] = ["external-address"];
+/// card carries their "Don't show…". Empty since the owner asked the tray to
+/// tell the additional route's external address when it connects.
+const LISTED_IN_TRAY_MENU_ONLY: [&str; 0] = [];
 
 /// Kinds whose card answers "don't report again" itself, for good: the user
 /// asked for it in those words, and a duration chooser would ask again.
@@ -87,6 +88,54 @@ fn the_tray_offers_the_mute_on_every_kind_and_gates_each_one() {
             || tray.contains(&format!("_noticeMutedNow(\"{kind}\")"));
         assert!(gated, "{kind} is offered a mute nothing honours");
     }
+}
+
+/// The body of the QML function `name` in `source`.
+fn qml_function<'a>(source: &'a str, name: &str) -> &'a str {
+    let head = format!("function {name}(");
+    let from = source
+        .find(&head)
+        .unwrap_or_else(|| panic!("{head:?} not found"));
+    let body = &source[from..];
+    &body[..body.find("\n    }\n").unwrap_or(body.len())]
+}
+
+/// The user connects the VPN with the window open — usually right after
+/// setting it up — and the address is learnt seconds later. The window's card
+/// sits in a list nobody is looking at, so the tray's short notice is the only
+/// place it is told; a window on screen must not swallow it.
+#[test]
+fn the_external_address_is_announced_with_the_window_open() {
+    let tray = repo_file("apps/desktop/qml/Tray.qml");
+    let body = qml_function(&tray, "_onSecondaryExternalAddress");
+    for quiet_while_shown in [
+        "_windowOnScreen",
+        "guiPresence",
+        "windowVisible",
+        "windowActive",
+    ] {
+        assert!(
+            !body.contains(quiet_while_shown),
+            "the external-address notice still waits on the window ({quiet_while_shown})"
+        );
+    }
+    assert!(
+        body.contains("if (!showNotifications) return"),
+        "the notifications switch no longer silences it"
+    );
+    assert!(
+        body.contains("_offerNotice(\"external-address\""),
+        "its \"Don't show again\" is no longer honoured"
+    );
+    // Joining the "routing is working again" notice is still showing it.
+    let merge = &body[body
+        .find("_restoredNoticeOnScreen()")
+        .unwrap_or_else(|| panic!("the merge into the restored notice is gone"))..];
+    let merge = &merge[..merge.find('\n').unwrap_or(merge.len())];
+    assert!(
+        merge.contains("_noticeMutedNow(\"external-address\")"),
+        "a muted address still joins the restored notice: {merge}"
+    );
 }
 
 #[test]

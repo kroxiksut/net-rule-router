@@ -9,8 +9,8 @@ mod js_harness;
 
 use js_harness::{arg, check, text, JsLib};
 use nrr_client_logic::vpn_client_trust::{
-    confirmed_apps, picker_preselected, picker_result, picker_rows, provider_names, removed_apps,
-    trust_offers, LinkProviderApp, PickerRow, TrustOffer,
+    confirmed_apps, picker_link_offer, picker_preselected, picker_result, picker_rows,
+    provider_names, removed_apps, trust_offers, LinkProviderApp, PickerRow, TrustOffer,
 };
 use serde_json::{json, Value};
 
@@ -308,5 +308,24 @@ fn reopening_the_picker_shows_what_its_confirm_stored() {
     assert_eq!(
         picker_result(&reopened, &picker_preselected(&reopened, &stored), &stored),
         stored
+    );
+}
+
+#[test]
+fn vpn_picker_link_offer_match_js() {
+    check(
+        "vpn_picker_link_offer",
+        &mut JsLib::pure(),
+        |input| {
+            format!(
+                "vpnPickerLinkOffer({}, {})",
+                arg(input, "rows"),
+                arg(input, "linkName")
+            )
+        },
+        |input| {
+            let offer = picker_link_offer(&rows_of(&input["rows"]), text(input, "linkName"));
+            json!({ "name": offer.name, "exePaths": offer.exe_paths })
+        },
     );
 }

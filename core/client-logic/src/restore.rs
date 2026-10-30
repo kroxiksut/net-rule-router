@@ -12,7 +12,8 @@ use serde_json::{json, Map, Value};
 use crate::js;
 use crate::route_policy::{
     build_full_update_request, coerce, coerce_leak_protection, effective, leak_protection_rank,
-    settle_leak_protection, DEFAULT_ROUTES, DEFAULT_ROUTE_MAIN, LEAK_PROTECTION_KEY,
+    settle_leak_protection, DEFAULT_ROUTES, DEFAULT_ROUTE_MAIN, LEAK_PROTECTION_EVERYTHING,
+    LEAK_PROTECTION_KEY,
 };
 
 /// The two adapter-binding slots of the route policy.
@@ -108,6 +109,12 @@ fn strengthened(key: &str, mine: &Value, service: &Map<String, Value>) -> Option
     let wanted = coerce_leak_protection(mode, wanted.as_str().unwrap_or_default());
     let held = effective(service, key).unwrap_or(Value::Null);
     let held = coerce_leak_protection(mode, held.as_str().unwrap_or_default());
+    // With no additional adapter bound "Everything" closes the internet: that
+    // goes only on the user's answer, offered with the binding.
+    let unbound = service.get("secondary").and_then(binding_id).is_none();
+    if wanted == LEAK_PROTECTION_EVERYTHING && unbound {
+        return None;
+    }
     (leak_protection_rank(wanted) > leak_protection_rank(held)).then(|| Value::from(wanted))
 }
 
@@ -478,7 +485,8 @@ mod tests {
     fn leak_protection_comes_back_only_stronger_and_as_the_route_offers_it() {
         let secondary = object(json!({
             "mode": "prefer-secondary-when-available",
-            "leak-protection": "off"
+            "leak-protection": "off",
+            "secondary": { "stable-id": "B" }
         }));
         let request =
             protection_restore(&object(json!({ "leak-protection": "sites" })), &secondary)
@@ -489,6 +497,17 @@ mod tests {
         let everything = object(json!({ "leak-protection": "everything" }));
         let weaker = object(json!({ "leak-protection": "sites" }));
         assert!(protection_to_restore(&weaker, &everything).is_empty());
+    }
+
+    #[test]
+    fn everything_is_never_sent_unasked_to_a_service_with_no_additional_adapter() {
+        let intent = object(json!({
+            "leak-protection": "everything",
+            "secondary": { "stable-id": "B", "display-name": "Tunnel", "user-confirmed": true }
+        }));
+        assert_eq!(protection_restore(&intent, &Map::new()), None);
+        let unbound = object(json!({ "leak-protection": "sites", "secondary": null }));
+        assert_eq!(protection_restore(&intent, &unbound), None);
     }
 
     #[test]

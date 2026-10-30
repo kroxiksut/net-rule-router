@@ -25,6 +25,8 @@ const MAX_LOCALE_FILES_PER_DIR: usize = 256;
 const MAX_LOCALE_WARNINGS: usize = 64;
 const MANAGED_SUBFOLDER: &str = "managed";
 const USER_LOCALES_SUBFOLDER: &str = "locales";
+/// Beside the main files: `tray/<id>.json` holds the words only the tray shows.
+const TRAY_SUBFOLDER: &str = "tray";
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct LocaleDescriptor {
@@ -150,9 +152,13 @@ pub fn resolve_catalog_text(
 /// build a single JSON document.
 #[derive(Clone, Debug)]
 pub struct LocaleLoadState {
+    /// Every language's words, its tray file's included.
     pub catalog: BTreeMap<String, BTreeMap<String, String>>,
     pub descriptors: Vec<LocaleDescriptor>,
+    /// One row per main locale file.
     pub reports: Vec<LocaleLoadReport>,
+    /// One row per tray file; a tray file never adds a language.
+    pub tray_reports: Vec<LocaleLoadReport>,
 }
 
 #[derive(Clone, Debug)]
@@ -194,23 +200,17 @@ static REPORTED_LOCALE_ISSUES: OnceLock<Mutex<HashSet<String>>> = OnceLock::new(
 /// the environment, and a process that changes them expects the next load to
 /// see the change.
 pub fn load_locale_state() -> LocaleLoadState {
-    let mut candidates = load_locale_candidates();
-    validate_cross_locale_rules(&mut candidates);
-    add_missing_baseline_coverage_warnings(&mut candidates);
-    let reports = candidates
-        .iter()
-        .map(|candidate| LocaleLoadReport {
-            id: candidate.id.clone(),
-            file_name: candidate.file_name.clone(),
-            source: candidate.source,
-            status: candidate.status(),
-            warnings: candidate.warnings.clone(),
-            errors: candidate.errors.clone(),
-        })
-        .collect::<Vec<_>>();
-    emit_locale_reports(&reports);
+    let (candidates, tray_candidates) = load_validated_candidates();
+    let reports = reports_of(&candidates);
+    let tray_reports = reports_of(&tray_candidates);
 
-    let active_bundles = build_effective_locale_bundles(&candidates);
+    let tray_bundles = build_effective_locale_bundles(&tray_candidates);
+    let mut active_bundles = build_effective_locale_bundles(&candidates);
+    for bundle in &mut active_bundles {
+        if let Some(tray) = tray_bundles.iter().find(|tray| tray.id == bundle.id) {
+            merge_missing_entries(&mut bundle.entries, &tray.entries);
+        }
+    }
     let descriptor_by_id = active_bundles
         .iter()
         .map(|bundle| (bundle.id.clone(), bundle.descriptor.clone()))
@@ -280,7 +280,111 @@ pub fn load_locale_state() -> LocaleLoadState {
         catalog,
         descriptors,
         reports,
+        tray_reports,
     }
+}
+
+/// The tray's catalogue: its own language and English, each the tray file's
+/// words plus the main file's words under `window_words` (a key, or a family
+/// when it ends in `.`). The tray never switches language, so the others
+/// would only cost it memory.
+pub fn load_tray_locale_catalog(
+    language_id: &str,
+    window_words: &[&str],
+) -> BTreeMap<String, BTreeMap<String, String>> {
+    let (candidates, tray_candidates) = load_validated_candidates();
+    reports_of(&candidates);
+    reports_of(&tray_candidates);
+    tray_catalog_from(&candidates, &tray_candidates, language_id, window_words)
+}
+
+/// Both sets of files read, validated and reported once.
+fn load_validated_candidates() -> (Vec<LocaleCandidate>, Vec<LocaleCandidate>) {
+    let mut candidates = load_locale_candidates();
+    validate_cross_locale_rules(&mut candidates);
+    add_missing_baseline_coverage_warnings(&mut candidates);
+    let mut tray_candidates = load_tray_locale_candidates();
+    validate_tray_candidates(&mut tray_candidates, &candidates);
+    (candidates, tray_candidates)
+}
+
+fn reports_of(candidates: &[LocaleCandidate]) -> Vec<LocaleLoadReport> {
+    let reports = candidates
+        .iter()
+        .map(|candidate| LocaleLoadReport {
+            id: candidate.id.clone(),
+            file_name: candidate.file_name.clone(),
+            source: candidate.source,
+            status: candidate.status(),
+            warnings: candidate.warnings.clone(),
+            errors: candidate.errors.clone(),
+        })
+        .collect::<Vec<_>>();
+    emit_locale_reports(&reports);
+    reports
+}
+
+fn tray_catalog_from(
+    candidates: &[LocaleCandidate],
+    tray_candidates: &[LocaleCandidate],
+    language_id: &str,
+    window_words: &[&str],
+) -> BTreeMap<String, BTreeMap<String, String>> {
+    let main = build_effective_locale_bundles(candidates);
+    let tray = build_effective_locale_bundles(tray_candidates);
+    let shown_by_tray = |key: &str| {
+        window_words.iter().any(|word| {
+            if word.ends_with('.') {
+                key.starts_with(word)
+            } else {
+                key == *word
+            }
+        })
+    };
+    // The main file's text wins a key both files hold, as in the window.
+    let words_of = |id: &str| -> BTreeMap<String, String> {
+        let mut words = main
+            .iter()
+            .find(|bundle| bundle.id == id)
+            .map(|bundle| {
+                bundle
+                    .entries
+                    .iter()
+                    .filter(|(key, _)| shown_by_tray(key))
+                    .map(|(key, value)| (key.clone(), value.clone()))
+                    .collect::<BTreeMap<_, _>>()
+            })
+            .unwrap_or_default();
+        if let Some(own) = tray.iter().find(|bundle| bundle.id == id) {
+            merge_missing_entries(&mut words, &own.entries);
+        }
+        words
+    };
+
+    // The id the tray's `tr()` finds first: the language, else its base.
+    let normalized = normalize_locale_id(language_id);
+    let base = normalized.split('-').next().unwrap_or_default().to_string();
+    let chosen = [normalized, base]
+        .into_iter()
+        .find(|id| main.iter().any(|bundle| &bundle.id == id))
+        .unwrap_or_else(|| "en".to_string());
+
+    let mut catalog = BTreeMap::new();
+    if chosen != "en" {
+        let mut words = words_of(&chosen);
+        let fallbacks = main
+            .iter()
+            .find(|bundle| bundle.id == chosen)
+            .map(|bundle| bundle.descriptor.fallbacks.clone())
+            .unwrap_or_default();
+        // English rides separately; `tr()` falls back to it per key.
+        for fallback in fallbacks.iter().filter(|id| id.as_str() != "en") {
+            merge_missing_entries(&mut words, &words_of(fallback));
+        }
+        catalog.insert(chosen, words);
+    }
+    catalog.insert("en".to_string(), words_of("en"));
+    catalog
 }
 
 /// One entry per LANGUAGE, ordered by id.

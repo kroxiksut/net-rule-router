@@ -52,6 +52,7 @@ pub mod client_error_codes;
 pub mod diagnostics_dto;
 pub mod display_text;
 pub mod dns_name;
+pub mod docs_location;
 pub mod eula;
 pub mod first_run_sheet;
 pub mod glob;
@@ -104,8 +105,9 @@ pub use ipc_transport::{
 };
 pub use localization::{
     load_locale_catalog, load_locale_descriptors, load_locale_map, load_locale_reports,
-    load_locale_state, resolve_catalog_text, translate_or, LocaleDescriptor, LocaleLoadReport,
-    LocaleLoadState, LocaleLoadStatus, LocaleSource, LOCALE_SCHEMA_VERSION,
+    load_locale_state, load_tray_locale_catalog, resolve_catalog_text, translate_or,
+    LocaleDescriptor, LocaleLoadReport, LocaleLoadState, LocaleLoadStatus, LocaleSource,
+    LOCALE_SCHEMA_VERSION,
 };
 
 mod shell;

@@ -187,7 +187,7 @@ fn run_state_migrations_empty_db() {
     // + v48 (auto_rule_dismissals.dto_json — the refused offer, kept verbatim)
     // + v49 (block_notice_mutes table — durable "do not show" choices)
     // + v50 (isp_block_candidates_enabled on service_stability_config)
-    assert_eq!(s.to_version, 84);
+    assert_eq!(s.to_version, 85);
     assert_eq!(
         s.migrations_applied,
         [
@@ -275,6 +275,7 @@ fn run_state_migrations_empty_db() {
             "add_vpn_gateway_confirmations",
             "add_routing_pause_term",
             "kill_switch_strict_shared_ips_by_default",
+            "external_address_auto_check_by_default",
         ]
     );
 }
@@ -286,8 +287,8 @@ fn state_migration_idempotent() {
 
     runner.run_pending_migrations().expect("first run");
     let s = runner.run_pending_migrations().expect("second run");
-    assert_eq!(s.from_version, 84);
-    assert_eq!(s.to_version, 84);
+    assert_eq!(s.from_version, 85);
+    assert_eq!(s.to_version, 85);
     assert!(s.migrations_applied.is_empty());
 }
 
@@ -414,8 +415,8 @@ fn verify_state_schema_after_migration() {
 
     let v = runner.verify_schema().expect("verify");
     assert!(v.is_ok(), "state schema verification failed: {v:?}");
-    // through v84 (kill_switch_strict_shared_ips_by_default)
-    assert_eq!(v.version, 84);
+    // through v85 (external_address_auto_check_by_default)
+    assert_eq!(v.version, 85);
 }
 
 #[test]
@@ -607,6 +608,7 @@ fn shipped_state_checksums_are_unchanged() {
             (82, "03594f74243f65a7"),
             (83, "09991a8bfe859891"),
             (84, "ceb379253d3fec7d"),
+            (85, "5e7f4b6ff972a662"),
         ],
     );
 }
@@ -1057,7 +1059,7 @@ fn upgrade_state_db_from_v1_to_v2() {
 
     let summary = runner.run_pending_migrations().expect("upgrade v1→latest");
     assert_eq!(summary.from_version, 1);
-    assert_eq!(summary.to_version, 84);
+    assert_eq!(summary.to_version, 85);
     assert_eq!(
         summary.migrations_applied,
         [
@@ -1144,6 +1146,7 @@ fn upgrade_state_db_from_v1_to_v2() {
             "add_vpn_gateway_confirmations",
             "add_routing_pause_term",
             "kill_switch_strict_shared_ips_by_default",
+            "external_address_auto_check_by_default",
         ]
     );
 
@@ -1181,7 +1184,7 @@ fn upgrade_state_db_from_v2_to_v3() {
 
     let summary = runner.run_pending_migrations().expect("upgrade v2→latest");
     assert_eq!(summary.from_version, 2);
-    assert_eq!(summary.to_version, 84);
+    assert_eq!(summary.to_version, 85);
     assert_eq!(
         summary.migrations_applied,
         [
@@ -1267,6 +1270,7 @@ fn upgrade_state_db_from_v2_to_v3() {
             "add_vpn_gateway_confirmations",
             "add_routing_pause_term",
             "kill_switch_strict_shared_ips_by_default",
+            "external_address_auto_check_by_default",
         ]
     );
 
@@ -1683,10 +1687,11 @@ fn the_strict_mode_and_unknown_protections_are_refused_by_the_schema() {
         .is_err());
 }
 
-/// A user who never chose the automatic external-address check does not get it
-/// from an upgrade, whatever else their policy row holds.
+/// The automatic external-address check is on by default, and an upgrade
+/// turns it on for users stored before that: a stored "off" cannot tell a
+/// user who switched it off from one who never chose.
 #[test]
-fn the_external_address_check_starts_off_for_existing_users() {
+fn the_external_address_check_is_on_for_existing_users_after_an_upgrade() {
     use crate::route_bindings::RouteBindingsRepository;
 
     let dir = tempfile::tempdir().expect("temp dir");
@@ -1715,10 +1720,31 @@ fn the_external_address_check_starts_off_for_existing_users() {
     let record = RouteBindingsRepository::new(&conn)
         .load_for_sid("S-1-5-21-existing")
         .expect("load");
-    assert!(!record.external_address_auto_check);
+    assert!(
+        record.external_address_auto_check,
+        "an existing user gets the check like a new one"
+    );
     assert!(
         record.primary_probe_auto,
         "the rest of the row is carried over"
+    );
+    // Once only: an off the user saves after the upgrade stays off when the
+    // migrations run again at the next start.
+    conn.execute(
+        "UPDATE secondary_block_policy SET external_address_auto_check = 0",
+        [],
+    )
+    .expect("the user switches it off");
+    drop(conn);
+    let again = state_runner(&dir);
+    again.run_pending_migrations().expect("restart");
+    let conn = again.into_connection();
+    assert!(
+        !RouteBindingsRepository::new(&conn)
+            .load_for_sid("S-1-5-21-existing")
+            .expect("load")
+            .external_address_auto_check,
+        "a restart does not switch it back on"
     );
     assert!(conn
         .execute(

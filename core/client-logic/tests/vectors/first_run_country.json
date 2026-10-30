@@ -1,0 +1,14 @@
+{
+  "cases": [
+    { "name": "English system set to Russia is offered Russia", "input": { "region": "RU", "locales": ["en-US"] }, "expected": "ru" },
+    { "name": "Russian display language in Germany is offered Germany", "input": { "region": "DE", "locales": ["ru-RU"] }, "expected": "de" },
+    { "name": "region as a locale tag names its territory", "input": { "region": "en_RU.UTF-8", "locales": ["en_US.UTF-8"] }, "expected": "ru" },
+    { "name": "a script subtag is not the territory", "input": { "region": "zh-Hans-CN", "locales": [] }, "expected": "cn" },
+    { "name": "a world code names no country: the locale decides", "input": { "region": "001", "locales": ["kk-KZ"] }, "expected": "kz" },
+    { "name": "no region: the locale's territory", "input": { "region": "", "locales": ["ru_RU.UTF-8", "en_US"] }, "expected": "ru" },
+    { "name": "no region, a bare language stands for its country", "input": { "region": "", "locales": ["ru"] }, "expected": "ru" },
+    { "name": "a region without a territory falls back to the locale", "input": { "region": "C.UTF-8", "locales": ["tr_TR"] }, "expected": "tr" },
+    { "name": "the POSIX locale names nothing", "input": { "region": "", "locales": ["C"] }, "expected": "" },
+    { "name": "nothing known", "input": { "region": "", "locales": [] }, "expected": "" }
+  ]
+}

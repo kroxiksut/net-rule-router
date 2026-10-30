@@ -125,6 +125,23 @@ pub fn logs_folder_url() -> Option<String> {
     nrr_platform_api::paths::logs_folder_to_show().map(|dir| path_to_file_url(&dir))
 }
 
+/// Help > Documentation: each documentation language's start page, the offline
+/// one beside the program or, when the package carries none, online.
+fn docs_urls(project_url: &str) -> serde_json::Map<String, serde_json::Value> {
+    let (executable_dir, checkout) = payload_roots();
+    let roots = executable_dir.as_deref().into_iter().chain(checkout);
+    nrr_shared::docs_location::docs_indexes(roots, project_url)
+        .into_iter()
+        .map(|(language, index)| {
+            let url = match index {
+                nrr_shared::docs_location::DocsIndex::Local(page) => path_to_file_url(&page),
+                nrr_shared::docs_location::DocsIndex::Online(url) => url,
+            };
+            (language, serde_json::Value::String(url))
+        })
+        .collect()
+}
+
 /// Embedded: the package does not ship `LICENSE` as a file.
 const LICENSE_EMBEDDED: &str =
     include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../../LICENSE"));
@@ -521,6 +538,9 @@ pub fn write_qt_context_file_at(
         // file beside a portable copy). `completesFirstRun` is the wizard's
         // whole gate; the individual answers pre-fill it when it does open.
         "provisioning": provisioning_payload,
+        // The country the system is set to, whatever its display language:
+        // the first-run window offers that country's rule set first.
+        "systemRegion": nrr_ui_support::ui_preferences::system_region().unwrap_or_default(),
         "startupDialog": if request.open_license {
             Some("license")
         } else if request.open_about {
@@ -551,6 +571,7 @@ pub fn write_qt_context_file_at(
             // screen (default off). Device-local.
             "showVirtualMachinesSection": preferences.show_virtual_machines_section,
             "appGroupsOfferDismissed": preferences.app_groups_offer_dismissed,
+            "ruleSetOfferAnswered": preferences.rule_set_offer_answered,
             "reopenLastSectionOnStartup": preferences.reopen_last_section_on_startup,
             "firstRunCompleted": preferences.first_run_completed,
             "acceptedEulaVersion": preferences.accepted_eula_version,
@@ -606,6 +627,7 @@ pub fn write_qt_context_file_at(
             "trafficStatsPeriod": preferences.traffic_stats_period.clone(),
             // Remembered byte unit for the traffic CSV export.
             "trafficExportUnit": preferences.traffic_export_unit.clone(),
+            "trafficExportIncludeVirtual": preferences.traffic_export_include_virtual,
             // How the connection trace list is grouped.
             "connTraceGroupBy": preferences.conn_trace_group_by.clone(),
             // Remembered support-archive privacy tier ("standard" / "diagnostics")
@@ -840,6 +862,8 @@ pub fn write_qt_context_file_at(
             "buildProfile": about.build_profile,
             "toolchain": about.rust_toolchain,
             "projectUrl": shell.about.project_url,
+            "communityUrl": shell.about.community_url,
+            "docsUrls": docs_urls(shell.about.project_url),
             "buildChannel": shell.about.build_channel,
             "author": shell.about.author,
             "authorEmail": shell.about.author_email,
@@ -1012,6 +1036,8 @@ struct QtPreferencesPayload {
     #[serde(default)]
     app_groups_offer_dismissed: Option<bool>,
     #[serde(default)]
+    rule_set_offer_answered: Option<bool>,
+    #[serde(default)]
     show_remembered_adapters: Option<bool>,
     #[serde(default)]
     auto_confirm_adapter_id_change: Option<bool>,
@@ -1025,6 +1051,8 @@ struct QtPreferencesPayload {
     traffic_stats_period: Option<String>,
     #[serde(default)]
     traffic_export_unit: Option<String>,
+    #[serde(default)]
+    traffic_export_include_virtual: Option<bool>,
     #[serde(default)]
     conn_trace_group_by: Option<String>,
     #[serde(default)]

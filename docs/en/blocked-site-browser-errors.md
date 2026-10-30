@@ -62,7 +62,7 @@ a private/incognito window, which has no local cache to fall back on.
   the destination and why it was blocked. On Windows it also shows which
   program started that one, so a blocked `curl.exe` launched by a script is
   easy to trace. When the reason is a setting rather than a rule of yours,
-  **Open settings** takes you to that exact switch in Settings → Routing,
+  **Open settings** takes you to that exact switch in Settings → Routing behavior,
   with a short note on what it does and when turning it off is safe.
 - New blocks join the notice already on screen instead of opening another,
   and blocks a setting caused are counted per program on one line

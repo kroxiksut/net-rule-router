@@ -188,11 +188,11 @@ with:
 
 ### 3. Contact the maintainer
 
-If a public issue is not an option, email <fmalkov91@gmail.com> with the same details.
+If a public issue is not an option, email [fmalkov91@gmail.com](mailto:fmalkov91@gmail.com) with the same details.
 
 ## For VPN vendors
 
 If you develop a VPN client and want it recognized out of the box, you are
-welcome to open a pull request or issue as above, or email <fmalkov91@gmail.com>. Tell
+welcome to open a pull request or issue as above, or email [fmalkov91@gmail.com](mailto:fmalkov91@gmail.com). Tell
 us the exact executable / package / bundle identifiers your client ships under on
 each platform so detection is reliable and free of false positives.

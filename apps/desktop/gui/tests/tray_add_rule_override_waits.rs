@@ -36,7 +36,7 @@ fn the_tray_outcome_names_the_confirmation_and_opens_the_rules() {
         tray.matches("\"tray-add-rule-open-rules\"").count() >= 2,
         "the way to the rules list is offered but not handled"
     );
-    for locale in ["locales/en.json", "locales/ru.json"] {
+    for locale in ["locales/tray/en.json", "locales/tray/ru.json"] {
         assert!(
             repo_file(locale).contains("\"added-awaits-confirmation\":"),
             "{locale} lacks tray.add-rule.added-awaits-confirmation"

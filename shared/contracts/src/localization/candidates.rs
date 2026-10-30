@@ -15,8 +15,26 @@ pub(super) fn sorted_unique_descriptors(
 }
 
 pub(super) fn load_locale_candidates() -> Vec<LocaleCandidate> {
-    let bundled_dir = resolve_bundled_locales_dir();
-    let user_dir = resolve_user_locales_dir();
+    load_locale_candidates_in(None)
+}
+
+/// The tray files, `tray/<id>.json` under each locales folder, named by that
+/// path in reports.
+pub(super) fn load_tray_locale_candidates() -> Vec<LocaleCandidate> {
+    let mut candidates = load_locale_candidates_in(Some(TRAY_SUBFOLDER));
+    for candidate in &mut candidates {
+        candidate.file_name = format!("{TRAY_SUBFOLDER}/{}", candidate.file_name);
+    }
+    candidates
+}
+
+fn load_locale_candidates_in(subfolder: Option<&str>) -> Vec<LocaleCandidate> {
+    let within = |dir: PathBuf| match subfolder {
+        Some(name) => dir.join(name),
+        None => dir,
+    };
+    let bundled_dir = resolve_bundled_locales_dir().map(within);
+    let user_dir = resolve_user_locales_dir().map(within);
     let user_dir_matches_bundled = match (&bundled_dir, &user_dir) {
         (Some(bundled), Some(user)) => canonical_eq(bundled, user),
         _ => false,

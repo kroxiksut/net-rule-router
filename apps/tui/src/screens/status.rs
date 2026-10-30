@@ -356,7 +356,9 @@ fn routing_lines(app: &AppState, texts: &Texts) -> Vec<ViewLine> {
             StateTone::Caution,
         )]));
     }
-    if let Some(line) = silence_line(app, texts) {
+    if let Some(line) = crate::screens::rules::offer::status_line(app, texts) {
+        lines.push(line);
+    } else if let Some(line) = silence_line(app, texts) {
         lines.push(line);
     }
     if app

@@ -1,10 +1,11 @@
 //! The order of a full reset and what each step's result decides
 //! (`fullResetNext` in `pure.js`).
 //!
-//! The service is stopped last because every earlier step needs it answering;
-//! a step that fails does not abort the ones after it, except when the client
-//! cannot gain the rights the step asked for: then the flow stops and says so,
-//! rather than stopping a service whose rules are still in place.
+//! The service is restarted last because every earlier step needs it
+//! answering, and a reset ends as a fresh install does: with the service
+//! running on the cleared state, not stopped. A step that fails does not abort
+//! the ones after it, except when the client cannot gain the rights the step
+//! asked for: then the flow stops and says so, before the service is touched.
 
 /// One step of the reset, in the order they run.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -12,7 +13,7 @@ pub enum Step {
     ClearLogs,
     ResetSidecar,
     PurgePrincipalData,
-    StopService,
+    RestartService,
 }
 
 /// The order the steps run in.
@@ -20,7 +21,7 @@ pub const ORDER: [Step; 4] = [
     Step::ClearLogs,
     Step::ResetSidecar,
     Step::PurgePrincipalData,
-    Step::StopService,
+    Step::RestartService,
 ];
 
 impl Step {
@@ -29,7 +30,7 @@ impl Step {
             Self::ClearLogs => "clear-logs",
             Self::ResetSidecar => "reset-sidecar",
             Self::PurgePrincipalData => "purge-principal-data",
-            Self::StopService => "stop-service",
+            Self::RestartService => "restart-service",
         }
     }
 
@@ -74,10 +75,11 @@ impl Outcome {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Next {
     Run(Step),
-    /// All steps ran; `cleared` says the service-side state is gone and the
-    /// service stopped.
+    /// All steps ran. `cleared`: the service-side state is gone; `restarted`:
+    /// the service is running again on it.
     Finish {
         cleared: bool,
+        restarted: bool,
     },
     /// The flow ends here: `step` was refused and this client cannot elevate.
     NeedsElevation {
@@ -100,7 +102,8 @@ pub fn next(can_elevate: bool, done: &[(Step, Outcome)]) -> Next {
         None => {
             let ok = |wanted: Step| done.iter().any(|&(s, o)| s == wanted && o == Outcome::Ok);
             Next::Finish {
-                cleared: ok(Step::PurgePrincipalData) && ok(Step::StopService),
+                cleared: ok(Step::PurgePrincipalData),
+                restarted: ok(Step::RestartService),
             }
         }
     }
@@ -122,7 +125,13 @@ mod tests {
             assert_eq!(next(false, &done), Next::Run(expected));
             done.push((expected, Good));
         }
-        assert_eq!(next(false, &done), Next::Finish { cleared: true });
+        assert_eq!(
+            next(false, &done),
+            Next::Finish {
+                cleared: true,
+                restarted: true
+            }
+        );
     }
 
     /// After a full reset the user reads the shared baseline like a new one.
@@ -143,21 +152,30 @@ mod tests {
                 "clear-logs",
                 "reset-sidecar",
                 "purge-principal-data",
-                "stop-service"
+                "restart-service"
             ]
         );
     }
 
+    /// A reset that ended on a stopped service left the user with no routing
+    /// and no protection until they found the service controls.
     #[test]
-    fn the_service_is_stopped_last() {
-        assert_eq!(ORDER[ORDER.len() - 1], Step::StopService);
+    fn the_reset_ends_with_the_service_restarted_not_stopped() {
+        assert_eq!(ORDER[ORDER.len() - 1], Step::RestartService);
+        assert!(Step::parse("stop-service").is_none());
     }
 
     #[test]
     fn a_failed_best_effort_step_does_not_abort() {
         assert_eq!(next(false, &run(&[Failed])), Next::Run(Step::ResetSidecar));
         let done = run(&[Failed, Skipped, Good, Good]);
-        assert_eq!(next(false, &done), Next::Finish { cleared: true });
+        assert_eq!(
+            next(false, &done),
+            Next::Finish {
+                cleared: true,
+                restarted: true
+            }
+        );
     }
 
     #[test]
@@ -169,7 +187,7 @@ mod tests {
                 step: Step::PurgePrincipalData
             }
         );
-        assert_eq!(next(true, &done), Next::Run(Step::StopService));
+        assert_eq!(next(true, &done), Next::Run(Step::RestartService));
     }
 
     #[test]
@@ -180,9 +198,17 @@ mod tests {
         );
     }
 
+    /// The data is gone either way; what the user must hear is that the
+    /// service did not come back, so they can start it.
     #[test]
-    fn a_failed_stop_downgrades_the_result() {
+    fn a_failed_restart_is_told_apart_from_uncleared_data() {
         let done = run(&[Good, Good, Good, Failed]);
-        assert_eq!(next(false, &done), Next::Finish { cleared: false });
+        assert_eq!(
+            next(false, &done),
+            Next::Finish {
+                cleared: true,
+                restarted: false
+            }
+        );
     }
 }

@@ -939,7 +939,13 @@ pub fn answer_traffic_merge(old_key: String, new_key: String, merged: bool, day:
 
 /// The CSV the service builds for the range, written to a new file; an
 /// existing file is never overwritten.
-pub fn export_traffic_csv(path: PathBuf, from_day: i64, to_day: i64, unit: &'static str) -> Job {
+pub fn export_traffic_csv(
+    path: PathBuf,
+    from_day: i64,
+    to_day: i64,
+    unit: &'static str,
+    include_virtual: bool,
+) -> Job {
     job(move |client| {
         let outcome = (|| {
             let stats: TrafficStatsGetResponse = read(
@@ -950,6 +956,7 @@ pub fn export_traffic_csv(path: PathBuf, from_day: i64, to_day: i64, unit: &'sta
                     "export-from-day": from_day,
                     "export-to-day": to_day,
                     "export-unit": unit,
+                    "export-include-virtual": include_virtual,
                 }),
             )
             .map_err(ExportError::Service)?;

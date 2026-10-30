@@ -21,7 +21,6 @@ impl UiPreferences {
     /// The defaults for a known language. The parser starts here with no
     /// language at all, so a file that names one never asks the system.
     pub(super) fn with_language(language: String) -> Self {
-        let (route_primary_label, route_secondary_label) = default_route_labels(&language);
         Self {
             launch_window_on_startup: true,
             minimize_to_tray_instead_of_close: true,
@@ -42,8 +41,8 @@ impl UiPreferences {
             accessibility_simplified_labels: false,
             tooltips_enabled: true,
             language,
-            route_primary_label,
-            route_secondary_label,
+            route_primary_label: String::new(),
+            route_secondary_label: String::new(),
             show_bluetooth_adapters: false,
             show_audit_tab: false,
             settings_autosave_secs: SETTINGS_AUTOSAVE_DEFAULT_SECS,
@@ -53,6 +52,7 @@ impl UiPreferences {
             routing_detailed_mode: false,
             show_virtual_machines_section: false,
             app_groups_offer_dismissed: false,
+            rule_set_offer_answered: false,
             show_remembered_adapters: true,
             auto_confirm_adapter_id_change: true,
             warn_kill_switch_block_all: true,
@@ -60,6 +60,7 @@ impl UiPreferences {
             missing_secondary_banner_acknowledged: false,
             traffic_stats_period: TRAFFIC_STATS_PERIOD_DEFAULT.to_string(),
             traffic_export_unit: TRAFFIC_EXPORT_UNIT_DEFAULT.to_string(),
+            traffic_export_include_virtual: false,
             conn_trace_group_by: CONN_TRACE_GROUPING_DEFAULT.to_string(),
             diagnostics_archive_redaction_level: DIAGNOSTICS_ARCHIVE_REDACTION_LEVEL_DEFAULT
                 .to_string(),
@@ -151,16 +152,23 @@ pub(super) fn clamp_liveness_window_secs(value: u32) -> u32 {
     }
 }
 
-pub(super) fn default_route_labels(language: &str) -> (String, String) {
-    let base = language
-        .split('-')
-        .next()
-        .filter(|item| !item.is_empty())
-        .unwrap_or("en");
-    if base == "ru" {
-        ("Основной".to_string(), "Дополнительный".to_string())
+/// A route label as stored: empty when the user never renamed the route, so
+/// the window names it in whatever language it runs. The values listed are
+/// defaults older builds wrote into the file (a data migration, not a list of
+/// languages).
+pub fn route_label_as_stored(value: &str) -> String {
+    const FORMER_DEFAULTS: [&str; 5] = [
+        "Primary",
+        "Secondary",
+        "Additional",
+        "Основной",
+        "Дополнительный",
+    ];
+    let value = value.trim();
+    if FORMER_DEFAULTS.contains(&value) {
+        String::new()
     } else {
-        ("Primary".to_string(), "Secondary".to_string())
+        value.to_string()
     }
 }
 
@@ -174,6 +182,15 @@ static SYSTEM_LOCALE_PORT: OnceLock<Box<dyn SystemLocalePort>> = OnceLock::new()
 /// process.
 pub fn install_system_locale_port(port: Box<dyn SystemLocalePort>) {
     let _ = SYSTEM_LOCALE_PORT.set(port);
+}
+
+/// The country the system is set to, as the installed probe spells it; `None`
+/// without a probe or an answer. Asked once per process.
+pub fn system_region() -> Option<String> {
+    static REGION: OnceLock<Option<String>> = OnceLock::new();
+    REGION
+        .get_or_init(|| SYSTEM_LOCALE_PORT.get().and_then(|port| port.region()))
+        .clone()
 }
 
 pub(super) fn detected_system_language() -> String {

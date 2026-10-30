@@ -1,20 +1,20 @@
 {
-  "description": "pure.js fullResetNext: the order of a full reset and what each step's result decides",
+  "description": "pure.js fullResetNext: the order of a full reset and what each step's result decides; it ends with the service running again",
   "cases": [
     {
       "name": "first step",
       "input": { "canElevate": false, "done": [] },
-      "expected": { "action": "run", "step": "clear-logs", "cleared": false, "why": "" }
+      "expected": { "action": "run", "step": "clear-logs", "cleared": false, "restarted": false, "why": "" }
     },
     {
       "name": "sidecar after logs",
       "input": { "canElevate": false, "done": [{ "step": "clear-logs", "result": "ok" }] },
-      "expected": { "action": "run", "step": "reset-sidecar", "cleared": false, "why": "" }
+      "expected": { "action": "run", "step": "reset-sidecar", "cleared": false, "restarted": false, "why": "" }
     },
     {
       "name": "refused log clear does not stop",
       "input": { "canElevate": false, "done": [{ "step": "clear-logs", "result": "forbidden" }] },
-      "expected": { "action": "run", "step": "reset-sidecar", "cleared": false, "why": "" }
+      "expected": { "action": "run", "step": "reset-sidecar", "cleared": false, "restarted": false, "why": "" }
     },
     {
       "name": "purge after a skipped sidecar",
@@ -25,7 +25,7 @@
           { "step": "reset-sidecar", "result": "skipped" }
         ]
       },
-      "expected": { "action": "run", "step": "purge-principal-data", "cleared": false, "why": "" }
+      "expected": { "action": "run", "step": "purge-principal-data", "cleared": false, "restarted": false, "why": "" }
     },
     {
       "name": "refused purge without elevation stops",
@@ -37,7 +37,7 @@
           { "step": "purge-principal-data", "result": "forbidden" }
         ]
       },
-      "expected": { "action": "stop", "step": "purge-principal-data", "cleared": false, "why": "needs-elevation" }
+      "expected": { "action": "stop", "step": "purge-principal-data", "cleared": false, "restarted": false, "why": "needs-elevation" }
     },
     {
       "name": "refused purge with elevation goes on",
@@ -49,10 +49,10 @@
           { "step": "purge-principal-data", "result": "forbidden" }
         ]
       },
-      "expected": { "action": "run", "step": "stop-service", "cleared": false, "why": "" }
+      "expected": { "action": "run", "step": "restart-service", "cleared": false, "restarted": false, "why": "" }
     },
     {
-      "name": "failed purge goes on to the service stop",
+      "name": "failed purge goes on to the service restart",
       "input": {
         "canElevate": false,
         "done": [
@@ -61,10 +61,10 @@
           { "step": "purge-principal-data", "result": "failed" }
         ]
       },
-      "expected": { "action": "run", "step": "stop-service", "cleared": false, "why": "" }
+      "expected": { "action": "run", "step": "restart-service", "cleared": false, "restarted": false, "why": "" }
     },
     {
-      "name": "service stop follows the purge: no rule book of the user's own is written",
+      "name": "service restart follows the purge: no rule book of the user's own is written",
       "input": {
         "canElevate": false,
         "done": [
@@ -73,7 +73,7 @@
           { "step": "purge-principal-data", "result": "ok" }
         ]
       },
-      "expected": { "action": "run", "step": "stop-service", "cleared": false, "why": "" }
+      "expected": { "action": "run", "step": "restart-service", "cleared": false, "restarted": false, "why": "" }
     },
     {
       "name": "everything cleared",
@@ -83,23 +83,49 @@
           { "step": "clear-logs", "result": "failed" },
           { "step": "reset-sidecar", "result": "skipped" },
           { "step": "purge-principal-data", "result": "ok" },
-          { "step": "stop-service", "result": "ok" }
+          { "step": "restart-service", "result": "ok" }
         ]
       },
-      "expected": { "action": "finish", "step": "", "cleared": true, "why": "" }
+      "expected": { "action": "finish", "step": "", "cleared": true, "restarted": true, "why": "" }
     },
     {
-      "name": "failed stop is not cleared",
+      "name": "a failed restart leaves the data cleared and says the service is not back",
       "input": {
         "canElevate": true,
         "done": [
           { "step": "clear-logs", "result": "ok" },
           { "step": "reset-sidecar", "result": "ok" },
           { "step": "purge-principal-data", "result": "ok" },
-          { "step": "stop-service", "result": "failed" }
+          { "step": "restart-service", "result": "failed" }
         ]
       },
-      "expected": { "action": "finish", "step": "", "cleared": false, "why": "" }
+      "expected": { "action": "finish", "step": "", "cleared": true, "restarted": false, "why": "" }
+    },
+    {
+      "name": "a refused restart is not a reason to stop: the reset is done, the service is not back",
+      "input": {
+        "canElevate": false,
+        "done": [
+          { "step": "clear-logs", "result": "ok" },
+          { "step": "reset-sidecar", "result": "ok" },
+          { "step": "purge-principal-data", "result": "ok" },
+          { "step": "restart-service", "result": "forbidden" }
+        ]
+      },
+      "expected": { "action": "finish", "step": "", "cleared": true, "restarted": false, "why": "" }
+    },
+    {
+      "name": "a failed purge with the service back is not cleared",
+      "input": {
+        "canElevate": false,
+        "done": [
+          { "step": "clear-logs", "result": "ok" },
+          { "step": "reset-sidecar", "result": "ok" },
+          { "step": "purge-principal-data", "result": "failed" },
+          { "step": "restart-service", "result": "ok" }
+        ]
+      },
+      "expected": { "action": "finish", "step": "", "cleared": false, "restarted": true, "why": "" }
     }
   ]
 }

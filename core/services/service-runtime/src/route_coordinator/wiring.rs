@@ -51,6 +51,7 @@ impl SecondaryRouteCoordinator {
             contributions: Mutex::new(HashMap::new()),
             reported_conflicts: Mutex::new(std::collections::BTreeMap::new()),
             rule_scope_service_driven,
+            scope_seen: Mutex::new(None),
             binding_heal_persist: None,
             binding_anchor_persist: None,
             device_status: None,

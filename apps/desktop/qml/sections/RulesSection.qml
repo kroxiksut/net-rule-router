@@ -1104,36 +1104,12 @@ ColumnLayout {
         root.emitPrefs()
     }
 
-    // Read the selected bundled preset's primary+secondary files and route
-    // them through the standard import-review flow. Absolute paths so the
-    // remembered file binding (lastSavedPath*) resolves on the next launch.
+    // The window's load, so this button and the empty-rules offer read the
+    // same files and take the same import review.
     function _loadBundledPreset(index) {
         if (section._refuseWhenLocked()) return
         if (index < 0 || index >= section._bundledPresets.length) return
-        if (typeof nrrNativeBridge === "undefined" || !nrrNativeBridge
-                || typeof nrrNativeBridge.resolvePresetPath !== "function"
-                || typeof nrrNativeBridge.readFileBytes !== "function") {
-            root.statusLine = root.tr("status.bridge-unavailable",
-                "Service bridge not connected.")
-            return
-        }
-        // Loading a set confirms it as the user's choice even when they never
-        // touched the dropdown (it already showed the one they wanted).
-        section._rememberPresetSelection(index)
-        // Path assembly lives on the window so the file this button reads is
-        // literally the file the cold-start hydration would have loaded.
-        var primAbs = root.ruleSetCatalog.ruleSetFilePath(index, "primary")
-        var secAbs = root.ruleSetCatalog.ruleSetFilePath(index, "secondary")
-        var primB64 = primAbs ? String(nrrNativeBridge.readFileBytes(primAbs) || "") : ""
-        var secB64 = secAbs ? String(nrrNativeBridge.readFileBytes(secAbs) || "") : ""
-        if (!primB64 && !secB64) {
-            root.statusLine = root.tr("status.bundled-preset-empty",
-                "Could not read the selected bundled preset.")
-            return
-        }
-        if (typeof root.presetImportController.startBothRoutesPresetImportReviewFlow === "function") {
-            root.presetImportController.startBothRoutesPresetImportReviewFlow(primB64, secB64, primAbs, secAbs)
-        }
+        root.ruleSetCatalog.loadRuleSetAt(index)
     }
 
     // "Update rules from file" re-reads the CURRENT source
@@ -2789,6 +2765,23 @@ ColumnLayout {
             font.pixelSize: 18
             font.bold: true
             horizontalAlignment: Text.AlignHCenter
+        }
+        // One click to the set the quick-load points at, whatever the answer
+        // to the banner's offer was.
+        ThemedButton {
+            Layout.alignment: Qt.AlignHCenter
+            theme: root.uiTheme
+            highlighted: true
+            visible: root.uiRevision >= 0 && root.ruleSetOfferName !== ""
+                && !root.rulesSourceIsUserBound()
+            enabled: !section.rulesLocked
+            text: root.uiRevision >= 0
+                ? root.tr("rules.empty.load-set", "Load the rule set «{name}»")
+                    .replace("{name}", Pure.displayText(root.ruleSetOfferName))
+                : ""
+            Accessible.role: Accessible.Button
+            Accessible.name: text
+            onClicked: root.loadOfferedRuleSet()
         }
         Label {
             Layout.alignment: Qt.AlignHCenter

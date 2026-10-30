@@ -24,6 +24,7 @@
 #include <QQmlApplicationEngine>
 #include <QQmlContext>
 #include <QQuickStyle>
+#include <QQuickWindow>
 #include <QProcess>
 #include <QScreen>
 #include <QSplashScreen>
@@ -265,6 +266,12 @@ int main(int argc, char *argv[]) {
                                             ? QStringLiteral("netrulerouter")
                                             : QStringLiteral("netrulerouter-tray"));
 #endif
+    // The tray draws only small notice and add-rule windows. On the GPU path its
+    // first notice loads the display driver for the rest of the session (~40 MB
+    // private, ~50 driver threads); the CPU renderer draws them for neither.
+    if (!isMainGui) {
+        QQuickWindow::setGraphicsApi(QSGRendererInterface::Software);
+    }
     // Main GUI: window may be hidden by close-to-tray and re-shown via
     // activation handover from the tray; do not quit on last-window-hidden.
     // Tray: its own prompt windows open and close on demand (TrayPromptWindow),

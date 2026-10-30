@@ -575,3 +575,49 @@ fn resend_writes_the_route_policy_again() {
         view_text(&app)
     );
 }
+
+/// The bound additional adapter is a dead copy of a stock VPN driver while
+/// another copy is connected: the details say which, as the window's card does.
+#[test]
+fn a_dead_bound_tap_names_the_connected_copy_of_its_driver() {
+    let with_sibling = |sibling_availability: &str| {
+        let mut snapshot = machine();
+        let rows = snapshot["adapters"]["rows"]
+            .as_array_mut()
+            .expect("fixture rows");
+        let base = rows[0].clone();
+        let bound = rows
+            .iter_mut()
+            .find(|row| row["name"] == "Example Tunnel")
+            .expect("the additional adapter");
+        bound["availability"] = json!("unavailable");
+        bound["interface-description"] = json!("TAP-Windows Adapter V9 #3");
+        let mut sibling = adapter(
+            &base,
+            "{00000000-0000-0000-0000-000000000005}",
+            "Ethernet 5",
+            "tunnel",
+        );
+        sibling["interface-description"] = json!("TAP-Windows Adapter V9 #5");
+        sibling["availability"] = json!(sibling_availability);
+        rows.push(sibling);
+        let mut app = app_with(snapshot);
+        choose(&mut app, "Example Tunnel");
+        view_text(&app)
+    };
+    let live = with_sibling("available");
+    assert!(
+        live.contains("another adapter of the same kind is: Ethernet 5"),
+        "{live}"
+    );
+    let idle = with_sibling("unavailable");
+    assert!(
+        idle.contains("other adapters of the same kind are on this computer"),
+        "{idle}"
+    );
+
+    // A connected bound adapter has nothing to warn about.
+    let mut app = app_with(machine());
+    choose(&mut app, "Example Tunnel");
+    assert!(!view_text(&app).contains("of the same kind"));
+}

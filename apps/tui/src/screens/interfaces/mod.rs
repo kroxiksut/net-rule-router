@@ -16,9 +16,9 @@ use nrr_shared::ipc_payloads::InterfaceRowDto;
 
 use self::keys as k;
 use super::binding::{
-    adapters, adapters_read, availability, binding, change_holds_now, error_text, find, hint_text,
-    holds, kill_switch_on, kind_text, positional, role_label, role_write, row_key, rows_are_live,
-    unroutable_lines, RoleChange, WriteFailure,
+    adapters, adapters_read, availability, binding, change_holds_now, driver_sibling_warning,
+    error_text, find, hint_text, holds, kill_switch_on, kind_text, positional, role_label,
+    role_write, row_key, rows_are_live, unroutable_lines, RoleChange, WriteFailure,
 };
 use super::choice;
 use super::Screen;
@@ -782,6 +782,15 @@ fn detail_lines(app: &AppState, row: &InterfaceRowDto, texts: &Texts) -> Vec<Vie
     }
     if row.selected_role.is_some() {
         lines.push(ViewLine::text(texts.get(k::EXCLUSIVE_NOTE)));
+    }
+    let held = Route::ALL
+        .into_iter()
+        .find(|route| row.selected_role.as_deref() == Some(route.as_str()));
+    if let Some(route) = held {
+        let all = adapters(app, true);
+        if let Some(warning) = driver_sibling_warning(&all, row, route, texts) {
+            lines.push(ViewLine::text(warning));
+        }
     }
     lines
 }

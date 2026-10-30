@@ -72,7 +72,14 @@ impl SecondaryRouteCoordinator {
             let Some(binding) = policy.secondary.as_ref() else {
                 continue;
             };
-            match self.resolve_binding_target(sid, binding, &infos, "secondary", None) {
+            match self.resolve_binding_target(
+                sid,
+                binding,
+                policy.primary.as_ref(),
+                &infos,
+                "secondary",
+                None,
+            ) {
                 Some(t) => {
                     // A tunnel adapter that is recreated comes back under a NEW
                     // ifindex, and the liveness window is keyed by index. Left

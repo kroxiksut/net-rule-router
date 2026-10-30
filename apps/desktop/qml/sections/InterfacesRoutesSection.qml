@@ -832,6 +832,18 @@ ColumnLayout {
                                 wrapMode: Text.WordWrap
                                 font.pixelSize: Math.max(11, root.uiTheme.baseFontSizePx - 1)
                             }
+                            Label {
+                                Layout.fillWidth: true
+                                Layout.preferredWidth: 0
+                                readonly property string _role: String(model.selectedRole || "")
+                                visible: text !== ""
+                                text: root.uiRevision >= 0 && _role !== "" && !cardFrame.isAvailable
+                                    ? root.interfacesRolesController.driverSiblingWarning(index, _role) : ""
+                                textFormat: Text.PlainText
+                                color: root.uiTheme.colorWarning
+                                wrapMode: Text.WordWrap
+                                font.pixelSize: Math.max(11, root.uiTheme.baseFontSizePx - 1)
+                            }
                         }
 
                         // Availability badge (right column, top). Green dot

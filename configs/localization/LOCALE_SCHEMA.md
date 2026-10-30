@@ -12,6 +12,23 @@ the application enforces. A defect in the file as a whole (metadata, version,
 fallback chain) rejects the locale; a defect in one key drops that key with a
 warning, and the key falls back to English.
 
+## Tray Files
+
+A language may also have a tray file, `tray/<id>.json` beside its main file
+(`locales/tray/ru.json`, and the same `tray/` folder in the user's locales
+folder, which outranks the shipped one key by key). It holds the words only
+the tray shows, in this same format and with the same metadata.
+
+- A language is found by its main file alone; a tray file without one is
+  refused and adds no language.
+- The window reads both files of a language. The tray reads its tray file
+  plus the main-file words it shares with the window, and only for the
+  current language and English.
+- A key lives in one of the two files, never both.
+- The fallback chain is the main file's; the tray file's `fallbacks` is only
+  checked.
+- A language without a tray file shows the tray's own words in English.
+
 ## Required Metadata
 
 Every locale file must contain the `metadata` object with required fields:

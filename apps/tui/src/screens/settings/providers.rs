@@ -7,8 +7,9 @@
 //! the other VPNs' servers the user let through, each taken back the same way.
 
 use nrr_client_logic::vpn_client_trust::{
-    confirmed_apps, picker_preselected, picker_result, picker_tickable, removed_apps,
-    LinkProviderApp, PickerRow, TrustOffer, PICKER_KERNEL_TUNNEL_SOURCE,
+    confirmed_apps, picker_link_offer, picker_preselected, picker_result, picker_tickable,
+    removed_apps, LinkClientOffer, LinkProviderApp, PickerRow, TrustOffer,
+    PICKER_KERNEL_TUNNEL_SOURCE,
 };
 use nrr_client_logic::vpn_gateway::program_file_name;
 use nrr_client_logic::vpn_gateway_trust::removed_gateways;
@@ -95,6 +96,10 @@ pub const CLEARED: Key = key(
     "vpn-onboarding.cleared-status",
     "No program is kept working over your main link any more.",
 );
+pub const OFFER_ROW: Key = key(
+    "notifications.vpn-client-offer.tui-row",
+    "Use {name} as your VPN client: {apps}",
+);
 
 #[cfg(test)]
 pub fn keys() -> Vec<Key> {
@@ -109,6 +114,7 @@ pub fn keys() -> Vec<Key> {
         TUNNEL_ASSIGN,
         TUNNEL_DOWN,
         CLEARED,
+        OFFER_ROW,
         TITLE,
         NOTE,
         EMPTY,
@@ -134,6 +140,8 @@ pub enum ProviderRow {
     Scan,
     /// A program the scan found, by its place in the list on screen.
     Found(usize),
+    /// The running programs tied to the additional adapter, as one answer.
+    UseOffer,
     /// A confirmed VPN gateway, by its place in the list on screen.
     RemoveGateway(usize),
 }
@@ -167,6 +175,40 @@ pub fn found_rows(candidates: &[VpnCandidate]) -> Vec<PickerRow> {
             interface_name: c.interface.clone().unwrap_or_default(),
         })
         .collect()
+}
+
+/// The bound additional adapter's stored name in `policy`, "" when none.
+pub fn link_name(policy: &Map<String, Value>) -> &str {
+    policy
+        .get("secondary")
+        .and_then(|s| s.get("display-name"))
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+}
+
+/// With no VPN client confirmed, the found programs tied to the additional
+/// adapter — the window's picker opens with the same ones ticked.
+pub fn link_offer(policy: &Map<String, Value>, found: &[PickerRow]) -> Option<LinkClientOffer> {
+    if !apps_of(policy).is_empty() {
+        return None;
+    }
+    Some(picker_link_offer(found, link_name(policy))).filter(|o| !o.exe_paths.is_empty())
+}
+
+/// What the offer row says.
+pub fn offer_label(offer: &LinkClientOffer) -> Words {
+    let apps: Vec<String> = offer
+        .exe_paths
+        .iter()
+        .map(|p| display_text(program_file_name(p)).into_owned())
+        .collect();
+    Words::Fill(
+        OFFER_ROW,
+        vec![
+            ("name", display_text(&offer.name).into_owned()),
+            ("apps", apps.join(", ")),
+        ],
+    )
 }
 
 /// Whether `row` is among the confirmed programs of `policy`.
@@ -273,6 +315,11 @@ enum Change {
         path: String,
         on: bool,
     },
+    /// The offered programs added together.
+    Offer {
+        rows: Vec<PickerRow>,
+        offer: LinkClientOffer,
+    },
 }
 
 pub fn activate(app: &mut AppState, row: ProviderRow, input: Input) -> Option<Job> {
@@ -318,6 +365,11 @@ pub fn activate(app: &mut AppState, row: ProviderRow, input: Input) -> Option<Jo
                 on,
             }))
         }
+        (ProviderRow::UseOffer, Input::Run) => {
+            let rows = app.settings.providers.found.clone()?;
+            let offer = link_offer(app.settings.data.policy.ready()?, &rows)?;
+            Some(write(Change::Offer { rows, offer }))
+        }
         (ProviderRow::RemoveGateway(index), Input::Run) => {
             let address = app.vpn_gateway_trust.confirmed.get(index)?.address.clone();
             Some(revoke_gateway(address))
@@ -347,6 +399,11 @@ fn changed(existing: &[LinkProviderApp], change: &Change) -> Vec<LinkProviderApp
             if *on {
                 selected.push(path.clone());
             }
+            picker_result(rows, &selected, existing)
+        }
+        Change::Offer { rows, offer } => {
+            let mut selected = picker_preselected(rows, existing);
+            selected.extend(offer.exe_paths.iter().cloned());
             picker_result(rows, &selected, existing)
         }
     }
@@ -413,6 +470,10 @@ fn replace(
         Change::Add(path) => Words::Fill(
             ADDED,
             vec![("name", display_text(program_file_name(path)).into_owned())],
+        ),
+        Change::Offer { offer, .. } => Words::Fill(
+            ADDED,
+            vec![("name", display_text(&offer.name).into_owned())],
         ),
         Change::Tick { .. } if apps.is_empty() => Words::Key(CLEARED),
         Change::Tick { path, on: true, .. } => Words::Fill(

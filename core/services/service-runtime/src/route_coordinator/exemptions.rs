@@ -367,7 +367,14 @@ impl SecondaryRouteCoordinator {
                 .and_then(|policy| {
                     let binding = policy.secondary.as_ref()?;
                     let infos = reading.adapters()?;
-                    self.resolve_binding_target(sid, binding, infos, "secondary", Some(reading))
+                    self.resolve_binding_target(
+                        sid,
+                        binding,
+                        policy.primary.as_ref(),
+                        infos,
+                        "secondary",
+                        Some(reading),
+                    )
                 })
                 .map(|t| vec![t.gateway])
                 .unwrap_or_default(),

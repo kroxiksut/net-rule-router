@@ -27,3 +27,14 @@ pub fn secondary_down_body_key(leak_protection: &str) -> &'static str {
         _ => "notifications.enforcement.secondary-down.body",
     }
 }
+
+/// The body of an adapter-choice notice naming `count` adapters
+/// (`enforcementAdapterChoiceBodyKey`): one is a similar adapter that is up
+/// while the saved one is not, several are names to choose between.
+pub fn adapter_choice_body_key(count: usize) -> &'static str {
+    if count == 1 {
+        "notifications.enforcement.adapter-choice.body-one"
+    } else {
+        "notifications.enforcement.adapter-choice.body"
+    }
+}

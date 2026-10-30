@@ -169,6 +169,7 @@ enum CsvByteUnit {
     Kilobytes,
     Megabytes,
     Gigabytes,
+    Terabytes,
 }
 
 impl CsvByteUnit {
@@ -179,6 +180,7 @@ impl CsvByteUnit {
             Some("kb") => Self::Kilobytes,
             Some("mb") => Self::Megabytes,
             Some("gb") => Self::Gigabytes,
+            Some("tb") => Self::Terabytes,
             _ => Self::Bytes,
         }
     }
@@ -191,6 +193,7 @@ impl CsvByteUnit {
             Self::Kilobytes => "kb",
             Self::Megabytes => "mb",
             Self::Gigabytes => "gb",
+            Self::Terabytes => "tb",
         }
     }
 
@@ -201,6 +204,7 @@ impl CsvByteUnit {
             Self::Kilobytes => 1024,
             Self::Megabytes => 1024 * 1024,
             Self::Gigabytes => 1024 * 1024 * 1024,
+            Self::Terabytes => 1024 * 1024 * 1024 * 1024,
         }
     }
 
@@ -282,10 +286,13 @@ impl TrafficStatsProvider for ProductionTrafficStats {
         let csv = match (request.export_from_day, request.export_to_day) {
             (Some(from), Some(to)) => {
                 let unit = CsvByteUnit::from_slug(request.export_unit.as_deref());
-                sampler
-                    .export_range(from, to)
-                    .ok()
-                    .map(|rows| build_csv(&rows, unit))
+                let include_virtual = request.export_include_virtual.unwrap_or(true);
+                sampler.export_range(from, to).ok().map(|mut rows| {
+                    if !include_virtual {
+                        rows.retain(|r| r.role != "virtual");
+                    }
+                    build_csv(&rows, unit)
+                })
             }
             _ => None,
         };
@@ -577,6 +584,7 @@ mod tests {
             export_from_day: None,
             export_to_day: None,
             export_unit: None,
+            export_include_virtual: None,
         });
         let today_primary = resp
             .today
@@ -628,6 +636,7 @@ mod tests {
             export_from_day: None,
             export_to_day: None,
             export_unit: None,
+            export_include_virtual: None,
         });
         let row = resp
             .today
@@ -648,6 +657,7 @@ mod tests {
             export_from_day: None,
             export_to_day: None,
             export_unit: None,
+            export_include_virtual: None,
         });
         let row = resp
             .today
@@ -705,6 +715,7 @@ mod tests {
             export_from_day: Some(0),
             export_to_day: Some(100),
             export_unit: unit.map(str::to_string),
+            export_include_virtual: None,
         })
         .csv
         .expect("csv present")
@@ -716,6 +727,57 @@ mod tests {
         let csv = export_csv_in(&provider_with_one_day(&dir), None);
         assert!(csv.starts_with("day;adapter;role;received_bytes;sent_bytes"));
         assert!(csv.contains(";Ethernet;primary;100;50"));
+    }
+
+    /// A ledger with one primary and one virtual (VM) adapter on day 42.
+    fn provider_with_virtual_adapter(dir: &tempfile::TempDir) -> ProductionTrafficStats {
+        let (src, mut sampler) = sampler_with(dir);
+        let vm = |in_o, out_o| InterfaceCounters {
+            is_virtual: true,
+            ..counters("VMnet", in_o, out_o)
+        };
+        src.set(vec![counters("Ethernet", 0, 0), vm(0, 0)]);
+        sampler
+            .tick(Some("Ethernet"), None, toggles_on(), 42, 1)
+            .expect("t1");
+        src.set(vec![counters("Ethernet", 100, 50), vm(700, 300)]);
+        sampler
+            .tick(Some("Ethernet"), None, toggles_on(), 42, 2)
+            .expect("t2");
+        ProductionTrafficStats::new(
+            Arc::new(Mutex::new(sampler)),
+            Arc::new(FakeSettings {
+                row: StdMutex::new(TrafficStatsSettings::DEFAULT),
+            }),
+        )
+    }
+
+    fn export_with_virtual_flag(prod: &ProductionTrafficStats, flag: Option<bool>) -> String {
+        prod.get(&TrafficStatsGetRequest {
+            day: 42,
+            export_from_day: Some(0),
+            export_to_day: Some(100),
+            export_unit: None,
+            export_include_virtual: flag,
+        })
+        .csv
+        .expect("csv present")
+    }
+
+    #[test]
+    fn export_without_virtual_rows_when_the_client_asks() {
+        let dir = tempfile::tempdir().expect("dir");
+        let prod = provider_with_virtual_adapter(&dir);
+
+        let full = export_with_virtual_flag(&prod, None);
+        assert!(full.contains(";VMnet;virtual;700;300"), "{full}");
+
+        let included = export_with_virtual_flag(&prod, Some(true));
+        assert!(included.contains(";VMnet;virtual;"), "{included}");
+
+        let without = export_with_virtual_flag(&prod, Some(false));
+        assert!(!without.contains("virtual"), "{without}");
+        assert!(without.contains(";Ethernet;primary;100;50"), "{without}");
     }
 
     #[test]
@@ -738,6 +800,12 @@ mod tests {
         assert!(gb.starts_with("day;adapter;role;received_gb;sent_gb"));
         assert!(gb.contains(";Ethernet;primary;0;0"), "{gb}");
 
+        let tb = export_csv_in(&prod, Some("tb"));
+        assert!(
+            tb.starts_with("day;adapter;role;received_tb;sent_tb"),
+            "{tb}"
+        );
+
         // An unrecognised slug must not mislabel the export.
         let unknown = export_csv_in(&prod, Some("furlongs"));
         assert!(unknown.starts_with("day;adapter;role;received_bytes;sent_bytes"));
@@ -757,6 +825,8 @@ mod tests {
         assert_eq!(CsvByteUnit::Kilobytes.render(1546), "1.51");
         assert_eq!(CsvByteUnit::Bytes.render(0), "0");
         assert_eq!(CsvByteUnit::Gigabytes.render(0), "0");
+        assert_eq!(CsvByteUnit::Terabytes.render(1_099_511_627_776), "1");
+        assert_eq!(CsvByteUnit::Terabytes.render(1_649_267_441_664), "1.5");
     }
 
     #[test]

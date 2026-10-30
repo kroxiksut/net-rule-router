@@ -195,15 +195,16 @@ Item {
     }
 
     // Request a CSV export for [fromDay, toDay], with the received/sent columns
-    // rendered in `unit` ("bytes" / "kb" / "mb" / "gb"); the service names the
+    // rendered in `unit` ("bytes" / "kb" / "mb" / "gb" / "tb"); the service names the
     // columns after the unit. `cb(csvText)` (empty on failure).
-    function requestExport(fromDay, toDay, unit, cb) {
+    function requestExport(fromDay, toDay, unit, includeVirtual, cb) {
         if (!bridgeReady()) { cb(""); return }
         var corr = ownerRoot.rpc.rpcTrafficStatsGet({
             "day": controller.epochDay(),
             "export-from-day": fromDay,
             "export-to-day": toDay,
-            "export-unit": String(unit || "bytes")
+            "export-unit": String(unit || "bytes"),
+            "export-include-virtual": includeVirtual === true
         })
         if (!corr || corr === "") { cb(""); return }
         ownerRoot.rpc.registerRpcCallback(corr, function(ok, p, code, msg) {

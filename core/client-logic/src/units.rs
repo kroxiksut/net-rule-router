@@ -3,6 +3,8 @@
 const KIB: u128 = 1024;
 const MIB: u128 = KIB * 1024;
 const GIB: u128 = MIB * 1024;
+const TIB: u128 = GIB * 1024;
+const PIB: u128 = TIB * 1024;
 
 /// `value / unit` to `places` decimals, rounding a tie up as JS `toFixed`
 /// does for a positive number. Integer arithmetic, so no binary rounding.
@@ -13,7 +15,7 @@ fn fixed(value: u128, unit: u128, places: u32) -> String {
     format!("{}.{:0width$}", scaled / scale, scaled % scale)
 }
 
-/// `512 B`, `1.5 KiB`, `12.3 MiB`, `2.05 GiB`.
+/// `512 B`, `1.5 KiB`, `12.3 MiB`, `2.05 GiB`, `1.50 TiB`, `2.00 PiB`.
 pub fn format_storage_bytes(bytes: u64) -> String {
     let n = u128::from(bytes);
     if n < KIB {
@@ -22,8 +24,12 @@ pub fn format_storage_bytes(bytes: u64) -> String {
         format!("{} KiB", fixed(n, KIB, 1))
     } else if n < GIB {
         format!("{} MiB", fixed(n, MIB, 1))
-    } else {
+    } else if n < TIB {
         format!("{} GiB", fixed(n, GIB, 2))
+    } else if n < PIB {
+        format!("{} TiB", fixed(n, TIB, 2))
+    } else {
+        format!("{} PiB", fixed(n, PIB, 2))
     }
 }
 

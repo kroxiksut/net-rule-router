@@ -167,8 +167,9 @@ pub struct RoutePolicyRecord {
     /// as the computer), "as-computer" or "unprotected".
     pub forwarded_outage: String,
     /// Ask a public server for the additional route's external address each
-    /// time that route connects. Off by default: the request leaves through the
-    /// tunnel unasked. The check the user starts by hand ignores this.
+    /// time that route connects. On by default, an owner's exception to
+    /// "tunnel traffic is opt-in": a couple of tiny requests per connect. The
+    /// check the user starts by hand ignores this.
     pub external_address_auto_check: bool,
     /// "Treat a domain as `domain` + `*.domain`". When `true`, the
     /// enforcement layer expands every bare-domain (`ExactFqdn`) rule with a
@@ -258,7 +259,8 @@ impl RoutePolicyRecord {
             short_name_suffix: String::new(),
             app_rules_take_all_addresses: false,
             forwarded_outage: String::new(),
-            external_address_auto_check: false,
+            // The SQL column DEFAULT stays 0 (checksummed DDL, inert).
+            external_address_auto_check: true,
             // Default ON: adding `site.example` and silently losing
             // `cdn.site.example` to the other route was the surprising outcome.
             // Widening only adds coverage towards the route the rule names, so
@@ -402,7 +404,7 @@ impl Default for BlockPolicyRow {
             short_name_suffix: String::new(),
             app_rules_take_all_addresses: false,
             forwarded_outage: String::new(),
-            external_address_auto_check: false,
+            external_address_auto_check: true,
         }
     }
 }

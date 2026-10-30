@@ -2,6 +2,7 @@
 //! picks implementations of platform ports; every decision codes against them.
 
 use nrr_platform_api::authorization::TerminalPromptAgent;
+use nrr_platform_api::installer_agreement::InstallerAgreementPort;
 use nrr_platform_api::path_registration::PathRegistrationPort;
 use nrr_platform_api::service_control::ServiceControlPort;
 use nrr_platform_api::system_locale::SystemLocalePort;
@@ -40,6 +41,23 @@ pub fn service_control() -> Option<Box<dyn ServiceControlPort>> {
 #[cfg(not(any(windows, target_os = "linux")))]
 pub fn service_control() -> Option<Box<dyn ServiceControlPort>> {
     None
+}
+
+/// Where the installer recorded the agreement accepted on its licence page.
+#[cfg(windows)]
+pub fn installer_agreement() -> Box<dyn InstallerAgreementPort> {
+    Box::new(nrr_platform_windows::installer_agreement::WindowsInstallerAgreement)
+}
+
+/// The Linux packages show no agreement: never a record.
+#[cfg(target_os = "linux")]
+pub fn installer_agreement() -> Box<dyn InstallerAgreementPort> {
+    Box::new(nrr_platform_linux::installer_agreement::LinuxInstallerAgreement)
+}
+
+#[cfg(not(any(windows, target_os = "linux")))]
+pub fn installer_agreement() -> Box<dyn InstallerAgreementPort> {
+    Box::new(nrr_platform_api::installer_agreement::NoInstallerAgreement)
 }
 
 /// The host's `PATH` mechanism, and this terminal's own folder once the

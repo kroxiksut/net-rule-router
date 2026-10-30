@@ -347,6 +347,26 @@ pub(super) fn validate_cross_locale_rules(candidates: &mut [LocaleCandidate]) {
     reject_fallback_cycles(candidates);
 }
 
+/// A tray file adds words to a language its main file declares; alone it is
+/// no language. Its fallbacks are checked but unused: the chain is the main
+/// file's.
+pub(super) fn validate_tray_candidates(tray: &mut [LocaleCandidate], main: &[LocaleCandidate]) {
+    let languages = main
+        .iter()
+        .filter(|candidate| candidate.errors.is_empty())
+        .map(|candidate| candidate.id.as_str())
+        .collect::<HashSet<_>>();
+    for candidate in tray.iter_mut() {
+        if !languages.contains(candidate.id.as_str()) {
+            candidate.errors.push(
+                "no locale file declares this language, so its tray file is not used".to_string(),
+            );
+        }
+    }
+    mark_duplicate_locale_ids(tray);
+    add_missing_baseline_coverage_warnings(tray);
+}
+
 pub(super) fn mark_duplicate_locale_ids(candidates: &mut [LocaleCandidate]) {
     let mut groups = HashMap::<(String, LocaleSource), Vec<usize>>::new();
     for (index, candidate) in candidates.iter().enumerate() {

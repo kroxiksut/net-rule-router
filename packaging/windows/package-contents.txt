@@ -9,14 +9,15 @@
 # script it ships is not listed here.
 #
 # Line: <set> <path>. Sets: all (both variants), full (window and tray),
-# installer (only what the MSI and EXE add).
+# installer (only what the MSI and EXE add), symbols and symbols-full (the
+# debug symbols of the executables in all and full).
+#
+# No package, EXE or MSI carries a .pdb: the symbols travel in
+# <artifact>-symbols.zip beside them, which holds exactly the symbols sets.
 
 all        nrr-service.exe
-all        nrr_service.pdb
 all        nrr-cli.exe
-all        nrr_cli.pdb
 all        nrr-tui.exe
-all        nrr_tui.pdb
 all        wintun.dll
 all        licenses\NetRuleRouter-LICENSE.txt
 all        licenses\THIRD_PARTY_LICENSES.md
@@ -33,11 +34,13 @@ all        scripts\lib\service-paths.ps1
 all        README.txt
 all        README.ru.txt
 all        build-info.json
+# The offline documentation Help > Documentation opens (nrr-docs-html).
+all        docs\style.css
+all        docs\en\index.html
+all        docs\ru\index.html
 
 full       NetRuleRouter.exe
-full       NetRuleRouter.pdb
 full       NetRuleRouterTray.exe
-full       NetRuleRouterTray.pdb
 full       nrr_qt_native_host.exe
 full       Qt6Core.dll
 full       licenses\Qt-NOTICE.txt
@@ -56,3 +59,10 @@ full       assets\images\logo\logo-lockup-stacked.png
 full       configs\presets\builtin-demo\rules_primary.txt
 
 installer  scripts\setup-actions.ps1
+
+# The Qt host has none: CMake builds it as Release, which writes no PDB.
+symbols       nrr_service.pdb
+symbols       nrr_cli.pdb
+symbols       nrr_tui.pdb
+symbols-full  NetRuleRouter.pdb
+symbols-full  NetRuleRouterTray.pdb

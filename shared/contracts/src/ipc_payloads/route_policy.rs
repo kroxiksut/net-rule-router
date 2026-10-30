@@ -222,9 +222,9 @@ pub struct RoutePolicyDto {
     #[serde(default)]
     pub forwarded_outage: String,
     /// Ask a public server for the additional route's external address each
-    /// time that route connects. Off by default, and an older peer that omits
-    /// it reads as off: the request leaves through the tunnel.
-    #[serde(default)]
+    /// time that route connects. On by default, so an older peer that omits
+    /// it does not switch it off.
+    #[serde(default = "default_true")]
     pub external_address_auto_check: bool,
 }
 
@@ -494,7 +494,7 @@ pub struct RoutePolicyUpdateRequest {
     #[serde(default)]
     pub forwarded_outage: String,
     /// Automatic external-address check (see [`RoutePolicyDto`]).
-    #[serde(default)]
+    #[serde(default = "default_true")]
     pub external_address_auto_check: bool,
     /// When not empty, only these fields (wire names) are taken from this
     /// request; the rest stay as stored. Two clients each writing the row they

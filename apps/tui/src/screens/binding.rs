@@ -3,8 +3,8 @@
 //! route-policy field) reaches the service.
 
 use nrr_client_logic::adapters::{
-    display_name, held_other_role, is_own_fake_ip_tun, role_hint, rows_are_live as source_is_live,
-    unroutable_reason,
+    display_name, driver_siblings, held_other_role, is_own_fake_ip_tun, role_hint,
+    rows_are_live as source_is_live, unroutable_reason,
 };
 use nrr_client_logic::route_policy::{
     build_full_update_request, coerce_leak_protection, name_changes, secondary_change_holds_now,
@@ -444,6 +444,28 @@ pub fn change_holds_now(app: &AppState, key: &str, change: &RoleChange) -> bool 
         } => before.filter(|row| row_key(row) != key),
     };
     secondary_change_holds_now(leak_level(app), before, after)
+}
+
+/// For `row` picked for `route` while not connected, the warning that another
+/// copy of its driver may be the one the VPN uses; `all` is every adapter, the
+/// hidden ones included. The window's card says the same.
+pub fn driver_sibling_warning(
+    all: &[InterfaceRowDto],
+    row: &InterfaceRowDto,
+    route: Route,
+    texts: &Texts,
+) -> Option<String> {
+    let index = all.iter().position(|r| row_key(r) == row_key(row))?;
+    let found = driver_siblings(all, index, route);
+    if !found.live.is_empty() {
+        let list: Vec<String> = found
+            .live
+            .iter()
+            .filter_map(|&i| all.get(i).map(display_name))
+            .collect();
+        return Some(texts.fill(k::DRIVER_SIBLING_LIVE, &[("list", list.join(", "))]));
+    }
+    (found.idle > 0).then(|| texts.get(k::DRIVER_SIBLING_IDLE))
 }
 
 /// The GUI's warning before an adapter with no way out takes a role.

@@ -435,7 +435,16 @@ fn settings() -> Vec<Setting> {
         Setting {
             store: "ServiceStabilityConfigRecord",
             field: "rule_scope_service_driven",
-            windows: Read(vec![(WIN_PER_SID_APPLY, "r.rule_scope_service_driven")]),
+            windows: Read(vec![
+                (
+                    "core/services/service-runtime/src/route_coordinator.rs",
+                    ".map(|r| r.rule_scope_service_driven)",
+                ),
+                (
+                    WIN_PER_SID_APPLY,
+                    "route_coordinator::rule_scope_from_store(",
+                ),
+            ]),
             linux: Unsupported(STABILITY_HIDDEN_ON_LINUX),
         },
         Setting {

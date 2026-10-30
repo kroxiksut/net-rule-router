@@ -251,6 +251,139 @@ pub fn picker_result(
     out
 }
 
+/// Words every VPN adapter or install path carries, so they tie nothing to
+/// anything.
+const LINK_TIE_GENERIC_WORDS: &[&str] = &[
+    "adapter",
+    "and",
+    "app",
+    "appdata",
+    "applications",
+    "apps",
+    "bin",
+    "channel",
+    "client",
+    "connection",
+    "contents",
+    "data",
+    "driver",
+    "ethernet",
+    "exe",
+    "files",
+    "for",
+    "gui",
+    "interface",
+    "lib",
+    "local",
+    "macos",
+    "miniport",
+    "network",
+    "offload",
+    "opt",
+    "program",
+    "programs",
+    "roaming",
+    "sbin",
+    "service",
+    "share",
+    "system32",
+    "tap",
+    "the",
+    "tun",
+    "tunnel",
+    "users",
+    "usr",
+    "virtual",
+    "vpn",
+    "windows",
+    "wintun",
+    "x64",
+    "x86",
+];
+
+const LINK_TIE_SEPARATORS: &[char] = &[
+    ' ', '\t', '\\', '/', '-', '_', '(', ')', '[', ']', ',', ':', '\u{2014}', '\u{2013}',
+];
+
+/// The distinctive words of an adapter name or a program path: ASCII-lowered,
+/// split on separators, dots kept inside a word (`hidemy.name`), versions,
+/// short words and the generic ones dropped.
+fn link_tie_words(raw: &str) -> Vec<String> {
+    let lowered = raw.to_ascii_lowercase();
+    let lowered = lowered.strip_suffix(".exe").unwrap_or(&lowered);
+    let mut words: Vec<String> = Vec::new();
+    for part in lowered.split(LINK_TIE_SEPARATORS) {
+        let word = part.trim_matches('.');
+        if word.chars().count() < 3
+            || word.chars().all(|c| c.is_ascii_digit() || c == '.')
+            || LINK_TIE_GENERIC_WORDS.contains(&word)
+            || words.iter().any(|w| w == word)
+        {
+            continue;
+        }
+        words.push(word.to_owned());
+    }
+    words
+}
+
+fn shares_a_word(words: &[String], raw: &str) -> bool {
+    link_tie_words(raw).iter().any(|w| words.contains(w))
+}
+
+/// Programs the picker can offer as the client of the additional link
+/// `link_name`, and what the offer calls them (`vpnPickerLinkOffer`).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct LinkClientOffer {
+    /// Empty when nothing on screen ties to the link.
+    pub name: String,
+    pub exe_paths: Vec<String>,
+}
+
+/// The running programs whose file sits under a folder (or carries a name)
+/// sharing a distinctive word with the additional link's adapter name, e.g.
+/// `C:\Program Files\Example VPN 3.0\OpenVPN\openvpn.exe` for the adapter
+/// "Example VPN Adapter". No OS reports which program raised an adapter, so
+/// this name tie is the strongest one available; it only ever pre-ticks or
+/// offers, and the user confirms. A program not running now is never tied:
+/// the link that just came up was raised by something running.
+pub fn picker_link_offer(rows: &[PickerRow], link_name: &str) -> LinkClientOffer {
+    let words = link_tie_words(link_name);
+    if words.is_empty() {
+        return LinkClientOffer::default();
+    }
+    let mut exe_paths: Vec<String> = Vec::new();
+    let mut name = String::new();
+    for row in rows.iter().filter(|r| picker_tickable(r) && r.running) {
+        let path = js::trim(&row.exe_path);
+        let own_name = js::trim(&row.display_name);
+        if !shares_a_word(&words, path) && !shares_a_word(&words, own_name) {
+            continue;
+        }
+        if exe_paths.iter().any(|p| same_path(p, path)) {
+            continue;
+        }
+        exe_paths.push(path.to_owned());
+        if name.is_empty() && shares_a_word(&words, own_name) {
+            name = strip_exe(own_name).to_owned();
+        }
+    }
+    if name.is_empty() {
+        if let Some(first) = exe_paths.first() {
+            name = strip_exe(program_file_name(first)).to_owned();
+        }
+    }
+    LinkClientOffer { name, exe_paths }
+}
+
+fn strip_exe(name: &str) -> &str {
+    let lowered = name.to_ascii_lowercase();
+    if lowered.ends_with(".exe") {
+        &name[..name.len() - 4]
+    } else {
+        name
+    }
+}
+
 #[cfg(test)]
 mod removal_tests {
     use super::*;

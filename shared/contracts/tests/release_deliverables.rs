@@ -127,6 +127,61 @@ fn notices_flaw(windows: &str, linux: &str, script: &str) -> Option<String> {
         .then(|| "check_package does not require the notice in each package's doc folder".into())
 }
 
+/// The linker's name for an executable's symbols: `nrr-cli.exe` -> `nrr_cli.pdb`.
+fn symbols_of(exe: &str) -> String {
+    format!("{}.pdb", exe.trim_end_matches(".exe").replace('-', "_"))
+}
+
+/// Why a Windows package, EXE or MSI could carry debug symbols, or a shipped
+/// executable leave its symbols out of the symbols archive, if either could.
+fn windows_symbols_flaw(windows: &str, package: &str, check: &str) -> Option<String> {
+    let list = manifest(windows);
+    let in_set = |set: &str, path: &str| list.iter().any(|(s, p)| s == set && p == path);
+    if let Some((set, path)) = list.iter().find(|(set, path)| {
+        ["all", "full", "installer"].contains(&set.as_str())
+            && path.to_ascii_lowercase().ends_with(".pdb")
+    }) {
+        return Some(format!("`{set} {path}` puts debug symbols into a package"));
+    }
+    for (shipped, symbols) in [("all", "symbols"), ("full", "symbols-full")] {
+        for (_, exe) in list
+            .iter()
+            .filter(|(s, p)| s == shipped && p.ends_with(".exe"))
+        {
+            // CMake builds the C++ host as Release, which writes no PDB.
+            if exe == "nrr_qt_native_host.exe" {
+                continue;
+            }
+            if !in_set(symbols, &symbols_of(exe)) {
+                return Some(format!("{exe} has no `{symbols} {}`", symbols_of(exe)));
+            }
+        }
+    }
+    if !package.contains("\"$artifactBase-symbols.zip\"") {
+        return Some("package-windows.ps1 writes no <artifact>-symbols.zip".into());
+    }
+    for needle in ["'*-symbols.zip'", "-Symbols", "'*.pdb'"] {
+        if !check.contains(needle) {
+            return Some(format!(
+                "check-windows-package.ps1 no longer checks the symbols ({needle})"
+            ));
+        }
+    }
+    None
+}
+
+/// Why a user downloading from the release page could not tell the archive
+/// that runs from a folder from the installers and the symbols, if they could.
+fn windows_portable_flaw(package: &str, check: &str) -> Option<String> {
+    if !package.contains("\"$artifactBase-portable.zip\"") {
+        return Some("package-windows.ps1 names the archive without -portable".into());
+    }
+    if !check.contains("'*-portable.zip'") {
+        return Some("check-windows-package.ps1 does not look for the -portable.zip".into());
+    }
+    None
+}
+
 /// `(revision, date as YYYY-MM-DD, stage, series)` from an agreement header.
 fn agreement_header(
     text: &str,
@@ -191,23 +246,23 @@ fn agreement_flaw(en: &str, ru: &str, version: &str) -> Option<String> {
             en.3, ru.3
         ));
     }
-    let stage = match pre {
-        "prealpha" => ("pre-alpha", "пре-альфа"),
-        "alpha" => ("alpha", "альфа"),
-        "beta" => ("beta", "бета"),
-        other => {
-            return Some(format!(
-                "no agreement stage known for version suffix `{other}`"
-            ))
-        }
+    // `alpha.2` is of stage `alpha`.
+    let stage = pre.split('.').next().unwrap_or(pre);
+    let Some((_, en_word, ru_word)) = STAGES.iter().find(|(suffix, _, _)| *suffix == stage) else {
+        return Some(format!(
+            "no agreement stage known for version suffix `{pre}`"
+        ));
     };
-    (en.2 != stage.0 || ru.2 != stage.1).then(|| {
+    (en.2 != *en_word || ru.2 != *ru_word).then(|| {
         format!(
-            "stage: en `{}`, ru `{}`, version {version} is `{}` / `{}`",
-            en.2, ru.2, stage.0, stage.1
+            "stage: en `{}`, ru `{}`, version {version} is `{en_word}` / `{ru_word}`",
+            en.2, ru.2
         )
     })
 }
+
+/// Version suffix and the stage word each agreement names, in release order.
+const STAGES: [(&str, &str, &str); 2] = [("alpha", "alpha", "альфа"), ("beta", "beta", "бета")];
 
 #[test]
 fn a_linux_package_is_checked_against_its_list_as_it_is_built() {
@@ -224,6 +279,29 @@ fn every_package_carries_the_third_party_notices() {
             &repo_file("packaging/windows/package-contents.txt"),
             &repo_file("packaging/linux/package-contents.txt"),
             &repo_file("scripts/package-linux.sh"),
+        ),
+        None
+    );
+}
+
+#[test]
+fn no_windows_package_carries_debug_symbols_and_each_executable_has_them_aside() {
+    assert_eq!(
+        windows_symbols_flaw(
+            &repo_file("packaging/windows/package-contents.txt"),
+            &repo_file("scripts/package-windows.ps1"),
+            &repo_file("scripts/check-windows-package.ps1"),
+        ),
+        None
+    );
+}
+
+#[test]
+fn the_windows_archive_says_it_is_the_portable_build() {
+    assert_eq!(
+        windows_portable_flaw(
+            &repo_file("scripts/package-windows.ps1"),
+            &repo_file("scripts/check-windows-package.ps1"),
         ),
         None
     );
@@ -300,6 +378,34 @@ fn each_deliverable_regression_is_seen() {
     );
     assert!(notices_flaw(&windows, &linux, &doc_unchecked).is_some());
 
+    let package = repo_file("scripts/package-windows.ps1");
+    let check = repo_file("scripts/check-windows-package.ps1");
+    let pdb_shipped = format!("{windows}\nfull       NetRuleRouter.pdb\n");
+    assert!(windows_symbols_flaw(&pdb_shipped, &package, &check).is_some());
+    let installer_pdb = format!("{windows}\ninstaller  nrr_service.PDB\n");
+    assert!(windows_symbols_flaw(&installer_pdb, &package, &check).is_some());
+    let tray_unsymbolled = edit(&windows, "NetRuleRouterTray.pdb", "NetRuleRouterTray.map");
+    assert!(windows_symbols_flaw(&tray_unsymbolled, &package, &check).is_some());
+    let new_exe = format!("{windows}\nall        nrr-helper.exe\n");
+    assert!(windows_symbols_flaw(&new_exe, &package, &check).is_some());
+    let no_archive = edit(
+        &package,
+        "\"$artifactBase-symbols.zip\"",
+        "\"$artifactBase.zip\"",
+    );
+    assert!(windows_symbols_flaw(&windows, &no_archive, &check).is_some());
+    assert!(check.contains("'*.pdb'"));
+    let pdb_unchecked = check.replace("'*.pdb'", "'*.none'");
+    assert!(windows_symbols_flaw(&windows, &package, &pdb_unchecked).is_some());
+    let unnamed_portable = edit(
+        &package,
+        "\"$artifactBase-portable.zip\"",
+        "\"$artifactBase.zip\"",
+    );
+    assert!(windows_portable_flaw(&unnamed_portable, &check).is_some());
+    let portable_unchecked = check.replace("'*-portable.zip'", "'*.zip'");
+    assert!(windows_portable_flaw(&package, &portable_unchecked).is_some());
+
     let en = repo_file("docs/legal/eula.en.md");
     let ru = repo_file("docs/legal/eula.ru.md");
     let version = workspace_version();
@@ -311,13 +417,244 @@ fn each_deliverable_regression_is_seen() {
     let ru_date = ru_header.split(" · ").nth(1).expect("ru date");
     let ru_other_day = edit(&ru, &format!(" · {ru_date} · "), " · 01.01.1999 · ");
     assert!(agreement_flaw(&en, &ru_other_day, &version).is_some());
-    let ru_revision_two = ru.replacen("Редакция соглашения 1 ", "Редакция соглашения 2 ", 1);
-    assert!(agreement_flaw(&en, &ru_revision_two, &version).is_some());
-    let next_stage = if version.ends_with("-alpha") {
-        "0.1.0-beta"
-    } else {
-        "0.1.0-alpha"
+    let ru_revision_ahead = edit(
+        &ru,
+        &format!("Редакция соглашения {CURRENT_EULA_VERSION} "),
+        &format!("Редакция соглашения {} ", CURRENT_EULA_VERSION + 1),
+    );
+    assert!(agreement_flaw(&en, &ru_revision_ahead, &version).is_some());
+    assert!(agreement_flaw(&en, &ru, "0.2.0-alpha.1").is_some());
+    // Stages, on agreements forged at each one against a 0.1 build.
+    let at_stage = |en_word: &str, ru_word: &str| {
+        let en_header = en
+            .lines()
+            .find(|l| l.starts_with("Agreement revision "))
+            .expect("en header");
+        let en_stage = en_header.split(" · ").nth(2).expect("en scope");
+        let ru_stage = ru_header.split(" · ").nth(2).expect("ru scope");
+        (
+            edit(
+                &en,
+                en_stage,
+                &format!("applies to {en_word} builds (0.1.x)"),
+            ),
+            edit(
+                &ru,
+                ru_stage,
+                &format!("относится к сборкам стадии {ru_word} (0.1.x)"),
+            ),
+        )
     };
-    assert!(agreement_flaw(&en, &ru, next_stage).is_some());
-    assert!(agreement_flaw(&en, &ru, "0.2.0-prealpha").is_some());
+    let (en_alpha, ru_alpha) = at_stage("alpha", "альфа");
+    assert_eq!(agreement_flaw(&en_alpha, &ru_alpha, "0.1.0-alpha"), None);
+    assert_eq!(agreement_flaw(&en_alpha, &ru_alpha, "0.1.0-alpha.2"), None);
+    assert!(agreement_flaw(&en_alpha, &ru_alpha, "0.1.0-beta").is_some());
+    assert!(agreement_flaw(&en_alpha, &ru_alpha, "0.1.0-dev").is_some());
+    // The agreement of the next stage does not cover a build still before it.
+    let (en_beta, ru_beta) = at_stage("beta", "бета");
+    assert!(agreement_flaw(&en_beta, &ru_beta, "0.1.0-alpha.1").is_some());
+    let (en_mixed, _) = at_stage("beta", "бета");
+    assert!(agreement_flaw(&en_mixed, &ru_alpha, "0.1.0-alpha").is_some());
+}
+
+/// Artifacts were named `...-0.1.0-alpha.1+unknown.msi`: a tree without a
+/// usable git state put "unknown" in every download, and the commit is noise
+/// on a release page anyway. Names, and the version Apps & Features shows,
+/// carry the product version only; the commit stays in build-info.json.
+#[test]
+fn windows_artifacts_are_named_by_the_version_alone() {
+    let package = repo_file("scripts/package-windows.ps1");
+    let assigned = |name: &str| -> String {
+        package
+            .lines()
+            .find(|line| line.trim_start().starts_with(&format!("{name} = ")))
+            .unwrap_or_else(|| panic!("package-windows.ps1 does not set {name}"))
+            .to_owned()
+    };
+    let line = assigned("$artifactBase");
+    let base = line.split('"').nth(1).unwrap_or_default();
+    assert!(
+        base.contains("$productVersion")
+            && !base.contains('+')
+            && !base.contains("revision")
+            && !base.contains("buildStamp"),
+        "an artifact name carries more than the version: {base}"
+    );
+    for (needle, what) in [
+        ("\"/DAppVersion=", "the EXE"),
+        ("\"DisplayVersion=", "the MSI"),
+    ] {
+        let line = package
+            .lines()
+            .find(|line| line.contains(needle))
+            .unwrap_or_else(|| panic!("{what} is not given its displayed version"));
+        let value = line[line.find(needle).expect("needle") + needle.len()..]
+            .split('"')
+            .next()
+            .unwrap_or_default();
+        assert_eq!(
+            value, "$productVersion",
+            "{what} shows another version in Apps & Features: {line}"
+        );
+    }
+    let info = package
+        .split("$buildInfo = [ordered]@{")
+        .nth(1)
+        .and_then(|rest| rest.split("\n}").next())
+        .expect("build-info.json fields");
+    assert!(
+        info.contains("commit         = $revision.commit"),
+        "build-info.json lost the commit: {info}"
+    );
+}
+
+/// The `release` job's steps from its `steps:` line to the end of the file.
+fn release_job_steps(workflow: &str) -> &str {
+    let job = workflow
+        .find("\n  release:\n")
+        .expect("release.yml has a release job");
+    &workflow[job..]
+}
+
+/// No ARM installer has run on ARM hardware, so the release carries the ARM
+/// portable archives and holds the ARM installers back: they are built only to
+/// catch a broken build. They must be gone before the checksums are taken, or
+/// SHA256SUMS would name files the release does not carry.
+#[test]
+fn arm_installers_are_built_but_not_released() {
+    let workflow = repo_file(".github/workflows/release.yml");
+    let steps = release_job_steps(&workflow);
+    let checksums = steps
+        .find("name: Checksums")
+        .expect("the release job takes checksums");
+    let before = &steps[..checksums];
+    for pattern in [
+        "NetRuleRouter-windows-arm64-*.exe",
+        "NetRuleRouter-windows-arm64-*.msi",
+        "*_arm64.deb",
+        "*.aarch64.rpm",
+    ] {
+        assert!(
+            before.contains(pattern),
+            "the release job does not hold back {pattern} before its checksums"
+        );
+    }
+    assert!(
+        !before.contains("windows-arm64-*.zip"),
+        "the ARM portable archive is what ships for Windows on ARM"
+    );
+}
+
+/// Why a Linux build could ship debug info inside a package, or leave a
+/// release without the symbols archive of one architecture or flavour.
+fn linux_symbols_flaw(script: &str, workflow: &str) -> Option<String> {
+    for needle in [
+        "--only-keep-debug",
+        "--strip-debug",
+        "--add-gnu-debuglink",
+        "-linux-$arch-symbols",
+    ] {
+        if !script.contains(needle) {
+            return Some(format!("package-linux.sh no longer does `{needle}`"));
+        }
+    }
+    for function in ["check_package", "check_tarball"] {
+        if !shell_function(script, function).contains("refuse_symbols ") {
+            return Some(format!(
+                "{function} does not refuse symbol files in a package"
+            ));
+        }
+    }
+    if !workflow.contains("arch: [x86_64, aarch64]") {
+        return Some("the Linux jobs no longer build both x86_64 and aarch64".into());
+    }
+    for keep in [
+        "netrulerouter-headless-*-symbols.tar.xz",
+        "netrulerouter-[0-9]*-symbols.tar.xz",
+    ] {
+        if !workflow.contains(keep) {
+            return Some(format!("release.yml keeps no `{keep}` from the Linux jobs"));
+        }
+    }
+    None
+}
+
+/// Why the Windows symbols archive of an architecture could miss the release.
+fn windows_symbols_release_flaw(workflow: &str) -> Option<String> {
+    if !workflow.contains("arch: [x64, arm64]") {
+        return Some("the Windows job no longer builds both x64 and arm64".into());
+    }
+    if !workflow.contains("/dist/*.zip") {
+        return Some(
+            "the Windows job does not upload the *.zip files (portable and symbols)".into(),
+        );
+    }
+    let release = release_job_steps(workflow);
+    let before = &release[..release.find("name: Checksums")?];
+    // The hold-back removes ARM installers by exact pattern; a pattern that
+    // takes a symbols archive goes with them.
+    if before.contains("symbols") || before.contains(".tar.xz") || before.contains("arm64-*.zip") {
+        return Some("the release job holds back a symbols archive with the ARM installers".into());
+    }
+    if !before.contains("--notes") && !release.contains("--notes") {
+        return Some("the release carries no note about the symbols archives".into());
+    }
+    if !release.contains("-symbols.zip") || !release.contains("-symbols.tar.xz") {
+        return Some("the release note does not name both symbols archive kinds".into());
+    }
+    None
+}
+
+#[test]
+fn linux_symbols_leave_the_packages_and_reach_the_release_for_both_architectures() {
+    assert_eq!(
+        linux_symbols_flaw(
+            &repo_file("scripts/package-linux.sh"),
+            &repo_file(".github/workflows/release.yml"),
+        ),
+        None
+    );
+}
+
+#[test]
+fn the_symbols_of_both_windows_architectures_reach_the_release() {
+    assert_eq!(
+        windows_symbols_release_flaw(&repo_file(".github/workflows/release.yml")),
+        None
+    );
+}
+
+#[test]
+fn each_symbols_regression_is_seen() {
+    let script = repo_file("scripts/package-linux.sh");
+    let workflow = repo_file(".github/workflows/release.yml");
+    let edit = |text: &str, from: &str, to: &str| {
+        assert!(text.contains(from), "{from:?} is gone");
+        text.replacen(from, to, 1)
+    };
+    // A symbols file inside the package.
+    let kept_in_package = edit(
+        &script,
+        "refuse_symbols \"$(basename \"$file\")\" \"$listing\"\n  top=",
+        "top=",
+    );
+    assert!(linux_symbols_flaw(&kept_in_package, &workflow).is_some());
+    let not_stripped = edit(&script, "--strip-debug", "--strip-all-not");
+    assert!(linux_symbols_flaw(&not_stripped, &workflow).is_some());
+    // A release without the Linux aarch64 (or any) symbols archive.
+    let no_aarch64 = edit(&workflow, "arch: [x86_64, aarch64]", "arch: [x86_64]");
+    assert!(linux_symbols_flaw(&script, &no_aarch64).is_some());
+    let not_kept = edit(&workflow, " netrulerouter-[0-9]*-symbols.tar.xz", "");
+    assert!(linux_symbols_flaw(&script, &not_kept).is_some());
+    // ARM64 Windows symbols held back together with the ARM installers.
+    let held = edit(
+        &workflow,
+        "arm64-*.msi",
+        "arm64-*.msi NetRuleRouter-windows-arm64-*-symbols.zip",
+    );
+    assert!(windows_symbols_release_flaw(&held).is_some());
+    let no_arm = edit(&workflow, "arch: [x64, arm64]", "arch: [x64]");
+    assert!(windows_symbols_release_flaw(&no_arm).is_some());
+    let unnoted = edit(&workflow, "--notes", "--title-again");
+    assert!(windows_symbols_release_flaw(&unnoted).is_some());
 }

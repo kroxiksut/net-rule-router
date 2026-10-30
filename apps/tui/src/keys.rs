@@ -177,6 +177,10 @@ pub const ENF_CHOICE_BODY: Key = key(
     "notifications.enforcement.adapter-choice.body",
     "Several adapters answer to the saved name, so your rules are not being applied. Pick the one to use: {list}",
 );
+pub const ENF_CHOICE_BODY_ONE: Key = key(
+    "notifications.enforcement.adapter-choice.body-one",
+    "The saved adapter is not up, but another adapter of the same kind is: {list}. If your VPN now uses that one, choose it; until then your rules are not being applied.",
+);
 pub const ENF_GONE_TITLE: Key = key(
     "notifications.enforcement.adapter-gone.title",
     "The saved connection is gone",
@@ -728,6 +732,7 @@ pub const ALL: &[Key] = &[
     RULES_UNKNOWN,
     ENF_CHOICE_TITLE,
     ENF_CHOICE_BODY,
+    ENF_CHOICE_BODY_ONE,
     ENF_GONE_TITLE,
     ENF_GONE_BODY,
     ENF_GONE_BODY_EMPTY,

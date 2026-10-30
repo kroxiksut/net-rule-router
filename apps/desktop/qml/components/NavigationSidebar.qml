@@ -39,7 +39,32 @@ Pane {
     readonly property bool rulesCheckDivergence: root.uiRevision >= 0
         && (root.rulesNotAppliedToService || root.rulesNotSavedToFile)
 
-    Layout.preferredWidth: root.sidebarCollapsed ? 64 : 280
+    // Wide enough for the longest section name with its shortcut in the current
+    // language and text size, so a translation is not cut; capped so the page keeps most of the window.
+    FontMetrics { id: navTitleMetrics; font: navigationSidebar.root.font }
+    FontMetrics {
+        id: navShortcutMetrics
+        font.family: navigationSidebar.root.font.family
+        font.pixelSize: Math.max(11, navigationSidebar.root.font.pixelSize - 1)
+    }
+    readonly property real expandedWidth: {
+        if (root.uiRevision < 0) return 280
+        var theme = root.uiTheme
+        var buttonPadding = 2 * (theme.spacingMd - theme.spacingXxs)
+        var glyph = 20 + theme.spacingMd - theme.spacingXxs
+        var shortcut = theme.spacingSm + navShortcutMetrics.advanceWidth("Ctrl+0")
+        var widest = 0
+        var ids = ["interfaces-routes", "rules", "diagnostics", "logs", "settings"]
+        for (var i = 0; i < ids.length; i += 1) {
+            var need = navTitleMetrics.advanceWidth(root.sectionTitle(ids[i]))
+            if (ids[i] !== "interfaces-routes" && ids[i] !== "logs") need += 28
+            if (ids[i] === "rules") need += theme.spacingSm + navTitleMetrics.advanceWidth("999")
+            widest = Math.max(widest, need)
+        }
+        var total = Math.ceil(widest + shortcut + glyph + buttonPadding + 2 * theme.spacingMd + theme.spacingSm)
+        return Math.max(280, Math.min(total, root.width * 0.35))
+    }
+    Layout.preferredWidth: root.sidebarCollapsed ? 64 : expandedWidth
     Layout.minimumWidth: root.sidebarCollapsed ? 64 : 260
     Layout.fillHeight: true
     padding: root.sidebarCollapsed ? root.uiTheme.spacingSm : root.uiTheme.spacingMd

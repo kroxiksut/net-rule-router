@@ -62,6 +62,13 @@ Dialog {
             onToggled: root._ack = checked
             text: root.tr("dialog.drift-clear-all.ack",
                 "I understand this removes all rules everywhere")
+            contentItem: Label {
+                text: driftClearAllAck.text
+                leftPadding: driftClearAllAck.indicator.width + driftClearAllAck.spacing
+                color: root.ownerRoot ? root.ownerRoot.textColor : palette.text
+                wrapMode: Text.WordWrap
+                verticalAlignment: Text.AlignVCenter
+            }
             Accessible.role: Accessible.CheckBox
             Accessible.name: text
         }

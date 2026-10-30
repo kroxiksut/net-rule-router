@@ -908,6 +908,8 @@ Dialog {
                 Item { Layout.fillWidth: true }
             }
             Label {
+                Layout.fillWidth: true
+                wrapMode: Text.Wrap
                 visible: !ruleDialog.bulkMode
                 text: root.tr("label.rule-type", "Rule type")
                 color: root.textColor
@@ -1093,6 +1095,8 @@ Dialog {
                 }
             }
             Label {
+                Layout.fillWidth: true
+                wrapMode: Text.Wrap
                 visible: !ruleDialog.bulkMode
                 text: root.tr("label.match-value", "Match value")
                 color: root.textColor
@@ -1288,12 +1292,21 @@ Dialog {
             // setting on, a "without subdomains" choice would be a lie — the
             // service expands every bare domain anyway.
             CheckBox {
+                id: includeSubdomainsCheck
                 Layout.fillWidth: true
                 visible: !ruleDialog.bulkMode && ruleDialog.localRuleType === "domain"
                     && root.prefs.routeIncludeSubdomains === false
                     && !/\.\*$/.test(ruleDialog.localValue)
                 checked: ruleDialog.localValue.indexOf("*.") === 0
                 text: root.tr("dialog.rule.include-subdomains", "Include subdomains")
+                contentItem: Label {
+                    text: includeSubdomainsCheck.text
+                    leftPadding: includeSubdomainsCheck.indicator.width + includeSubdomainsCheck.spacing
+                    color: root.textColor
+                    wrapMode: Text.WordWrap
+                    verticalAlignment: Text.AlignVCenter
+                }
+                Accessible.name: text
                 onToggled: {
                     var v = ruleDialog.localValue
                     var bare = v.indexOf("*.") === 0 ? v.substring(2) : v
@@ -1384,7 +1397,12 @@ Dialog {
                 Accessible.role: Accessible.StaticText
                 Accessible.name: text
             }
-            Label { text: root.tr("label.target-route", "Target route"); color: root.textColor }
+            Label {
+                Layout.fillWidth: true
+                wrapMode: Text.Wrap
+                text: root.tr("label.target-route", "Target route")
+                color: root.textColor
+            }
             ThemedComboBox {
                 id: routeTargetCombo
                 theme: root.uiTheme

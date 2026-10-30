@@ -59,7 +59,7 @@ packs by scenario rather than by the country you are sitting in.
 
 Category packs use exactly the same layout and file names as country packs and
 appear in the same GUI list. Only the first-run wizard treats them differently:
-it suggests packs by the OS locale's country code, so a category pack is chosen
+it suggests packs by the country of the system's region setting, so a category pack is chosen
 manually from the full list.
 
 ## Required files in each pack

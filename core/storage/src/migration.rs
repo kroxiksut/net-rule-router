@@ -37,6 +37,7 @@ use crate::schema::STATE_DB_V81_DDL;
 use crate::schema::STATE_DB_V82_DDL;
 use crate::schema::STATE_DB_V83_DDL;
 use crate::schema::STATE_DB_V84_DDL;
+use crate::schema::STATE_DB_V85_DDL;
 use crate::schema::{
     CACHE_DB_V1_DDL, CACHE_DB_V2_DDL, CACHE_DB_V3_DDL, CACHE_DB_V4_DDL, STATE_DB_V10_DDL,
     STATE_DB_V11_DDL, STATE_DB_V12_DDL, STATE_DB_V13_DDL, STATE_DB_V14_DDL, STATE_DB_V15_DDL,
@@ -702,6 +703,11 @@ pub(crate) const STATE_MIGRATIONS: &[MigrationDef] = &[
         version: 84,
         name: "kill_switch_strict_shared_ips_by_default",
         stmts: STATE_DB_V84_DDL,
+    },
+    MigrationDef {
+        version: 85,
+        name: "external_address_auto_check_by_default",
+        stmts: STATE_DB_V85_DDL,
     },
 ];
 

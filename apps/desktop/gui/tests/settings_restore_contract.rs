@@ -189,7 +189,8 @@ fn the_tray_restores_the_protection_the_window_would() {
     let out = run_pure(
         r#"var req = routePolicyProtectionRestore(
             { "leak-protection": "everything", "doh-lockdown-enabled": true },
-            { "mode": "prefer-primary", "leak-protection": "off", "doh-lockdown-enabled": false });
+            { "mode": "prefer-primary", "leak-protection": "off", "doh-lockdown-enabled": false,
+              "secondary": { "stable-id": "B" } });
         console.log(JSON.stringify([req["apply-only"], req["leak-protection"], req["doh-lockdown-enabled"]]))"#,
     );
     assert_eq!(

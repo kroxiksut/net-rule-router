@@ -2,13 +2,25 @@
 ; from the package folder it has just produced; see docs/en/packaging-windows.md.
 ;
 ; Defines (ISCC /D): PackageDir, AppVersion, VersionNumeric, OutputDir,
-; OutputBaseFilename. Optional: Variant (full | headless), Arch (x64 | arm64).
+; OutputBaseFilename, AgreementEn and AgreementRu (the end-user agreement as
+; RTF, made from docs/legal/eula.*.md), AgreementVersion (its revision),
+; WizardImages and WizardSmallImages
+; (comma-separated BMPs). Optional: Variant (full | headless), Arch (x64 | arm64).
 ;
 ; Service and data steps run through scripts\setup-actions.ps1, which reuses the
 ; console and the user scripts; nothing here registers or removes anything itself.
 ;
-; Refuses to run over the MSI installation, which shares the folder, or over a
-; newer version.
+; Refuses to run over the MSI installation, which installs the same service, or
+; over a newer version.
+;
+; /DIR=<folder> must lie inside Program Files: the service runs with system
+; rights only from a folder that only administrators can change, and the
+; uninstall steps run elevated from there. /COMPONENTS= lists what to install:
+; main (with the console, always installed), tui (the terminal interface) and
+; docs (the offline documentation); /COMPONENTS=main,tui leaves out the
+; documentation, /COMPONENTS=main both.
+; /TASKS= (or /MERGETASKS=) names desktopicon and addtopath; an upgrade keeps
+; the earlier components and tasks unless they are given.
 ;
 ; Unattended install with prepared files (full paths):
 ;   Setup.exe /VERYSILENT /SUPPRESSMSGBOXES /PROVISION=<rules for the main route>
@@ -18,6 +30,11 @@
 ; with exit code 7, the service binary's own code (10-14) in the setup log. A
 ; file that fails when it is copied after the install ends with that code itself,
 ; and a service that could not be registered or started with 15.
+;
+; /INSTALL_FOR=all|me picks whose Start menu gets the shortcut (full package):
+; every user's (the default for a new install) or only the account Setup runs
+; as. Without it an upgrade keeps the earlier choice; another value ends Setup
+; before anything is installed.
 
 ; The architecture identifiers used below arrived in 6.3.
 #if VER < EncodeVer(6,3,0) || VER >= EncodeVer(7,0,0)
@@ -25,6 +42,21 @@
 #endif
 #ifndef PackageDir
   #error PackageDir is not defined: build through scripts\package-windows.ps1
+#endif
+#ifndef AgreementEn
+  #error AgreementEn is not defined: build through scripts\package-windows.ps1
+#endif
+#ifndef AgreementRu
+  #error AgreementRu is not defined: build through scripts\package-windows.ps1
+#endif
+#ifndef AgreementVersion
+  #error AgreementVersion is not defined: build through scripts\package-windows.ps1
+#endif
+#ifndef WizardImages
+  #error WizardImages is not defined: build through scripts\package-windows.ps1
+#endif
+#ifndef WizardSmallImages
+  #error WizardSmallImages is not defined: build through scripts\package-windows.ps1
 #endif
 #ifndef Variant
   #define Variant "full"
@@ -59,10 +91,12 @@ AppPublisher=NetRuleRouter
 AppContact=fmalkov91@gmail.com
 VersionInfoVersion={#VersionNumeric}
 VersionInfoProductName=NetRuleRouter
-; The service runs as LocalSystem from this folder and refuses one an ordinary
-; user can write to, so the location is not offered for change.
+; The folder is offered only inside Program Files (FolderAllowed); an upgrade
+; keeps the earlier one.
 DefaultDirName={autopf}\NetRuleRouter
-DisableDirPage=yes
+DisableDirPage=auto
+; The console tools on PATH (the addtopath task).
+ChangesEnvironment=yes
 DisableProgramGroupPage=yes
 PrivilegesRequired=admin
 ArchitecturesAllowed={#ArchAllowed}
@@ -74,17 +108,26 @@ SetupIconFile={#PackageDir}\assets\icons\app\app.ico
 UninstallDisplayIcon={app}\{#MainExe}
 UninstallDisplayName=NetRuleRouter
 WizardStyle=modern
+WizardImageFile={#WizardImages}
+WizardSmallImageFile={#WizardSmallImages}
 Compression=lzma2/max
 SolidCompression=yes
-; Restart Manager closes a running window and tray; restarting them would run
-; them elevated, as Setup.
+; PrepareToInstall closes the window, the tray and the console tools first
+; (CloseApps): their launchers have no window for Restart Manager to ask, so it
+; is the fallback only. Restarting them would run them elevated, as Setup.
 CloseApplications=yes
 RestartApplications=no
 SetupLogging=yes
+; {userprograms} is used only when Setup runs as the person who started it:
+; see SetupRunsAsStarter.
+UsedUserAreasWarning=no
 
+; The licence page shows the end-user agreement in Setup's language. The app
+; does not ask again the account Setup ran as when it accepted the page here;
+; every other Windows account is asked on its own first launch.
 [Languages]
-Name: "english"; MessagesFile: "compiler:Default.isl"
-Name: "russian"; MessagesFile: "compiler:Languages\Russian.isl"
+Name: "english"; MessagesFile: "compiler:Default.isl"; LicenseFile: "{#AgreementEn}"
+Name: "russian"; MessagesFile: "compiler:Languages\Russian.isl"; LicenseFile: "{#AgreementRu}"
 
 [Messages]
 english.ConfirmUninstall=Remove %1 from this computer?
@@ -93,8 +136,24 @@ russian.ConfirmUninstall=Удалить %1 с этого компьютера?
 [CustomMessages]
 english.LaunchApp=Start NetRuleRouter
 russian.LaunchApp=Запустить NetRuleRouter
-english.MsiInstalled=NetRuleRouter is already installed from its MSI package into the same folder. Remove that installation first (removing only the program keeps settings and rules), then run this Setup again.
-russian.MsiInstalled=NetRuleRouter уже установлена из пакета MSI в ту же папку. Сначала удалите эту установку (при удалении только программы настройки и правила сохранятся), затем запустите эту установку снова.
+english.MsiInstalled=NetRuleRouter is already installed from its MSI package. Remove that installation first (removing only the program keeps settings and rules), then run this Setup again.
+russian.MsiInstalled=NetRuleRouter уже установлена из пакета MSI. Сначала удалите эту установку (при удалении только программы настройки и правила сохранятся), затем запустите эту установку снова.
+english.FolderOutsideProgramFiles=NetRuleRouter installs only into a folder inside %1: its background service runs with system rights, so it may run only from a folder that only administrators can change. Choose a folder there.
+russian.FolderOutsideProgramFiles=NetRuleRouter устанавливается только в папку внутри %1: её фоновая служба работает с правами системы, поэтому может запускаться только из папки, которую могут изменять лишь администраторы. Выберите папку там.
+english.TypeDefault=Selected components
+russian.TypeDefault=Выбранные компоненты
+english.ComponentMainFull=NetRuleRouter: window, tray, background service and console (always installed: removing and repairing the program rely on the console)
+russian.ComponentMainFull=NetRuleRouter: окно, значок в трее, фоновая служба и консоль (устанавливаются всегда: удаление и восстановление программы выполняются через консоль)
+english.ComponentMainHeadless=NetRuleRouter: background service and console (always installed: removing and repairing the program rely on the console)
+russian.ComponentMainHeadless=NetRuleRouter: фоновая служба и консоль (устанавливаются всегда: удаление и восстановление программы выполняются через консоль)
+english.ComponentTui=Terminal interface (nrr-tui): rules, routes and settings in a terminal
+russian.ComponentTui=Терминальный интерфейс (nrr-tui): правила, маршруты и настройки в терминале
+english.ComponentDocs=Documentation (offline, HTML): opens from Help > Documentation without the internet
+russian.ComponentDocs=Документация (офлайн, HTML): открывается из меню «Справка > Документация» без интернета
+english.ConsoleTasks=Console tools:
+russian.ConsoleTasks=Консольные инструменты:
+english.AddToPath=Add the console tools to &PATH (nrr-cli, and nrr-tui when installed; not the program folder)
+russian.AddToPath=Добавить консольные инструменты в &PATH (nrr-cli, а также nrr-tui, если он установлен; не папку программы)
 english.NewerInstalled=A newer version of NetRuleRouter is already installed. To go back to this version, remove the installed one first (removing only the program keeps settings and rules).
 russian.NewerInstalled=Уже установлена более новая версия NetRuleRouter. Чтобы вернуться к этой версии, сначала удалите установленную (при удалении только программы настройки и правила сохранятся).
 english.ServiceStopFailed=The NetRuleRouter background service did not stop, so its files cannot be replaced. Restart Windows and run Setup again.
@@ -127,9 +186,55 @@ english.UninstallIncomplete=Not every removal step finished. If the network misb
 russian.UninstallIncomplete=Не все шаги удаления завершились. Если сеть работает неправильно, перезагрузите Windows. Подробности, в том числе данные, оставшиеся у других учётных записей Windows, - в файле %1
 english.UninstallOthersLeft=NetRuleRouter is removed. Other Windows accounts on this computer still keep their own NetRuleRouter settings; each of them can delete those folders when signed in. The folders are listed in %1
 russian.UninstallOthersLeft=NetRuleRouter удалена. У других учётных записей Windows на этом компьютере остались их собственные настройки NetRuleRouter; каждый пользователь может удалить эти папки, войдя в свою учётную запись. Список папок - в файле %1
+english.InstallForTitle=Install for
+russian.InstallForTitle=Для кого установить
+english.InstallForDescription=Who should find NetRuleRouter in the Start menu?
+russian.InstallForDescription=У кого NetRuleRouter появится в меню «Пуск»?
+english.InstallForText=NetRuleRouter is installed once for the whole computer, and its background service routes traffic for every Windows account whichever you choose. This choice only decides whose Start menu and desktop get the NetRuleRouter shortcuts, and whose PATH gets the console tools if you add them.
+russian.InstallForText=NetRuleRouter устанавливается один раз на весь компьютер, и её фоновая служба направляет трафик всех учётных записей Windows при любом выборе. Выбор определяет только, в чьём меню «Пуск» и на чьём рабочем столе появятся ярлыки NetRuleRouter и в чей PATH попадут консольные инструменты, если вы их добавите.
+english.InstallForAllUsers=All users of this computer
+russian.InstallForAllUsers=Все пользователи этого компьютера
+english.InstallForOnlyMe=Only me (%1)
+russian.InstallForOnlyMe=Только я (%1)
+english.InstallForOnlyMeOff=Only me - not available, see above
+russian.InstallForOnlyMeOff=Только я - недоступно, см. выше
+english.InstallForOnlyMeUnavailable=Setup is running under the administrator account that approved it, not under yours, so the shortcut can only be added for all users.
+russian.InstallForOnlyMeUnavailable=Установка выполняется от имени учётной записи администратора, который её подтвердил, а не от вашей, поэтому ярлык можно добавить только для всех пользователей.
+english.InstallForInvalid=/INSTALL_FOR=%1 is not understood: use all or me. Nothing was installed.
+russian.InstallForInvalid=Значение /INSTALL_FOR=%1 не распознано: укажите all или me. Ничего не установлено.
+
+; One type, so the page shows only the list.
+[Types]
+Name: "selected"; Description: "{cm:TypeDefault}"; Flags: iscustom
+
+[Components]
+#if Variant == "full"
+Name: "main"; Description: "{cm:ComponentMainFull}"; Types: selected; Flags: fixed
+#else
+Name: "main"; Description: "{cm:ComponentMainHeadless}"; Types: selected; Flags: fixed
+#endif
+Name: "tui"; Description: "{cm:ComponentTui}"; Types: selected
+Name: "docs"; Description: "{cm:ComponentDocs}"; Types: selected
+
+[Tasks]
+#if Variant == "full"
+; Unticked: the Start menu shortcut is always there.
+Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; GroupDescription: "{cm:AdditionalIcons}"; Flags: unchecked
+#endif
+Name: "addtopath"; Description: "{cm:AddToPath}"; GroupDescription: "{cm:ConsoleTasks}"; Flags: unchecked
+
+[InstallDelete]
+; Symbols no longer ship; an upgrade would otherwise keep the earlier ones.
+Type: files; Name: "{app}\*.pdb"
+; A component left out on an upgrade takes its earlier file with it.
+Type: files; Name: "{app}\nrr-tui.exe"; Components: not tui
+; Always: a page the new version no longer has would stay linked from nowhere.
+Type: filesandordirs; Name: "{app}\docs"
 
 [Files]
-Source: "{#PackageDir}\*"; DestDir: "{app}"; Excludes: "\.nrr-package"; Flags: ignoreversion recursesubdirs createallsubdirs
+Source: "{#PackageDir}\*"; DestDir: "{app}"; Excludes: "\.nrr-package,\nrr-tui.exe,\docs"; Flags: ignoreversion recursesubdirs createallsubdirs
+Source: "{#PackageDir}\nrr-tui.exe"; DestDir: "{app}"; Components: tui; Flags: ignoreversion
+Source: "{#PackageDir}\docs\*"; DestDir: "{app}\docs"; Components: docs; Flags: ignoreversion recursesubdirs createallsubdirs
 Source: "setup-actions.ps1"; DestDir: "{app}\scripts"; Flags: ignoreversion
 ; Extracted to {tmp} to stop the service before any file is replaced.
 Source: "setup-actions.ps1"; Flags: dontcopy
@@ -143,9 +248,18 @@ Source: "{#PackageDir}\vcruntime140.dll"; Flags: dontcopy
 Source: "{#PackageDir}\vcruntime140_1.dll"; Flags: dontcopy
 #endif
 
+[Registry]
+; Read by the app at an account's first start: only after the wizard's licence
+; page was accepted, and only for the account Setup ran as.
+Root: HKLM64; Subkey: "SOFTWARE\NetRuleRouter\Agreement"; ValueType: dword; ValueName: "Version"; ValueData: "{#AgreementVersion}"; Flags: uninsdeletekey; Check: AgreementAcceptedInWizard
+Root: HKLM64; Subkey: "SOFTWARE\NetRuleRouter\Agreement"; ValueType: string; ValueName: "AcceptedBy"; ValueData: "{code:SetupAccountSid}"; Check: AgreementAcceptedInWizard
+
 #if Variant == "full"
 [Icons]
-Name: "{autoprograms}\NetRuleRouter"; Filename: "{app}\NetRuleRouter.exe"; WorkingDir: "{app}"
+Name: "{commonprograms}\NetRuleRouter"; Filename: "{app}\NetRuleRouter.exe"; WorkingDir: "{app}"; Check: ShortcutForAll
+Name: "{userprograms}\NetRuleRouter"; Filename: "{app}\NetRuleRouter.exe"; WorkingDir: "{app}"; Check: ShortcutForMe
+Name: "{commondesktop}\NetRuleRouter"; Filename: "{app}\NetRuleRouter.exe"; WorkingDir: "{app}"; Tasks: desktopicon; Check: ShortcutForAll
+Name: "{userdesktop}\NetRuleRouter"; Filename: "{app}\NetRuleRouter.exe"; WorkingDir: "{app}"; Tasks: desktopicon; Check: ShortcutForMe
 
 [Run]
 Filename: "{app}\NetRuleRouter.exe"; Description: "{cm:LaunchApp}"; Flags: postinstall nowait skipifsilent runasoriginaluser
@@ -159,6 +273,10 @@ var
   RegisterFailed: Boolean;
   { Setup stopped the service and Register has not taken it over yet. }
   ServiceStoppedBySetup: Boolean;
+  { Left the licence page with "I accept" chosen. }
+  LicenceAcceptedInWizard: Boolean;
+  AccountSid: String;
+  AccountSidRead: Boolean;
 
 const
   { The MSI's UpgradeCode (NetRuleRouter.wxs), and this Setup's uninstall key:
@@ -308,10 +426,96 @@ begin
   Result := Code;
 end;
 
+{ Inside Program Files, below it: every folder above is one only
+  administrators can change, as the service requires of the folder it runs
+  from, and Register secures the folder itself. Never the folder a portable
+  install copies the service to. }
+function FolderAllowed(const Dir: String): Boolean;
+var
+  Full, Root: String;
+  I: Integer;
+begin
+  Result := False;
+  Full := Lowercase(AddBackslash(ExpandFileName(Dir)));
+  for I := 0 to 1 do
+  begin
+    if I = 0 then
+      Root := Lowercase(AddBackslash(ExpandConstant('{commonpf64}')))
+    else
+      Root := Lowercase(AddBackslash(ExpandConstant('{commonpf32}')));
+    if (Length(Full) > Length(Root)) and (Copy(Full, 1, Length(Root)) = Root) then
+      Result := True;
+  end;
+  if Full = Lowercase(AddBackslash(ExpandConstant('{commonpf64}\NetRuleRouter Service'))) then
+    Result := False;
+end;
+
+function FolderRefusedText(): String;
+begin
+  Result := FmtMessage(CustomMessage('FolderOutsideProgramFiles'), [ExpandConstant('{commonpf64}')]);
+end;
+
+function NextButtonClick(CurPageID: Integer): Boolean;
+begin
+  Result := True;
+  if CurPageID = wpLicense then
+    LicenceAcceptedInWizard := WizardForm.LicenseAcceptedRadio.Checked;
+  if (CurPageID = wpSelectDir) and not FolderAllowed(WizardDirValue()) then
+  begin
+    MsgBox(FolderRefusedText(), mbError, MB_OK);
+    Result := False;
+  end;
+end;
+
+{ The security identifier of the account Setup runs as, from the system
+  itself; '' when it cannot be read, and then nothing is recorded. }
+function SetupAccountSid(Param: String): String;
+var
+  Output: TExecOutput;
+  Code, I, Start, Stop: Integer;
+  Line: String;
+begin
+  if not AccountSidRead then
+  begin
+    AccountSidRead := True;
+    try
+      if ExecAndCaptureOutput(ExpandConstant('{sys}\whoami.exe'), '/user /fo csv /nh', '',
+          SW_HIDE, ewWaitUntilTerminated, Code, Output) and (Code = 0) then
+        for I := 0 to GetArrayLength(Output.StdOut) - 1 do
+        begin
+          Line := Output.StdOut[I];
+          Start := Pos('"S-1-', Line);
+          if Start > 0 then
+          begin
+            Line := Copy(Line, Start + 1, Length(Line) - Start);
+            Stop := Pos('"', Line);
+            if Stop > 1 then
+              AccountSid := Copy(Line, 1, Stop - 1);
+          end;
+        end;
+    except
+      Log('the account Setup runs as could not be read: ' + GetExceptionMessage());
+    end;
+  end;
+  Result := AccountSid;
+end;
+
+{ A silent Setup shows no licence page, so it never records an acceptance. }
+function AgreementAcceptedInWizard(): Boolean;
+begin
+  Result := LicenceAcceptedInWizard and not WizardSilent() and (SetupAccountSid('') <> '');
+end;
+
 function PrepareToInstall(var NeedsRestart: Boolean): String;
 var
   Refused: Integer;
 begin
+  { /DIR= of a silent Setup meets the same rule as the folder page. }
+  if not FolderAllowed(ExpandConstant('{app}')) then
+  begin
+    Result := FolderRefusedText();
+    Exit;
+  end;
   Result := '';
   Refused := CheckProvisioning();
   { Outside 10-14 the binary did not run (a loader status such as 0xC0000135 is
@@ -328,6 +532,10 @@ begin
   end;
   ExtractTemporaryFile('setup-actions.ps1');
   ExtractTemporaryFile('service-paths.ps1');
+  { Before Restart Manager looks: it cannot close the windowless launchers. }
+  if DirExists(ExpandConstant('{app}')) then
+    RunAction(ExpandConstant('{tmp}\setup-actions.ps1'),
+      '-Action CloseApps -Folder "' + ExpandConstant('{app}') + '"');
   ServiceStoppedBySetup := True;
   if RunAction(ExpandConstant('{tmp}\setup-actions.ps1'), '-Action Stop') <> 0 then
     Result := CustomMessage('ServiceStopFailed');
@@ -410,10 +618,79 @@ begin
     Exit;
   end;
   RemoveData := Choice = IDNO;
+  { A task dialog takes no MB_DEFBUTTON flag (it stops with "Invalid Buttons")
+    and defaults to its first button: keeping the trail comes first. }
   if RemoveData then
     RemoveAudit := TaskDialogMsgBox(CustomMessage('UninstallAuditTitle'),
-      CustomMessage('UninstallAuditText'), mbConfirmation, MB_YESNO or MB_DEFBUTTON2, [
-      CustomMessage('UninstallAuditErase'), CustomMessage('UninstallAuditKeep')], 0) = IDYES;
+      CustomMessage('UninstallAuditText'), mbConfirmation, MB_YESNO, [
+      CustomMessage('UninstallAuditKeep'), CustomMessage('UninstallAuditErase')], 0) = IDNO;
+end;
+
+const
+  MachineEnvironmentKey = 'SYSTEM\CurrentControlSet\Control\Session Manager\Environment';
+  UserEnvironmentKey = 'Environment';
+
+{ Holds links to the console and the terminal interface only: the program
+  folder carries Qt and runtime DLLs that every program searching PATH would
+  load. }
+function ConsoleBin(): String;
+begin
+  Result := ExpandConstant('{app}\bin');
+end;
+
+{ A PATH entry as the console's PATH action compares it: quotes, spaces, a
+  trailing backslash and case do not count. }
+function PathEntryKey(const Entry: String): String;
+begin
+  Result := Trim(Entry);
+  StringChangeEx(Result, '"', '', True);
+  Result := Lowercase(RemoveBackslashUnlessRoot(Trim(Result)));
+end;
+
+{ Adds Entry at the end of the PATH under RootKey once, or removes every copy
+  of it; the rest of the value stays as written. }
+procedure EditPath(RootKey: Integer; const SubKey, Entry: String; Add: Boolean);
+var
+  Old, Rest, Item, Kept: String;
+  P: Integer;
+  Found: Boolean;
+begin
+  if not RegQueryStringValue(RootKey, SubKey, 'Path', Old) then
+    Old := '';
+  Rest := Old;
+  Kept := '';
+  Found := False;
+  while Rest <> '' do
+  begin
+    P := Pos(';', Rest);
+    if P = 0 then
+    begin
+      Item := Rest;
+      Rest := '';
+    end
+    else
+    begin
+      Item := Copy(Rest, 1, P - 1);
+      Delete(Rest, 1, P);
+    end;
+    if (Trim(Item) <> '') and (PathEntryKey(Item) = PathEntryKey(Entry)) then
+      Found := True
+    else if Kept = '' then
+      Kept := Item
+    else
+      Kept := Kept + ';' + Item;
+  end;
+  if Add = Found then
+    Exit;
+  if Add then
+  begin
+    if (Old = '') or (Copy(Old, Length(Old), 1) = ';') then
+      Kept := Old + Entry
+    else
+      Kept := Old + ';' + Entry;
+  end;
+  if not RegWriteExpandStringValue(RootKey, SubKey, 'Path', Kept) then
+    Log('PATH was not changed under ' + SubKey);
 end;
 
 { Before any file is deleted: the steps need the console and the scripts. }
@@ -421,8 +698,20 @@ procedure CurUninstallStepChanged(CurUninstallStep: TUninstallStep);
 var
   Arguments: String;
 begin
+  if CurUninstallStep = usPostUninstall then
+  begin
+    { Whichever scope the installation used; another one's entry is not ours. }
+    EditPath(HKLM, MachineEnvironmentKey, ConsoleBin(), False);
+    EditPath(HKCU, UserEnvironmentKey, ConsoleBin(), False);
+    { Also when the installation that wrote it was not the last one. }
+    RegDeleteKeyIncludingSubkeys(HKLM64, 'SOFTWARE\NetRuleRouter\Agreement');
+    RegDeleteKeyIfEmpty(HKLM64, 'SOFTWARE\NetRuleRouter');
+    Exit;
+  end;
   if CurUninstallStep <> usUninstall then
     Exit;
+  { Every session's window, tray and console tools, before their files go. }
+  RunAction(ExpandConstant('{app}\scripts\setup-actions.ps1'), '-Action CloseApps');
   Arguments := '-Action Unregister';
   if RemoveData then
     Arguments := Arguments + ' -RemoveData';
@@ -436,4 +725,198 @@ begin
     SuppressibleMsgBox(FmtMessage(CustomMessage('UninstallIncomplete'), [ActionLog()]),
       mbInformation, MB_OK, IDOK);
   end;
+end;
+
+{ Whose Start menu gets the shortcut. The folder, the service and routing are
+  per machine whichever is chosen; the tray's launch at sign-in stays the app's
+  own per-user setting. }
+function InstallForParam(): String;
+begin
+  Result := Lowercase(SetupParam('INSTALL_FOR'));
+end;
+
+<event('InitializeSetup')>
+function InstallForInitializeSetup(): Boolean;
+begin
+  Result := (InstallForParam() = '') or (InstallForParam() = 'all') or (InstallForParam() = 'me');
+  if not Result then
+    SuppressibleMsgBox(FmtMessage(CustomMessage('InstallForInvalid'), [SetupParam('INSTALL_FOR')]),
+      mbError, MB_OK, IDOK);
+end;
+
+#if Variant == "full"
+const
+  ShortcutFileName = 'NetRuleRouter.lnk';
+  StarterProbeKey = 'Software\NetRuleRouter\SetupProbe';
+
+var
+  InstallForPage: TInputOptionWizardPage;
+  { 'all' or 'me', settled when the installation starts. }
+  InstallFor: String;
+  { The per-user shortcuts this installation leaves in place, '' for none. }
+  OwnShortcut, OwnDesktop: String;
+  KeepEarlierShortcut: Boolean;
+
+{ Elevated with another account's credentials, Setup runs as that administrator
+  and the per-user Programs folder is theirs. A value Setup writes to its own
+  HKCU is seen by a process of the person who started Setup only when both share
+  one hive. }
+function SetupRunsAsStarter(): Boolean;
+var
+  Probe: String;
+  Code: Integer;
+begin
+  Result := False;
+  Probe := 'Probe' + GetDateTimeString('hhnnsszzz', '-', ':') + IntToStr(Random(1000000));
+  if not RegWriteStringValue(HKCU, StarterProbeKey, Probe, '') then
+    Exit;
+  try
+    Result := ExecAsOriginalUser(ExpandConstant('{sys}\reg.exe'),
+      'query "HKCU\' + StarterProbeKey + '" /v ' + Probe, '', SW_HIDE, ewWaitUntilTerminated, Code)
+      and (Code = 0);
+  except
+    Log('the account that started Setup could not be asked: ' + GetExceptionMessage());
+  end;
+  RegDeleteKeyIncludingSubkeys(HKCU, StarterProbeKey);
+  RegDeleteKeyIfEmpty(HKCU, 'Software\NetRuleRouter');
+  Log(Format('Setup runs as the account that started it: %d', [Ord(Result)]));
+end;
+
+{ A silent Setup has no one else to ask about: "me" is the account it runs as. }
+<event('InitializeWizard')>
+procedure InstallForInitializeWizard();
+var
+  Starter: Boolean;
+  Text, Initial: String;
+begin
+  if WizardSilent() then
+    Exit;
+  Starter := SetupRunsAsStarter();
+  Text := CustomMessage('InstallForText');
+  if not Starter then
+    Text := Text + #13#10#13#10 + CustomMessage('InstallForOnlyMeUnavailable');
+  InstallForPage := CreateInputOptionPage(wpWelcome, CustomMessage('InstallForTitle'),
+    CustomMessage('InstallForDescription'), Text, True, False);
+  InstallForPage.Add(CustomMessage('InstallForAllUsers'));
+  if Starter then
+    InstallForPage.Add(FmtMessage(CustomMessage('InstallForOnlyMe'), [GetUserNameString()]))
+  else
+  begin
+    InstallForPage.Add(CustomMessage('InstallForOnlyMeOff'));
+    InstallForPage.CheckListBox.ItemEnabled[1] := False;
+  end;
+  Initial := InstallForParam();
+  if Initial = '' then
+    Initial := GetPreviousData('InstallFor', 'all');
+  if Starter and (Initial = 'me') then
+    InstallForPage.SelectedValueIndex := 1
+  else
+    InstallForPage.SelectedValueIndex := 0;
+end;
+
+{ Only the shortcut file itself: the earlier path lies in a folder its owner controls. }
+procedure DeleteShortcut(const Path: String);
+begin
+  if CompareText(ExtractFileName(Path), ShortcutFileName) <> 0 then
+    Exit;
+  if FileExists(Path) and not DeleteFile(Path) then
+    Log('the earlier shortcut was not removed: ' + Path);
+end;
+
+<event('CurStepChanged')>
+procedure InstallForStepChanged(CurStep: TSetupStep);
+var
+  Earlier, EarlierDesktop: String;
+begin
+  if CurStep <> ssInstall then
+    Exit;
+  Earlier := GetPreviousData('OwnShortcut', '');
+  if InstallForPage <> nil then
+  begin
+    if InstallForPage.SelectedValueIndex = 1 then
+      InstallFor := 'me'
+    else
+      InstallFor := 'all';
+  end
+  else
+  begin
+    InstallFor := InstallForParam();
+    { A silent upgrade that does not say leaves the earlier person's shortcut be. }
+    if InstallFor = '' then
+    begin
+      InstallFor := GetPreviousData('InstallFor', 'all');
+      KeepEarlierShortcut := InstallFor = 'me';
+    end;
+  end;
+  if KeepEarlierShortcut then
+    OwnShortcut := Earlier
+  else if InstallFor = 'me' then
+    OwnShortcut := ExpandConstant('{userprograms}\' + ShortcutFileName)
+  else
+    OwnShortcut := '';
+  { A changed choice takes away the shortcut the earlier one made. }
+  if InstallFor = 'me' then
+    DeleteShortcut(ExpandConstant('{commonprograms}\' + ShortcutFileName));
+  if (Earlier <> '') and (CompareText(Earlier, OwnShortcut) <> 0) then
+    DeleteShortcut(Earlier);
+  Log(Format('Start menu shortcut for: %s %s', [InstallFor, OwnShortcut]));
+
+  { The desktop shortcut follows the same choice, and goes when unticked. }
+  EarlierDesktop := GetPreviousData('OwnDesktop', '');
+  if KeepEarlierShortcut then
+    OwnDesktop := EarlierDesktop
+  else if WizardIsTaskSelected('desktopicon') and (InstallFor = 'me') then
+    OwnDesktop := ExpandConstant('{userdesktop}\' + ShortcutFileName)
+  else
+    OwnDesktop := '';
+  if (InstallFor = 'me') or not WizardIsTaskSelected('desktopicon') then
+    DeleteShortcut(ExpandConstant('{commondesktop}\' + ShortcutFileName));
+  if (EarlierDesktop <> '') and (CompareText(EarlierDesktop, OwnDesktop) <> 0) then
+    DeleteShortcut(EarlierDesktop);
+end;
+
+function ShortcutForAll(): Boolean;
+begin
+  Result := InstallFor <> 'me';
+end;
+
+function ShortcutForMe(): Boolean;
+begin
+  Result := (InstallFor = 'me') and not KeepEarlierShortcut;
+end;
+
+procedure RegisterPreviousData(PreviousDataKey: Integer);
+begin
+  SetPreviousData(PreviousDataKey, 'InstallFor', InstallFor);
+  SetPreviousData(PreviousDataKey, 'OwnShortcut', OwnShortcut);
+  SetPreviousData(PreviousDataKey, 'OwnDesktop', OwnDesktop);
+end;
+#endif
+
+{ The PATH of every user, or with "only me" of the account Setup runs as, gets
+  bin; the other scope loses an entry an earlier choice left. }
+function PathForMe(): Boolean;
+begin
+#if Variant == "full"
+  Result := InstallFor = 'me';
+#else
+  Result := False;
+#endif
+end;
+
+<event('CurStepChanged')>
+procedure ConsoleStepChanged(CurStep: TSetupStep);
+var
+  Wanted: Boolean;
+  Arguments: String;
+begin
+  if CurStep <> ssPostInstall then
+    Exit;
+  Wanted := WizardIsTaskSelected('addtopath');
+  { Links always: the app's own "add to PATH" setting registers bin too. }
+  Arguments := '-Action ConsoleLinks -Links';
+  if RunAction(ExpandConstant('{app}\scripts\setup-actions.ps1'), Arguments) <> 0 then
+    Log('the console links in ' + ConsoleBin() + ' are incomplete');
+  EditPath(HKLM, MachineEnvironmentKey, ConsoleBin(), Wanted and not PathForMe());
+  EditPath(HKCU, UserEnvironmentKey, ConsoleBin(), Wanted and PathForMe());
 end;

@@ -9,6 +9,33 @@ impl SystemLocalePort for LinuxSystemLocale {
     fn ui_language_candidates(&self) -> Vec<String> {
         language_candidates_from(|key| std::env::var(key).ok())
     }
+
+    fn region(&self) -> Option<String> {
+        region_from(|key| std::env::var(key).ok())
+    }
+}
+
+/// The first locale that names a territory, in glibc's precedence for the
+/// categories a country decides (address, telephone, money, time); the
+/// message language (`LANGUAGE`, `LC_MESSAGES`) says nothing about it.
+fn region_from(lookup: impl Fn(&str) -> Option<String>) -> Option<String> {
+    [
+        "LC_ALL",
+        "LC_ADDRESS",
+        "LC_TELEPHONE",
+        "LC_MONETARY",
+        "LC_TIME",
+        "LANG",
+    ]
+    .into_iter()
+    .filter_map(lookup)
+    .map(|value| value.trim().to_string())
+    .find(|value| {
+        value
+            .split(['.', '@'])
+            .next()
+            .is_some_and(|tag| tag.contains(['_', '-']))
+    })
 }
 
 /// `LANGUAGE` is gettext's colon-separated priority list and outranks the
@@ -75,6 +102,25 @@ mod tests {
             language_candidates_from(env_of(&[("LANG", "de_DE.UTF-8")])),
             vec!["de_DE.UTF-8"]
         );
+    }
+
+    #[test]
+    fn the_region_follows_the_country_categories_not_the_message_language() {
+        assert_eq!(
+            region_from(env_of(&[
+                ("LANGUAGE", "en_US:en"),
+                ("LC_MESSAGES", "en_US.UTF-8"),
+                ("LC_TIME", "ru_RU.UTF-8"),
+                ("LANG", "en_US.UTF-8"),
+            ])),
+            Some("ru_RU.UTF-8".to_string())
+        );
+        // A bare language names no country; the next locale that does wins.
+        assert_eq!(
+            region_from(env_of(&[("LC_ALL", "C"), ("LANG", "kk_KZ.UTF-8")])),
+            Some("kk_KZ.UTF-8".to_string())
+        );
+        assert_eq!(region_from(env_of(&[("LANG", "C.UTF-8")])), None);
     }
 
     #[test]

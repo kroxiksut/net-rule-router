@@ -11,8 +11,8 @@ the app's window is closed. It also means that if the background service stops
 protection can outlive the service and leave the machine unable to reach the
 network or resolve names, with no running service left to lift it.
 
-This only happens after an abnormal stop. A normal **Stop**, **Exit**, or
-**Uninstall** restores networking. If the service could not hand the system DNS
+This only happens after an abnormal stop. A normal **Stop service**, **Exit**,
+or **Uninstall service** restores networking. If the service could not hand the system DNS
 settings back, the app says so and offers **Restore network** (Option 2 below).
 
 If the service stops on its own while the tray, the window or the terminal
@@ -25,7 +25,7 @@ and a reboot does not change that: the protection comes back with the
 service. Bring the additional connection back, or set leak protection to
 **Off**; if you cannot reach the settings, use Option 2.
 
-If it does happen, there are two ways to recover.
+If it does happen, there are three ways to recover.
 
 ## Option 1 — Reboot
 
@@ -55,7 +55,7 @@ nrr-cli reset-network --confirm --stop-service
 
 Without `--stop-service` the reset refuses while the service runs and tells you
 this command. In the window the same action is "Stop service and restore
-network" under Settings, Service.
+network" under Settings → Service management.
 
 The reset restores networking to its default state — removing the app's
 traffic filters, its routes, and its DNS redirect — so the network resolves
@@ -71,8 +71,40 @@ something. See [the `nrr-cli` console](cli.md).
 
 On Linux the same commands undo the same things — the packet filters, the DNS
 redirect and the routes the service added — with root rights instead of an
-administrator console, and the service is stopped the same way. From a source checkout, `./scripts/reset-network.sh` does the same and
-gets the network back even when no service binary is at hand.
+administrator console, and the service is stopped the same way.
+
+## Option 3 — The reset script
+
+If `nrr-cli` will not start, or the reset above did not finish, use the reset
+script that comes with the program. It does the same reset, and it still gets
+the network back when the program's own files are missing or broken.
+
+On Windows it is `scripts\reset-network.ps1` in the program folder:
+`C:\Program Files\NetRuleRouter\scripts` for a copy installed with the EXE or
+the MSI, the `scripts` folder inside a portable copy. Open PowerShell and run:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File "C:\Program Files\NetRuleRouter\scripts\reset-network.ps1"
+```
+
+It asks for administrator approval by itself. When it is done, it asks
+whether to restart the computer, and does not unless you answer yes; add
+`-Reboot` to restart without the question. If a step could not be finished,
+the script says which and ends with an error, so a quiet finish means the
+network was handed back.
+
+On Linux the script is `/usr/libexec/netrulerouter/scripts/reset-network.sh`
+(in a source checkout, `./scripts/reset-network.sh`). Run it as root or let it
+ask for `sudo`:
+
+```
+sudo /usr/libexec/netrulerouter/scripts/reset-network.sh
+```
 
 > This is a safety escape hatch, not part of normal operation. Reach for it only
 > after an abnormal termination has left the machine's network or DNS stuck.
+
+If none of these brings the network back, ask from another device in the
+Telegram channel [t.me/netrulerouter](https://t.me/netrulerouter), or open an
+[issue](https://github.com/kroxiksut/net-rule-router/issues) once you are back
+online, with the diagnostic archive attached.

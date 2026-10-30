@@ -150,6 +150,67 @@ fn an_external_address_check_is_the_askers_own() {
     );
 }
 
+/// The exit the automatic check found on connect is on the interfaces screen
+/// at the next read, without the user pressing "Check external address" —
+/// for that user only, and kept on disk like their own check's result.
+#[test]
+fn an_exit_the_automatic_check_observed_shows_on_the_interfaces_screen() {
+    use nrr_platform_api::interface_rows::PREVIEW_VPN_PERSISTENT_ID;
+    const ALICE: &str = "S-1-5-21-1-2-3-1001";
+    const BOB: &str = "S-1-5-21-1-2-3-1002";
+    let mut rows = nrr_platform_api::fallback_rows();
+    for row in &mut rows {
+        if row.persistent_id == PREVIEW_VPN_PERSISTENT_ID {
+            row.local_ip = "10.88.1.41".to_owned();
+        }
+    }
+    let recorder = Arc::new(FakeAddressRecorder::new());
+    let provider = MonitoredAdaptersSnapshotProvider::new(
+        Arc::new(MockWindowsApi::new()) as Arc<dyn RouteTablePort>,
+        Arc::new(MockInterfaceRows::new(
+            InterfacesDataSource::LinuxLive,
+            rows,
+        )) as Arc<dyn InterfaceRowsPort>,
+    )
+    .with_address_recorder(Arc::clone(&recorder) as Arc<dyn AdapterAddressRecorder>);
+
+    provider.remember_observed_external(
+        ALICE,
+        Ipv4Addr::new(10, 88, 1, 41),
+        Ipv4Addr::new(198, 51, 100, 9),
+    );
+
+    assert_eq!(
+        external_of(
+            &provider.adapters_snapshot_for(false, ALICE),
+            PREVIEW_VPN_PERSISTENT_ID
+        ),
+        Some("198.51.100.9"),
+        "the observed exit is on the probed adapter's row"
+    );
+    assert_eq!(
+        external_of(
+            &provider.adapters_snapshot_for(false, BOB),
+            PREVIEW_VPN_PERSISTENT_ID
+        ),
+        None,
+        "another user is not shown it"
+    );
+    let calls = recorder.calls.lock().expect("lock");
+    assert_eq!(calls.len(), 1, "one write per probe");
+    assert_eq!(calls[0].1, "10.88.1.41");
+    assert_eq!(calls[0].2, "198.51.100.9");
+    drop(calls);
+
+    // An address no adapter holds any more files nothing.
+    provider.remember_observed_external(
+        ALICE,
+        Ipv4Addr::new(10, 99, 0, 1),
+        Ipv4Addr::new(198, 51, 100, 10),
+    );
+    assert_eq!(recorder.calls.lock().expect("lock").len(), 1);
+}
+
 /// A plain refresh shows what the service sends; unscored rows turned every
 /// badge into "allowed, not recommended" the moment the user refreshed.
 #[test]

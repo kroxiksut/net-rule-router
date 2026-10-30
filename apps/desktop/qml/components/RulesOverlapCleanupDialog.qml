@@ -112,6 +112,7 @@ Dialog {
                 Label {
                     Layout.fillWidth: true
                     visible: dialog._pairs().length > 0
+                    wrapMode: Text.Wrap
                     font.bold: true
                     color: dialog._textColor()
                     text: dialog.tr("dialog.rules-overlap.group-spare", "Safe to remove")
@@ -156,6 +157,7 @@ Dialog {
                     Layout.fillWidth: true
                     Layout.topMargin: 6
                     visible: dialog._deliberate().length > 0
+                    wrapMode: Text.Wrap
                     font.bold: true
                     color: dialog._textColor()
                     text: dialog.tr("dialog.rules-overlap.group-deliberate", "Your call")

@@ -1,0 +1,365 @@
+{
+  "description": "adapterDriverSiblings / driver_siblings: for a picked adapter that is not connected, the other adapters of the same driver (description without the `#N` Windows adds to each copy) — connected ones by row index, the rest counted. `rows` are patches over `base-row`.",
+  "base-row": {
+    "persistent-id": "{00000000-0000-0000-0000-000000000001}",
+    "adapter-name": "{00000000-0000-0000-0000-000000000001}",
+    "name": "Ethernet 3",
+    "interface-description": "TAP-Windows Adapter V9 #3",
+    "interface-type": "ethernet",
+    "kind": "tunnel",
+    "is-bluetooth-like": false,
+    "local-ip": "-",
+    "gateway": "-",
+    "dns-servers": "192.0.2.53",
+    "has-default-route": false,
+    "has-forwarding-path": true,
+    "availability": "unavailable",
+    "route-state": "not-selected",
+    "observed-facts": {
+      "connectivity-state": "internet",
+      "external-ip-status": "unknown",
+      "external-ip": null,
+      "external-probe-attempted": false,
+      "external-probe-note": ""
+    },
+    "derived-assessment": {
+      "vpn-tunnel-likelihood": "unlikely",
+      "virtual-interface-likelihood": "unlikely",
+      "service-interface-likelihood": "unlikely",
+      "classification": "regular-interface",
+      "confidence-percent": 90,
+      "heuristic-only": true,
+      "signals": []
+    },
+    "recommendation": {
+      "class": "preferred-primary",
+      "confidence": "high",
+      "advisory-only": true,
+      "key-signals": [],
+      "excluded-alternatives": []
+    }
+  },
+  "cases": [
+    {
+      "name": "the VPN brought up a sibling TAP: it is named",
+      "input": {
+        "role": "secondary",
+        "index": 0,
+        "rows": [
+          {},
+          {
+            "name": "Ethernet",
+            "interface-description": "Example PCIe GbE Controller",
+            "kind": "ethernet",
+            "availability": "available",
+            "gateway": "192.0.2.1",
+            "local-ip": "192.0.2.10"
+          },
+          {
+            "name": "Ethernet 5",
+            "interface-description": "TAP-Windows Adapter V9 #5",
+            "availability": "available",
+            "local-ip": "10.8.0.2"
+          }
+        ]
+      },
+      "expected": {
+        "live": [
+          2
+        ],
+        "idle": 0
+      }
+    },
+    {
+      "name": "dead siblings only: counted, none named",
+      "input": {
+        "role": "secondary",
+        "index": 0,
+        "rows": [
+          {},
+          {
+            "name": "Ethernet",
+            "interface-description": "Example PCIe GbE Controller",
+            "kind": "ethernet",
+            "availability": "available",
+            "gateway": "192.0.2.1",
+            "local-ip": "192.0.2.10"
+          },
+          {
+            "name": "Ethernet 4",
+            "interface-description": "TAP-Windows Adapter V9 #4"
+          },
+          {
+            "name": "Ethernet 6",
+            "interface-description": "TAP-Windows Adapter V9 #6"
+          }
+        ]
+      },
+      "expected": {
+        "live": [],
+        "idle": 2
+      }
+    },
+    {
+      "name": "the first copy carries no number and is still a sibling",
+      "input": {
+        "role": "secondary",
+        "index": 1,
+        "rows": [
+          {
+            "name": "Ethernet 2",
+            "interface-description": "TAP-Windows Adapter V9",
+            "availability": "available",
+            "local-ip": "10.8.0.2"
+          },
+          {}
+        ]
+      },
+      "expected": {
+        "live": [
+          0
+        ],
+        "idle": 0
+      }
+    },
+    {
+      "name": "two live siblings: both named, none chosen",
+      "input": {
+        "role": "secondary",
+        "index": 0,
+        "rows": [
+          {},
+          {
+            "name": "Ethernet 5",
+            "interface-description": "TAP-Windows Adapter V9 #5",
+            "availability": "available",
+            "local-ip": "10.8.0.2"
+          },
+          {
+            "name": "Ethernet 7",
+            "interface-description": "TAP-Windows Adapter V9 #7"
+          },
+          {
+            "name": "Ethernet 9",
+            "interface-description": "TAP-Windows Adapter V9 #9",
+            "availability": "available",
+            "local-ip": "10.8.0.2"
+          }
+        ]
+      },
+      "expected": {
+        "live": [
+          1,
+          3
+        ],
+        "idle": 1
+      }
+    },
+    {
+      "name": "a connected pick needs no warning",
+      "input": {
+        "role": "secondary",
+        "index": 0,
+        "rows": [
+          {
+            "availability": "available"
+          },
+          {
+            "name": "Ethernet 5",
+            "interface-description": "TAP-Windows Adapter V9 #5",
+            "availability": "available",
+            "local-ip": "10.8.0.2"
+          }
+        ]
+      },
+      "expected": {
+        "live": [],
+        "idle": 0
+      }
+    },
+    {
+      "name": "an adapter of another driver is never a sibling",
+      "input": {
+        "role": "secondary",
+        "index": 0,
+        "rows": [
+          {},
+          {
+            "name": "Ethernet",
+            "interface-description": "Example PCIe GbE Controller",
+            "kind": "ethernet",
+            "availability": "available",
+            "gateway": "192.0.2.1",
+            "local-ip": "192.0.2.10"
+          },
+          {
+            "name": "Ethernet 4",
+            "interface-description": "TAP-Windows Adapter V9 extra #4",
+            "availability": "available",
+            "local-ip": "10.8.0.2"
+          },
+          {
+            "name": "Wi-Fi",
+            "interface-description": "Example Wireless Adapter #3",
+            "availability": "available",
+            "local-ip": "10.8.0.2"
+          }
+        ]
+      },
+      "expected": {
+        "live": [],
+        "idle": 0
+      }
+    },
+    {
+      "name": "a sibling holding the other route is not offered",
+      "input": {
+        "role": "secondary",
+        "index": 0,
+        "rows": [
+          {},
+          {
+            "name": "Ethernet 5",
+            "interface-description": "TAP-Windows Adapter V9 #5",
+            "availability": "available",
+            "local-ip": "10.8.0.2",
+            "selected-role": "primary"
+          }
+        ]
+      },
+      "expected": {
+        "live": [],
+        "idle": 0
+      }
+    },
+    {
+      "name": "the product's own tunnel is never a sibling",
+      "input": {
+        "role": "secondary",
+        "index": 0,
+        "rows": [
+          {
+            "name": "Ethernet 3",
+            "interface-description": "Wintun Userspace Tunnel"
+          },
+          {
+            "name": "NetRuleRouter",
+            "interface-description": "Wintun Userspace Tunnel",
+            "availability": "available",
+            "local-ip": "10.8.0.2"
+          }
+        ]
+      },
+      "expected": {
+        "live": [],
+        "idle": 0
+      }
+    },
+    {
+      "name": "case of the description does not matter",
+      "input": {
+        "role": "primary",
+        "index": 0,
+        "rows": [
+          {},
+          {
+            "name": "Ethernet 5",
+            "interface-description": "tap-windows adapter v9 #5",
+            "availability": "available",
+            "local-ip": "10.8.0.2"
+          }
+        ]
+      },
+      "expected": {
+        "live": [
+          1
+        ],
+        "idle": 0
+      }
+    },
+    {
+      "name": "a number glued to the name is part of the name",
+      "input": {
+        "role": "secondary",
+        "index": 0,
+        "rows": [
+          {
+            "interface-description": "Example Adapter#3"
+          },
+          {
+            "name": "Ethernet 5",
+            "interface-description": "Example Adapter#5",
+            "availability": "available",
+            "local-ip": "10.8.0.2"
+          }
+        ]
+      },
+      "expected": {
+        "live": [],
+        "idle": 0
+      }
+    },
+    {
+      "name": "a pick with no description has no family",
+      "input": {
+        "role": "secondary",
+        "index": 0,
+        "rows": [
+          {
+            "interface-description": ""
+          },
+          {
+            "name": "Ethernet 5",
+            "interface-description": "",
+            "availability": "available",
+            "local-ip": "10.8.0.2"
+          }
+        ]
+      },
+      "expected": {
+        "live": [],
+        "idle": 0
+      }
+    },
+    {
+      "name": "a requires-check sibling is not connected",
+      "input": {
+        "role": "secondary",
+        "index": 0,
+        "rows": [
+          {},
+          {
+            "name": "Ethernet 5",
+            "interface-description": "TAP-Windows Adapter V9 #5",
+            "availability": "requires-check",
+            "local-ip": "10.8.0.2"
+          }
+        ]
+      },
+      "expected": {
+        "live": [],
+        "idle": 1
+      }
+    },
+    {
+      "name": "an index past the list warns of nothing",
+      "input": {
+        "role": "secondary",
+        "index": 5,
+        "rows": [
+          {},
+          {
+            "name": "Ethernet 5",
+            "interface-description": "TAP-Windows Adapter V9 #5",
+            "availability": "available",
+            "local-ip": "10.8.0.2"
+          }
+        ]
+      },
+      "expected": {
+        "live": [],
+        "idle": 0
+      }
+    }
+  ]
+}

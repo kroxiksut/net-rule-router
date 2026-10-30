@@ -8,9 +8,13 @@
 
 use std::sync::atomic::{AtomicBool, Ordering};
 
+use nrr_platform_api::installer_agreement::InstallerAgreementPort;
 use nrr_shared::client_error_codes::{
     MALFORMED_INPUT, RULES_FILE_HAND_EDITED, RULES_FILE_WRITE_FAILED, USER_SETTINGS_READ_ONLY,
     USER_SETTINGS_UNAVAILABLE,
+};
+use nrr_shared::preset_parser::{
+    canonical_rules_body, passthrough_sections, with_passthrough_sections,
 };
 use nrr_shared::user_settings::{
     portable_path, read_rules_file_bytes, UserSettings, UserSettingsError, UserSettingsStore,
@@ -30,6 +34,7 @@ pub(crate) fn settings_from_preferences(preferences: &UiPreferences) -> UserSett
         accepted_eula: preferences.accepted_eula_version,
         merge_policy: preferences.merge_conflict_policy.clone(),
         window_parked: intent_object(&preferences.route_pending_offline_json),
+        rule_set_offer_answered: preferences.rule_set_offer_answered,
         ..UserSettings::default()
     };
     let bound = |path: &Option<String>| path.as_deref().unwrap_or_default().to_owned();
@@ -101,9 +106,26 @@ pub(crate) fn overlay(preferences: &mut UiPreferences, settings: &UserSettings) 
     preferences.accepted_eula_version = preferences
         .accepted_eula_version
         .max(settings.accepted_eula);
+    preferences.rule_set_offer_answered = settings.rule_set_offer_answered;
     if is_storable_json_blob(&intent) {
         preferences.service_intent_json = intent;
     }
+}
+
+/// The current agreement, accepted by this very account on the installer's
+/// licence page, counts as accepted here. Put into the preferences before the
+/// session opens, it reaches the shared file like an acceptance in the window.
+pub(crate) fn adopt_installer_acceptance(
+    preferences: &mut UiPreferences,
+    installer: &dyn InstallerAgreementPort,
+) -> bool {
+    if nrr_shared::eula::is_accepted(preferences.accepted_eula_version)
+        || !nrr_platform_api::installer_agreement::accepted_in_installer(installer)
+    {
+        return false;
+    }
+    preferences.accepted_eula_version = nrr_shared::eula::CURRENT_EULA_VERSION;
+    true
 }
 
 /// The preferences file keeps each value on one line.
@@ -121,7 +143,7 @@ pub(crate) fn preference_changes(
     before: &UiPreferences,
     after: &UiPreferences,
 ) -> Map<String, Value> {
-    let fields: [(&str, Value, Value); 9] = [
+    let fields: [(&str, Value, Value); 10] = [
         (
             "userPresetsDir",
             before.user_presets_dir.clone().into(),
@@ -166,6 +188,11 @@ pub(crate) fn preference_changes(
             "acceptedEulaVersion",
             before.accepted_eula_version.into(),
             after.accepted_eula_version.into(),
+        ),
+        (
+            "ruleSetOfferAnswered",
+            before.rule_set_offer_answered.into(),
+            after.rule_set_offer_answered.into(),
         ),
     ];
     fields
@@ -416,7 +443,8 @@ pub(crate) fn rules_file_written_in(
 /// since the program last wrote it is refused (`rules-file-hand-edited`)
 /// unless `overwrite` is true: the check sits in the write itself, so no
 /// client can skip it. The write lands whether or not this session may
-/// record it; an unrecorded write is asked about next time, never lost.
+/// record it; an unrecorded write is asked about next time, never lost. The
+/// sections the replaced file holds and this build does not apply are kept.
 pub(crate) fn rules_file_write(payload: &Value) -> Result<Value, IntentError> {
     let may_write = SESSION_MAY_WRITE.load(Ordering::Relaxed);
     rules_file_write_in(&UserSettingsStore::open()?, payload, may_write)
@@ -434,24 +462,53 @@ pub(crate) fn rules_file_write_in(
         .filter(|text| text.len() as u64 <= MAX_RULES_FILE_BYTES)
         .ok_or(IntentError::BadRequest("`text` is not a rules file"))?;
     let overwrite = payload.get("overwrite").and_then(Value::as_bool) == Some(true);
+    let bytes = read_rules_file_bytes(std::path::Path::new(path));
+    let on_disk = match &bytes {
+        Ok(bytes) => bytes.as_deref().map(sha256_hex),
+        Err(_) => Some(String::new()),
+    };
+    let old_text = match &bytes {
+        Ok(Some(bytes)) => std::str::from_utf8(bytes).ok(),
+        _ => None,
+    };
+    // The sections this build does not apply live only in the file being
+    // replaced (another system's programs, unknown ones): its own go back in,
+    // whatever the caller was handed.
+    let text = match old_text {
+        Some(old) => {
+            let carried = with_passthrough_sections(text, &passthrough_sections(old));
+            if carried.len() as u64 > MAX_RULES_FILE_BYTES {
+                return Err(IntentError::FileWrite(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "larger than a rules file can be",
+                )));
+            }
+            std::borrow::Cow::Owned(carried)
+        }
+        None => std::borrow::Cow::Borrowed(text),
+    };
     if !overwrite {
         let settings = store.load()?.unwrap_or_default();
-        let on_disk = rules_file_sha256(path).unwrap_or_else(|_| Some(String::new()));
         let unchanged = on_disk.as_deref() == Some(sha256_hex(text.as_bytes()).as_str());
         if !unchanged && settings.rules_file_hand_edited(path, on_disk.as_deref()) {
             return Err(IntentError::HandEdited);
         }
     }
-    write_file_atomically(std::path::Path::new(path), text.as_bytes())
-        .map_err(IntentError::FileWrite)?;
+    // Only the time of writing would change: the file stays as it is.
+    let same_rules =
+        old_text.is_some_and(|old| canonical_rules_body(old) == canonical_rules_body(&text));
+    if !same_rules {
+        write_file_atomically(std::path::Path::new(path), text.as_bytes())
+            .map_err(IntentError::FileWrite)?;
+    }
     if !may_write {
-        return Ok(serde_json::json!({ "written": true, "recorded": false }));
+        return Ok(serde_json::json!({ "written": !same_rules, "recorded": false }));
     }
     let Ok(Some(sha256)) = rules_file_sha256(path) else {
-        return Ok(serde_json::json!({ "written": true, "recorded": false }));
+        return Ok(serde_json::json!({ "written": !same_rules, "recorded": false }));
     };
     store.update(|settings| settings.record_rules_file_written(path, &sha256))?;
-    Ok(serde_json::json!({ "written": true, "recorded": true }))
+    Ok(serde_json::json!({ "written": !same_rules, "recorded": true }))
 }
 
 /// Staged beside the file and renamed into place: a reader sees the old
@@ -719,6 +776,45 @@ mod tests {
         assert_eq!(prefs.user_presets_dir, "/home/user/sets");
     }
 
+    /// "Not now" in either client is the answer for both: the terminal's
+    /// reaches the window when a session opens and while it runs, the
+    /// window's reaches the file, and a full reset there offers it again.
+    #[test]
+    fn the_rule_set_offer_is_answered_once_for_both_clients() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        store_in(&dir)
+            .update(|s| s.rule_set_offer_answered = true)
+            .expect("terminal answered");
+        let mut prefs = preferences();
+        let mut mirror = open_session_in(store_in(&dir), &mut prefs, true).expect("mirror");
+        assert!(prefs.rule_set_offer_answered, "the window offers it again");
+
+        let answered = |dir: &tempfile::TempDir| {
+            store_in(dir)
+                .load()
+                .expect("load")
+                .expect("file")
+                .rule_set_offer_answered
+        };
+        prefs.rule_set_offer_answered = false;
+        mirror.publish(&prefs).expect("publish reset");
+        assert!(!answered(&dir), "a reset in the window left it answered");
+        prefs.rule_set_offer_answered = true;
+        mirror.publish(&prefs).expect("publish answer");
+        assert!(answered(&dir), "the window's answer never reached the file");
+
+        let before = UiPreferences::default();
+        let after = UiPreferences {
+            rule_set_offer_answered: true,
+            ..UiPreferences::default()
+        };
+        assert_eq!(
+            preference_changes(&before, &after).get("ruleSetOfferAnswered"),
+            Some(&Value::Bool(true)),
+            "an open window does not learn of the terminal's answer"
+        );
+    }
+
     #[test]
     fn an_agreement_accepted_in_the_terminal_is_not_asked_again() {
         let mut prefs = preferences();
@@ -735,6 +831,88 @@ mod tests {
         };
         overlay(&mut prefs, &older);
         assert_eq!(prefs.accepted_eula_version, 1);
+    }
+
+    /// What an installer recorded, and the account this session runs as.
+    struct Installer {
+        recorded_by: &'static str,
+        version: u32,
+        running_as: &'static str,
+    }
+
+    impl InstallerAgreementPort for Installer {
+        fn recorded(&self) -> Option<nrr_shared::eula::InstallerAcceptance> {
+            nrr_shared::eula::InstallerAcceptance::new(self.version, self.recorded_by)
+        }
+        fn current_account(&self) -> Option<String> {
+            Some(self.running_as.to_owned())
+        }
+    }
+
+    const IVANOV: &str = "S-1-5-21-1-2-3-1001";
+    const PETROV: &str = "S-1-5-21-1-2-3-1002";
+
+    fn opened_after(installer: &Installer) -> (UiPreferences, UserSettings) {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let mut prefs = preferences();
+        prefs.accepted_eula_version = 0;
+        adopt_installer_acceptance(&mut prefs, installer);
+        let _mirror = open_session_in(store_in(&dir), &mut prefs, true);
+        let shared = store_in(&dir).load().expect("read").expect("seeded");
+        (prefs, shared)
+    }
+
+    #[test]
+    fn the_account_that_accepted_in_the_installer_is_not_asked_and_it_is_kept() {
+        let current = nrr_shared::eula::CURRENT_EULA_VERSION;
+        let (prefs, shared) = opened_after(&Installer {
+            recorded_by: IVANOV,
+            version: current,
+            running_as: IVANOV,
+        });
+        assert_eq!(prefs.accepted_eula_version, current, "the window asks");
+        assert_eq!(shared.accepted_eula, current, "the terminal asks");
+    }
+
+    #[test]
+    fn another_account_is_asked_after_someone_else_installed() {
+        let (prefs, shared) = opened_after(&Installer {
+            recorded_by: IVANOV,
+            version: nrr_shared::eula::CURRENT_EULA_VERSION,
+            running_as: PETROV,
+        });
+        assert_eq!(prefs.accepted_eula_version, 0);
+        assert_eq!(shared.accepted_eula, 0);
+    }
+
+    #[test]
+    fn an_older_agreement_accepted_in_the_installer_is_asked_again() {
+        let (prefs, _) = opened_after(&Installer {
+            recorded_by: IVANOV,
+            version: nrr_shared::eula::CURRENT_EULA_VERSION - 1,
+            running_as: IVANOV,
+        });
+        assert_eq!(prefs.accepted_eula_version, 0);
+    }
+
+    /// An acceptance the user already has is never lowered by the installer's.
+    #[test]
+    fn an_acceptance_already_recorded_stays_as_it_is() {
+        let mut prefs = preferences();
+        prefs.accepted_eula_version = nrr_shared::eula::CURRENT_EULA_VERSION + 1;
+        let adopted = adopt_installer_acceptance(
+            &mut prefs,
+            &Installer {
+                recorded_by: IVANOV,
+                version: nrr_shared::eula::CURRENT_EULA_VERSION,
+                running_as: IVANOV,
+            },
+        );
+        assert!(!adopted);
+        assert_eq!(
+            prefs.accepted_eula_version,
+            nrr_shared::eula::CURRENT_EULA_VERSION + 1
+        );
     }
 
     // A backslash separates only on Windows; elsewhere it is part of a name.
@@ -955,6 +1133,61 @@ mod tests {
             true,
         )
         .expect("a missing file");
+    }
+
+    /// Another system's programs and an unknown section live only in the
+    /// bound file. A rewrite after a service-side change carries them over
+    /// whatever sections the writer was handed: none (the sidecar could not be
+    /// read) or another file's (the sidecar's last import).
+    #[test]
+    fn a_rewrite_keeps_the_sections_only_the_bound_file_holds() {
+        let other_os = if cfg!(target_os = "linux") {
+            "MacOS"
+        } else {
+            "Linux"
+        };
+        let held = format!(
+            "--- {other_os}\nfirefox  # browser\n# disabled-app\n\n--- Geo\nsome line\n  indented\n"
+        );
+        let dir = tempfile::tempdir().expect("temp dir");
+        let store = store_in(&dir);
+        let file = dir.path().join("home.txt");
+        let path = file.to_string_lossy().into_owned();
+        let write = |text: &str| {
+            rules_file_write_in(
+                &store,
+                &serde_json::json!({ "path": path, "text": text }),
+                true,
+            )
+        };
+        write(&format!("# header\n\n--- Domains\nold.example\n\n{held}")).expect("first write");
+
+        for handed in ["", "--- Elsewhere\nfrom another file\n\n"] {
+            write(&format!(
+                "# header 2\n\n--- Domains\nnew.example\n\n{handed}"
+            ))
+            .expect("rewrite");
+            let written = std::fs::read_to_string(&file).expect("read");
+            assert!(written.contains("new.example"), "{written}");
+            assert!(!written.contains("old.example"), "{written}");
+            assert!(
+                written.contains(&format!(
+                    "--- {other_os}\nfirefox  # browser\n# disabled-app\n"
+                )),
+                "another system's programs were dropped: {written}"
+            );
+            assert!(
+                written.contains("--- Geo\nsome line\n  indented\n"),
+                "the unknown section was dropped: {written}"
+            );
+        }
+
+        // The window is never handed these sections, so each pass sends a text
+        // without them: same rules, new time of writing, and the file (which a
+        // sync folder would ship again) stays as it is.
+        let before = std::fs::read_to_string(&file).expect("read");
+        write("# header 3\n\n--- Domains\nnew.example\n\n").expect("same rules");
+        assert_eq!(std::fs::read_to_string(&file).expect("read"), before);
     }
 
     #[cfg(unix)]

@@ -261,9 +261,8 @@ pub fn note_written(file: &Path, paths: &[PathBuf]) -> Result<(), UserSettingsEr
 /// wrote it. A file that cannot be read counts as edited when there is a
 /// record: overwriting it unasked is the loss to avoid.
 pub fn hand_edited(file: &Path, path: &Path) -> bool {
-    let Ok(settings) = read(file) else {
-        return false;
-    };
+    // No readable record is no record: the text is the user's unless empty.
+    let settings = read(file).unwrap_or_default();
     let on_disk = rules_file_sha256(path).unwrap_or_else(|_| Some(String::new()));
     settings.rules_file_hand_edited(&path_text(&absolute(path)), on_disk.as_deref())
 }
@@ -314,6 +313,22 @@ mod tests {
         note_written(&file, std::slice::from_ref(&rules)).expect("record");
         assert!(!hand_edited(&file, &rules));
         std::fs::write(&rules, "example.org\n").expect("hand edit");
+        assert!(hand_edited(&file, &rules));
+        std::fs::remove_file(&rules).expect("remove");
+        assert!(!hand_edited(&file, &rules), "nothing left to lose");
+    }
+
+    /// The record of what the program wrote cannot be read: the user's text
+    /// is asked about, never overwritten on a guess.
+    #[test]
+    fn a_file_is_edited_by_hand_while_the_record_cannot_be_read() {
+        let dir = Scratch::new("hand-edited-unreadable");
+        let file = dir.settings_file();
+        let rules = dir.path().join("rules_primary.txt");
+        std::fs::write(&rules, "example.com\n").expect("write");
+        note_written(&file, std::slice::from_ref(&rules)).expect("record");
+        std::fs::write(&rules, "example.org\n").expect("hand edit");
+        std::fs::write(&file, "{damaged").expect("damage the record");
         assert!(hand_edited(&file, &rules));
         std::fs::remove_file(&rules).expect("remove");
         assert!(!hand_edited(&file, &rules), "nothing left to lose");

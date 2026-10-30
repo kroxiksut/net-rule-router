@@ -14,7 +14,7 @@ Every archive gets a unique, sortable name of the form:
 nrr-diagnostics-v<app-version>-<YYYYMMDD-HHMMSS>-<milliseconds>.zip
 ```
 
-For example: `nrr-diagnostics-v0.1.0-pre-alpha-20260717-143205-812.zip`. The app version is embedded so a support technician can tell builds apart from the file name alone. If two archives are built in the same millisecond (practically never happens by hand), a `-1`, `-2`, … counter is appended so an existing file is never overwritten.
+For example: `nrr-diagnostics-v0.1.0-alpha.1-20261031-143205-812.zip`. The app version is embedded so a support technician can tell builds apart from the file name alone. If two archives are built in the same millisecond (practically never happens by hand), a `-1`, `-2`, … counter is appended so an existing file is never overwritten.
 
 ## What is inside
 

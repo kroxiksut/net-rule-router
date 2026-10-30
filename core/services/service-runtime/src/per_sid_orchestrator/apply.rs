@@ -151,19 +151,6 @@ impl PerSidApplyOrchestrator {
                     secondary_binding_unresolved: false,
                 });
             }
-            ComputedFilterSet::NoActiveRules => {
-                return Ok(SidApplyPreview {
-                    sid: sid.to_string(),
-                    enforceable: false,
-                    filters: 0,
-                    installed_now,
-                    additions: 0,
-                    removals: installed_now,
-                    colliding_filter_ids: Vec::new(),
-                    unresolved_apps: Vec::new(),
-                    secondary_binding_unresolved: false,
-                })
-            }
         };
         // Two specs sharing an id would have the second silently replace the
         // first in the engine, so the plan quietly enforces less than it says.
@@ -287,9 +274,8 @@ impl PerSidApplyOrchestrator {
             .map(|s| s.installed.clone())
             .unwrap_or_default();
         // Derive the full filter set (rule-driven + leak-guard) via the shared
-        // `compute_filters_for_sid` path. No-policy / no-active-rules install
-        // nothing but still record the SID so a later on_disconnect / recompile
-        // stays consistent.
+        // `compute_filters_for_sid` path. No policy installs nothing but still
+        // records the SID so a later on_disconnect / recompile stays consistent.
         // A book or policy row that does not read is this user's failure, and
         // the health card hears of it the same way as a refused filter set.
         let computed =
@@ -314,17 +300,6 @@ impl PerSidApplyOrchestrator {
                 self.delete_superseded_filters(sid, &previously_installed, &[]);
                 self.upsert_state(sid, Vec::new());
                 self.emit_audit(sid, PerSidApplyAuditKind::Applied, 0, "no-policy");
-                return Ok(0);
-            }
-            ComputedFilterSet::NoActiveRules => {
-                self.delete_superseded_filters(sid, &previously_installed, &[]);
-                self.upsert_state(sid, Vec::new());
-                let kind = if was_known {
-                    PerSidApplyAuditKind::Updated
-                } else {
-                    PerSidApplyAuditKind::Applied
-                };
-                self.emit_audit(sid, kind, 0, "no-active-rules");
                 return Ok(0);
             }
             ComputedFilterSet::Install(plan) => plan.filters,
@@ -530,9 +505,9 @@ impl PerSidApplyOrchestrator {
         };
         let desired = match self.compute_filters_for_sid(sid, false, None, ComputeIntent::Apply)? {
             ComputedFilterSet::Install(f) => f,
-            // No policy / no active rules → nothing desired; leave the set as-is
-            // (full teardown is owned by the stop / policy-change paths).
-            ComputedFilterSet::NoPolicy | ComputedFilterSet::NoActiveRules => return Ok(0),
+            // No policy → nothing desired; leave the set as-is (full teardown
+            // is owned by the stop / policy-change paths).
+            ComputedFilterSet::NoPolicy => return Ok(0),
         };
         self.reconcile_to_desired(
             sid,
@@ -1182,9 +1157,9 @@ impl PerSidApplyOrchestrator {
             return self.install_for_sid_with(sid, rules_override);
         };
         match self.compute_filters_for_sid(sid, true, rules_override, ComputeIntent::Apply)? {
-            // Policy/rules gone → a real teardown; the full-replace path
-            // re-records the empty state and emits the same audits as before.
-            ComputedFilterSet::NoPolicy | ComputedFilterSet::NoActiveRules => {
+            // Policy gone → a real teardown; the full-replace path re-records
+            // the empty state and emits the same audits as before.
+            ComputedFilterSet::NoPolicy => {
                 let _ = self.remove_for_sid_locked(sid)?;
                 self.install_for_sid_with(sid, rules_override)
             }

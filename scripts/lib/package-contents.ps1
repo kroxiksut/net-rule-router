@@ -1,21 +1,24 @@
 # The files a Windows package must carry: packaging\windows\package-contents.txt
-# plus what the checkout names. Dot-sourced by package-windows.ps1 and
-# check-windows-package.ps1, never run.
+# plus what the checkout names; and the symbols its archive must carry.
+# Dot-sourced by package-windows.ps1 and check-windows-package.ps1, never run.
 
+# -Symbols returns the PDBs the symbols archive must hold instead.
 function Get-PackageContents {
     param(
         [Parameter(Mandatory)] [string]$RepoRoot,
         [Parameter(Mandatory)] [ValidateSet('full', 'headless')] [string]$Variant,
-        [switch]$Installer
+        [switch]$Installer,
+        [switch]$Symbols
     )
 
     $manifest = Join-Path $RepoRoot 'packaging\windows\package-contents.txt'
     if (-not (Test-Path -LiteralPath $manifest)) {
         throw "Missing $manifest."
     }
-    $sets = @('all')
-    if ($Variant -eq 'full') { $sets += 'full' }
-    if ($Installer) { $sets += 'installer' }
+    $symbolSets = @('symbols', 'symbols-full')
+    $sets = @($(if ($Symbols) { 'symbols' } else { 'all' }))
+    if ($Variant -eq 'full') { $sets += $(if ($Symbols) { 'symbols-full' } else { 'full' }) }
+    if ($Installer -and -not $Symbols) { $sets += 'installer' }
 
     $paths = New-Object System.Collections.Generic.List[string]
     foreach ($line in [System.IO.File]::ReadAllLines($manifest)) {
@@ -25,10 +28,17 @@ function Get-PackageContents {
         if ($fields.Count -ne 2) {
             throw "${manifest}: expected '<set> <path>', got '$text'."
         }
-        if (@('all', 'full', 'installer') -notcontains $fields[0]) {
+        if ((@('all', 'full', 'installer') + $symbolSets) -notcontains $fields[0]) {
             throw "${manifest}: unknown set '$($fields[0])'."
         }
+        $isPdb = $fields[1] -like '*.pdb'
+        if ($isPdb -ne ($symbolSets -contains $fields[0])) {
+            throw "${manifest}: '$text' - debug symbols go in the symbols sets only, and nothing else does."
+        }
         if ($sets -contains $fields[0]) { $paths.Add($fields[1]) }
+    }
+    if ($Symbols) {
+        return @($paths | Sort-Object -Unique)
     }
 
     # Payload the package copies whole: every file of it must arrive.

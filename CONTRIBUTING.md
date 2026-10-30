@@ -1,9 +1,21 @@
 # Contributing
 
-NetRuleRouter is pre-alpha. Windows builds and runs today; Linux is in progress
+NetRuleRouter is in alpha. Windows builds and runs today; Linux is in progress
 and macOS has not started. That shapes what is useful right now: a precise bug
 report is worth more than a feature patch, and an issue before a pull request
 saves both of us the work of discovering that a change does not fit.
+
+## Where to talk
+
+- **The Telegram channel [t.me/netrulerouter](https://t.me/netrulerouter)**,
+  in English and Russian, is for questions, discussion, ideas and
+  announcements of new builds. Not sure whether something is a bug, or
+  whether an idea fits? Ask there first.
+- **[GitHub Issues](https://github.com/kroxiksut/net-rule-router/issues)** is
+  where bugs and feature requests are tracked until they are done. A problem
+  raised in the channel that needs a fix ends up as an issue.
+- **Vulnerabilities** go to neither: see
+  [Reporting a security issue](#reporting-a-security-issue).
 
 ## Reporting a bug
 
@@ -17,7 +29,8 @@ so they carry no raw host names or addresses, and the archive is safe to attach
 to a public issue. **Full diagnostics** is different: it is less redacted and
 can include the destination host name of sampled routing decisions, so review it
 before sharing. [`docs/en/diagnostic-archive.md`](docs/en/diagnostic-archive.md)
-lists every file and what is in it.
+lists every file and what is in it. Attach the archive to the issue rather
+than posting it in the Telegram channel: the issue keeps it next to the report.
 
 If the machine has lost network access and you need it back before anything
 else, [`docs/en/recovering-network-access.md`](docs/en/recovering-network-access.md)
@@ -25,10 +38,10 @@ is the page to open first.
 
 ## Reporting a security issue
 
-Do not open a public issue. Use GitHub's **Report a vulnerability** button on
-the repository's Security tab, which opens a private advisory, or e-mail
-<fmalkov91@gmail.com> if you cannot use GitHub. Include the
-version, the platform, and what an attacker would gain — that last part decides
+Do not open a public issue and do not post it in the Telegram channel. Use
+GitHub's **Report a vulnerability** button on the repository's Security tab,
+which opens a private advisory, or e-mail [fmalkov91@gmail.com](mailto:fmalkov91@gmail.com) if you cannot
+use GitHub. Include the version, the platform, and what an attacker would gain — that last part decides
 how fast it moves. The trust boundaries the product is built around are written
 down in [`SECURITY.md`](SECURITY.md); a report that names the boundary it
 crosses is much easier to act on.
@@ -36,7 +49,8 @@ crosses is much easier to act on.
 ## Suggesting a feature
 
 Open an issue and describe the situation you are in, not the mechanism you have
-in mind. The scope is deliberately narrow, and two limits come up often enough
+in mind. To talk an idea over before writing it up, bring it to the Telegram
+channel. The scope is deliberately narrow, and two limits come up often enough
 to state here:
 
 **It is a routing manager, not a security suite.** It decides which of your

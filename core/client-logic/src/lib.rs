@@ -39,6 +39,7 @@
 //! - [`doh_resolvers`] — the user's resolver-list edits laid over a fresh
 //!   read of the machine's list.
 //! - [`enforcement_notice`] — when the rules applying again is worth a line.
+//! - [`first_run`] — the country whose rule set the setup offers first.
 //! - [`forwarded`] — whether WSL runs, and asking what it gets when the
 //!   tunnel is down.
 //! - [`notice_mutes`] — hiding whole notice kinds for a while.
@@ -51,6 +52,7 @@
 //! - [`stability`] — the full-replacement `settings.service-stability.set` row.
 //! - [`system_dns`] — whether the system DNS was left redirected, and when to
 //!   say so.
+//! - [`traffic_rows`] — which traffic rows a view shows.
 //! - [`units`] — byte counts as people read them.
 //! - [`verify_verdicts`] — the notice for `?` rules that work only on the
 //!   other route.
@@ -71,6 +73,7 @@ pub mod contract;
 pub mod diagnostics;
 pub mod doh_resolvers;
 pub mod enforcement_notice;
+pub mod first_run;
 pub mod forwarded;
 pub mod full_reset;
 mod js;
@@ -94,6 +97,7 @@ pub mod service_loss;
 pub mod site_notice;
 pub mod stability;
 pub mod system_dns;
+pub mod traffic_rows;
 pub mod units;
 pub mod verify_verdicts;
 pub mod vpn_client_trust;

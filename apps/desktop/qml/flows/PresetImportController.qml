@@ -1,6 +1,7 @@
 import QtQuick 2.15
 import "../lib/pure.js" as Pure
 import "../lib/rules.js" as Rules
+import "../lib/plurals.js" as Plurals
 
 // Non-visual controller owning the preset-import subsystem: canonical parse
 // (via the launcher `preset.parse` RPC), the review-dialog decision apply,
@@ -758,8 +759,24 @@ QtObject {
     // SaveBeforeCloseDialog still knows where to write), and mark the
     // section dirty so a future `Save & review…` can push the new
     // revision once the service is reachable.
-    function _applyPresetImportOffline(state, reasonLabel) {
+    function _applyPresetImportOffline(state, reasonLabel, kind) {
         if (!state) return
+        // A load the user asked for that could not reach the service is a
+        // message box, not a status line: the window that started it may be
+        // gone (the first-run window closes on Finish).
+        var name = _ruleSetName(state)
+        if (!state.hydration && name !== "") {
+            var reason = String(reasonLabel || "")
+            if (reason === "transport-disconnected" && typeof root.ipcErrorLabel === "function")
+                reason = root.ipcErrorLabel(reason)
+            var body = kind === "not-installed"
+                ? root.tr("dialog.rule-set-not-applied.not-installed",
+                    "«{name}»: the background service is not installed, so these rules are not in use. They are kept and will be offered for applying once the service is installed and running.")
+                : root.tr("dialog.rule-set-not-applied.service-down",
+                    "«{name}»: the service could not be started, so these rules are not in use yet ({reason}). They are kept and will be offered for applying as soon as the service runs.")
+            root.showNotice(root.tr("dialog.rule-set-not-applied.title", "Rule set not applied"),
+                body.replace("{name}", name).replace("{reason}", reason))
+        }
         _refreshRulesAfterPresetImport(state, {
             // Offline path applies rules locally — there's no service
             // to fan them back via snapshot push, so we own the GUI's
@@ -828,17 +845,72 @@ QtObject {
     /// the review flow can save it into `UiPreferences::last_saved_path_<role>`.
     /// A refused import has an empty diff; saying "Nothing to apply" and
     /// binding its files as matching would call it in force. True when refused.
-    function _announcePreviewRefusal(summary) {
+    function _announcePreviewRefusal(summary, options) {
         var refusal = Pure.previewRefusal(summary)
         if (!refusal) return false
-        root.statusLine = root.tr("status.preset-import-failed", "Failed to import preset: ")
-            + root.previewRefusalText(refusal)
+        _reportImportFailure(root.tr("status.preset-import-failed", "Failed to import preset: ")
+            + root.previewRefusalText(refusal), options)
+        return true
+    }
+
+    /// A failed import in the status bar and in a message box: the caller's
+    /// own window may have closed. Hydration was not asked for and stays quiet.
+    function _reportImportFailure(text, options) {
+        root.statusLine = text
+        if (!(options && options.hydration === true)) {
+            root.showNotice(root.tr("dialog.rules-not-imported.title", "The rules were not imported"), text)
+        }
+    }
+
+    /// How the set is named to the user: the name it was picked by, else the
+    /// folder of a set's two files, else the file. Empty for a load of no
+    /// file (the rollback to an empty book), which announces nothing.
+    function _ruleSetName(st) {
+        var label = String((st && st.label) || "")
+        if (label !== "") return label
+        var path = String((st && (st.primaryPath || st.secondaryPath || st.sourcePath)) || "")
+            .replace(/\\/g, "/")
+        if (path === "") return ""
+        var parts = path.split("/")
+        var file = parts[parts.length - 1]
+        if (/^rules_(primary|secondary)\.txt$/i.test(file) && parts.length > 1)
+            return Pure.displayText(parts[parts.length - 2])
+        return Pure.displayText(file)
+    }
+
+    // A load the user asked for reaches the service in the same action: a
+    // stopped service is started first. Hydration only puts the bound files on
+    // screen and never starts a service the user may have stopped on purpose.
+    // A start that does not happen keeps the rules on screen and parked for
+    // the service, and says why.
+    function _whenServiceUp(options, run) {
+        if ((options && options.hydration) || !root.serviceStarter) {
+            run()
+            return
+        }
+        // The load's own state: a newer load may have replaced the pending one
+        // by the time this start fails.
+        var state = root.pendingPresetImportState
+        root.serviceStarter.startIfStoppedThen(run, function(reason, kind) {
+            _applyPresetImportOffline(state, String(reason || ""), kind)
+        })
+    }
+
+    // A dry run that found no channel right after the start waits, once and
+    // bounded, for the service to answer before the load goes offline.
+    function _retryWhenAnswering(options, state, again) {
+        if ((options && options.hydration) || !root.serviceStarter
+                || typeof root.serviceStarter.waitForAnswerThen !== "function") return false
+        root.serviceStarter.waitForAnswerThen(again, function(reason) {
+            _applyPresetImportOffline(state, String(reason || "transport-disconnected"))
+        })
         return true
     }
 
     function startPresetImportReviewFlow(targetRoute, bytesB64, sourcePath, mode, options) {
         if (!root.bridgeAvailable) {
             console.log("preset-import: bridge unavailable, aborting")
+            _reportImportFailure(root.tr("status.bridge-unavailable", "Service bridge not connected."), options)
             return
         }
         var corr = "preset-import-" + Date.now() + "-" + Math.floor(Math.random() * 1e6)
@@ -863,9 +935,13 @@ QtObject {
             correlationId: corr,
             summary: null,
             confirmationToken: "",
-            hydration: !!(options && options.hydration)
+            hydration: !!(options && options.hydration),
+            label: String((options && options.label) || "")
         }
         root._activeReviewKind = "preset-import"
+        var loadState = root.pendingPresetImportState
+        var retried = false
+        _whenServiceUp(options, function dryRun() {
         var rpcCorr = nrrNativeBridge.rpcMutationSubmit(
             "preset-import", payload, true /* dryRun */, ""
         )
@@ -873,19 +949,23 @@ QtObject {
             if (!ok) {
                 console.log("preset-import: dry-run failed:", code, msg)
                 if (String(code) === "transport-disconnected") {
-                    _applyPresetImportOffline(root.pendingPresetImportState, String(code))
+                    if (!retried) {
+                        retried = true
+                        if (_retryWhenAnswering(options, loadState, dryRun)) return
+                    }
+                    _applyPresetImportOffline(loadState, String(code))
                     return
                 }
                 var label = (typeof root.ipcErrorLabel === "function")
                     ? root.ipcErrorLabel(String(code || "unknown"))
                     : String(code || "unknown")
-                root.statusLine = root.tr("status.preset-import-dry-run-failed",
-                    "Preset import dry-run failed: ") + label
+                _reportImportFailure(root.tr("status.preset-import-dry-run-failed",
+                    "Preset import dry-run failed: ") + label, options)
                 return
             }
             var summary = (p && p["review-summary"]) || p || {}
             var token = (p && p["confirmation-token"]) || ""
-            if (_announcePreviewRefusal(summary)) return
+            if (_announcePreviewRefusal(summary, options)) return
             // Re-importing a preset that already
             // matches the active rules yields an empty diff (content-based
             // diff, domain fix same day). Surface a plain notice instead of an
@@ -919,6 +999,7 @@ QtObject {
             root.reviewDiffDialog.readOnly = false
             root.reviewDiffDialog.open()
         })
+        })
     }
 
     /// Both-routes variant for the first-run wizard
@@ -938,6 +1019,7 @@ QtObject {
     function startBothRoutesPresetImportReviewFlow(primaryBytesB64, secondaryBytesB64, primaryPath, secondaryPath, options) {
         if (!root.bridgeAvailable) {
             console.log("preset-import-both: bridge unavailable, aborting")
+            _reportImportFailure(root.tr("status.bridge-unavailable", "Service bridge not connected."), options)
             return
         }
         var corr = "preset-import-both-" + Date.now() + "-" + Math.floor(Math.random() * 1e6)
@@ -969,10 +1051,14 @@ QtObject {
             correlationId: corr,
             summary: null,
             confirmationToken: "",
-            hydration: !!(options && options.hydration)
+            hydration: !!(options && options.hydration),
+            label: String((options && options.label) || "")
         }
         root._activeReviewKind = "preset-import"
         var startedAtMs = Date.now()
+        var loadState = root.pendingPresetImportState
+        var retried = false
+        _whenServiceUp(options, function dryRun() {
         var rpcCorr = nrrNativeBridge.rpcMutationSubmit(
             "preset-import", payload, true /* dryRun */, ""
         )
@@ -980,14 +1066,18 @@ QtObject {
             if (!ok) {
                 console.log("preset-import-both: dry-run failed:", code, msg)
                 if (String(code) === "transport-disconnected") {
-                    _applyPresetImportOffline(root.pendingPresetImportState, String(code))
+                    if (!retried) {
+                        retried = true
+                        if (_retryWhenAnswering(options, loadState, dryRun)) return
+                    }
+                    _applyPresetImportOffline(loadState, String(code))
                     return
                 }
-                root.statusLine = root.tr("status.preset-import-dry-run-failed",
+                _reportImportFailure(root.tr("status.preset-import-dry-run-failed",
                     "Preset import dry-run failed: ") +
                     ((typeof root.ipcErrorLabel === "function")
                         ? root.ipcErrorLabel(String(code || "unknown"))
-                        : String(code || "unknown"))
+                        : String(code || "unknown")), options)
                 return
             }
             if (root.reviewIsSuperseded(startedAtMs)) {
@@ -996,7 +1086,7 @@ QtObject {
             }
             var summary = (p && p["review-summary"]) || p || {}
             var token = (p && p["confirmation-token"]) || ""
-            if (_announcePreviewRefusal(summary)) return
+            if (_announcePreviewRefusal(summary, options)) return
             // No-op re-import → plain notice
             // instead of an empty review dialog (see single-route variant).
             if (Pure.reviewSummaryIsEmpty(summary)) {
@@ -1025,6 +1115,7 @@ QtObject {
             // otherwise the import review opens without an Apply button.
             root.reviewDiffDialog.readOnly = false
             root.reviewDiffDialog.open()
+        })
         })
     }
 
@@ -1098,11 +1189,13 @@ QtObject {
     // `forbidden` is the mutation gate (e.g. an unacknowledged security
     // alert), not missing rights.
     function _announcePresetImportFailed(code, args) {
-        root.statusLine = root.tr("status.preset-import-failed",
+        var text = root.tr("status.preset-import-failed",
             "Failed to import preset: ") +
             ((typeof root.ipcErrorLabel === "function")
                 ? root.ipcErrorLabel(String(code || "unknown"), args || null)
                 : String(code || "unknown"))
+        root.statusLine = text
+        root.showNotice(root.tr("dialog.rule-set-not-applied.title", "Rule set not applied"), text)
     }
 
     function _completePresetImportActivation(st) {
@@ -1119,6 +1212,16 @@ QtObject {
                 root.statusLine = base
                     + _formatImportPassthroughSuffix(summary.passthroughByRoute)
                     + _formatNewerFormatSuffix()
+                // A box, not only the status line: the load is the user's
+                // action and the window that started it may have closed.
+                var name = _ruleSetName(st)
+                if (name !== "") {
+                    root.showNotice(root.tr("dialog.rule-set-applied.title", "Rule set applied"),
+                        Plurals.counted(root.tr, "dialog.rule-set-applied.body.", summary.rulesCount,
+                            "«{name}»: {count} rule is now in use.",
+                            "«{name}»: {count} rules are now in use.")
+                            .replace("{name}", name))
+                }
             }
         })
         // The in-memory rules now match what the service has.

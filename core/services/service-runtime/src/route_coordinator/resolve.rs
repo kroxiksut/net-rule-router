@@ -117,8 +117,10 @@ impl SecondaryRouteCoordinator {
         };
         let r = self.resolve_from(sid, Some(machine));
         let secondary = r.secondary.map(|t| t.interface_index).or_else(|| {
-            let binding = self.route_source.load_for_sid(sid)?.secondary?;
-            self.resolve_binding_target(sid, &binding, infos, "secondary", Some(machine))
+            let policy = self.route_source.load_for_sid(sid)?;
+            let binding = policy.secondary.as_ref()?;
+            let primary = policy.primary.as_ref();
+            self.resolve_binding_target(sid, binding, primary, infos, "secondary", Some(machine))
                 .map(|t| t.interface_index)
         });
         nrr_platform_api::fake_ip::stale_flows::FlowLinks::from_adapters(
@@ -315,7 +317,14 @@ impl SecondaryRouteCoordinator {
         let secondary = match policy.secondary.as_ref() {
             Some(b) => {
                 self.clear_no_secondary(sid);
-                let raw = self.resolve_binding_target(sid, b, infos, "secondary", reading);
+                let raw = self.resolve_binding_target(
+                    sid,
+                    b,
+                    policy.primary.as_ref(),
+                    infos,
+                    "secondary",
+                    reading,
+                );
                 self.gate_secondary_on_liveness(sid, raw)
             }
             None => {
@@ -333,10 +342,16 @@ impl SecondaryRouteCoordinator {
         };
         // Primary carries mode-A's `/2` counter-overlay (unmatched → real link,
         // not the tunnel) and mode-B's exception `/32`s.
-        let mut primary = policy
-            .primary
-            .as_ref()
-            .and_then(|b| self.resolve_binding_target(sid, b, infos, "primary", reading));
+        let mut primary = policy.primary.as_ref().and_then(|b| {
+            self.resolve_binding_target(
+                sid,
+                b,
+                policy.secondary.as_ref(),
+                infos,
+                "primary",
+                reading,
+            )
+        });
         // Footgun fix: the common setup binds ONLY the secondary (VPN). Without
         // a primary, mode A's counter-overlay can't be emitted and unmatched
         // traffic silently rides the VPN's redirect. Derive the real primary

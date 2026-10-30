@@ -155,6 +155,7 @@ Dialog {
                         color: root._accentColor()
                         font.bold: true
                         font.pixelSize: 14
+                        wrapMode: Text.Wrap
                         text: root._tr("dialog.preset-review.duplicates-heading",
                             "Duplicate sections")
                     }
@@ -206,6 +207,7 @@ Dialog {
                                 }
 
                                 ThemedRadioButton {
+                                    Layout.fillWidth: true
                                     theme: root.ownerRoot ? root.ownerRoot.uiTheme : null
                                     text: root._tr("dialog.preset-review.duplicate-merge",
                                         "Merge (concatenate contents)")
@@ -218,6 +220,7 @@ Dialog {
                                     }
                                 }
                                 ThemedRadioButton {
+                                    Layout.fillWidth: true
                                     theme: root.ownerRoot ? root.ownerRoot.uiTheme : null
                                     text: root._tr("dialog.preset-review.duplicate-last-wins",
                                         "Use only the last occurrence")
@@ -230,6 +233,7 @@ Dialog {
                                     }
                                 }
                                 ThemedRadioButton {
+                                    Layout.fillWidth: true
                                     theme: root.ownerRoot ? root.ownerRoot.uiTheme : null
                                     text: root._tr("dialog.preset-review.duplicate-ignore",
                                         "Skip this section entirely")
@@ -256,6 +260,7 @@ Dialog {
                         color: root._accentColor()
                         font.bold: true
                         font.pixelSize: 14
+                        wrapMode: Text.Wrap
                         text: root._tr("dialog.preset-review.unknowns-heading",
                             "Unrecognised sections")
                     }
@@ -281,6 +286,7 @@ Dialog {
                                 Label {
                                     Layout.fillWidth: true
                                     color: root._textColor()
+                                    wrapMode: Text.Wrap
                                     text: {
                                         var name = String(modelData["section-name"] || "")
                                         var lines = parseInt(modelData["content-lines"] || 0)

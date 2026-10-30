@@ -1,7 +1,8 @@
 //! The user's rule-set folder and the set on screen moving into it
 //! (`isPathUnderDir`, `rememberedRulesPathFor`, `isUsableSetName`,
-//! `rulesFileFolder`, `adoptedSetName`, `rulesLiveInFolder` and
-//! `numberedSetName` in `pure.js`).
+//! `rulesFileFolder`, `adoptedSetName`, `rulesLiveInFolder`,
+//! `numberedSetName` and `ruleSetOfferDue` in `pure.js`), and the set
+//! offered to a user who has no rules.
 
 use crate::js;
 
@@ -125,6 +126,65 @@ pub fn numbered_set_name(base: &str, has_files: impl Fn(&str) -> bool) -> String
         n += 1;
     }
     name
+}
+
+/// Whether the service is running, as far as the client can tell.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ServiceState {
+    Running,
+    /// Stopped or not installed: nothing answers, and nothing is starting.
+    Stopped,
+    /// Connecting, refused or not asked yet.
+    NotKnown,
+}
+
+impl ServiceState {
+    /// `"running"`, `"stopped"`; anything else is not known.
+    pub fn from_slug(slug: &str) -> Self {
+        match slug {
+            "running" => Self::Running,
+            "stopped" => Self::Stopped,
+            _ => Self::NotKnown,
+        }
+    }
+}
+
+/// What decides whether a user with no rules is offered a rule set.
+#[derive(Clone, Copy, Debug)]
+pub struct RuleSetOffer<'a> {
+    /// The first run finished before this launch: its own choice of set,
+    /// "start empty" included, is not questioned in the same breath.
+    pub first_run_done: bool,
+    pub service: ServiceState,
+    /// The rules the service answered it holds; `None` until it answers.
+    pub service_rules: Option<usize>,
+    /// Rules on screen, applied or not.
+    pub local_rules: usize,
+    /// A rules file the user loaded, saved or bound backs their rules.
+    pub user_bound: bool,
+    /// The set that would be offered; blank is none.
+    pub set_name: &'a str,
+    /// Either client already had an answer to the offer.
+    pub answered: bool,
+    /// An administrator turned rule editing off: no set could be loaded.
+    pub edits_locked: bool,
+}
+
+/// Offer `set_name` when the user has no rules: the service answered it holds
+/// none, or is not running and nothing is on screen. Twin of
+/// `ruleSetOfferDue`.
+pub fn rule_set_offer_due(offer: &RuleSetOffer<'_>) -> bool {
+    if !offer.first_run_done || offer.answered || offer.user_bound || offer.edits_locked {
+        return false;
+    }
+    if js::trim(offer.set_name).is_empty() || offer.local_rules > 0 {
+        return false;
+    }
+    match offer.service {
+        ServiceState::Running => offer.service_rules == Some(0),
+        ServiceState::Stopped => offer.service_rules.unwrap_or(0) == 0,
+        ServiceState::NotKnown => false,
+    }
 }
 
 #[cfg(test)]

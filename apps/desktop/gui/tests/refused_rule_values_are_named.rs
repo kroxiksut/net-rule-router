@@ -60,7 +60,7 @@ fn every_preview_reader_asks_about_a_refusal_before_calling_the_diff_empty() {
     );
     refusal_is_read_before_emptiness(
         "apps/desktop/qml/flows/PresetImportController.qml",
-        "_announcePreviewRefusal(summary)",
+        "_announcePreviewRefusal(summary, options)",
         "Pure.reviewSummaryIsEmpty(summary)",
     );
     refusal_is_read_before_emptiness(

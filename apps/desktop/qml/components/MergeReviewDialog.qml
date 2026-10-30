@@ -226,6 +226,7 @@ Dialog {
         Label {
             Layout.fillWidth: true
             visible: dialog.loading
+            wrapMode: Text.Wrap
             text: dialog._t("dialog.merge.loading", "Comparing file and app rules…")
             color: dialog._mutedColor()
         }
@@ -268,6 +269,7 @@ Dialog {
                 Label {
                     Layout.fillWidth: true
                     visible: dialog._normalized().length > 0
+                    wrapMode: Text.Wrap
                     text: dialog.tr("dialog.review-diff.duplicates-heading",
                         "Rules written into both routes")
                         + " (" + dialog._normalized().length + ")"
@@ -317,6 +319,7 @@ Dialog {
                 Label {
                     Layout.fillWidth: true
                     visible: dialog._fileOnly().length > 0
+                    wrapMode: Text.Wrap
                     text: dialog._t("dialog.merge.bucket-file-only", "Only in the file")
                         + " (" + dialog._fileOnly().length + ")"
                     font.bold: true
@@ -366,6 +369,7 @@ Dialog {
                     Layout.fillWidth: true
                     Layout.topMargin: 6
                     visible: dialog._changed().length > 0
+                    wrapMode: Text.Wrap
                     text: dialog.tr("dialog.merge.bucket-edits-changed", "Changed by you")
                         + " (" + dialog._changed().length + ")"
                     font.bold: true
@@ -413,6 +417,7 @@ Dialog {
                     Layout.fillWidth: true
                     Layout.topMargin: 6
                     visible: dialog._removed().length > 0
+                    wrapMode: Text.Wrap
                     text: dialog.tr("dialog.merge.bucket-edits-deleted", "Deleted by you")
                         + " (" + dialog._removed().length + ")"
                     font.bold: true
@@ -462,6 +467,7 @@ Dialog {
                     Layout.fillWidth: true
                     Layout.topMargin: 6
                     visible: dialog._serviceOnly().length > 0
+                    wrapMode: Text.Wrap
                     text: dialog._t("dialog.merge.bucket-service-only", "Only in the app")
                         + " (" + dialog._serviceOnly().length + ")"
                     font.bold: true
@@ -510,6 +516,7 @@ Dialog {
                     Layout.fillWidth: true
                     Layout.topMargin: 6
                     visible: dialog._conflicts().length > 0
+                    wrapMode: Text.Wrap
                     text: dialog.tr("dialog.merge.bucket-conflicts", "Conflicts")
                         + " (" + dialog._conflicts().length + ")"
                     font.bold: true

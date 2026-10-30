@@ -10,6 +10,10 @@ const SHARED_CALL: &str = "nrr_platform_windows::dll_search::restrict_dll_search
 /// Built for Linux only, where the loader settles its search before `main`.
 const NOT_BUILT_FOR_WINDOWS: &[&str] = &["nrr-serviced"];
 
+/// Run by the packaging script on the build machine and never shipped; the
+/// test below holds them out of the package list.
+const BUILD_TOOLS: &[&str] = &["nrr-docs-html"];
+
 fn workspace_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
         .ancestors()
@@ -93,7 +97,7 @@ fn every_windows_main_restricts_the_dll_search_first() {
         );
     }
     for (name, path) in mains {
-        if NOT_BUILT_FOR_WINDOWS.contains(&name.as_str()) {
+        if NOT_BUILT_FOR_WINDOWS.contains(&name.as_str()) || BUILD_TOOLS.contains(&name.as_str()) {
             continue;
         }
         let source = std::fs::read_to_string(&path).expect("main source readable");
@@ -118,6 +122,25 @@ fn every_windows_main_restricts_the_dll_search_first() {
             shim_source.contains(SHARED_CALL),
             "{name}: {} must delegate to {SHARED_CALL}",
             module.display()
+        );
+    }
+}
+
+#[test]
+fn a_build_tool_exempt_from_the_dll_check_never_ships() {
+    let list =
+        std::fs::read_to_string(workspace_root().join("packaging/windows/package-contents.txt"))
+            .expect("package list readable");
+    for tool in BUILD_TOOLS {
+        let exe = format!("{tool}.exe");
+        let shipped = list
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.starts_with('#'))
+            .any(|line| line.contains(&exe));
+        assert!(
+            !shipped,
+            "{exe} is in the package, so it must restrict its DLL search"
         );
     }
 }

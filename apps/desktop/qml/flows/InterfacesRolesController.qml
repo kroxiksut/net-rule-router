@@ -126,6 +126,8 @@ QtObject {
         rebuildInterfacesModel()
         _persistExternalIpCache(mapped)
         root.uiRevision += 1
+        // An additional adapter that just came up may want its VPN client set.
+        if (typeof root._maybeOfferVpnClient === "function") Qt.callLater(root._maybeOfferVpnClient)
     }
 
     function refreshInterfacesFromService() {
@@ -475,6 +477,24 @@ QtObject {
         }
         return -1
     }
+    /// For the adapter at `index` picked for `role` while not connected, the
+    /// warning that another copy of its driver may be the one the VPN uses,
+    /// or "". The interfaces cards and the first-run window show it.
+    function driverSiblingWarning(index, role) {
+        var all = []
+        for (var i = 0; i < root.interfacesModel.count; i += 1)
+            all.push(root.interfacesModel.get(i))
+        var found = Pure.adapterDriverSiblings(all, index, role)
+        if (found.live.length > 0)
+            return root.tr("interfaces.role.driver-sibling-live",
+                    "This adapter is not connected, but another adapter of the same kind is: {list}. A VPN program often brings up a different copy than the one chosen; if yours did, choose that one instead.")
+                .replace("{list}", found.live.map(function(j) {
+                    return Pure.adapterDisplayName(all[j]) }).join(", "))
+        if (found.idle > 0)
+            return root.tr("interfaces.role.driver-sibling-idle",
+                "This adapter is not connected, and other adapters of the same kind are on this computer. Your VPN program may use one of them: connect the VPN first, then choose the adapter that comes up.")
+        return ""
+    }
     /// `holdsNowConfirmed` is set by the leak-protection question's proceed
     /// callback; every other caller omits it.
     function unassignRole(index, role, holdsNowConfirmed) {
@@ -721,6 +741,19 @@ QtObject {
     function _vpnConflictSecondaryDisplayName() {
         var r = _vpnConflictSecondaryRow()
         return r ? Pure.adapterDisplayName(r) : ""
+    }
+    /// The bound additional adapter's names while it is up, "" otherwise:
+    /// what ties a running VPN program to it.
+    function _secondaryUpLinkName() {
+        var rows = root.interfacesRowsAll || []
+        for (var i = 0; i < rows.length; i += 1) {
+            var r = rows[i]
+            if (String(r.selectedRole) !== "secondary") continue
+            if (String(r.availability) !== "available") return ""
+            return Pure.adapterDisplayName(r) + " "
+                + String((root.prefs && root.prefs.selectedSecondaryInterfaceName) || "")
+        }
+        return ""
     }
     function _enabledSecondaryRuleCount() {
         var n = 0

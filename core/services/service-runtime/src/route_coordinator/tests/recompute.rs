@@ -388,3 +388,81 @@ fn with_the_dns_setting_on_the_public_resolvers_ride_the_tunnel_instead() {
             .collect::<HashSet<_>>()
     );
 }
+
+/// Settings but no rule revision ("Start empty", a reset with no baseline)
+/// route exactly as an emptied book: the additional connection still carries
+/// what its default route promises, rather than every route coming down.
+#[test]
+fn no_rule_revision_routes_as_an_emptied_book() {
+    let table_for = |rules: Arc<FakeRules>| {
+        let api = Arc::new(MockWindowsApi::new());
+        let policy = Arc::new(FakePolicy::new());
+        policy.bind_secondary("S-IVANOV", "vpn");
+        policy.set_mode(
+            "S-IVANOV",
+            crate::per_sid_orchestrator::PerSidBehaviorMode::PreferSecondaryWhenAvailable,
+        );
+        let coord = coordinator_with_policy(Arc::clone(&api), rules, policy);
+        let resolution = RouteResolution {
+            mode: RouteBehaviorMode::PreferSecondaryWhenAvailable,
+            primary: None,
+            secondary: Some(target()),
+        };
+        coord.recompute_for("S-IVANOV", &resolution).unwrap();
+        table_dests(&api)
+    };
+    let emptied = Arc::new(FakeRules::new());
+    emptied.set_secondary("S-IVANOV", CanonicalRuleSet::from_rules(vec![]));
+    let emptied = table_for(emptied);
+    assert!(
+        !emptied.is_empty(),
+        "fixture: an emptied book routes the overlay"
+    );
+    assert_eq!(table_for(Arc::new(FakeRules::new())), emptied);
+}
+
+/// A book that cannot be read is not "no rules": the routes a crashed run
+/// left and this one adopted stay until it reads, as the filters do.
+#[test]
+fn an_unreadable_book_keeps_the_routes_adopted_after_a_crash() {
+    struct Unreadable;
+    impl RulesProvider for Unreadable {
+        fn active_rules(&self) -> Option<ActiveRulesSnapshot> {
+            None
+        }
+        fn rules_read_for(&self, _principal: &str) -> crate::per_sid_orchestrator::RulesRead {
+            crate::per_sid_orchestrator::RulesRead::Unreadable("database is locked".into())
+        }
+    }
+    let api = Arc::new(MockWindowsApi::new());
+    let ours = RouteEntry {
+        destination: IpAddr::V4(Ipv4Addr::new(198, 51, 100, 1)),
+        prefix_length: 32,
+        next_hop: IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)),
+        interface_index: 9,
+        metric: 5,
+        is_ours: false,
+        table: nrr_platform_api::RouteTableRef::Main,
+    };
+    api.set_route_table(vec![ours]);
+    let sec = adapter("vpn", 9, true, true, Some([10, 0, 0, 1]));
+    let sec_id = sec.stable_id();
+    api.set_adapter_infos(vec![sec]);
+    let policy = Arc::new(FakePolicy::new());
+    policy.bind_secondary("S-IVANOV", &sec_id);
+    let coord = SecondaryRouteCoordinator::new(
+        Arc::clone(&api) as Arc<dyn RouteTablePort>,
+        Arc::new(Unreadable) as Arc<dyn RulesProvider>,
+        policy as Arc<dyn RoutePolicySource>,
+        Arc::new(MockFqdnCacheLookup::new()) as Arc<dyn FqdnCacheLookup>,
+        Arc::new(|| false) as RuleScopeProvider,
+    );
+    coord.adopt_orphans_from_table();
+    assert_eq!(coord.owned_count(), 1, "fixture: the orphan is adopted");
+
+    coord.recompute_active(&["S-IVANOV".to_string()]).unwrap();
+    assert!(
+        table_dests(&api).contains(&Ipv4Addr::new(198, 51, 100, 1)),
+        "an unreadable book took down the routes it could not judge"
+    );
+}

@@ -290,6 +290,8 @@ fn save_then_load_roundtrip_is_stable() {
         show_virtual_machines_section: true,
         // Non-default (default is false) — proves the field persists.
         app_groups_offer_dismissed: true,
+        // Non-default (default is false) — proves the field persists.
+        rule_set_offer_answered: true,
         // Non-default (default is true) so the round-trip test proves the
         // field actually persists rather than reading the default.
         show_remembered_adapters: false,
@@ -303,7 +305,9 @@ fn save_then_load_roundtrip_is_stable() {
         // Non-default (default is "today") — proves the field persists.
         traffic_stats_period: "session".to_string(),
         // Non-default (default is "mb") — proves the field persists.
-        traffic_export_unit: "gb".to_string(),
+        traffic_export_unit: "tb".to_string(),
+        // Non-default (default is false) — proves the field persists.
+        traffic_export_include_virtual: true,
         // Non-default (default is "program") — proves the field persists.
         conn_trace_group_by: "folder".to_string(),
         // Non-default values (defaults: "standard" / true) — prove the
@@ -658,18 +662,42 @@ fn a_newer_files_unknown_settings_survive_a_save_by_this_build() {
     );
 }
 
+// An empty label is one the user never renamed: the window shows it in the
+// language it runs at that moment, so nothing here may bake a word in.
 #[test]
-fn route_labels_follow_the_chosen_language_not_the_system_one() {
-    // A file from before the labels existed carries `language=` and no
-    // labels. Deriving them from the system language is how a Russian-UI
-    // user ended up with "Primary"/"Secondary".
-    let parsed = parse_preferences("language=ru\ntheme_mode=dark\n");
-    assert_eq!(parsed.route_primary_label, "Основной");
-    assert_eq!(parsed.route_secondary_label, "Дополнительный");
+fn a_route_label_nobody_renamed_follows_a_language_switch() {
+    let mut prefs = UiPreferences::with_language("en".to_string());
+    prefs.language = "ru".to_string();
+    let reread = parse_preferences(&format_preferences(&prefs));
+    assert_eq!(reread.route_primary_label, "");
+    assert_eq!(reread.route_secondary_label, "");
+}
 
-    // Labels the user actually set are never recomputed.
-    let parsed = parse_preferences("language=ru\nroute_primary_label=Дом\n");
-    assert_eq!(parsed.route_primary_label, "Дом");
+#[test]
+fn a_former_default_stored_by_an_old_build_counts_as_not_renamed() {
+    for legacy in [
+        "Primary",
+        "Secondary",
+        "Additional",
+        "Основной",
+        "Дополнительный",
+    ] {
+        let parsed = parse_preferences(&format!(
+            "language=en\nroute_primary_label={legacy}\nroute_secondary_label={legacy}\n"
+        ));
+        assert_eq!(parsed.route_primary_label, "", "{legacy}");
+        assert_eq!(parsed.route_secondary_label, "", "{legacy}");
+    }
+}
+
+#[test]
+fn a_renamed_route_label_survives_a_language_switch() {
+    let mut prefs =
+        parse_preferences("language=en\nroute_primary_label=Дом\nroute_secondary_label=Work VPN\n");
+    prefs.language = "ru".to_string();
+    let reread = parse_preferences(&format_preferences(&prefs));
+    assert_eq!(reread.route_primary_label, "Дом");
+    assert_eq!(reread.route_secondary_label, "Work VPN");
 }
 
 #[test]
@@ -682,7 +710,6 @@ fn a_file_that_names_its_language_never_asks_the_system() {
     let parsed = super::parse_preferences_with("language=ru\ntheme_mode=dark\n", probe);
     assert_eq!(asked.get(), 0);
     assert_eq!(parsed.language, "ru");
-    assert_eq!(parsed.route_secondary_label, "Дополнительный");
 }
 
 #[test]
@@ -696,7 +723,7 @@ fn a_file_without_a_language_asks_the_system_once() {
     assert_eq!(asked.get(), 1);
     assert_eq!(parsed.language, "ru");
     assert_eq!(parsed.route_primary_label, "Дом");
-    assert_eq!(parsed.route_secondary_label, "Дополнительный");
+    assert_eq!(parsed.route_secondary_label, "");
 }
 
 #[test]

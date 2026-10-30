@@ -91,6 +91,8 @@ pub mod interface_traffic;
 // LOCAL day; only the OS knows the machine's time zone.
 pub mod key_store;
 pub mod local_time;
+// The end-user agreement an installer's licence page recorded as accepted.
+pub mod installer_agreement;
 // Interactive sign-in port: policy is per-principal, so anything enforcing on a
 // user's behalf waits for one — event-driven, because the sign-in happens
 // inside the logon phase where an early arm costs the user a frozen screen.

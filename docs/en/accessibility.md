@@ -31,7 +31,6 @@ a box; the arrow keys move within a list and change the choice of a drop-down.
 | `F1` | About |
 | `Ctrl+Shift+L` | Licence |
 | `Ctrl+Shift+O` | Open the logs folder |
-| `Ctrl+U` | Check for updates (once the first release is out) |
 
 ## Themes and high contrast
 
@@ -61,7 +60,8 @@ use the line mode of the terminal interface, `nrr-tui --plain`.
 
 - The window has not yet been checked end to end with a screen reader, nor
   every dialog from the keyboard alone or at the largest text sizes. If something cannot be reached or is
-  read badly, please [report it](https://github.com/kroxiksut/net-rule-router/issues):
+  read badly, please [report it](https://github.com/kroxiksut/net-rule-router/issues)
+  or say so in the Telegram channel [t.me/netrulerouter](https://t.me/netrulerouter):
   it counts as a bug.
 - Turning on high contrast in Windows does not switch the app's theme by
   itself: choose *High contrast* in Settings.

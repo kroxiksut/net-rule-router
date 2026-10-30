@@ -36,7 +36,7 @@ What this means in practice:
 - When two rules of the same kind are equally specific, a deny wins over a
   route, and the main route over the additional one.
 - A rule for a site or an address wins over a rule for a program. The switch
-  **Programs in your rules take all their traffic** (Settings → Routing) turns
+  **Programs in your rules take all their traffic** (Settings → Routing behavior) turns
   that around for the programs you named.
 - A destination no rule matches takes the default route.
 

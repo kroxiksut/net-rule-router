@@ -2,7 +2,8 @@
 //! them, over the same operations. Whatever needs the window's own files (the
 //! saved comments) is not this terminal's to clear and is skipped; whatever
 //! needs administrator rights is refused with how to start the terminal with
-//! them, and then the reset stops before it touches the service.
+//! them, and then the reset stops before it touches the service. It ends with
+//! the service restarted on the cleared state, as after a fresh install.
 
 use std::time::{Duration, Instant};
 
@@ -25,7 +26,7 @@ use crate::state::AppState;
 pub const TITLE: Key = key("dialog.full-reset.title", "Full reset");
 pub const BODY: Key = key(
     "dialog.full-reset.body",
-    "This resets ALL application settings to defaults, deletes the rules the service keeps for you (back to a post-install state), wipes saved comments and logs, and stops the background service. Your own rules files on disk are left untouched, and the background service is NOT uninstalled. This cannot be undone.",
+    "This resets ALL application settings to defaults, deletes the rules the service keeps for you (back to a post-install state), wipes saved comments and logs, and restarts the background service clean, so routing and protection start again as after a fresh install. Your own rules files on disk are left untouched, and the background service is NOT uninstalled. This cannot be undone.",
 );
 pub const OTHERS: Key = key(
     "dialog.full-reset.other-users",
@@ -41,7 +42,15 @@ pub const RUN: Key = key("dialog.full-reset.confirm", "Reset everything");
 pub const RUNNING: Key = key("status.full-reset-running", "Performing full reset…");
 pub const DONE: Key = key(
     "tui.settings.reset.done",
-    "Full reset is done and the service is stopped. Close this terminal and any NetRuleRouter window, then start again.",
+    "Full reset is done and the service is running again on the cleared state. Close this terminal and any NetRuleRouter window, then start again.",
+);
+pub const RESTART_FAILED: Key = key(
+    "tui.settings.reset.restart-failed",
+    "Full reset is done, but the service did not start again, so routing and protection are off until it runs: {error}. Start it in Settings.",
+);
+pub const SILENT: Key = key(
+    "status.service-did-not-answer",
+    "The service did not start answering in time.",
 );
 pub const PARTIAL: Key = key(
     "dialog.full-reset-done.service-warn",
@@ -49,18 +58,30 @@ pub const PARTIAL: Key = key(
 );
 pub const STOPPED: Key = key(
     "tui.settings.reset.needs-elevation",
-    "Full reset stopped before the rules were cleared and the service was stopped: {error}",
+    "Full reset stopped before the rules were cleared and the service was restarted: {error}",
 );
 
 #[cfg(test)]
 pub fn keys() -> Vec<Key> {
     vec![
-        TITLE, BODY, OTHERS, SCOPE, MINE, EVERYONE, RUN, RUNNING, DONE, PARTIAL, STOPPED,
+        TITLE,
+        BODY,
+        OTHERS,
+        SCOPE,
+        MINE,
+        EVERYONE,
+        RUN,
+        RUNNING,
+        DONE,
+        RESTART_FAILED,
+        SILENT,
+        PARTIAL,
+        STOPPED,
     ]
 }
 
-/// A service stop that has not finished in this time is reported as failed.
-const STOP_WAIT: Duration = Duration::from_secs(30);
+/// A service restart that has not finished in this time is reported as failed.
+const RESTART_WAIT: Duration = Duration::from_secs(30);
 /// How long a service started for the reset gets to come up and answer.
 const START_WAIT: Duration = Duration::from_secs(30);
 const ANSWER_WAIT: Duration = Duration::from_secs(15);
@@ -149,7 +170,7 @@ fn run_step(
     client: &dyn IpcClient,
     step: Step,
     everyone: bool,
-    stop: &dyn Fn() -> Outcome,
+    restart: &dyn Fn() -> Outcome,
 ) -> Outcome {
     match step {
         Step::ClearLogs => outcome(call(
@@ -170,13 +191,13 @@ fn run_step(
                 all_principals: everyone,
             }),
         )),
-        Step::StopService => stop(),
+        Step::RestartService => restart(),
     }
 }
 
 /// A stopped service answers none of the steps, so the reset would only say
-/// what it could not clear: it is started first, and the last step stops it
-/// again. A start that fails or is refused leaves the steps to report that.
+/// what it could not clear: it is started first, and the last step restarts
+/// it. A start that fails or is refused leaves the steps to report that.
 pub(super) fn start_if_stopped(
     port: Option<&dyn ServiceControlPort>,
     client: &dyn IpcClient,
@@ -190,7 +211,11 @@ pub(super) fn start_if_stopped(
     if !stopped || port.start(START_WAIT).is_err() {
         return false;
     }
-    // Running to the service manager is not yet listening on its channel.
+    answers(client, answer_wait)
+}
+
+/// Running to the service manager is not yet listening on its channel.
+fn answers(client: &dyn IpcClient, answer_wait: Duration) -> bool {
     client.force_reconnect();
     let deadline = Instant::now() + answer_wait;
     loop {
@@ -210,14 +235,49 @@ pub(super) fn start_if_stopped(
     }
 }
 
-fn stop_service(probe: RegistrationProbe) -> Outcome {
-    match probe() {
-        None => Outcome::Failed,
-        Some(port) => match port.stop(STOP_WAIT) {
-            Ok(()) => Outcome::Ok,
-            Err(ServiceControlError::AccessDenied) => Outcome::Forbidden,
-            Err(_) => Outcome::Failed,
-        },
+/// Why the service did not come back after the reset.
+#[derive(Debug)]
+pub(super) enum RestartFailure {
+    NoManager,
+    Control(ServiceControlError),
+    Silent,
+}
+
+impl RestartFailure {
+    fn outcome(&self) -> Outcome {
+        match self {
+            Self::Control(ServiceControlError::AccessDenied) => Outcome::Forbidden,
+            _ => Outcome::Failed,
+        }
+    }
+
+    fn words(&self) -> Words {
+        let reason = match self {
+            Self::NoManager => Words::Key(super::text::SERVICE_NO_MANAGER),
+            Self::Control(ServiceControlError::AccessDenied) => {
+                return Words::Failed(RESTART_FAILED, Failure::elevation())
+            }
+            Self::Control(error) => Words::Raw(error.to_string()),
+            Self::Silent => Words::Key(SILENT),
+        };
+        Words::Nested(RESTART_FAILED, vec![("error", reason)])
+    }
+}
+
+/// The last step: stop and start in one go, then wait until the service
+/// answers on the cleared state.
+pub(super) fn restart_service(
+    port: Option<&dyn ServiceControlPort>,
+    client: &dyn IpcClient,
+    answer_wait: Duration,
+) -> Result<(), RestartFailure> {
+    let port = port.ok_or(RestartFailure::NoManager)?;
+    port.restart(RESTART_WAIT)
+        .map_err(RestartFailure::Control)?;
+    if answers(client, answer_wait) {
+        Ok(())
+    } else {
+        Err(RestartFailure::Silent)
     }
 }
 
@@ -225,10 +285,10 @@ fn stop_service(probe: RegistrationProbe) -> Outcome {
 /// cannot elevate itself, so a refusal where rights are needed ends the run.
 /// Clearing every user's data is the step that needs them, so it runs first:
 /// refused, it stops the reset before the logs or anything else are erased.
-pub(super) fn drive(client: &dyn IpcClient, everyone: bool, stop: &dyn Fn() -> Outcome) -> Next {
+pub(super) fn drive(client: &dyn IpcClient, everyone: bool, restart: &dyn Fn() -> Outcome) -> Next {
     let mut purged = None;
     if everyone {
-        let outcome = run_step(client, Step::PurgePrincipalData, true, stop);
+        let outcome = run_step(client, Step::PurgePrincipalData, true, restart);
         if outcome == Outcome::Forbidden {
             return Next::NeedsElevation {
                 step: Step::PurgePrincipalData,
@@ -242,7 +302,7 @@ pub(super) fn drive(client: &dyn IpcClient, everyone: bool, stop: &dyn Fn() -> O
             Next::Run(step) => {
                 let outcome = match (step, purged) {
                     (Step::PurgePrincipalData, Some(outcome)) => outcome,
-                    _ => run_step(client, step, everyone, stop),
+                    _ => run_step(client, step, everyone, restart),
                 };
                 done.push((step, outcome));
             }
@@ -253,7 +313,8 @@ pub(super) fn drive(client: &dyn IpcClient, everyone: bool, stop: &dyn Fn() -> O
 
 /// The shared per-user file both clients read goes back to a fresh install's
 /// state, as the window's reset does through its preferences: the folder, the
-/// chosen set, the bound files, the recorded choices and the agreement. `true`
+/// chosen set, the bound files, the recorded choices, the answer to the rule-set
+/// offer and the agreement. `true`
 /// when there was nothing to clear or it is cleared; a damaged file is left as
 /// it is and reported.
 pub(super) fn clear_user_settings(file: Option<&std::path::Path>) -> bool {
@@ -267,6 +328,7 @@ pub(super) fn clear_user_settings(file: Option<&std::path::Path>) -> bool {
             settings.set_secondary_file("");
             settings.selected_set.clear();
             settings.service_intent.clear();
+            settings.rule_set_offer_answered = false;
             settings.accepted_eula = nrr_shared::eula::EULA_NOT_ACCEPTED;
         })
         .is_ok()
@@ -279,16 +341,32 @@ pub fn full_reset(
 ) -> Job {
     Box::new(move |client: &dyn IpcClient| {
         start_if_stopped(probe().as_deref(), client, ANSWER_WAIT);
-        let end = drive(client, everyone, &|| stop_service(probe));
+        let failure = std::cell::RefCell::new(None);
+        let end = drive(client, everyone, &|| match restart_service(
+            probe().as_deref(),
+            client,
+            ANSWER_WAIT,
+        ) {
+            Ok(()) => Outcome::Ok,
+            Err(why) => {
+                let outcome = why.outcome();
+                *failure.borrow_mut() = Some(why);
+                outcome
+            }
+        });
+        let failure = failure.into_inner();
         // The local file goes last: a reset stopped for want of rights keeps
         // the bound files and the choices a reinstalled service is restored from.
         let settings_cleared =
             matches!(end, Next::Finish { .. }) && clear_user_settings(settings_file.as_deref());
         Reply::new(move |app| match end {
-            Next::Finish { cleared: true } if settings_cleared => {
+            Next::Finish { cleared: true, .. } if settings_cleared => {
                 app.settings.reset.others = Loadable::Ready(0);
                 app.settings.reset.everyone = false;
-                app.settings.done(Words::Key(DONE));
+                match failure {
+                    None => app.settings.done(Words::Key(DONE)),
+                    Some(why) => app.settings.refuse(why.words()),
+                }
             }
             Next::Finish { .. } => app.settings.refuse(Words::Key(PARTIAL)),
             Next::NeedsElevation { .. } => app.settings.failed(STOPPED, Failure::elevation()),

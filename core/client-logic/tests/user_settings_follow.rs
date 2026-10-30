@@ -72,6 +72,24 @@ fn a_choice_waiting_for_apply_is_not_replaced() {
     );
 }
 
+/// "Not now" in the terminal closes the window's offer of a rule set while
+/// the window is open, and nothing waits for Apply because of it.
+#[test]
+fn the_terminals_answer_to_the_rule_set_offer_reaches_an_open_window() {
+    let mut pure = JsLib::pure();
+    let step = adoption(
+        &mut pure,
+        json!({ "ruleSetOfferAnswered": false }),
+        Value::Null,
+        json!({ "ruleSetOfferAnswered": true }),
+    );
+    assert_eq!(
+        step["take"],
+        json!({ "ruleSetOfferAnswered": true }),
+        "{step}"
+    );
+}
+
 /// Only the fields the file carries are taken; an answer naming anything else
 /// cannot reach the rest of the window's preferences.
 #[test]

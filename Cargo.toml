@@ -28,6 +28,7 @@ members = [
   "apps/desktop/tray",
   "apps/desktop/launcher",
   "apps/desktop/broker",
+  "tools/docs-html",
 ]
 # The fuzz targets are their own nightly-only workspace (`scripts/fuzz.sh`), so
 # the stable gate, clippy and cargo-deny never see libfuzzer.
@@ -38,7 +39,7 @@ exclude = ["fuzz", "third_party/tappers"]
 resolver = "2"
 
 [workspace.package]
-version = "0.1.0-prealpha"
+version = "0.1.0-alpha.1"
 edition = "2021"
 rust-version = "1.94.1"
 license = "MPL-2.0"
@@ -69,7 +70,6 @@ debug = 1
 # Thin LTO: cross-crate inlining without whole-program analysis.
 lto = "thin"
 codegen-units = 1
-# Line tables only: a tester's panic names file:line, the code stays release.
-# The symbols live in the PDB beside each exe, not in the binary. Back to
-# `strip = "debuginfo"` for the public release.
+# Line tables only: the PDBs go into the release's symbols archive, never into
+# the package, and the code stays release.
 debug = "line-tables-only"

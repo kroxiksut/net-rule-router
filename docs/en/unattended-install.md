@@ -35,6 +35,55 @@ NetRuleRouter-setup.exe /VERYSILENT /SUPPRESSMSGBOXES /LOG=C:\temp\nrr-setup.log
 
 Use full paths. Every parameter is optional.
 
+A silent installation shows no licence page, so every Windows account, the
+one that installed included, is asked to accept the end-user agreement the
+first time it starts the app. After an installation through the wizard, the
+account that accepted the agreement there is not asked again; every other
+account still is.
+
+### Folder, components and shortcuts
+
+Each choice the wizard offers has a command-line form. Without it, a new
+installation takes the default and an upgrade keeps the earlier choice.
+
+| Choice | MSI | EXE | Default |
+|---|---|---|---|
+| Installation folder, inside Program Files | `INSTALLFOLDER=<folder>` | `/DIR=<folder>` | `C:\Program Files\NetRuleRouter` |
+| Leave out the terminal interface (`nrr-tui`) | `NRR_TUI=0` | `/COMPONENTS=main,docs` | Installed |
+| Leave out the offline documentation | `NRR_DOCS=0` | `/COMPONENTS=main,tui` | Installed |
+| Desktop shortcut | `NRR_DESKTOP_SHORTCUT=1` | `/MERGETASKS=desktopicon` | None |
+| `nrr-cli` and `nrr-tui` on PATH | `NRR_ADD_TO_PATH=1` | `/MERGETASKS=addtopath` | Not added |
+
+The window, the tray, the background service and the console (`nrr-cli`) are
+always installed. A folder outside Program Files fails the installation
+before anything is installed: the MSI returns 1603, the EXE installer 7. To
+take a choice back on an upgrade, give it again: `NRR_TUI=1` or `NRR_DOCS=1`,
+or for the EXE installer the full list, such as `/COMPONENTS=main,tui,docs` or
+`/TASKS=addtopath` (an empty `/TASKS=""` drops every task). `/COMPONENTS=main`
+leaves out both the terminal interface and the documentation. Several tasks are
+separated by commas: `/MERGETASKS=desktopicon,addtopath`.
+
+Without the offline documentation, Help > Documentation in the application
+opens these pages online.
+
+### Whose Start menu gets the shortcut
+
+The program is installed once for the whole computer, and routing works for
+every Windows account whatever you choose. `NRR_INSTALL_FOR` (MSI) and
+`/INSTALL_FOR` (EXE installer) only decide who finds NetRuleRouter in the Start
+menu and on the desktop, and whose PATH gets the console tools:
+
+| Value | Shortcut and PATH |
+|---|---|
+| `all` | Every user of the computer. The default for a new installation |
+| `me` | Only the account the installer runs as: for the MSI, the account that started `msiexec` |
+
+Without it, an upgrade keeps the choice made at the earlier installation, and
+an upgrade that changes it moves the shortcuts and the PATH entry. Any other
+value stops the installation before anything is installed: the MSI returns
+1603, the EXE installer exit code 1. The package without the window has no
+shortcuts and always puts the console tools on the PATH of every user.
+
 ## Linux
 
 Before installing the `.deb` or `.rpm`, place the files in

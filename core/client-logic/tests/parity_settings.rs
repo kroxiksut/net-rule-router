@@ -14,7 +14,9 @@ use nrr_client_logic::notice_mutes::{
 };
 use nrr_client_logic::routing_settings::{self, RoutingContext};
 use nrr_client_logic::stability;
+use nrr_client_logic::traffic_rows::visible_traffic_rows;
 use nrr_client_logic::units::format_storage_bytes;
+use nrr_shared::ipc_payloads::TrafficRowDto;
 use serde_json::{json, Map, Value};
 
 fn object(value: &Value) -> Map<String, Value> {
@@ -290,6 +292,29 @@ fn offered_routing_settings_match_js() {
                 secondary_bound: truthy("bound"),
                 fake_ip_enabled: truthy("fake-ip"),
             }))
+        },
+    );
+}
+
+// ---- traffic rows ----
+
+#[test]
+fn visible_traffic_rows_match_js() {
+    check(
+        "visible_traffic_rows",
+        &mut JsLib::pure(),
+        |input| {
+            format!(
+                "visibleTrafficRows({}, {})",
+                arg(input, "rows"),
+                arg(input, "countVirtual")
+            )
+        },
+        |input| {
+            let rows: Vec<TrafficRowDto> =
+                serde_json::from_value(input["rows"].clone()).expect("vector rows");
+            let count_virtual = input["countVirtual"].as_bool().unwrap_or(false);
+            serde_json::to_value(visible_traffic_rows(&rows, count_virtual)).expect("rows")
         },
     );
 }

@@ -4,7 +4,7 @@
 
 Settings → Routing behavior → Routing method has five switches that fine-tune how
 NetRuleRouter resolves names and routes traffic, whatever leak protection is set to: **DNS through the
-tunnel**, **Fast DNS answers**, **fake-IP**, **fake-IP UDP relay**, and
+tunnel**, **Fast DNS answers**, **Route sites over virtual addresses (fake-IP)**, **Fake-IP UDP relay (experimental)**, and
 **Instant reset when the additional route is unavailable**. Each solves a
 different, narrow problem, and most of them are safe to leave on together.
 This page explains what each one buys you, when it is worth turning on, and
@@ -29,21 +29,25 @@ setting on this page:
 
 ## DNS through the tunnel
 
-**What you get:** Name lookups are sent through the additional connection
-instead of your main provider's resolver, so the provider neither sees which
-names you look up nor gets to decide what the answer is. See
-[DNS through the tunnel](dns-via-secondary.md) for the full picture, including
-the specific symptom this fixes.
+**What you get:** The names in your rules for the additional connection are
+looked up through it in any case. This switch sends the rest of
+NetRuleRouter's own lookups — the names in your rules for the main
+connection, the sites it keeps fresh for your rules — through the additional
+connection as well, to public resolvers, so your main provider neither sees
+those names nor gets to decide the answers. Your programs' lookups of sites
+outside your rules for the additional connection still go to your main
+provider's resolver. See [DNS through the tunnel](dns-via-secondary.md) for
+which names go where.
 
-**When to turn it on:** A site fails to load even though your rules and the
-additional connection both look correct — especially if it works in one
-browser or window and not another. That pattern points at tampered name
-resolution rather than broken routing.
+**When to turn it on:** You would rather your main provider did not see the
+names NetRuleRouter looks up for your rules. If a site fails to load because
+your provider tampers with its name, a rule that sends the site through the
+additional connection is what fixes it; this switch alone does not change
+what your programs are told.
 
 **What it costs:** Nothing while the additional connection is up. If it drops,
-lookups fall back to the main connection automatically so names keep
-resolving — they simply stop being protected until the additional connection
-returns.
+lookups go through the main connection so names keep resolving, and your
+main provider sees them until the additional connection returns.
 
 ## Fast DNS answers
 
@@ -110,7 +114,7 @@ watching for it.
 
 | Combination | What it gets you |
 |---|---|
-| DNS through the tunnel + Fast DNS answers | Trustworthy name resolution — your provider can neither see nor tamper with lookups — without giving up quick page loads. This is the everyday pairing for most setups. |
+| DNS through the tunnel + Fast DNS answers | NetRuleRouter's own lookups for your rules stay out of your main provider's sight, without giving up quick page loads. |
 | Fake-IP + UDP relay | Per-site separation that also covers modern QUIC/HTTP-3 traffic, not just classic TCP connections. Turn both on together if the sites you route matter on today's web. |
 | Fake-IP + Instant reset | A brief tunnel hiccup produces a fast, visible failure that apps can react to, instead of a silent multi-second stall in the middle of a fake-IP-routed connection. |
 | Fake-IP alone, UDP relay off | Per-site separation for ordinary TCP connections; QUIC connections to the same sites fall back to plain addressing and lose that separation until the relay is turned on too. |

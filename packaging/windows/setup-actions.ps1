@@ -11,7 +11,11 @@
 #   MarkStop    before the MSI's own stop: mark it as wanted, or the service
 #               restarts itself mid-removal; -Upgrade when a newer MSI replaces
 #               this one, so protection stays
-#   Register    files in place: register the service from this folder and start it
+#   Register    files in place: give this folder a protected DACL (SYSTEM and
+#               Administrators full, Users read and execute), so the service
+#               and the steps run elevated from here stay out of ordinary
+#               accounts' reach whatever it inherited; then register the
+#               service from this folder and start it
 #   Unregister  removal: stop and unregister the service, restore the network,
 #               and remove the service copy a portable install left under
 #               Program Files once nothing is registered; start again a service
@@ -25,6 +29,16 @@
 #               the installing user
 #   Rollback    a failed install: stop the service; after a fresh install
 #               (no -Upgrade) also unregister it
+#   CloseApps   before files are replaced or removed: end the window, the tray,
+#               the terminal interface and the console started from -Folder
+#               (default: this installation) in every session; the service is
+#               stopped by its own steps. Run unelevated it reaches only the
+#               caller's own processes
+#   ConsoleLinks  -Links: put links to the console and the terminal interface
+#               into <folder>\bin, the one folder put on PATH by an installer
+#               or the app's setting (the program folder holds Qt and runtime
+#               DLLs that every program searching PATH would find); without
+#               -Links remove them
 #   Provision   files in place, before Register: hand -Primary, -Secondary,
 #               -Settings and -SecondaryUnset to `nrr-service provision-stage`,
 #               which checks the files and copies them into the service's
@@ -39,8 +53,17 @@
 [CmdletBinding()]
 param(
     [Parameter(Mandatory = $true)]
-    [ValidateSet('Stop', 'Resume', 'MarkStop', 'Register', 'Unregister', 'RemoveUserData', 'Rollback', 'Provision')]
+    [ValidateSet('Stop', 'Resume', 'MarkStop', 'Register', 'Unregister', 'RemoveUserData', 'Rollback', 'Provision',
+        'CloseApps', 'ConsoleLinks')]
     [string] $Action,
+
+    # CloseApps only: the installation folder when the script runs from elsewhere.
+    [Parameter()]
+    [string] $Folder,
+
+    # ConsoleLinks only.
+    [Parameter()]
+    [switch] $Links,
 
     [Parameter()]
     [switch] $RemoveData,
@@ -232,7 +255,8 @@ function Get-PathEntryKey {
 # entries that now point at nothing, and is named in the log.
 function Remove-UserEntries {
     $tray = [IO.Path]::GetFullPath((Join-Path $installDir $NrrTrayExeName))
-    $folderKey = Get-PathEntryKey $installDir
+    # The folder itself (the app's own PATH action) or its bin (an installer's).
+    $folderKeys = @((Get-PathEntryKey $installDir), (Get-PathEntryKey (Join-Path $installDir 'bin')))
     $runSubkey = 'Software\Microsoft\Windows\CurrentVersion\Run'
     $loaded = @()
     foreach ($sid in [Microsoft.Win32.Registry]::Users.GetSubKeyNames()) {
@@ -268,10 +292,10 @@ function Remove-UserEntries {
             # Raw and with its type: `%USERPROFILE%\bin` must stay written so.
             $list = [string] $environment.GetValue('Path', '', [Microsoft.Win32.RegistryValueOptions]::DoNotExpandEnvironmentNames)
             $entries = $list -split ';'
-            $kept = @($entries | Where-Object { (Get-PathEntryKey $_) -ne $folderKey })
+            $kept = @($entries | Where-Object { $folderKeys -notcontains (Get-PathEntryKey $_) })
             if ($kept.Count -eq $entries.Count) { continue }
             $environment.SetValue('Path', ($kept -join ';'), $environment.GetValueKind('Path'))
-            Write-Host "    removed $installDir from the PATH of $sid"
+            Write-Host "    removed $installDir or its bin from the PATH of $sid"
         }
         catch { Write-Host "    PATH of $sid was not checked: $($_.Exception.Message)" }
         finally { if ($environment) { $environment.Dispose() } }
@@ -283,6 +307,107 @@ function Remove-UserEntries {
             Write-Host "    $sid is signed out; its launch at sign-in and PATH entry, if any, stay"
         }
     }
+}
+
+# The program's own processes, by image name and folder: a portable copy run
+# from elsewhere is not ours to end. Unelevated, other accounts' processes show
+# no path and are left alone.
+$NrrAppImages = @('nrr_qt_native_host.exe', 'NetRuleRouter.exe', 'NetRuleRouterTray.exe', 'nrr-tui.exe', 'nrr-cli.exe')
+
+function Get-NrrAppProcess {
+    param([string] $Root, [string[]] $Names)
+    $prefix = [IO.Path]::GetFullPath($Root).TrimEnd('\') + '\'
+    $filter = ($Names | ForEach-Object { "Name='$_'" }) -join ' OR '
+    return @(Get-CimInstance -ClassName Win32_Process -Filter $filter -ErrorAction SilentlyContinue |
+        Where-Object { $_.ExecutablePath -and $_.ExecutablePath.StartsWith($prefix, [StringComparison]::OrdinalIgnoreCase) })
+}
+
+# The Qt hosts go first: a launcher saves the window's settings once its host
+# exits and then exits itself. The rest is ended; a window brought back by the
+# one still running is caught by the next pass. Restart Manager cannot do this:
+# the launchers and the tray have no top-level window to ask.
+function Close-NrrApps {
+    param([string] $Root)
+    if (-not $Root -or -not (Test-Path -LiteralPath $Root)) { return $true }
+    for ($pass = 0; $pass -lt 3; $pass++) {
+        $names = if ($pass -eq 0) { @('nrr_qt_native_host.exe') } else { $NrrAppImages }
+        foreach ($process in (Get-NrrAppProcess -Root $Root -Names $names)) {
+            Write-Host "    ending $($process.Name) ($($process.ProcessId))"
+            Stop-Process -Id $process.ProcessId -Force -ErrorAction SilentlyContinue
+        }
+        $deadline = (Get-Date).AddSeconds($(if ($pass -eq 0) { 5 } else { 1 }))
+        while ((Get-Date) -lt $deadline -and (Get-NrrAppProcess -Root $Root -Names $NrrAppImages).Count -gt 0) {
+            Start-Sleep -Milliseconds 200
+        }
+    }
+    $left = @(Get-NrrAppProcess -Root $Root -Names $NrrAppImages)
+    foreach ($process in $left) { Write-Host "    $($process.Name) ($($process.ProcessId)) is still running" }
+    return ($left.Count -eq 0)
+}
+
+# What the service's own location check accepts for the folder it runs from.
+$NrrProgramFolderSddl = 'D:PAI(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;0x1200a9;;;BU)'
+
+function Protect-NrrFolder {
+    param([string] $Path)
+    $item = Get-Item -LiteralPath $Path -Force
+    if (Test-ReparsePoint $item) {
+        Write-Host "    $Path is a link; its permissions were not changed"
+        return $false
+    }
+    $acl = New-Object System.Security.AccessControl.DirectorySecurity
+    $acl.SetSecurityDescriptorSddlForm($NrrProgramFolderSddl)
+    try {
+        $item.SetAccessControl($acl)
+        return $true
+    }
+    catch {
+        Write-Host "    $Path was not secured: $($_.Exception.Message)"
+        return $false
+    }
+}
+
+$NrrConsoleImages = @('nrr-cli.exe', 'nrr-tui.exe')
+
+# Links, not copies: Windows runs a linked program from its target's folder,
+# so it finds the runtime DLLs and its sibling binaries there, and `bin`
+# itself exposes no DLL to programs that search PATH.
+function Set-NrrConsoleLinks {
+    param([bool] $Wanted)
+    $bin = Join-Path $installDir 'bin'
+    $ok = $true
+    $existing = Get-Item -LiteralPath $bin -Force -ErrorAction SilentlyContinue
+    if ($existing -and (Test-ReparsePoint $existing)) {
+        [IO.Directory]::Delete($bin, $false)
+        $existing = $null
+    }
+    if ($existing) {
+        foreach ($name in $NrrConsoleImages) {
+            $link = Join-Path $bin $name
+            # Get-Item, not Test-Path: a link whose target is gone must go too.
+            if (Get-Item -LiteralPath $link -Force -ErrorAction SilentlyContinue) {
+                try { [IO.File]::Delete($link) }
+                catch { Write-Host "    $link was not removed: $($_.Exception.Message)"; $ok = $false }
+            }
+        }
+    }
+    if (-not $Wanted) {
+        if ($existing) {
+            try { [IO.Directory]::Delete($bin, $false) } catch { Write-Host "    $bin was not removed: $($_.Exception.Message)" }
+        }
+        return $ok
+    }
+    New-Item -ItemType Directory -Path $bin -Force | Out-Null
+    foreach ($name in $NrrConsoleImages) {
+        $target = Join-Path $installDir $name
+        if (-not (Test-Path -LiteralPath $target -PathType Leaf)) { continue }
+        try {
+            New-Item -ItemType SymbolicLink -Path (Join-Path $bin $name) -Target $target -ErrorAction Stop | Out-Null
+            Write-Host "    bin\$name -> $target"
+        }
+        catch { Write-Host "    bin\$name was not created: $($_.Exception.Message)"; $ok = $false }
+    }
+    return $ok
 }
 
 $exitCode = 0
@@ -316,6 +441,10 @@ switch ($Action) {
             $exitCode = 1
             break
         }
+        if (-not (Protect-NrrFolder $installDir)) {
+            $exitCode = 1
+            break
+        }
         # Registers the service beside the console, takes over a registration
         # another copy left, keeps the start mode chosen before, and starts it.
         Write-Host '==> nrr-cli reinstall'
@@ -331,6 +460,7 @@ switch ($Action) {
         if ($service -ne 'foreign' -and (Restore-NetworkAfterRemoval) -ne 0) { $exitCode = 1 }
         if ($service -eq 'gone' -and -not (Remove-ServiceCopy)) { $exitCode = 1 }
         if ($service -eq 'foreign') { Resume-ForeignService }
+        if (-not (Set-NrrConsoleLinks $false)) { $exitCode = 1 }
         Remove-UserEntries
         if ($RemoveData) {
             if ($service -eq 'foreign') {
@@ -346,6 +476,13 @@ switch ($Action) {
                 elseif ($purged -ne 0) { $exitCode = 1 }
             }
         }
+    }
+    'CloseApps' {
+        $root = if ($Folder) { $Folder } else { $installDir }
+        if (-not (Close-NrrApps $root)) { $exitCode = 1 }
+    }
+    'ConsoleLinks' {
+        if (-not (Set-NrrConsoleLinks $Links.IsPresent)) { $exitCode = 1 }
     }
     'RemoveUserData' {
         if ((Invoke-UserScript 'purge-data.ps1' @{ Yes = $true; UserOnly = $true }) -ne 0) { $exitCode = 1 }

@@ -29,9 +29,8 @@ pub fn parses_as_version(s: &str) -> bool {
     split_version(s).is_some()
 }
 
-/// Prerelease stages, oldest first. Alphabetical order would put `prealpha`
-/// after `alpha` and never offer the first alpha to a prealpha build.
-const PRERELEASE_STAGES: [&str; 4] = ["prealpha", "alpha", "beta", "rc"];
+/// Prerelease stages, oldest first; the position is the order, not the spelling.
+const PRERELEASE_STAGES: [&str; 3] = ["alpha", "beta", "rc"];
 
 /// `(stage, number)` of a prerelease tag such as `alpha`, `beta.2` or `rc1`;
 /// a missing number is 0. `None` for a stage outside [`PRERELEASE_STAGES`].
@@ -85,25 +84,25 @@ mod tests {
 
     #[test]
     fn newer_versions_are_detected_and_prerelease_orders_below_release() {
-        assert!(version_is_newer("0.2.0", "0.1.0-prealpha"));
-        assert!(version_is_newer("0.1.1", "0.1.0-prealpha"));
-        // Release of the same triple is newer than the prealpha build.
-        assert!(version_is_newer("0.1.0", "0.1.0-prealpha"));
+        assert!(version_is_newer("0.2.0", "0.1.0-alpha.1"));
+        assert!(version_is_newer("0.1.1", "0.1.0-alpha.1"));
+        // Release of the same triple is newer than the alpha build.
+        assert!(version_is_newer("0.1.0", "0.1.0-alpha.1"));
         // Not newer: same, older, or the prerelease of the current release.
-        assert!(!version_is_newer("0.1.0-prealpha", "0.1.0-prealpha"));
-        assert!(!version_is_newer("0.1.0-prealpha", "0.1.0"));
-        assert!(!version_is_newer("0.0.9", "0.1.0-prealpha"));
+        assert!(!version_is_newer("0.1.0-alpha.1", "0.1.0-alpha.1"));
+        assert!(!version_is_newer("0.1.0-alpha.1", "0.1.0"));
+        assert!(!version_is_newer("0.0.9", "0.1.0-alpha.1"));
         // Tag prefixes and build metadata are tolerated.
-        assert!(version_is_newer("v1.0.0", "0.1.0-prealpha"));
-        assert!(!version_is_newer("garbage", "0.1.0-prealpha"));
+        assert!(version_is_newer("v1.0.0", "0.1.0-alpha.1"));
+        assert!(!version_is_newer("garbage", "0.1.0-alpha.1"));
         assert!(!version_is_newer("1.0", "0.1.0"));
     }
 
     #[test]
     fn prerelease_stages_order_by_maturity_not_alphabet() {
         let chain = [
-            "0.1.0-prealpha",
             "0.1.0-alpha",
+            "0.1.0-alpha.1",
             "0.1.0-beta",
             "0.1.0-rc",
             "0.1.0",
@@ -122,15 +121,15 @@ mod tests {
         assert!(version_is_newer("0.1.0-beta.10", "0.1.0-beta.9"));
         assert!(version_is_newer("0.1.0-rc2", "0.1.0-rc1"));
         assert!(version_is_newer("0.1.0-beta", "0.1.0-alpha.9"));
-        assert!(version_is_newer("0.1.0-ALPHA", "0.1.0-prealpha"));
-        assert!(version_is_newer("0.1.0-alpha+sha", "0.1.0-prealpha"));
+        assert!(version_is_newer("0.1.0-ALPHA.2", "0.1.0-alpha.1"));
+        assert!(version_is_newer("0.1.0-alpha.2+sha", "0.1.0-alpha.1"));
         assert!(!version_is_newer("0.1.0-alpha.1", "0.1.0-alpha.1"));
     }
 
     #[test]
     fn an_unknown_prerelease_stage_is_never_offered_nor_outranked() {
         for unknown in ["0.1.0-dev", "0.1.0-nightly", "0.1.0-alpha.x"] {
-            for known in ["0.1.0-prealpha", "0.1.0-alpha", "0.1.0-rc"] {
+            for known in ["0.1.0-alpha", "0.1.0-alpha.1", "0.1.0-rc"] {
                 assert!(!version_is_newer(unknown, known), "{unknown} vs {known}");
                 assert!(!version_is_newer(known, unknown), "{known} vs {unknown}");
             }

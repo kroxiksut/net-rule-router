@@ -106,6 +106,46 @@ fn an_own_folder_is_a_local_path_or_nothing() {
     }
 }
 
+fn own_docs_page(pure: &mut JsLib, url: &str) -> bool {
+    let call = format!(
+        "isOwnDocsPageUrl({})",
+        serde_json::to_string(url).expect("json")
+    );
+    pure.eval_json(&call) == Value::Bool(true)
+}
+
+/// Help > Documentation hands the browser the start page the package carries;
+/// the same door must not open any other local file: a program, a page on a
+/// share, or a page with a query a handler could act on.
+#[test]
+fn only_the_own_documentation_page_opens_from_the_disk() {
+    let mut pure = JsLib::pure();
+    for page in [
+        "file:///C:/Program%20Files/NetRuleRouter/docs/en/index.html",
+        "file:///usr/libexec/netrulerouter/docs/ru/index.html",
+    ] {
+        assert!(own_docs_page(&mut pure, page), "{page} is the own page");
+    }
+    for attempt in [
+        "file:///C:/Users/u/Downloads/x.exe",
+        "file:///C:/Users/u/Downloads/index.html",
+        "file:///C:/x/docs/en/index.html.exe",
+        "file:///C:/x/docs/en/index.hta",
+        "file:////host/share/docs/en/index.html",
+        "file://host/share/docs/en/index.html",
+        "file:///C:/x/docs/en/index.html?x=1",
+        "file:///C:/x/docs/en/index.html#top",
+        "file:///C:/x/docs/../../Users/u/index.html",
+        "https://example.com/docs/en/index.html",
+        "",
+    ] {
+        assert!(
+            !own_docs_page(&mut pure, attempt),
+            "{attempt:?} is not the own documentation page"
+        );
+    }
+}
+
 #[test]
 fn pure_js_opens_nothing_but_the_web_itself() {
     let source = std::fs::read_to_string(

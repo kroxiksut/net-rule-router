@@ -18,6 +18,12 @@ Dialog {
     /// Whether service-side state (rules AND auxiliary data) was fully
     /// cleared. False shows a warning that the reset was only partial.
     property bool serviceCleared: true
+    /// Whether the service came back after the reset. False: routing and
+    /// protection are off until it is started, so the dialog says why and
+    /// offers the start.
+    property bool serviceRestarted: true
+    /// The reason the restart did not happen, already in words; may be empty.
+    property string restartFailure: ""
 
     function tr(key, fallback) {
         if (ownerRoot && typeof ownerRoot.tr === "function") {
@@ -30,7 +36,9 @@ Dialog {
     modal: true
     popupType: Popup.Item
     anchors.centerIn: parent
-    width: 480
+    // Same sizing as the reset confirm it follows.
+    width: Math.min(parent ? parent.width - 32 : 560,
+        Math.max(480, (ownerRoot && ownerRoot.uiTheme ? ownerRoot.uiTheme.baseFontSizePx : 14) * 38))
     standardButtons: Dialog.NoButton
     closePolicy: Popup.NoAutoClose
     header: DialogDragHeader {
@@ -57,10 +65,29 @@ Dialog {
                 "Note: some service-side data could not be cleared (administrator "
                 + "approval may be required, or a temporary error occurred). Re-run the reset.")
         }
+        Label {
+            Layout.fillWidth: true
+            wrapMode: Text.Wrap
+            visible: !root.serviceRestarted
+            color: root.ownerRoot ? root.ownerRoot.uiTheme.colorWarning : "orange"
+            text: root.tr("dialog.full-reset-done.restart-failed",
+                "The background service did not start again, so routing and protection are off until it runs.")
+                + (root.restartFailure !== "" ? " (" + root.restartFailure + ")" : "")
+        }
         RowLayout {
             Layout.fillWidth: true
             Layout.topMargin: 6
             spacing: 8
+            ThemedButton {
+                visible: !root.serviceRestarted
+                theme: root.ownerRoot ? root.ownerRoot.uiTheme : null
+                text: root.tr("settings.service.action.start", "Start service")
+                onClicked: {
+                    if (root.ownerRoot && typeof root.ownerRoot._startServiceFromBanner === "function")
+                        root.ownerRoot._startServiceFromBanner()
+                    root.serviceRestarted = true
+                }
+            }
             Item { Layout.fillWidth: true }
             ThemedButton {
                 theme: root.ownerRoot ? root.ownerRoot.uiTheme : null

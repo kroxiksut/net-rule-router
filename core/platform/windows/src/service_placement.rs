@@ -61,8 +61,8 @@ pub fn installed_copy_binary(dir: &Path) -> PathBuf {
 }
 
 /// Files the service loads from its own folder, besides itself: the TUN
-/// driver, the C runtime, and the symbols that put file and line into a panic
-/// message in its log.
+/// driver, the C runtime, and its symbols where a developer build has them
+/// (packages ship them in a separate archive).
 fn companion_names() -> Vec<String> {
     let mut names = vec![WINTUN_COMPONENT.file_name.to_string()];
     names.extend(C_RUNTIME.iter().map(|name| (*name).to_string()));

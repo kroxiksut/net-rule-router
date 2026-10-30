@@ -67,10 +67,17 @@ Window {
             : (fallback || key)
     }
 
+    /// Adapter name of the additional link, set by the caller before `open`;
+    /// with nothing confirmed yet, the first scan ticks the running programs
+    /// tied to it. Ticked, never saved: the user still presses Save.
+    property string linkName: ""
+    property bool _linkPreselectPending: false
+
     /// `stored`: the confirmed set as the service holds it.
     function open(stored) {
         storedUnread = false
         storedApps = stored || []
+        _linkPreselectPending = storedApps.length === 0 && linkName.trim() !== ""
         found = []
         picked = []
         selectedPaths = Pure.vpnPickerPreselected(Pure.vpnPickerRows([], storedApps), storedApps)
@@ -81,6 +88,7 @@ Window {
     }
 
     function openUnread() {
+        _linkPreselectPending = false
         storedUnread = true
         storedApps = []
         found = []
@@ -192,6 +200,13 @@ Window {
             }
             root.found = normalized
             root.scanFailed = false
+            if (root._linkPreselectPending) {
+                root._linkPreselectPending = false
+                var tied = Pure.vpnPickerLinkOffer(root.rows, root.linkName).exePaths
+                for (var t = 0; t < tied.length; t += 1) {
+                    if (!root._isSelected(tied[t])) root._setSelected(tied[t], true)
+                }
+            }
         })
     }
 

@@ -48,6 +48,14 @@ pub const EXCLUSIVE_NOTE: Key = key(
     "interfaces.role.exclusive-note",
     "One adapter cannot carry both routes: to use it for the other one, unassign its current role first.",
 );
+pub const DRIVER_SIBLING_LIVE: Key = key(
+    "interfaces.role.driver-sibling-live",
+    "This adapter is not connected, but another adapter of the same kind is: {list}. A VPN program often brings up a different copy than the one chosen; if yours did, choose that one instead.",
+);
+pub const DRIVER_SIBLING_IDLE: Key = key(
+    "interfaces.role.driver-sibling-idle",
+    "This adapter is not connected, and other adapters of the same kind are on this computer. Your VPN program may use one of them: connect the VPN first, then choose the adapter that comes up.",
+);
 pub const UNASSIGN_PRIMARY: Key = key("interfaces.action.unassign-primary", "Unassign primary");
 pub const UNASSIGN_SECONDARY: Key = key(
     "interfaces.action.unassign-secondary",
@@ -253,6 +261,8 @@ pub const ALL: &[Key] = &[
     ABSENT_BODY,
     REMEMBERED,
     EXCLUSIVE_NOTE,
+    DRIVER_SIBLING_LIVE,
+    DRIVER_SIBLING_IDLE,
     UNASSIGN_PRIMARY,
     UNASSIGN_SECONDARY,
     ROW_SUMMARY,

@@ -7,7 +7,7 @@ clean Windows machine: no Qt, no Rust toolchain, no repository, no installer.
 Copy the folder to the target machine and start `NetRuleRouter.exe`.
 
 On request the same run also builds two installers from that folder, an EXE
-and an MSI. They put the program in `C:\Program Files\NetRuleRouter`, set up
+and an MSI. They put the program in Program Files, set up
 the background service and remove both cleanly again. See
 [Installers](#installers).
 
@@ -27,10 +27,10 @@ puts an archive of it beside the folder.
 | `-Arch x64` / `-Arch arm64` | The processor the package is for. Default `x64`. See [ARM64 packages](#arm64-packages). |
 | `-QtBin <path>` | Qt `bin` directory of the kit for `-Arch`. By default the kit the Qt host was built with is used; a different kit is refused. |
 | `-Full` | Ship the complete Qt runtime instead of the trimmed one. |
-| `-Zip` | Also produce `NetRuleRouter-windows-<arch>-<version>+<commit>.zip`. |
+| `-Zip` | Also produce `NetRuleRouter-windows-<arch>-<version>-portable.zip` and the symbols archive of the build. |
 | `-Installers` | Also build the EXE installer and the MSI, plus a checksum file for everything the run produced. |
 | `-Exe` / `-Msi` | Build only one of the two installers. |
-| `-Headless` | Package without the window and the tray: the service, `nrr-cli` and `nrr-tui`, for servers and Windows without a desktop session. The folder is `NetRuleRouter-headless`, and every artifact name ends in `-headless`. |
+| `-Headless` | Package without the window and the tray: the service, `nrr-cli` and `nrr-tui`, for servers and Windows without a desktop session. The folder is `NetRuleRouter-headless`, and every artifact name carries `-headless` after the version (`...-<version>-headless-portable.zip`). |
 | `-Force` | Replace a package folder left by a previous run. |
 
 The script refuses to delete a folder it did not produce: it drops a
@@ -50,7 +50,11 @@ NetRuleRouter\
   apps\desktop\qml\     the application's QML
   locales\  presets\  configs\  assets\  scripts\
   licenses\            licence texts: this product, Wintun, and (full package) Qt
+  docs\                these pages as offline HTML, docs\<language>\index.html
 ```
+
+The offline pages are what Help > Documentation opens. Building them stops
+the run when a page links to something that is not there.
 
 Two details of that layout are load bearing rather than cosmetic:
 
@@ -69,7 +73,7 @@ Every package carries `build-info.json`:
 ```json
 {
   "product": "NetRuleRouter",
-  "version": "0.1.0-prealpha",
+  "version": "0.1.0-alpha.1",
   "commit": "19670e8",
   "commit_date": "2026-08-07T22:37:22+08:00",
   "uncommitted": true,
@@ -84,8 +88,8 @@ Every package carries `build-info.json`:
 `uncommitted` records whether the working tree had local changes when the
 package was built. When it is `true`, `commit` alone does not identify this
 code — say so in any report about that copy. The same version and revision are
-printed at the top of both README files, and `-Zip` puts them in the archive name
-so two builds cannot be mistaken for one another.
+printed at the top of both README files. File names carry the version only, so
+two local builds of one version share names: `build-info.json` tells them apart.
 
 ## Installers
 
@@ -94,24 +98,63 @@ powershell -ExecutionPolicy Bypass -File .\scripts\package-windows.ps1 -Zip -Ins
 ```
 
 Everything lands beside the package folder, with the processor (`x64` or
-`arm64`), the version and the revision in every name:
+`arm64`) and the version in every name:
 
 | File | What it is |
 |---|---|
-| `NetRuleRouter-windows-<arch>-<version>+<commit>.zip` | The portable build (`-Zip`). |
-| `NetRuleRouter-windows-<arch>-<version>+<commit>-setup.exe` | The EXE installer, in English and Russian. |
-| `NetRuleRouter-windows-<arch>-<version>+<commit>.msi` | The MSI, for software-deployment tools and `msiexec`. |
-| `NetRuleRouter-windows-<arch>-<version>+<commit>-SHA256SUMS.txt` | SHA-256 checksums of every file above, checkable with `sha256sum -c`. |
+| `NetRuleRouter-windows-<arch>-<version>-portable.zip` | The portable build (`-Zip`): unpack and run, nothing to install. |
+| `NetRuleRouter-windows-<arch>-<version>-setup.exe` | The EXE installer, in English and Russian. |
+| `NetRuleRouter-windows-<arch>-<version>.msi` | The MSI, for software-deployment tools and `msiexec`, in English and Russian: it follows the Windows display language. |
+| `NetRuleRouter-windows-<arch>-<version>-symbols.zip` | The debug symbols of this build. Not needed to run or install anything; see [Debug symbols](#debug-symbols). |
+| `NetRuleRouter-windows-<arch>-<version>-SHA256SUMS.txt` | SHA-256 checksums of every file above, checkable with `sha256sum -c`. |
 
 An installer only starts on the processor it was built for: the `x64` one on
 x64 Windows, the `arm64` one on Windows on ARM.
 
+### Debug symbols
+
+The package and both installers carry no debug symbols, which keeps them
+about half the size. The symbols of the same build come as a separate
+`-symbols.zip`, produced with any archive or installer and attached to each
+release, for x64 and for ARM64 alike. Users never need it: it is for
+developers reading a crash of exactly that build. Symbols from another build
+do not fit. The Linux symbols are a separate download as well, see
+[Debug symbols](packaging-linux.md#debug-symbols).
+
 What both installers do:
 
+- Before installing, they show the NetRuleRouter end-user agreement in the
+  installer's language, to read and accept. The Windows account that accepted
+  it there is not asked again when it first starts the application. Every
+  other account is asked at its own first launch: accepting it while
+  installing does not accept it for the other people using the PC. When the
+  EXE installer was approved with another administrator's password, the
+  agreement counts as accepted by that administrator, so the person who
+  started it is asked at first launch. A later version with a changed
+  agreement asks everyone again.
 - They ask for administrator rights and install into
-  `C:\Program Files\NetRuleRouter`. The folder cannot be changed: the service
-  runs only from a folder ordinary users cannot modify.
-- They add NetRuleRouter to the Start menu.
+  `C:\Program Files\NetRuleRouter` by default. Another folder can be chosen,
+  as long as it is inside Program Files: the service runs with system rights,
+  so it runs only from a folder ordinary users cannot modify. A folder
+  elsewhere is refused with a message saying so.
+- The window, the tray, the background service and the console (`nrr-cli`)
+  are always installed: removing and repairing the program rely on the
+  console. The terminal interface (`nrr-tui`) is ticked by default and can be
+  left out.
+- The offline documentation (these pages as HTML, opened by Help >
+  Documentation without an internet connection) is ticked by default and can
+  be left out; the application then opens the pages online.
+- They add NetRuleRouter to the Start menu, and on request to the desktop
+  (unticked by default). They ask whether these shortcuts and the PATH entry
+  below are for every user of the computer (the default) or only for you; the
+  program and its service are installed for the whole computer either way.
+- On request (unticked by default) they put `nrr-cli` and `nrr-tui` on PATH,
+  so they run from any new terminal. Only these two commands are added, not
+  the program folder.
+- The last page offers to start NetRuleRouter. It starts as you, not with the
+  installer's administrator rights.
+- Updating or removing the program closes its window, tray and terminal tools
+  by itself, in every signed-in account; nothing has to be closed by hand.
 - They set up the background service and start it. It starts with Windows;
   when the service was already set to start with the application instead,
   that choice is kept.
@@ -144,13 +187,15 @@ keeps the data unless told otherwise:
 & "C:\Program Files\NetRuleRouter\unins000.exe" /VERYSILENT /REMOVEALLDATA /REMOVEAUDIT    # audit trail too
 ```
 
-**MSI.** Uninstalling from Settings > Apps, or with `msiexec /x`, keeps the
-data. Complete removal is asked for on the command line, from an
-administrator console:
+**MSI.** Uninstalling from Settings > Apps opens the installer's window:
+choose **Remove**, and it asks which mode to use and, for complete removal,
+whether to erase the audit trail too. A silent removal, from an administrator
+console, keeps the data unless told otherwise:
 
 ```powershell
-msiexec /x NetRuleRouter-windows-<arch>-<version>+<commit>.msi REMOVEALLDATA=1
-msiexec /x NetRuleRouter-windows-<arch>-<version>+<commit>.msi REMOVEALLDATA=1 REMOVEAUDIT=1
+msiexec /x NetRuleRouter-windows-<arch>-<version>.msi /qn                                  # keep data
+msiexec /x NetRuleRouter-windows-<arch>-<version>.msi /qn REMOVEALLDATA=1                  # remove completely
+msiexec /x NetRuleRouter-windows-<arch>-<version>.msi /qn REMOVEALLDATA=1 REMOVEAUDIT=1    # audit trail too
 ```
 
 `REMOVEAUDIT=1` only counts together with `REMOVEALLDATA=1`. The MSI names
@@ -267,8 +312,9 @@ machine cannot start it.
 - **Use one installer per machine.** The EXE and the MSI are separate
   installations of the same program: to switch from one to the other, remove
   the first.
-- **The MSI's own screens are in English.** The EXE installer speaks English
-  and Russian.
+- **The `.msi` file shows the Windows Installer icon** in File Explorer:
+  Windows draws it for every MSI, whatever the package carries. Once
+  installed, Settings > Apps shows the NetRuleRouter icon.
 - **`scripts\` holds only what a user of the package needs:**
   `reset-network.ps1`, `service-status.ps1`, `uninstall-service.ps1` and
   `purge-data.ps1`; an installed copy also carries `setup-actions.ps1`, which

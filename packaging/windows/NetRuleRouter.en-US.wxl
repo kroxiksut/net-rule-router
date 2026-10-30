@@ -1,0 +1,41 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- The MSI's own texts in English; NetRuleRouter.ru-RU.wxl holds the same Ids. -->
+<WixLocalization Culture="en-US" Codepage="1252" Language="1033" xmlns="http://wixtoolset.org/schemas/v4/wxl">
+  <String Id="NrrLanguage" Value="1033" />
+  <String Id="NrrNewerInstalled" Value="A newer version of NetRuleRouter is already installed." />
+  <String Id="NrrExeInstalled" Value="NetRuleRouter is already installed by its EXE setup. Remove that installation first (removing only the program keeps settings and rules), then run this package again." />
+  <String Id="NrrFolderRefused" Value="NetRuleRouter installs only into a folder inside [ProgramFiles64Folder]: its background service runs with system rights, so it may run only from a folder that only administrators can change. Choose a folder there." />
+  <String Id="NrrLaunch" Value="Launch NetRuleRouter" />
+
+  <String Id="NrrFolderTitle" Value="Installation folder" />
+  <String Id="NrrFolderDescription" Value="Where should NetRuleRouter be installed?" />
+  <String Id="NrrFolderLabel" Value="The folder must be inside [ProgramFiles64Folder]. The background service runs with system rights, so it may run only from a folder that only administrators can change." />
+
+  <String Id="NrrOptionsTitle" Value="Components and shortcuts" />
+  <String Id="NrrOptionsDescription" Value="Choose what to install and which shortcuts to add." />
+  <String Id="NrrAlwaysFull" Value="Always installed: the window, the tray, the background service and the console (nrr-cli), which removing and repairing NetRuleRouter rely on." />
+  <String Id="NrrAlwaysHeadless" Value="Always installed: the background service and the console (nrr-cli), which removing and repairing NetRuleRouter rely on." />
+  <String Id="NrrTui" Value="&amp;Terminal interface (nrr-tui): rules, routes and settings in a terminal" />
+  <String Id="NrrDocs" Value="&amp;Documentation (offline, HTML): opens from Help > Documentation" />
+  <String Id="NrrDesktop" Value="Create a &amp;desktop shortcut" />
+  <String Id="NrrPath" Value="Add the console tools to &amp;PATH" />
+  <String Id="NrrPathNote" Value="For every user of this computer: nrr-cli, and nrr-tui when it is installed, run from any new terminal. Only these two commands are added, not the program folder." />
+  <String Id="NrrPathNoteMe" Value="For you only: nrr-cli, and nrr-tui when it is installed, run from any new terminal you open. Only these two commands are added, not the program folder." />
+
+  <String Id="NrrInstallForTitle" Value="Install for" />
+  <String Id="NrrInstallForDescription" Value="Who should find NetRuleRouter in the Start menu?" />
+  <String Id="NrrInstallForText" Value="NetRuleRouter is installed once for the whole computer, and its background service routes traffic for every Windows account whichever you choose. This choice only decides whose Start menu and desktop get the NetRuleRouter shortcuts, and whose PATH gets the console tools if you add them." />
+  <String Id="NrrInstallForAll" Value="&amp;All users of this computer" />
+  <String Id="NrrInstallForMe" Value="Only &amp;me" />
+  <String Id="NrrInstallForAccount" Value="Only me means the Windows account [LogonUser], which started this installation, even when an administrator approves it." />
+  <String Id="NrrInstallForRefused" Value="NRR_INSTALL_FOR=[NRR_INSTALL_FOR] is not understood: use all or me. Nothing was installed." />
+
+  <String Id="NrrRemoveTitle" Value="How should NetRuleRouter be removed?" />
+  <String Id="NrrRemoveDescription" Value="Choose what to keep." />
+  <String Id="NrrRemoveIntro" Value="Either way the background service is removed and the network settings it changed are put back." />
+  <String Id="NrrRemoveProgram" Value="Remove the program only (&amp;keep settings and rules)" />
+  <String Id="NrrRemoveComplete" Value="Remove &amp;completely (also erase settings, rules and service data)" />
+  <String Id="NrrRemoveNote" Value="Keeping them lets a later installation pick up where you left off. Complete removal erases the service's data and your own NetRuleRouter settings; data of other Windows accounts is listed in the removal log, not deleted, and rule files you saved in your own folders are kept." />
+  <String Id="NrrRemoveAudit" Value="Also erase the &amp;audit trail" />
+  <String Id="NrrRemoveAuditNote" Value="The audit trail is the security record of every change made to routing on this computer. Keep it unless you are sure nobody will need it." />
+</WixLocalization>

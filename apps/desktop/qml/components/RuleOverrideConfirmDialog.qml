@@ -159,6 +159,7 @@ Dialog {
         Label {
             Layout.fillWidth: true
             visible: dialog.busy && !dialog.preview
+            wrapMode: Text.Wrap
             color: dialog.ownerRoot ? dialog.ownerRoot.mutedTextColor : palette.text
             text: dialog.tr("rules.override.dialog.reading", "Reading what the rule would take...")
         }
@@ -261,6 +262,7 @@ Dialog {
             Label {
                 Layout.fillWidth: true
                 Layout.topMargin: 6
+                wrapMode: Text.Wrap
                 color: dialog.ownerRoot ? dialog.ownerRoot.textColor : palette.text
                 text: dialog.tr("rules.override.dialog.term", "Applies for")
             }

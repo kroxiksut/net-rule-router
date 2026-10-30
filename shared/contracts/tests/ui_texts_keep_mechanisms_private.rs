@@ -60,13 +60,15 @@ fn locale_texts_do_not_name_closed_mechanisms() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../locales");
     let mut found = Vec::new();
     for (lang, words) in CLOSED {
-        let path = root.join(format!("{lang}.json"));
-        let raw = std::fs::read_to_string(&path)
-            .unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
-        let document: Value =
-            serde_json::from_str(&raw).unwrap_or_else(|e| panic!("parse {}: {e}", path.display()));
         let mut all = Vec::new();
-        texts(&document, "", &mut all);
+        for file in [format!("{lang}.json"), format!("tray/{lang}.json")] {
+            let path = root.join(file);
+            let raw = std::fs::read_to_string(&path)
+                .unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
+            let document: Value = serde_json::from_str(&raw)
+                .unwrap_or_else(|e| panic!("parse {}: {e}", path.display()));
+            texts(&document, "", &mut all);
+        }
         for (key, text) in &all {
             if key.starts_with("metadata.") {
                 continue;

@@ -1929,6 +1929,80 @@ fn a_rule_host_answer_reads_the_store_only_when_the_books_moved() {
     );
 }
 
+/// A rule book behind a lock the test holds, as a writer holds the store's.
+struct LockedRules {
+    store: std::sync::Mutex<()>,
+    book: std::sync::Mutex<CanonicalRuleBook>,
+    reads: AtomicUsize,
+}
+
+impl RulesProvider for LockedRules {
+    fn active_rules(&self) -> Option<ActiveRulesSnapshot> {
+        None
+    }
+    fn active_rules_for(&self, _principal: &str) -> Option<ActiveRulesSnapshot> {
+        let _store = self.store.lock().unwrap_or_else(PoisonError::into_inner);
+        self.reads.fetch_add(1, Ordering::SeqCst);
+        Some(ActiveRulesSnapshot {
+            rule_book: self
+                .book
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .clone(),
+        })
+    }
+}
+
+/// When the safety re-read falls due while a writer holds the store, every
+/// worker asking at that moment answers by the book it has instead of
+/// parking on the lock: one stalled lookup per program is a broken internet.
+/// The book is read once beside them, and a change shows once it is read.
+#[test]
+fn an_expired_book_answers_at_once_while_a_writer_holds_the_store() {
+    let rules = Arc::new(LockedRules {
+        store: std::sync::Mutex::new(()),
+        book: std::sync::Mutex::new(secondary_book(vec![exact_rule("r-s", "tunnel.example")])),
+        reads: AtomicUsize::new(0),
+    });
+    let mut books = RememberedBooks::new(Arc::clone(&rules) as Arc<dyn RulesProvider>);
+    books.set_books_stamp(Arc::new(|| 1));
+    let books = Arc::new(books);
+    let names = |books: &RememberedBooks, at| {
+        books
+            .book_of_at(ALICE, at)
+            .is_some_and(|book| book.names("tunnel.example"))
+    };
+    let t0 = Instant::now();
+    assert!(names(&books, t0));
+
+    // A change no counter follows, written while the writer holds the store.
+    *rules.book.lock().expect("book") = secondary_book(vec![]);
+    let writer = rules.store.lock().expect("store");
+    let expired = t0 + BOOK_MEMO_TTL + Duration::from_millis(1);
+    let (tx, rx) = std::sync::mpsc::channel();
+    for _ in 0..8 {
+        let (books, tx) = (Arc::clone(&books), tx.clone());
+        std::thread::spawn(move || {
+            let _ = tx.send(names(&books, expired));
+        });
+    }
+    let deadline = Instant::now() + Duration::from_secs(2);
+    for _ in 0..8 {
+        let answer = rx
+            .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+            .expect("a query waited on the store's lock");
+        assert!(answer, "the remembered book answers");
+    }
+    drop(writer);
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while names(&books, expired) {
+        assert!(Instant::now() < deadline, "the change never showed");
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert_eq!(rules.reads.load(Ordering::SeqCst), 2, "one re-read for all");
+}
+
 /// The rule-host check runs on every query: against a large book it judges
 /// only the rules that can name the query, not every rule the user has, and
 /// still answers as the whole book would.

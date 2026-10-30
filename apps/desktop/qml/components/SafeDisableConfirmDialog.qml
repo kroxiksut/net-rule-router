@@ -100,6 +100,7 @@ Dialog {
                 text: dialog.tr(
                     "dialog.safe-disable.reason-label",
                     "Reason (required)")
+                wrapMode: Text.Wrap
                 font.pixelSize: 12
                 color: dialog.ownerRoot ? dialog.ownerRoot.mutedTextColor : palette.text
             }
@@ -140,6 +141,7 @@ Dialog {
             Label {
                 Layout.fillWidth: true
                 text: dialog.tr("dialog.safe-disable.term-label", "Turn rules back on")
+                wrapMode: Text.Wrap
                 font.pixelSize: 12
                 color: dialog.ownerRoot ? dialog.ownerRoot.mutedTextColor : palette.text
             }

@@ -57,6 +57,7 @@
     "settings": "Settings"
   },
   "action": {
+    "choose": "Choose",
     "select-all": "Select all",
     "save": "Save",
     "open-folder": "Open folder",
@@ -72,6 +73,8 @@
     "open-about-window": "About",
     "open-license-window": "Licenses",
     "open-logs-folder": "Open logs folder",
+    "open-telegram-channel": "Telegram channel (help and news)",
+    "open-documentation": "Documentation",
     "exit-application": "Exit",
     "load-rule-list": "Load rules list...",
     "browse": "Browse...",
@@ -149,6 +152,7 @@
     "build-profile-release": "release",
     "compiler": "Compiler",
     "project-url": "Project",
+    "telegram-channel": "Telegram channel",
     "author": "Author",
     "author-name": "Fyodor Malkov (kroxiksut)",
     "author-email": "E-mail",
@@ -220,7 +224,7 @@
       },
       "launch-tray": {
         "label": "Also start the tray at sign-in",
-        "description": "The service starts at boot before anyone logs in and cannot open the tray itself. This starts the tray icon when you sign in — the same setting as “Start the tray automatically at sign-in” in General."
+        "description": "The service starts at boot before anyone logs in and cannot open the tray itself. This starts the tray icon when you sign in — the same setting as “{setting}” in Settings → {page} → {group}."
       },
       "crash-recovery": "After a failure the service restarts by itself; if failures repeat, the network returns to normal and the service keeps trying, less often.",
       "admin-auto-revoke": {
@@ -454,7 +458,7 @@
       },
       "dns-via-secondary": {
         "label": "DNS through the tunnel",
-        "note": "Site names are looked up through the additional connection instead of your provider's resolver, so the provider can neither see nor alter the answers. Some providers return a wrong or empty address for certain sites, which makes those sites fail to load even when routing is correct. If the additional connection is not available, lookups fall back to the main one. Off by default."
+        "note": "The names in your rules for the additional connection are always looked up through it while it is up. With this on, the rest of NetRuleRouter's own lookups go through it too, to public DNS services (Cloudflare, Google, Quad9), so your provider neither sees nor alters those answers. Your programs' lookups of other sites still go to your provider's resolver. If the additional connection is not available, lookups go through the main one. Off by default."
       },
       "dns-fast-answers": {
         "label": "Fast DNS answers",
@@ -558,7 +562,7 @@
         "set-up": "Set up my VPN",
         "change": "Change",
         "external-address-auto": "Check the external address each time the additional route connects",
-        "external-address-auto-note": "Once per connection, asks a public address server through the additional route which address the internet sees, and shows it in a notice. Off by default: the request leaves through your VPN. The “Check external address” button works either way."
+        "external-address-auto-note": "Once per connection, asks a public address server through the additional route which address the internet sees, and shows it in a notice and under Interfaces and routes. On by default: it costs a couple of tiny requests through your VPN. The “Check external address” button works either way."
       },
       "providers": {
         "note": "Programs that keep working over your main link while leak protection is on, such as your VPN client. Type a program's full path to add one.",
@@ -858,6 +862,7 @@
       "retention-days": "Keep daily history for (days)",
       "export-csv": "Export CSV",
       "export-unit": "Export units",
+      "export-include-virtual": "Include virtual adapters in export",
       "reset": "Reset statistics",
       "no-data": "No data yet — counting starts once traffic flows.",
       "service-stopped": "Statistics are not being collected while the service is stopped.",
@@ -1133,8 +1138,7 @@
       "detail-paused": "Rules are disabled for the time chosen; they come back on their own when it is up, or when you turn them back on.",
       "detail-no-tray": "Run the tray icon to apply rules on this session.",
       "detail-no-rules": "Add rules in the Rules section, then click Save and review.",
-      "detail-disconnected": "Showing preview data. Install and start the NetRuleRouter service to apply rules.",
-      "tray-tooltip-paused": "Rules disabled — click to enable"
+      "detail-disconnected": "Showing preview data. Install and start the NetRuleRouter service to apply rules."
     },
     "pause": {
       "until-restart": "until restart"
@@ -1149,55 +1153,7 @@
   "a11y": {
     "high-contrast": "High contrast",
     "enhanced-focus": "Enhanced focus",
-    "simplified-labels": "Simplified labels",
-    "tray": {
-      "status-text": {
-        "preview-mode": "First-run setup is not finished: your rules are not applied yet.",
-        "checking-status": "Checking whether the service is reachable and whether your rules are being applied.",
-        "no-active-policy": "Your rules are not being applied right now.",
-        "service-unavailable": "The background service is not reachable: rules cannot be applied or changed until it is back."
-      },
-      "setup-state": {
-        "allowed": "Action is available in the current setup state.",
-        "soft-guided": "Available; finishing the first-run setup first is recommended.",
-        "blocked-until-wizard-completion": "Available once the first-run setup is finished."
-      },
-      "preview-only-note": "This action is not available yet.",
-      "action-label": {
-        "open-main-window": "Open NetRuleRouter",
-        "interfaces-routes": "Interfaces and routes",
-        "rules": "Rules",
-        "diagnostics": "Diagnostics",
-        "logs": "Logs",
-        "settings": "Settings",
-        "open-about-window": "About",
-        "open-license-window": "License",
-        "open-logs-folder": "Open logs folder",
-        "exit-application": "Exit",
-        "refresh-interfaces": "Refresh interfaces",
-        "check-service-status": "Check service status",
-        "safe-rollback": "Safe rollback",
-        "temporary-disable-product-impact": "Temporarily disable product impact",
-        "check-for-updates": "Check for updates"
-      },
-      "action-description": {
-        "open-main-window": "Open the main NetRuleRouter window.",
-        "interfaces-routes": "Open interfaces and routes screen.",
-        "rules": "Open rules screen.",
-        "diagnostics": "Open diagnostics screen.",
-        "logs": "Open logs screen.",
-        "settings": "Open settings screen.",
-        "open-about-window": "Open About window.",
-        "open-license-window": "Open license window.",
-        "open-logs-folder": "Open the logs folder.",
-        "exit-application": "Exit the application.",
-        "refresh-interfaces": "Refresh network interface snapshot.",
-        "check-service-status": "Check service status.",
-        "safe-rollback": "Trigger safe rollback flow.",
-        "temporary-disable-product-impact": "Temporarily disable product impact.",
-        "check-for-updates": "Check for application updates."
-      }
-    }
+    "simplified-labels": "Simplified labels"
   },
   "dialog": {
     "host-start": {
@@ -1230,7 +1186,7 @@
     },
     "full-reset": {
       "title": "Full reset",
-      "body": "This resets ALL application settings to defaults, deletes the rules the service keeps for you (back to a post-install state), wipes saved comments and logs, and stops the background service. Your own rules files on disk are left untouched, and the background service is NOT uninstalled. This cannot be undone.",
+      "body": "This resets ALL application settings to defaults, deletes the rules the service keeps for you (back to a post-install state), wipes saved comments and logs, and restarts the background service clean, so routing and protection start again as after a fresh install. Your own rules files on disk are left untouched, and the background service is NOT uninstalled. This cannot be undone.",
       "ack": "I understand this erases all settings and applied rules",
       "confirm": "Reset everything",
       "other-users": "Other users of this computer have rules here too ({count}). What should be cleared?",
@@ -1241,6 +1197,7 @@
       "title": "Full reset complete",
       "body": "Full reset is done. To apply it the program and the tray must be fully closed. Close them now?",
       "service-warn": "Note: some service-side data could not be cleared (administrator approval may be required, or a temporary error occurred). Re-run the reset.",
+      "restart-failed": "The background service did not start again, so routing and protection are off until it runs.",
       "later": "Later",
       "close-now": "Close everything now"
     },
@@ -1254,6 +1211,22 @@
     "nothing-to-apply": {
       "title": "Nothing to apply",
       "body": "There are no changes to apply — the current rules already match what is active."
+    },
+    "rules-not-imported": {
+      "title": "The rules were not imported"
+    },
+    "rule-set-applied": {
+      "title": "Rule set applied",
+      "body": {
+        "one": "«{name}»: {count} rule is now in use.",
+        "other": "«{name}»: {count} rules are now in use."
+      }
+    },
+    "rule-set-not-applied": {
+      "title": "Rule set not applied",
+      "service-down": "«{name}»: the service could not be started, so these rules are not in use yet ({reason}). They are kept and will be offered for applying as soon as the service runs.",
+      "not-installed": "«{name}»: the background service is not installed, so these rules are not in use. They are kept and will be offered for applying once the service is installed and running.",
+      "protection-not-saved": "«{name}»: these rules were not applied, because the leak protection chosen with them could not be saved ({reason}). Set leak protection in Settings, then load the set again on the Rules screen."
     },
     "reset-baseline-noop": {
       "title": "Already on baseline",
@@ -1622,8 +1595,8 @@
       "title": "Welcome to NetRuleRouter",
       "description": "Choose how to populate your initial rule set. You can change it later from the Rules toolbar or in Settings → Presets and settings.",
       "view-eula": "View EULA",
-      "option-country-preset": "Load country preset ({country})",
-      "option-country-preset-description": "Detected from your OS locale. Imports the bundled pack for your region.",
+      "option-country-preset": "Use the preset for your region ({country})",
+      "option-country-preset-description": "Detected from your system's region setting. The set that comes with the app for your region.",
       "location-title": "Where are you?",
       "location-home": "I am {where}",
       "location-abroad": "I am {where} and need access to its services",
@@ -1716,10 +1689,10 @@
           "outside": "outside Vietnam"
         }
       },
-      "option-country-preset-abroad": "Load access preset ({country})",
+      "option-country-preset-abroad": "Use the access preset ({country})",
       "option-country-preset-abroad-description": "Everything stays on your local provider; only that country's services take the additional route.",
       "option-country-not-available": "No country preset is bundled for your region — pick a different option.",
-      "option-builtin-demo": "Use built-in demo rules",
+      "option-builtin-demo": "Use the built-in demo rules",
       "option-builtin-demo-description": "A tiny showcase set covering each rule kind. Replace with your own later.",
       "option-open-file": "Open my rules...",
       "option-open-file-description": "Choose one or two preset .txt files — one for each route. Leave a route empty to start it blank.",
@@ -1730,7 +1703,7 @@
       "no-file-selected": "(no file selected)",
       "change-button": "Change...",
       "clear-button": "Clear",
-      "import-button": "Import selected files",
+      "import-button": "Use the selected files",
       "option-start-empty": "Start empty",
       "option-start-empty-description": "No rules. Add or import them whenever you want.",
       "protection-title": "Protection",
@@ -1748,12 +1721,35 @@
       "primary-adapter-unavailable": "No connections to choose from yet — the background service reports them once it is running. You can set this later in Interfaces and routes.",
       "secondary-adapter-description": "The connection your rules send traffic to — a VPN or a second network. Rules that name it do nothing until it is assigned.",
       "secondary-adapter-assigned": "Additional connection: {name}. You can change it later in Interfaces and routes.",
+      "secondary-adapter-assigned-down": "Additional connection: {name} — chosen, not connected yet. Your rules use it as soon as it connects. You can change it later in Interfaces and routes.",
+      "other-countries": "Rule set of another country",
+      "rule-set-chosen": "Starting rules: {name}. They are imported when you press Finish; choose another option above to change them.",
+      "rule-set-none": "No starting rules chosen yet. Without a choice, Finish starts with the rules already applied to you.",
+      "rule-set-demo-name": "the built-in demo rules",
+      "rule-set-empty-name": "none, an empty start",
+      "option-chosen": "Chosen. Imported when you press Finish.",
+      "finish-hint": "Applies the choices above: connections, starting rules and protection.",
       "secondary-adapter-assign": "Set as additional",
       "secondary-adapter-later": "I will choose it later",
-      "secondary-adapter-vpn-hint": "{name} looks like a VPN connection — choose it above to make it the additional route.",
-      "secondary-adapter-vpn-none": "No VPN connection found yet. Install your VPN and connect it, then come back here.",
+      "secondary-adapter-vpn-hint": "{name} looks like a VPN connection. We recommend it as the additional route: choose it above and press \"Set as additional\".",
+      "secondary-adapter-vpn-installed": "VPN found on this computer: {names}. Start it and connect first: its connection then shows up in the list above as connected and is easy to pick. Then press \"Refresh interfaces\".",
+      "secondary-adapter-vpn-none": "No VPN connection found yet. Start your VPN and connect first: its connection then shows up in the list above as connected and is easy to pick. Then press \"Refresh interfaces\".",
       "secondary-adapter-vpn-setup": "Set up my VPN",
-      "secondary-adapter-deferred": "You can assign it any time in Interfaces and routes. Until then, with leak protection on, the traffic your rules send that way is blocked instead of leaking to the main connection."
+      "secondary-adapter-deferred": "You can assign it any time in Interfaces and routes. Until then, with leak protection on, the traffic your rules send that way is blocked instead of leaking to the main connection.",
+      "step-of": "Step {step} of {total}: {name}",
+      "step-rules": "Starting rules",
+      "step-options": "Protection and options",
+      "step-review": "Ready to finish",
+      "review-description": "Check your choices. Finish applies them; Back returns to any step. Each of them can be changed later.",
+      "review-primary": "Main connection: {name}",
+      "review-secondary": "Additional connection: {name}",
+      "review-rules": "Starting rules: {name}",
+      "review-rules-current": "the rules already applied to you",
+      "review-leak-in-force": "Leak protection: {name} — in force.",
+      "review-leak-not-yet": "Leak protection: {name} — not in force yet.",
+      "review-no-primary": "Your rules are not applied until a main connection is chosen. You can choose it later in Interfaces and routes.",
+      "review-later": "later",
+      "review-not-chosen": "not chosen"
     },
     "preset-review": {
       "title": "Review preset import",
@@ -1923,6 +1919,8 @@
     "preset-import-needs-elevation": "Could not get administrator approval to import the preset. Approve the prompt next time, or re-launch NetRuleRouter as Administrator.",
     "preset-import-failed": "Failed to import preset: ",
     "preset-import-completed": "Preset imported and activated ({count} rules).",
+    "service-did-not-answer": "The service did not start answering in time.",
+    "service-action-superseded": "Another service action started before this one finished.",
     "preset-import-passthrough-suffix": "Preserved foreign-OS sections: {sections}.",
     "preset-import-passthrough-dropped": "Not preserved, too large to store: {sections}.",
     "preset-import-newer-format": "The file declares format version {found}; this build reads version {supported}. Rules in sections it does not know were kept but not applied.",
@@ -2075,6 +2073,7 @@
     "local-network-offer-open": "Found your home network's IPv6 addresses: {cidr} ({adapter}). Open them to devices on this network while routed traffic is blocked?",
     "app-groups-offer": "Found programs that can be given their own route: {names}.",
     "app-groups-offer-keep": "Leave as they are",
+    "rule-set-offer": "No rules yet. Load the rule set «{name}»? You can change it or remove it at any time.",
     "local-network-offer-keep": "Keep them reachable",
     "local-network-offer-decide": "Decide for each…",
     "local-network-offer-accepted": "These local networks stay reachable while routed traffic is blocked.",
@@ -2113,8 +2112,8 @@
     "enforcement-mode-resolver": "Routing method: local DNS resolver. Applied — the resolver is now active.",
     "enforcement-mode-uac-declined": "Administrator approval was declined; the mode was not changed.",
     "enforcement-mode-failed": "Could not update the enforcement mode: ",
-    "dns-via-secondary-on": "DNS now goes through the tunnel.",
-    "dns-via-secondary-off": "DNS goes through the main connection again.",
+    "dns-via-secondary-on": "NetRuleRouter's own lookups now go through the tunnel.",
+    "dns-via-secondary-off": "Only the names in your rules for the additional connection go through the tunnel now.",
     "dns-via-secondary-failed": "Could not change where DNS goes: ",
     "dns-fast-answers-on": "Fast DNS answers are on.",
     "dns-fast-answers-off": "Fast DNS answers are off — every answer waits for route protection.",
@@ -2355,7 +2354,9 @@
         "primary": "already the main connection",
         "secondary": "already the additional connection"
       },
-      "exclusive-note": "One adapter cannot carry both routes: to use it for the other one, unassign its current role first."
+      "exclusive-note": "One adapter cannot carry both routes: to use it for the other one, unassign its current role first.",
+      "driver-sibling-live": "This adapter is not connected, but another adapter of the same kind is: {list}. A VPN program often brings up a different copy than the one chosen; if yours did, choose that one instead.",
+      "driver-sibling-idle": "This adapter is not connected, and other adapters of the same kind are on this computer. Your VPN program may use one of them: connect the VPN first, then choose the adapter that comes up."
     },
     "kind": {
       "wifi": "Wi-Fi",
@@ -2514,7 +2515,7 @@
     "app-browse-filter-all": "All files (*)",
     "import-only-active": {
       "label": "Import only active rules",
-      "tooltip": "When loading a preset, skip rules that are turned off in it (for example application rules, which can't route yet). Default comes from Settings → General; changing it here applies to imports this session only."
+      "tooltip": "When loading a preset, skip rules that are turned off in it (for example application rules, which can't route yet). Default comes from Settings → {page} → {group}; changing it here applies to imports this session only."
     },
     "placeholder": {
       "zone": ".ru  (matches *.ru)",
@@ -2724,6 +2725,7 @@
       "title": "No rules yet",
       "body": "Add your first routing rule to start sending traffic through the additional route.",
       "cta": "Add your first rule",
+      "load-set": "Load the rule set «{name}»",
       "no-source": {
         "title": "No rule set loaded",
         "body": "Pick a rule set above and press Load, or add a rule by hand. The background service is not needed for this."
@@ -2767,7 +2769,6 @@
         "sort-name": "By name",
         "filter-active": "Showing only what {name} needs",
         "filter-clear": "Show everything",
-        "action-add": "Add to the additional route",
         "action-never": "Don't suggest again",
         "selected": "{count} selected",
         "search-placeholder": "Search by domain, host, or site",
@@ -3074,109 +3075,27 @@
   },
   "tray": {
     "menu": {
-      "open": "Open",
-      "add-rule": "Add rule…",
-      "suggestions": "Suggested addresses",
-      "suggestions-count": "Suggested addresses ({count})",
-      "start-service": "Start service",
-      "stop-service": "Stop service",
-      "pause-rules": "Turn off rules…"
+      "suggestions-count": "Suggested addresses ({count})"
     },
     "add-rule": {
-      "title": "Add rule",
-      "saving": "Adding the rule…",
-      "load-failed": "Could not read your rules from the service, so nothing was added. Check that the service is running.",
-      "on-other-route": "{value} is already in your rules, on the route {route}.",
-      "on-other-route-many": "{count} of these are already in your rules, on another route.",
-      "already-denied": "{value} is already denied in your rules.",
-      "already-denied-many": "{count} of these are already denied in your rules.",
-      "on-a-route-many": "{count} of these are already in your rules, on a route.",
-      "on-other-route-or-denied-many": "{count} of these are already in your rules, on the other route or denied.",
       "move": "Move to this route",
       "deny-instead": "Deny instead",
-      "lift-deny": "Lift the deny, use this route",
-      "added": "Rule added: {value} → {route}",
-      "added-awaits-confirmation": "Rule added: {value} → {route}. It is not applied yet: the protection of system programs holds it until you confirm it in the rules list.",
-      "added-disabled": "Rule added, switched off: {value} → {route}. It does not route anything until you switch it on.",
-      "added-deny": "Rule added: {value} denied.",
-      "added-deny-many": "Deny rules added: {count}.",
-      "added-deny-disabled": "Rule added, switched off: deny {value}. It does not deny anything until you switch it on.",
-      "moved": "Rule moved: {value} → {route}",
-      "moved-count": "Moved to this route: {count}.",
-      "moved-deny": "Rule changed: {value} is now denied.",
-      "now-denied-count": "Now denied: {count}.",
-      "deny-lifted": "Deny lifted: {value} → {route}",
-      "deny-lifted-count": "Deny lifted, now over {route}: {count}.",
-      "changed-elsewhere": "Your rules were changed elsewhere in the meantime, so nothing was added. Open the main window and add the rule there.",
-      "undoing": "Undoing…",
-      "undo-load-failed": "Could not read your rules from the service, so nothing was undone. Check that the service is running.",
-      "undo-changed": "The rule has been changed since, so nothing was undone.",
-      "undone": "Undone: the rules are as they were."
-    },
-    "external": {
-      "label": "External IP",
-      "main-route": "Main route",
-      "additional-route": "Additional route",
-      "checking": "checking…",
-      "unknown": "check",
-      "last-known": "last known {when}"
-    },
-    "suggestions": {
-      "silence": "Do not suggest addresses",
-      "silence-menu": "Do not suggest addresses…",
-      "silence-body": "New addresses will not be offered for as long as you choose. They keep collecting under Suggested addresses.",
-      "for-30-minutes": "For 30 minutes",
-      "for-2-hours": "For 2 hours",
-      "for-4-hours": "For 4 hours",
-      "for-8-hours": "For 8 hours",
-      "until-restart": "Until restart",
-      "resume": "Suggest addresses again",
-      "stop-automatic": "Stop adding automatically"
-    },
-    "status": {
-      "preview-mode": "Setup not finished",
-      "checking-status": "Checking status...",
-      "no-active-policy": "No active policy application",
-      "service-unavailable": "Service unavailable"
+      "lift-deny": "Lift the deny, use this route"
     },
     "action": {
       "safe-disable": "Safe disable (temporary)…",
-      "open-window": "Open window",
       "start-service": "Start service",
       "stop-service": "Stop service",
       "install-service": "Install service...",
       "uninstall-service": "Uninstall service",
       "exit": "Exit"
     },
-    "tooltip": {
-      "service-running": "NetRuleRouter — Service running",
-      "service-stopped": "Service stopped — click to start",
-      "service-pending": "Service changing state...",
-      "service-not-installed": "Service not installed — click to install",
-      "service-unknown": "Cannot read service status",
-      "no-updates": "The service is running, but this app is not receiving updates from it",
-      "rules-applied": "NetRuleRouter — your rules are being applied",
-      "no-rules-applied": "NetRuleRouter — no rules are being applied yet",
-      "contract-skew": "App and service builds differ — changes are off"
-    },
     "auto-rules": {
       "title": "Addresses a site needs",
       "body": "Found addresses without which {name} will not work fully.",
-      "body-multi": "Found addresses that {count} of the sites you routed need.",
-      "item-companion-short": "← {name}",
-      "route-line-primary": "They will be added to the main route.",
-      "route-line-secondary": "They will be added to the additional route.",
       "site-fallback": "a site you use",
-      "empty": "No addresses to suggest right now.",
-      "none-pending": "Nothing is waiting to be added right now.",
-      "list-accessible-name": "Suggested addresses",
-      "unchecked-declined": "Unchecked rows will be declined; you can bring them back later in the app.",
       "detail-observations": "seen in {count} visits",
       "detail-affinity": "belongs to this site {percent}% of the time",
-      "detail-match-kind": {
-        "exact": "this address only",
-        "suffix": "this address and its subdomains"
-      },
       "signal": {
         "brand-related": "shares a name with the site",
         "delivery-name": "looks like a delivery address of the site",
@@ -3191,11 +3110,6 @@
         "unconfirmed": "the additional route may help",
         "unreachable": "it does not open over the additional route either"
       },
-      "action": {
-        "accept": "Add checked",
-        "always": "Add automatically from now on",
-        "dismiss": "Never suggest checked"
-      },
       "title-blocked": "Sites the main route will not carry",
       "body-blocked": "Connections to {name} keep failing on the main route.",
       "title-app-blocked": "Programs the main route will not carry",
@@ -3204,71 +3118,31 @@
       "body-app-own-resolver": "{name} looks up site names on its own, so rules by site name do not apply to it. A rule for the program sends all of its connections over the additional route.",
       "title-assorted": "Suggested rules",
       "body-assorted": "Each item below says why it is offered.",
-      "body-blocked-multi": "Connections to {count} sites keep failing on the main route.",
       "title-mixed-blocked": "Not getting through on the main route",
-      "body-mixed-blocked": "The programs and sites below keep failing on the main route.",
-      "reload": {
-        "title": "Rule applied"
-      }
-    },
-    "auto-rules-mode-confirm": {
-      "title": "Turn on “Apply automatically”?",
-      "body": "From now on NetRuleRouter will add suggested addresses to your rules files by itself, without asking. You can undo this anytime in Settings → Routing, by switching back to “Suggest only”.",
-      "confirm": "Turn on"
+      "body-mixed-blocked": "The programs and sites below keep failing on the main route."
     },
     "external-address": {
       "title": "Additional route connected",
       "body": "External address of the additional route: {address}",
-      "adapter": "Adapter: {name}"
+      "adapter": "Adapter: {name}",
+      "offer-auto": "Show its external address each time"
     },
     "rules-drift": {
-      "title": "Your rule files differ from what is applied",
-      "body": "The rules saved in your files are not the ones being applied right now. Apply the files, or open the app to see the difference.",
-      "list-accessible-name": "Rule files that differ",
-      "action": {
-        "compare": "Open and compare",
-        "apply-files": "Apply the files"
-      }
+      "title": "Your rule files differ from what is applied"
     },
     "block-notice": {
       "title": "Connection blocked",
-      "title-route-down": "Additional route is unavailable",
-      "merged": {
-        "title": "{count} connections blocked",
-        "body": "Check the addresses to send over the additional route.",
-        "list-accessible-name": "Blocked connections"
-      },
-      "attempts": "{count} attempts",
-      "reason": {
-        "route-unavailable": "The route these addresses are bound to is down right now, so none of them open. This is one notice for the whole route.",
-        "blocked-by-rule": "A rule denies this address directly.",
-        "ipv6-blocked": "With leak protection set to Everything, IPv6 goes out only through the additional connection, and this IPv6 address could not. No rule blocked it — the switch is in Settings.",
-        "dns-lockdown": "This app tried to reach a public DNS resolver of its own instead of the one NetRuleRouter provides, and encrypted-DNS blocking closed it. No rule blocked it — the switch is in Settings, under Routing.",
-        "unattributed": "NetRuleRouter blocked this address, but could not identify which filter did it.",
-        "unspecified": "No further detail available."
-      },
-      "reason-short": {
-        "route-unavailable": "Route is down",
-        "blocked-by-rule": "Denied by a rule",
-        "ipv6-blocked": "IPv6 held by leak protection",
-        "dns-lockdown": "Own encrypted DNS",
-        "unattributed": "Blocked, filter unknown",
-        "unspecified": "Blocked"
-      },
       "action": {
         "route-to-secondary": "To additional route",
-        "open-routes": "Open routes",
         "snooze": "Snooze"
       },
       "route-confirm": {
         "title": "Route {name} via the additional link?",
-        "title-many": "Route {count} addresses via the additional link?",
         "body": "Adds a rule that sends this address over the additional route from now on. You can undo it later in Rules."
       },
       "snooze": {
         "title": "Snooze this notice",
         "body": "Stop asking about {name} for a while.",
-        "body-many": "Stop asking about these {count} addresses for a while.",
         "for-15-minutes": "15 minutes",
         "for-1-hour": "1 hour",
         "for-8-hours": "8 hours"
@@ -3276,26 +3150,9 @@
       "mute": {
         "title": "What should stop appearing?",
         "this-host": "Only {name}",
-        "these-hosts": "Only these {count} addresses",
         "this-app": "All from {name}",
         "this-reason": "All \"{name}\"",
-        "all": "All blocks: any host, any app",
-        "these-apps": "All from these {count} programs"
-      },
-      "launched-by": "launched by {name}",
-      "count": {
-        "dns-lockdown": {
-          "one": "{count} DNS server",
-          "other": "{count} DNS servers"
-        },
-        "ipv6-blocked": {
-          "one": "{count} IPv6 address",
-          "other": "{count} IPv6 addresses"
-        },
-        "address": {
-          "one": "{count} address",
-          "other": "{count} addresses"
-        }
+        "all": "All blocks: any host, any app"
       }
     },
     "mute": {
@@ -3308,18 +3165,7 @@
     "site-not-opening": {
       "title": "A site does not open",
       "body-unconfirmed": "{host} does not open over the main connection; the additional route may help.",
-      "body-confirmed": "{host} does not open over the main connection, but opens over the additional route.",
-      "add": "Add rule",
-      "mute": "Don't report again"
-    },
-    "settings-lost": {
-      "body": "This happens after the service was reinstalled or its data was reset. Settings missing: {count}."
-    },
-    "settings-restore-failed": "Your settings could not be restored. Open the app to try again.",
-    "pause": {
-      "title": "Turn off rules",
-      "body": "Your routing and leak protection stop for the time you choose and come back on their own.",
-      "failed": "Could not turn the rules off: "
+      "body-confirmed": "{host} does not open over the main connection, but opens over the additional route."
     }
   },
   "diag": {
@@ -3461,7 +3307,8 @@
         "bytes": "Bytes",
         "kb": "KB",
         "mb": "MB",
-        "gb": "GB"
+        "gb": "GB",
+        "tb": "TB"
       },
       "audit-max-age-label": "Keep audit trail for",
       "audit-max-age-unit": "days",
@@ -4389,7 +4236,7 @@
       "route-local-networks-unreadable-additional": "Could not read the system route table ({error}) — reporting no local networks for the additional route.",
       "route-local-networks-unreadable-screen": "Could not read the system route table ({error}) — the local networks screen will show nothing.",
       "route-binding-healed-by-name": "The saved {role} adapter ({stale_id}) was no longer found; automatically matched it to \"{healed_adapter}\" ({healed_id}) by name and saved the correction.",
-      "route-binding-down-no-heal": "The {role} adapter ({stable_id}) is present but not usable right now (status: {oper_status}, has address: {has_ipv4}) and no matching adapter could be found — routing for it is stopped.",
+      "route-binding-down-no-heal": "The {role} adapter ({stable_id}) is present but not usable right now (status: {oper_status}, has address: {has_ipv4}) and no matching adapter could be found — routing for it is stopped. Adapters answering to the saved name: {name_matched}, refused as another program's: {refused_foreign}.",
       "route-binding-not-found": "The saved {role} adapter \"{display_name}\" ({bound}) was not found among the current network adapters — routing for it is stopped.",
       "route-binding-no-next-hop": "The {role} adapter \"{effective_adapter}\" (interface {ifindex}) is up but has no gateway, and no next hop could be determined — it cannot be used for routing.",
       "route-no-active-rules": "No active rules for this user — no additional routes will be applied.",
@@ -4827,8 +4674,7 @@
     "verify-verdicts": {
       "title": "Addresses that do not open where they are written: {count}",
       "body": "They do get through over the other route and use it until the service restarts. “Move” writes them there for good; “Not now” keeps them as written and checks again after the service restarts.",
-      "item": "{value} → {route}",
-      "list": "Rules and the route they would move to"
+      "item": "{value} → {route}"
     },
     "chip-label": "Notifications",
     "chip-tooltip": "Show notifications",
@@ -4902,14 +4748,13 @@
       "body": "{adapter} reports {network} as its local network — far wider than any local network can be. It is not treated as local: devices on it stay blocked while leak protection is on, and sites inside it still follow your rules."
     },
     "local-networks": {
-      "title": "A local network was found",
-      "body": "{cidr} on {adapter} stays reachable while routed traffic is blocked. Keep it that way?",
-      "body-open": "Your home network's IPv6 addresses {cidr} on {adapter} are closed while routed traffic is blocked. Open them to devices on this network?"
+      "title": "A local network was found"
     },
     "enforcement": {
       "adapter-choice": {
         "title": "Choose which adapter to use",
-        "body": "Several adapters answer to the saved name, so your rules are not being applied. Pick the one to use: {list}"
+        "body": "Several adapters answer to the saved name, so your rules are not being applied. Pick the one to use: {list}",
+        "body-one": "The saved adapter is not up, but another adapter of the same kind is: {list}. If your VPN now uses that one, choose it; until then your rules are not being applied."
       },
       "no-primary": {
         "title": "Main connection is not set",
@@ -4924,7 +4769,6 @@
         "title": "Connections are not chosen yet",
         "suggest-title": "Confirm your main connection: {name}",
         "suggest-body": "Nothing is routed until you confirm it. Rules for the additional connection wait until you choose one.",
-        "choose-other": "Choose another",
         "body": "The service has no routing settings for you yet, so nothing is being routed. Choose the main and additional connections."
       },
       "restored": {
@@ -5027,19 +4871,23 @@
         "other": "{name} looks like a VPN client, but it is not installed in a protected program folder, so leak protection does not trust it on its own. It ships with {count} more programs that can be trusted with it."
       },
       "action-bundle": "This is my VPN, with the programs it ships with",
-      "tray-body": "{apps} looks like a VPN client, but it is not installed in a protected program folder. Open NetRuleRouter to confirm it, or leak protection keeps blocking it while the additional route is down.",
       "tui-body": "{apps}: named like a VPN client, but not installed in a protected program folder, so leak protection does not trust it on its own.",
       "tui-hint": "t: confirm {name} as your VPN. The other programs are asked one at a time after it.",
       "tui-hint-bundle": "t: confirm {name} as your VPN. T: confirm it together with the {count} program(s) it ships with in its protected folder. The other programs are asked one at a time after it.",
       "tui-done": "{count} program(s) confirmed as your VPN; leak protection keeps them working over the main link.",
       "tui-failed": "Could not save the confirmation to the routing service ({error})."
     },
+    "vpn-client-offer": {
+      "body": "Looks like your VPN is {name}. Use it as your VPN client, so it keeps working over your main link while leak protection is on? Programs: {apps}",
+      "use": "Use it",
+      "choose": "Choose…",
+      "tui-row": "Use {name} as your VPN client: {apps}"
+    },
     "vpn-gateway-trust": {
       "title": "Let this VPN connect?",
       "body": "Leak protection stopped a VPN from reaching its server {address} over your main connection. Allow it and that VPN connects while leak protection is on; nothing else is let through to that address.",
       "body-program": "Leak protection stopped {name} from reaching the VPN server {address} over your main connection. Allow it and that VPN connects while leak protection is on; nothing else is let through to that address.",
-      "action": "Allow this VPN",
-      "tray-body": "A VPN is waiting for your answer in the NetRuleRouter window: leak protection stopped it from reaching its server {addresses}."
+      "action": "Allow this VPN"
     },
     "protection-coverage": {
       "title": "Leak protection coverage changed"
@@ -5050,7 +4898,6 @@
     },
     "service-lost": {
       "title": "The service stopped",
-      "body": "The NetRuleRouter service stopped unexpectedly, so your rules are not applied. Start it again, or restore network access if the connection is cut.",
       "body-start-only": "The NetRuleRouter service stopped unexpectedly, so your rules are not applied."
     },
     "rules-book-unreadable": {
@@ -5726,8 +5573,9 @@
       "reset": {
         "scope": "Whose data to clear",
         "scope-everyone": "Every user on this computer (needs nrr-tui started as administrator)",
-        "done": "Full reset is done and the service is stopped. Close this terminal and any NetRuleRouter window, then start again.",
-        "needs-elevation": "Full reset stopped before the rules were cleared and the service was stopped: {error}"
+        "done": "Full reset is done and the service is running again on the cleared state. Close this terminal and any NetRuleRouter window, then start again.",
+        "restart-failed": "Full reset is done, but the service did not start again, so routing and protection are off until it runs: {error}. Start it in Settings.",
+        "needs-elevation": "Full reset stopped before the rules were cleared and the service was restarted: {error}"
       },
       "logs": {
         "window-until": "On until {timestamp}"
@@ -5781,10 +5629,20 @@
       "line": "The service does not have your settings. r: restore them.",
       "failed": "Your settings could not be restored: {error}"
     },
+    "rule-set": {
+      "start-needs-rights": "starting the service needs administrator rights",
+      "not-applied-reason": "«{name}»: these rules are not in use ({reason}). Load the set again from the Rules screen.",
+      "not-applied-protection": "«{name}»: these rules are not in use, because the leak protection chosen with them could not be saved. Set it in Interfaces and routes, then load the set again from the Rules screen.",
+      "not-applied": "«{name}»: the service could not be started, so these rules are not in use yet ({reason}). Start the service in Settings, then load the set again."
+    },
     "answer-in-routing-settings": "Answer in Settings, Routing section (c2).",
     "see-diagnostics": "Details are on the Diagnostics and logs screen (9).",
     "app-groups-offer": {
       "how": "To give them a route, press g on the Rules screen."
+    },
+    "rule-set-offer": {
+      "keys": "l: Load. n: Not now.",
+      "how": "To load it, press l on the Rules screen; n there means Not now."
     }
   }
 }

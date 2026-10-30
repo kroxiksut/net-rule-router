@@ -296,6 +296,57 @@ fn a_policy_without_bindings_is_still_a_policy() {
     assert!(!repo.has_policy_for_sid("S-1-5-21-B").expect("probe"));
 }
 
+/// The connect-time external-address check is on for a user who never chose,
+/// and a user who switched it off keeps it off across a reopen.
+#[test]
+fn the_external_address_check_is_on_until_the_user_switches_it_off() {
+    let dir = TempDir::new().expect("tempdir");
+    let path = dir.path().join("nrr_service_state.db");
+    let sid = "S-1-5-21-A";
+    {
+        let conn = open_connection(&path).expect("open");
+        let runner = SqliteMigrationRunner::for_state_db(conn);
+        runner.run_pending_migrations().expect("migrate");
+        let conn = runner.into_connection();
+        let repo = RouteBindingsRepository::new(&conn);
+        assert!(
+            repo.load_for_sid(sid)
+                .expect("load")
+                .external_address_auto_check,
+            "a user with no saved policy gets the check"
+        );
+        let mut rec = RoutePolicyRecord::empty(BindingSource::UserAssigned);
+        rec.leak_protection = LeakProtection::Sites;
+        repo.update_for_sid(sid, &rec, 1_700_000_000)
+            .expect("update");
+        assert!(
+            repo.load_for_sid(sid)
+                .expect("load")
+                .external_address_auto_check,
+            "saving some other setting does not switch it off"
+        );
+        rec.external_address_auto_check = false;
+        repo.update_for_sid(sid, &rec, 1_700_000_001)
+            .expect("switch off");
+    }
+
+    let conn = open_connection(&path).expect("reopen");
+    let repo = RouteBindingsRepository::new(&conn);
+    assert!(
+        !repo
+            .load_for_sid(sid)
+            .expect("load after reopen")
+            .external_address_auto_check,
+        "the user's off survives a restart"
+    );
+    assert!(
+        repo.load_for_sid("S-1-5-21-B")
+            .expect("other user")
+            .external_address_auto_check,
+        "one user's off is not another's"
+    );
+}
+
 #[test]
 fn update_then_load_round_trips_full_record() {
     let (_dir, conn) = fresh_db();

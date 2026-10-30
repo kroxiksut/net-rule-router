@@ -11,7 +11,6 @@ ae                   # ОАЭ / United Arab Emirates (.ae)
 --- Domains
 *.etisalat.ae  # UAE telecom and government/public services
 *.du.ae  # UAE telecom and government/public services
-*.google.com  # UAE telecom and government/public services
 *.tdra.gov.ae  # UAE telecom and government/public services
 *.u.ae  # UAE telecom and government/public services
 *.gov.ae  # UAE telecom and government/public services
@@ -24,6 +23,8 @@ ae                   # ОАЭ / United Arab Emirates (.ae)
 
 *.bayut.com  # Regional and local media/services often expected on direct route
 *.dubizzle.com  # Regional and local media/services often expected on direct route
+
+# *.google.com  # Google already takes the main route; turn on with the default route "Additional connection — exceptions through the main one"
 
 ?*.proton.me
 ?*.protonmail.com

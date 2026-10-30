@@ -537,6 +537,8 @@ pub struct SettingsContract {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct AboutContract {
     pub project_url: &'static str,
+    /// The project's Telegram channel: help, questions and news.
+    pub community_url: &'static str,
     pub build_channel: &'static str,
     /// Rights holder named by the licence agreement, spelled as the English
     /// text spells it; the UI renders it through `label.author-name`, so each

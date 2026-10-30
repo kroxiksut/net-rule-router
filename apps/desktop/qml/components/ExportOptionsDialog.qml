@@ -82,6 +82,13 @@ Dialog {
             text: dialog.tr(
                 "dialog.export-options.include-comments",
                 "Include rule comments")
+            contentItem: Label {
+                text: includeCommentsCheck.text
+                leftPadding: includeCommentsCheck.indicator.width + includeCommentsCheck.spacing
+                color: dialog.ownerRoot ? dialog.ownerRoot.textColor : palette.text
+                wrapMode: Text.WordWrap
+                verticalAlignment: Text.AlignVCenter
+            }
             Accessible.role: Accessible.CheckBox
             Accessible.name: text
             Accessible.description: dialog.tr(

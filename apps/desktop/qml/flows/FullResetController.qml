@@ -2,14 +2,14 @@ import QtQuick 2.15
 import "../lib/pure.js" as Pure
 
 // Non-visual controller owning the FULL RESET flow: wipe the GUI's own state,
-// clear the service's rules and auxiliary tables, stop the service, then offer
-// to close every NetRuleRouter process so the next launch starts fresh.
+// clear the service's rules and auxiliary tables, restart the service on the
+// cleared state, then offer to close every NetRuleRouter process so the next
+// launch starts fresh.
 //
-// Extracted from Main.qml (thin-shell rule). The shell keeps the two dialogs —
-// they are what the user sees — and this owns the order the steps run in, which
-// is the part that matters: the auxiliary purge survives a declined UAC prompt
-// at the rules step, and the service is stopped LAST because every step above
-// needs it answering.
+// The shell keeps the two dialogs; this owns the order the steps run in: the
+// auxiliary purge survives a declined UAC prompt at the rules step, and the
+// service is restarted LAST because every step above needs it answering. The
+// reset ends as a fresh install does — with the service running.
 QtObject {
     id: fullResetController
 
@@ -36,6 +36,7 @@ QtObject {
             autoOpenOnLaunchPathPrimary: "",
             autoOpenOnLaunchPathSecondary: "",
             firstRunCompleted: false,
+            ruleSetOfferAnswered: false,
             // "Reset everything" means the state a fresh install starts from,
             // and that includes not having agreed to anything yet.
             acceptedEulaVersion: 0
@@ -43,47 +44,16 @@ QtObject {
         root.emitPrefs()
         Pure.clearModel(root.rulesModel)
         root.clearAllUnsavedChanges()
-        _startServiceThen(function() { _runResetSteps(allPrincipals === true, []) })
+        // A stopped service answers none of the steps: it is started first. A
+        // declined or failed start leaves the steps to say what they could not
+        // clear, and the last step tries the service again.
+        var steps = function() { _runResetSteps(allPrincipals === true, []) }
+        _restartFailure = ""
+        root.serviceStarter.startIfStoppedThen(steps, steps)
     }
 
-    // A stopped service answers none of the steps, so the reset would only
-    // report what it could not clear: it is started first, and the last step
-    // stops it again. A declined or failed start leaves the steps to say so.
-    function _startServiceThen(next) {
-        var ctl = (typeof nrrServiceController !== "undefined") ? nrrServiceController : null
-        // 2 = stopped in the controller's status vocabulary.
-        if (!ctl || parseInt(ctl.status) !== 2 || typeof ctl.startService !== "function") {
-            next()
-            return
-        }
-        ctl.startService()
-        _startWatch.attempts = 0
-        _startWatch.onDone = next
-        _startWatch.restart()
-    }
-
-    // Waits for the started service to answer on its channel, not only to run.
-    property Timer _startWatch: Timer {
-        id: _startWatch
-        interval: 500
-        repeat: true
-        property int attempts: 0
-        property var onDone: null
-        onTriggered: {
-            attempts += 1
-            var ctl = (typeof nrrServiceController !== "undefined") ? nrrServiceController : null
-            var st = ctl ? parseInt(ctl.status) : 0
-            // 3 = start pending, 4 = running: anything else once the prompt
-            // is gone means the start was declined or failed.
-            var gaveUp = !(ctl && ctl.busy === true) && st !== 3 && st !== 4 && attempts >= 3
-            if (root._routingBackendConnected() || gaveUp || attempts >= 40) {
-                stop()
-                var cb = onDone
-                onDone = null
-                if (typeof cb === "function") cb()
-            }
-        }
-    }
+    /// Why the restart at the end did not happen, for the completion dialog.
+    property string _restartFailure: ""
 
     // Asks the shared step machine what comes next, runs that step, records
     // its outcome and repeats. The window's own preference reset above is the
@@ -92,7 +62,11 @@ QtObject {
     function _runResetSteps(allPrincipals, done) {
         var next = Pure.fullResetNext(true, done)
         if (next.action !== "run") {
-            root.fullResetCompleteDialog.serviceCleared = next.action === "finish" && next.cleared
+            var finished = next.action === "finish"
+            root.fullResetCompleteDialog.serviceCleared = finished && next.cleared
+            // A reset stopped for want of rights never touched the service.
+            root.fullResetCompleteDialog.serviceRestarted = !finished || next.restarted
+            root.fullResetCompleteDialog.restartFailure = _restartFailure
             root.fullResetCompleteDialog.open()
             return
         }
@@ -120,54 +94,19 @@ QtObject {
         if (step === "clear-logs") fireAndForget("rpcLogsClear", false, true)
         else if (step === "reset-sidecar") fireAndForget("rpcSidecarReset")
         else if (step === "purge-principal-data") _purgePrincipalData(allPrincipals, viaBool)
-        else if (step === "stop-service") _stopService(viaBool)
+        else if (step === "restart-service") _restartService(viaBool)
         else report("skipped")
     }
 
-    // Stop the background service as the last step of a full reset. Elevation
-    // goes through the same broker the Settings button uses, so a declined UAC
-    // prompt reports itself instead of failing silently. Best-effort: the reset
-    // itself already happened, so a service that refuses to stop downgrades the
-    // completion notice rather than aborting anything.
-    function _stopService(onComplete) {
-        if (typeof nrrServiceController === "undefined" || !nrrServiceController
-                || typeof nrrServiceController.stopService !== "function") {
+    // The last step: the service comes back on the cleared state, through the
+    // same broker the Settings button uses (one prompt for stop and start). A
+    // restart that fails keeps its reason for the completion dialog, which
+    // offers to start the service from there.
+    function _restartService(onComplete) {
+        root.serviceStarter.restartThen(function() { onComplete(true) }, function(reason) {
+            _restartFailure = String(reason || "")
             onComplete(false)
-            return
-        }
-        nrrServiceController.stopService()
-        _stopWatch.attempts = 0
-        _stopWatch.onDone = onComplete
-        _stopWatch.restart()
-    }
-
-    // The controller reports status asynchronously; poll it a few times rather
-    // than block the reset on a signal that may already have fired.
-    // Property-held (QtObject has no default property, so a bare child would
-    // not be created), exactly as RpcTransport holds its collector.
-    property Timer _stopWatch: Timer {
-        id: _stopWatch
-        interval: 700
-        repeat: true
-        property int attempts: 0
-        property var onDone: null
-        onTriggered: {
-            attempts += 1
-            var busy = (typeof nrrServiceController !== "undefined" && nrrServiceController)
-                ? nrrServiceController.busy === true
-                : false
-            // 4 = running in the controller's status vocabulary; anything else
-            // (stopped, not installed) means it is no longer enforcing.
-            var stopped = (typeof nrrServiceController !== "undefined" && nrrServiceController)
-                ? parseInt(nrrServiceController.status) !== 4
-                : false
-            if (!busy && (stopped || attempts >= 8)) {
-                stop()
-                var cb = onDone
-                onDone = null
-                if (typeof cb === "function") cb(stopped)
-            }
-        }
+        })
     }
 
     // Full-reset auxiliary-state purge via `principal-data.purge`. Caller's own

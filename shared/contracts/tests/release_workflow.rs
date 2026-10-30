@@ -96,6 +96,29 @@ fn job_runs(job: &Yaml) -> String {
         .unwrap_or_default()
 }
 
+/// A command split over lines whose continuation broke: the next line opens
+/// with an option, but the line before it no longer ends in `\` (bash) or a
+/// backtick (PowerShell), so the option runs as a command of its own.
+fn broken_continuation(workflow: &str) -> Option<String> {
+    let doc = load(workflow);
+    let jobs = doc["jobs"].as_hash()?;
+    for (name, job) in jobs {
+        let runs = job_runs(job);
+        let lines: Vec<&str> = runs.lines().collect();
+        for pair in lines.windows(2) {
+            let (before, next) = (pair[0].trim_end(), pair[1].trim_start());
+            if next.starts_with("--")
+                && !before.ends_with('\\')
+                && !before.ends_with('`')
+                && !before.ends_with('(')
+            {
+                return Some(format!("{}: {before:?} does not continue", name.as_str()?));
+            }
+        }
+    }
+    None
+}
+
 /// Why a tag could reach a build without the guard, if it could.
 fn guard_flaw(workflow: &str) -> Option<String> {
     let doc = load(workflow);
@@ -192,6 +215,64 @@ fn windows_contents_flaw(workflow: &str) -> Option<String> {
             "package {package:?}, contents check {check:?}, upload {upload:?}: the check must sit between them"
         )),
     }
+}
+
+/// Whether `glob`, where `*` is the only wildcard, matches the whole of `name`.
+fn glob_matches(glob: &str, name: &str) -> bool {
+    let parts: Vec<&str> = glob.split('*').collect();
+    let (first, rest) = parts.split_first().expect("split yields one part");
+    let Some(mut tail) = name.strip_prefix(first) else {
+        return false;
+    };
+    let Some((last, middle)) = rest.split_last() else {
+        return tail.is_empty();
+    };
+    for part in middle {
+        let Some(at) = tail.find(part) else {
+            return false;
+        };
+        tail = &tail[at + part.len()..];
+    }
+    tail.ends_with(last)
+}
+
+/// Why a Windows build could reach the release without its portable or its
+/// symbols archive, or an archive without a checksum, if it could.
+fn windows_symbols_flaw(workflow: &str) -> Option<String> {
+    // As package-windows.ps1 names them: `$artifactBase-portable.zip` and
+    // `$artifactBase-symbols.zip`.
+    let archives = [
+        "NetRuleRouter-windows-arm64-0.1.0-alpha.1-headless-portable.zip",
+        "NetRuleRouter-windows-arm64-0.1.0-alpha.1-headless-symbols.zip",
+    ];
+    let doc = load(workflow);
+    let steps = doc["jobs"]["windows"]["steps"]
+        .as_vec()
+        .cloned()
+        .unwrap_or_default();
+    let globs: Vec<&str> = steps
+        .iter()
+        .filter(|s| {
+            s["uses"]
+                .as_str()
+                .is_some_and(|u| u.starts_with("actions/upload-artifact@"))
+        })
+        .filter_map(|s| s["with"]["path"].as_str())
+        .flat_map(str::lines)
+        .filter_map(|line| line.trim().rsplit('/').next())
+        .collect();
+    if let Some(archive) = archives
+        .iter()
+        .find(|archive| !globs.iter().any(|glob| glob_matches(glob, archive)))
+    {
+        return Some(format!("no Windows upload glob matches {archive}"));
+    }
+    let release = job_runs(&doc["jobs"]["release"]);
+    if !release.contains("sha256sum -- * > SHA256SUMS") {
+        return Some("the checksums do not cover every downloaded file".into());
+    }
+    (!release.contains("gh release create \"$GITHUB_REF_NAME\" artifacts/* "))
+        .then(|| "the release does not attach every downloaded file".into())
 }
 
 /// Why a released file could lack provenance, or a job hold a right it does
@@ -342,6 +423,11 @@ fn a_windows_package_is_checked_against_its_list_before_upload() {
 }
 
 #[test]
+fn every_windows_build_reaches_the_release_with_its_symbols_archive() {
+    assert_eq!(windows_symbols_flaw(&release_workflow()), None);
+}
+
+#[test]
 fn every_released_file_is_attested_and_only_two_jobs_may_write() {
     assert_eq!(attestation_flaw(&release_workflow()), None);
 }
@@ -362,9 +448,38 @@ fn each_release_gate_regression_is_seen() {
         "    runs-on: ${{ matrix.runner }}\n    strategy:\n      fail-fast: false\n      matrix:\n        arch: [x86_64",
     );
     // A check that cannot find what it looks for reports it.
-    for check in [guard_flaw, windows_contents_flaw, attestation_flaw] {
+    for check in [
+        guard_flaw,
+        windows_contents_flaw,
+        attestation_flaw,
+        windows_symbols_flaw,
+    ] {
         assert!(check("jobs: {}\n").is_some());
     }
+
+    assert!(windows_symbols_flaw(&without(
+        "            ${{ runner.temp }}/dist/*.zip\n",
+        "            ${{ runner.temp }}/dist/*[0-9].zip\n",
+    ))
+    .is_some());
+    assert!(windows_symbols_flaw(&without(
+        "            ${{ runner.temp }}/dist/*.zip\n",
+        "            ${{ runner.temp }}/dist/*-symbols.zip\n",
+    ))
+    .is_some());
+    assert!(windows_symbols_flaw(&without(
+        "sha256sum -- * > SHA256SUMS",
+        "sha256sum -- *.msi > SHA256SUMS"
+    ))
+    .is_some());
+    assert!(windows_symbols_flaw(&without(
+        "\"$GITHUB_REF_NAME\" artifacts/* \\",
+        "\"$GITHUB_REF_NAME\" artifacts/*.msi \\"
+    ))
+    .is_some());
+    assert!(glob_matches("*.zip", "a-symbols.zip"));
+    assert!(!glob_matches("*-symbols.zip", "a.zip"));
+    assert!(!glob_matches("*.exe", "a.exe.zip"));
     assert!(glibc_floor_flaw("jobs: {}\n", &glibc_docs()).is_some());
 
     assert!(guard_flaw(&linux_unguarded).is_some());
@@ -412,6 +527,28 @@ fn the_full_package_installs_the_qt_licence_texts() {
 #[test]
 fn the_checksum_signature_is_verified_with_the_key_in_the_repository() {
     assert_eq!(signing_flaw(&release_workflow()), None);
+}
+
+#[test]
+fn every_multi_line_command_in_the_workflows_still_continues() {
+    for file in [
+        ".github/workflows/release.yml",
+        ".github/workflows/linux-quality.yml",
+        ".github/workflows/windows-quality.yml",
+        ".github/workflows/codeql.yml",
+    ] {
+        assert_eq!(broken_continuation(&repo_file(file)), None, "{file}");
+    }
+    let workflow = release_workflow();
+    let anchor = "--title \"NetRuleRouter $GITHUB_REF_NAME\" \\\n";
+    assert!(workflow.contains(anchor), "the release title line moved");
+    // The slip this exists for: a literal `\r` left where the `\` was.
+    let broken = workflow.replacen(
+        anchor,
+        "--title \"NetRuleRouter $GITHUB_REF_NAME\" \\r\n",
+        1,
+    );
+    assert!(broken_continuation(&broken).is_some());
 }
 
 /// The two checks above must see each break they exist for.

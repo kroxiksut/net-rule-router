@@ -1968,7 +1968,9 @@ impl PrincipalPlanSource for ProductionPrincipalPlanSource {
                 return PlanRead::Unreadable(reason);
             }
             RulesRead::Rules(snapshot) => Some(snapshot),
-            RulesRead::NoPolicy => None,
+            // Settings but no revision: protection holds as over an emptied
+            // book. Without settings an empty book plans nothing either.
+            RulesRead::NoPolicy => Some(ActiveRulesSnapshot::default()),
         };
         let planned = self
             .plan_over(principal, availability, || rules)
@@ -2684,6 +2686,33 @@ mod tests {
             planned.is_some(),
             "a principal in a tunnel mode must reach the caller, which is what decides whether they count as unprotected",
         );
+    }
+
+    /// Settings but no rule revision at all ("Start empty", a reset with no
+    /// baseline): "Everything" holds as over an emptied book, while a user who
+    /// never configured anything still gets nothing planned.
+    #[test]
+    fn everything_with_no_rule_revision_still_waits_for_the_tunnel() {
+        use crate::principal_enforcement::PlanRead;
+        for policy in [Policy::everything(), Policy::prefer_secondary()] {
+            let (api, links) = machine(true);
+            let read = source(Arc::new(NoRules), Arc::new(policy))
+                .with_machine_facts(
+                    api as Arc<dyn nrr_platform_api::route_table::RouteTablePort>,
+                    links as Arc<dyn nrr_platform_api::adapters::AdapterEventSource>,
+                )
+                .plan_read_for(&user(), availability(false));
+            match read {
+                PlanRead::Planned(planned) => {
+                    assert_eq!(held(&planned.plan), Held::Everything);
+                    assert!(planned.guard_holding);
+                }
+                _ => panic!("no rule revision dropped the whole guard"),
+            }
+        }
+        let never_configured = source(Arc::new(NoRules), Arc::new(NoPolicy))
+            .plan_read_for(&user(), availability(false));
+        assert!(matches!(never_configured, PlanRead::NoPolicy));
     }
 
     /// A user who never bound their adapters has nothing to enforce, and that is

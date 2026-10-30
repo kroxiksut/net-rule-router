@@ -4,6 +4,9 @@
 
 This release still has gaps. Each one is listed here with what it means for
 you and what to do about it, and it stays on this page until it is fixed.
+Ran into one that is not listed? Open an
+[issue](https://github.com/kroxiksut/net-rule-router/issues) or ask in the
+Telegram channel [t.me/netrulerouter](https://t.me/netrulerouter).
 
 ## Right after the computer starts
 

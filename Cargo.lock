@@ -1348,7 +1348,7 @@ dependencies = [
 
 [[package]]
 name = "nrr-application"
-version = "0.1.0-prealpha"
+version = "0.1.0-alpha.1"
 dependencies = [
  "nrr-domain",
  "nrr-mock-backend",
@@ -1357,7 +1357,7 @@ dependencies = [
 
 [[package]]
 name = "nrr-broker"
-version = "0.1.0-prealpha"
+version = "0.1.0-alpha.1"
 dependencies = [
  "getrandom 0.2.17",
  "nrr-ipc-client",
@@ -1372,7 +1372,7 @@ dependencies = [
 
 [[package]]
 name = "nrr-cli"
-version = "0.1.0-prealpha"
+version = "0.1.0-alpha.1"
 dependencies = [
  "embed-resource",
  "nrr-ipc-client",
@@ -1385,7 +1385,7 @@ dependencies = [
 
 [[package]]
 name = "nrr-client-logic"
-version = "0.1.0-prealpha"
+version = "0.1.0-alpha.1"
 dependencies = [
  "boa_engine",
  "nrr-shared",
@@ -1394,7 +1394,7 @@ dependencies = [
 
 [[package]]
 name = "nrr-desktop-gui"
-version = "0.1.0-prealpha"
+version = "0.1.0-alpha.1"
 dependencies = [
  "boa_engine",
  "nrr-application",
@@ -1407,7 +1407,7 @@ dependencies = [
 
 [[package]]
 name = "nrr-desktop-tray"
-version = "0.1.0-prealpha"
+version = "0.1.0-alpha.1"
 dependencies = [
  "nrr-platform-api",
  "nrr-shared",
@@ -1418,7 +1418,7 @@ dependencies = [
 
 [[package]]
 name = "nrr-diagnostics"
-version = "0.1.0-prealpha"
+version = "0.1.0-alpha.1"
 dependencies = [
  "chrono",
  "hmac",
@@ -1435,8 +1435,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "nrr-docs-html"
+version = "0.1.0-alpha.1"
+dependencies = [
+ "nrr-shared",
+ "pulldown-cmark",
+ "tempfile",
+]
+
+[[package]]
 name = "nrr-domain"
-version = "0.1.0-prealpha"
+version = "0.1.0-alpha.1"
 dependencies = [
  "idna",
  "nrr-shared",
@@ -1445,7 +1454,7 @@ dependencies = [
 
 [[package]]
 name = "nrr-ipc-client"
-version = "0.1.0-prealpha"
+version = "0.1.0-alpha.1"
 dependencies = [
  "nrr-service-runtime",
  "nrr-shared",
@@ -1457,7 +1466,7 @@ dependencies = [
 
 [[package]]
 name = "nrr-launcher"
-version = "0.1.0-prealpha"
+version = "0.1.0-alpha.1"
 dependencies = [
  "chrono",
  "embed-resource",
@@ -1487,7 +1496,7 @@ dependencies = [
 
 [[package]]
 name = "nrr-linux-service"
-version = "0.1.0-prealpha"
+version = "0.1.0-alpha.1"
 dependencies = [
  "nrr-diagnostics",
  "nrr-platform-api",
@@ -1503,7 +1512,7 @@ dependencies = [
 
 [[package]]
 name = "nrr-mock-backend"
-version = "0.1.0-prealpha"
+version = "0.1.0-alpha.1"
 dependencies = [
  "nrr-diagnostics",
  "nrr-domain",
@@ -1515,7 +1524,7 @@ dependencies = [
 
 [[package]]
 name = "nrr-platform-api"
-version = "0.1.0-prealpha"
+version = "0.1.0-alpha.1"
 dependencies = [
  "getrandom 0.3.4",
  "libc",
@@ -1532,7 +1541,7 @@ dependencies = [
 
 [[package]]
 name = "nrr-platform-linux"
-version = "0.1.0-prealpha"
+version = "0.1.0-alpha.1"
 dependencies = [
  "libc",
  "nftables",
@@ -1550,7 +1559,7 @@ dependencies = [
 
 [[package]]
 name = "nrr-platform-windows"
-version = "0.1.0-prealpha"
+version = "0.1.0-alpha.1"
 dependencies = [
  "getrandom 0.3.4",
  "nrr-platform-api",
@@ -1570,11 +1579,11 @@ dependencies = [
 
 [[package]]
 name = "nrr-qt-host"
-version = "0.1.0-prealpha"
+version = "0.1.0-alpha.1"
 
 [[package]]
 name = "nrr-service-runtime"
-version = "0.1.0-prealpha"
+version = "0.1.0-alpha.1"
 dependencies = [
  "base64 0.22.1",
  "getrandom 0.3.4",
@@ -1601,7 +1610,7 @@ dependencies = [
 
 [[package]]
 name = "nrr-shared"
-version = "0.1.0-prealpha"
+version = "0.1.0-alpha.1"
 dependencies = [
  "serde",
  "serde_json",
@@ -1611,7 +1620,7 @@ dependencies = [
 
 [[package]]
 name = "nrr-sqlite-support"
-version = "0.1.0-prealpha"
+version = "0.1.0-alpha.1"
 dependencies = [
  "rusqlite",
  "tempfile",
@@ -1619,7 +1628,7 @@ dependencies = [
 
 [[package]]
 name = "nrr-storage"
-version = "0.1.0-prealpha"
+version = "0.1.0-alpha.1"
 dependencies = [
  "bitflags 2.13.2",
  "hmac",
@@ -1635,7 +1644,7 @@ dependencies = [
 
 [[package]]
 name = "nrr-storage-sidecar"
-version = "0.1.0-prealpha"
+version = "0.1.0-alpha.1"
 dependencies = [
  "nrr-sqlite-support",
  "rusqlite",
@@ -1645,7 +1654,7 @@ dependencies = [
 
 [[package]]
 name = "nrr-tui"
-version = "0.1.0-prealpha"
+version = "0.1.0-alpha.1"
 dependencies = [
  "base64 0.22.1",
  "chrono",
@@ -1667,7 +1676,7 @@ dependencies = [
 
 [[package]]
 name = "nrr-ui-support"
-version = "0.1.0-prealpha"
+version = "0.1.0-alpha.1"
 dependencies = [
  "nrr-platform-api",
  "nrr-shared",
@@ -1676,7 +1685,7 @@ dependencies = [
 
 [[package]]
 name = "nrr-windows-service"
-version = "0.1.0-prealpha"
+version = "0.1.0-alpha.1"
 dependencies = [
  "embed-resource",
  "nrr-diagnostics",
@@ -1968,6 +1977,24 @@ checksum = "985e7ec9bb745e6ce6535b544d84d6cd6f7ad8bd711c398938ae983b91a766d9"
 dependencies = [
  "unicode-ident",
 ]
+
+[[package]]
+name = "pulldown-cmark"
+version = "0.13.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "278e9268c93b9e498a2da46c34d90ba93a3255eb99009646398f34bc73ab36eb"
+dependencies = [
+ "bitflags 2.13.2",
+ "memchr",
+ "pulldown-cmark-escape",
+ "unicase",
+]
+
+[[package]]
+name = "pulldown-cmark-escape"
+version = "0.11.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "007d8adb5ddab6f8e3f491ac63566a7d5002cc7ed73901f72057943fa71ae1ae"
 
 [[package]]
 name = "quote"
@@ -2841,6 +2868,12 @@ name = "typenum"
 version = "1.20.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b6f5e870be6c3b371b77fe0ee0bafb859fa4964b4404c27de1d380043c4dda20"
+
+[[package]]
+name = "unicase"
+version = "2.10.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "357cc3acc6a036009fd6c973ed009037c732d60d0b4f6c673e9041497482a28f"
 
 [[package]]
 name = "unicode-ident"

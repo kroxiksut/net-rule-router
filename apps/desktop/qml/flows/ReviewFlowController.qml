@@ -661,13 +661,14 @@ QtObject {
                     state.secondaryBytesB64,
                     state.primaryPath,
                     state.secondaryPath,
-                    { mode: state.mode, hydration: state.hydration })
+                    { mode: state.mode, hydration: state.hydration, label: state.label })
             } else {
                 root.presetImportController.startPresetImportReviewFlow(
                     state.targetRoute,
                     state.bytesB64,
                     state.sourcePath,
-                    state.mode)
+                    state.mode,
+                    { hydration: state.hydration, label: state.label })
             }
         } else if (root._activeReviewKind === "rules-reset-to-baseline") {
             startResetToBaselineFlow()

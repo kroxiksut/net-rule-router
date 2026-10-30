@@ -13,11 +13,11 @@
           NetRuleRouter.exe     start here
           README.txt  README.ru.txt
           <tray, service, console, terminal interface, Qt host, the Qt runtime, wintun.dll>
-          <*.pdb>               line tables, so a panic names file:line
           qml\                  Qt's own modules, written by windeployqt
           apps\desktop\qml\     the app's own QML
           locales\  presets\  configs\  assets\
           scripts\              recovery and uninstall scripts
+          docs\                 offline documentation, docs\<language>\index.html
 
     Two QML trees under one name would collide, which is why the app's own tree
     keeps the `apps\desktop\qml` path it has in the checkout, where the launcher
@@ -27,6 +27,12 @@
     Every package carries build-info.json - version, commit, whether the tree
     had uncommitted changes, build time, Qt version - so a report about a
     specific copy can be tied back to the code that produced it.
+
+    No package carries debug symbols (*.pdb): a panic names its file:line
+    without them. A run that writes any artifact also writes
+    <artifact>-symbols.zip beside it, the PDBs of exactly the executables
+    shipped, for reading a crash's call stack later. A bare folder gets none:
+    the symbols of the same build stay in the target directory.
 
 .PARAMETER OutputRoot
     Where the package folder is created. The package itself is always
@@ -55,13 +61,14 @@
     libraries, and the network and touch plugins nothing loads.
 
 .PARAMETER Zip
-    Also produce NetRuleRouter-windows-<arch>-<version>+<commit>.zip next to
-    the folder, for carrying the build on a flash drive.
+    Also produce NetRuleRouter-windows-<arch>-<version>-portable.zip
+    next to the folder, for carrying the build on a flash drive, and the
+    -symbols.zip of the build.
 
 .PARAMETER Installers
     Also build both installers from the package: the EXE (Inno Setup 6) and the
     MSI (WiX Toolset 5), next to the folder, plus a SHA256 checksum file that
-    covers every artifact of this run, the archive included.
+    covers every artifact of this run, the archives included.
 
 .PARAMETER Exe
     Build the EXE installer only (same output as -Installers otherwise).
@@ -72,8 +79,8 @@
 .PARAMETER Headless
     Package without the window and the tray: the service, the console and the
     terminal interface, for servers and Windows without a desktop session. The
-    folder is <OutputRoot>\NetRuleRouter-headless and every artifact name ends
-    in -headless.
+    folder is <OutputRoot>\NetRuleRouter-headless and every artifact name
+    carries -headless right after the version (...-headless-portable.zip).
 
 .PARAMETER Force
     Replace an existing package folder.
@@ -370,28 +377,335 @@ function Resolve-WixTool {
     return $wix
 }
 
-# The MSI's licence page reads RTF; each line of the plain text becomes a paragraph.
-function ConvertTo-RtfFile {
-    param([string] $Source, [string] $Destination)
+function ConvertTo-RtfText {
+    param([string] $Text)
+    $out = New-Object System.Text.StringBuilder
+    foreach ($ch in $Text.ToCharArray()) {
+        $code = [int]$ch
+        if ($ch -eq [char]'\' -or $ch -eq [char]'{' -or $ch -eq [char]'}') { [void]$out.Append('\').Append($ch) }
+        elseif ($code -gt 127) { [void]$out.Append("\u$(if ($code -gt 32767) { $code - 65536 } else { $code })?") }
+        else { [void]$out.Append($ch) }
+    }
+    return $out.ToString()
+}
+
+# A line of the agreement's Markdown as the licence pages show it: bold kept,
+# a link as "text (url)", code without its backticks. RichEdit breaks a line
+# before the "@" of an e-mail address: with -LinkFields (the EXE page,
+# RichEdit 4.1) the address is a mailto link, which it keeps whole; the MSI
+# page's RichEdit 2.0 breaks even a link, so there the address is glued with
+# zero-width no-break spaces.
+function ConvertTo-RtfInline {
+    param([string] $Text, [switch] $LinkFields)
+    $mails = New-Object System.Collections.Generic.List[object]
+    $mail = [System.Text.RegularExpressions.MatchEvaluator] {
+        param($match)
+        $address = $match.Groups['address'].Value
+        $label = if ($match.Groups['label'].Success) { $match.Groups['label'].Value } else { $address }
+        $mails.Add(@{ Address = $address; Label = $label })
+        "$([char]1)$($mails.Count - 1)$([char]1)"
+    }
+    $Text = [regex]::Replace($Text, '\[(?<label>[^\]]+)\]\(mailto:(?<address>[^)\s]+)\)', $mail)
+    $Text = [regex]::Replace($Text, '<(?:mailto:)?(?<address>[^<>\s:]+@[^<>\s]+)>', $mail)
+    $link = [System.Text.RegularExpressions.MatchEvaluator] {
+        param($match)
+        $label = $match.Groups[1].Value
+        $url = $match.Groups[2].Value
+        # A relative link names a file beside the Markdown, which no installer carries.
+        if ($url -notmatch '^[a-z][a-z0-9+.-]*:' -or $url -eq $label) { $label } else { "$label ($url)" }
+    }
+    $Text = [regex]::Replace($Text, '\[([^\]]+)\]\(([^)\s]+)\)', $link)
+    $Text = [regex]::Replace($Text, '<([^<>\s]+)>', '$1')
+    $Text = [regex]::Replace($Text, '`([^`]*)`', '$1')
+    $rtf = [regex]::Replace((ConvertTo-RtfText $Text), '\*\*(.+?)\*\*', '{\b $1}')
+    $placed = [System.Text.RegularExpressions.MatchEvaluator] {
+        param($match)
+        $entry = $mails[[int]$match.Groups[1].Value]
+        $label = ConvertTo-RtfText $entry.Label
+        if ($LinkFields) {
+            "{\field{\*\fldinst{HYPERLINK `"mailto:$($entry.Address)`"}}{\fldrslt{$label}}}"
+        } else {
+            [regex]::Replace($label, '[@.]', '\u-257?$0\u-257?')
+        }
+    }
+    return [regex]::Replace($rtf, "$([char]1)(\d+)$([char]1)", $placed)
+}
+
+# Both installers' licence pages read RTF and wrap it to their own width: the
+# lines of a paragraph or list item join, a blank line or a rule ends it, and
+# headings and list items keep their look.
+function ConvertFrom-AgreementMarkdown {
+    param([string] $Source, [string] $Destination, [switch] $LinkFields)
+
+    $blocks = New-Object System.Collections.Generic.List[object]
+    $current = $null
+    foreach ($raw in [System.IO.File]::ReadAllLines($Source, [System.Text.Encoding]::UTF8)) {
+        $line = $raw.TrimEnd()
+        $heading = [regex]::Match($line, '^(#{1,6})\s+(.+)$')
+        $item = [regex]::Match($line, '^\s*([-*+]|\d+[.)])\s+(.+)$')
+        if (-not $line.Trim() -or $line -match '^\s*(-{3,}|\*{3,}|_{3,})\s*$' -or $heading.Success -or $item.Success) {
+            if ($current) { $blocks.Add($current) }
+            $current = $null
+        }
+        if ($heading.Success) {
+            $blocks.Add(@{ Kind = $(if ($heading.Groups[1].Length -eq 1) { 'title' } else { 'heading' }); Text = $heading.Groups[2].Value })
+        } elseif ($item.Success) {
+            $marker = $item.Groups[1].Value
+            $current = @{ Kind = 'item'; Marker = $(if ($marker -match '^\d') { $marker } else { '\bullet' }); Text = $item.Groups[2].Value }
+        } elseif (-not $line.Trim() -or $line -match '^\s*(-{3,}|\*{3,}|_{3,})\s*$') {
+            continue
+        } elseif ($current) {
+            $current.Text += ' ' + $line.Trim()
+        } else {
+            $current = @{ Kind = 'paragraph'; Text = $line.Trim() }
+        }
+    }
+    if ($current) { $blocks.Add($current) }
+    if ($blocks.Count -lt 2) {
+        throw "'$Source' holds no agreement text."
+    }
 
     $rtf = New-Object System.Text.StringBuilder
-    [void]$rtf.Append('{\rtf1\ansi\deff0{\fonttbl{\f0 Consolas;}}\fs16 ')
-    foreach ($line in [System.IO.File]::ReadAllLines($Source)) {
-        foreach ($ch in $line.ToCharArray()) {
-            $code = [int]$ch
-            if ($ch -eq [char]'\' -or $ch -eq [char]'{' -or $ch -eq [char]'}') { [void]$rtf.Append('\').Append($ch) }
-            elseif ($code -gt 127) { [void]$rtf.Append("\u$(if ($code -gt 32767) { $code - 65536 } else { $code })?") }
-            else { [void]$rtf.Append($ch) }
+    [void]$rtf.Append("{\rtf1\ansi\ansicpg1252\deff0\uc1{\fonttbl{\f0\fswiss\fcharset0 Segoe UI;}}\f0\fs18`r`n")
+    foreach ($block in $blocks) {
+        $text = ConvertTo-RtfInline $block.Text -LinkFields:$LinkFields
+        switch ($block.Kind) {
+            'title' { [void]$rtf.Append("\pard\sa160\b\fs24 $text\b0\fs18\par`r`n") }
+            'heading' { [void]$rtf.Append("\pard\keepn\sb160\sa80\b\fs20 $text\b0\fs18\par`r`n") }
+            'item' { [void]$rtf.Append("\pard\fi-240\li480\tx480\sa60 $($block.Marker)\tab $text\par`r`n") }
+            default { [void]$rtf.Append("\pard\sa120 $text\par`r`n") }
         }
-        [void]$rtf.Append("\par`r`n")
     }
     [void]$rtf.Append('}')
     [System.IO.File]::WriteAllText($Destination, $rtf.ToString(), [System.Text.Encoding]::ASCII)
 }
 
+# The revision in an agreement's header line. The installers record it with
+# the account that accepted the page, and the app skips its own page only for
+# that account and exactly this revision.
+function Get-AgreementRevision {
+    param([string] $Source)
+    foreach ($line in [System.IO.File]::ReadAllLines($Source, [System.Text.Encoding]::UTF8)) {
+        $header = [regex]::Match($line, '^(?:Agreement revision|Редакция соглашения) (\d+) ')
+        if ($header.Success) { return [int]$header.Groups[1].Value }
+    }
+    throw "'$Source' names no agreement revision."
+}
+
+# The wizards' pictures, drawn from the app icon on a light background:
+# otherwise WiX shows its red ones and Inno Setup its own.
+function New-Canvas {
+    param([int] $Width, [int] $Height)
+    $bitmap = New-Object System.Drawing.Bitmap $Width, $Height, ([System.Drawing.Imaging.PixelFormat]::Format24bppRgb)
+    $graphics = [System.Drawing.Graphics]::FromImage($bitmap)
+    $graphics.InterpolationMode = [System.Drawing.Drawing2D.InterpolationMode]::HighQualityBicubic
+    $graphics.SmoothingMode = [System.Drawing.Drawing2D.SmoothingMode]::AntiAlias
+    $graphics.PixelOffsetMode = [System.Drawing.Drawing2D.PixelOffsetMode]::HighQuality
+    $graphics.TextRenderingHint = [System.Drawing.Text.TextRenderingHint]::AntiAliasGridFit
+    $graphics.Clear([System.Drawing.Color]::White)
+    return $bitmap, $graphics
+}
+
+# A panel PanelWidth wide on the left, holding the icon and the product name;
+# white beyond it, where the wizard writes its own text.
+function New-PanelBitmap {
+    param([string] $Path, [int] $Width, [int] $Height, [int] $PanelWidth, [System.Drawing.Image] $Icon)
+    $bitmap, $graphics = New-Canvas $Width $Height
+    $panel = New-Object System.Drawing.SolidBrush ([System.Drawing.Color]::FromArgb(0xEC, 0xF2, 0xF8))
+    $ink = New-Object System.Drawing.SolidBrush ([System.Drawing.Color]::FromArgb(0x1B, 0x27, 0x33))
+    $scale = $PanelWidth / 164.0
+    $font = New-Object System.Drawing.Font('Segoe UI Semibold', [float](19 * $scale), [System.Drawing.FontStyle]::Regular, [System.Drawing.GraphicsUnit]::Pixel)
+    $centered = New-Object System.Drawing.StringFormat
+    $centered.Alignment = [System.Drawing.StringAlignment]::Center
+    try {
+        $graphics.FillRectangle($panel, 0, 0, $PanelWidth, $Height)
+        $size = [int](96 * $scale)
+        $top = [int]($Height * 0.3)
+        $graphics.DrawImage($Icon, [int](($PanelWidth - $size) / 2), $top, $size, $size)
+        $caption = New-Object System.Drawing.RectangleF 0, ($top + $size + 14 * $scale), $PanelWidth, (40 * $scale)
+        $graphics.DrawString('NetRuleRouter', $font, $ink, $caption, $centered)
+        $bitmap.Save($Path, [System.Drawing.Imaging.ImageFormat]::Bmp)
+    } finally {
+        $centered.Dispose(); $font.Dispose(); $ink.Dispose(); $panel.Dispose()
+        $graphics.Dispose(); $bitmap.Dispose()
+    }
+}
+
+# The icon alone on white, IconSize square, Right pixels from the right edge
+# (centred when negative).
+function New-IconBitmap {
+    param([string] $Path, [int] $Width, [int] $Height, [int] $IconSize, [int] $Right, [System.Drawing.Image] $Icon)
+    $bitmap, $graphics = New-Canvas $Width $Height
+    try {
+        $x = if ($Right -lt 0) { [int](($Width - $IconSize) / 2) } else { $Width - $Right - $IconSize }
+        $graphics.DrawImage($Icon, $x, [int](($Height - $IconSize) / 2), $IconSize, $IconSize)
+        $bitmap.Save($Path, [System.Drawing.Imaging.ImageFormat]::Bmp)
+    } finally {
+        $graphics.Dispose(); $bitmap.Dispose()
+    }
+}
+
+# The MSI's banner and side picture (WixUIBannerBmp, WixUIDialogBmp) and Inno
+# Setup's at 100, 150 and 200 % scaling, into Folder.
+function New-InstallerImages {
+    param([string] $Folder)
+    Add-Type -AssemblyName System.Drawing
+    $source = Join-Path $repoRoot 'assets\icons\app\icon-256.png'
+    if (-not (Test-Path -LiteralPath $source)) {
+        throw "The app icon '$source' is missing from the checkout."
+    }
+    $icon = [System.Drawing.Image]::FromFile($source)
+    try {
+        $images = @{
+            Banner = Join-Path $Folder 'msi-banner.bmp'
+            Dialog = Join-Path $Folder 'msi-dialog.bmp'
+            Wizard = @()
+            WizardSmall = @()
+        }
+        New-IconBitmap -Path $images.Banner -Width 493 -Height 58 -IconSize 44 -Right 10 -Icon $icon
+        New-PanelBitmap -Path $images.Dialog -Width 493 -Height 312 -PanelWidth 164 -Icon $icon
+        foreach ($size in @(@(164, 314, 55, 55), @(246, 459, 83, 80), @(328, 628, 110, 106))) {
+            $large = Join-Path $Folder "wizard-$($size[0]).bmp"
+            New-PanelBitmap -Path $large -Width $size[0] -Height $size[1] -PanelWidth $size[0] -Icon $icon
+            $small = Join-Path $Folder "wizard-small-$($size[2]).bmp"
+            New-IconBitmap -Path $small -Width $size[2] -Height $size[3] -IconSize ([Math]::Min($size[2], $size[3]) - 6) -Right -1 -Icon $icon
+            $images.Wizard += $large
+            $images.WizardSmall += $small
+        }
+        return $images
+    } finally {
+        $icon.Dispose()
+    }
+}
+
+# Windows Installer's automation object has no type information PowerShell can
+# bind to, so its members are reached by name. A string PowerShell wrapped (as
+# Join-Path returns it) would reach it as a type mismatch: the bare value goes.
+function Invoke-MsiMember {
+    param($Object, [string] $Member, [string] $Kind = 'InvokeMethod', [object[]] $Arguments = @())
+    $bare = [object[]]@($Arguments | ForEach-Object { $_.PSObject.BaseObject })
+    return $Object.GetType().InvokeMember($Member, [System.Reflection.BindingFlags]$Kind, $null, $Object, $bare)
+}
+
+# A transform that left the wizard English would reach a Russian Windows with
+# nothing saying so: it is applied to a copy of the MSI, which must then carry
+# the culture's language and a text of its .wxl exactly as written there.
+function Test-LanguageTransform {
+    param([string] $Msi, [string] $Transform, [hashtable] $Culture, [string] $Copy)
+    Copy-Item -LiteralPath $Msi -Destination $Copy -Force
+    $wxl = [xml][System.IO.File]::ReadAllText((Join-Path $installerSources "NetRuleRouter.$($Culture.Culture).wxl"), [System.Text.Encoding]::UTF8)
+    $expected = ($wxl.WixLocalization.String | Where-Object { $_.Id -eq 'NrrRemoveIntro' }).Value
+    $found = @{}
+    $held = New-Object System.Collections.Generic.List[object]
+    try {
+        $installer = New-Object -ComObject WindowsInstaller.Installer
+        $held.Add($installer)
+        $database = Invoke-MsiMember $installer 'OpenDatabase' -Arguments @($Copy, 1)
+        $held.Add($database)
+        # With the errors the transform itself suppresses, as an installation
+        # applies it: a language transform changes the code page.
+        $summary = Invoke-MsiMember $installer 'SummaryInformation' 'GetProperty' @($Transform, 0)
+        $held.Add($summary)
+        $suppressed = [int](Invoke-MsiMember $summary 'Property' 'GetProperty' @(16)) -band 0xFFFF
+        Invoke-MsiMember $database 'ApplyTransform' -Arguments @($Transform, $suppressed) | Out-Null
+        $queries = @{
+            Language = 'SELECT `Value` FROM `Property` WHERE `Property` = ''ProductLanguage'''
+            Text = 'SELECT `Text` FROM `Control` WHERE `Dialog_` = ''NrrRemoveDlg'' AND `Control` = ''Intro'''
+        }
+        foreach ($name in $queries.Keys) {
+            $view = Invoke-MsiMember $database 'OpenView' -Arguments @($queries[$name])
+            $held.Add($view)
+            Invoke-MsiMember $view 'Execute' | Out-Null
+            $record = Invoke-MsiMember $view 'Fetch'
+            if ($record) {
+                $held.Add($record)
+                $found[$name] = Invoke-MsiMember $record 'StringData' 'GetProperty' @(1)
+            }
+            Invoke-MsiMember $view 'Close' | Out-Null
+        }
+    } finally {
+        $held.Reverse()
+        foreach ($object in $held) {
+            [void][System.Runtime.InteropServices.Marshal]::FinalReleaseComObject($object)
+        }
+        [GC]::Collect()
+        [GC]::WaitForPendingFinalizers()
+    }
+    if ("$($found.Language)" -ne "$($Culture.Lcid)" -or -not $expected -or "$($found.Text)" -cne $expected) {
+        throw "The $($Culture.Culture) transform does not turn the wizard $($Culture.Culture): ProductLanguage '$($found.Language)', text '$($found.Text)'."
+    }
+}
+
+# Each transform stored in the MSI under its language id, and every language in
+# the package's template: Windows Installer then applies the one matching the
+# display language by itself.
+function Add-LanguageTransforms {
+    param([string] $Msi, [hashtable] $Transforms, [int] $BaseLanguage)
+    # Every object is released at the end: one left holds the file open.
+    $held = New-Object System.Collections.Generic.List[object]
+    try {
+        $installer = New-Object -ComObject WindowsInstaller.Installer
+        $held.Add($installer)
+        $database = Invoke-MsiMember $installer 'OpenDatabase' -Arguments @($Msi, 1)
+        $held.Add($database)
+        foreach ($language in $Transforms.Keys) {
+            $view = Invoke-MsiMember $database 'OpenView' -Arguments @('INSERT INTO `_Storages` (`Name`, `Data`) VALUES (?, ?)')
+            $held.Add($view)
+            $record = Invoke-MsiMember $installer 'CreateRecord' -Arguments @(2)
+            $held.Add($record)
+            Invoke-MsiMember $record 'StringData' 'SetProperty' @(1, "$language") | Out-Null
+            Invoke-MsiMember $record 'SetStream' -Arguments @(2, $Transforms[$language]) | Out-Null
+            Invoke-MsiMember $view 'Execute' -Arguments @($record) | Out-Null
+            Invoke-MsiMember $view 'Close' | Out-Null
+        }
+        $summary = Invoke-MsiMember $database 'SummaryInformation' 'GetProperty' @(1)
+        $held.Add($summary)
+        $platform = ("$(Invoke-MsiMember $summary 'Property' 'GetProperty' @(7))" -split ';')[0]
+        $languages = @($BaseLanguage) + @($Transforms.Keys | Sort-Object)
+        Invoke-MsiMember $summary 'Property' 'SetProperty' @(7, "$platform;$($languages -join ',')") | Out-Null
+        Invoke-MsiMember $summary 'Persist' | Out-Null
+        Invoke-MsiMember $database 'Commit' | Out-Null
+    } finally {
+        $held.Reverse()
+        foreach ($object in $held) {
+            [void][System.Runtime.InteropServices.Marshal]::FinalReleaseComObject($object)
+        }
+        [GC]::Collect()
+        [GC]::WaitForPendingFinalizers()
+    }
+}
+
+# The MSI's components of the offline documentation, one per file, each held to
+# the NRR_DOCS choice: WiX harvests a folder only without a condition.
+function Write-DocsFragment {
+    param([string] $PackageRoot, [string] $Destination)
+    $root = $PackageRoot.TrimEnd('\')
+    $files = @(Get-ChildItem -LiteralPath (Join-Path $root 'docs') -Recurse -File | Sort-Object FullName)
+    if ($files.Count -eq 0) {
+        throw "No offline documentation in '$root\docs'."
+    }
+    $lines = New-Object System.Collections.Generic.List[string]
+    $lines.Add('<?xml version="1.0" encoding="utf-8"?>')
+    $lines.Add('<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs"><Fragment>')
+    $lines.Add('<ComponentGroup Id="DocsFiles" Directory="INSTALLFOLDER">')
+    $index = 0
+    foreach ($file in $files) {
+        $index++
+        $relative = $file.FullName.Substring($root.Length + 1)
+        $folder = [System.Security.SecurityElement]::Escape((Split-Path -Parent $relative))
+        $source = [System.Security.SecurityElement]::Escape("!(bindpath.pkg)\$relative")
+        $lines.Add(('  <Component Id="NrrDoc{0}" Subdirectory="{1}" Condition="NRR_DOCS=&quot;1&quot;">' -f $index, $folder))
+        $lines.Add(('    <File Id="NrrDocFile{0}" Source="{1}" KeyPath="yes" />' -f $index, $source))
+        $lines.Add('  </Component>')
+    }
+    $lines.Add('</ComponentGroup></Fragment></Wix>')
+    [System.IO.File]::WriteAllLines($Destination, [string[]]$lines, (New-Object System.Text.UTF8Encoding $false))
+}
+
 # Resolved before the build, so a missing tool fails in seconds, not after it.
 $buildExe = $Installers -or $Exe
 $buildMsi = $Installers -or $Msi
+$buildSymbols = $Zip -or $buildExe -or $buildMsi
 $iscc = if ($buildExe) { Resolve-InnoCompiler } else { $null }
 $wix = if ($buildMsi) { Resolve-WixTool } else { $null }
 
@@ -426,7 +740,6 @@ if ($archSpec.RustTarget) {
 }
 $productVersion = Resolve-ProductVersion -Metadata $metadata
 $revision = Resolve-SourceRevision
-$buildStamp = "$productVersion+$($revision.commit)" + $(if ($revision.dirty) { '-dirty' } else { '' })
 Write-Step "version $productVersion, revision $($revision.commit)$(if ($revision.dirty) { ' (uncommitted changes)' })"
 
 if (-not $SkipBuild) {
@@ -481,21 +794,26 @@ $executables = @('nrr-service.exe', 'nrr-cli.exe', 'nrr-tui.exe')
 if (-not $Headless) {
     $executables = @('NetRuleRouter.exe', 'NetRuleRouterTray.exe') + $executables
 }
+# The linker names the PDB after the crate-style name: `nrr-cli` -> `nrr_cli.pdb`.
+function Get-SymbolsName {
+    param([string]$Executable)
+    return ([IO.Path]::GetFileNameWithoutExtension($Executable) -replace '-', '_') + '.pdb'
+}
+# Kept out of the package; they go to the symbols archive.
+$symbolFiles = New-Object System.Collections.Generic.List[string]
 foreach ($binaryName in $executables) {
     $source = Join-Path $releaseDir $binaryName
     if (-not (Test-Path $source)) {
         throw "'$binaryName' is missing from '$releaseDir'. Run without -SkipBuild."
     }
     Copy-Item -Path $source -Destination $binDir -Force
-    # Line tables for the panic message; the backtrace looks beside the exe.
-    # Cargo names the PDB after the crate-style name: `nrr-cli` -> `nrr_cli.pdb`.
-    $pdb = Join-Path $releaseDir (([IO.Path]::GetFileNameWithoutExtension($binaryName) -replace '-', '_') + '.pdb')
-    if (-not (Test-Path $pdb)) {
+    $pdb = Join-Path $releaseDir (Get-SymbolsName $binaryName)
+    if ($buildSymbols -and -not (Test-Path -LiteralPath $pdb)) {
         throw "'$(Split-Path $pdb -Leaf)' is missing from '$releaseDir'. Run without -SkipBuild."
     }
-    Copy-Item -Path $pdb -Destination $binDir -Force
+    $symbolFiles.Add($pdb)
 }
-Write-Step "copied $($executables.Count) executables with their symbols"
+Write-Step "copied $($executables.Count) executables"
 
 if (-not $Headless) {
     $nativeHost = Resolve-NativeHost -ReleaseDir $releaseDir
@@ -662,6 +980,18 @@ if ($Headless) {
     Write-Step 'copied the QML, locales, presets, configs, icons, images and user scripts'
 }
 
+# ── Offline documentation ────────────────────────────────────────────────────
+
+# docs\<language>\index.html, opened by Help > Documentation. Built for this
+# machine, never for -Arch: the converter runs here. A link that reaches
+# nothing fails the run.
+$docsDir = Join-Path $packageRoot 'docs'
+& cargo run --release --locked --quiet -p nrr-docs-html -- --repo $repoRoot --out $docsDir
+if ($LASTEXITCODE -ne 0) {
+    throw 'The offline documentation did not build: a page links to something that is not there (named above), or Cargo.lock is out of date.'
+}
+Write-Step 'built the offline documentation'
+
 # ── Licence texts ────────────────────────────────────────────────────────────
 
 # Wintun and Qt (LGPLv3) are redistributed as binaries, and both licences ask
@@ -713,7 +1043,7 @@ $buildInfo = [ordered]@{
     qt_runtime     = $(if ($Headless) { 'none' } elseif ($Full) { 'full' } else { 'trimmed' })
 }
 $buildInfo | ConvertTo-Json | Set-Content -Path (Join-Path $packageRoot 'build-info.json') -Encoding UTF8
-Write-Step "stamped build-info.json ($buildStamp)"
+Write-Step "stamped build-info.json ($productVersion, revision $($revision.commit))"
 
 # ── Entry point and notes ────────────────────────────────────────────────────
 
@@ -749,7 +1079,8 @@ The service
 -----------
 From this folder the service is installed from the app; Windows asks for
 administrator confirmation. The EXE and MSI installers of the same build do
-that step themselves and put the program in C:\Program Files\NetRuleRouter.
+that step themselves and put the program in C:\Program Files\NetRuleRouter
+or another folder inside Program Files.
 
 What is inside
 --------------
@@ -779,6 +1110,14 @@ If nothing happens when you start it
 ------------------------------------
 The app opens no console, so it writes its errors to a file. Look at
 launcher-main.log in %TEMP%\NetRuleRouter.
+
+Questions and problems
+----------------------
+Questions, discussion and news of new builds, in English and Russian:
+https://t.me/netrulerouter
+Bugs to be fixed: https://github.com/kroxiksut/net-rule-router/issues - attach
+the diagnostic archive (Diagnostics section, or nrr-cli.exe diag export).
+Never report a vulnerability in public; see SECURITY.md in the repository.
 "@
 Set-Content -Path (Join-Path $packageRoot 'README.txt') -Value $readMeEn -Encoding UTF8
 
@@ -815,7 +1154,8 @@ English: см. README.txt.
 ------
 Из этой папки служба ставится из интерфейса программы; система спросит
 подтверждение администратора. Установщики EXE и MSI той же сборки делают этот
-шаг сами и кладут программу в C:\Program Files\NetRuleRouter.
+шаг сами и кладут программу в C:\Program Files\NetRuleRouter или другую
+папку внутри Program Files.
 
 Что внутри
 ----------
@@ -845,6 +1185,14 @@ scripts\reset-network.ps1 делает то же восстановление и
 -------------------------------------
 Программа не открывает консоль, поэтому ошибки пишет в файл. Смотрите
 launcher-main.log в папке %TEMP%\NetRuleRouter.
+
+Вопросы и проблемы
+------------------
+Вопросы, обсуждение и новости о сборках, на русском и английском:
+https://t.me/netrulerouter
+Ошибки: https://github.com/kroxiksut/net-rule-router/issues - приложите
+диагностический архив (раздел «Диагностика» или nrr-cli.exe diag export).
+Об уязвимостях не пишите публично; см. SECURITY.md в репозитории.
 "@
 Set-Content -Path (Join-Path $packageRoot 'README.ru.txt') -Value $readMeRu -Encoding UTF8
 
@@ -874,6 +1222,11 @@ C:\Program Files\NetRuleRouter Service and runs it from there.
 
 If the network stops working: nrr-cli.exe reset-network --confirm, or
 scripts\reset-network.ps1.
+
+Questions and news: https://t.me/netrulerouter (English and Russian).
+Bugs: https://github.com/kroxiksut/net-rule-router/issues - attach the archive
+from nrr-cli.exe diag export. Never report a vulnerability in public; see
+SECURITY.md in the repository.
 "@
 Set-Content -Path (Join-Path $packageRoot 'README.txt') -Value $readMeEn -Encoding UTF8
 
@@ -899,6 +1252,11 @@ NetRuleRouter - сборка для Windows без окна
 
 Если пропала сеть: nrr-cli.exe reset-network --confirm или
 scripts\reset-network.ps1.
+
+Вопросы и новости: https://t.me/netrulerouter (на русском и английском).
+Ошибки: https://github.com/kroxiksut/net-rule-router/issues - приложите архив
+из nrr-cli.exe diag export. Об уязвимостях не пишите публично; см. SECURITY.md
+в репозитории.
 "@
 Set-Content -Path (Join-Path $packageRoot 'README.ru.txt') -Value $readMeRu -Encoding UTF8
 }
@@ -907,29 +1265,49 @@ Set-Content -Path (Join-Path $packageRoot 'README.ru.txt') -Value $readMeRu -Enc
 
 # Every executable, its symbols and every user script shipped must be on the
 # list, or a new one would ship unchecked.
-$shipped = @($executables | ForEach-Object {
-    $_
-    ([IO.Path]::GetFileNameWithoutExtension($_) -replace '-', '_') + '.pdb'
-}) + @($userScripts | ForEach-Object { "scripts\$_" })
-$unlisted = @($shipped | Where-Object { $required -notcontains $_ })
+$variant = $(if ($Headless) { 'headless' } else { 'full' })
+$requiredSymbols = @(Get-PackageContents -RepoRoot $repoRoot -Variant $variant -Symbols)
+$symbolNames = @($symbolFiles | Split-Path -Leaf)
+$shipped = @($executables) + @($userScripts | ForEach-Object { "scripts\$_" })
+$unlisted = @($shipped | Where-Object { $required -notcontains $_ }) +
+    @($symbolNames | Where-Object { $requiredSymbols -notcontains $_ })
 if ($unlisted) {
     throw "packaging\windows\package-contents.txt does not list $($unlisted -join ', '), which this script ships."
+}
+$unshipped = @($requiredSymbols | Where-Object { $symbolNames -notcontains $_ })
+if ($unshipped) {
+    throw "packaging\windows\package-contents.txt lists the symbols of executables this script does not ship: $($unshipped -join ', ')"
 }
 $missing = Get-MissingContents -Root $packageRoot -Expected $required
 if ($missing) {
     throw "Package is incomplete, missing: $($missing -join ', ')"
 }
+$strayPdb = @(Get-ChildItem -LiteralPath $packageRoot -Recurse -File -Filter '*.pdb')
+if ($strayPdb) {
+    throw "A package carries no debug symbols, found: $(($strayPdb | ForEach-Object { $_.FullName.Substring($packageRoot.Length + 1) }) -join ', ')"
+}
 
 $totalBytes = (Get-ChildItem -Path $packageRoot -Recurse -File | Measure-Object -Property Length -Sum).Sum
 $totalFiles = (Get-ChildItem -Path $packageRoot -Recurse -File | Measure-Object).Count
 
-# The build stamp is in every artifact name so two builds on the same flash
-# drive cannot be confused for one another.
-$artifactBase = "NetRuleRouter-windows-$Arch-$buildStamp" + $(if ($Headless) { '-headless' } else { '' })
+# The version alone names the files; the commit is in build-info.json, and two
+# builds of one version share names.
+$artifactBase = "NetRuleRouter-windows-$Arch-$productVersion" + $(if ($Headless) { '-headless' } else { '' })
 $artifacts = New-Object System.Collections.Generic.List[string]
 
+if ($buildSymbols) {
+    $symbolsPath = Join-Path $OutputRoot "$artifactBase-symbols.zip"
+    if (Test-Path -LiteralPath $symbolsPath) {
+        Remove-Item -LiteralPath $symbolsPath -Force
+    }
+    Write-Step 'compressing the debug symbols'
+    Compress-Archive -LiteralPath @($symbolFiles) -DestinationPath $symbolsPath -CompressionLevel Optimal
+    Write-Host ("[package] symbols: {0} ({1:N1} MB)" -f $symbolsPath, ((Get-Item -LiteralPath $symbolsPath).Length / 1MB)) -ForegroundColor Green
+    $artifacts.Add($symbolsPath)
+}
+
 if ($Zip) {
-    $archivePath = Join-Path $OutputRoot "$artifactBase.zip"
+    $archivePath = Join-Path $OutputRoot "$artifactBase-portable.zip"
     if (Test-Path $archivePath) {
         Remove-Item -Path $archivePath -Force
     }
@@ -945,7 +1323,7 @@ if ($Zip) {
 if ($buildExe -or $buildMsi) {
     $installerSources = Join-Path $repoRoot 'packaging\windows'
     # Windows Installer and the EXE's version block take numbers only; the
-    # full stamp still names the files and shows in Apps & Features. The
+    # full version still names the files and shows in Apps & Features. The
     # numbers come from the service binary, whose fourth field is the
     # pre-release (packaging/windows/version_rank.rs): read back, not derived
     # a second time. Windows Installer compares three fields, so there the
@@ -957,8 +1335,32 @@ if ($buildExe -or $buildMsi) {
     }
     $exeVersion = "$numericVersion.$($fileVersion.Revision)"
     $msiVersion = "$($fileVersion.Major).$($fileVersion.Minor).$($fileVersion.Build * 100 + $fileVersion.Revision)"
+
+    # The agreement each wizard asks the installing person to accept, in the
+    # wizard's language, and the wizards' pictures. The first culture is the
+    # MSI's own; the others ride inside it as language transforms.
+    $installerCultures = @(
+        @{ Culture = 'en-US'; Lcid = 1033; Agreement = 'docs\legal\eula.en.md' },
+        @{ Culture = 'ru-RU'; Lcid = 1049; Agreement = 'docs\legal\eula.ru.md' }
+    )
+    $resourceDir = Join-Path ([System.IO.Path]::GetTempPath()) "nrr-installer-$([guid]::NewGuid().ToString('N'))"
+    New-Item -ItemType Directory -Path $resourceDir -Force | Out-Null
+    foreach ($culture in $installerCultures) {
+        $agreement = Join-Path $repoRoot $culture.Agreement
+        $culture.Rtf = Join-Path $resourceDir "eula.$($culture.Culture).rtf"
+        ConvertFrom-AgreementMarkdown -Source $agreement -Destination $culture.Rtf
+        ConvertFrom-AgreementMarkdown -Source $agreement -Destination (Join-Path $resourceDir "eula.$($culture.Culture).exe.rtf") -LinkFields
+    }
+    $agreementRevisions = @($installerCultures | ForEach-Object { Get-AgreementRevision -Source (Join-Path $repoRoot $_.Agreement) } | Sort-Object -Unique)
+    if ($agreementRevisions.Count -ne 1) {
+        throw "The agreement's translations name different revisions: $($agreementRevisions -join ', ')."
+    }
+    $agreementVersion = $agreementRevisions[0]
+    $installerImages = New-InstallerImages -Folder $resourceDir
+    Write-Step 'rendered the agreement and the wizard pictures'
 }
 
+try {
 if ($buildExe) {
     $setupName = "$artifactBase-setup"
     $setupPath = Join-Path $OutputRoot "$setupName.exe"
@@ -966,8 +1368,13 @@ if ($buildExe) {
         Remove-Item -LiteralPath $setupPath -Force
     }
     Write-Step "building the EXE installer with '$iscc'"
-    & $iscc '/Q' "/DPackageDir=$packageRoot" "/DAppVersion=$buildStamp" "/DVersionNumeric=$exeVersion" "/DArch=$Arch" `
+    & $iscc '/Q' "/DPackageDir=$packageRoot" "/DAppVersion=$productVersion" "/DVersionNumeric=$exeVersion" "/DArch=$Arch" `
         "/DVariant=$(if ($Headless) { 'headless' } else { 'full' })" `
+        "/DAgreementEn=$(Join-Path $resourceDir 'eula.en-US.exe.rtf')" `
+        "/DAgreementRu=$(Join-Path $resourceDir 'eula.ru-RU.exe.rtf')" `
+        "/DAgreementVersion=$agreementVersion" `
+        "/DWizardImages=$($installerImages.Wizard -join ',')" `
+        "/DWizardSmallImages=$($installerImages.WizardSmall -join ',')" `
         "/DOutputDir=$OutputRoot" "/DOutputBaseFilename=$setupName" (Join-Path $installerSources 'NetRuleRouter.iss')
     if ($LASTEXITCODE -ne 0 -or -not (Test-Path -LiteralPath $setupPath)) {
         throw 'Inno Setup failed to build the EXE installer.'
@@ -981,31 +1388,57 @@ if ($buildMsi) {
     if (Test-Path -LiteralPath $msiPath) {
         Remove-Item -LiteralPath $msiPath -Force
     }
-    $workDir = Join-Path ([System.IO.Path]::GetTempPath()) "nrr-msi-$([guid]::NewGuid().ToString('N'))"
+    $workDir = Join-Path $resourceDir 'msi'
     New-Item -ItemType Directory -Path $workDir -Force | Out-Null
-    try {
-        $licenseRtf = Join-Path $workDir 'LICENSE.rtf'
-        ConvertTo-RtfFile -Source (Join-Path $repoRoot 'LICENSE') -Destination $licenseRtf
-        $wixArguments = @('build', '-arch', $Arch,'-bindpath', "pkg=$packageRoot",
-            '-d', "Version=$msiVersion", '-d', "DisplayVersion=$buildStamp", '-d', "LicenseRtf=$licenseRtf",
+    # One product code for every culture's build: a transform between two
+    # products would not be a language transform.
+    $productCode = [guid]::NewGuid().ToString('B').ToUpperInvariant()
+    $estimatedSizeKb = [int][Math]::Ceiling($totalBytes / 1KB)
+    $base = $installerCultures[0]
+    $transforms = @{}
+    $docsFragment = Join-Path $workDir 'docs-files.wxs'
+    Write-DocsFragment -PackageRoot $packageRoot -Destination $docsFragment
+    foreach ($culture in $installerCultures) {
+        $cultureDir = Join-Path $workDir $culture.Culture
+        $output = if ($culture -eq $base) { $msiPath } else { Join-Path $cultureDir 'NetRuleRouter.msi' }
+        $wixArguments = @('build', '-arch', $Arch, '-bindpath', "pkg=$packageRoot",
+            '-culture', $culture.Culture, '-loc', (Join-Path $installerSources "NetRuleRouter.$($culture.Culture).wxl"),
+            '-d', "Version=$msiVersion", '-d', "DisplayVersion=$productVersion", '-d', "ProductCode=$productCode",
+            '-d', "LicenseRtf=$($culture.Rtf)",
+            '-d', "AgreementVersion=$agreementVersion",
+            '-d', "BannerBmp=$($installerImages.Banner)", '-d', "DialogBmp=$($installerImages.Dialog)",
+            '-d', "EstimatedSizeKb=$estimatedSizeKb",
             '-d', "Variant=$(if ($Headless) { 'headless' } else { 'full' })",
-            '-intermediatefolder', $workDir, '-pdb', (Join-Path $workDir 'NetRuleRouter.wixpdb'),
-            '-o', $msiPath)
+            '-intermediatefolder', $cultureDir, '-pdb', (Join-Path $cultureDir 'NetRuleRouter.wixpdb'),
+            '-cc', (Join-Path $workDir 'cabinets'), '-o', $output)
         foreach ($extension in $wixExtensions) {
             $wixArguments += @('-ext', "$extension/$wixVersion")
         }
-        $wixArguments += (Join-Path $installerSources 'NetRuleRouter.wxs')
-        Write-Step "building the MSI with '$wix'"
+        $wixArguments += @((Join-Path $installerSources 'NetRuleRouter.wxs'), $docsFragment)
+        Write-Step "building the $($culture.Culture) MSI with '$wix'"
         & $wix @wixArguments
-        if ($LASTEXITCODE -ne 0 -or -not (Test-Path -LiteralPath $msiPath)) {
-            throw 'WiX failed to build the MSI.'
+        if ($LASTEXITCODE -ne 0 -or -not (Test-Path -LiteralPath $output)) {
+            throw "WiX failed to build the $($culture.Culture) MSI."
+        }
+        if ($culture -ne $base) {
+            $transform = Join-Path $cultureDir "$($culture.Lcid).mst"
+            & $wix @('msi', 'transform', '-t', 'language', '-intermediateFolder', $cultureDir, '-out', $transform, $msiPath, $output)
+            if ($LASTEXITCODE -ne 0 -or -not (Test-Path -LiteralPath $transform)) {
+                throw "WiX failed to make the $($culture.Culture) language transform."
+            }
+            Test-LanguageTransform -Msi $msiPath -Transform $transform -Culture $culture -Copy (Join-Path $cultureDir 'applied.msi')
+            $transforms[$culture.Lcid] = $transform
         }
     }
-    finally {
-        Remove-Item -LiteralPath $workDir -Recurse -Force -ErrorAction SilentlyContinue
-    }
+    Add-LanguageTransforms -Msi $msiPath -Transforms $transforms -BaseLanguage $base.Lcid
+    Write-Step "embedded the $(@($installerCultures | Select-Object -Skip 1 | ForEach-Object { $_.Culture }) -join ', ') wizard"
     Write-Host ("[package] MSI: {0} ({1:N1} MB)" -f $msiPath, ((Get-Item $msiPath).Length / 1MB)) -ForegroundColor Green
     $artifacts.Add($msiPath)
+}
+} finally {
+    if ($buildExe -or $buildMsi) {
+        Remove-Item -LiteralPath $resourceDir -Recurse -Force -ErrorAction SilentlyContinue
+    }
 }
 
 if ($buildExe -or $buildMsi) {

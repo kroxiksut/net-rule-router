@@ -324,6 +324,8 @@ Dialog {
 
         // ── Risk signals ─────────────────────────────────────────
         Label {
+            Layout.fillWidth: true
+            wrapMode: Text.Wrap
             text: root.tr("dialog.review-diff.signals-heading", "Detected signals")
             font.bold: true
             color: root.ownerRoot ? root.ownerRoot.textColor : palette.text
@@ -370,6 +372,8 @@ Dialog {
         // it is a question about what they meant, and the answer changes what
         // the diff will apply.
         Label {
+            Layout.fillWidth: true
+            wrapMode: Text.Wrap
             text: root.tr("dialog.review-diff.duplicates-heading",
                 "Rules written into both routes")
             font.bold: true
@@ -503,6 +507,13 @@ Dialog {
             text: root.tr(
                 "dialog.confirm-activate.checkbox-understand",
                 "I understand the risk and want to proceed")
+            contentItem: Label {
+                text: understandCheckbox.text
+                leftPadding: understandCheckbox.indicator.width + understandCheckbox.spacing
+                color: root.ownerRoot ? root.ownerRoot.textColor : palette.text
+                wrapMode: Text.WordWrap
+                verticalAlignment: Text.AlignVCenter
+            }
             Layout.fillWidth: true
             Accessible.role: Accessible.CheckBox
             Accessible.name: text

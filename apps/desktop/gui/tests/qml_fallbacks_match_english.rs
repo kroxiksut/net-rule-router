@@ -33,10 +33,13 @@ fn english() -> BTreeMap<String, String> {
             _ => {}
         }
     }
-    let text = std::fs::read_to_string(repo_root().join("locales/en.json")).expect("en.json");
-    let json: Value = serde_json::from_str(&text).expect("en.json parses");
+    // The tray's own words live in its file beside the main one.
     let mut out = BTreeMap::new();
-    flatten(&json, "", &mut out);
+    for file in ["locales/en.json", "locales/tray/en.json"] {
+        let text = std::fs::read_to_string(repo_root().join(file)).expect(file);
+        let json: Value = serde_json::from_str(&text).expect("English parses");
+        flatten(&json, "", &mut out);
+    }
     out
 }
 

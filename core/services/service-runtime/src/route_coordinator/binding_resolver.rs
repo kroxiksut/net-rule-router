@@ -174,7 +174,10 @@ pub(super) fn is_version_token(token: &str) -> bool {
 }
 
 /// Words that name a category, not a vendor. A family match resting only on
-/// these is not evidence: every tunnel on the machine carries some of them.
+/// these is not evidence: every tunnel on the machine carries some of them, and
+/// Windows names connections from them in the system language ("Local Area
+/// Connection* 12", «Подключение по локальной сети 12»), differing only by a
+/// number the matcher drops.
 pub(super) const GENERIC_NAME_TOKENS: &[&str] = &[
     "vpn",
     "adapter",
@@ -187,6 +190,27 @@ pub(super) const GENERIC_NAME_TOKENS: &[&str] = &[
     "virtual",
     "tap",
     "wintun",
+    "local",
+    "area",
+    "wi",
+    "fi",
+    "bluetooth",
+    "lan",
+    "подключение",
+    "подключения",
+    "по",
+    "локальной",
+    "сети",
+    "сеть",
+    "сетевое",
+    "сетевой",
+    "беспроводная",
+    "беспроводное",
+    "адаптер",
+    "туннель",
+    "клиент",
+    "виртуальный",
+    "виртуальная",
 ];
 
 /// Lower-cased tokens of a friendly name with version tokens dropped — the
@@ -197,11 +221,13 @@ pub(super) const GENERIC_NAME_TOKENS: &[&str] = &[
 /// the TAP device, "examplevpn_VPN" for the WireGuard one), and treating the
 /// underscore spelling as one opaque token left the family match blind exactly
 /// when the user switched transport. `.` stays a word character — it belongs to
-/// brand names like "examplevpn".
+/// brand names like "examplevpn". The `*` Windows puts in hidden connection
+/// names ("Local Area Connection* 2") is not part of a word.
 pub(super) fn core_tokens(name: &str) -> Vec<String> {
     name.split(|c: char| c.is_whitespace() || c == '_' || c == '-')
+        .map(|t| t.trim_matches('*'))
         .filter(|t| !t.is_empty() && !is_version_token(t))
-        .map(|t| t.to_ascii_lowercase())
+        .map(str::to_lowercase)
         .collect()
 }
 
@@ -377,6 +403,28 @@ pub(super) fn mac_anchor_id(info: &AdapterInfo) -> Option<String> {
         return None;
     }
     mac_dash(info).map(|mac| format!("win-mac:{mac}"))
+}
+
+/// The one usable adapter other than `bound` running another copy of its
+/// driver, unless `excluded` (the user's other route) says it is spoken for.
+/// A VPN client on a stock driver brings up whichever copy it likes, so the
+/// copy a route was bound to can stay down for good while its sibling carries
+/// the tunnel. `None` for zero or several: which of two is theirs is not ours
+/// to guess.
+pub(super) fn sole_live_driver_sibling<'a>(
+    infos: &'a [AdapterInfo],
+    bound: &AdapterInfo,
+    excluded: impl Fn(&AdapterInfo) -> bool,
+) -> Option<&'a AdapterInfo> {
+    let mut siblings = infos.iter().filter(|info| {
+        info.index != bound.index
+            && info.friendly_name != nrr_shared::product_identity::TUN_ADAPTER_NAME
+            && classify_availability(info) == Some(AdapterAvailability::Available)
+            && nrr_shared::same_driver(&info.description, &bound.description)
+            && !excluded(info)
+    });
+    let only = siblings.next()?;
+    siblings.next().is_none().then_some(only)
 }
 
 /// Live connections worth offering when the bound one is gone; tunnels first

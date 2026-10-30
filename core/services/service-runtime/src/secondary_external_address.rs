@@ -22,10 +22,10 @@
 //!   and [`ExternalAddressAnnouncer::on_probe_result`], both of which take
 //!   `now: Instant` so the whole anti-spam policy is testable without sleeping.
 //! - **Asking the network** happens on a detached thread, never on the caller's.
-//! - **Whether to ask at all** is the user's: the check is opt-in per user
-//!   (`external_address_auto_check`), off by default, because it sends a
-//!   request through the tunnel. A user who has not opted in is never even
-//!   resolved, so the steady state costs them nothing.
+//! - **Whether to ask at all** is the user's: a per-user setting
+//!   (`external_address_auto_check`), on by default as an owner's exception to
+//!   "tunnel traffic is opt-in" — a couple of tiny requests per connect. A user
+//!   who switched it off is never even resolved, so it costs them nothing.
 //!
 //! # Cost, and why the probe is detached
 //!
@@ -125,6 +125,11 @@ pub type AutoCheckOptInFn = Arc<dyn Fn(&str) -> bool + Send + Sync>;
 /// One user's currently usable additional link, `None` while there is none.
 pub type SecondaryLinkOfFn = Arc<dyn Fn(&str) -> Option<SecondaryLink> + Send + Sync>;
 
+/// Files an exit a probe observed where the interfaces screens read it, as the
+/// user's own check would. Called on the probe's thread, before the push that
+/// makes the clients re-read.
+pub type ObservedExitSinkFn = Arc<dyn Fn(&SecondaryLink, Ipv4Addr) + Send + Sync>;
+
 // ── Values ───────────────────────────────────────────────────────────────────
 
 /// One user's usable additional link, as the announcer needs to see it.
@@ -190,8 +195,9 @@ impl ExternalAddressWiring {
     }
 }
 
-/// The opt-in as stored in the user's route policy. A row that cannot be read
-/// reads as off: the check is never sent on a guess.
+/// The setting as stored in the user's route policy; a user without a row has
+/// the default (on). A row that cannot be read reads as off: the check is
+/// never sent on a guess.
 pub fn stored_opt_in(state_conn: Arc<Mutex<rusqlite::Connection>>) -> AutoCheckOptInFn {
     Arc::new(move |sid: &str| {
         let guard = state_conn.lock().unwrap_or_else(|p| p.into_inner());
@@ -322,6 +328,7 @@ pub struct ExternalAddressAnnouncer {
     /// again after it.
     sleeps: Arc<SleepLedger>,
     wakes_seen: AtomicU64,
+    observed_sink: Option<ObservedExitSinkFn>,
 }
 
 impl ExternalAddressAnnouncer {
@@ -345,7 +352,16 @@ impl ExternalAddressAnnouncer {
             state: Mutex::new(HashMap::new()),
             wakes_seen: AtomicU64::new(sleeps.wakes()),
             sleeps,
+            observed_sink: None,
         }
+    }
+
+    /// File every observed exit through `sink` as well, so the interfaces
+    /// screens show it without the user's own check.
+    #[must_use]
+    pub fn with_observed_sink(mut self, sink: ObservedExitSinkFn) -> Self {
+        self.observed_sink = Some(sink);
+        self
     }
 
     /// Count wakes in `sleeps` instead of the process's own ledger.
@@ -515,6 +531,8 @@ impl ExternalAddressAnnouncer {
             return AnnounceOutcome::NoAddress;
         };
         if std::mem::take(&mut entry.recheck) && entry.told_address == Some(address) {
+            drop(state);
+            self.file_observed(link, address);
             return AnnounceOutcome::Unchanged;
         }
 
@@ -525,6 +543,7 @@ impl ExternalAddressAnnouncer {
         entry.told_address = Some(address);
         if too_soon {
             drop(state);
+            self.file_observed(link, address);
             tracing::debug!(
                 target: "nrr::interfaces",
                 sid = %link.sid,
@@ -538,6 +557,7 @@ impl ExternalAddressAnnouncer {
 
         entry.announced_at = Some(now);
         drop(state);
+        self.file_observed(link, address);
 
         tracing::info!(
             target: "nrr::interfaces",
@@ -548,6 +568,13 @@ impl ExternalAddressAnnouncer {
         );
         self.publish_observed(link, address, false);
         AnnounceOutcome::Announced
+    }
+
+    /// Outside the state lock: the sink may enumerate adapters.
+    fn file_observed(&self, link: &SecondaryLink, address: Ipv4Addr) {
+        if let Some(sink) = self.observed_sink.as_ref() {
+            sink(link, address);
+        }
     }
 
     fn publish_observed(&self, link: &SecondaryLink, address: Ipv4Addr, quiet: bool) {
@@ -1080,6 +1107,59 @@ mod tests {
         assert_eq!(withdrawals(&bus), 2);
     }
 
+    /// The interfaces screens re-read their rows when the push arrives, so an
+    /// observed exit must already be filed there by then; an unanswered probe
+    /// files nothing.
+    #[test]
+    fn an_observed_exit_is_filed_for_the_interfaces_screens_before_the_push() {
+        let bus = Arc::new(EventBus::new());
+        let filed: Arc<Mutex<Vec<(u32, Ipv4Addr, usize)>>> = Arc::default();
+        let a = ExternalAddressAnnouncer::new(Arc::clone(&bus), Arc::new(|_| None))
+            .with_sleeps(Arc::default())
+            .with_observed_sink({
+                let filed = Arc::clone(&filed);
+                let bus = Arc::clone(&bus);
+                Arc::new(move |link: &SecondaryLink, address| {
+                    filed.lock().expect("filed").push((
+                        link.interface_index,
+                        address,
+                        bus.buffer_len(),
+                    ));
+                })
+            });
+        let t0 = Instant::now();
+        let l = link(7, [10, 88, 1, 41]);
+        a.observe(std::slice::from_ref(&l), t0);
+        a.observe(std::slice::from_ref(&l), t0 + LINK_SETTLE);
+        assert_eq!(
+            a.on_probe_result(&l, None, t0 + LINK_SETTLE),
+            AnnounceOutcome::NoAddress
+        );
+        assert!(filed.lock().expect("filed").is_empty(), "nothing observed");
+
+        assert_eq!(
+            a.on_probe_result(&l, Some(addr(10)), t0 + LINK_SETTLE * 2),
+            AnnounceOutcome::Announced
+        );
+        assert_eq!(
+            *filed.lock().expect("filed"),
+            [(7, addr(10), 0)],
+            "filed once, before anything was pushed"
+        );
+        assert_eq!(bus.buffer_len(), 1);
+
+        // A quick reconnect refills the value quietly; the screens follow it.
+        let down = t0 + LINK_SETTLE * 3;
+        a.observe(&[], down);
+        a.observe(std::slice::from_ref(&l), down);
+        a.observe(std::slice::from_ref(&l), down + LINK_SETTLE);
+        assert_eq!(
+            a.on_probe_result(&l, Some(addr(11)), down + LINK_SETTLE),
+            AnnounceOutcome::SuppressedTooSoon
+        );
+        assert_eq!(filed.lock().expect("filed").last(), Some(&(7, addr(11), 2)));
+    }
+
     /// `l` settles and its exit `address` is announced at `t0 + LINK_SETTLE`.
     fn told(a: &ExternalAddressAnnouncer, l: &SecondaryLink, t0: Instant, address: Ipv4Addr) {
         a.observe(std::slice::from_ref(l), t0);
@@ -1331,7 +1411,7 @@ mod tests {
     }
 
     #[test]
-    fn the_stored_opt_in_is_off_until_the_user_turns_it_on() {
+    fn the_stored_opt_in_is_on_until_the_user_switches_it_off() {
         use nrr_storage::repository::MigrationRunner;
         use nrr_storage::route_bindings::{
             BindingSource, RouteBindingsRepository, RoutePolicyRecord,
@@ -1342,7 +1422,7 @@ mod tests {
         runner.run_pending_migrations().expect("state migrations");
         let conn = Arc::new(Mutex::new(runner.into_connection()));
         let opted_in = stored_opt_in(Arc::clone(&conn));
-        assert!(!opted_in(SID), "a user with no policy row has not opted in");
+        assert!(opted_in(SID), "a user with no policy row gets the check");
 
         let mut record = RoutePolicyRecord::empty(BindingSource::UserAssigned);
         {
@@ -1351,17 +1431,17 @@ mod tests {
                 .update_for_sid(SID, &record, 1)
                 .expect("write");
         }
-        assert!(!opted_in(SID), "the default policy leaves it off");
+        assert!(opted_in(SID), "the default policy keeps it on");
 
-        record.external_address_auto_check = true;
+        record.external_address_auto_check = false;
         {
             let guard = conn.lock().expect("lock");
             RouteBindingsRepository::new(&guard)
                 .update_for_sid(SID, &record, 2)
                 .expect("write");
         }
-        assert!(opted_in(SID));
-        assert!(!opted_in("S-1-5-21-someone-else"), "the choice is per user");
+        assert!(!opted_in(SID), "the user switched it off");
+        assert!(opted_in("S-1-5-21-someone-else"), "the choice is per user");
     }
 
     #[test]

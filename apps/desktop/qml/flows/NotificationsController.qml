@@ -358,6 +358,8 @@ QtObject {
         else if (actionKey === "restore-settings") root.settingsRestoreController.restore()
         else if (actionKey === "trust-vpn-client") root._trustVpnClient(actionArg, false)
         else if (actionKey === "trust-vpn-client-bundle") root._trustVpnClient(actionArg, true)
+        else if (actionKey === "vpn-client-offer-use") root._answerVpnClientOffer(actionArg, true)
+        else if (actionKey === "vpn-client-offer-choose") root._answerVpnClientOffer(actionArg, false)
         else if (actionKey === "trust-vpn-gateway") root._trustVpnGateway(actionArg)
         else if (actionKey === "open-release-page") {
             // The release the notice names; else the project's releases page.

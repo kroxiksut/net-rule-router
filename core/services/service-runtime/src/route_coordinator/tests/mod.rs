@@ -309,6 +309,7 @@ fn adapter(stable_seed: &str, idx: u32, up: bool, ipv4: bool, gw: Option<[u8; 4]
 }
 
 mod binding_identity;
+mod driver_siblings;
 mod first_contact_and_probe;
 mod foreign_tunnels;
 mod guest_networks;
@@ -317,4 +318,5 @@ mod offers_and_paused;
 mod primary_way_out;
 mod read_counts;
 mod recompute;
+mod rule_scope;
 mod sid_and_notices;

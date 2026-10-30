@@ -1,8 +1,8 @@
 //! The first-run setup: the GUI's first-run window minus its look-and-feel
-//! questions. Language (for this session), the main and the additional
-//! connection, leak protection, and the starting rule set — a country's bundled
-//! set, the user's own files, or none. Every step is one numbered list of
-//! answers, the same in both modes.
+//! questions. Language (for this session), then the window's five steps: the
+//! main and the additional connection, the starting rule set — a country's
+//! bundled set, the user's own files, or none — leak protection, and a
+//! summary. Every step is one numbered list of answers, the same in both modes.
 
 pub(crate) mod import;
 pub mod keys;
@@ -13,7 +13,11 @@ mod stability;
 use std::cell::OnceCell;
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-use nrr_client_logic::adapters::{display_name, held_other_role, unroutable_reason};
+use nrr_client_logic::adapters::{
+    adapter_passes_filter, display_name, first_run_suggestion, held_other_role, looks_like_tunnel,
+    offered_for_role, unroutable_reason,
+};
+use nrr_client_logic::first_run::first_run_country;
 use nrr_client_logic::route_policy::{
     first_run_held_protection, first_run_writes, leak_protection_choices_at_least,
     leak_protection_holds_now, raise_leak_protection,
@@ -36,6 +40,7 @@ use super::interfaces::keys as ik;
 use super::{choice, Screen, ScreenId};
 use crate::i18n::{available_languages, Key, Language, Texts};
 use crate::keys as common;
+use crate::rule_set_load::Refusal;
 use crate::state::{AppState, Focus};
 use crate::view::{Panel, ScreenView, ViewLine};
 
@@ -54,18 +59,22 @@ enum Step {
     OtherCountries,
     Files,
     Review,
+    Summary,
 }
 
 const STEP_COUNT: usize = 5;
 
 impl Step {
-    fn number(self) -> usize {
+    /// The window's step number; the agreement and the session language come
+    /// before the window's steps and are not counted.
+    fn number(self) -> Option<usize> {
         match self {
-            Self::Licence | Self::Language => 1,
-            Self::Primary => 2,
-            Self::Secondary => 3,
-            Self::Protection => 4,
-            Self::Rules | Self::OtherCountries | Self::Files | Self::Review => 5,
+            Self::Licence | Self::Language => None,
+            Self::Primary => Some(1),
+            Self::Secondary => Some(2),
+            Self::Rules | Self::OtherCountries | Self::Files | Self::Review => Some(3),
+            Self::Protection => Some(4),
+            Self::Summary => Some(5),
         }
     }
 
@@ -75,18 +84,22 @@ impl Step {
             Self::Language => k::LANGUAGE_TITLE,
             Self::Primary => common::ROLE_PRIMARY,
             Self::Secondary => common::ROLE_SECONDARY,
-            Self::Protection => k::PROTECTION_TITLE,
-            Self::Rules | Self::OtherCountries | Self::Files | Self::Review => k::RULES_TITLE,
+            Self::Protection => k::OPTIONS_STEP,
+            Self::Rules | Self::OtherCountries | Self::Files | Self::Review => k::RULES_STEP,
+            Self::Summary => k::SUMMARY_STEP,
         }
     }
 
+    /// The starting rules follow the connections they route between, as in
+    /// the window; the protection answers come next, the summary last.
     fn next(self) -> Self {
         match self {
             Self::Licence => Self::Language,
             Self::Language => Self::Primary,
             Self::Primary => Self::Secondary,
-            Self::Secondary => Self::Protection,
-            _ => Self::Rules,
+            Self::Secondary => Self::Rules,
+            Self::Protection | Self::Summary => Self::Summary,
+            Self::Rules | Self::OtherCountries | Self::Files | Self::Review => Self::Protection,
         }
     }
 
@@ -94,9 +107,9 @@ impl Step {
         match self {
             Self::Licence | Self::Language | Self::Primary => Self::Language,
             Self::Secondary => Self::Primary,
-            Self::Protection => Self::Secondary,
-            Self::Rules => Self::Protection,
-            Self::OtherCountries | Self::Files | Self::Review => Self::Rules,
+            Self::Rules => Self::Secondary,
+            Self::OtherCountries | Self::Files | Self::Review | Self::Protection => Self::Rules,
+            Self::Summary => Self::Protection,
         }
     }
 }
@@ -105,7 +118,13 @@ impl Step {
 enum Busy {
     Saving,
     Previewing,
-    Applying,
+}
+
+/// The starting rules the setup applies as it closes.
+#[derive(Clone, Debug)]
+enum Chosen {
+    Set(Box<Pending>),
+    Empty,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -128,12 +147,16 @@ enum Outcome {
 struct Pending {
     files: [Option<RulesFile>; 2],
     payload: Value,
+    /// How the set is named when its outcome is told.
+    name: crate::rule_set_load::SetName,
 }
 
 #[derive(Debug)]
 pub struct WizardState {
     /// The system's locale candidates, for the country whose set is offered.
     pub locale: Vec<String>,
+    /// The country the system is set to; outranks `locale`.
+    pub region: Option<String>,
     /// The start-up check (open when the user has no connections) has run.
     decided: bool,
     /// The setup was asked for (`--wizard`), so accepting the agreement goes on
@@ -167,10 +190,13 @@ pub struct WizardState {
     /// What the service held when the setup opened, when the user was already
     /// set up; the protection is then sent only if the user changed it.
     protection_at_start: Option<(&'static str, bool)>,
+    /// What this run's own protection write left the service holding.
+    protection_written: Option<(&'static str, bool)>,
     /// The first look at the snapshot has been taken.
     seeded: bool,
     secondary_deferred: bool,
-    protection_sent: bool,
+    /// The adapter lists include adapters that are not connected.
+    show_all_adapters: bool,
     question: Option<RoleChange>,
     busy: Option<Busy>,
     outcome: Option<Outcome>,
@@ -179,6 +205,8 @@ pub struct WizardState {
     editing: Option<(usize, String)>,
     pending: Option<Pending>,
     preview: Option<Preview>,
+    /// Applied as the setup closes, once the protection is in force.
+    chosen: Option<Chosen>,
     languages: OnceCell<Vec<Language>>,
     packs: OnceCell<Vec<Pack>>,
 }
@@ -187,6 +215,7 @@ impl Default for WizardState {
     fn default() -> Self {
         Self {
             locale: Vec::new(),
+            region: None,
             decided: false,
             requested: false,
             licence_needed: false,
@@ -206,9 +235,10 @@ impl Default for WizardState {
             fake_ip_touched: false,
             stability_notice: None,
             protection_at_start: None,
+            protection_written: None,
             seeded: false,
             secondary_deferred: false,
-            protection_sent: false,
+            show_all_adapters: false,
             question: None,
             busy: None,
             outcome: None,
@@ -216,6 +246,7 @@ impl Default for WizardState {
             editing: None,
             pending: None,
             preview: None,
+            chosen: None,
             languages: OnceCell::new(),
             packs: OnceCell::new(),
         }
@@ -273,6 +304,7 @@ impl WizardState {
     fn reset(&mut self) {
         let fresh = Self {
             locale: std::mem::take(&mut self.locale),
+            region: self.region.take(),
             decided: true,
             sheet: self.sheet.take(),
             stability_notice: self.stability_notice.take(),
@@ -320,7 +352,9 @@ enum Action {
     Close,
     Assign(Route, String),
     Later,
+    ChooseNow,
     Refresh,
+    ShowAll,
     LeakProtection(&'static str),
     ToggleDohLockdown,
     ToggleFakeIp,
@@ -331,7 +365,6 @@ enum Action {
     StartEmpty,
     EditPath(usize),
     ImportFiles,
-    Apply,
     Confirm,
     Cancel,
     PreviousPage,
@@ -341,7 +374,9 @@ enum Action {
 }
 
 fn region(app: &AppState) -> Option<String> {
-    presets::region(&app.wizard.locale)
+    let state = &app.wizard;
+    let country = first_run_country(state.region.as_deref().unwrap_or_default(), &state.locale);
+    (!country.is_empty()).then_some(country)
 }
 
 fn regional_indexes(app: &AppState) -> Vec<usize> {
@@ -363,10 +398,36 @@ fn assigned(app: &AppState, route: Route) -> Option<String> {
 }
 
 /// The additional connection the user has bound, as the adapters read shows it.
+/// The adapter bound to `route` is down while another copy of its driver is
+/// on the computer: a VPN program often brings up a different copy.
+fn sibling_warning(app: &AppState, route: Route, texts: &Texts) -> Option<String> {
+    let all = adapters(app, true);
+    let row = all.iter().find(|row| holds(row, route))?;
+    super::binding::driver_sibling_warning(&all, row, route, texts)
+}
+
 fn secondary_row(app: &AppState) -> Option<InterfaceRowDto> {
     adapters(app, true)
         .into_iter()
         .find(|row| holds(row, Route::Secondary))
+}
+
+/// The adapters the setup offers for `route`: connected ones unless all were
+/// asked for, never the one holding the other route, the one that fits the
+/// role best first.
+fn offered_adapters(app: &AppState, route: Route) -> Vec<InterfaceRowDto> {
+    let mut rows: Vec<InterfaceRowDto> = adapters(app, false)
+        .into_iter()
+        .filter(|row| {
+            offered_for_role(row, route)
+                && adapter_passes_filter(row, app.wizard.show_all_adapters, "")
+        })
+        .collect();
+    if let Some(best) = first_run_suggestion(&rows, route, None) {
+        let row = rows.remove(best);
+        rows.insert(0, row);
+    }
+    rows
 }
 
 fn pickable(app: &AppState) -> bool {
@@ -406,20 +467,24 @@ fn actions(app: &AppState) -> Vec<Action> {
             } else {
                 Route::Secondary
             };
-            let settled = assigned(app, route).is_some()
-                || (route == Route::Secondary && state.secondary_deferred);
-            if !settled {
+            let held = assigned(app, route).is_some();
+            let deferred = !held && route == Route::Secondary && state.secondary_deferred;
+            if !held && !deferred {
                 if pickable(app) {
                     actions.extend(
-                        adapters(app, false)
+                        offered_adapters(app, route)
                             .iter()
                             .map(|row| Action::Assign(route, super::binding::row_key(row))),
                     );
+                    actions.push(Action::ShowAll);
                 }
                 if route == Route::Secondary {
                     actions.push(Action::Later);
                     actions.push(Action::Refresh);
                 }
+            }
+            if deferred {
+                actions.push(Action::ChooseNow);
             }
             actions.push(Action::Next);
             actions.push(Action::Back);
@@ -461,15 +526,13 @@ fn actions(app: &AppState) -> Vec<Action> {
             ]);
         }
         Step::Review => {
-            let ready = state
-                .preview
-                .as_ref()
-                .is_some_and(|p| !p.empty && p.refused.is_none());
-            if ready {
-                actions.push(Action::Apply);
+            // An unchanged set goes on too: its rules are already in force.
+            if state.preview.as_ref().is_some_and(|p| p.refused.is_none()) {
+                actions.push(Action::Next);
             }
             actions.push(Action::Back);
         }
+        Step::Summary => actions.extend([Action::Next, Action::Back]),
     }
     actions.push(Action::Close);
     actions
@@ -482,10 +545,24 @@ fn country_name(country: &str, texts: &Texts) -> String {
     )
 }
 
-fn pack_label(packs: &[Pack], index: usize, texts: &Texts) -> String {
+/// In the list of every set (`listed`), each goes by its own name, as the
+/// window shows it: "for your region" belongs to the region's set alone.
+fn pack_label(packs: &[Pack], index: usize, listed: bool, texts: &Texts) -> String {
     let Some(pack) = packs.get(index) else {
         return String::new();
     };
+    let folder = pack.dir.file_name().and_then(|n| n.to_str()).unwrap_or("");
+    if listed {
+        let home = if pack.abroad {
+            "abroad"
+        } else {
+            pack.country.as_str()
+        };
+        return texts.dynamic(
+            &format!("rules.bundled-preset.name.{home}-{folder}"),
+            &format!("{} — {folder}", country_name(&pack.country, texts)),
+        );
+    }
     let key = if pack.abroad {
         k::COUNTRY_PRESET_ABROAD
     } else {
@@ -497,10 +574,8 @@ fn pack_label(packs: &[Pack], index: usize, texts: &Texts) -> String {
         .iter()
         .filter(|p| p.country == pack.country && p.abroad == pack.abroad)
         .count();
-    if twins > 1 {
-        if let Some(name) = pack.dir.file_name().and_then(|n| n.to_str()) {
-            label.push_str(&format!(" — {name}"));
-        }
+    if twins > 1 && !folder.is_empty() {
+        label.push_str(&format!(" — {folder}"));
     }
     label
 }
@@ -530,6 +605,7 @@ fn label(action: &Action, app: &AppState, texts: &Texts) -> String {
                 name
             }
         }
+        Action::Next if state.step == Step::Summary => texts.get(k::FINISH),
         Action::Next => texts.get(k::NEXT),
         Action::Back => texts.get(k::BACK),
         Action::Close => texts.get(k::CLOSE),
@@ -537,7 +613,15 @@ fn label(action: &Action, app: &AppState, texts: &Texts) -> String {
             .map(|row| picker_label(row, *route, texts))
             .unwrap_or_default(),
         Action::Later => texts.get(k::SECONDARY_LATER),
+        Action::ChooseNow => texts.get(k::CHOOSE_NOW),
         Action::Refresh => texts.get(k::REFRESH),
+        Action::ShowAll => texts.fill(
+            k::SETTING,
+            &[
+                ("name", texts.get(k::SHOW_ALL_ADAPTERS)),
+                ("value", yes_no(state.show_all_adapters)),
+            ],
+        ),
         Action::LeakProtection(level) => {
             let value = texts.get(level_label(level));
             let value = if *level == shown_level(app) {
@@ -574,7 +658,12 @@ fn label(action: &Action, app: &AppState, texts: &Texts) -> String {
                 ),
             ],
         ),
-        Action::Pack(index) => pack_label(state.packs(), *index, texts),
+        Action::Pack(index) => pack_label(
+            state.packs(),
+            *index,
+            state.step == Step::OtherCountries,
+            texts,
+        ),
         Action::OtherCountries => texts.get(k::OTHER_COUNTRY),
         Action::OwnFiles => texts.get(k::OPEN_FILES),
         Action::StartEmpty => texts.get(k::START_EMPTY),
@@ -587,7 +676,6 @@ fn label(action: &Action, app: &AppState, texts: &Texts) -> String {
             format!("{} {path}", texts.get(file_key(*index)))
         }
         Action::ImportFiles => texts.get(k::IMPORT_FILES),
-        Action::Apply => texts.get(k::APPLY),
         Action::Confirm => texts.get(ik::UNROUTABLE_CONFIRM),
         Action::Cancel => texts.get(ik::CANCEL),
         Action::PreviousPage => texts.get(k::LICENCE_PREVIOUS),
@@ -603,15 +691,18 @@ fn perform(app: &mut AppState, action: Action) {
     }
     match action {
         Action::Language(id) => app.language_change = Some(id),
-        Action::Next => {
-            if app.wizard.step == Step::Protection {
-                send_protection(app);
-                stability::send(app);
+        Action::Next => match app.wizard.step {
+            Step::Summary => finish(app),
+            // The protection is in force before the summary tells of it.
+            Step::Protection => {
+                app.wizard.go(Step::Summary);
+                send_protection(app, None);
             }
-            let next = app.wizard.step.next();
-            app.wizard.go(next);
-            preselect(app);
-        }
+            step => {
+                app.wizard.go(step.next());
+                preselect(app);
+            }
+        },
         Action::Back => {
             let previous = app.wizard.step.previous();
             app.wizard.go(previous);
@@ -627,22 +718,29 @@ fn perform(app: &mut AppState, action: Action) {
         }
         Action::Accept => accept_licence(app),
         Action::Decline => app.quit = true,
-        Action::Close | Action::StartEmpty => finish(app, None),
+        Action::Close => finish(app),
+        Action::StartEmpty => {
+            app.wizard.chosen = Some(Chosen::Empty);
+            app.wizard.go(Step::Protection);
+        }
         Action::Assign(route, key) => assign(app, route, &key),
         Action::Later => {
             app.wizard.secondary_deferred = true;
             app.wizard.cursor = 0;
         }
+        Action::ChooseNow => {
+            app.wizard.secondary_deferred = false;
+            app.wizard.cursor = 0;
+        }
         Action::Refresh => app.outbox.push(adapters_read(false, |_, _| {})),
+        Action::ShowAll => app.wizard.show_all_adapters = !app.wizard.show_all_adapters,
         Action::LeakProtection(level) => {
             seed_protection(app);
             app.wizard.leak_protection = level;
-            app.wizard.protection_sent = false;
         }
         Action::ToggleDohLockdown => {
             seed_protection(app);
             app.wizard.doh_lockdown = !app.wizard.doh_lockdown;
-            app.wizard.protection_sent = false;
         }
         Action::ToggleFakeIp => {
             seed_protection(app);
@@ -661,7 +759,7 @@ fn perform(app: &mut AppState, action: Action) {
                 return;
             };
             let [primary, secondary] = pack.files();
-            preview_files(app, [primary, secondary]);
+            preview_files(app, [primary, secondary], pack_name(&pack));
         }
         Action::OtherCountries => app.wizard.go(Step::OtherCountries),
         Action::OwnFiles => app.wizard.go(Step::Files),
@@ -673,11 +771,15 @@ fn perform(app: &mut AppState, action: Action) {
                 let p = presets::typed_path(&p);
                 (!p.is_empty()).then(|| std::path::PathBuf::from(p))
             });
-            if paths.iter().any(Option::is_some) {
-                preview_files(app, paths);
+            let name = paths
+                .iter()
+                .flatten()
+                .next()
+                .map(|p| crate::rule_set_load::SetName::of_path(p));
+            if let Some(name) = name {
+                preview_files(app, paths, name);
             }
         }
-        Action::Apply => apply(app),
         Action::Confirm => {
             if let Some(change) = app.wizard.question.take() {
                 start_role(app, change);
@@ -685,6 +787,28 @@ fn perform(app: &mut AppState, action: Action) {
         }
         Action::Cancel => app.wizard.question = None,
     }
+}
+
+/// The agreement version this account has accepted, counting the current one
+/// when it accepted that on the installer's licence page; that acceptance is
+/// then written where an acceptance here would be.
+pub fn accepted_with_installer(
+    settings_file: Option<&std::path::Path>,
+    recorded: u32,
+    installer: &dyn nrr_platform_api::installer_agreement::InstallerAgreementPort,
+) -> u32 {
+    let current = nrr_shared::eula::CURRENT_EULA_VERSION;
+    if nrr_shared::eula::is_accepted(recorded)
+        || !nrr_platform_api::installer_agreement::accepted_in_installer(installer)
+    {
+        return recorded;
+    }
+    if let Some(file) = settings_file {
+        // Not kept, it is found in the installer's record again next start.
+        let _ = nrr_shared::user_settings::UserSettingsStore::at(file.to_path_buf())
+            .update(|settings| settings.accepted_eula = settings.accepted_eula.max(current));
+    }
+    current
 }
 
 /// Records the acceptance where the window reads it, then goes on: to the
@@ -923,22 +1047,36 @@ fn seed_protection(app: &mut AppState) {
     }
 }
 
-fn send_protection(app: &mut AppState) {
+/// The chosen protection, as its write sends it.
+fn chosen_protection(app: &AppState) -> (&'static str, bool) {
+    (shown_level(app), app.wizard.doh_lockdown)
+}
+
+/// Writes the chosen protection unless the service holds it already, then
+/// hands `rules` on: they are applied only once the protection is in force,
+/// and never over a write that failed.
+fn send_protection(app: &mut AppState, rules: Option<Pending>) {
     seed_protection(app);
-    if app.wizard.protection_sent {
-        return;
-    }
+    let chosen = chosen_protection(app);
+    let held = app
+        .wizard
+        .protection_written
+        .or(app.wizard.protection_at_start);
     // Nothing changed for a user already set up: nothing to write.
-    let chosen = (shown_level(app), app.wizard.doh_lockdown);
-    let held = app.wizard.protection_at_start;
     if !first_run_writes(held, chosen, false, false).protection {
+        if let Some(rules) = rules {
+            apply_rules(app, rules);
+        }
         return;
     }
     if !app.link.is_connected() {
         app.wizard.outcome = Some(Outcome::NeedsService);
+        if let Some(rules) = rules {
+            crate::rule_set_load::refused(app, rules.name, Refusal::NoService);
+        }
         return;
     }
-    app.wizard.protection_sent = true;
+    app.wizard.busy = Some(Busy::Saving);
     let (level, doh_lockdown) = chosen;
     app.outbox.push(policy_write(
         move |request| {
@@ -948,25 +1086,79 @@ fn send_protection(app: &mut AppState) {
             // "Yes" is the automatic posture; "no" is a choice that holds.
             request.insert("doh-lockdown-auto".into(), Value::Bool(doh_lockdown));
         },
-        |app, result| {
-            let outcome = match result {
-                Ok(()) => Outcome::ProtectionSaved,
-                Err(failure) => {
-                    app.wizard.protection_sent = false;
-                    if app.screen != ScreenId::Wizard {
-                        super::interfaces::protection_failed(app, failure.clone());
+        move |app, result| {
+            // Sent from the protection step, the summary tells the outcome;
+            // sent as the setup closes, a failure is told where the user
+            // landed, and the closed setup keeps nothing for its next run.
+            let on_setup = app.screen == ScreenId::Wizard;
+            if on_setup {
+                app.wizard.busy = None;
+            }
+            match result {
+                Ok(()) => {
+                    if on_setup {
+                        app.wizard.protection_written = Some(chosen);
+                        app.wizard.outcome = Some(Outcome::ProtectionSaved);
                     }
-                    Outcome::ProtectionFailed(failure)
+                    if let Some(rules) = rules {
+                        apply_rules(app, rules);
+                    }
                 }
-            };
-            if app.wizard.outcome.is_none() || app.wizard.step == Step::Rules {
-                app.wizard.outcome = Some(outcome);
+                Err(failure) => {
+                    if let Some(rules) = rules {
+                        crate::rule_set_load::refused(app, rules.name, Refusal::ProtectionNotSaved);
+                    }
+                    if on_setup {
+                        app.wizard.outcome = Some(Outcome::ProtectionFailed(failure));
+                    } else {
+                        super::interfaces::protection_failed(app, failure);
+                    }
+                }
             }
         },
     ));
 }
 
-fn preview_files(app: &mut AppState, paths: [Option<std::path::PathBuf>; 2]) {
+/// Whether the service holds the protection chosen here.
+fn protection_in_force(app: &AppState) -> bool {
+    if app.wizard.busy == Some(Busy::Saving) {
+        return false;
+    }
+    let held = app
+        .snapshot
+        .as_ref()
+        .and_then(|s| s.route_policy.as_ref())
+        .and_then(|p| {
+            first_run_held_protection(
+                true,
+                route_slug(p.mode),
+                p.leak_protection.as_slug(),
+                p.doh_lockdown_auto,
+                p.doh_lockdown_enabled,
+            )
+        });
+    held == Some(chosen_protection(app))
+}
+
+/// A shipped set by the name the window gives it in the list of every set.
+fn pack_name(pack: &Pack) -> crate::rule_set_load::SetName {
+    let folder = pack.dir.file_name().and_then(|n| n.to_str()).unwrap_or("");
+    let home = if pack.abroad {
+        "abroad"
+    } else {
+        pack.country.as_str()
+    };
+    crate::rule_set_load::SetName::keyed(
+        format!("rules.bundled-preset.name.{home}-{folder}"),
+        folder.to_owned(),
+    )
+}
+
+fn preview_files(
+    app: &mut AppState,
+    paths: [Option<std::path::PathBuf>; 2],
+    name: crate::rule_set_load::SetName,
+) {
     let mut files: [Option<RulesFile>; 2] = Default::default();
     for (slot, path) in files.iter_mut().zip(paths) {
         let Some(path) = path else { continue };
@@ -981,47 +1173,84 @@ fn preview_files(app: &mut AppState, paths: [Option<std::path::PathBuf>; 2]) {
             }
         }
     }
-    if !app.link.is_connected() {
-        app.wizard.outcome = Some(Outcome::NeedsService);
-        return;
-    }
     let payload = import::payload(files[0].as_ref(), files[1].as_ref(), app.rules.baseline);
     app.wizard.go(Step::Review);
     app.wizard.preview = None;
     app.wizard.busy = Some(Busy::Previewing);
+    app.wizard.outcome = None;
     app.wizard.pending = Some(Pending {
         files,
         payload: payload.clone(),
+        name: name.clone(),
     });
+    if app.link.is_connected() {
+        send_preview(app, payload);
+        return;
+    }
+    // The set is applied in the same action: a stopped service is started
+    // first, and the preview goes once it answers.
+    app.outbox.push(crate::rule_set_load::start_then(
+        app.settings.service_probe,
+        move |app, result| match result {
+            Ok(()) => send_preview(app, payload),
+            Err(why) => {
+                app.wizard.busy = None;
+                app.wizard.pending = None;
+                app.wizard.go(Step::Rules);
+                app.wizard.outcome = Some(Outcome::NeedsService);
+                crate::rule_set_load::not_applied(app, name, why);
+            }
+        },
+    ));
+}
+
+/// The dry run shows what the set would change; a set that would change
+/// something becomes the choice the setup applies as it closes.
+fn send_preview(app: &mut AppState, payload: Value) {
     app.outbox.push(import::preview_job(payload, |app, result| {
         let state = &mut app.wizard;
         state.busy = None;
         match result {
-            Ok(preview) => state.preview = Some(preview),
+            Ok(preview) => {
+                if !preview.empty && preview.refused.is_none() {
+                    state.chosen = state.pending.clone().map(|p| Chosen::Set(Box::new(p)));
+                }
+                state.preview = Some(preview);
+            }
             Err(code) => state.outcome = Some(Outcome::ImportFailed(code)),
         }
     }));
 }
 
-fn apply(app: &mut AppState) {
-    let (Some(pending), Some(preview)) = (&app.wizard.pending, &app.wizard.preview) else {
-        return;
-    };
+/// The starting set reaches the service: a fresh dry run (the rules step's
+/// token may have lapsed while the protection was answered), then the
+/// confirmation with its token. The setup is closed by then; the outcome is
+/// told in the feed.
+fn apply_rules(app: &mut AppState, pending: Pending) {
     let rules: usize = pending.files.iter().flatten().map(|f| f.rules).sum();
-    let job = import::apply_job(
-        pending.payload.clone(),
-        preview.token.clone(),
-        move |app, result| {
-            app.wizard.busy = None;
-            match result {
-                Ok(()) => finish(app, Some(rules)),
-                Err(code) => app.wizard.outcome = Some(Outcome::ImportFailed(code)),
+    let payload = import::renewed(&pending.payload);
+    let name = pending.name;
+    app.outbox
+        .push(import::preview_job(payload.clone(), move |app, result| {
+            let preview = match result {
+                Ok(preview) => preview,
+                Err(code) => return crate::rule_set_load::refused(app, name, Refusal::Code(code)),
+            };
+            if let Some(code) = preview.refused {
+                return crate::rule_set_load::refused(app, name, Refusal::Code(code));
             }
-        },
-    );
-    app.wizard.busy = Some(Busy::Applying);
-    app.wizard.outcome = None;
-    app.outbox.push(job);
+            if preview.empty {
+                return crate::rule_set_load::applied(app, name, rules);
+            }
+            app.outbox.push(import::apply_job(
+                payload,
+                preview.token,
+                move |app, result| match result {
+                    Ok(()) => crate::rule_set_load::applied(app, name, rules),
+                    Err(code) => crate::rule_set_load::refused(app, name, Refusal::Code(code)),
+                },
+            ));
+        }));
 }
 
 /// The screen the GUI's first-run contract opens when the setup is done.
@@ -1037,16 +1266,20 @@ fn after_setup() -> ScreenId {
     }
 }
 
-/// Every way out of the setup applies the protection answers, as closing the
-/// GUI's window does.
-fn finish(app: &mut AppState, imported_rules: Option<usize>) {
-    send_protection(app);
+/// Every way out of the setup applies its answers, as closing the GUI's
+/// window does: the protection first, the starting rules once it is in force.
+fn finish(app: &mut AppState) {
+    let rules = match app.wizard.chosen.take() {
+        Some(Chosen::Set(pending)) => Some(*pending),
+        Some(Chosen::Empty) | None => None,
+    };
+    send_protection(app, rules);
     stability::send(app);
     app.wizard.reset();
     let target = after_setup();
     app.open(target);
     if target == ScreenId::Interfaces {
-        super::interfaces::setup_finished(app, imported_rules);
+        super::interfaces::setup_finished(app, None);
     }
 }
 
@@ -1054,17 +1287,16 @@ impl Screen for WizardScreen {
     fn view(&self, app: &AppState, texts: &Texts) -> ScreenView {
         let state = &app.wizard;
         let step = state.step;
-        let heading = if step == Step::Licence {
-            texts.get(k::LICENCE_TITLE)
-        } else {
-            texts.fill(
+        let heading = match step.number() {
+            Some(number) => texts.fill(
                 k::STEP,
                 &[
-                    ("number", step.number().to_string()),
+                    ("number", number.to_string()),
                     ("total", STEP_COUNT.to_string()),
                     ("name", texts.get(step.name())),
                 ],
-            )
+            ),
+            None => texts.get(step.name()),
         };
         let mut panels = vec![Panel {
             title: heading,
@@ -1216,19 +1448,12 @@ impl Screen for WizardScreen {
 
 /// The candidate the hint names: the first connection that looks like a
 /// tunnel, by the kind the OS decided, else by the classification.
+/// The connected adapter that reads as the VPN; an idle one a VPN client left
+/// behind is not it.
 fn tunnel_candidate(rows: &[InterfaceRowDto]) -> Option<String> {
     rows.iter()
-        .filter(|row| !holds(row, Route::Primary))
-        .find(|row| {
-            if !row.kind.is_empty() && row.kind != "other" {
-                row.kind == "tunnel"
-            } else {
-                row.derived_assessment
-                    .classification
-                    .to_lowercase()
-                    .contains("vpn")
-            }
-        })
+        .filter(|row| !holds(row, Route::Primary) && row.availability == "available")
+        .find(|row| looks_like_tunnel(row))
         .map(|row| row.name.clone())
 }
 
@@ -1254,7 +1479,10 @@ fn step_lines(app: &AppState, texts: &Texts) -> Vec<ViewLine> {
             }
         }
         Step::Primary => match assigned(app, Route::Primary) {
-            Some(name) => lines.push(texts.fill(k::PRIMARY_ASSIGNED, &[("name", name)])),
+            Some(name) => {
+                lines.push(texts.fill(k::PRIMARY_ASSIGNED, &[("name", name)]));
+                lines.extend(sibling_warning(app, Route::Primary, texts));
+            }
             None => {
                 lines.push(texts.get(k::PRIMARY_DESCRIPTION));
                 if !pickable(app) || adapters(app, false).is_empty() {
@@ -1263,7 +1491,17 @@ fn step_lines(app: &AppState, texts: &Texts) -> Vec<ViewLine> {
             }
         },
         Step::Secondary => match assigned(app, Route::Secondary) {
-            Some(name) => lines.push(texts.fill(k::SECONDARY_ASSIGNED, &[("name", name)])),
+            Some(name) => {
+                // A VPN adapter is down until its client connects: still chosen.
+                let up = secondary_row(app).is_some_and(|row| row.availability == "available");
+                let key = if up {
+                    k::SECONDARY_ASSIGNED
+                } else {
+                    k::SECONDARY_ASSIGNED_DOWN
+                };
+                lines.push(texts.fill(key, &[("name", name)]));
+                lines.extend(sibling_warning(app, Route::Secondary, texts));
+            }
             None if state.secondary_deferred => lines.push(texts.get(k::SECONDARY_DEFERRED)),
             None => {
                 lines.push(texts.get(k::SECONDARY_DESCRIPTION));
@@ -1295,6 +1533,7 @@ fn step_lines(app: &AppState, texts: &Texts) -> Vec<ViewLine> {
         }
         Step::Files => lines.push(texts.get(k::OPEN_FILES_DESCRIPTION)),
         Step::Review => lines.extend(review_lines(app, texts)),
+        Step::Summary => lines.extend(summary_lines(app, texts)),
     }
     if let Some(line) = status_line(app, texts) {
         lines.push(line);
@@ -1340,13 +1579,50 @@ fn review_lines(app: &AppState, texts: &Texts) -> Vec<String> {
     lines
 }
 
+/// What closing the setup applies, as the window's last step lists it: the
+/// protection as the service now holds it.
+fn summary_lines(app: &AppState, texts: &Texts) -> Vec<String> {
+    let state = &app.wizard;
+    let named = |key: Key, name: String| texts.fill(key, &[("name", name)]);
+    let mut lines = vec![texts.get(k::REVIEW_DESCRIPTION)];
+    let primary = assigned(app, Route::Primary);
+    let no_primary = primary.is_none();
+    lines.push(named(
+        k::REVIEW_PRIMARY,
+        primary.unwrap_or_else(|| texts.get(k::REVIEW_NOT_CHOSEN)),
+    ));
+    if no_primary {
+        lines.push(texts.get(k::REVIEW_NO_PRIMARY));
+    }
+    let secondary = assigned(app, Route::Secondary).unwrap_or_else(|| {
+        texts.get(if state.secondary_deferred {
+            k::REVIEW_LATER
+        } else {
+            k::REVIEW_NOT_CHOSEN
+        })
+    });
+    lines.push(named(k::REVIEW_SECONDARY, secondary));
+    let rules = match &state.chosen {
+        Some(Chosen::Set(pending)) => pending.name.resolve(texts),
+        Some(Chosen::Empty) => texts.get(k::RULE_SET_EMPTY_NAME),
+        None => texts.get(k::REVIEW_RULES_CURRENT),
+    };
+    lines.push(named(k::REVIEW_RULES, rules));
+    let leak = if protection_in_force(app) {
+        k::REVIEW_LEAK_IN_FORCE
+    } else {
+        k::REVIEW_LEAK_NOT_YET
+    };
+    lines.push(named(leak, texts.get(level_label(shown_level(app)))));
+    lines
+}
+
 fn status_line(app: &AppState, texts: &Texts) -> Option<String> {
     let state = &app.wizard;
     if let Some(busy) = state.busy {
         return Some(texts.get(match busy {
             Busy::Saving => k::SAVING,
             Busy::Previewing => k::PREVIEWING,
-            Busy::Applying => k::APPLYING,
         }));
     }
     Some(match state.outcome.as_ref()? {
