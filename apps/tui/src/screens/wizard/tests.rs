@@ -1272,6 +1272,8 @@ fn idle_vpn_adapters_do_not_bury_the_live_links() {
         row["persistent-id"] = json!(format!("{{00000000-0000-0000-0000-0000000000{n}}}"));
         row["adapter-name"] = row["persistent-id"].clone();
         row["name"] = json!(format!("Idle Tap {n}"));
+        // Each of its own driver: down copies of one driver are not offered.
+        row["interface-description"] = json!(format!("Idle Tap Driver {n}"));
         rows.insert(1, row);
     }
     let parsed = serde_json::from_value(snapshot).expect("snapshot parses");

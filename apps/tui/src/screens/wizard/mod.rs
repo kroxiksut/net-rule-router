@@ -685,15 +685,32 @@ fn actions(app: &AppState) -> Vec<Action> {
             let held = assigned(app, route).is_some();
             let deferred = !held && route == Route::Secondary && state.secondary_deferred;
             if choosing(app, route) {
+                let rows = if pickable(app) {
+                    offered_adapters(app, route)
+                } else {
+                    Vec::new()
+                };
+                // Asked to turn the VPN on with nothing connected to offer:
+                // the cursor starts on "later", never on a guessed adapter.
+                let wait_for_vpn = route == Route::Secondary
+                    && !held
+                    && rows
+                        .first()
+                        .is_none_or(|row| row.availability != "available")
+                    && !idle_vpns(app, &adapters(app, false))
+                        .start_vpn_first
+                        .is_empty();
+                if wait_for_vpn {
+                    actions.push(Action::Later);
+                }
                 if pickable(app) {
                     actions.extend(
-                        offered_adapters(app, route)
-                            .iter()
+                        rows.iter()
                             .map(|row| Action::Assign(route, super::binding::row_key(row))),
                     );
                     actions.push(Action::ShowAll);
                 }
-                if route == Route::Secondary && !held {
+                if route == Route::Secondary && !held && !wait_for_vpn {
                     actions.push(Action::Later);
                 }
                 if route == Route::Secondary {
