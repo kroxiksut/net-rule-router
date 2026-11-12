@@ -101,7 +101,9 @@ fn a_private_srv_reply_must_match_the_question_and_be_complete() {
 fn a_secondary_service_name_stays_withheld_when_the_guard_blocks() {
     let l = listener(&[LDAP], Err(ResolveError::Unavailable("offline".into())))
         .with_leak_guard_posture(Arc::new(|| true))
-        .with_private_resolvers(Arc::new(|_| panic!("a protected SRV query must not forward")));
+        .with_private_resolvers(Arc::new(|_| {
+            panic!("a protected SRV query must not forward")
+        }));
     match l.answer_query(&query(LDAP, SRV)) {
         ListenerAction::Respond(reply) => assert_eq!(reply[3] & 0x0F, RCODE_SERVFAIL),
         other => panic!("must withhold the secondary SRV query, got {other:?}"),

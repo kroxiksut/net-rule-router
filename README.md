@@ -25,7 +25,7 @@ Windows and Linux builds today; macOS next.
 [![Telegram: netrulerouter](https://img.shields.io/badge/Telegram-netrulerouter-26A5E4.svg?logo=telegram)](https://t.me/netrulerouter)
 ![Status: alpha](https://img.shields.io/badge/status-alpha-orange.svg)
 
-**English** · [Русский](README_RU.md)
+**English** · [Русский](README_RU.md) · [Changelog](CHANGELOG.md)
 
 <img src="docs/en/images/rules.png" alt="Rules: each rule names what it matches and which route it takes" width="900" />
 
@@ -396,7 +396,6 @@ The full order of work, without dates: [ROADMAP.md](ROADMAP.md).
 
 | File | What's in it |
 |------|--------------|
-| [`CHANGELOG.md`](CHANGELOG.md) | Notable changes planned for the next release and the history of published releases |
 | [`SECURITY.md`](SECURITY.md) | Security model & trust boundaries |
 | [`STRUCTURE.md`](STRUCTURE.md) | Repository layout |
 | [`docs/en/quickstart.md`](docs/en/quickstart.md) | Quick start: from install to the first applied rule |

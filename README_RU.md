@@ -25,7 +25,7 @@ Wi-Fi, Ethernet. Без собственного туннеля, без обла
 [![Telegram: netrulerouter](https://img.shields.io/badge/Telegram-netrulerouter-26A5E4.svg?logo=telegram)](https://t.me/netrulerouter)
 ![Status: alpha](https://img.shields.io/badge/status-alpha-orange.svg)
 
-[English](README.md) · **Русский**
+[English](README.md) · **Русский** · [История изменений](CHANGELOG_RU.md)
 
 <img src="docs/ru/images/rules.png" alt="«Правила»: у каждого правила — что под него попадает и через какой маршрут" width="900" />
 
@@ -403,7 +403,6 @@ explain mode, защита от утечки, предлагаемые адре�
 
 | Файл | Содержание |
 |------|------------|
-| [`CHANGELOG_RU.md`](CHANGELOG_RU.md) | Существенные изменения следующей версии и история выпущенных версий |
 | [`SECURITY.md`](SECURITY.md) | Модель безопасности и границы доверия |
 | [`STRUCTURE.md`](STRUCTURE.md) | Структура репозитория |
 | [`docs/ru/rules-file-format.md`](docs/ru/rules-file-format.md) | Формат файлов пресетов и правил |

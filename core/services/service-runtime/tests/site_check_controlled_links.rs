@@ -3,6 +3,8 @@
 use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener};
+#[cfg(target_os = "linux")]
+use std::process::Command;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime};
@@ -31,6 +33,56 @@ const BOB: &str = "S-1-5-21-3212-2002";
 const HOST: &str = "controlled-links.example";
 const PRIMARY: Ipv4Addr = Ipv4Addr::new(127, 0, 0, 2);
 const SECONDARY: Ipv4Addr = Ipv4Addr::new(127, 0, 0, 3);
+
+#[cfg(target_os = "linux")]
+struct LoopbackAliases(Vec<Ipv4Addr>);
+
+#[cfg(target_os = "linux")]
+impl LoopbackAliases {
+    fn ensure() -> Result<Self, Box<dyn std::error::Error>> {
+        let output = Command::new("ip")
+            .args(["-4", "-o", "addr", "show", "dev", "lo"])
+            .output()?;
+        if !output.status.success() {
+            return Err(format!(
+                "could not inspect loopback addresses: {}",
+                String::from_utf8_lossy(&output.stderr)
+            )
+            .into());
+        }
+        let present = String::from_utf8_lossy(&output.stdout);
+        let mut aliases = Self(Vec::new());
+        for address in [PRIMARY, SECONDARY] {
+            let cidr = format!("{address}/32");
+            if present.split_whitespace().any(|field| field == cidr) {
+                continue;
+            }
+            let added = Command::new("ip")
+                .args(["addr", "add", &cidr, "dev", "lo"])
+                .output()?;
+            if !added.status.success() {
+                return Err(format!(
+                    "could not add {cidr} to lo: {}",
+                    String::from_utf8_lossy(&added.stderr)
+                )
+                .into());
+            }
+            aliases.0.push(address);
+        }
+        Ok(aliases)
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl Drop for LoopbackAliases {
+    fn drop(&mut self) {
+        for address in self.0.drain(..) {
+            let _ = Command::new("ip")
+                .args(["addr", "del", &format!("{address}/32"), "dev", "lo"])
+                .status();
+        }
+    }
+}
 
 #[derive(Default)]
 struct Books(Mutex<HashMap<String, ActiveRulesSnapshot>>);
@@ -226,9 +278,11 @@ impl Drop for Server {
 }
 
 #[test]
-#[ignore = "requires a free loopback TCP/443 and Linux loopback aliases 127.0.0.2/32, 127.0.0.3/32 on the test laptop"]
+#[ignore = "requires a free loopback TCP/443 and permission to add Linux loopback aliases"]
 fn controlled_links_confirm_accept_and_keep_the_accepted_site_off_primary(
 ) -> Result<(), Box<dyn std::error::Error>> {
+    #[cfg(target_os = "linux")]
+    let _aliases = LoopbackAliases::ensure()?;
     let server = Server::start()?;
     let books = Arc::new(Books::default());
     let engine = Arc::new(
