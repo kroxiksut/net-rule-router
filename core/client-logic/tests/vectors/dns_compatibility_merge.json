@@ -1,0 +1,92 @@
+{
+  "cases": [
+    {
+      "name": "new service evidence for another browser cannot silently drop the old browser incident",
+      "input": {
+        "previous": {"instance-id":"old-service","sequence":20,"status":"limited","issues":[{"program":"browser-a","reason":"our-dns-block","evidence":"confirmed","first-seen-ms":1,"last-seen-ms":2,"attempts":3,"needs-recheck":false}]},
+        "updates": [
+          {"instance-id":"new-service","sequence":1,"status":"limited","issues":[{"program":"browser-b","reason":"our-dns-block","evidence":"confirmed","first-seen-ms":4,"last-seen-ms":4,"attempts":1,"needs-recheck":false}]},
+          {"instance-id":"new-service","sequence":2,"status":"verified","verified-program":"browser-b","issues":[]}
+        ]
+      },
+      "expected": {"status":"needs-recheck","issues":[{"program":"browser-a","reason":"our-dns-block","evidence":"confirmed","first-seen-ms":1,"last-seen-ms":2,"attempts":3,"needs-recheck":true}]}
+    },
+    {
+      "name": "a verified different program cannot erase the cached browser incident",
+      "input": {
+        "previous": {"instance-id":"service-a","sequence":2,"status":"limited","issues":[{"program":"browser","reason":"our-dns-block","evidence":"confirmed","first-seen-ms":1,"last-seen-ms":2,"attempts":3,"needs-recheck":false}]},
+        "incoming": {"instance-id":"service-a","sequence":3,"status":"verified","verified-program":"other-program","issues":[]}
+      },
+      "expected": {"status":"needs-recheck","issues":[{"program":"browser","reason":"our-dns-block","evidence":"confirmed","first-seen-ms":1,"last-seen-ms":2,"attempts":3,"needs-recheck":true}]}
+    },
+    {
+      "name": "even the selected site connection cannot prove the strict DNS setting changed",
+      "input": {
+        "previous": {"instance-id":"service-a","sequence":2,"status":"limited","issues":[{"program":"browser","reason":"strict-browser-dns","evidence":"confirmed","first-seen-ms":1,"last-seen-ms":2,"attempts":3,"needs-recheck":false}]},
+        "incoming": {"instance-id":"service-a","sequence":3,"status":"verified","verified-program":"browser","issues":[]}
+      },
+      "expected": {"status":"needs-recheck","issues":[{"program":"browser","reason":"strict-browser-dns","evidence":"confirmed","first-seen-ms":1,"last-seen-ms":2,"attempts":3,"needs-recheck":true}]}
+    },
+    {
+      "name": "an expired verdict at the same version is not reactivated by a delayed success",
+      "input": {
+        "previous": {"instance-id":"service-a","sequence":2,"status":"needs-recheck","issues":[{"program":"browser","reason":"our-dns-block","evidence":"confirmed","first-seen-ms":1,"last-seen-ms":2,"attempts":3,"needs-recheck":true}]},
+        "incoming": {"instance-id":"service-a","sequence":2,"status":"verified","issues":[]}
+      },
+      "expected": {"status":"needs-recheck","issues":[{"program":"browser","reason":"our-dns-block","evidence":"confirmed","first-seen-ms":1,"last-seen-ms":2,"attempts":3,"needs-recheck":true}]}
+    },
+    {
+      "name": "an older empty recheck response cannot replace confirmed new evidence",
+      "input": {
+        "previous": {"instance-id":"service-a","sequence":2,"status":"limited","issues":[{"program":"browser","reason":"our-dns-block","evidence":"confirmed","first-seen-ms":1,"last-seen-ms":2,"attempts":3,"needs-recheck":false}]},
+        "incoming": {"instance-id":"service-a","sequence":1,"status":"unchecked","issues":[]}
+      },
+      "expected": {"status":"limited","issues":[{"program":"browser","reason":"our-dns-block","evidence":"confirmed","first-seen-ms":1,"last-seen-ms":2,"attempts":3,"needs-recheck":false}]}
+    },
+    {
+      "name": "a delayed success cannot replace a newer failure push",
+      "input": {
+        "previous": {"instance-id":"service-a","sequence":2,"status":"limited","issues":[{"program":"browser","reason":"our-dns-block","evidence":"confirmed","first-seen-ms":1,"last-seen-ms":2,"attempts":3,"needs-recheck":false}]},
+        "incoming": {"instance-id":"service-a","sequence":1,"status":"verified","issues":[]}
+      },
+      "expected": {"status":"limited","issues":[{"program":"browser","reason":"our-dns-block","evidence":"confirmed","first-seen-ms":1,"last-seen-ms":2,"attempts":3,"needs-recheck":false}]}
+    },
+    {
+      "name": "an old service cannot certify recovery after a new service reported failure",
+      "input": {
+        "previous": {"instance-id":"service-b","sequence":2,"status":"limited","issues":[{"program":"browser","reason":"our-dns-block","evidence":"confirmed","first-seen-ms":1,"last-seen-ms":2,"attempts":3,"needs-recheck":false}]},
+        "incoming": {"instance-id":"service-a","sequence":100,"status":"verified","issues":[]}
+      },
+      "expected": {"status":"limited","issues":[{"program":"browser","reason":"our-dns-block","evidence":"confirmed","first-seen-ms":1,"last-seen-ms":2,"attempts":3,"needs-recheck":false}]}
+    },
+    {
+      "name": "a restarted service cannot certify a blocked browser as recovered",
+      "input": {
+        "previous": {"status":"limited","issues":[{"program":"browser","reason":"our-dns-block","evidence":"confirmed","first-seen-ms":1,"last-seen-ms":2,"attempts":3,"needs-recheck":false}]},
+        "incoming": {"status":"unchecked","issues":[]}
+      },
+      "expected": {"status":"needs-recheck","issues":[{"program":"browser","reason":"our-dns-block","evidence":"confirmed","first-seen-ms":1,"last-seen-ms":2,"attempts":3,"needs-recheck":true}]}
+    },
+    {
+      "name": "fresh browser evidence can resolve the old episode",
+      "input": {
+        "previous": {"status":"limited","issues":[{"program":"browser","reason":"our-dns-block","evidence":"confirmed","first-seen-ms":1,"last-seen-ms":2,"attempts":3,"needs-recheck":false}]},
+        "incoming": {"status":"verified","verified-program":"browser","issues":[]}
+      },
+      "expected": {"status":"verified","issues":[]}
+    },
+    {
+      "name": "a new client starts unchecked",
+      "input": {"previous":{"status":"unchecked","issues":[]},"incoming":{"status":"unchecked","issues":[]}},
+      "expected": {"status":"unchecked","issues":[]}
+    },
+    {
+      "name": "fresh evidence replaces stale cached evidence",
+      "input": {
+        "previous":{"status":"needs-recheck","issues":[{"program":"browser","reason":"our-dns-block","evidence":"confirmed","first-seen-ms":1,"last-seen-ms":2,"attempts":3,"needs-recheck":true}]},
+        "incoming":{"status":"limited","issues":[{"program":"browser","reason":"strict-browser-dns","evidence":"confirmed","first-seen-ms":5,"last-seen-ms":5,"attempts":1,"needs-recheck":false}]}
+      },
+      "expected":{"status":"limited","issues":[{"program":"browser","reason":"strict-browser-dns","evidence":"confirmed","first-seen-ms":5,"last-seen-ms":5,"attempts":1,"needs-recheck":false}]}
+    }
+  ]
+}

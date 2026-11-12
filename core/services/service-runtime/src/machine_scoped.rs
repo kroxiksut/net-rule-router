@@ -1,16 +1,5 @@
-//! Writing a machine-wide setting from a user-scoped operation.
-//!
-//! The operations [`MachineScopedSetting::written_by`] names change state that
-//! belongs to the MACHINE, not to the caller, yet travel under a class that
-//! does not require elevation.
-//!
-//! Demanding elevation for the whole operation would be wrong: clients
-//! read-modify-write the whole row, so refusing every save that merely echoes
-//! the current value would turn ordinary settings into a UAC prompt for exactly
-//! the users the restriction applies to.
-//!
-//! So the check is on the VALUE, not on the operation: a non-elevated caller
-//! may save anything as long as the machine-wide part comes back unchanged.
+//! Gate machine-wide values within user-scoped writes; saving an unchanged
+//! machine value must not demand elevation for an otherwise per-user edit.
 
 use nrr_shared::ipc::IpcOperationName;
 
@@ -32,12 +21,7 @@ pub enum MachineScopedSetting {
 }
 
 impl MachineScopedSetting {
-    /// The setting `op` writes when its handler gates the write by value.
-    ///
-    /// Exhaustive on purpose: a new operation does not compile until somebody
-    /// decides whether it writes machine state this way. The privilege tests
-    /// derive the list of value-gated operations from here, and the gate
-    /// probes run each one's real handler.
+    /// Exhaustiveness forces each operation to declare whether it writes machine state.
     #[must_use]
     pub const fn written_by(op: IpcOperationName) -> Option<Self> {
         use IpcOperationName as Op;
@@ -50,6 +34,7 @@ impl MachineScopedSetting {
             Op::ServiceStabilityConfigSet => Some(Self::ServiceStability),
             Op::TrafficStatsSet => Some(Self::TrafficStats),
             Op::ContractNegotiate
+            | Op::DnsCompatibilityRecheck
             | Op::ServiceHealthGet
             | Op::SnapshotInitialGet
             | Op::SnapshotInterfacesGet
@@ -95,6 +80,7 @@ impl MachineScopedSetting {
             | Op::TrafficHistoryMergeSet
             | Op::TrafficStatsClear
             | Op::AutoRuleCandidatesProbe
+            | Op::AutoRuleDiscoveryFeedback
             | Op::RefusingAnchorSet
             | Op::LocalNetworksGet
             | Op::LocalNetworksSet

@@ -225,6 +225,8 @@ pub enum IpcOperationName {
     /// [`crate::ipc_payloads::AutoRuleCandidatesProbeRequest`] →
     /// [`crate::ipc_payloads::AutoRuleCandidatesProbeResponse`].
     AutoRuleCandidatesProbe,
+    /// Record what the caller's surface actually showed or held back.
+    AutoRuleDiscoveryFeedback,
     /// Record the caller's decisions about local networks: refuse a discovered
     /// one, or name one the service cannot discover (a hypervisor in NAT mode
     /// creates no host interface). Per-SID configuration, no elevation.
@@ -270,6 +272,7 @@ pub enum IpcOperationName {
     /// over durable per-SID storage. GUI **and tray**: the tray is where the
     /// notice — and the mute action on it — appear.
     BlockNoticeMutesList,
+    DnsCompatibilityRecheck,
     /// Add or refresh one block-notice mute for the caller. An absent expiry
     /// means "until removed". User-scoped and deliberately NOT elevated — a
     /// user silencing their own notices never meets a UAC prompt, same stance
@@ -398,7 +401,7 @@ pub enum IpcOperationName {
 }
 
 impl IpcOperationName {
-    pub const ALL: [Self; 86] = [
+    pub const ALL: [Self; 88] = [
         Self::ContractNegotiate,
         Self::ServiceHealthGet,
         Self::SnapshotInitialGet,
@@ -452,6 +455,7 @@ impl IpcOperationName {
         Self::TrafficHistoryMergeSet,
         Self::TrafficStatsClear,
         Self::AutoRuleCandidatesProbe,
+        Self::AutoRuleDiscoveryFeedback,
         Self::RefusingAnchorSet,
         Self::LocalNetworksGet,
         Self::LocalNetworksSet,
@@ -464,6 +468,7 @@ impl IpcOperationName {
         Self::BlockNoticeJournalList,
         Self::BlockNoticeJournalAck,
         Self::BlockNoticeMutesList,
+        Self::DnsCompatibilityRecheck,
         Self::BlockNoticeMutesSet,
         Self::BlockNoticeMutesRemove,
         Self::BlockNoticeMutesClear,
@@ -542,6 +547,7 @@ impl IpcOperationName {
             Self::TrafficHistoryMergeSet => "traffic-stats.history-merge.set",
             Self::TrafficStatsClear => "traffic-stats.clear",
             Self::AutoRuleCandidatesProbe => "autorules.candidates.probe",
+            Self::AutoRuleDiscoveryFeedback => "autorules.discovery.feedback",
             Self::RefusingAnchorSet => "autorules.refusing-anchor.set",
             Self::LocalNetworksGet => "settings.local-networks.get",
             Self::LocalNetworksSet => "settings.local-networks.set",
@@ -554,6 +560,7 @@ impl IpcOperationName {
             Self::BlockNoticeJournalList => "block-notices.journal.list",
             Self::BlockNoticeJournalAck => "block-notices.journal.ack",
             Self::BlockNoticeMutesList => "block-notices.mutes.list",
+            Self::DnsCompatibilityRecheck => "dns.compatibility.recheck",
             Self::BlockNoticeMutesSet => "block-notices.mutes.set",
             Self::BlockNoticeMutesRemove => "block-notices.mutes.remove",
             Self::BlockNoticeMutesClear => "block-notices.mutes.clear",

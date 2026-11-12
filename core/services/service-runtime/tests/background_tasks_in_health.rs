@@ -306,6 +306,25 @@ const THREADS: &[(&str, &str, usize, Verdict)] = &[
         Verdict::Bounded("one upstream re-selection at a time, on a network or tunnel change"),
     ),
     (
+        "service-runtime/src/dns_compatibility.rs",
+        "nrr-dns-compatibility-check",
+        1,
+        Verdict::Bounded(
+            "one resolver/profile snapshot per caller, 16 callers maximum, 30-second retry floor; \
+             bounded resolver probes and three profile results; panic and spawn failure finish \
+             with unverified readiness published to the caller",
+        ),
+    ),
+    (
+        "service-runtime/src/dns_compatibility.rs",
+        "nrr-dns-compatibility-push",
+        1,
+        Verdict::Bounded(
+            "one coalesced push per caller, 16 callers maximum; delay at most one second, \
+             then publishes once; spawn failure flushes synchronously",
+        ),
+    ),
+    (
         "service-runtime/src/fake_ip/apply_queue.rs",
         "nrr-fakeip-apply",
         1,
@@ -388,6 +407,12 @@ const THREADS: &[(&str, &str, usize, Verdict)] = &[
         "nrr-main-link-probe",
         1,
         Verdict::Bounded("one probe pass"),
+    ),
+    (
+        "service-runtime/src/discovery_observation.rs",
+        "nrr-close-confirm",
+        1,
+        Verdict::Bounded("at most two confirmation workers, with a deadline on each TLS exchange"),
     ),
     (
         "service-runtime/src/rule_hostname_seeder.rs",

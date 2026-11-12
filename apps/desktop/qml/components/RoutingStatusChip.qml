@@ -60,6 +60,13 @@ Rectangle {
         return root.tr("routing.status.detail-active",
             "Your rules are working.")
     }
+    readonly property string fullDetailText: {
+        var readiness = root.routingReadinessDetail()
+        var fakeIp = root.fakeIpFailureText()
+        return detailText
+            + (readiness === "" ? "" : "\n" + readiness)
+            + (fakeIp === "" ? "" : "\n" + fakeIp)
+    }
 
     implicitHeight: 26
     implicitWidth: chipRow.implicitWidth + theme.spacingMd * 2
@@ -78,7 +85,7 @@ Rectangle {
     Keys.onEnterPressed: chip.clicked()
     Accessible.role: Accessible.Button
     Accessible.name: chip.labelText
-    Accessible.description: chip.detailText
+    Accessible.description: chip.fullDetailText
     Accessible.onPressAction: chip.clicked()
 
     Row {
@@ -104,6 +111,6 @@ Rectangle {
         onClicked: chip.clicked()
         hoverEnabled: true
         ToolTip.visible: containsMouse && root.prefs.tooltipsEnabled
-        ToolTip.text: chip.detailText
+        ToolTip.text: chip.fullDetailText
     }
 }

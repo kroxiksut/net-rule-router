@@ -22,6 +22,25 @@ pub fn first_run_country(region: &str, locales: &[String]) -> String {
         .unwrap_or_default()
 }
 
+/// Whether the setup may finish after a starting rule set was chosen. Rules
+/// for the additional route require both a binding and a live adapter.
+/// Twin of `firstRunFinishState` in `pure.js`.
+pub const fn first_run_finish_state(
+    requires_secondary: bool,
+    secondary_assigned: bool,
+    secondary_available: bool,
+) -> &'static str {
+    if !requires_secondary {
+        "ready"
+    } else if !secondary_assigned {
+        "secondary-not-chosen"
+    } else if !secondary_available {
+        "secondary-unavailable"
+    } else {
+        "ready"
+    }
+}
+
 /// The territory a tag names: the tag itself when it is a two-letter code,
 /// else its first two-letter subtag after the language.
 fn territory(tag: &str) -> Option<String> {

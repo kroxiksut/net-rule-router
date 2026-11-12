@@ -570,7 +570,10 @@ fn panels(app: &AppState, texts: &Texts) -> Vec<Panel> {
 }
 
 fn role_lines(app: &AppState, rows: &[InterfaceRowDto], texts: &Texts) -> Vec<ViewLine> {
-    let mut lines = vec![ViewLine::text(texts.get(k::ROLE_EXPLANATION))];
+    let mut lines = vec![
+        ViewLine::text(texts.get(k::ROLE_EXPLANATION)),
+        ViewLine::text(texts.get(k::SYSTEM_PROXY_NOTE)),
+    ];
     for route in Route::ALL {
         let mut segments = vec![
             Segment::route(texts.get(role_label(route)), route),

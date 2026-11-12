@@ -484,6 +484,21 @@ impl ProductionRulesProvider {
         }
     }
 
+    /// Name the exact stored or applying book decoded under this read.
+    pub(crate) fn stored_with_revision_for(
+        &self,
+        principal: &str,
+    ) -> Option<(ActiveRulesSnapshot, String)> {
+        let guard = self.conn.lock().ok()?;
+        let book = book_in_force_for(&guard, principal).ok()??;
+        let snapshot = decode_rules_snapshot(&book.rules_json, book.origin())?;
+        let revision = book
+            .revision_id
+            .clone()
+            .unwrap_or_else(|| format!("applying:{}", base_revision_of(Some(&book))));
+        Some((snapshot, revision))
+    }
+
     /// Report to `notices` instead of the service's registry.
     #[must_use]
     pub fn with_notices(

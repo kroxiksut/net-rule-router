@@ -15,12 +15,14 @@ Service: OK
 Rules status:
   Rules are working
   Your rules are working.
+  Service: healthy
 Connections:
   Main connection: Ethernet — Example Network Adapter — Available — Rules applied
   Additional connection (e.g. VPN): Example Tunnel — Example Network Adapter — Available — Rules applied
 Notifications:
   No notifications.
 Commands on this screen:
+  d: Check DNS compatibility
   r: restore your settings to a service that lost them
   t: confirm the first listed program as your VPN (T: with the programs it ships with), so leak protection keeps it working
   a: allow the first listed VPN to reach its server, so leak protection lets it connect

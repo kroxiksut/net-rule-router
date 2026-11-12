@@ -15,12 +15,14 @@ Service: OK
 Rules status:
   Rules are working
   Your rules are working.
+  Service: healthy
 Connections:
   Main connection: Ethernet — Example Network Adapter — Available — Rules applied
   Additional connection (e.g. VPN): Example Tunnel — Example Network Adapter — Available — Rules applied
 Notifications:
   No notifications.
 Commands on this screen:
+  d: Check DNS compatibility
   r: restore your settings to a service that lost them
   t: confirm the first listed program as your VPN (T: with the programs it ships with), so leak protection keeps it working
   a: allow the first listed VPN to reach its server, so leak protection lets it connect
@@ -76,13 +78,14 @@ Selected connection: Enter / e: Why this connection?
 Screen: Blocked while the additional connection was down
 Service: OK
 Blocked while the additional connection was down:
-  What leak protection held back while the additional connection was down. Your rules send these addresses there, so they were blocked instead of leaving through the main connection.
+  These connection attempts were blocked because the additional connection required by your rules was unavailable. The list stays available after it returns. Names marked “did not resolve” got no address during the outage, so no connection was made.
   Loading...
 Connections:
 Selected connection:
 Commands on this screen:
   n: next page (more)   p: previous page (back)
   d and a row number: show that connection, for example d 3
+  / and text: search all fields, for example /example; / on its own clears the search
   r: read again from the service. Lists do not refresh by themselves, so nothing moves while you read.
 Type a screen number, h for help or q to quit, then press Enter.
 Blocked while the additional connection was down: The additional connection has been down since 2026-10-06 11:50:00.
@@ -102,7 +105,7 @@ Selected connection: Last: 2026-10-06 11:59:00
 Screen: Blocked while the additional connection was down
 Service: OK
 Blocked while the additional connection was down:
-  What leak protection held back while the additional connection was down. Your rules send these addresses there, so they were blocked instead of leaving through the main connection.
+  These connection attempts were blocked because the additional connection required by your rules was unavailable. The list stays available after it returns. Names marked “did not resolve” got no address during the outage, so no connection was made.
   The additional connection has been down since 2026-10-06 11:50:00.
   3: Open Connections
 Connections:
@@ -121,13 +124,14 @@ Selected connection:
 Commands on this screen:
   n: next page (more)   p: previous page (back)
   d and a row number: show that connection, for example d 3
+  / and text: search all fields, for example /example; / on its own clears the search
   r: read again from the service. Lists do not refresh by themselves, so nothing moves while you read.
 Type a screen number, h for help or q to quit, then press Enter.
 
 Screen: Blocked while the additional connection was down
 Service: OK
 Blocked while the additional connection was down:
-  What leak protection held back while the additional connection was down. Your rules send these addresses there, so they were blocked instead of leaving through the main connection.
+  These connection attempts were blocked because the additional connection required by your rules was unavailable. The list stays available after it returns. Names marked “did not resolve” got no address during the outage, so no connection was made.
   The additional connection has been down since 2026-10-06 11:50:00.
   3: Open Connections
 Connections:
@@ -145,5 +149,6 @@ Selected connection:
 Commands on this screen:
   n: next page (more)   p: previous page (back)
   d and a row number: show that connection, for example d 3
+  / and text: search all fields, for example /example; / on its own clears the search
   r: read again from the service. Lists do not refresh by themselves, so nothing moves while you read.
 Type a screen number, h for help or q to quit, then press Enter.

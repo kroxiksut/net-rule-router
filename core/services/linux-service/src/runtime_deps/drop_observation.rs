@@ -139,7 +139,7 @@ pub(crate) fn app_observation_wiring(
     let scripts = Arc::new(ScriptLaunches::new(Arc::new(LinuxProcessLaunches)));
     let started = match (drops, tee.as_ref()) {
         (Some(parts), Some(tee)) => match start_drop_reports() {
-            Ok(reports) => Some((parts, tee.ring(), reports)),
+            Ok(reports) => Some((parts, tee.ring(), tee.discovery_observation(), reports)),
             Err(error) => {
                 tracing::info!(
                     target: "nrr::conn-trace",
@@ -153,13 +153,17 @@ pub(crate) fn app_observation_wiring(
         _ => None,
     };
     match started {
-        Some((parts, ring, reports)) => {
+        Some((parts, ring, discovery, reports)) => {
             tracing::info!(
                 target: "nrr::conn-trace",
                 msg_key = "linux-svc-drop-reports-enabled",
                 "drop reports enabled: notices and the outage list are fed",
             );
             let consumer = drop_consumer(parts, ring, Arc::clone(&store), scripts);
+            let consumer = match discovery {
+                Some(pipeline) => consumer.with_discovery_observation(pipeline),
+                None => consumer,
+            };
             AppObservationWiring {
                 // Socket table first: a drop reported by the time the table is
                 // read lands in the same batch as its socket row.

@@ -19,7 +19,7 @@ libfuzzer-sys = "0.4"
 serde_json = "1"
 nrr-shared = { path = "../shared/contracts", features = ["fuzzing"] }
 nrr-client-logic = { path = "../core/client-logic" }
-nrr-diagnostics = { path = "../core/diagnostics" }
+nrr-diagnostics = { path = "../core/diagnostics", features = ["fuzzing"] }
 nrr-domain = { path = "../core/domain" }
 nrr-platform-api = { path = "../core/platform/api", features = ["fuzzing"] }
 nrr-platform-linux = { path = "../core/platform/linux", features = ["fuzzing"] }
@@ -31,6 +31,41 @@ nrr-service-runtime = { path = "../core/services/service-runtime" }
 debug = 1
 debug-assertions = true
 overflow-checks = true
+
+[[bin]]
+name = "browser_dns_settings"
+path = "fuzz_targets/browser_dns_settings.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "discovery_probe_view"
+path = "fuzz_targets/discovery_probe_view.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "discovery_feedback"
+path = "fuzz_targets/discovery_feedback.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "discovery_ledger"
+path = "fuzz_targets/discovery_ledger.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "archive_correlation"
+path = "fuzz_targets/archive_correlation.rs"
+test = false
+doc = false
+bench = false
 
 [[bin]]
 name = "dns_wire_query"

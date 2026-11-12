@@ -172,6 +172,16 @@ ColumnLayout {
         }
     }
 
+    Label {
+        Layout.fillWidth: true
+        text: root.tr("interfaces.secondary.system-proxy-note",
+            "A VPN in system proxy mode does not create a network connection NetRuleRouter can assign. Use the VPN's TUN mode when you want rules to use it as the additional connection.")
+        color: root.mutedTextColor
+        wrapMode: Text.WordWrap
+        Accessible.role: Accessible.StaticText
+        Accessible.name: text
+    }
+
     // Why traffic is being blocked, stated on the screen the user is sent to.
     // Two sources: the service reporting that leak protection is blocking, and
     // the plain fact that the bound additional adapter is absent -- the second

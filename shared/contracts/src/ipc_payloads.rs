@@ -20,6 +20,13 @@
 
 use serde::{Deserialize, Serialize};
 
+mod dns_compatibility;
+pub use dns_compatibility::{
+    dns_compatibility_actions, DnsCompatibilityAction, DnsCompatibilityDto,
+    DnsCompatibilityIssueDto, DnsCompatibilityRecheckRequest, DnsCompatibilityStatus,
+    DnsResolverReadinessDto,
+};
+
 use crate::auto_rule::RuleOrigin;
 use crate::diagnostics_dto::{
     AuditEntryDto, AuditEntryFilter, DiagnosticsStatusDto, LogEntryDto, LogEntryFilter,
@@ -131,7 +138,7 @@ pub struct ServiceHealthResponse {
 /// Wire mirror of the service's fake-IP datapath probe, carried inside
 /// [`ServiceHealthResponse`]. Kebab-case on the wire: `"fake-ip-datapath"`
 /// with `"desired"` / `"running"` / `"zombies"` members.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub struct FakeIpDatapathDto {
     /// What the user's toggle last requested.
@@ -141,6 +148,28 @@ pub struct FakeIpDatapathDto {
     /// Detached stack threads that ignored the stop grace and are still
     /// being reaped. Non-zero means a start may be deferred.
     pub zombies: u32,
+    /// Last platform refusal while the feature remains requested.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_failure: Option<FakeIpFailureDto>,
+}
+
+/// Stable, privacy-bounded reason a requested fake-IP datapath is down.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub struct FakeIpFailureDto {
+    pub code: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub family: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub network: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prefix_len: Option<u8>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub interface_index: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_hop: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub metric: Option<u32>,
 }
 
 /// One component of the health aggregator, as `HealthReporter::components`
@@ -682,6 +711,10 @@ pub const REVISION_STATUS_RESET_TO_BASELINE: &str = "reset-to-baseline";
     tag = "type"
 )]
 pub enum StatusUpdateEvent {
+    DnsCompatibilityChanged {
+        sid: String,
+        state: DnsCompatibilityDto,
+    },
     /// The protection in force for this principal does not match what their
     /// settings ask for, or is in force because of somebody ELSE's settings.
     ///
@@ -1045,6 +1078,7 @@ impl StatusUpdateEvent {
             | Self::LocalNetworkTooWide { sid, .. }
             | Self::AdditionalConnectionMoved { sid, .. }
             | Self::BlockNoticeRaised { sid, .. }
+            | Self::DnsCompatibilityChanged { sid, .. }
             | Self::BlockNoticeMutesChanged { sid }
             | Self::VerifyVerdictsChanged { sid, .. }
             | Self::RuleOverridesChanged { sid, .. }
@@ -1153,6 +1187,8 @@ pub struct SnapshotInitialRequest {}
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub struct SnapshotInitialResponse {
+    #[serde(default)]
+    pub dns_compatibility: DnsCompatibilityDto,
     pub health: ServiceHealthResponse,
     pub adapters: SnapshotInterfacesResponse,
     pub diagnostics: DiagnosticsStatusDto,

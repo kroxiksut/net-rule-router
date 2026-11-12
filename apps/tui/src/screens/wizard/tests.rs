@@ -580,6 +580,7 @@ fn the_country_set_is_previewed_then_applied_with_its_token() {
         json!({ "state": "completed" }),
     );
     let mut app = app_on_wizard();
+    bind_healthy_routes(&mut app, &fake);
     app.wizard.go(Step::Rules);
     let home = regional_indexes(&app)
         .into_iter()
@@ -1346,6 +1347,17 @@ fn with_a_set_chosen(fake: &FakeService) -> AppState {
     app
 }
 
+fn bind_healthy_routes(app: &mut AppState, fake: &FakeService) {
+    let snapshot = snapshot_json(&Fixture::healthy());
+    fake.answer(
+        IpcOperationName::RoutePolicyUpdate,
+        snapshot["route-policy"].clone(),
+    );
+    fake.answer(IpcOperationName::SnapshotInitialGet, snapshot.clone());
+    app.snapshot.as_mut().expect("snapshot").route_policy =
+        Some(serde_json::from_value(snapshot["route-policy"].clone()).expect("route policy"));
+}
+
 fn confirmed(fake: &FakeService) -> bool {
     fake.sent(IpcOperationName::MutationSubmit)
         .iter()
@@ -1359,6 +1371,7 @@ fn confirmed(fake: &FakeService) -> bool {
 fn the_starting_rules_never_run_before_the_protection() {
     let fake = set_service();
     let mut app = with_a_set_chosen(&fake);
+    bind_healthy_routes(&mut app, &fake);
     take(&mut app, &Action::Next);
     assert_eq!(app.wizard.step, Step::Protection);
     while run_jobs(&mut app, &fake) > 0 {}
@@ -1396,6 +1409,7 @@ fn the_starting_rules_never_run_before_the_protection() {
 fn closing_early_applies_the_set_only_after_the_protection() {
     let fake = set_service();
     let mut app = with_a_set_chosen(&fake);
+    bind_healthy_routes(&mut app, &fake);
     let previewed = fake.operations().len();
     take(&mut app, &Action::Close);
     while run_jobs(&mut app, &fake) > 0 {}
@@ -1411,6 +1425,26 @@ fn closing_early_applies_the_set_only_after_the_protection() {
     );
 }
 
+#[test]
+fn secondary_rules_do_not_offer_finish_without_a_live_secondary() {
+    let fake = set_service();
+    let mut app = with_a_set_chosen(&fake);
+    take(&mut app, &Action::Next);
+    take(&mut app, &Action::Next);
+    while run_jobs(&mut app, &fake) > 0 {}
+
+    assert_eq!(app.wizard.step, Step::Summary);
+    assert!(!actions(&app).contains(&Action::Next));
+    assert!(actions(&app).contains(&Action::ChooseNow));
+    assert!(summary(&app, &texts_en())
+        .iter()
+        .any(|line| line.contains("TUN mode")));
+
+    take(&mut app, &Action::ChooseNow);
+    assert_eq!(app.wizard.step, Step::Secondary);
+    assert!(!confirmed(&fake));
+}
+
 /// A protection write the service refused keeps the starting rules out, and
 /// the feed says why.
 #[test]
@@ -1421,6 +1455,7 @@ fn a_protection_that_was_not_saved_keeps_the_starting_rules_out() {
         nrr_shared::ipc_transport::IpcErrorCode::Forbidden,
     );
     let mut app = with_a_set_chosen(&fake);
+    bind_healthy_routes(&mut app, &fake);
     take(&mut app, &Action::Close);
     while run_jobs(&mut app, &fake) > 0 {}
     assert!(!confirmed(&fake), "rules ran without the protection");
@@ -1814,6 +1849,7 @@ fn a_set_held_by_a_security_alert_goes_once_the_alert_is_acknowledged() {
     let texts = texts_en();
     let fake = set_service();
     let mut app = with_a_set_chosen(&fake);
+    bind_healthy_routes(&mut app, &fake);
     fake.refuse(
         IpcOperationName::MutationSubmit,
         nrr_shared::ipc_transport::IpcErrorCode::SecurityAlertUnacknowledged,

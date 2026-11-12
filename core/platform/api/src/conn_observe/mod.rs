@@ -66,7 +66,12 @@ pub enum ConnectionProgress {
     #[default]
     Attempt,
     Retransmit,
+    /// An orderly transport close; it does not prove a successful HTTPS response.
     ClosedInOrder,
+    /// A close without enough evidence to distinguish FIN from RST.
+    ClosedUnknown,
+    /// A reset reported by a mechanism that can distinguish it from a close.
+    Reset,
     /// The opening handshake was sent again: the peer has not answered the
     /// connection at all yet. A path that swallows handshakes shows only this.
     HandshakeRetransmit,

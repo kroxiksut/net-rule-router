@@ -1,28 +1,18 @@
-//! "Is it us or the site?" — one site's names checked over the caller's own
-//! routes, when the caller asks.
-//!
-//! A site that loops between its page and its sign-in looks broken while the
-//! network is fine; a sign-in that leaves by another route than the site does
-//! breaks for real, because the address changes in the middle of signing in.
-//! The check tells the two apart: for the site, its sign-in names and the names
-//! the caller's own observation saw with it, it shows the address, the route
-//! the caller's rules give it, and whether the name answers over that route.
-//!
-//! Nothing here sits on a connection's path. It reads what the trace and the
-//! auto-rules ledger already hold, resolves nothing (a name the browser never
-//! asked for is not part of the problem), connects only to addresses the
-//! caller's own traffic or the cache know, and is bounded in names and time.
-//! It changes no state: a failure can neither lift Fail-Closed nor touch DNS.
+//! User-requested checks over known real addresses on their assigned routes.
+//! Cached addresses never prove that fresh DNS or the browser's path works.
 
 pub mod http_answer;
 pub mod https_head;
+mod manual;
+mod manual_http;
+pub use manual::{captured_dns_upstream, ManualSiteCheckWiring, SiteResolverFactory};
 #[cfg(test)]
 mod tests;
 
 use std::collections::HashMap;
 use std::net::Ipv4Addr;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 
 use nrr_domain::companion_affinity::{registrable_domain, site_shared_across_zones};
@@ -32,8 +22,9 @@ use nrr_shared::ipc_payloads::{
     SiteCheckNameDto, SiteCheckReport, SiteCheckStatus, SITE_CHECK_MAX_HOST_LEN,
     SITE_CHECK_MAX_NAMES, SITE_CHECK_MAX_REDIRECTS, SITE_CHECK_SIGN_IN_LABELS,
     SITE_CHECK_STATE_DONE, SITE_CHECK_STATE_IDLE, SITE_CHECK_STATE_RUNNING,
-    SITE_CHECK_VERDICT_BLOCKED, SITE_CHECK_VERDICT_CERTIFICATE_UNTRUSTED, SITE_CHECK_VERDICT_FINE,
-    SITE_CHECK_VERDICT_NOT_ANSWERING, SITE_CHECK_VERDICT_ROUTE_DOWN,
+    SITE_CHECK_VERDICT_BLOCKED, SITE_CHECK_VERDICT_CERTIFICATE_UNTRUSTED,
+    SITE_CHECK_VERDICT_DNS_UNAVAILABLE, SITE_CHECK_VERDICT_FINE, SITE_CHECK_VERDICT_NOT_ANSWERING,
+    SITE_CHECK_VERDICT_ROUTE_DOWN, SITE_CHECK_VERDICT_SERVER_ERROR,
     SITE_CHECK_VERDICT_SIGN_IN_SPLIT, SITE_CHECK_VERDICT_UNCLEAR,
 };
 
@@ -62,12 +53,32 @@ const MAX_RUNNING: usize = 2;
 pub trait SiteRoutes: Send + Sync {
     fn route_for(&self, sid: &str, name: &str, address: Option<Ipv4Addr>) -> String;
 
+    fn evidence_for(&self, sid: &str, name: &str, address: Option<Ipv4Addr>) -> RouteEvidence {
+        RouteEvidence {
+            route: self.route_for(sid, name, address),
+            ..RouteEvidence::default()
+        }
+    }
+
     /// Whether one of `sid`'s own rules names `name`. The machine's name cache
     /// is everybody's: only such a name, or one the caller's own traffic saw,
     /// may take an address from it.
     fn covers(&self, _sid: &str, _name: &str) -> bool {
         false
     }
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct RouteEvidence {
+    pub route: String,
+    pub rule_id: Option<String>,
+    pub revision: Option<String>,
+}
+
+#[derive(Default)]
+struct EvidenceSources {
+    fake_ip: Option<crate::fake_ip::FakeIpBindingView>,
+    dns: Option<Arc<crate::dns_compatibility::DnsCompatibilityCenter>>,
 }
 
 /// The head of an HTTPS answer: `request` sent over TLS to `target:443` from
@@ -92,6 +103,8 @@ pub enum HeadFailure {
     /// The certificate did not verify against the bundled roots: something on
     /// this route answers in the site's place.
     Untrusted,
+    /// Local setup or capability failed; no remote outcome was measured.
+    Unavailable,
 }
 
 /// The answer for a name whose certificate does not verify on its route.
@@ -233,7 +246,7 @@ pub(crate) fn decide(site_route: &str, examined: &[Examined]) -> (&'static str, 
     match site.answer {
         "blocked" => return (SITE_CHECK_VERDICT_BLOCKED, Vec::new()),
         "route-down" => return (SITE_CHECK_VERDICT_ROUTE_DOWN, Vec::new()),
-        "silent" => return (SITE_CHECK_VERDICT_NOT_ANSWERING, Vec::new()),
+        "silent" | "https-unconfirmed" => return (SITE_CHECK_VERDICT_NOT_ANSWERING, Vec::new()),
         _ => {}
     }
     let sign_in = || examined.iter().filter(|e| e.planned.role == Role::SignIn);
@@ -249,7 +262,7 @@ pub(crate) fn decide(site_route: &str, examined: &[Examined]) -> (&'static str, 
     if site.answer == ANSWER_UNTRUSTED || sign_in().any(|e| e.answer == ANSWER_UNTRUSTED) {
         return (SITE_CHECK_VERDICT_CERTIFICATE_UNTRUSTED, Vec::new());
     }
-    if sign_in().any(|e| e.answer == "silent" || e.answer == "route-down") {
+    if sign_in().any(|e| matches!(e.answer, "silent" | "https-unconfirmed" | "route-down")) {
         return (SITE_CHECK_VERDICT_NOT_ANSWERING, Vec::new());
     }
     if site.answer == "answered" {
@@ -296,6 +309,8 @@ pub enum StartRefused {
 /// Runs checks and keeps each caller's latest.
 pub struct SiteChecker {
     wiring: SiteCheckWiring,
+    evidence: RwLock<EvidenceSources>,
+    manual: RwLock<Option<Arc<ManualSiteCheckWiring>>>,
     latest: Mutex<HashMap<String, SiteCheckStatus>>,
     running: AtomicUsize,
 }
@@ -304,9 +319,20 @@ impl SiteChecker {
     pub fn new(wiring: SiteCheckWiring) -> Self {
         Self {
             wiring,
+            evidence: RwLock::new(EvidenceSources::default()),
+            manual: RwLock::new(None),
             latest: Mutex::new(HashMap::new()),
             running: AtomicUsize::new(0),
         }
+    }
+
+    pub fn attach_diagnostics(
+        &self,
+        fake_ip: Option<crate::fake_ip::FakeIpBindingView>,
+        dns: Option<Arc<crate::dns_compatibility::DnsCompatibilityCenter>>,
+    ) {
+        *self.evidence.write().unwrap_or_else(|p| p.into_inner()) =
+            EvidenceSources { fake_ip, dns };
     }
 
     /// `sid`'s latest check.
@@ -418,39 +444,105 @@ impl SiteChecker {
             .as_ref()
             .map(|e| e.seen_with(sid, &root, SEEN_WITH))
             .unwrap_or_default();
-        let planned = plan_names(site, &traced_names, &seen);
-        let address_of = |name: &str| -> Option<Ipv4Addr> {
+        let mut planned = plan_names(site, &traced_names, &seen);
+        let evidence = self.evidence.read().unwrap_or_else(|p| p.into_inner());
+        let fake_ip = evidence.fake_ip.clone();
+        let dns_center = evidence.dns.clone();
+        let resolver_unavailable = evidence.dns.as_ref().is_some_and(|center| {
+            let state = center.snapshot(Some(sid), crate::dns_compatibility::now_ms());
+            state.resolver.listener == "unavailable"
+                || state.resolver.redirect == "unavailable"
+                || state.resolver.upstream == "unavailable"
+        });
+        drop(evidence);
+        let held = w.traffic_held.as_ref().is_some_and(|held| held(sid));
+        let manual = self
+            .manual
+            .read()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone();
+        if let Some(manual) = manual.as_ref() {
+            planned.truncate((manual.limits)(sid).max_targets);
+        }
+        let next_timeout = || {
+            budget_left(deadline).map(|left| {
+                manual
+                    .as_ref()
+                    .map_or(left, |manual| left.min((manual.limits)(sid).timeout))
+            })
+        };
+        let entered_addresses = if held {
+            Vec::new()
+        } else if let Some(manual) = manual.as_ref() {
+            let cached = w.cache.ips_for_hostname(site);
+            if cached.is_empty() {
+                let route = normalised_route(&w.routes.route_for(sid, site, None));
+                next_timeout()
+                    .map(|budget| manual.resolve(sid, site, budget, route == "primary"))
+                    .unwrap_or_default()
+            } else {
+                crate::dns_wire::only_v4(&cached)
+            }
+        } else {
+            Vec::new()
+        };
+        let real_addresses = |name: &str| -> Vec<std::net::IpAddr> {
             let own = traced.iter().find(|(n, _)| n == name);
+            let entered = manual.is_some() && name == site;
+            let known = entered
+                || own.is_some()
+                || seen.iter().any(|n| n == name)
+                || w.routes.covers(sid, name);
+            if !known {
+                return Vec::new();
+            }
+            let mut addresses = w.cache.ips_for_hostname(name);
+            if entered {
+                addresses.extend(entered_addresses.iter().copied().map(std::net::IpAddr::V4));
+            }
             if let Some(address) = own.and_then(|(_, a)| *a) {
-                return Some(address);
+                addresses.insert(0, std::net::IpAddr::V4(address));
             }
-            let known_to_caller =
-                own.is_some() || seen.iter().any(|n| n == name) || w.routes.covers(sid, name);
-            if !known_to_caller {
-                return None;
-            }
-            crate::dns_wire::only_v4(&w.cache.ips_for_hostname(name))
+            addresses.retain(|ip| {
+                fake_ip
+                    .as_ref()
+                    .is_none_or(|view| view.domain_for_address(*ip).is_none())
+                    && !nrr_platform_api::fake_ip::FakeIpPoolConfig::is_default_pool_addr(*ip)
+            });
+            addresses.truncate(32);
+            let mut unique = std::collections::HashSet::new();
+            addresses.retain(|address| unique.insert(*address));
+            addresses
+        };
+        let address_of = |name: &str| -> Option<Ipv4Addr> {
+            crate::dns_wire::only_v4(&real_addresses(name))
                 .first()
                 .copied()
         };
         // The probe leaves from the service's own exempt socket: while the
         // caller's traffic is held it must not reach the site in their place.
-        let held = w.traffic_held.as_ref().is_some_and(|held| held(sid));
         let (main, additional) = if held {
             (None, None)
         } else {
             w.egress.egress_source_ips(sid)
         };
+        // Source binding cannot distinguish two roles with the same address.
+        // A required additional route is unavailable rather than substituted.
+        let additional = additional.filter(|address| Some(*address) != main);
         let source_for = |route: &str| match route {
             "secondary" => additional,
-            _ => main,
+            "primary" => main,
+            _ => None,
         };
 
+        let mut route_evidence = HashMap::new();
         let mut examined: Vec<Examined> = planned
             .into_iter()
             .map(|p| {
                 let address = address_of(&p.name);
-                let route = normalised_route(&w.routes.route_for(sid, &p.name, address));
+                let evidence = w.routes.evidence_for(sid, &p.name, address);
+                let route = normalised_route(&evidence.route);
+                route_evidence.insert(p.name.clone(), evidence);
                 Examined {
                     planned: p,
                     address,
@@ -459,12 +551,38 @@ impl SiteChecker {
                 }
             })
             .collect();
+        if !held {
+            if let (Some(center), Some(site)) = (
+                dns_center.as_ref(),
+                examined.iter().find(|e| e.planned.role == Role::Site),
+            ) {
+                let required = match site.route.as_str() {
+                    "primary" => Some(nrr_shared::RouteRole::Primary),
+                    "secondary" => Some(nrr_shared::RouteRole::Secondary),
+                    _ => None,
+                };
+                if let Some(required) = required {
+                    center.arm_browser_confirmation(sid, &site.planned.name, required);
+                    center.request_recheck(sid);
+                }
+            }
+        }
         let probe = |e: &Examined| -> &'static str {
             if e.route == "blocked" {
                 return "blocked";
             }
+            if e.route == "unknown" {
+                return "unclear";
+            }
             if held {
                 return "route-down";
+            }
+            if e.route == "primary"
+                && manual.as_ref().is_some_and(|manual| {
+                    !manual.permits_primary_probe(sid, &e.planned.name, e.address)
+                })
+            {
+                return "unclear";
             }
             let Some(target) = e.address else {
                 return "no-address";
@@ -472,7 +590,7 @@ impl SiteChecker {
             let Some(source) = source_for(&e.route) else {
                 return "route-down";
             };
-            let Some(timeout) = budget_left(deadline) else {
+            let Some(timeout) = next_timeout() else {
                 return "unclear";
             };
             match w
@@ -502,27 +620,53 @@ impl SiteChecker {
         for (e, answer) in examined.iter_mut().zip(answers) {
             e.answer = answer;
         }
-
         let mut chain = http_answer::ChainReport::default();
         let mut untrusted: Vec<String> = Vec::new();
+        let mut http_unconfirmed: Vec<String> = Vec::new();
+        let mut http_unavailable: Vec<String> = Vec::new();
+        let mut http_statuses = HashMap::new();
         let site_answered = examined.first().is_some_and(|e| e.answer == "answered");
         if let Some(https) = w.https.as_ref() {
             if site_answered {
                 let fetch = |host: &str| {
                     let target = address_of(host)?;
                     let route = normalised_route(&w.routes.route_for(sid, host, Some(target)));
+                    if route == "primary"
+                        && manual.as_ref().is_some_and(|manual| {
+                            !manual.permits_primary_probe(sid, host, Some(target))
+                        })
+                    {
+                        return None;
+                    }
                     let source = source_for(&route)?;
                     let request = http_answer::request_for(host)?;
-                    let timeout = budget_left(deadline)?;
+                    let timeout = next_timeout()?;
                     match https.fetch(target, host, source, &request, timeout) {
-                        Ok(bytes) => http_answer::parse_head(&bytes).ok(),
+                        Ok(bytes) => {
+                            let answer = match http_answer::parse_head(&bytes) {
+                                Ok(answer) => answer,
+                                Err(_) => {
+                                    http_unconfirmed.push(host.to_owned());
+                                    return None;
+                                }
+                            };
+                            http_statuses.insert(host.to_owned(), answer.status);
+                            Some(answer)
+                        }
                         // Nothing more is read from a name whose certificate
                         // does not verify here.
                         Err(HeadFailure::Untrusted) => {
                             untrusted.push(host.to_owned());
                             None
                         }
-                        Err(HeadFailure::NoAnswer) => None,
+                        Err(HeadFailure::NoAnswer) => {
+                            http_unconfirmed.push(host.to_owned());
+                            None
+                        }
+                        Err(HeadFailure::Unavailable) => {
+                            http_unavailable.push(host.to_owned());
+                            None
+                        }
                     }
                 };
                 chain = http_answer::follow(
@@ -540,7 +684,9 @@ impl SiteChecker {
                         continue;
                     }
                     let address = address_of(host);
-                    let route = normalised_route(&w.routes.route_for(sid, host, address));
+                    let evidence = w.routes.evidence_for(sid, host, address);
+                    let route = normalised_route(&evidence.route);
+                    route_evidence.insert(host.clone(), evidence);
                     let mut e = Examined {
                         planned: Planned {
                             name: host.clone(),
@@ -556,9 +702,40 @@ impl SiteChecker {
                 }
             }
         }
+        if site_answered
+            && w.https.is_some()
+            && !http_statuses.contains_key(site)
+            && !untrusted.iter().any(|host| host == site)
+        {
+            http_unconfirmed.push(site.to_owned());
+        }
         for e in examined.iter_mut() {
-            if untrusted.contains(&e.planned.name) && e.answer == "answered" {
+            if http_unavailable.contains(&e.planned.name) && e.answer == "answered" {
+                e.answer = "unclear";
+            } else if untrusted.contains(&e.planned.name) && e.answer == "answered" {
                 e.answer = ANSWER_UNTRUSTED;
+            } else if http_unconfirmed.contains(&e.planned.name) && e.answer == "answered" {
+                e.answer = "https-unconfirmed";
+            }
+        }
+
+        if !held {
+            if let (Some(manual), Some(site)) = (manual.as_ref(), examined.first_mut()) {
+                if w.https.is_some() {
+                    let initial_status = http_statuses.get(&site.planned.name).copied();
+                    if let Some(status) = self.manual_http_pair(
+                        sid,
+                        site,
+                        (main, additional),
+                        initial_status,
+                        deadline,
+                        manual,
+                    ) {
+                        http_statuses.insert(site.planned.name.clone(), status);
+                    }
+                } else {
+                    self.manual_pair(sid, site, main, additional, deadline, manual);
+                }
             }
         }
 
@@ -574,10 +751,27 @@ impl SiteChecker {
                 || e.address.is_some()
                 || e.route != site_route
         });
-        let (verdict, move_names) = decide(&site_route, &examined);
-        SiteCheckReport {
+        let (mut verdict, move_names) = decide(&site_route, &examined);
+        if verdict == SITE_CHECK_VERDICT_FINE && http_statuses.values().any(|code| *code >= 500) {
+            verdict = SITE_CHECK_VERDICT_SERVER_ERROR;
+        }
+        if verdict == SITE_CHECK_VERDICT_FINE
+            && http_statuses.values().any(|code| (400..500).contains(code))
+        {
+            verdict = nrr_shared::ipc_payloads::SITE_CHECK_VERDICT_HTTP_REFUSED;
+        }
+        let report = SiteCheckReport {
             site: site.to_owned(),
-            verdict: verdict.to_owned(),
+            verdict: if resolver_unavailable
+                && !matches!(
+                    verdict,
+                    SITE_CHECK_VERDICT_BLOCKED | SITE_CHECK_VERDICT_ROUTE_DOWN
+                ) {
+                SITE_CHECK_VERDICT_DNS_UNAVAILABLE
+            } else {
+                verdict
+            }
+            .to_owned(),
             site_route,
             names: examined
                 .iter()
@@ -588,24 +782,64 @@ impl SiteChecker {
                     address: e.address.map(|a| a.to_string()).unwrap_or_default(),
                     route: e.route.clone(),
                     answer: e.answer.to_owned(),
-                    status: if i == 0 { chain.status } else { None },
+                    not_run_reason: if http_unavailable.contains(&e.planned.name) {
+                        Some("probe-unavailable".to_owned())
+                    } else if e.answer == "unclear" && e.route == "primary" {
+                        manual
+                            .as_ref()
+                            .and_then(|manual| {
+                                manual.primary_probe_refusal(sid, &e.planned.name, e.address)
+                            })
+                            .map(str::to_owned)
+                    } else {
+                        None
+                    },
+                    status: http_statuses.get(&e.planned.name).copied(),
                     redirects: if i == 0 {
                         chain.hosts.clone()
                     } else {
                         Vec::new()
                     },
+                    rule_id: route_evidence
+                        .get(&e.planned.name)
+                        .and_then(|v| v.rule_id.clone()),
+                    revision: route_evidence
+                        .get(&e.planned.name)
+                        .and_then(|v| v.revision.clone()),
+                    real_addresses: real_addresses(&e.planned.name)
+                        .iter()
+                        .map(ToString::to_string)
+                        .collect(),
+                    fake_address: fake_ip
+                        .as_ref()
+                        .filter(|_| {
+                            w.routes.covers(sid, &e.planned.name)
+                                || traced.iter().any(|(name, _)| name == &e.planned.name)
+                        })
+                        .and_then(|view| view.fake_v4_for(&e.planned.name))
+                        .map(|ip| ip.to_string()),
+                    dns: if resolver_unavailable {
+                        "unavailable"
+                    } else if real_addresses(&e.planned.name).is_empty() {
+                        "not-observed"
+                    } else {
+                        "cached"
+                    }
+                    .to_owned(),
                 })
                 .collect(),
             move_names,
-            reads_answer: w.https.is_some(),
-        }
+            reads_answer: !http_statuses.is_empty(),
+        };
+        self.record_manual_report(sid, &report);
+        report
     }
 }
 
 /// `primary`, `secondary` or `blocked`: an unmatched name takes the main route.
 fn normalised_route(route: &str) -> String {
     match route {
-        "secondary" | "blocked" => route.to_owned(),
+        "secondary" | "blocked" | "unknown" => route.to_owned(),
         _ => "primary".to_owned(),
     }
 }
@@ -631,6 +865,10 @@ impl ExplainRoutes {
 
 impl SiteRoutes for ExplainRoutes {
     fn route_for(&self, sid: &str, name: &str, address: Option<Ipv4Addr>) -> String {
+        self.evidence_for(sid, name, address).route
+    }
+
+    fn evidence_for(&self, sid: &str, name: &str, address: Option<Ipv4Addr>) -> RouteEvidence {
         use nrr_diagnostics::explain::{ExplainQuery, RuntimeInputSample};
         let mut sample = RuntimeInputSample::new().with_hostname(name.to_owned());
         if let Some(ip) = address {
@@ -645,8 +883,19 @@ impl SiteRoutes for ExplainRoutes {
                 nrr_diagnostics::redaction::ExplainDetailLevel::CompactUi,
                 sid,
             )
-            .map(|r| crate::ipc_handlers::diagnostics_handlers::explained_route(&r))
-            .unwrap_or_else(|_| "primary".to_owned())
+            .map(|r| RouteEvidence {
+                route: if r.is_available() {
+                    crate::ipc_handlers::diagnostics_handlers::explained_route(&r)
+                } else {
+                    "unknown".to_owned()
+                },
+                rule_id: r.match_section.and_then(|m| m.matched_rule_id),
+                revision: r.correlation.revision_id,
+            })
+            .unwrap_or_else(|_| RouteEvidence {
+                route: "unknown".to_owned(),
+                ..RouteEvidence::default()
+            })
     }
 
     fn covers(&self, sid: &str, name: &str) -> bool {

@@ -365,6 +365,7 @@ pub struct SettingsState {
     pub shared_exemptions_open: bool,
     /// The resolver list is open, and the entry being typed for it.
     pub doh_open: bool,
+    pub dns_help_open: bool,
     pub doh_new_target: String,
     pub doh_new_comment: String,
     pub export_path: String,
@@ -425,6 +426,7 @@ impl Default for SettingsState {
             local_network_new: String::new(),
             shared_exemptions_open: false,
             doh_open: false,
+            dns_help_open: false,
             doh_new_target: String::new(),
             doh_new_comment: String::new(),
             export_path: String::new(),
@@ -1326,6 +1328,9 @@ fn needs_service(id: ItemId) -> bool {
     !matches!(
         id,
         ItemId::MuteScope
+            | ItemId::DnsCompatibilityHelp
+            | ItemId::DnsCompatibilitySecondary
+            | ItemId::DnsCompatibilitySite
             | ItemId::MuteTarget
             | ItemId::MuteForever
             | ItemId::MuteAmount
@@ -1365,6 +1370,23 @@ fn activate(app: &mut AppState, item: &Item, input: Input) {
         _ => false,
     };
     let job = match (item.id, input) {
+        (ItemId::DnsCompatibilityRecheck, Input::Run) => {
+            crate::dns_compatibility::recheck(app);
+            None
+        }
+        (ItemId::DnsCompatibilityHelp, Input::Run) => {
+            app.settings.dns_help_open = !app.settings.dns_help_open;
+            None
+        }
+        (ItemId::DnsCompatibilitySecondary, Input::Run) => {
+            app.open(crate::screens::ScreenId::Interfaces);
+            None
+        }
+        (ItemId::DnsCompatibilitySite, Input::Run) => {
+            app.open(crate::screens::ScreenId::Diagnostics);
+            crate::screens::inspect::diagnostics::focus_site_input(app);
+            None
+        }
         (ItemId::Reset(row), input) => reset::activate(app, row, input),
         (ItemId::Provider(row), input) => providers::activate(app, row, input),
         (ItemId::HideKind(kind), Input::Pick(choice)) => hide_kind(app, kind, choice),

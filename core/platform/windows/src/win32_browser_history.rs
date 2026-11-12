@@ -374,10 +374,7 @@ fn discover_history_sources(roots: &AppDataRoots) -> Vec<HistorySource> {
     out
 }
 
-/// SID → profile-root resolution through the `ProfileList` registry key.
-/// Self-contained Win32 FFI, mirroring the registry helpers in
-/// [`crate::vpn_discovery`] rather than sharing them (same precedent: a few
-/// well-understood calls beat destabilising a load-bearing module).
+/// Resolve the requested SID without consulting the service's environment.
 #[cfg(target_os = "windows")]
 mod profile_root {
     use std::path::PathBuf;
@@ -634,13 +631,9 @@ fn fill(slot: &mut Option<File>, source: &File, cap: u64) -> Result<u64, String>
     std::io::copy(&mut limited, &mut out).map_err(|e| format!("copy: {e}"))
 }
 
-/// Open `path` for reading only once it is proven to be the principal's own
-/// regular file, reached from `anchor` without any link. Checks, in order:
-/// no link on any component below `anchor`; `anchor` is owned by the
-/// principal (or a machine principal); the file, opened without following a
-/// final link, is a plain single-link file owned likewise; its final path is
-/// still under `anchor`'s final path; its size is within `max_bytes`.
-fn open_verified(
+/// Return the checked handle: a bounded, single-link regular file belonging
+/// to this principal, reached without links and still inside its profile.
+pub(crate) fn open_verified(
     anchor: &Path,
     path: &Path,
     principal: &str,

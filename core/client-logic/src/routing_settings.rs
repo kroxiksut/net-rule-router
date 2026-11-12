@@ -83,6 +83,52 @@ pub fn offered(ctx: &RoutingContext<'_>) -> Vec<&'static str> {
     .collect()
 }
 
+/// A presentation reason from the service verdict, never a local enforcement decision.
+#[must_use]
+pub fn doh_lockdown_status(policy: &Map<String, Value>) -> &'static str {
+    let Some(effective) = policy
+        .get("doh-lockdown-effective")
+        .and_then(Value::as_bool)
+    else {
+        return "unconfirmed";
+    };
+    let read = |key| crate::route_policy::effective(policy, key);
+    if read("doh-lockdown-auto") == Some(Value::Bool(true)) {
+        return if effective { "auto-on" } else { "auto-off" };
+    }
+    if read("doh-lockdown-enabled") != Some(Value::Bool(true)) {
+        return if effective {
+            "unconfirmed"
+        } else {
+            "manual-disabled"
+        };
+    }
+    match read("doh-lockdown-scope").as_ref().and_then(Value::as_str) {
+        Some("always") if effective => "manual-always",
+        Some("leak-protection-only") => {
+            let level = read("leak-protection");
+            if !matches!(
+                level.as_ref().and_then(Value::as_str),
+                Some("off" | "sites" | "everything")
+            ) {
+                return "unconfirmed";
+            }
+            let protection_on = matches!(
+                level.as_ref().and_then(Value::as_str),
+                Some("sites" | "everything")
+            );
+            if protection_on != effective {
+                "unconfirmed"
+            } else if effective {
+                "manual-protected"
+            } else {
+                "manual-waiting"
+            }
+        }
+        _ => "unconfirmed",
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -15,12 +15,14 @@ Service: OK
 Rules status:
   Rules are working
   Your rules are working.
+  Service: healthy
 Connections:
   Main connection: Ethernet — Example Network Adapter — Available — Rules applied
   Additional connection (e.g. VPN): Example Tunnel — Example Network Adapter — Available — Rules applied
 Notifications:
   No notifications.
 Commands on this screen:
+  d: Check DNS compatibility
   r: restore your settings to a service that lost them
   t: confirm the first listed program as your VPN (T: with the programs it ships with), so leak protection keeps it working
   a: allow the first listed VPN to reach its server, so leak protection lets it connect
@@ -36,6 +38,7 @@ Screen: Suggested addresses
 Service: OK
 Addresses your sites need:
   These addresses were pulled in by sites you route. Adding one sends it through the additional connection together with the site that needs it. Anything you leave alone keeps going through the main connection.
+  e: switch between suggestions and recent decisions explaining their absence
   Mode: Suggest only (default)
   Sort: What the main connection can't reach first
   Show answered (0): No
@@ -43,6 +46,8 @@ Addresses your sites need:
   Reading the suggestions from the service...
 Suggested addresses:
 Commands on this screen:
+  e: switch between suggestions and recent decisions explaining their absence
+  h and a domain: check that site, even when no suggestion exists
   a and an item number, for example a 2: add that item to the additional connection
   z and an item number: add that item as its site in every zone
   n and an item number: do not suggest that item again
@@ -61,6 +66,7 @@ Screen: Suggested addresses
 Service: OK
 Addresses your sites need:
   These addresses were pulled in by sites you route. Adding one sends it through the additional connection together with the site that needs it. Anything you leave alone keeps going through the main connection.
+  e: switch between suggestions and recent decisions explaining their absence
   Mode: Suggest only (default)
   Sort: What the main connection can't reach first
   Show answered (1): No
@@ -80,6 +86,8 @@ Suggested addresses (3):
        keeps appearing together with the site · seen in 4 visits · belongs to this site 75% of the time
        The rule covers every name under img.example.com. Seen so far: a.img.example.com, b.img.example.com.
 Commands on this screen:
+  e: switch between suggestions and recent decisions explaining their absence
+  h and a domain: check that site, even when no suggestion exists
   a and an item number, for example a 2: add that item to the additional connection
   z and an item number: add that item as its site in every zone
   n and an item number: do not suggest that item again
@@ -98,6 +106,7 @@ Screen: Suggested addresses
 Service: OK
 Addresses your sites need:
   These addresses were pulled in by sites you route. Adding one sends it through the additional connection together with the site that needs it. Anything you leave alone keeps going through the main connection.
+  e: switch between suggestions and recent decisions explaining their absence
   Mode: Suggest only (default)
   Sort: What the main connection can't reach first
   Show answered (1): No
@@ -117,6 +126,8 @@ Suggested addresses (3):
        keeps appearing together with the site · seen in 4 visits · belongs to this site 75% of the time
        The rule covers every name under img.example.com. Seen so far: a.img.example.com, b.img.example.com.
 Commands on this screen:
+  e: switch between suggestions and recent decisions explaining their absence
+  h and a domain: check that site, even when no suggestion exists
   a and an item number, for example a 2: add that item to the additional connection
   z and an item number: add that item as its site in every zone
   n and an item number: do not suggest that item again
@@ -136,6 +147,7 @@ Screen: Suggested addresses
 Service: OK
 Addresses your sites need:
   These addresses were pulled in by sites you route. Adding one sends it through the additional connection together with the site that needs it. Anything you leave alone keeps going through the main connection.
+  e: switch between suggestions and recent decisions explaining their absence
   Mode: Suggest only (default)
   Sort: What the main connection can't reach first
   Show answered (1): No
@@ -156,6 +168,8 @@ Suggested addresses (3):
        keeps appearing together with the site · seen in 4 visits · belongs to this site 75% of the time
        The rule covers every name under img.example.com. Seen so far: a.img.example.com, b.img.example.com.
 Commands on this screen:
+  e: switch between suggestions and recent decisions explaining their absence
+  h and a domain: check that site, even when no suggestion exists
   a and an item number, for example a 2: add that item to the additional connection
   z and an item number: add that item as its site in every zone
   n and an item number: do not suggest that item again
@@ -174,6 +188,7 @@ Screen: Suggested addresses
 Service: OK
 Addresses your sites need:
   These addresses were pulled in by sites you route. Adding one sends it through the additional connection together with the site that needs it. Anything you leave alone keeps going through the main connection.
+  e: switch between suggestions and recent decisions explaining their absence
   Mode: Suggest only (default)
   Sort: What the main connection can't reach first
   Show answered (1): No
@@ -196,6 +211,8 @@ Suggested addresses (3):
        keeps appearing together with the site · seen in 4 visits · belongs to this site 75% of the time
        The rule covers every name under img.example.com. Seen so far: a.img.example.com, b.img.example.com.
 Commands on this screen:
+  e: switch between suggestions and recent decisions explaining their absence
+  h and a domain: check that site, even when no suggestion exists
   a and an item number, for example a 2: add that item to the additional connection
   z and an item number: add that item as its site in every zone
   n and an item number: do not suggest that item again
@@ -214,6 +231,7 @@ Screen: Suggested addresses
 Service: OK
 Addresses your sites need:
   These addresses were pulled in by sites you route. Adding one sends it through the additional connection together with the site that needs it. Anything you leave alone keeps going through the main connection.
+  e: switch between suggestions and recent decisions explaining their absence
   Mode: Suggest only (default)
   Sort: What the main connection can't reach first
   Show answered (1): No
@@ -234,6 +252,8 @@ Suggested addresses (3):
        keeps appearing together with the site · seen in 4 visits · belongs to this site 75% of the time
        The rule covers every name under img.example.com. Seen so far: a.img.example.com, b.img.example.com.
 Commands on this screen:
+  e: switch between suggestions and recent decisions explaining their absence
+  h and a domain: check that site, even when no suggestion exists
   a and an item number, for example a 2: add that item to the additional connection
   z and an item number: add that item as its site in every zone
   n and an item number: do not suggest that item again
@@ -252,6 +272,7 @@ Screen: Suggested addresses
 Service: OK
 Addresses your sites need:
   These addresses were pulled in by sites you route. Adding one sends it through the additional connection together with the site that needs it. Anything you leave alone keeps going through the main connection.
+  e: switch between suggestions and recent decisions explaining their absence
   Mode: Suggest only (default)
   Sort: What the main connection can't reach first
   Show answered (1): No
@@ -273,6 +294,8 @@ Suggested addresses (3):
        keeps appearing together with the site · seen in 4 visits · belongs to this site 75% of the time
        The rule covers every name under img.example.com. Seen so far: a.img.example.com, b.img.example.com.
 Commands on this screen:
+  e: switch between suggestions and recent decisions explaining their absence
+  h and a domain: check that site, even when no suggestion exists
   a and an item number, for example a 2: add that item to the additional connection
   z and an item number: add that item as its site in every zone
   n and an item number: do not suggest that item again

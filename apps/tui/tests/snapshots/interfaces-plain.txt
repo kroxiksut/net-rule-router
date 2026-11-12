@@ -14,6 +14,7 @@ Screen: Connections
 Service: OK
 Connections:
   The main connection is your usual internet. The additional connection (e.g. VPN) carries what your rules send to it.
+  A VPN in system proxy mode does not create a network connection NetRuleRouter can assign. Use the VPN's TUN mode when you want rules to use it as the additional connection.
   Main connection: Ethernet — Example Network Adapter — Available
   Additional connection (e.g. VPN): Example Tunnel — Example Network Adapter — Available
 Adapters:
@@ -44,6 +45,7 @@ Screen: Connections
 Service: OK
 Connections:
   The main connection is your usual internet. The additional connection (e.g. VPN) carries what your rules send to it.
+  A VPN in system proxy mode does not create a network connection NetRuleRouter can assign. Use the VPN's TUN mode when you want rules to use it as the additional connection.
   Main connection: Ethernet — Example Network Adapter — Available
   Additional connection (e.g. VPN): Example Tunnel — Example Network Adapter — Available
 Which adapter?:
@@ -80,6 +82,7 @@ Screen: Connections
 Service: OK
 Connections:
   The main connection is your usual internet. The additional connection (e.g. VPN) carries what your rules send to it.
+  A VPN in system proxy mode does not create a network connection NetRuleRouter can assign. Use the VPN's TUN mode when you want rules to use it as the additional connection.
   Main connection: Ethernet — Example Network Adapter — Available
   Additional connection (e.g. VPN): Example Tunnel — Example Network Adapter — Available
 What should Wi-Fi carry?:
@@ -113,6 +116,7 @@ Screen: Connections
 Service: OK
 Connections:
   The main connection is your usual internet. The additional connection (e.g. VPN) carries what your rules send to it.
+  A VPN in system proxy mode does not create a network connection NetRuleRouter can assign. Use the VPN's TUN mode when you want rules to use it as the additional connection.
   Main connection: Ethernet — Example Network Adapter — Available
   Additional connection (e.g. VPN): Example Tunnel — Example Network Adapter — Available
 Last action:

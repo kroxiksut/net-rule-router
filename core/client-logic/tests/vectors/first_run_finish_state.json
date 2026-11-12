@@ -1,0 +1,44 @@
+{
+  "cases": [
+    {
+      "name": "empty start needs no secondary",
+      "input": { "requiresSecondary": false, "secondaryAssigned": false, "secondaryAvailable": false },
+      "expected": "ready"
+    },
+    {
+      "name": "primary-only start needs no secondary",
+      "input": { "requiresSecondary": false, "secondaryAssigned": true, "secondaryAvailable": false },
+      "expected": "ready"
+    },
+    {
+      "name": "required secondary was deferred",
+      "input": { "requiresSecondary": true, "secondaryAssigned": false, "secondaryAvailable": false },
+      "expected": "secondary-not-chosen"
+    },
+    {
+      "name": "required secondary is bound but down",
+      "input": { "requiresSecondary": true, "secondaryAssigned": true, "secondaryAvailable": false },
+      "expected": "secondary-unavailable"
+    },
+    {
+      "name": "required secondary is ready",
+      "input": { "requiresSecondary": true, "secondaryAssigned": true, "secondaryAvailable": true },
+      "expected": "ready"
+    },
+    {
+      "name": "available without a binding is not ready",
+      "input": { "requiresSecondary": true, "secondaryAssigned": false, "secondaryAvailable": true },
+      "expected": "secondary-not-chosen"
+    },
+    {
+      "name": "unused available secondary does not block finish",
+      "input": { "requiresSecondary": false, "secondaryAssigned": false, "secondaryAvailable": true },
+      "expected": "ready"
+    },
+    {
+      "name": "unused bound secondary does not block finish",
+      "input": { "requiresSecondary": false, "secondaryAssigned": true, "secondaryAvailable": true },
+      "expected": "ready"
+    }
+  ]
+}

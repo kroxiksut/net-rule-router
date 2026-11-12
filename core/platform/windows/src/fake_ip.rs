@@ -489,10 +489,9 @@ impl TunAdapterPort for WintunTunAdapter {
         // route the static-address assignment implies: with another tunnel
         // holding split-default routes the implicit route has been observed
         // absent, silently steering pool traffic out a real adapter. An
-        // already-present route is success; any other failure fails the open —
-        // a pool the OS will not route into this adapter is a non-functional
-        // stack, and a failed open keeps the feature off (fail-open). The
-        // route needs no teardown of its own: it dies with the adapter.
+        // identical route already on this adapter is success. A conflict or
+        // other failure keeps the non-functional stack off (fail-open). The
+        // route dies with the adapter.
         let ifindex = adapter
             .get_adapter_index()
             .map_err(|err| PlatformError::Transient {
@@ -598,14 +597,8 @@ impl TunControl for windows_impl::WintunControl {
     }
 }
 
-/// Win32 `ERROR_OBJECT_ALREADY_EXISTS` — the forwarding entry is already
-/// present, which for the pool route is success, not failure.
-#[cfg(target_os = "windows")]
-const ERROR_OBJECT_ALREADY_EXISTS: u32 = 5010;
-
 /// Install the on-link IPv4 route that sends the whole fake pool into the TUN
-/// adapter. Metric 0 within its prefix keeps it preferred over any same-prefix
-/// stray; longest-prefix match already beats a tunnel's split-default routes.
+/// adapter. A duplicate is success only when the live row is exactly ours.
 #[cfg(target_os = "windows")]
 fn ensure_pool_route_v4(
     config: &TunAdapterConfig,
@@ -623,11 +616,50 @@ fn ensure_pool_route_v4(
         is_ours: true,
         table: nrr_platform_api::RouteTableRef::Main,
     };
-    match crate::win32_ffi::route_table::add_route(&entry) {
+    finish_pool_route_add(
+        &entry,
+        crate::win32_ffi::route_table::add_route(&entry),
+        crate::win32_ffi::route_table::enumerate_routes,
+    )
+}
+
+#[cfg(target_os = "windows")]
+fn finish_pool_route_add(
+    expected: &nrr_platform_api::RouteEntry,
+    add_result: Result<(), PlatformError>,
+    enumerate: impl FnOnce() -> Result<Vec<nrr_platform_api::RouteEntry>, PlatformError>,
+) -> Result<(), PlatformError> {
+    match add_result {
         Ok(()) => Ok(()),
-        Err(PlatformError::Win32 { code, .. }) if code == ERROR_OBJECT_ALREADY_EXISTS => Ok(()),
+        Err(err @ PlatformError::Win32 { code, .. })
+            if code == nrr_platform_api::error::win32_codes::ERROR_OBJECT_ALREADY_EXISTS =>
+        {
+            match enumerate() {
+                Ok(routes)
+                    if routes
+                        .iter()
+                        .any(|existing| pool_route_matches_existing(expected, existing)) =>
+                {
+                    Ok(())
+                }
+                Ok(_) | Err(_) => Err(err),
+            }
+        }
         Err(err) => Err(err),
     }
+}
+
+#[cfg(target_os = "windows")]
+fn pool_route_matches_existing(
+    expected: &nrr_platform_api::RouteEntry,
+    existing: &nrr_platform_api::RouteEntry,
+) -> bool {
+    expected.destination == existing.destination
+        && expected.prefix_length == existing.prefix_length
+        && expected.next_hop == existing.next_hop
+        && expected.interface_index == existing.interface_index
+        && expected.metric == existing.metric
+        && expected.table == existing.table
 }
 
 /// IPv4 prefix length as a dotted netmask (`15` → `255.254.0.0`).
@@ -795,6 +827,66 @@ mod tests {
         assert_eq!(prefix_to_netmask_v4(24), Ipv4Addr::new(255, 255, 255, 0));
         assert_eq!(prefix_to_netmask_v4(32), Ipv4Addr::new(255, 255, 255, 255));
         assert_eq!(prefix_to_netmask_v4(0), Ipv4Addr::UNSPECIFIED);
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn a_foreign_route_with_the_same_prefix_is_not_our_pool_route() {
+        use nrr_platform_api::{RouteEntry, RouteTableRef};
+        use std::net::{IpAddr, Ipv4Addr};
+
+        let expected = RouteEntry {
+            destination: IpAddr::V4(Ipv4Addr::new(198, 18, 0, 0)),
+            prefix_length: 15,
+            next_hop: IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+            interface_index: 42,
+            metric: 0,
+            is_ours: true,
+            table: RouteTableRef::Main,
+        };
+        let mut enumerated = expected.clone();
+        enumerated.is_ours = false;
+        assert!(pool_route_matches_existing(&expected, &enumerated));
+
+        for foreign in [
+            RouteEntry {
+                interface_index: 77,
+                ..enumerated.clone()
+            },
+            RouteEntry {
+                next_hop: IpAddr::V4(Ipv4Addr::new(198, 18, 0, 1)),
+                ..enumerated.clone()
+            },
+            RouteEntry {
+                metric: 7,
+                ..enumerated.clone()
+            },
+        ] {
+            assert!(
+                !pool_route_matches_existing(&expected, &foreign),
+                "a non-identical live row must keep ERROR_OBJECT_ALREADY_EXISTS as a conflict"
+            );
+        }
+
+        let duplicate = || PlatformError::Win32 {
+            operation: "CreateIpForwardEntry2",
+            code: nrr_platform_api::error::win32_codes::ERROR_OBJECT_ALREADY_EXISTS,
+            message: "route already exists".to_owned(),
+        };
+        assert!(finish_pool_route_add(&expected, Err(duplicate()), || Ok(
+            vec![enumerated.clone()]
+        ))
+        .is_ok());
+
+        let foreign = RouteEntry {
+            metric: 7,
+            ..enumerated
+        };
+        assert!(matches!(
+            finish_pool_route_add(&expected, Err(duplicate()), || Ok(vec![foreign])),
+            Err(PlatformError::Win32 { code, .. })
+                if code == nrr_platform_api::error::win32_codes::ERROR_OBJECT_ALREADY_EXISTS
+        ));
     }
 
     /// The vendored driver as it sits in the repository, when present.

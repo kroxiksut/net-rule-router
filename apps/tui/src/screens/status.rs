@@ -50,12 +50,16 @@ impl Screen for StatusScreen {
                     lines: feed::lines(app, texts),
                     feed: true,
                 },
-            ],
+            ]
+            .into_iter()
+            .chain(crate::dns_compatibility::panel(app, texts))
+            .collect(),
         }
     }
 
     fn help(&self) -> &'static [Key] {
         &[
+            crate::dns_compatibility::HELP_CHECK,
             keys::HELP_STATUS_FEED,
             feed::HELP,
             feed::HELP_SITE,
@@ -69,6 +73,7 @@ impl Screen for StatusScreen {
 
     fn plain_help(&self) -> &'static [Key] {
         &[
+            crate::dns_compatibility::HELP_CHECK,
             restore::PLAIN_HELP,
             vpn_trust::HELP,
             vpn_gateway_trust::HELP,
@@ -99,6 +104,7 @@ impl Screen for StatusScreen {
             return true;
         }
         match key.code {
+            KeyCode::Char('d') => crate::dns_compatibility::recheck(app),
             KeyCode::Char('r') => restore::restore(app),
             KeyCode::Char('t') => vpn_trust::trust_first(app, false),
             KeyCode::Char('T') => vpn_trust::trust_first(app, true),
@@ -121,6 +127,7 @@ impl Screen for StatusScreen {
             return true;
         }
         match line {
+            "d" => crate::dns_compatibility::recheck(app),
             "r" => restore::restore(app),
             "t" => vpn_trust::trust_first(app, false),
             "T" => vpn_trust::trust_first(app, true),
@@ -321,6 +328,42 @@ fn routing_lines(app: &AppState, texts: &Texts) -> Vec<ViewLine> {
         // Without the service the screen shows what it last knew and says so.
         None if app.snapshot.is_some() => lines.push(ViewLine::text(texts.get(keys::STALE))),
         None => lines.push(ViewLine::text(texts.get(keys::NO_DATA))),
+    }
+    if let (Some(snapshot), Some(readiness)) = (
+        app.snapshot.as_ref().filter(|_| app.link.is_connected()),
+        app.routing_readiness(),
+    ) {
+        lines.push(ViewLine::text(texts.get(
+            if readiness.service == "healthy" {
+                keys::ROUTING_SERVICE_HEALTHY
+            } else {
+                keys::ROUTING_SERVICE_UNHEALTHY
+            },
+        )));
+        if readiness.routing != "ready" {
+            lines.push(ViewLine::text(match readiness.affected_assignments {
+                Some(count) => texts.fill(
+                    keys::ROUTING_AFFECTED_ASSIGNMENTS,
+                    &[("count", count.to_string())],
+                ),
+                None => texts.get(keys::ROUTING_AFFECTED_UNKNOWN),
+            }));
+        }
+        if let Some(failure) = snapshot
+            .health
+            .fake_ip_datapath
+            .as_ref()
+            .filter(|datapath| datapath.desired && !datapath.running)
+            .and_then(|datapath| datapath.last_failure.as_ref())
+        {
+            lines.push(ViewLine::new(vec![Segment::state(
+                texts.dynamic(
+                    &format!("errors.fake-ip-{}", failure.code),
+                    "Name-based routing is unavailable. Open Diagnostics for details.",
+                ),
+                StateTone::Caution,
+            )]));
+        }
     }
     if let Some(error) = &app.fetch_error {
         lines.push(ViewLine::text(

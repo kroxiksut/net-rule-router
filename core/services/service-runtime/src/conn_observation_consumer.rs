@@ -73,6 +73,8 @@ pub struct ConnConsumeSummary {
     /// Drops attributed to a FOREIGN WFP filter (firewall /
     /// antivirus) this batch. Answers "blocked, but not by us" at a glance.
     pub blocked_foreign: u32,
+    /// Drops whose filter owner could not be verified this batch.
+    pub blocked_unknown: u32,
     /// Role-verified kill-switch/fail-closed drops observed WHILE
     /// the secondary resolved as usable (routes up, not probe-dead). The
     /// block-all exists only for windows where the secondary is unusable, so
@@ -203,6 +205,7 @@ pub struct ConnectionTraceRing {
         Arc<crate::own_resolver_watch::OwnResolverWatch>,
         crate::own_resolver_watch::OwnResolverOfferFn,
     )>,
+    dns_compatibility: std::sync::OnceLock<Arc<crate::dns_compatibility::DnsCompatibilityCenter>>,
 }
 
 /// A cheap look at one connection: `(owner, remote)`.
@@ -220,6 +223,7 @@ impl ConnectionTraceRing {
             connection_watch: std::sync::OnceLock::new(),
             history: std::sync::OnceLock::new(),
             own_resolver: std::sync::OnceLock::new(),
+            dns_compatibility: std::sync::OnceLock::new(),
         }
     }
 
@@ -232,6 +236,13 @@ impl ConnectionTraceRing {
         offer: crate::own_resolver_watch::OwnResolverOfferFn,
     ) -> bool {
         self.own_resolver.set((watch, offer)).is_ok()
+    }
+
+    pub fn attach_dns_compatibility(
+        &self,
+        center: Arc<crate::dns_compatibility::DnsCompatibilityCenter>,
+    ) -> bool {
+        self.dns_compatibility.set(center).is_ok()
     }
 
     /// Keep each user's history of the rows pushed from now on. The first
@@ -298,6 +309,9 @@ impl ConnectionTraceRing {
         }
         if let Some(history) = self.history.get() {
             history.record(&rec, now_unix_ms());
+        }
+        if let Some(center) = self.dns_compatibility.get() {
+            center.observe_connection(&rec, now_unix_ms());
         }
         if let (Some((watch, offer)), Some(namer)) = (self.own_resolver.get(), self.namer.get()) {
             let named_now = |ip: IpAddr| namer.name(ip).is_some();
@@ -726,6 +740,7 @@ pub struct ConnectionObservationConsumer {
     /// Main-link resends and closes, folded to one outcome per connection
     /// before they reach the primary-health sink.
     primary_stall_evidence: Mutex<stall_evidence::ConnectionStallTracker>,
+    discovery_observation: Option<Arc<crate::discovery_observation::DiscoveryObservationPipeline>>,
     /// Connections on any link the far side stopped answering (see `unanswered`).
     unanswered: Mutex<unanswered::UnansweredTracker>,
     /// Connections the service tore down: their close is not the far side's.

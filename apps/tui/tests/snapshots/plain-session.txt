@@ -20,6 +20,7 @@ Connections:
 Notifications:
   No notifications.
 Commands on this screen:
+  d: Check DNS compatibility
   r: restore your settings to a service that lost them
   t: confirm the first listed program as your VPN (T: with the programs it ships with), so leak protection keeps it working
   a: allow the first listed VPN to reach its server, so leak protection lets it connect
@@ -33,6 +34,7 @@ Type a screen number, h for help or q to quit, then press Enter.
 Service: OK
 Rules status: Rules are working
 Rules status: Your rules are working.
+Rules status: Service: healthy
 Connections: Main connection: Ethernet — Example Network Adapter — Available — Rules applied
 Connections: Additional connection (e.g. VPN): Example Tunnel — Example Network Adapter — Available — Rules applied
 1. Warning: The additional connection is not up — Sites your rules send there go over the main connection until it comes back: leak protection is off. Start the connection, or turn leak protection on to hold them instead.

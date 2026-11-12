@@ -26,6 +26,7 @@ pub fn ipc_operation_timeout(op: IpcOperationName) -> Duration {
         IpcOperationName::SnapshotInitialGet => Duration::from_secs(3),
         IpcOperationName::SnapshotInterfacesGet => Duration::from_secs(5),
         IpcOperationName::SnapshotDiagnosticsGet => Duration::from_secs(2),
+        IpcOperationName::DnsCompatibilityRecheck => Duration::from_secs(2),
         IpcOperationName::LogsList | IpcOperationName::AuditList => Duration::from_secs(5),
         IpcOperationName::SecurityAlertsList => Duration::from_secs(1),
         // `rules.list` shares the state-DB connection mutex with the mutation
@@ -50,6 +51,7 @@ pub fn ipc_operation_timeout(op: IpcOperationName) -> Duration {
         // Accepting a probe pass only reads the pending list and starts a
         // thread — the pass itself never holds this reply open.
         IpcOperationName::AutoRuleCandidatesProbe => Duration::from_secs(2),
+        IpcOperationName::AutoRuleDiscoveryFeedback => Duration::from_secs(2),
         // One small per-SID row write plus a read-back.
         IpcOperationName::RefusingAnchorSet => Duration::from_secs(2),
         // The confirm phase runs `rollback_to` with a full activation before

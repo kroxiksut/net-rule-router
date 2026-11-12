@@ -113,6 +113,10 @@ impl ConnectionStallTracker {
                 let established = entry.is_some_and(|r| r.established);
                 (!ours && established).then_some(false)
             }
+            ConnectionProgress::ClosedUnknown | ConnectionProgress::Reset => {
+                self.connections.remove(&key);
+                None
+            }
             ConnectionProgress::HandshakeRetransmit
                 if self.connections.get(&key).is_some_and(|r| r.established) =>
             {

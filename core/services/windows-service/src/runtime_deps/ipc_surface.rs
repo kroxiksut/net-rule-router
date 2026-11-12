@@ -863,6 +863,19 @@ pub(super) fn build(inputs: IpcSurfaceInputs<'_>) -> IpcSurface {
                     },
                 )
                 .with_verdicts(Arc::clone(&main_route_verdicts))
+                .with_https(
+                    nrr_service_runtime::site_check::https_head::RustlsHttpsHead::new(Arc::new(
+                        nrr_service_runtime::path_probe::SystemPathProbe,
+                    ))
+                    .map(|head| {
+                        Arc::new(head) as Arc<dyn nrr_service_runtime::site_check::HttpsHead>
+                    }),
+                )
+                .with_primary_probe_guard(
+                    nrr_service_runtime::discovery_observation::stored_primary_probe_guard(
+                        Arc::clone(conn_for_probe),
+                    ),
+                )
                 // Its own prober: the repeat-suppression is per instance, and a
                 // shared one would skip every host the main-link pass had just
                 // asked about.
@@ -952,9 +965,23 @@ pub(super) fn build(inputs: IpcSurfaceInputs<'_>) -> IpcSurface {
                         as nrr_service_runtime::site_check::TrafficHeld
                 }),
             };
-            deps = deps.with_site_check(Arc::new(
-                nrr_service_runtime::site_check::SiteChecker::new(site_check),
+            let checker = Arc::new(nrr_service_runtime::site_check::SiteChecker::new(
+                site_check,
             ));
+            checker.attach_manual(
+                nrr_service_runtime::site_check::ManualSiteCheckWiring::production(
+                    Arc::clone(conn_for_probe),
+                    Arc::clone(coord)
+                        as Arc<dyn nrr_service_runtime::production_auto_rule_probe::EgressSources>,
+                    Arc::new(nrr_platform_windows::WindowsDnsCacheRead::new()),
+                    Arc::new(|| {
+                        upstream_dns_pool()
+                            .current()
+                            .or_else(nrr_service_runtime::site_check::captured_dns_upstream)
+                    }),
+                ),
+            );
+            deps = deps.with_site_check(checker);
         }
         // The one fact about a routed site nothing here can measure: the user
         // says it, and it only ever un-quietens that site's companions.

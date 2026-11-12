@@ -49,6 +49,7 @@ pub mod auto_rules_handlers;
 pub mod block_notice_handlers;
 pub mod contract_negotiate;
 pub mod diagnostics_handlers;
+pub mod dns_compatibility;
 pub mod doh_resolvers;
 pub mod interfaces_refresh;
 pub mod local_dns_suffixes;
@@ -89,7 +90,8 @@ pub use app_path_coverage::AppPathCoverageHandler;
 pub use audit_list::AuditListHandler;
 pub use auto_rules_handlers::{
     AutoRuleCandidatesAcceptHandler, AutoRuleCandidatesDismissHandler,
-    AutoRuleCandidatesForgetHandler, AutoRuleCandidatesListHandler, AutoRuleDismissedListHandler,
+    AutoRuleCandidatesForgetHandler, AutoRuleCandidatesListHandler,
+    AutoRuleDiscoveryFeedbackHandler, AutoRuleDismissedListHandler,
     AutoRuleDismissedRestoreHandler,
 };
 pub use block_notice_handlers::{

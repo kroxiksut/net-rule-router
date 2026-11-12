@@ -53,6 +53,7 @@ pub const BLOCK_NOTICE_PUSH_WINDOW: Duration = Duration::from_secs(10);
 /// that opens a fresh, unmuted episode. Delivery to the tray/GUI is a later
 /// step — this is the sole consumer of `record`'s result today.
 pub struct BlockNoticeCenter {
+    dns_compatibility: Arc<crate::dns_compatibility::DnsCompatibilityCenter>,
     ledgers: Mutex<HashMap<String, BlockNoticeLedger>>,
     mute_loader: Option<MuteLoaderFn>,
     events: Option<Arc<EventBus>>,
@@ -76,6 +77,7 @@ impl BlockNoticeCenter {
     #[must_use]
     pub fn new() -> Self {
         Self {
+            dns_compatibility: Arc::new(crate::dns_compatibility::DnsCompatibilityCenter::default()),
             ledgers: Mutex::new(HashMap::new()),
             mute_loader: None,
             events: None,
@@ -84,6 +86,11 @@ impl BlockNoticeCenter {
             blocked_network: None,
             push_windows: Mutex::new(HashMap::new()),
         }
+    }
+
+    #[must_use]
+    pub fn dns_compatibility(&self) -> Arc<crate::dns_compatibility::DnsCompatibilityCenter> {
+        Arc::clone(&self.dns_compatibility)
     }
 
     /// Whether `sid` may be pushed one more notice now.
@@ -128,6 +135,7 @@ impl BlockNoticeCenter {
     /// adds delivery, it never gates whether an episode is recorded.
     #[must_use]
     pub fn with_event_bus(mut self, events: Arc<EventBus>) -> Self {
+        self.dns_compatibility.attach_events(Arc::clone(&events));
         self.events = Some(events);
         self
     }

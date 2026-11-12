@@ -2,31 +2,31 @@ import QtQuick 2.15
 import QtQuick.Controls 2.15
 import QtQuick.Layouts 1.15
 
-// One entry of a navigation-rail submenu: optional icon, label and an optional
-// count, selected while its section is open. The caller wires the click, since
-// some entries open their section through a controller.
+// The caller wires navigation through its section controller.
 ThemedButton {
     id: control
 
     // The ApplicationWindow. Not `root`: that is ThemedButton's own id.
     property var shell: null
     property string sectionId: ""
-    // Overrides the section match for entries whose selection is not a section
-    // id (a settings category); null keeps the section match.
+    // Settings categories need selection independent of their section.
     property var selected: null
     property string iconName: ""
     // Items waiting in the section; hidden at zero.
     property int badge: 0
-    // The focus ring follows the keyboard: a click leaves focus here without
-    // drawing it, unless the user asked for focus to show always.
+    // Mouse focus is quiet unless enhanced focus is requested.
     readonly property bool focusShown: visualFocus
         || (activeFocus && shell.prefs.enhancedFocus === true)
 
     theme: shell.uiTheme
     Layout.fillWidth: true
+    Layout.preferredWidth: 0
+    Layout.minimumWidth: 0
     highlighted: control.selected !== null ? control.selected === true
         : shell.section === control.sectionId
     Accessible.name: control.text
+    ToolTip.visible: control.hovered && shell.prefs.tooltipsEnabled
+    ToolTip.text: control.text
 
     background: PanelSurface {
         theme: control.theme
@@ -67,6 +67,7 @@ ThemedButton {
         }
         Label {
             Layout.fillWidth: true
+            Layout.minimumWidth: 0
             text: control.text
             color: control.highlighted ? palette.highlightedText
                 : (control.enabled ? control.shell.textColor : control.shell.mutedTextColor)

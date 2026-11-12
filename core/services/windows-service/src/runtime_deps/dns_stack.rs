@@ -1,16 +1,8 @@
-//! Factories for the DNS half of the datapath: the Mode-B resolver, the
-//! fake-IP stack, the egress policy and the hosts-bypass resolver.
-//!
-//! They are factories rather than values because Mode B re-arms: the resolver
-//! is rebuilt on every start so it re-captures the CURRENT upstream after a
-//! network change. `pub(super)` — the caller is `build_supervised_runtime_deps`.
+//! DNS factories capture the current upstream when the resolver re-arms.
 
 use super::*;
 
-/// The Mode-B resolver factory: the neutral assembly
-/// (`nrr_service_runtime::dns_stack`) over the Windows mechanisms — NRPT, the
-/// adapters' DNS servers and the namespaces connections claim. `None` if a
-/// required input is missing; the controller then never arms (fail-safe).
+/// Missing inputs keep the resolver unarmed rather than relaxing enforcement.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn build_dns_resolver_factory(
     settings_conn: Option<&Arc<Mutex<Connection>>>,
@@ -33,6 +25,9 @@ pub(super) fn build_dns_resolver_factory(
     outage_blocks: Option<Arc<nrr_service_runtime::outage_blocks::OutageBlocks>>,
     liveness: Arc<TaskLiveness>,
     paused: Option<Arc<nrr_service_runtime::routing_pause::PausedPrincipals>>,
+    dns_compatibility: Option<
+        std::sync::Weak<nrr_service_runtime::dns_compatibility::DnsCompatibilityCenter>,
+    >,
 ) -> Option<nrr_service_runtime::dns_resolver_service::DnsResolverFactory> {
     use nrr_platform_windows::dns_redirect::{
         NrptDnsRedirect, PowerShellRunner, TransactedNrptStore, WindowsSearchList,
@@ -40,6 +35,7 @@ pub(super) fn build_dns_resolver_factory(
     use nrr_service_runtime::dns_stack::{DnsStackInputs, DnsStackPlatform};
 
     let inputs = DnsStackInputs {
+        dns_compatibility,
         settings_conn: Arc::clone(settings_conn?),
         cache: Arc::clone(cache_store?),
         active_sid: Arc::clone(active_routing_sid?),
@@ -239,6 +235,7 @@ impl nrr_service_runtime::fake_ip::RelaySourceAddrs for CoordinatorRelaySourceAd
 #[allow(clippy::too_many_arguments)]
 pub(super) fn build_fake_ip_stack_factory(
     assembly: Arc<nrr_service_runtime::fake_ip::FakeIpAssembly>,
+    api: &Arc<dyn nrr_platform_api::windows_api::WindowsApiPort>,
     cache_store: Option<&Arc<Mutex<dyn nrr_storage::repository::CacheRepository + Send>>>,
     settings_conn: Option<&Arc<Mutex<Connection>>>,
     active_routing_sid: Option<&nrr_service_runtime::supervised_runtime::ActiveRoutingSidFn>,
@@ -249,6 +246,7 @@ pub(super) fn build_fake_ip_stack_factory(
     served_principals: nrr_service_runtime::fake_ip::ServedPrincipalsFn,
     liveness: Arc<TaskLiveness>,
     paused: Option<Arc<nrr_service_runtime::routing_pause::PausedPrincipals>>,
+    dns_compatibility: Arc<nrr_service_runtime::dns_compatibility::DnsCompatibilityCenter>,
 ) -> Option<nrr_service_runtime::fake_ip::FakeIpStackFactory> {
     use nrr_platform_api::fake_ip::tun::{TunAdapterConfig, TunAdapterPort};
     use nrr_platform_windows::fake_ip::WintunTunAdapter;
@@ -257,11 +255,36 @@ pub(super) fn build_fake_ip_stack_factory(
     };
 
     let cache = Arc::clone(cache_store?);
+    let api = Arc::clone(api);
     let settings_conn = Arc::clone(settings_conn?);
     let active_sid = Arc::clone(active_routing_sid?);
     let route_coordinator = route_coordinator.map(Arc::clone);
     let auto_rules_engine = auto_rules_engine.map(Arc::clone);
     let factory: nrr_service_runtime::fake_ip::FakeIpStackFactory = Arc::new(move || {
+        match fake_ip_pool_preflight(assembly.pool(), api.as_ref()) {
+            Ok(()) => {}
+            Err(FakeIpPoolPreflightError::Inspect(error)) => {
+                tracing::warn!(
+                    target: "nrr::fake-ip",
+                    msg_key = "svc-dns-fakeip-pool-inspect-failed",
+                    error = %error,
+                    "fake-IP could not verify that its address pool is free; feature stays off",
+                );
+                return Err(nrr_service_runtime::fake_ip::FakeIpBuildFailure::PoolInspectFailed);
+            }
+            Err(FakeIpPoolPreflightError::Collision(collision)) => {
+                tracing::warn!(
+                    target: "nrr::fake-ip",
+                    msg_key = "svc-dns-fakeip-pool-collision",
+                    destination = %collision.local.network,
+                    prefix_len = collision.local.prefix_len,
+                    "fake-IP address pool overlaps a live local subnet; feature stays off",
+                );
+                return Err(
+                    nrr_service_runtime::fake_ip::FakeIpBuildFailure::PoolCollision(collision),
+                );
+            }
+        }
         let adapter = WintunTunAdapter::new();
         if !adapter.is_available() {
             tracing::warn!(
@@ -274,7 +297,10 @@ pub(super) fn build_fake_ip_stack_factory(
         // The config is derived from the SAME pool the assembly uses
         // (`TunAdapterConfig::for_pool`), so the adapter's address range can
         // never disagree with the fake addresses the answerer hands out.
-        let config = TunAdapterConfig::default();
+        let config = TunAdapterConfig::for_pool(
+            nrr_shared::product_identity::TUN_ADAPTER_NAME,
+            assembly.pool(),
+        );
         let device = match adapter.open(&config) {
             Ok(device) => device,
             Err(e) => {
@@ -284,7 +310,7 @@ pub(super) fn build_fake_ip_stack_factory(
                     error = %e,
                     "fake-IP: TUN adapter open failed; asked again shortly (fail-open meanwhile)",
                 );
-                return Err(nrr_service_runtime::fake_ip::FakeIpBuildFailure::Transient);
+                return Err(nrr_service_runtime::fake_ip::FakeIpBuildFailure::TunOpenFailed);
             }
         };
         // Upstream = the direct-host session map layered over the FQDN
@@ -412,7 +438,7 @@ pub(super) fn build_fake_ip_stack_factory(
             Some(heal_persist),
             Some(Arc::clone(&liveness)),
         ));
-        let flow_observer: Arc<dyn nrr_service_runtime::fake_ip::FlowObserver> =
+        let activity_observer: Arc<dyn nrr_service_runtime::fake_ip::FlowObserver> =
             match auto_rules_engine.as_ref() {
                 Some(engine) => Arc::new(nrr_service_runtime::fake_ip::CompositeFlowObserver::new(
                     vec![
@@ -426,6 +452,19 @@ pub(super) fn build_fake_ip_stack_factory(
                 )),
                 None => self_heal,
             };
+        let flow_observer: Arc<dyn nrr_service_runtime::fake_ip::FlowObserver> = match route_coordinator.as_ref() {
+            Some(coordinator) => Arc::new(nrr_service_runtime::fake_ip::CompositeFlowObserver::new(vec![
+                activity_observer,
+                Arc::new(nrr_service_runtime::dns_compatibility::DnsCompatibilityFlowObserver {
+                    center: Arc::clone(&dns_compatibility),
+                    owners: Arc::new(nrr_platform_windows::flow_owner::WindowsFlowOwnerLookup::new()),
+                    routing: Arc::clone(&active_sid),
+                    served: Arc::clone(&served_principals),
+                    sources: Arc::clone(coordinator) as Arc<dyn nrr_service_runtime::production_auto_rule_probe::EgressSources>,
+                }),
+            ])),
+            None => activity_observer,
+        };
         tracing::info!(
             target: "nrr::fake-ip",
             msg_key = "svc-dns-fakeip-stack-up",
@@ -455,6 +494,29 @@ pub(super) fn build_fake_ip_stack_factory(
             .with_instant_rst(nrr_service_runtime::fake_ip::global_instant_rst_enabled()))
     });
     Some(factory)
+}
+
+#[derive(Debug)]
+enum FakeIpPoolPreflightError {
+    Inspect(nrr_platform_api::error::PlatformError),
+    Collision(nrr_platform_api::fake_ip::PoolCollision),
+}
+
+fn fake_ip_pool_preflight(
+    pool: &nrr_platform_api::fake_ip::FakeIpPoolConfig,
+    api: &(impl nrr_platform_api::route_table::RouteTablePort + ?Sized),
+) -> Result<(), FakeIpPoolPreflightError> {
+    let routes = api
+        .get_ip_forward_table()
+        .map_err(FakeIpPoolPreflightError::Inspect)?;
+    let adapters = api
+        .get_adapter_infos()
+        .map_err(FakeIpPoolPreflightError::Inspect)?;
+    let local = nrr_platform_api::fake_ip::pool_collision_candidates(&routes, &adapters);
+    match pool.collisions(&local).into_iter().next() {
+        Some(collision) => Err(FakeIpPoolPreflightError::Collision(collision)),
+        None => Ok(()),
+    }
 }
 
 /// Build the rule-host resolver used by the seeder and the DNS
@@ -557,4 +619,48 @@ pub(super) fn upstream_dns_pool() -> Arc<nrr_service_runtime::dns_upstream::Upst
 fn claimed_namespaces() -> Vec<nrr_platform_api::dns_scope::ClaimedNamespace> {
     let ours = nrr_service_runtime::foreign_tunnels::global_foreign_tunnels().own_links();
     nrr_platform_windows::dns_scope::live_claims(&ours)
+}
+
+#[cfg(test)]
+mod pool_preflight_tests {
+    use super::*;
+    use nrr_platform_api::adapters::{AdapterInfo, IfOperStatus, InterfaceType};
+    use nrr_platform_api::enforcement::RouteTableRef;
+    use nrr_platform_api::fake_ip::FakeIpPoolConfig;
+    use nrr_platform_api::types::RouteEntry;
+    use nrr_platform_api::windows_api::MockWindowsApi;
+    use std::net::{IpAddr, Ipv4Addr};
+
+    #[test]
+    fn an_occupied_part_of_the_fake_pool_refuses_activation() {
+        let api = MockWindowsApi::new();
+        api.set_adapter_infos(vec![AdapterInfo {
+            index: 7,
+            adapter_name: "{foreign}".to_owned(),
+            description: "Corporate adapter".to_owned(),
+            friendly_name: "Corporate".to_owned(),
+            mac: None,
+            interface_type: InterfaceType::Ethernet,
+            oper_status: IfOperStatus::Up,
+            ipv4_addresses: vec![Ipv4Addr::new(198, 18, 5, 1)],
+            ipv6_addresses: Vec::new(),
+            gateways: Vec::new(),
+        }]);
+        api.set_route_table(vec![RouteEntry {
+            destination: IpAddr::V4(Ipv4Addr::new(198, 18, 5, 0)),
+            prefix_length: 24,
+            next_hop: IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+            interface_index: 7,
+            metric: 0,
+            is_ours: false,
+            table: RouteTableRef::Main,
+        }]);
+
+        assert!(matches!(
+            fake_ip_pool_preflight(&FakeIpPoolConfig::default(), &api),
+            Err(FakeIpPoolPreflightError::Collision(collision))
+                if collision.local.network == IpAddr::V4(Ipv4Addr::new(198, 18, 5, 0))
+                    && collision.local.prefix_len == 24
+        ));
+    }
 }

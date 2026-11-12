@@ -23,7 +23,7 @@
 //! TUN adapter itself carries (the peer/gateway the OS routes towards). The last
 //! index of the v4 range is reserved as its broadcast address.
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fmt;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::sync::Arc;
@@ -57,6 +57,10 @@ pub struct LocalSubnet {
     pub network: IpAddr,
     /// Prefix length of the subnet.
     pub prefix_len: u8,
+    /// Route-table evidence, when the subnet came from a route snapshot.
+    pub interface_index: Option<u32>,
+    pub next_hop: Option<IpAddr>,
+    pub metric: Option<u32>,
 }
 
 impl LocalSubnet {
@@ -66,8 +70,141 @@ impl LocalSubnet {
         Self {
             network,
             prefix_len,
+            interface_index: None,
+            next_hop: None,
+            metric: None,
         }
     }
+
+    #[must_use]
+    pub const fn with_route(
+        network: IpAddr,
+        prefix_len: u8,
+        interface_index: u32,
+        next_hop: IpAddr,
+        metric: u32,
+    ) -> Self {
+        Self {
+            network,
+            prefix_len,
+            interface_index: Some(interface_index),
+            next_hop: Some(next_hop),
+            metric: Some(metric),
+        }
+    }
+}
+
+/// Route-table networks that can collide with a fake-address pool.
+///
+/// Internet redirects and our persistent adapter do not occupy a local subnet.
+#[must_use]
+pub fn pool_collision_candidates(
+    routes: &[crate::types::RouteEntry],
+    adapters: &[crate::adapters::AdapterInfo],
+) -> Vec<LocalSubnet> {
+    let redirects = internet_redirect_paths(routes, adapters);
+    routes
+        .iter()
+        .filter(|route| {
+            route.prefix_length > 0
+                && route.prefix_length <= route.max_prefix_length()
+                && route.family().is_some()
+                && !crate::route_signature::is_overlay_route(route)
+                && !adapters.iter().any(|adapter| {
+                    adapter.index == route.interface_index
+                        && crate::uplink::is_own_fake_ip_adapter(adapter)
+                })
+                && !(redirect_member(route, adapters).is_some()
+                    && redirects.contains(&forwarding_path(route)))
+        })
+        .map(|route| {
+            LocalSubnet::with_route(
+                route.destination,
+                route.prefix_length,
+                route.interface_index,
+                route.next_hop,
+                route.metric,
+            )
+        })
+        .collect()
+}
+
+type ForwardingPath = (u32, IpAddr, crate::enforcement::RouteTableRef);
+const MAX_REDIRECT_ROWS: usize = 4096;
+
+fn forwarding_path(route: &crate::types::RouteEntry) -> ForwardingPath {
+    (route.interface_index, route.next_hop, route.table.clone())
+}
+
+fn redirect_member(
+    route: &crate::types::RouteEntry,
+    adapters: &[crate::adapters::AdapterInfo],
+) -> Option<(u32, u32)> {
+    let IpAddr::V4(destination) = route.destination else {
+        return None;
+    };
+    if !(1..=crate::route_signature::TUNNEL_CATCH_ALL_MAX_PREFIX).contains(&route.prefix_length)
+        || destination.octets()[0] >= 224
+        || !route.next_hop.is_ipv4()
+        || route.next_hop.is_loopback()
+        || route.is_ours
+        || crate::route_signature::is_owned_route(route)
+    {
+        return None;
+    }
+    let network = IpBlock::new(route.destination, route.prefix_length)?;
+    if nrr_domain::ip_network_policy::is_private(network) {
+        return None;
+    }
+    let adapter = adapters
+        .iter()
+        .find(|adapter| adapter.index == route.interface_index)?;
+    // A connected local network remains occupied even beside internet redirects.
+    if adapter.ipv4_addresses.is_empty()
+        || adapter
+            .ipv4_addresses
+            .iter()
+            .any(|address| network.contains(IpAddr::V4(*address)))
+    {
+        return None;
+    }
+    match (network.network(), network.last()) {
+        (IpAddr::V4(first), IpAddr::V4(last)) => Some((u32::from(first), u32::from(last))),
+        _ => None,
+    }
+}
+
+fn internet_redirect_paths(
+    routes: &[crate::types::RouteEntry],
+    adapters: &[crate::adapters::AdapterInfo],
+) -> HashSet<ForwardingPath> {
+    let mut paths: HashMap<ForwardingPath, Vec<(u32, u32)>> = HashMap::new();
+    let mut rows = 0;
+    for route in routes {
+        if let Some(range) = redirect_member(route, adapters) {
+            rows += 1;
+            if rows > MAX_REDIRECT_ROWS {
+                return HashSet::new();
+            }
+            paths.entry(forwarding_path(route)).or_default().push(range);
+        }
+    }
+    paths
+        .into_iter()
+        .filter_map(|(path, mut ranges)| {
+            ranges.sort_unstable();
+            let mut covered = 0u64;
+            let mut end = 0u64;
+            for (first, last) in ranges {
+                let first = u64::from(first).max(end);
+                let next = u64::from(last) + 1;
+                covered += next.saturating_sub(first);
+                end = end.max(next);
+            }
+            // Distinct coverage, matching the forwarding-path threshold; duplicates add nothing.
+            (covered >= (1u64 << 31)).then_some(path)
+        })
+        .collect()
 }
 
 /// A live subnet found to overlap the fake pool — activation surfaces it rather
@@ -966,11 +1103,226 @@ mod tests {
     }
 
     #[test]
+    fn collision_candidates_exclude_defaults_and_our_persistent_adapter() {
+        use crate::adapters::{AdapterInfo, IfOperStatus, InterfaceType};
+        use crate::enforcement::RouteTableRef;
+        use crate::types::RouteEntry;
+
+        let own = AdapterInfo {
+            index: 9,
+            adapter_name: "{7a3e1c55-0b6d-4f82-9e14-2d6c8b0a5f31}".to_owned(),
+            description: String::new(),
+            friendly_name: String::new(),
+            mac: None,
+            interface_type: InterfaceType::Tunnel,
+            oper_status: IfOperStatus::Up,
+            ipv4_addresses: Vec::new(),
+            ipv6_addresses: Vec::new(),
+            gateways: Vec::new(),
+        };
+        let route = |destination, prefix_length, interface_index| RouteEntry {
+            destination,
+            prefix_length,
+            next_hop: match destination {
+                IpAddr::V4(_) => IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+                IpAddr::V6(_) => IpAddr::V6(Ipv6Addr::UNSPECIFIED),
+            },
+            interface_index,
+            metric: 0,
+            is_ours: false,
+            table: RouteTableRef::Main,
+        };
+        let routes = [
+            route(ip("0.0.0.0"), 0, 7),
+            route(ip("198.18.0.0"), 15, 9),
+            route(ip("198.18.9.0"), 33, 7),
+            route(ip("198.18.5.0"), 24, 7),
+        ];
+
+        let candidates = pool_collision_candidates(&routes, &[own]);
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].network, ip("198.18.5.0"));
+        assert_eq!(candidates[0].prefix_len, 24);
+        assert_eq!(candidates[0].interface_index, Some(7));
+        assert_eq!(candidates[0].next_hop, Some(ip("0.0.0.0")));
+        assert_eq!(candidates[0].metric, Some(0));
+    }
+
+    #[test]
     fn a_wider_local_subnet_containing_the_pool_is_flagged() {
         let cfg = FakeIpPoolConfig::default();
         // A /8 that swallows the whole pool overlaps just as much as a subset.
         let clash = [LocalSubnet::new(ip("198.0.0.0"), 8)];
         assert!(cfg.overlaps_any(&clash));
+    }
+
+    fn preflight_route(network: &str, prefix_length: u8, index: u32) -> crate::types::RouteEntry {
+        crate::types::RouteEntry {
+            destination: ip(network),
+            prefix_length,
+            next_hop: ip("0.0.0.0"),
+            interface_index: index,
+            metric: 0,
+            is_ours: false,
+            table: crate::enforcement::RouteTableRef::Main,
+        }
+    }
+
+    fn preflight_adapter(index: u32, address: &str) -> crate::adapters::AdapterInfo {
+        crate::adapters::AdapterInfo {
+            index,
+            adapter_name: format!("interface-{index}"),
+            description: String::new(),
+            friendly_name: String::new(),
+            mac: None,
+            interface_type: crate::adapters::InterfaceType::Other(53),
+            oper_status: crate::adapters::IfOperStatus::Up,
+            ipv4_addresses: vec![address.parse().unwrap()],
+            ipv6_addresses: Vec::new(),
+            gateways: Vec::new(),
+        }
+    }
+
+    fn redirect_routes() -> Vec<crate::types::RouteEntry> {
+        vec![
+            preflight_route("64.0.0.0", 2, 64),
+            preflight_route("128.0.0.0", 2, 64),
+            preflight_route("196.0.0.0", 6, 64),
+            preflight_route("200.0.0.0", 5, 64),
+        ]
+    }
+
+    #[test]
+    fn pool_preflight_accepts_an_existing_decomposed_internet_redirect_after_restart() {
+        let routes = redirect_routes();
+        let candidates =
+            pool_collision_candidates(&routes, &[preflight_adapter(64, "10.83.174.246")]);
+        assert!(
+            FakeIpPoolConfig::default()
+                .collisions(&candidates)
+                .is_empty(),
+            "196/6 in an internet redirect set does not occupy the fake-address pool"
+        );
+    }
+
+    #[test]
+    fn pool_preflight_duplicate_or_unrelated_routes_cannot_fake_internet_coverage() {
+        let pool = FakeIpPoolConfig::default();
+        let adapter = preflight_adapter(64, "10.83.174.246");
+        let duplicates = vec![preflight_route("196.0.0.0", 6, 64); 64];
+        assert!(!pool
+            .collisions(&pool_collision_candidates(
+                &duplicates,
+                std::slice::from_ref(&adapter)
+            ))
+            .is_empty());
+        let mut other_link = redirect_routes();
+        other_link[0].interface_index = 65;
+        assert!(!pool
+            .collisions(&pool_collision_candidates(
+                &other_link,
+                std::slice::from_ref(&adapter)
+            ))
+            .is_empty());
+        let mut other_peer = redirect_routes();
+        other_peer[0].next_hop = ip("10.0.0.1");
+        assert!(!pool
+            .collisions(&pool_collision_candidates(
+                &other_peer,
+                std::slice::from_ref(&adapter)
+            ))
+            .is_empty());
+        let mut other_table = redirect_routes();
+        other_table[0].table = crate::enforcement::RouteTableRef::Tagged(77);
+        assert!(!pool
+            .collisions(&pool_collision_candidates(
+                &other_table,
+                std::slice::from_ref(&adapter)
+            ))
+            .is_empty());
+        for filler in [
+            preflight_route("224.0.0.0", 1, 64),
+            preflight_route("0.0.0.0", 33, 64),
+            preflight_route("0.0.0.0", 0, 64),
+        ] {
+            let mut rows = vec![preflight_route("196.0.0.0", 6, 64)];
+            rows.extend(vec![filler; 64]);
+            assert!(!pool
+                .collisions(&pool_collision_candidates(
+                    &rows,
+                    std::slice::from_ref(&adapter)
+                ))
+                .is_empty());
+        }
+    }
+
+    #[test]
+    fn pool_preflight_keeps_real_local_networks_and_specific_pool_routes_blocked() {
+        let pool = FakeIpPoolConfig::default();
+        let mut routes = redirect_routes();
+        routes.push(preflight_route("198.0.0.0", 8, 64));
+        let local = pool_collision_candidates(&routes, &[preflight_adapter(64, "198.1.0.10")]);
+        assert!(pool
+            .collisions(&local)
+            .iter()
+            .any(|hit| hit.local.network == ip("198.0.0.0") && hit.local.prefix_len == 8));
+        for prefix in [15, 24, 32] {
+            let mut routes = redirect_routes();
+            routes.push(preflight_route("198.18.0.0", prefix, 64));
+            let local =
+                pool_collision_candidates(&routes, &[preflight_adapter(64, "10.83.174.246")]);
+            assert!(pool
+                .collisions(&local)
+                .iter()
+                .any(|hit| hit.local.prefix_len == prefix));
+        }
+        let physical = [
+            preflight_route("0.0.0.0", 0, 7),
+            preflight_route("198.0.0.0", 8, 7),
+        ];
+        assert!(!pool
+            .collisions(&pool_collision_candidates(
+                &physical,
+                &[preflight_adapter(7, "192.168.1.8")]
+            ))
+            .is_empty());
+    }
+
+    #[test]
+    fn pool_preflight_does_not_adopt_foreign_networks_or_our_network_rules_as_overlays() {
+        let pool = FakeIpPoolConfig::default();
+        let mut routes = redirect_routes();
+        routes.push(preflight_route("198.16.0.0", 14, 7));
+        let mut rule = preflight_route("198.0.0.0", 8, 64);
+        rule.metric = crate::route_signature::NETWORK_ROUTE_METRIC;
+        rule.is_ours = true;
+        routes.push(rule);
+        let hits = pool.collisions(&pool_collision_candidates(
+            &routes,
+            &[preflight_adapter(64, "10.83.174.246")],
+        ));
+        assert!(hits.iter().any(|hit| hit.local.interface_index == Some(7)));
+        assert!(hits
+            .iter()
+            .any(|hit| hit.local.metric == Some(crate::route_signature::NETWORK_ROUTE_METRIC)));
+    }
+
+    #[test]
+    fn pool_preflight_ignores_our_counter_overlay_without_ignoring_a_foreign_lookalike() {
+        let pool = FakeIpPoolConfig::default();
+        let mut own = preflight_route("198.0.0.0", 7, 7);
+        own.metric = crate::route_signature::SECONDARY_ROUTE_METRIC;
+        let adapters = [preflight_adapter(7, "192.168.1.8")];
+        assert!(pool
+            .collisions(&pool_collision_candidates(
+                std::slice::from_ref(&own),
+                &adapters
+            ))
+            .is_empty());
+        own.metric = 0;
+        assert!(!pool
+            .collisions(&pool_collision_candidates(&[own], &adapters))
+            .is_empty());
     }
 
     #[test]

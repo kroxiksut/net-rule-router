@@ -4,18 +4,7 @@ import QtQuick.Layouts 1.15
 import "../lib/pure.js" as Pure
 import "../lib/plurals.js" as Plurals
 
-// Top banner stack (extracted from Main.qml). The status banners
-// (backend / combined-amber / drift / merge / compat / secondary-adapter /
-// empty-rules / policy-inactive / block-all / rules-folder-suggestion /
-// revision-integrity / local-network-offer / binding-divergence), stacked
-// top-to-bottom
-// and anchored to each other. The combined-amber bar merges the drift and
-// secondary-adapter warnings into one container while both apply; those two
-// stand down for its duration. Kept as ONE
-// component because the banners cross-anchor (each `anchors.top` is the
-// previous banner's `bottom`). `totalHeight` is consumed by the main content's
-// top margin so the content sits below whatever banners are visible. Shared
-// state via `root` (the ApplicationWindow).
+// Cross-anchored banners share one height so content stays below every notice.
 Item {
     id: topBannerStack
 
@@ -30,8 +19,17 @@ Item {
         + blockAllBanner.height
         + rulesFolderSuggestionBanner.height + revisionIntegrityBanner.height
         + localNetworkOfferBanner.height + appGroupsOfferBanner.height
-        + bindingDivergenceBanner.height + protectionVolumeBanner.height
+        + bindingDivergenceBanner.height + protectionVolumeBanner.height + dnsCompatibilityBanner.height
     height: totalHeight
+
+    DnsCompatibilityCard {
+        id: dnsCompatibilityBanner
+        root: topBannerStack.root
+        compact: true
+        anchors.top: protectionVolumeBanner.bottom
+        anchors.left: parent.left
+        anchors.right: parent.right
+    }
 
     // The service stopped though nobody asked for it: the banner says so and
     // offers the way out next to "Start service". Re-read on each state change,

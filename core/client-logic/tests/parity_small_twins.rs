@@ -138,6 +138,96 @@ fn first_run_country_matches_js() {
 }
 
 #[test]
+fn first_run_finish_state_matches_js() {
+    check(
+        "first_run_finish_state",
+        &mut JsLib::pure(),
+        |input| {
+            format!(
+                "firstRunFinishState({}, {}, {})",
+                arg(input, "requiresSecondary"),
+                arg(input, "secondaryAssigned"),
+                arg(input, "secondaryAvailable")
+            )
+        },
+        |input| {
+            json!(nrr_client_logic::first_run::first_run_finish_state(
+                input
+                    .get("requiresSecondary")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false),
+                input
+                    .get("secondaryAssigned")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false),
+                input
+                    .get("secondaryAvailable")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false),
+            ))
+        },
+    );
+}
+
+#[test]
+fn routing_readiness_matches_js() {
+    check(
+        "routing_readiness",
+        &mut JsLib::pure(),
+        |input| {
+            format!(
+                "routingReadiness({}, {}, {}, {}, {}, {}, {}, {})",
+                arg(input, "serviceHealthy"),
+                arg(input, "primaryBound"),
+                arg(input, "primaryStatus"),
+                arg(input, "secondaryRequired"),
+                arg(input, "secondaryBound"),
+                arg(input, "secondaryStatus"),
+                arg(input, "activeRuleCount"),
+                arg(input, "secondaryRuleCount")
+            )
+        },
+        |input| {
+            let count = |key| {
+                input
+                    .get(key)
+                    .and_then(Value::as_u64)
+                    .and_then(|n| u32::try_from(n).ok())
+            };
+            let readiness = nrr_client_logic::routing_readiness::routing_readiness(
+                input
+                    .get("serviceHealthy")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false),
+                input
+                    .get("primaryBound")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false),
+                text(input, "primaryStatus"),
+                input
+                    .get("secondaryRequired")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false),
+                input
+                    .get("secondaryBound")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false),
+                text(input, "secondaryStatus"),
+                count("activeRuleCount"),
+                count("secondaryRuleCount"),
+            );
+            json!({
+                "service": readiness.service,
+                "routing": readiness.routing,
+                "primary": readiness.primary,
+                "secondary": readiness.secondary,
+                "affectedAssignments": readiness.affected_assignments,
+            })
+        },
+    );
+}
+
+#[test]
 fn security_alerts_unreadable_matches_js() {
     check(
         "security_alerts_unreadable",
@@ -149,4 +239,100 @@ fn security_alerts_unreadable_matches_js() {
             ))
         },
     );
+}
+
+#[test]
+fn dns_blocking_status_matches_the_service_verdict_in_both_clients() {
+    check(
+        "dns_blocking_status",
+        &mut JsLib::pure(),
+        |input| format!("dohLockdownStatus({})", input),
+        |input| {
+            let policy = input.as_object().cloned().unwrap_or_default();
+            json!(nrr_client_logic::routing_settings::doh_lockdown_status(
+                &policy
+            ))
+        },
+    );
+}
+
+#[test]
+fn a_service_restart_does_not_erase_the_dns_problem_in_either_client() {
+    check(
+        "dns_compatibility_merge",
+        &mut JsLib::pure(),
+        |input| {
+            format!("(function() {{ var s = {}; var updates = {} || [{}]; updates.forEach(function(next) {{ s = mergeDnsCompatibility(s, next); }}); return {{status:s.status, issues:s.issues}}; }})()",
+            arg(input, "previous"), arg(input, "updates"), arg(input, "incoming"))
+        },
+        |input| {
+            use nrr_shared::ipc_payloads::DnsCompatibilityDto;
+            let parse = |source: &Value| {
+                let mut value =
+                    serde_json::to_value(DnsCompatibilityDto::default()).expect("default state");
+                if let Some(fields) = source.as_object() {
+                    value
+                        .as_object_mut()
+                        .expect("state object")
+                        .extend(fields.clone());
+                }
+                serde_json::from_value::<DnsCompatibilityDto>(value).expect("fixture state")
+            };
+            let updates = input
+                .get("updates")
+                .and_then(Value::as_array)
+                .cloned()
+                .unwrap_or_else(|| vec![input.get("incoming").cloned().unwrap_or(Value::Null)]);
+            let state = updates.iter().fold(
+                parse(input.get("previous").unwrap_or(&Value::Null)),
+                |state, next| nrr_client_logic::dns_compatibility::merge(&state, parse(next)),
+            );
+            json!({"status":state.status, "issues":state.issues})
+        },
+    );
+}
+
+#[test]
+fn dns_history_overflow_cannot_become_a_full_recovery_notice() {
+    use nrr_shared::ipc_payloads::{DnsCompatibilityDto, DnsCompatibilityStatus};
+    let empty = serde_json::to_value(DnsCompatibilityDto::default()).expect("state");
+    let mut incoming = empty.clone();
+    incoming["instance-id"] = json!("bounded-service");
+    incoming["sequence"] = json!(1);
+    incoming["status"] = json!("limited");
+    incoming["issues"] = json!((0..80)
+        .map(|n| json!({
+            "program":format!("browser-{n}"), "reason":"our-dns-block", "evidence":"confirmed",
+            "first-seen-ms":1, "last-seen-ms":2, "attempts":1, "needs-recheck":false
+        }))
+        .collect::<Vec<_>>());
+    let limited = nrr_client_logic::dns_compatibility::merge(
+        &DnsCompatibilityDto::default(),
+        serde_json::from_value(incoming.clone()).expect("bounded input"),
+    );
+    assert!(
+        limited.issues.len() <= 64,
+        "the client must bound retained programs"
+    );
+    let mut proof = DnsCompatibilityDto {
+        status: DnsCompatibilityStatus::Verified,
+        instance_id: "bounded-service".to_owned(),
+        sequence: 2,
+        verified_program: Some("browser-0".to_owned()),
+        ..Default::default()
+    };
+    proof.last_checked_ms = Some(3);
+    let result = nrr_client_logic::dns_compatibility::merge(&limited, proof.clone());
+    assert_eq!(result.status, DnsCompatibilityStatus::NeedsRecheck);
+    assert!(
+        result.history_incomplete,
+        "a truncated history cannot certify full recovery"
+    );
+    let from_js = JsLib::pure().eval_json(&format!(
+        "mergeDnsCompatibility(mergeDnsCompatibility({}, {}), {})",
+        empty,
+        incoming,
+        serde_json::to_value(proof).expect("proof")
+    ));
+    assert_eq!(serde_json::to_value(result).expect("result"), from_js);
 }

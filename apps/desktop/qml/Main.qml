@@ -268,6 +268,8 @@ ApplicationWindow {
     property string _serviceLeakFloor: "off"
     /// The route policy the service last reported, null for a user with none.
     property var _serviceRoutePolicy: null
+    property alias dnsCompatibilityController: dnsCompatibilityFlow
+    DnsCompatibilityController { id: dnsCompatibilityFlow; root: window }
     /// Follow the service's answer: `rpRaw` is its route policy (absent for a
     /// user with none), `first` its `first-policy`.
     function _noteServicePolicy(rpRaw, first) {
@@ -2505,6 +2507,17 @@ ApplicationWindow {
         // that is more than the filtering service stays stable under.
         protectionFiltersOnMachine: 0,
         protectionFiltersHigh: false,
+        routingReadiness: {
+            service: "unhealthy", routing: "unknown", primary: "unknown",
+            secondary: "not-required", affectedAssignments: null
+        },
+        readinessServiceHealthy: false,
+        readinessPrimaryBound: false,
+        readinessSecondaryBound: false,
+        readinessSecondaryRequired: false,
+        readinessActiveRuleCount: null,
+        readinessSecondaryRuleCount: null,
+        fakeIpFailure: null,
         // What forwarded traffic gets while the tunnel is down ("" until answered).
         forwardedOutage: "",
         // Where the applied rules are enforced differently from how they
@@ -2520,6 +2533,60 @@ ApplicationWindow {
         routingState = Object.assign({}, routingState, patch || {})
         uiRevision += 1
     }
+
+    function _refreshRoutingReadiness() {
+        var primaryStatus = String(enforcementStatusByRole.primary || "")
+        var secondaryStatus = String(enforcementStatusByRole.secondary || "")
+        if (primaryStatus === "" && routingState.readinessPrimaryBound) primaryStatus = "ok"
+        if (secondaryStatus === "" && routingState.readinessSecondaryBound) secondaryStatus = "ok"
+        updateRoutingState({
+            routingReadiness: Pure.routingReadiness(
+                routingState.readinessServiceHealthy === true,
+                routingState.readinessPrimaryBound === true,
+                primaryStatus,
+                routingState.readinessSecondaryRequired === true,
+                routingState.readinessSecondaryBound === true,
+                secondaryStatus,
+                routingState.readinessActiveRuleCount,
+                routingState.readinessSecondaryRuleCount)
+        })
+    }
+
+    function _readinessRoleText(state) {
+        if (state === "ready") return tr("routing.readiness.role-ready", "ready")
+        if (state === "not-required")
+            return tr("routing.readiness.role-not-required", "not needed by current rules")
+        if (state === "not-chosen")
+            return tr("routing.readiness.role-not-chosen", "not selected")
+        if (state === "not-ready") return tr("routing.readiness.role-not-ready", "not ready")
+        return tr("routing.readiness.role-unknown", "unknown")
+    }
+
+    function routingReadinessDetail() {
+        var rr = routingState.routingReadiness || {}
+        var lines = [rr.service === "healthy"
+            ? tr("routing.readiness.service-healthy", "Service: healthy")
+            : tr("routing.readiness.service-unhealthy", "Service: needs attention")]
+        lines.push(tr("routing.readiness.primary", "Main connection: {state}")
+            .replace("{state}", _readinessRoleText(String(rr.primary || "unknown"))))
+        lines.push(tr("routing.readiness.secondary", "Additional connection: {state}")
+            .replace("{state}", _readinessRoleText(String(rr.secondary || "unknown"))))
+        if (rr.routing !== "ready") {
+            lines.push(rr.affectedAssignments === null || rr.affectedAssignments === undefined
+                ? tr("routing.readiness.affected-unknown", "Active assignments affected: unknown")
+                : tr("routing.readiness.affected-assignments", "Active assignments affected: {count}")
+                    .replace("{count}", String(rr.affectedAssignments)))
+        }
+        return lines.join("\n")
+    }
+
+    function fakeIpFailureText() {
+        var failure = routingState.fakeIpFailure
+        if (!failure) return ""
+        var code = String(failure.code || "transient")
+        return tr("errors.fake-ip-" + code,
+            "Name-based routing is unavailable. Open Diagnostics for details.")
+    }
     /// Pull the set of application rules the service could
     /// NOT enforce (executable path unresolved) from the connect-time snapshot
     /// and mirror it into `routingState` so the top-of-window banner reflects
@@ -2534,12 +2601,19 @@ ApplicationWindow {
                 || typeof nrrNativeBridge.rpcSnapshotInitialGet !== "function") {
             return
         }
+        var dnsGeneration = dnsCompatibilityFlow.connectionGeneration
         var corr = nrrNativeBridge.rpcSnapshotInitialGet()
         rpcTransport.registerRpcCallback(corr, function(ok, p, code, msg) {
             if (!ok || !p) return
             var list = p["unenforced-app-rules"] || p.unenforcedAppRules || []
             var rpRaw = p["route-policy"] || p.routePolicy
             var rp = rpRaw || {}
+            var activeRaw = p["active-rule-count"]
+            var secondaryRaw = p["active-secondary-rule-count"]
+            var activeCount = typeof activeRaw === "number" ? activeRaw : null
+            var secondaryCount = typeof secondaryRaw === "number" ? secondaryRaw : null
+            var health = p.health || {}
+            var fakeIpDatapath = health["fake-ip-datapath"] || null
             // Does the service hold anything that can route this user's rules?
             // An absent `route-policy` is the service's own "no route policy
             // for this user" state; a policy without a secondary slot resolves
@@ -2587,6 +2661,15 @@ ApplicationWindow {
                 protectionFiltersOnMachine:
                     Number(p["protection-filters-on-machine"]) || 0,
                 protectionFiltersHigh: p["protection-filters-high"] === true,
+                readinessServiceHealthy: String(health["worst-severity"] || "") === "ok",
+                readinessPrimaryBound: activeCount === 0 || !!rp.primary,
+                readinessSecondaryBound: !!rp.secondary,
+                readinessSecondaryRequired: secondaryCount !== null && secondaryCount > 0,
+                readinessActiveRuleCount: activeCount,
+                readinessSecondaryRuleCount: secondaryCount,
+                fakeIpFailure: fakeIpDatapath && fakeIpDatapath.desired === true
+                        && fakeIpDatapath.running !== true
+                    ? (fakeIpDatapath["last-failure"] || null) : null,
                 ruleConflicts: (p["rule-conflicts"] instanceof Array)
                     ? p["rule-conflicts"] : [],
                 ruleOverrides: (p["rule-overrides"] instanceof Array)
@@ -2615,9 +2698,11 @@ ApplicationWindow {
             // statuses before this call: it skips a report equal to the one
             // already held, so a premature write hid the notice and the chip.
             _applyStandingEnforcementStatus(p["enforcement-status"])
+            _refreshRoutingReadiness()
             _applyStandingRoutesHeld(p["routes-held-by-another-user"])
             _applyStandingTrafficCarried(p["traffic-carried-by-another-user"])
             _onRulesBookReading(p["rules-book-unreadable"] === true)
+            dnsCompatibilityFlow.accept(p["dns-compatibility"], dnsGeneration)
             _applyPushedSettingsFromSnapshot(p)
             if (typeof onSnapshot === "function") onSnapshot(p)
         })
@@ -4422,6 +4507,9 @@ ApplicationWindow {
             case "enforcement-status-changed":
                 _onEnforcementStatusChanged(event)
                 break
+            case "dns-compatibility-changed":
+                dnsCompatibilityFlow.accept(event.state)
+                break
             case "routes-held-by-another-user":
                 _onRoutesHeldByAnotherUser(event)
                 break
@@ -4637,6 +4725,7 @@ ApplicationWindow {
         if (status === "" || status === "ok") delete next[role]
         else next[role] = status
         enforcementStatusByRole = next
+        Qt.callLater(_refreshRoutingReadiness)
     }
 
     /// The snapshot's standing reports, handled as the pushes they stand for.
@@ -4960,8 +5049,7 @@ ApplicationWindow {
                     "With leak protection set to Everything, IPv6 goes out only through the additional connection, so this connection did not go out.")
             case "dns-lockdown":
                 return tr("notifications.block-notice.reason.dns-lockdown",
-                    "This app went to its own DNS resolver instead of the one NetRuleRouter provides, "
-                    + "and encrypted-DNS blocking closed it.")
+                    "Our DNS protection blocked a connection to a known resolver endpoint. This does not prove encrypted DNS use or explain a particular site's failure. Check DNS compatibility in Routing settings; keep your routing rules enabled.")
             case "unattributed":
                 return tr("notifications.block-notice.reason.unattributed",
                     "NetRuleRouter blocked this connection, but could not identify which filter did it.")
@@ -5213,7 +5301,9 @@ ApplicationWindow {
         if (!rulesModel || rulesModel.count === 0) return "no-rules"
         // A role the service reports as not enforced: its rules are blocked,
         // which "active" would contradict.
-        if (_enforcementDownRoles.length > 0) return "limited"
+        if (_enforcementDownRoles.length > 0
+                || String((routingState.routingReadiness || {}).routing || "unknown") !== "ready")
+            return "limited"
         return "active"
     }
 

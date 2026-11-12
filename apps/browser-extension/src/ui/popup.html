@@ -1,0 +1,53 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <link rel="stylesheet" href="styles.css">
+  <script type="module" src="popup.js"></script>
+</head>
+<body class="popup" data-title="popup_title">
+  <header class="brand-row">
+    <img src="../icons/icon-32.png" width="28" height="28" alt="">
+    <strong data-i18n="app_name"></strong>
+    <button id="open-options" type="button" data-i18n="settings"></button>
+  </header>
+  <main>
+    <p id="connection" class="badge" data-i18n="standalone"></p>
+    <h1 id="current-host" data-i18n="current_site"></h1>
+    <p class="muted" data-i18n="standalone_description"></p>
+    <p id="notice" class="notice" role="status" aria-live="polite" hidden></p>
+    <p id="pending" class="notice" role="status" aria-live="polite" data-tone="warning" data-i18n="pending_changes" hidden></p>
+    <section class="panel">
+      <h2 data-i18n="site_profile"></h2>
+      <p id="inherited-profile" class="scope" hidden></p>
+      <form id="site-form">
+        <input name="host" type="hidden">
+        <label for="language-mode" data-i18n="language_mode"></label>
+        <select id="language-mode" name="languageMode">
+          <option value="inherit" data-i18n="mode_inherit"></option>
+          <option value="system" data-i18n="mode_system"></option>
+          <option value="manual" data-i18n="mode_manual"></option>
+          <option value="route" disabled data-i18n="mode_route_unavailable"></option>
+        </select>
+        <label for="language" data-i18n="language_tag"></label>
+        <input id="language" name="language" type="text" maxlength="35" spellcheck="false" autocapitalize="off" autocomplete="off" aria-describedby="language-help">
+        <p id="language-help" class="help" data-i18n="language_tag_help"></p>
+        <label class="check"><input name="includeSubdomains" type="checkbox"><span data-i18n="include_subdomains"></span></label>
+        <p class="scope" id="scope"></p>
+        <p class="help" data-i18n="language_partial"></p>
+        <div class="actions">
+          <button class="primary" type="submit" data-i18n="save_apply"></button>
+          <button id="inherit" type="button" data-i18n="restore_inheritance"></button>
+        </div>
+      </form>
+    </section>
+    <dl class="facts">
+      <div><dt data-i18n="route"></dt><dd data-i18n="route_unavailable"></dd></div>
+      <div><dt data-i18n="timezone"></dt><dd data-i18n="timezone_unavailable"></dd></div>
+      <div><dt data-i18n="webrtc"></dt><dd id="webrtc-state"></dd></div>
+    </dl>
+    <p class="help" data-i18n="explicit_only"></p>
+  </main>
+</body>
+</html>

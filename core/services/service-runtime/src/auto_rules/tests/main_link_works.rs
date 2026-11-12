@@ -7,7 +7,7 @@ fn pending_candidate(dto: AutoRuleCandidateDto) -> PendingCandidate {
     PendingCandidate {
         dto,
         route: RouteRole::Secondary,
-        match_kind: AuthoredMatchKind::SuffixDomain,
+        match_kind: AuthoredMatchKind::ExactHost,
     }
 }
 
@@ -103,16 +103,14 @@ fn a_shared_cdn_that_answers_on_the_main_link_is_not_worth_asking_about() {
 }
 
 #[test]
-fn the_sites_own_name_keeps_its_question_even_when_it_answers() {
-    // Answering is not serving: the assistant site answers main-link addresses
-    // with a refusal, so its own names stay on offer whatever the connectivity says.
+fn a_hosts_own_response_is_not_overruled_by_its_brand_or_anchor() {
     let own = main_link_dto(
         "assistant.example",
         "cdn.assistant.example",
         AUTO_RULE_SIGNAL_DELIVERY_NAME,
         AUTO_RULE_PRIMARY_BEHAVIOR_RESPONDS,
     );
-    assert!(!settled_by_the_main_link(&own));
+    assert!(settled_by_the_main_link(&own));
 
     let brand = main_link_dto(
         "assistant.example",
@@ -121,8 +119,8 @@ fn the_sites_own_name_keeps_its_question_even_when_it_answers() {
         AUTO_RULE_PRIMARY_BEHAVIOR_RESPONDS,
     );
     assert!(
-        !settled_by_the_main_link(&brand),
-        "brand tier is never settled by connectivity"
+        settled_by_the_main_link(&brand),
+        "brand similarity does not overrule this host's measured response"
     );
 }
 

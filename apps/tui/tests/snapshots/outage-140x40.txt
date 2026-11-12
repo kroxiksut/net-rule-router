@@ -1,8 +1,8 @@
 Service: OK
 > Screens                                               Blocked while the additional connection was down
-  1 Status                                              What leak protection held back while the additional connection was down. Your rules
-  2 First run                                           send these addresses there, so they were blocked instead of leaving through the main
-  3 Connections                                         connection.
+  1 Status                                              These connection attempts were blocked because the additional connection required by
+  2 First run                                           your rules was unavailable. The list stays available after it returns. Names marked
+  3 Connections                                         “did not resolve” got no address during the outage, so no connection was made.
   4 Rules                                               The additional connection has been down since 2026-10-06 11:50:00.
   5 Overlaps                                            3: Open Connections
   6 Suggested addresses

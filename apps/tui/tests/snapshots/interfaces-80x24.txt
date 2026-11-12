@@ -1,11 +1,11 @@
 Service: OK
-╭Screens──────────────────╮╭Connections — +4 more rows─────────────────────────╮
+╭Screens──────────────────╮╭Connections — +9 more rows─────────────────────────╮
 │  1 Status               ││The main connection is your usual internet. The    │
 │  2 First run            ││additional connection (e.g. VPN) carries what your │
 │> 3 Connections          ││rules send to it.                                  │
-│  4 Rules                ││Main connection: Ethernet — Example Network Adapter│
-│  5 Overlaps             ││— Available                                        │
-│  6 Suggested addresses  ││Additional connection (e.g. VPN): Example Tunnel — │
+│  4 Rules                ││A VPN in system proxy mode does not create a       │
+│  5 Overlaps             ││network connection NetRuleRouter can assign. Use   │
+│  6 Suggested addresses  ││the VPN's TUN mode when you want rules to use it as│
 │  7 Connection trace     │╰───────────────────────────────────────────────────╯
 │  8 Cache                │╭Adapters — +6 more rows────────────────────────────╮
 │  9 Diagnostics and logs ││Wired (Ethernet) — Available — Additional          │

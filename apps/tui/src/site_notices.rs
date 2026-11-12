@@ -1,12 +1,5 @@
-//! "A site does not open" in the feed, under the rule every surface keeps:
-//! nothing once muted, one such notice per half hour, the same site once a
-//! day unless the user answered it (`nrr_client_logic::site_notice`, the
-//! tray's and the service's rule too).
-//!
-//! When each was told and answered is kept in `tui.json` under one section,
-//! keyed as the tray's ledger keys it. The file is the user's to edit and
-//! anybody's to break: it is read bounded, and whatever cannot be read is
-//! forgotten, never a reason to stay silent.
+//! Per-site repeats and short batches share the tray's neutral policy.
+//! An unreadable bounded history in `tui.json` does not silence future notices.
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -104,13 +97,18 @@ impl SiteNoticeLog {
 
     /// Whether a notice about `host` may be told at `now_ms`.
     pub fn due(&self, host: &str, muted: bool, now_ms: i64) -> bool {
+        self.due_in_batch(host, muted, now_ms, false)
+    }
+
+    fn due_in_batch(&self, host: &str, muted: bool, now_ms: i64, continuing: bool) -> bool {
         let site = self.sites.get(host).copied().unwrap_or_default();
         let answered = match (site.answered, site.shown) {
             (Some(answered), Some(shown)) => answered >= shown,
             (Some(_), None) => true,
             _ => false,
         };
-        site_notice_due(muted, self.shown, site.shown, answered, now_ms)
+        let last_card = if continuing { None } else { self.shown };
+        site_notice_due(muted, last_card, site.shown, answered, now_ms)
     }
 
     pub fn told(&mut self, host: &str, now_ms: i64) {
@@ -129,7 +127,7 @@ impl SiteNoticeLog {
         }
     }
 
-    /// Sites past their day hold nothing back any more.
+    /// Sites past the short repeat window hold nothing back any more.
     fn forget_stale(&mut self, now_ms: i64) {
         self.sites.retain(|_, s| {
             now_ms.saturating_sub(s.latest()) < SAME_SITE_GAP_MS || s.latest() > now_ms
@@ -158,17 +156,31 @@ fn save(app: &mut AppState) {
     let _ = app.settings.write_prefs(entries);
 }
 
-/// Whether the feed may tell that `host` does not open, and if so, that it
-/// was told.
-pub fn tell(app: &mut AppState, host: &str) -> bool {
+/// Names newly told in this batch. Existing feed content does not open a card.
+pub fn tell_batch(app: &mut AppState, hosts: &[String], continuing: bool) -> Vec<String> {
     let now = app.settings.clock.now();
     let muted = crate::notice_mutes::muted(app, SITE_NOT_OPENING_KIND);
-    if !app.site_notices.due(host, muted, now) {
-        return false;
+    let fresh: Vec<String> = hosts
+        .iter()
+        .filter(|host| plain_host(host))
+        .filter(|host| {
+            if continuing {
+                app.site_notices.due_in_batch(host, muted, now, true)
+            } else {
+                app.site_notices.due(host, muted, now)
+            }
+        })
+        .take(50)
+        .cloned()
+        .collect();
+    if fresh.is_empty() {
+        return fresh;
     }
-    app.site_notices.told(host, now);
+    for host in &fresh {
+        app.site_notices.told(host, now);
+    }
     save(app);
-    true
+    fresh
 }
 
 /// The user answered the notices about `hosts`: a rule now carries them.

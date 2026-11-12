@@ -310,10 +310,11 @@ impl DnsObservationConsumer {
                 }
             } else {
                 summary.ignored = summary.ignored.saturating_add(1);
-                // Discarded from the CACHE, kept as a name. An address
-                // no rule covers still needs a name the moment its
-                // connections start failing on the main link.
-                if let Some(names) = self.observed_names.as_ref() {
+            }
+            if let Some(names) = &self.observed_names {
+                if let Some(owner) = obs.owner.as_deref() {
+                    names.record_for(owner, &obs.hostname, &routable);
+                } else {
                     names.record(&obs.hostname, &routable);
                 }
             }

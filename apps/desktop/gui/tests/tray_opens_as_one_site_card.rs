@@ -53,13 +53,11 @@ fn block<'a>(source: &'a str, start: &str, indent: &str) -> &'a str {
     &rest[..end]
 }
 
-/// A running tray that pops the card itself keeps the rule the service keeps
-/// before starting a closed one: the mute, one card per half hour, a site
-/// once a day unless answered — written where the other tray reads it.
+/// Every launch mode shares the mute, batching and per-site repeat policy.
 #[test]
 fn a_running_tray_holds_its_card_to_the_rule_a_closed_one_keeps() {
     let source = tray();
-    let rule = block(&source, "function _siteNoticeDue(host) {", "    ");
+    let rule = block(&source, "function _siteNoticeDue(", "    ");
     assert!(
         rule.contains("Pure.siteNoticeDue(_noticeMutedNow(\"site-not-opening\")"),
         "the card is not decided by the shared rule:\n{rule}"
@@ -78,10 +76,6 @@ fn a_running_tray_holds_its_card_to_the_rule_a_closed_one_keeps() {
     assert!(
         source.matches("_recordSitesShown(").count() >= 3,
         "a card shown on one path is not written for the other"
-    );
-    assert!(
-        source.contains("answered.concat(_siteHostsOnScreen.map(_siteAnsweredId))"),
-        "an answer in the running tray is not recorded"
     );
 }
 

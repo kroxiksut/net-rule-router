@@ -106,6 +106,9 @@ pub(crate) fn build_runtime_deps(
         stack.rules_provider.set_health(Arc::clone(&health));
     }
     let wake_refresh = policy.as_ref().map(|stack| Arc::clone(&stack.wake_refresh));
+    let dns_compatibility = policy
+        .as_ref()
+        .map(|stack| stack.block_notice_center.dns_compatibility());
     // The user whose book stops reading is told at once, alone.
     nrr_service_runtime::rules_book_notice::attach_events(Arc::clone(&event_bus));
     let (
@@ -290,6 +293,7 @@ pub(crate) fn build_runtime_deps(
         (Some(conn), Some(cache), Some(hook)) => crate::dns_stack::resolver_controller(
             &dns_capture,
             nrr_service_runtime::dns_stack::DnsStackInputs {
+                dns_compatibility: dns_compatibility.as_ref().map(Arc::downgrade),
                 settings_conn: Arc::clone(conn),
                 cache: Arc::clone(cache),
                 active_sid: Arc::clone(&routing_principal),
@@ -363,6 +367,16 @@ pub(crate) fn build_runtime_deps(
     // Besides logind's user edges, the enforcement pass asks logind who is
     // present every few seconds: a sign-in missed while the bus was down, and
     // a resolver whose serve thread died, are looked after from there.
+    if let (Some(center), Some(controller)) =
+        (dns_compatibility.as_ref(), dns_resolver_controller.as_ref())
+    {
+        center.attach_resolver(Arc::clone(controller));
+    }
+    if let Some(center) = dns_compatibility.as_ref() {
+        center.attach_browser_settings(Arc::new(
+            nrr_platform_linux::browser_dns_settings::LinuxBrowserDnsSettings,
+        ));
+    }
     if let (Some(cycle), Some(controller)) =
         (enforcement.as_ref(), dns_resolver_controller.as_ref())
     {
@@ -1406,13 +1420,9 @@ pub(crate) fn build_policy_stack(
             )),
             std::time::SystemTime::now(),
         )
-        // What the main link currently does with a host, by name. Without it
-        // an offer a host made about ITSELF could never learn that the site
-        // started working, and would keep standing after the reason went away.
-        .with_primary_behavior_source({
-            let stalls = nrr_service_runtime::primary_stall_registry::global_primary_stalls();
-            Arc::new(move |sid: &str, hostname: &str| stalls.behavior_of_subtree(sid, hostname))
-        })
+        .with_primary_health_registry(
+            nrr_service_runtime::primary_stall_registry::global_primary_stalls(),
+        )
         // The user's mode decides which offers change anything.
         .with_behavior_mode_source({
             let policy = Arc::clone(&policy);
@@ -1825,6 +1835,19 @@ pub(crate) fn build_policy_stack(
                 })
             }),
     );
+    trace_ring.attach_dns_compatibility(block_notice_center.dns_compatibility());
+    {
+        let sources = nrr_service_runtime::production_auto_rule_probe::StoredBindingEgress::new(
+            Arc::clone(&policy),
+            Arc::new(nrr_platform_linux::LinuxApi),
+        );
+        block_notice_center
+            .dns_compatibility()
+            .attach_secondary_status(Arc::new(move |sid| {
+                use nrr_service_runtime::production_auto_rule_probe::EgressSources;
+                Some(sources.egress_source_ips(sid).1.is_some())
+            }));
+    }
     let drop_observation = drop_observation::DropObservationParts {
         api: Arc::new(nrr_platform_linux::LinuxApi),
         egress_of: drop_observation::egress_of(
@@ -1881,6 +1904,40 @@ pub(crate) fn build_policy_stack(
             as Arc<dyn nrr_service_runtime::principal_reset::PrincipalStateHolder>),
     );
 
+    let discovery_observation = Arc::new(
+        nrr_service_runtime::discovery_observation::DiscoveryObservationPipeline::new(
+            nrr_service_runtime::discovery_observation::DiscoveryObservationWiring {
+                engine: Arc::clone(&auto_rules),
+                rules: Arc::clone(&rules_for_stack),
+                names: nrr_service_runtime::observed_host_names::global_observed_host_names(),
+                egress: Arc::new(
+                    nrr_service_runtime::production_auto_rule_probe::StoredBindingEgress::new(
+                        Arc::clone(&policy),
+                        Arc::new(nrr_platform_linux::LinuxApi),
+                    ),
+                ),
+                probe: Arc::new(crate::ipc_deps::LinkBoundPathProbe),
+                cadence: nrr_service_runtime::service_tasks::stored_auto_probe_cadence(Arc::clone(
+                    &state_conn,
+                )),
+                limits: nrr_service_runtime::discovery_observation::stored_probe_limits(
+                    Arc::clone(&state_conn),
+                ),
+                primary_default: nrr_service_runtime::discovery_observation::stored_primary_default(
+                    Arc::clone(&state_conn),
+                ),
+                passive_reset_available: false,
+                os_cache_available: false,
+            },
+        )
+        .with_https(
+            nrr_service_runtime::site_check::https_head::RustlsHttpsHead::new(Arc::new(
+                crate::ipc_deps::LinkBoundPathProbe,
+            ))
+            .map(|head| Arc::new(head) as Arc<dyn nrr_service_runtime::site_check::HttpsHead>),
+        ),
+    );
+
     Some(PolicyStack {
         app_enforcement,
         shared_ip_exemptions,
@@ -1909,7 +1966,8 @@ pub(crate) fn build_policy_stack(
                 Arc::new(nrr_platform_linux::LinuxApi),
                 bindings_for_trace,
             )
-            .with_log_ndjson_flag(conn_trace_log.flag()),
+            .with_log_ndjson_flag(conn_trace_log.flag())
+            .with_discovery_observation(discovery_observation),
         ),
         conn_trace_log,
         cycle,

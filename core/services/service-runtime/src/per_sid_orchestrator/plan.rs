@@ -6,6 +6,21 @@
 //! protection arms is decided by `nrr_domain::protection_posture`, not here.
 
 use super::*;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum UnresolvedSecondaryClaim {
+    HoldingTraffic,
+    NoHeldDestinations,
+}
+
+fn unresolved_secondary_claim(fail_closed_filters: usize) -> UnresolvedSecondaryClaim {
+    if fail_closed_filters == 0 {
+        UnresolvedSecondaryClaim::NoHeldDestinations
+    } else {
+        UnresolvedSecondaryClaim::HoldingTraffic
+    }
+}
+
 use crate::enforcement_planner::ServiceAccountPosture;
 
 impl PerSidApplyOrchestrator {
@@ -904,39 +919,40 @@ impl PerSidApplyOrchestrator {
                         );
                         app_block_emitted |= !app_pair.is_empty();
                         ks.extend(app_pair);
-                        // A destination withdrawn from an app is the main link's,
-                        // that app's included. What a tunnel rule or the DoH
-                        // lockdown holds stays held: the permit would outrank it.
-                        let held: std::collections::HashSet<std::net::IpAddr> = ks_dest_ips
-                            .iter()
-                            .copied()
-                            .chain(
-                                policy
-                                    .doh_resolver_ips
-                                    .iter()
-                                    .copied()
-                                    .filter(|_| doh_lockdown),
-                            )
-                            .collect();
-                        ks.extend(crate::killswitch_codegen::app_withdrawn_permits(
-                            sid,
-                            &codegen_out.secondary_app_patterns,
-                            |app| {
-                                observations
-                                    .withdrawn_from(app)
-                                    .into_iter()
-                                    .filter(|ip| {
-                                        !held.contains(ip)
-                                            && !ownership.named_by(
-                                                *ip,
-                                                crate::address_ownership::Link::Additional,
-                                            )
-                                    })
-                                    .collect()
-                            },
-                            resolution.secondary_luid,
-                            protocols,
-                        ));
+                        // Withdrawing a shared host route must not relax strict protection.
+                        // Smart mode may fall back, except where an explicit rule still holds it.
+                        if !policy.kill_switch_strict_shared_ips {
+                            let held: std::collections::HashSet<std::net::IpAddr> = ks_dest_ips
+                                .iter()
+                                .copied()
+                                .chain(
+                                    policy
+                                        .doh_resolver_ips
+                                        .iter()
+                                        .copied()
+                                        .filter(|_| doh_lockdown),
+                                )
+                                .collect();
+                            ks.extend(crate::killswitch_codegen::app_withdrawn_permits(
+                                sid,
+                                &codegen_out.secondary_app_patterns,
+                                |app| {
+                                    observations
+                                        .withdrawn_from(app)
+                                        .into_iter()
+                                        .filter(|ip| {
+                                            !held.contains(ip)
+                                                && !ownership.named_by(
+                                                    *ip,
+                                                    crate::address_ownership::Link::Additional,
+                                                )
+                                        })
+                                        .collect()
+                                },
+                                resolution.secondary_luid,
+                                protocols,
+                            ));
+                        }
                         ks
                     };
                     // Under the blanket through the tunnel, what the machine
@@ -1155,26 +1171,43 @@ impl PerSidApplyOrchestrator {
                     collect_service_account_block_ids(&shares.service, &mut killswitch_block_ids);
                     filters.extend(shares.service);
                     filters.extend(shares.forwarded);
-                    // Full level on a posture change or a heartbeat (the shape is
-                    // part of the posture); the ~5 s re-derivations in between
-                    // drop to debug — a long block-all with no line after the
-                    // first reads as "silently stuck", hence the heartbeat.
-                    let posture = if effective_block_all {
-                        "unresolved-fail-closed-block-all"
-                    } else {
-                        "unresolved-fail-closed-per-ip"
+                    let claim = unresolved_secondary_claim(fc.len());
+                    let posture = match (effective_block_all, claim) {
+                        (true, UnresolvedSecondaryClaim::HoldingTraffic) => {
+                            "unresolved-fail-closed-block-all"
+                        }
+                        (false, UnresolvedSecondaryClaim::HoldingTraffic) => {
+                            "unresolved-fail-closed-per-ip"
+                        }
+                        (_, UnresolvedSecondaryClaim::NoHeldDestinations) => {
+                            "unresolved-no-held-destinations"
+                        }
                     };
+                    let affected_rules = rules.rule_book.secondary.rules().len();
                     match self.posture_log_event_for(intent, sid, posture) {
                         PostureLogEvent::Transition => {
-                            tracing::warn!(
-                                target: "nrr::per_sid_orchestrator",
-                                msg_key = "persid-plan-secondary-unresolved-fail-closed",
-                                sid,
-                                mode = ?behavior_mode,
-                                block_all = effective_block_all,
-                                fail_closed_filters = fc.len(),
-                                "secondary interface unresolved — leak protection holds traffic",
-                            );
+                            match claim {
+                                UnresolvedSecondaryClaim::HoldingTraffic => tracing::warn!(
+                                    target: "nrr::per_sid_orchestrator",
+                                    msg_key = "persid-plan-secondary-unresolved-fail-closed",
+                                    sid,
+                                    mode = ?behavior_mode,
+                                    block_all = effective_block_all,
+                                    fail_closed_filters = fc.len(),
+                                    affected_rules,
+                                    "secondary interface unresolved — leak protection holds traffic",
+                                ),
+                                UnresolvedSecondaryClaim::NoHeldDestinations => tracing::warn!(
+                                    target: "nrr::per_sid_orchestrator",
+                                    msg_key = "persid-plan-secondary-unresolved-no-held-destinations",
+                                    sid,
+                                    mode = ?behavior_mode,
+                                    block_all = effective_block_all,
+                                    fail_closed_filters = fc.len(),
+                                    affected_rules,
+                                    "secondary interface unresolved — no destinations are held by leak protection",
+                                ),
+                            }
                             // Ask for the re-resolve on the arming edge: the
                             // common cause is a tunnel adapter just recreated with
                             // a new GUID, which the name heal finds at once.
@@ -1185,16 +1218,30 @@ impl PerSidApplyOrchestrator {
                             }
                         }
                         PostureLogEvent::Heartbeat { elapsed } => {
-                            tracing::warn!(
-                                target: "nrr::per_sid_orchestrator",
-                                msg_key = "persid-plan-secondary-unresolved-heartbeat",
-                                sid,
-                                mode = ?behavior_mode,
-                                block_all = effective_block_all,
-                                fail_closed_filters = fc.len(),
-                                elapsed_minutes = elapsed.as_secs() / 60,
-                                "secondary interface still unresolved — leak protection still holds traffic (heartbeat)",
-                            );
+                            match claim {
+                                UnresolvedSecondaryClaim::HoldingTraffic => tracing::warn!(
+                                    target: "nrr::per_sid_orchestrator",
+                                    msg_key = "persid-plan-secondary-unresolved-heartbeat",
+                                    sid,
+                                    mode = ?behavior_mode,
+                                    block_all = effective_block_all,
+                                    fail_closed_filters = fc.len(),
+                                    affected_rules,
+                                    elapsed_minutes = elapsed.as_secs() / 60,
+                                    "secondary interface still unresolved — leak protection still holds traffic (heartbeat)",
+                                ),
+                                UnresolvedSecondaryClaim::NoHeldDestinations => tracing::warn!(
+                                    target: "nrr::per_sid_orchestrator",
+                                    msg_key = "persid-plan-secondary-unresolved-no-held-destinations-heartbeat",
+                                    sid,
+                                    mode = ?behavior_mode,
+                                    block_all = effective_block_all,
+                                    fail_closed_filters = fc.len(),
+                                    affected_rules,
+                                    elapsed_minutes = elapsed.as_secs() / 60,
+                                    "secondary interface still unresolved — no destinations are held by leak protection (heartbeat)",
+                                ),
+                            }
                             // After a resume the binding can stay unresolvable
                             // until something re-runs the name heal.
                             if let Some(requests) =
@@ -1203,16 +1250,26 @@ impl PerSidApplyOrchestrator {
                                 requests.request("fail-closed-heartbeat");
                             }
                         }
-                        PostureLogEvent::Steady => {
-                            tracing::debug!(
+                        PostureLogEvent::Steady => match claim {
+                            UnresolvedSecondaryClaim::HoldingTraffic => tracing::debug!(
                                 target: "nrr::per_sid_orchestrator",
                                 sid,
                                 mode = ?behavior_mode,
                                 block_all = effective_block_all,
                                 fail_closed_filters = fc.len(),
+                                affected_rules,
                                 "secondary interface unresolved — leak protection holds traffic",
-                            );
-                        }
+                            ),
+                            UnresolvedSecondaryClaim::NoHeldDestinations => tracing::debug!(
+                                target: "nrr::per_sid_orchestrator",
+                                sid,
+                                mode = ?behavior_mode,
+                                block_all = effective_block_all,
+                                fail_closed_filters = fc.len(),
+                                affected_rules,
+                                "secondary interface unresolved — no destinations are held by leak protection",
+                            ),
+                        },
                     }
                     collect_block_ids(&fc, &mut killswitch_block_ids);
                     filters.extend(fc);
@@ -1577,5 +1634,22 @@ pub(super) fn note_machine_volume(edge: crate::standing_volume::MachineEdge) {
             "standing WFP filters on the machine back under the alarm line",
         ),
         MachineEdge::Steady => {}
+    }
+}
+
+#[cfg(test)]
+mod unresolved_secondary_claim_tests {
+    use super::{unresolved_secondary_claim, UnresolvedSecondaryClaim};
+
+    #[test]
+    fn zero_filters_do_not_claim_that_traffic_is_held() {
+        assert_eq!(
+            unresolved_secondary_claim(0),
+            UnresolvedSecondaryClaim::NoHeldDestinations
+        );
+        assert_eq!(
+            unresolved_secondary_claim(1),
+            UnresolvedSecondaryClaim::HoldingTraffic
+        );
     }
 }

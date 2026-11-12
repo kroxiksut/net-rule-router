@@ -94,7 +94,7 @@ fn unencodable<E>(_: E) -> String {
 }
 
 /// `YYYY-MM-DD HH:MM` in local time (`formatTimestamp`), "—" for none.
-fn wall_clock(ms: i64) -> String {
+pub(crate) fn wall_clock(ms: i64) -> String {
     zoned(ms, "%Y-%m-%d %H:%M")
 }
 

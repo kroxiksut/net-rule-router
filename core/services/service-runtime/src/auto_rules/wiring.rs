@@ -18,9 +18,20 @@ impl AutoRulesEngine {
         now: SystemTime,
     ) -> Self {
         let now_ms = unix_ms(now);
+        let discovery_namespace = discovery::new_namespace();
+        let discovery_limitations = if discovery_namespace.is_none() {
+            vec!["discovery-identity-unavailable".to_owned()]
+        } else {
+            Vec::new()
+        };
         Self {
+            discovery_queue: Mutex::new(None),
+            discovery_namespace,
+            discovery: Mutex::new(nrr_domain::suggestion_discovery::DiscoveryLedger::default()),
+            discovery_limitations: Mutex::new(discovery_limitations),
             ledgers: Mutex::new(HashMap::new()),
             pending: Mutex::new(hydrate_pending(pending_store.as_ref(), now_ms)),
+            http_primary: Mutex::new(HashMap::new()),
             dismissed: Mutex::new(HashMap::new()),
             authored: Mutex::new(HashMap::new()),
             publish_state: Mutex::new(HashMap::new()),
@@ -158,6 +169,17 @@ impl AutoRulesEngine {
     pub fn with_primary_behavior_source(mut self, source: PrimaryBehaviorFn) -> Self {
         self.primary_behavior_of = Some(source);
         self
+    }
+
+    /// Attach the owner's passive host-health registry at the composition seam.
+    #[must_use]
+    pub fn with_primary_health_registry(
+        self,
+        registry: Arc<crate::primary_stall_registry::PrimaryStallRegistry>,
+    ) -> Self {
+        self.with_primary_behavior_source(Arc::new(move |owner, host| {
+            registry.behavior_of(owner, host)
+        }))
     }
 
     /// Wire the principal's behaviour mode. Without it every principal reads

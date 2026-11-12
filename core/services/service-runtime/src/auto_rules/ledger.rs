@@ -78,8 +78,12 @@ impl AutoRulesEngine {
         true
     }
 
-    /// Drops every trace of a principal that turned collection off.
+    /// Drop learned offers and durable evidence when collection turns off.
     pub(super) fn forget(&self, sid: &str) {
+        self.http_primary
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .retain(|(owner, _), _| owner != sid);
         self.ledgers
             .lock()
             .unwrap_or_else(|p| p.into_inner())
@@ -110,10 +114,14 @@ impl AutoRulesEngine {
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .remove(sid);
-        self.publish_state
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .remove(sid);
+        {
+            let mut states = self.publish_state.lock().unwrap_or_else(|p| p.into_inner());
+            states.remove(sid);
+            self.discovery
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .forget_principal(sid);
+        }
         self.unreachable_told
             .lock()
             .unwrap_or_else(|p| p.into_inner())
@@ -189,8 +197,22 @@ impl AutoRulesEngine {
         fresh: Vec<PendingCandidate>,
         now_ms: i64,
     ) -> (u32, usize) {
+        let refreshed: HashSet<String> = fresh
+            .iter()
+            .map(|candidate| candidate.dto.id.clone())
+            .collect();
         let mut guard = self.pending.lock().unwrap_or_else(|p| p.into_inner());
         let entry = guard.entry(sid.to_string()).or_default();
+        let obsolete: Vec<_> = entry
+            .iter()
+            .filter(|candidate| {
+                unconfirmed_scope(&candidate.dto) || is_own_application_offer(&candidate.dto)
+            })
+            .map(|candidate| candidate.dto.clone())
+            .collect();
+        entry.retain(|candidate| {
+            !unconfirmed_scope(&candidate.dto) && !is_own_application_offer(&candidate.dto)
+        });
         let mut added = 0_u32;
         for mut candidate in fresh {
             match entry.iter_mut().find(|c| c.dto.id == candidate.dto.id) {
@@ -200,6 +222,9 @@ impl AutoRulesEngine {
                 // offer didn't have before shows up; unchanged evidence keeps
                 // its date, which is what lets the tray sort by what's new.
                 Some(existing) => {
+                    if candidate.dto.secondary_reach.is_none() {
+                        candidate.dto.secondary_reach = existing.dto.secondary_reach;
+                    }
                     let known: HashSet<&str> = existing
                         .dto
                         .consumers
@@ -237,6 +262,33 @@ impl AutoRulesEngine {
         let snapshot = entry.clone();
         drop(guard);
         self.persist_pending(sid, &snapshot, now_ms);
+        for dto in obsolete {
+            self.record_candidate_discovery(
+                sid,
+                &dto,
+                DiscoveryDecision::new(
+                    "candidate",
+                    "hidden",
+                    if is_own_application_offer(&dto) {
+                        "own-process"
+                    } else {
+                        "scope-unconfirmed"
+                    },
+                ),
+                SystemTime::UNIX_EPOCH + Duration::from_millis(now_ms.max(0) as u64),
+            );
+        }
+        for candidate in snapshot
+            .iter()
+            .filter(|candidate| refreshed.contains(&candidate.dto.id))
+        {
+            self.record_candidate_discovery(
+                sid,
+                &candidate.dto,
+                DiscoveryDecision::new("candidate", "ready", "offer-ready"),
+                SystemTime::UNIX_EPOCH + Duration::from_millis(now_ms.max(0) as u64),
+            );
+        }
         (added, total)
     }
 
@@ -321,7 +373,10 @@ impl AutoRulesEngine {
         };
         let mut selected = Vec::new();
         entry.retain(|c| {
-            if wanted.contains(c.dto.id.as_str()) {
+            if wanted.contains(c.dto.id.as_str())
+                && !is_own_application_offer(&c.dto)
+                && !unconfirmed_scope(&c.dto)
+            {
                 selected.push(c.clone());
                 false
             } else {
@@ -337,17 +392,19 @@ impl AutoRulesEngine {
         (selected, unknown)
     }
 
-    /// `auto` mode: write the rules without asking. Returns how many landed.
-    ///
-    /// A less certain offer is parked for a person instead, whatever produced
-    /// it: the unattended bar already leaves them out, and this is the one
-    /// place a rule is written unasked, so the guarantee is held here too. So
-    /// is one covering a name a reverse lookup produced: the owner of the
-    /// address chose that name.
+    /// Unattended authoring excludes findings that still need human approval.
+    /// Reverse DNS also needs approval because the address owner chose its name.
     pub(super) fn author_now(&self, sid: &str, fresh: &[PendingCandidate], now: SystemTime) -> u32 {
-        let (asked, unasked): (Vec<PendingCandidate>, Vec<PendingCandidate>) =
-            fresh.iter().cloned().partition(|c| {
-                is_less_certain(&c.dto) || self.covers_reverse_named(sid, &c.dto.proposed_match)
+        let (asked, unasked): (Vec<PendingCandidate>, Vec<PendingCandidate>) = fresh
+            .iter()
+            .filter(|c| {
+                !is_own_application_offer(&c.dto)
+                    && !unconfirmed_scope(&c.dto)
+                    && !settled_by_the_main_link(&c.dto)
+            })
+            .cloned()
+            .partition(|c| {
+                requires_review(&c.dto) || self.covers_reverse_named(sid, &c.dto.proposed_match)
             });
         if !asked.is_empty() {
             self.park(sid, asked, unix_ms(now));
@@ -412,6 +469,14 @@ impl AutoRulesEngine {
         now: SystemTime,
     ) -> bool {
         let Some(bus) = self.events.as_ref() else {
+            for candidate in offered {
+                self.record_candidate_discovery(
+                    sid,
+                    &candidate.dto,
+                    DiscoveryDecision::new("notice", "deferred", "no-subscriber"),
+                    now,
+                );
+            }
             return false;
         };
         // A subscription starts at the bus's current head, so a push sent
@@ -420,6 +485,14 @@ impl AutoRulesEngine {
         // start together, and the service wins that race routinely.
         // Announcing means having had an audience.
         if !bus.has_subscriber_for(sid) {
+            for candidate in offered {
+                self.record_candidate_discovery(
+                    sid,
+                    &candidate.dto,
+                    DiscoveryDecision::new("notice", "deferred", "no-subscriber"),
+                    now,
+                );
+            }
             tracing::debug!(
                 target: "nrr::auto-rules",
                 sid = %sid,
@@ -429,7 +502,21 @@ impl AutoRulesEngine {
             return false;
         }
         let mut states = self.publish_state.lock().unwrap_or_else(|p| p.into_inner());
+        cap_publish_states(&mut states, sid);
         let state = states.entry(sid.to_string()).or_default();
+        let audience = bus.subscriber_ids_for(sid);
+        if state.audience != audience {
+            state.announced.retain(|id| state.delivered.contains(id));
+            state.in_flight.clear();
+            state.audience = audience;
+        }
+        state.in_flight.retain(|_, at| {
+            now.duration_since(*at)
+                .is_ok_and(|age| age < Duration::from_secs(60))
+        });
+        state
+            .announced
+            .retain(|id| state.delivered.contains(id) || state.in_flight.contains_key(id));
         let unseen: Vec<&PendingCandidate> = offered
             .iter()
             .filter(|c| !state.announced.contains(&c.dto.id))
@@ -444,6 +531,15 @@ impl AutoRulesEngine {
                 .map_or(true, |since| since >= PUBLISH_MIN_INTERVAL)
         });
         if !quiet_enough {
+            drop(states);
+            for candidate in offered {
+                self.record_candidate_discovery(
+                    sid,
+                    &candidate.dto,
+                    DiscoveryDecision::new("notice", "deferred", "notification-pacing"),
+                    now,
+                );
+            }
             return false;
         }
         // Name the site whose suggestions the user has not seen yet.
@@ -456,6 +552,13 @@ impl AutoRulesEngine {
         // set tracks the live offer instead of growing all session.
         let live: HashSet<&str> = offered.iter().map(|c| c.dto.id.as_str()).collect();
         state.announced.retain(|id| live.contains(id.as_str()));
+        state.delivered.retain(|id| live.contains(id.as_str()));
+        state.in_flight.retain(|id, _| live.contains(id.as_str()));
+        for candidate in offered {
+            if !state.delivered.contains(&candidate.dto.id) {
+                state.in_flight.insert(candidate.dto.id.clone(), now);
+            }
+        }
         state
             .announced
             .extend(offered.iter().map(|c| c.dto.id.clone()));
@@ -471,6 +574,14 @@ impl AutoRulesEngine {
                 announces: !force,
             },
         );
+        for candidate in offered {
+            self.record_candidate_discovery(
+                sid,
+                &candidate.dto,
+                DiscoveryDecision::new("notice", "deferred", "awaiting-client"),
+                now,
+            );
+        }
         true
     }
 
@@ -487,6 +598,7 @@ impl AutoRulesEngine {
         }
         {
             let mut states = self.publish_state.lock().unwrap_or_else(|p| p.into_inner());
+            cap_publish_states(&mut states, sid);
             let state = states.entry(sid.to_string()).or_default();
             if state.told_count == Some(pending) {
                 return;
@@ -511,6 +623,10 @@ impl crate::principal_reset::PrincipalStateHolder for AutoRulesEngine {
     }
 
     fn forget_everyone(&self) {
+        self.http_primary
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clear();
         let mut sids: HashSet<String> = HashSet::new();
         sids.extend(
             self.ledgers
@@ -543,5 +659,11 @@ impl crate::principal_reset::PrincipalStateHolder for AutoRulesEngine {
         for sid in sids {
             self.forget_everything_of(&sid);
         }
+        let mut states = self.publish_state.lock().unwrap_or_else(|p| p.into_inner());
+        states.clear();
+        self.discovery
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .forget_everyone();
     }
 }

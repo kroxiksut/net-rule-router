@@ -1,0 +1,98 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <link rel="stylesheet" href="styles.css">
+  <script type="module" src="options.js"></script>
+</head>
+<body class="options" data-title="options_title">
+  <header class="brand-row">
+    <img src="../icons/icon-32.png" width="28" height="28" alt="">
+    <strong data-i18n="app_name"></strong>
+    <span id="connection" class="badge" data-i18n="standalone"></span>
+  </header>
+  <main>
+    <h1 data-i18n="options_title"></h1>
+    <p class="muted" data-i18n="standalone_description"></p>
+    <p id="notice" class="notice" role="status" aria-live="polite" hidden></p>
+    <p id="pending" class="notice" role="status" aria-live="polite" data-tone="warning" data-i18n="pending_changes" hidden></p>
+    <div class="settings-grid">
+      <section class="panel">
+        <h2 data-i18n="global_profile"></h2>
+        <p class="help" data-i18n="global_description"></p>
+        <form id="global-form">
+          <label for="global-mode" data-i18n="language_mode"></label>
+          <select id="global-mode" name="languageMode">
+            <option value="system" data-i18n="mode_system"></option>
+            <option value="manual" data-i18n="mode_manual"></option>
+            <option value="route" disabled data-i18n="mode_route_unavailable"></option>
+          </select>
+          <label for="global-language" data-i18n="language_tag"></label>
+          <input id="global-language" name="language" type="text" maxlength="35" spellcheck="false" autocapitalize="off" autocomplete="off" aria-describedby="global-help">
+          <p id="global-help" class="help" data-i18n="language_tag_help"></p>
+          <p class="scope" data-i18n="scope_global"></p>
+          <p class="help" data-i18n="language_partial"></p>
+          <button class="primary" type="submit" data-i18n="save_apply"></button>
+        </form>
+      </section>
+      <section class="panel">
+        <h2 data-i18n="site_profile"></h2>
+        <form id="profile-form">
+          <label for="site-host" data-i18n="hostname"></label>
+          <input id="site-host" name="host" type="text" maxlength="253" required spellcheck="false" autocapitalize="off" autocomplete="off" aria-describedby="host-help">
+          <p id="host-help" class="help" data-i18n="hostname_help"></p>
+          <label class="check"><input name="includeSubdomains" type="checkbox"><span data-i18n="include_subdomains"></span></label>
+          <label for="site-mode" data-i18n="language_mode"></label>
+          <select id="site-mode" name="languageMode">
+            <option value="inherit" data-i18n="mode_inherit"></option>
+            <option value="system" data-i18n="mode_system"></option>
+            <option value="manual" data-i18n="mode_manual"></option>
+            <option value="route" disabled data-i18n="mode_route_unavailable"></option>
+          </select>
+          <label for="site-language" data-i18n="language_tag"></label>
+          <input id="site-language" name="language" type="text" maxlength="35" spellcheck="false" autocapitalize="off" autocomplete="off" aria-describedby="site-language-help">
+          <p id="site-language-help" class="help" data-i18n="language_tag_help"></p>
+          <p class="help" data-i18n="system_override_help"></p>
+          <div class="actions"><button class="primary" type="submit" data-i18n="save_apply"></button><button type="reset" data-i18n="clear_form"></button></div>
+        </form>
+      </section>
+    </div>
+    <section class="panel">
+      <h2 data-i18n="profiles_title"></h2>
+      <p class="help" data-i18n="profile_precedence"></p>
+      <p id="empty-profiles" class="muted" data-i18n="no_profiles"></p>
+      <ul id="profile-list" class="profile-list"></ul>
+    </section>
+    <div class="settings-grid">
+      <section class="panel">
+        <h2 data-i18n="webrtc_title"></h2>
+        <p id="webrtc-state"></p>
+        <p class="scope" data-i18n="webrtc_scope"></p>
+        <p class="help" data-i18n="webrtc_consequence"></p>
+        <form id="webrtc-form">
+          <label class="check"><input name="acknowledge" type="checkbox"><span data-i18n="webrtc_acknowledge"></span></label>
+          <div class="actions"><button id="webrtc-enable" type="submit" data-i18n="webrtc_enable"></button><button id="webrtc-restore" type="button" data-i18n="webrtc_restore"></button></div>
+        </form>
+      </section>
+      <section class="panel">
+        <h2 data-i18n="capabilities"></h2>
+        <dl class="facts">
+          <div><dt data-i18n="timezone"></dt><dd data-i18n="timezone_unavailable"></dd></div>
+          <div><dt data-i18n="route"></dt><dd data-i18n="route_unavailable"></dd></div>
+          <div><dt data-i18n="fingerprint"></dt><dd data-i18n="fingerprint_unchanged"></dd></div>
+          <div><dt data-i18n="nrr_sync"></dt><dd data-i18n="nrr_sync_unavailable"></dd></div>
+        </dl>
+        <p class="help" data-i18n="explicit_only"></p>
+      </section>
+    </div>
+    <section class="panel">
+      <h2 data-i18n="appearance"></h2>
+      <div class="settings-grid">
+        <label for="theme"><span data-i18n="theme"></span><select id="theme"><option value="system" data-i18n="theme_system"></option><option value="light" data-i18n="theme_light"></option><option value="dark" data-i18n="theme_dark"></option><option value="high-contrast" data-i18n="theme_contrast"></option></select></label>
+        <label for="font"><span data-i18n="font"></span><select id="font"><option value="system" data-i18n="font_system"></option><option value="segoe">Segoe UI</option><option value="arial">Arial</option><option value="tahoma">Tahoma</option></select></label>
+      </div>
+    </section>
+  </main>
+</body>
+</html>

@@ -242,7 +242,7 @@ fn discard_copies_in(dir: &Path) -> usize {
 }
 
 /// The home directory the account database records for `uid`.
-fn home_dir_of(uid: u32) -> Option<PathBuf> {
+pub(crate) fn home_dir_of(uid: u32) -> Option<PathBuf> {
     use std::os::unix::ffi::OsStrExt;
 
     let mut buf = vec![0u8; 4096];
@@ -279,14 +279,14 @@ fn home_dir_of(uid: u32) -> Option<PathBuf> {
 
 /// A directory held open, so what lies below it is looked up in THIS
 /// directory however its path changes meanwhile.
-struct Dir {
+pub(crate) struct Dir {
     handle: File,
 }
 
 impl Dir {
     /// The home, following a link on the home itself: a relocated home is a
     /// legitimate symlink. It must belong to the user, or to root for root.
-    fn open_home(path: &Path, uid: u32) -> Result<Self, String> {
+    pub(crate) fn open_home(path: &Path, uid: u32) -> Result<Self, String> {
         let handle = OpenOptions::new()
             .read(true)
             .custom_flags(libc::O_DIRECTORY)
@@ -323,7 +323,7 @@ impl Dir {
         Ok(Self { handle })
     }
 
-    fn open_path(&self, names: &[&str], uid: u32) -> Result<Self, String> {
+    pub(crate) fn open_path(&self, names: &[&str], uid: u32) -> Result<Self, String> {
         let mut parts = names.iter();
         let first = parts.next().ok_or("empty path")?;
         let mut dir = self.open_dir(OsStr::new(first), uid)?;
@@ -353,7 +353,12 @@ impl Dir {
     ///
     /// Checked before the open so a FIFO or device is never opened at all,
     /// and again on the handle, which is what is actually read.
-    fn open_file(&self, name: &str, uid: u32, max_bytes: u64) -> Result<Option<File>, String> {
+    pub(crate) fn open_file(
+        &self,
+        name: &str,
+        uid: u32,
+        max_bytes: u64,
+    ) -> Result<Option<File>, String> {
         let path = self.below(OsStr::new(name)).ok_or("not a plain name")?;
         match std::fs::symlink_metadata(&path) {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),

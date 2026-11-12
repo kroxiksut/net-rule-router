@@ -2,11 +2,7 @@
 
 **English** · [Русский](../ru/other-software.md)
 
-NetRuleRouter sets rules over the connections you already have, so it often
-runs next to other network software. This page lists what is known to work
-together, what to expect, and what to do. "Checked" means we tried it on a
-real machine; "not checked yet" means we expect it to behave as written but
-have not watched it happen.
+NetRuleRouter sets rules over the connections you already have, so it often runs next to other network software. This page lists what is known to work together, what to expect, and what to do. "Checked" means we tried it on a real machine; "not checked yet" means we expect it to behave as written but have not watched it happen.
 
 | Software | What to expect | What to do | Status |
 |---|---|---|---|
@@ -23,7 +19,4 @@ have not watched it happen.
 | Strict reverse-path filtering on Linux (RHEL family, RED OS) | A second signed-in user may get no replies. | See [Known limitations](known-limitations.md). | Not checked yet |
 | Browser with its own encrypted DNS | It hides names from the rules. | Keep the setting that blocks it, or give the browser a rule of its own. See [Known limitations](known-limitations.md). | Checked |
 
-Found a combination that misbehaves? Open an issue with the name and version of
-the other program; the table grows from such reports. Not sure it is the other
-program? Ask in the Telegram channel [t.me/netrulerouter](https://t.me/netrulerouter)
-first.
+Found a combination that misbehaves? Open an issue with the name and version of the other program; the table grows from such reports. Not sure it is the other program? Ask in the Telegram channel [t.me/netrulerouter](https://t.me/netrulerouter) first.

@@ -1,15 +1,7 @@
 import QtQuick 2.15
 import "../lib/pure.js" as Pure
 
-// Non-visual controller for SUGGESTED ADDRESSES: the destinations the service
-// parked because a routed site appears to need them.
-//
-// Extracted from Main.qml (thin-shell rule). The tray asks about them; this
-// window is where the ones nobody answered can still be turned into rules, and
-// the screen that shows them (`RuleSuggestionsSection.qml`) merges them with
-// the dismissed history into one table. The list is deliberately re-fetched on
-// every navigation — a list cached before the user browsed on would offer
-// addresses the service has since dropped.
+// Re-read on navigation: an old list can offer addresses the service dropped.
 QtObject {
     id: autoRuleSuggestionsController
 
@@ -27,6 +19,9 @@ QtObject {
 
     /// Wire rows from the last `autorules.candidates.list`.
     property var autoRuleCandidates: []
+    property var discoveryEpisodes: []
+    property real discoveryOmitted: 0
+    property var discoveryLimitations: []
     /// How many the list shows by default, as the service counts them — drives
     /// the sidebar badges. Never re-counted here: a second rule would drift.
     property int autoRuleCandidatesPending: 0
@@ -72,6 +67,11 @@ QtObject {
         // install. Only one is on screen at a time — the newer supersedes.
         root.notificationsController._dropPushNotice(_autoRuleNoticeId)
         _autoRuleNoticeId = "auto-rule-candidates:" + String(eventId || "")
+        var prefs = root.prefs || {}
+        if (prefs.showNotifications === false || prefs.notifySuggestionChanges === false) {
+            _reportDiscoveryHidden(anchor)
+            return
+        }
         var told = announcementText(anchor, autoRuleCandidatesPending)
         root.notificationsController._addPushNotice({
             "id": _autoRuleNoticeId,
@@ -97,7 +97,16 @@ QtObject {
         var rows = Pure.autoRuleRowsShownByDefault(autoRuleCandidates || []).filter(function(r) {
             return anchor !== "" && String((r || {}).anchor || "") === anchor
         })
-        if (anchor !== "" && Pure.autoRuleNoticeKind(rows) === "sites-blocked") {
+        var kind = Pure.autoRuleNoticeKind(rows)
+        if (kind === "shared-address") {
+            return {
+                "sitesBlocked": true,
+                "title": root.tr("tray.auto-rules.title-shared-address", "Checked names on a shared address"),
+                "body": root.tr("tray.auto-rules.body-shared-address",
+                    "These DNS names passed the TLS check only over the additional connection. The shared address does not identify which site you opened. Review the names before adding a rule; page loading has not been verified.")
+            }
+        }
+        if (anchor !== "" && kind === "sites-blocked") {
             return {
                 "sitesBlocked": true,
                 "title": root.tr("tray.auto-rules.title-blocked", "Sites the main connection will not carry"),
@@ -131,6 +140,9 @@ QtObject {
             autoRuleSuggestionsController.autoRuleLoadFailed = false
             var list = payload.candidates || payload["candidates"] || []
             autoRuleSuggestionsController.autoRuleCandidates = list
+            autoRuleSuggestionsController.discoveryEpisodes = payload["discovery-episodes"] || []
+            autoRuleSuggestionsController.discoveryOmitted = Number(payload["discovery-omitted"] || 0)
+            autoRuleSuggestionsController.discoveryLimitations = payload["discovery-limitations"] || []
             autoRuleSuggestionsController.autoRuleCandidatesPending = Number(payload["pending-count"] || 0)
             // A notice promising addresses the list no longer holds goes too.
             if (autoRuleSuggestionsController.autoRuleCandidatesPending <= 0)
@@ -140,6 +152,23 @@ QtObject {
             autoRuleSuggestionsController.autoRuleInertDropped = Number(payload["inert-dropped"] || 0)
             autoRuleSuggestionsController.autoRuleInertSample = payload["inert-sample"] || []
             autoRuleSuggestionsController._tellOwedAnnouncement()
+        })
+    }
+
+    function _reportDiscoveryHidden(anchor) {
+        if (!root.rpc || typeof root.rpc.rpcAutoRuleDiscoveryFeedback !== "function") return
+        var ids = (autoRuleCandidates || []).filter(function(row) {
+            return String(row.anchor || "") === anchor
+                && String(row.signal || "") === "main-link-blocked"
+        }).map(function(row) { return String(row.id || "") }).filter(function(id) {
+            return id !== "" && id.length <= 128
+        }).slice(0, 50)
+        if (ids.length === 0) return
+        var corr = root.rpc.rpcAutoRuleDiscoveryFeedback({
+            "ids": ids, "state": "hidden", "reason": "notifications-muted"
+        })
+        if (corr) root.rpc.registerRpcCallback(corr, function(ok) {
+            if (ok) autoRuleSuggestionsController.refreshAutoRuleCandidates()
         })
     }
 

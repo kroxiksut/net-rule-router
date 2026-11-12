@@ -2,9 +2,8 @@
 // ones you previously told the service to stop offering. One table, grouped
 // by registrable domain (a subdomain-by-subdomain list was unreadable once a
 // single site pulled in a dozen hosts of the same domain) — every action here
-// acts on a domain as a whole ("domain" + "*.domain", the same shape the
-// rules table already understands), the expandable host list underneath is
-// read-only detail on how that domain earned its place.
+// acts on the group's candidate IDs. Each candidate retains its own match
+// scope; grouping by domain must never widen a proposed rule.
 //
 // There is deliberately no "keep on the main route" button: doing nothing
 // already leaves a pending domain there, and the intro says so. A dismissed
@@ -58,9 +57,8 @@ ColumnLayout {
     }
 
     /// Tell the service this site answers the main route with a refusal (or take
-    /// it back). The only consequence is that this site's addresses stop being
-    /// quietened by "the main route reaches it" — we still never claim to know
-    /// what the far end served.
+    /// it back). The annotation does not overrule another host's own successful
+    /// main-link evidence or certify what the browser received.
     function _toggleRefusingAnchor(host) {
         var hostname = String(host || "")
         if (hostname === "") return
@@ -473,7 +471,7 @@ ColumnLayout {
             // exactly wrong here.
             if (host.anchorRefusesMainLink === true) {
                 return root.tr("rules.suggestions.inbox.behavior-responds-refusing",
-                    "the main connection reaches it, but the site refuses addresses there")
+                    "the main connection reaches this host; the linked site is marked as refusing addresses")
             }
             return root.tr("rules.suggestions.inbox.behavior-responds", "the main connection reaches it")
         }
@@ -547,6 +545,13 @@ ColumnLayout {
         Accessible.role: Accessible.StaticText
         // Screen readers get plain text — strip the styling tags used for visual emphasis.
         Accessible.name: text.replace(/<\/?[a-z]+>/gi, "")
+    }
+
+    DiscoveryEpisodesPanel {
+        root: section.root
+        episodes: root.autoRuleSuggestionsController.discoveryEpisodes
+        omitted: root.autoRuleSuggestionsController.discoveryOmitted
+        limitations: root.autoRuleSuggestionsController.discoveryLimitations
     }
 
     /// Why the list is empty, when the service knows: companions it saw but
@@ -741,7 +746,7 @@ ColumnLayout {
                 onClicked: section._toggleRefusingAnchor(section.consumerFilter)
                 ToolTip.visible: hovered
                 ToolTip.text: root.tr("rules.suggestions.inbox.mark-refusing-tooltip",
-                    "Use this when the site opens over the main connection but answers that your address is not served. Its addresses then keep being offered even though they are reachable.")
+                    "Record an access refusal by the selected site. This mark does not override successful main-connection evidence for another host. Check the specific site to distinguish an HTTP refusal from a connection failure.")
                 Accessible.role: Accessible.CheckBox
                 Accessible.name: text
                 Accessible.description: ToolTip.text
@@ -822,7 +827,7 @@ ColumnLayout {
                 color: root.mutedTextColor
                 text: root.uiRevision >= 0 && emptyFrameNote.hiddenAsServed
                     ? root.tr("rules.suggestions.inbox.empty-served-by-main-link",
-                        "Connections to these {n} address(es) complete over your main connection. If a site still refuses to open, what you are seeing is not a routing failure — the traffic gets through, so a rule here would not change it.")
+                        "These {n} hosts have answered on the main connection and are hidden from pending work. A connection response does not certify the browser page. Check the specific site if it still fails; the report distinguishes HTTP refusals from connection failures.")
                         .replace("{n}", String(section.servedByMainLinkCount))
                     : root.tr("rules.suggestions.inbox.search-empty", "No addresses match your search.")
                 Accessible.role: Accessible.StaticText
@@ -916,6 +921,19 @@ ColumnLayout {
                                     Accessible.name: text
                                 }
 
+                                // Who needs it. Each site is a button: pressing
+                                Label {
+                                    Layout.fillWidth: true
+                                    wrapMode: Text.Wrap
+                                    textFormat: Text.PlainText
+                                    color: root.textColor
+                                    Layout.preferredWidth: 0
+                                    text: root.tr("rules.suggestions.inbox.proposed-hosts", "Proposed names: {hosts}")
+                                        .replace("{hosts}", (modelData.hosts || []).map(function(host) {
+                                            return Pure.displayText((host.matchKind === "suffix" ? "*." : "") + host.match)
+                                        }).join(", "))
+                                    Accessible.name: text
+                                }
                                 // Who needs it. Each site is a button: pressing
                                 // one answers "what else does this site need?".
                                 // Flow is a positioner with a single-row implicit
@@ -1029,13 +1047,13 @@ ColumnLayout {
                                 ThemedButton {
                                     theme: root.uiTheme
                                     visible: !modelData.isApp && (modelData.hosts || []).some(
-                                        function (h) { return String(h.signal || "") === "main-link-blocked" })
+                                        function (h) { return Pure.siteOfferReach(h.signal, null) !== "" })
                                     text: root.tr("diag.conn-trace.check-site", "Check site…")
                                     Accessible.role: Accessible.Button
                                     Accessible.name: text
                                     onClicked: {
                                         var failing = (modelData.hosts || []).filter(function (h) {
-                                            return String(h.signal || "") === "main-link-blocked"
+                                            return Pure.siteOfferReach(h.signal, null) !== ""
                                         })
                                         root.notificationsController.checkSiteInDiagnostics(
                                             failing.length > 0 ? String(failing[0].match || "")

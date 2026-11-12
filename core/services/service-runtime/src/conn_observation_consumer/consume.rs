@@ -15,6 +15,9 @@ impl ConnectionObservationConsumer {
     pub fn consume(&self, batch: &[ConnectionObservation], now: SystemTime) -> ConnConsumeSummary {
         let mut summary = ConnConsumeSummary::default();
         if batch.is_empty() {
+            if let Some(pipeline) = &self.discovery_observation {
+                pipeline.pump();
+            }
             return summary;
         }
         let now_ms = now
@@ -94,16 +97,19 @@ impl ConnectionObservationConsumer {
         let mut flow_pid_lookups_left: u32 = 8;
 
         for obs in batch {
+            let own_process = crate::app_observation_lookup::is_own_process(obs.pid);
             // Asked of EVERY observation, before the filter below keeps only
             // established connections. A host a provider censors is one whose
             // connection never comes up, so waiting for an establishment to
             // confirm that somebody went there waits forever — the whole point
             // is that they went and it did not work.
-            self.confirm_placeholder_use(
-                obs.remote.ip(),
-                obs.observed_unix_ms.unwrap_or(now_ms),
-                obs.user_sid.as_deref(),
-            );
+            if !own_process {
+                self.confirm_placeholder_use(
+                    obs.remote.ip(),
+                    obs.observed_unix_ms.unwrap_or(now_ms),
+                    obs.user_sid.as_deref(),
+                );
+            }
             let on_active_links = self.machine_accounts_follow_active
                 && obs.user_sid.as_deref().is_none_or(|o| {
                     o.is_empty() || nrr_platform_api::types::is_service_account_sid(o)
@@ -114,7 +120,12 @@ impl ConnectionObservationConsumer {
                 (active_primary, active_secondary)
             };
             let mut rec = classify_connection(obs, &unicast, primary_ifindex, secondary_ifindex);
-            self.note_unanswered(obs, &rec, now_ms);
+            if let Some(pipeline) = &self.discovery_observation {
+                pipeline.enqueue_observation(obs, rec.egress.role);
+            }
+            if !own_process {
+                self.note_unanswered(obs, &rec, now_ms);
+            }
             // A resend or an orderly close is evidence about a peer, not a
             // connection of its own: it must never become a trace row, an
             // NDJSON line, an app→IP fact or a drop statistic. Only the primary
@@ -125,7 +136,8 @@ impl ConnectionObservationConsumer {
             // A filter classify is not one: it fires before the handshake.
             let establishes = obs.progress == ConnectionProgress::Attempt
                 && obs.verdict == ConnectionVerdict::Unknown;
-            if rec.egress.role == EgressRole::Primary
+            if !own_process
+                && rec.egress.role == EgressRole::Primary
                 && (establishes || obs.progress != ConnectionProgress::Attempt)
             {
                 self.note_companion_primary_health(obs, now_ms);
@@ -187,7 +199,7 @@ impl ConnectionObservationConsumer {
                 match rec.blocked_by_nrr {
                     Some(true) => summary.blocked_nrr += 1,
                     Some(false) => summary.blocked_foreign += 1,
-                    None => {}
+                    None => summary.blocked_unknown += 1,
                 }
                 // Not an outage: the pinned link is up and both branches below
                 // heal themselves, so this class is repaired, never announced —
@@ -342,21 +354,8 @@ impl ConnectionObservationConsumer {
                     }
                 }
             }
-            // App-routing via observation: record (app → remote IP)
-            // so the codegen routes this app's destinations via the secondary on
-            // the next apply. The store ignores unroutable IPs itself.
-            //
-            // Before recording, the reverse question: is this flow somebody
-            // ELSE riding a route an application rule installed? A host route
-            // cannot be scoped to a process, so an address learned for one
-            // application moves every process that talks to it — which is how a
-            // site the user put on the main link ended up inside the tunnel.
-            // A foreign process EGRESSING THE SECONDARY on such an address is
-            // that collateral, in the act; nothing else needs to go wrong first,
-            // and waiting for a failure would mean waiting for a timeout that
-            // may never come. The pin comes off and the owner does not relearn
-            // it this session.
-            // Kept per user where routes are: the owner's own store.
+            // A host route moves other programs too; withdraw its owner's claim on collateral use.
+            // The owner's leak-protection policy still governs fallback to the main link.
             if let Some(store) = self
                 .app_observations
                 .as_ref()
@@ -409,7 +408,7 @@ impl ConnectionObservationConsumer {
                                 owner = %owner,
                                 intruder = %this_app,
                                 destination = %rip,
-                                "withdrew a destination an application rule had pinned: another process was travelling the additional link on it, and a host route cannot tell the two apart. That address goes back to the main link for everyone, this application included",
+                                "withdrew an application's claim on a shared destination; leak protection and explicit rules still apply",
                             );
                         }
                     }
@@ -434,7 +433,7 @@ impl ConnectionObservationConsumer {
             // site IS the half-broken page. The ledger decides whether it means
             // anything — it only counts inside an open anchor window — so the
             // observer stays a reporter of facts.
-            if rec.egress.role == EgressRole::Secondary {
+            if !own_process && rec.egress.role == EgressRole::Secondary {
                 self.note_owner_on_secondary(rec.user_sid.as_deref());
                 // Same outcome filter as the main-link half: only what the stack
                 // established went over the link.
@@ -442,7 +441,7 @@ impl ConnectionObservationConsumer {
                     self.note_app_additional_link(&rec);
                 }
             }
-            if rec.egress.role == EgressRole::Primary {
+            if !own_process && rec.egress.role == EgressRole::Primary {
                 self.note_companion_in_use(rec.remote.ip(), rec.user_sid.as_deref());
                 self.remember_program(&rec, rec.observed_unix_ms.unwrap_or(now_ms));
             }
@@ -451,12 +450,14 @@ impl ConnectionObservationConsumer {
             // and the drain time would collapse a whole interval onto one
             // instant. A backend that stamps nothing degrades to exactly that,
             // which is why the fallback is last, not first.
-            self.note_navigation_attempt(
-                rec.user_sid.as_deref(),
-                rec.process_path.as_deref(),
-                rec.remote.ip(),
-                rec.observed_unix_ms.unwrap_or_else(now_unix_ms),
-            );
+            if !own_process {
+                self.note_navigation_attempt(
+                    rec.user_sid.as_deref(),
+                    rec.process_path.as_deref(),
+                    rec.remote.ip(),
+                    rec.observed_unix_ms.unwrap_or_else(now_unix_ms),
+                );
+            }
             match rec.egress.role {
                 EgressRole::Primary => summary.primary += 1,
                 EgressRole::Secondary => summary.secondary += 1,
@@ -581,6 +582,9 @@ impl ConnectionObservationConsumer {
                 count = summary.killswitch_drops_live_secondary_app_scope,
                 "app-pinned processes hit the kill-switch on destinations that are not routed through the additional link yet — expected first contact: the drop is what teaches the destination, and the route plus its own pin follow on the next reconcile",
             );
+        }
+        if let Some(pipeline) = &self.discovery_observation {
+            pipeline.pump();
         }
         summary
     }

@@ -16,7 +16,7 @@ fn a_dedicated_companion_seen_across_two_visits_becomes_a_pending_suggestion() {
     let c = &candidates[0];
     assert_eq!(c.anchor, "site.example");
     assert_eq!(c.proposed_match, "cdn.example");
-    assert_eq!(c.match_kind, AUTO_RULE_MATCH_KIND_SUFFIX);
+    assert_eq!(c.match_kind, AUTO_RULE_MATCH_KIND_EXACT);
     assert_eq!(c.route, RouteRole::Secondary.slug());
     assert_eq!(c.observations, Some(2));
     assert!(c.id.starts_with("arc-"));
@@ -186,7 +186,7 @@ fn mode_auto_authors_immediately_with_the_site_companion_reason() {
     assert_eq!(rules.len(), 1);
     assert_eq!(rules[0].value, "cdn.example");
     assert_eq!(rules[0].route, RouteRole::Secondary);
-    assert_eq!(rules[0].match_kind, AuthoredMatchKind::SuffixDomain);
+    assert_eq!(rules[0].match_kind, AuthoredMatchKind::ExactHost);
     assert_eq!(rules[0].anchor, "site.example");
     // The rule now exists in the book, so a further tick must not re-add it.
     let again = f.engine.tick(SID, later());

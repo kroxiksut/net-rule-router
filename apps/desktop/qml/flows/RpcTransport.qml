@@ -402,6 +402,11 @@ QtObject {
             ? bridge.rpcAutoRuleCandidatesProbe(payload)
             : ""
     }
+    function rpcAutoRuleDiscoveryFeedback(payload) {
+        return (bridgeAvailable && typeof bridge.rpcAutoRuleDiscoveryFeedback === "function")
+            ? bridge.rpcAutoRuleDiscoveryFeedback(payload)
+            : ""
+    }
     function rpcAutoRuleCandidatesList() {
         return (bridgeAvailable && typeof bridge.rpcAutoRuleCandidatesList === "function")
             ? bridge.rpcAutoRuleCandidatesList()

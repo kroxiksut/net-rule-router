@@ -376,6 +376,62 @@ fn why_this_route_runs_the_probe_in_diagnostics() {
 }
 
 #[test]
+fn nov10_a_site_url_is_explained_as_the_exact_hostname_and_keeps_its_flow_context() {
+    let fake = service();
+    let mut app = connected();
+    super::diagnostics::probe(
+        &mut app,
+        "https://www.himalayas.app/path?q=secret",
+        "203.0.113.3",
+        "browser.exe",
+    );
+    settle(&mut app, &fake);
+    let sent = fake.sent(IpcOperationName::ExplainGet);
+    assert_eq!(sent.len(), 1);
+    assert_eq!(sent[0]["input-sample"]["hostname"], "www.himalayas.app");
+    assert_eq!(sent[0]["input-sample"]["observed-ip"], "203.0.113.3");
+    assert_eq!(sent[0]["input-sample"]["process-name"], "browser.exe");
+}
+
+#[test]
+fn nov10_another_clients_running_site_check_cannot_replace_the_requested_site() {
+    let fake = service();
+    fake.answer(
+        IpcOperationName::SiteCheckRun,
+        json!({"state":"running","host":"himalayas.app"}),
+    );
+    fake.answer(
+        IpcOperationName::SiteCheckResultGet,
+        json!({"state":"running","host":"other.example"}),
+    );
+    let mut app = connected();
+    super::diagnostics::check_site(&mut app, "https://himalayas.app/");
+    settle(&mut app, &fake);
+    for (_, job) in app.outbox.take_delayed() {
+        (job(&fake).0)(&mut app);
+    }
+    assert_eq!(
+        app.inspect.site.host(),
+        "himalayas.app",
+        "the running status belongs to a different check"
+    );
+    fake.answer(
+        IpcOperationName::SiteCheckResultGet,
+        json!({"state":"done","host":"other.example", "report":{
+        "site":"other.example","verdict":"fine","site-route":"primary","names":[]}}),
+    );
+    for (_, job) in app.outbox.take_delayed() {
+        (job(&fake).0)(&mut app);
+    }
+    let text = super::site_check::lines(&app, &texts_en(), None)
+        .iter()
+        .map(|line| line.plain_text())
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(text.contains("Checking himalayas.app"), "{text}");
+}
+
+#[test]
 fn a_system_dns_left_redirected_tells_the_user_how_to_repair_it() {
     let fake = service();
     fake.answer(
@@ -934,6 +990,31 @@ fn the_outage_list_names_what_was_blocked_while_the_route_is_down() {
     let text = view_text(&app, ScreenId::OutageBlocks);
     assert!(text.contains("Remote: cdn.example.net"), "{text}");
     assert!(!text.contains("Path:"), "{text}");
+}
+
+#[test]
+fn outage_search_filters_retained_rows_and_clearing_restores_the_list() {
+    let fake = service();
+    fake.answer(
+        IpcOperationName::ConnTraceOutageBlocksList,
+        outage(json!({ "since-unix-ms": NOON }), 0),
+    );
+    let mut app = connected();
+    open(&mut app, &fake, ScreenId::OutageBlocks);
+
+    assert!(crate::screens::screen(ScreenId::OutageBlocks).on_line(&mut app, "/cdn.example.net"));
+    let text = view_text(&app, ScreenId::OutageBlocks);
+    assert!(text.contains("updater.exe | cdn.example.net"), "{text}");
+    assert!(!text.contains("browser.exe |"), "{text}");
+    assert!(!text.contains("198.51.100.9"), "{text}");
+    assert!(text.contains("Remote: cdn.example.net"), "{text}");
+
+    assert!(crate::screens::screen(ScreenId::OutageBlocks).on_line(&mut app, "/"));
+    let text = view_text(&app, ScreenId::OutageBlocks);
+    assert!(text.contains("browser.exe |"), "{text}");
+    assert!(text.contains("updater.exe | cdn.example.net"), "{text}");
+    assert!(text.contains("198.51.100.9"), "{text}");
+    assert!(text.contains("Path: /opt/example/browser.exe"), "{text}");
 }
 
 #[test]
@@ -1560,6 +1641,18 @@ fn checked_site(verdict: &str) -> (AppState, FakeService) {
         (job(&fake).0)(&mut app);
     }
     (app, fake)
+}
+
+#[test]
+fn nov10_an_inconclusive_check_with_a_known_ip_does_not_claim_the_address_is_unknown() {
+    let (app, _fake) = checked_site("unclear");
+    let text = super::site_check::lines(&app, &texts_en(), None)
+        .iter()
+        .map(|line| line.plain_text())
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(text.contains("203.0.113.1"), "{text}");
+    assert!(!text.contains("No address is known"), "{text}");
 }
 
 /// A site that does not answer over its route leads on to the trace, where

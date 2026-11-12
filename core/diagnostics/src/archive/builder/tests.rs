@@ -336,6 +336,7 @@ fn health_json_merges_enrichment_fields_when_populated() {
             secondary: None,
             rows: Vec::new(),
         }),
+        ..Default::default()
     };
     ArchiveBuilder::build(input, &dest).expect("build");
 
@@ -1002,6 +1003,123 @@ fn export_with_verbose_history(request: DiagnosticArchiveRequest) -> String {
     read_zip_entry(&dest, "service-logs/nrr_service_20260907-1.ndjson")
 }
 
+#[test]
+fn discovery_redacted_repeated_hosts_keep_one_archive_local_identity() {
+    let dir = tempfile::tempdir().expect("temp");
+    let mut exports = Vec::new();
+    for index in 0..2 {
+        let mut input = sample_input(DiagnosticArchiveRequest::default_export("0.1.0"));
+        let make_line = |id: &str, host: &str| {
+            crate::event::LogEvent::new(
+                id,
+                1_745_000_000_000,
+                crate::taxonomy::EventLevel::Info,
+                crate::reason::service::STARTED,
+            )
+            .with_payload(serde_json::json!({ "host": host, "count": 1 }))
+            .with_privacy(crate::taxonomy::PrivacyClass::Diagnostic)
+            .to_ndjson()
+            .expect("line")
+        };
+        input.raw_log_files = vec![RawLogFile {
+            name: "nrr_service_20260907-1.ndjson".into(),
+            lines: vec![
+                make_line("one", "private-one.example"),
+                make_line("two", "private-one.example"),
+                make_line("three", "private-two.example"),
+            ],
+        }];
+        let path = dir.path().join(format!("archive-{index}.zip"));
+        ArchiveBuilder::build(input, &path).expect("archive");
+        let text = read_zip_entry(&path, "service-logs/nrr_service_20260907-1.ndjson");
+        assert!(!text.contains("private-one.example"));
+        let values: Vec<serde_json::Value> = text
+            .lines()
+            .map(|line| serde_json::from_str(line).expect("event"))
+            .collect();
+        let names: Vec<_> = values
+            .iter()
+            .map(|value| value["payload"]["host"].as_str().expect("host").to_owned())
+            .collect();
+        assert_eq!(names[0], names[1]);
+        assert_ne!(
+            names[0], names[2],
+            "different redacted hosts must remain distinguishable"
+        );
+        exports.push(names[0].clone());
+    }
+    assert_ne!(
+        exports[0], exports[1],
+        "exports must not be linkable by host tokens"
+    );
+}
+
+#[test]
+fn discovery_health_and_log_share_the_archive_identity_without_disclosing_the_site() {
+    let dir = tempfile::tempdir().expect("temp");
+    let path = dir.path().join("archive.zip");
+    let mut input = sample_input(DiagnosticArchiveRequest::default_export("test"));
+    input.health_enrichment.suggestion_discovery =
+        Some(nrr_shared::ipc_payloads::DiscoveryEpisodesSnapshotDto {
+            episodes: vec![nrr_shared::ipc_payloads::DiscoveryEpisodeDto {
+                id: "discovery-7".into(),
+                host: Some("private.example".into()),
+                state: "not-created".into(),
+                reason: "name-unknown".into(),
+                stage: "name".into(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        });
+    input.health_enrichment.site_check = Some(
+        serde_json::from_value(serde_json::json!({
+            "state": "done", "host": "PRIVATE.example.",
+            "report": { "site": "private.example", "verdict": "not-answering",
+                "site-route": "primary", "names": [{
+                    "name": "private.example", "role": "site", "address": "203.0.113.7",
+                    "route": "primary", "answer": "https-unconfirmed", "revision": "rev-test",
+                    "dns": "cached", "redirects": ["private.example"]
+                }] }
+        }))
+        .expect("site check"),
+    );
+    let line = crate::event::LogEvent::new(
+        "evt-one",
+        1,
+        crate::taxonomy::EventLevel::Info,
+        crate::reason::service::STARTED,
+    )
+    .with_payload(serde_json::json!({"discovery_id":"discovery-7","host":"private.example"}))
+    .with_privacy(crate::taxonomy::PrivacyClass::Diagnostic)
+    .to_ndjson()
+    .expect("event");
+    input.raw_log_files = vec![RawLogFile {
+        name: "nrr_service_20261108-1.ndjson".into(),
+        lines: vec![line],
+    }];
+    ArchiveBuilder::build(input, &path).expect("archive");
+    let health = read_zip_entry(&path, "health.json");
+    let log = read_zip_entry(&path, "service-logs/nrr_service_20261108-1.ndjson");
+    assert!(!health.contains("private.example"));
+    assert!(!log.contains("private.example"));
+    let health: serde_json::Value = serde_json::from_str(&health).expect("health");
+    let log: serde_json::Value = serde_json::from_str(log.trim()).expect("log");
+    let episode = &health["suggestion_discovery"]["episodes"][0];
+    assert_eq!(episode["id"], log["payload"]["discovery_id"]);
+    assert_eq!(episode["host"], log["payload"]["host"]);
+    assert_eq!(episode["host"], health["site_check"]["host"]);
+    assert_eq!(episode["host"], health["site_check"]["report"]["site"]);
+    assert_eq!(
+        episode["host"],
+        health["site_check"]["report"]["names"][0]["name"]
+    );
+    assert_eq!(
+        episode["host"],
+        health["site_check"]["report"]["names"][0]["redirects"][0]
+    );
+    assert_ne!(episode["id"], "discovery-7");
+}
+
 /// What a Default export may disclose is set by the EXPORT, not by the mode
 /// the line happened to be written in: an hour of verbose logging must not
 /// leave raw hostnames in every Default bundle for the next 90 days.
@@ -1094,4 +1212,59 @@ fn the_redaction_report_counts_hosts_only_under_the_host_marker() {
     assert_eq!(counts.hostnames, 1);
     assert_eq!(counts.values, 2);
     assert_eq!(counts.paths, 1);
+}
+
+#[test]
+fn dns_recovery_evidence_survives_export_with_sensitive_fields_redacted() {
+    for detailed in [false, true] {
+        let dir = tempfile::tempdir().expect("temp");
+        let dest = dir.path().join("dns.zip");
+        let request = if detailed {
+            DiagnosticArchiveRequest::diagnostics_export("test")
+        } else {
+            DiagnosticArchiveRequest::default_export("test")
+        };
+        let mut input = sample_input(request);
+        input.health_enrichment = serde_json::from_value(serde_json::json!({
+            "dns_compatibility": {
+                "status":"verified", "verified-program":"/home/customer/private-browser",
+                "issues":[], "last-checked-ms":null, "recovery-pending":false,
+                "resolver":{"listener":"ready","redirect":"ready","upstream":"ready"}
+            },
+            "site_check": {
+                "state": "done", "host": "private.customer.example",
+                "report": { "site": "private.customer.example", "verdict": "fine",
+                    "site-route": "secondary", "names": [{
+                        "name": "private.customer.example", "role": "site", "address": "203.0.113.7",
+                        "route": "secondary", "answer": "answered", "revision": "rev-test",
+                        "rule-id": "rule-test", "dns": "cached", "fake-address": "198.18.0.7",
+                        "real-addresses": ["203.0.113.7", "2001:db8::7"]
+                    }] }
+            }
+        })).expect("enrichment");
+        ArchiveBuilder::build(input, &dest).expect("archive");
+        let body = read_zip_entry(&dest, "health.json");
+        let evidence: serde_json::Value = serde_json::from_str(&body).expect("health");
+        assert_eq!(
+            evidence["site_check"]["report"]["names"][0]["revision"],
+            "rev-test"
+        );
+        for sensitive in [
+            "private.customer.example",
+            "203.0.113.7",
+            "198.18.0.7",
+            "2001:db8::7",
+        ] {
+            assert_eq!(body.contains(sensitive), detailed, "{sensitive}: {body}");
+        }
+        assert!(!body.contains("/home/customer/private-browser"), "{body}");
+        assert_eq!(
+            evidence["dns_compatibility"]["verified-program"],
+            if detailed {
+                "/home/<masked-user>/private-browser"
+            } else {
+                "private-browser"
+            }
+        );
+    }
 }

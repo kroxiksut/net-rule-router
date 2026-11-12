@@ -184,18 +184,7 @@ impl ConfirmedVpnClients {
         self.armed.load(Ordering::Relaxed)
     }
 
-    /// `true` when `image` names a confirmed executable. Accepts either a full
-    /// path or a bare file name, because the two producers differ: the WFP /
-    /// codegen side holds concrete paths, while the OS flow-owner lookup can
-    /// only return an image BASENAME.
-    ///
-    /// Matching on the basename is a deliberate, bounded widening: a binary
-    /// that merely shares the file name of a confirmed client also matches. The
-    /// hole is narrow (the user must have confirmed that exact name), strictly
-    /// narrower than the `looks_like_vpn` keyword heuristic that already gates
-    /// the self-heal, and the worst outcome is that one flow egresses the
-    /// primary link — never that something the user routed is silently
-    /// unprotected by the kill-switch, which keys on paths only.
+    /// Discovery accepts display names; authorizing a flow requires [`Self::matches_path_for`].
     #[must_use]
     pub fn matches_image(&self, image: &str) -> bool {
         if !self.is_armed() {
@@ -237,6 +226,25 @@ impl ConfirmedVpnClients {
                 .any(|(sid, paths)| sid.eq_ignore_ascii_case(owner) && matches(paths)),
             None => by_sid.len() == 1 && by_sid.values().any(matches),
         }
+    }
+
+    /// Only this principal's exact program path authorizes a flow.
+    #[must_use]
+    pub fn matches_path_for(&self, owner: &str, path: &str) -> bool {
+        if !self.is_armed() || owner.is_empty() || path.is_empty() {
+            return false;
+        }
+        let case_insensitive = nrr_domain::rules_file::HostPlatform::compiled()
+            .path_style()
+            .case_insensitive();
+        let by_sid = self.by_sid.read().unwrap_or_else(|p| p.into_inner());
+        by_sid.iter().any(|(sid, paths)| {
+            sid.eq_ignore_ascii_case(owner)
+                && paths.iter().any(|entry| {
+                    entry.full == path
+                        || (case_insensitive && entry.full.eq_ignore_ascii_case(path))
+                })
+        })
     }
 
     /// Every confirmed path, deduplicated case-insensitively. Order is not

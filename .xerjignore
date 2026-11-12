@@ -1,0 +1,6 @@
+# Vendored code and rendered snapshots distort project-owned search results.
+third_party/
+apps/tui/tests/snapshots/
+
+# Dependency metadata is useful to Cargo, not to code navigation.
+Cargo.lock

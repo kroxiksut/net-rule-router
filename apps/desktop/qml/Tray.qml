@@ -143,7 +143,9 @@ SystemTrayIcon {
     }
     function _presentPrompt(config) {
         if (!promptWindow) promptWindow = _promptWindowComponent.createObject(tray)
+        if (!promptWindow) return false
         promptWindow.present(config)
+        return promptWindow.visible === true
     }
 
     // ── One window, several things wanting it ────────────────────────────────
@@ -213,6 +215,9 @@ SystemTrayIcon {
         _activeNoticeId = ""
         _addRuleUndo = null
         _autoRuleActiveIds = []
+        _autoRuleDeclineIds = []
+        _autoRuleReviewSerial = -1
+        _autoRuleSiteById = ({})
         // Unanswered: the sites it told of wait their day.
         _siteHostsOnScreen = []
         _enforcementNoticeKind = ""
@@ -503,12 +508,27 @@ SystemTrayIcon {
     /// Sites the prompt on screen is telling of, answered by its buttons.
     property var _siteHostsOnScreen: []
 
+    // Pacing is a short wait, not a dependency on the service's next push.
+    // Keep one pending retry; repeated pushes must not restart its deadline.
+    property Timer _siteNoticeRetryTimer: Timer {
+        interval: Pure.SITE_NOTICE_GAP_MS
+        repeat: false
+        onTriggered: {
+            if (tray._noticeSite !== "") {
+                tray._showSiteNotice()
+            } else {
+                tray._autoRuleOnlySitesNotOpening = true
+                tray._refreshNoticeMutes(function() { tray._fetchAutoRuleCandidates() })
+            }
+        }
+    }
+
     /// Whether a card about `host` may show now; the mutes as last read.
-    function _siteNoticeDue(host) {
+    function _siteNoticeDue(host, updatingReview) {
         var shown = noticeLedger.decidedAt(_siteShownId(host))
         var answered = noticeLedger.decidedAt(_siteAnsweredId(host))
         return Pure.siteNoticeDue(_noticeMutedNow("site-not-opening"),
-            noticeLedger.decidedAt(_siteShownAnyId) || null,
+            updatingReview ? null : (noticeLedger.decidedAt(_siteShownAnyId) || null),
             shown || null,
             answered > 0 && answered >= shown,
             Date.now())
@@ -533,7 +553,7 @@ SystemTrayIcon {
         var shown = Pure.displayText(host)
         return reach === "confirmed"
             ? tr("tray.site-not-opening.body-confirmed",
-                "{host} does not open over the main connection, but opens over the additional connection.")
+                "{host} keeps failing on the main connection. The connection check passed over the additional connection; page loading has not been verified.")
                 .replace("{host}", shown)
             : tr("tray.site-not-opening.body-unconfirmed",
                 "{host} does not open over the main connection; the additional connection may help.")
@@ -556,7 +576,7 @@ SystemTrayIcon {
                 if (String(c["proposed-match"] || "") !== host) continue
                 var reach = Pure.siteOfferReach(c.signal, c["secondary-reach"])
                 if (reach !== "") {
-                    done(reach)
+                    done(reach, [String(c.id || "")])
                     return
                 }
             }
@@ -567,22 +587,41 @@ SystemTrayIcon {
     function _showSiteNotice() {
         _noticeModeStartedAt = Date.now()
         _noticeModeWatch.start()
-        _whenNoticeAllowed("site-not-opening", function() {
-            if (!tray._siteNoticeDue(tray._noticeSite)) {
-                console.log("tray notice: site-not-opening held back — told within its window")
+        _refreshNoticeMutes(function() {
+            if (!showNotifications || !notifySuggestionChanges
+                    || tray._noticeMutedNow("site-not-opening")) {
+                tray._reportDiscoveryForSite(tray._noticeSite, "hidden", "notifications-muted")
                 return
             }
-            tray._siteReachThen(tray._noticeSite, function(reach) {
-                tray._showSiteNoticeCard(reach)
+            if (!tray._siteNoticeDue(tray._noticeSite)) {
+                console.log("tray notice: site-not-opening held back — told within its window")
+                tray._reportDiscoveryForSite(tray._noticeSite, "deferred", "notification-pacing")
+                if (!tray._siteNoticeRetryTimer.running) tray._siteNoticeRetryTimer.start()
+                return
+            }
+            tray._siteReachThen(tray._noticeSite, function(reach, ids) {
+                tray._showSiteNoticeCard(reach, ids)
             })
         })
     }
 
-    function _showSiteNoticeCard(reach) {
+    function _showSiteNoticeCard(reach, ids) {
+        if (promptWindow && promptWindow.visible)
+            _reportDiscovery(ids, "deferred", "client-busy")
         _presentOrQueue("site-not-opening", function() {
-            tray._noticeShown = true
-            tray._recordSitesShown([tray._noticeSite])
-            _presentPrompt({
+            if (!showNotifications || !notifySuggestionChanges
+                    || tray._noticeMutedNow("site-not-opening")) {
+                tray._reportDiscovery(ids, "hidden", "notifications-muted")
+                tray._scheduleDrain()
+                return
+            }
+            if (!tray._siteNoticeDue(tray._noticeSite)) {
+                tray._reportDiscovery(ids, "deferred", "notification-pacing")
+                if (!tray._siteNoticeRetryTimer.running) tray._siteNoticeRetryTimer.start()
+                tray._scheduleDrain()
+                return
+            }
+            var shown = _presentPrompt({
                 titleText: tr("tray.site-not-opening.title", "A site does not open"),
                 bodyText: tray._siteNoticeBody(tray._noticeSite, reach),
                 primaryAction: {
@@ -597,6 +636,39 @@ SystemTrayIcon {
                 dismissActionId: "site-not-opening-dismiss",
                 autoRetireMs: _promptAutoRetireMs
             })
+            if (shown) {
+                tray._noticeShown = true
+                tray._recordSitesShown([tray._noticeSite])
+                tray._reportDiscovery(ids, "delivered", "shown")
+            } else {
+                tray._reportDiscovery(ids, "deferred", "client-busy")
+            }
+        })
+    }
+
+    function _reportDiscovery(ids, state, reason) {
+        if (!rpc || typeof rpc.rpcAutoRuleDiscoveryFeedback !== "function") return
+        var bounded = (ids || []).filter(function(id) {
+            return typeof id === "string" && id !== "" && id.length <= 128
+        }).slice(0, 50)
+        if (bounded.length === 0) return
+        var corr = rpc.rpcAutoRuleDiscoveryFeedback({
+            "ids": bounded, "state": state, "reason": reason
+        })
+        if (corr) rpc.registerRpcCallback(corr, function() {})
+    }
+
+    function _reportDiscoveryForSite(host, state, reason) {
+        if (!rpc || typeof rpc.rpcAutoRuleCandidatesList !== "function") return
+        var corr = rpc.rpcAutoRuleCandidatesList()
+        if (!corr) return
+        rpc.registerRpcCallback(corr, function(ok, payload) {
+            if (!ok || !payload) return
+            var ids = (payload.candidates || []).filter(function(row) {
+                return Pure.siteOfferReach(String(row.signal || ""), row["secondary-reach"]) !== ""
+                    && String(row["proposed-match"] || "") === host
+            }).map(function(row) { return String(row.id || "") })
+            tray._reportDiscovery(ids, state, reason)
         })
     }
 
@@ -873,23 +945,11 @@ SystemTrayIcon {
     function _autoRuleNoticeId(candidateId) {
         return "auto-rule:" + String(candidateId || "")
     }
-    /// Ledger id of an explicit REFUSAL. Kept apart from the id above because
-    /// the two answers have opposite lifetimes: "never suggest this" is the
-    /// only one that may outlive the state it was given about.
-    function _autoRuleRefusedId(candidateId) {
-        return "auto-rule-never:" + String(candidateId || "")
-    }
-    /// How long an ACCEPTED candidate stays quiet. Accepting creates the rule,
-    /// and the service stops proposing what is already covered — so the only
-    /// way the same candidate comes back is that its rule is gone again
-    /// (the user deleted it, or reloaded rules from a file that predates it),
-    /// which is precisely when it must be offered anew. The window only spans
-    /// the gap between the answer and the service dropping the candidate.
+    /// Quiet only bridges the gap until the service drops an accepted candidate.
     readonly property int _autoRuleAcceptQuietMs: 600000
 
     /// Is a previous answer about this candidate still binding?
     function _autoRuleAnswered(candidateId) {
-        if (noticeLedger.isDecided(_autoRuleRefusedId(candidateId))) return true
         if (Date.now() < Number(_autoRuleSnoozedIds[candidateId] || 0)) return true
         var at = noticeLedger.decidedAt(_autoRuleNoticeId(candidateId))
         return at > 0 && (Date.now() - at) < _autoRuleAcceptQuietMs
@@ -930,17 +990,19 @@ SystemTrayIcon {
     /// Ids carried by the prompt currently on screen — the set every button
     /// acts on.
     property var _autoRuleActiveIds: []
+    property int _autoRuleReviewSerial: -1
+    // Only the initial review's unchecked rows carry implicit refusal consent.
+    property var _autoRuleDeclineIds: []
     /// Ids awaiting the "turn on automatic mode?" confirmation — held apart
     /// from `_autoRuleActiveIds` so a cancel can leave the original notice's
     /// candidates untouched instead of discarding them.
     property var _autoRulesModePendingIds: []
+    property var _autoRuleSiteById: ({})
     property bool _autoRuleFetchInFlight: false
     /// How many suggestions the main window's list shows by default, as the
     /// service counts them — the menu row's count.
     property int _autoRulePendingCount: 0
-    /// The user asked to see the offer, so the quiet windows that pace an
-    /// UNSOLICITED notice do not apply. Only an explicit "never suggest this"
-    /// still hides a row.
+    /// An explicit review bypasses local pacing; the service owns refusals.
     property bool _autoRuleShowAll: false
 
     /// Re-open the offer on demand — the tray menu's way back to a notice that
@@ -956,6 +1018,12 @@ SystemTrayIcon {
         // Listed, not announced: the menu carries the count and opens the
         // prompt when the user asks for it.
         _autoRulePendingCount = Number(event["pending-count"] || 0)
+        _autoRuleLatestAnchor = String(event["top-anchor"] || "")
+        if (_autoRuleReviewOnScreen()) {
+            _autoRuleOnlySitesNotOpening = true
+            _refreshNoticeMutes(function() { tray._fetchAutoRuleCandidates() })
+            return
+        }
         // Except a site the user opened that does not open: that one gets its
         // card, also for what piled up while no surface of theirs was running.
         // The tray started for one card says nothing else.
@@ -968,13 +1036,23 @@ SystemTrayIcon {
 
     /// The next prompt lists only sites that do not open over the main route.
     property bool _autoRuleOnlySitesNotOpening: false
+    property string _autoRuleLatestAnchor: ""
+
+    function _autoRuleReviewOnScreen() {
+        return promptWindow && promptWindow.visible
+            && promptWindow.presentationSerial === _autoRuleReviewSerial
+            && _autoRuleActiveIds.length > 0
+            && promptWindow.primaryAction
+            && promptWindow.primaryAction.actionId === "auto-rules-accept"
+    }
 
     function _fetchAutoRuleCandidates() {
         if (_autoRuleFetchInFlight) return
-        // A prompt is already on screen: stacking a second window over it would
-        // be exactly the "aggressive" behaviour this flow must avoid. Ask again
-        // when it frees up — the list is re-fetched then, so nothing goes stale.
-        if (promptWindow && promptWindow.visible) {
+        var updatingReview = _autoRuleReviewOnScreen()
+        var requestSerial = promptWindow ? promptWindow.presentationSerial : -1
+        if (promptWindow && promptWindow.visible && !updatingReview) {
+            if (_autoRuleLatestAnchor !== "")
+                _reportDiscoveryForSite(_autoRuleLatestAnchor, "deferred", "client-busy")
             _presentOrQueue("auto-rules", function() { tray._fetchAutoRuleCandidates() })
             return
         }
@@ -988,6 +1066,15 @@ SystemTrayIcon {
         _autoRuleFetchInFlight = true
         rpc.registerRpcCallback(corr, function(ok, payload, code, msg) {
             tray._autoRuleFetchInFlight = false
+            if ((promptWindow ? promptWindow.presentationSerial : -1) !== requestSerial
+                    || (updatingReview && !tray._autoRuleReviewOnScreen())
+                    || (!updatingReview && promptWindow && promptWindow.visible)) {
+                tray._noticeQueue = Pure.noticeQueueWith(tray._noticeQueue,
+                    {kind: "auto-rules", show: function() {tray._fetchAutoRuleCandidates()}},
+                    tray._noticeQueueCap)
+                tray._scheduleDrain()
+                return
+            }
             if (!ok || !payload) {
                 console.warn("auto-rule candidates fetch failed:", code, msg)
                 // A request left standing would turn a later unasked fetch into
@@ -1092,8 +1179,14 @@ SystemTrayIcon {
     /// Normalise the wire rows, drop the ones already offered, and show the
     /// prompt. Nothing new to say -> nothing shown.
     function _presentAutoRulePrompt(candidates) {
+        var updatingReview = _autoRuleReviewOnScreen()
+        var existingIds = updatingReview ? _autoRuleActiveIds.slice() : []
         var ids = []
         var items = []
+        var mutedIds = []
+        var pacedIds = []
+        var filteredIds = []
+        var heldIds = []
         // Which route the answer would put them on. The user asked to see it
         // before deciding; it is the anchor's own route, so it is the same for
         // every row of one site and only differs when sites are mixed.
@@ -1114,6 +1207,13 @@ SystemTrayIcon {
         // Only what the inbox lists by default: a row the list hides is not
         // news, and offering it here made the popup disagree with the count.
         var ordered = Pure.autoRuleRowsShownByDefault(candidates).sort(function(a, b) {
+            var ai = existingIds.indexOf(String((a || {}).id || ""))
+            var bi = existingIds.indexOf(String((b || {}).id || ""))
+            if (ai >= 0 || bi >= 0) {
+                if (ai < 0) return 1
+                if (bi < 0) return -1
+                return ai - bi
+            }
             var aa = String((a || {}).anchor || "")
             var bb = String((b || {}).anchor || "")
             if (aa === bb) return 0
@@ -1124,21 +1224,34 @@ SystemTrayIcon {
         var onlySitesNotOpening = _autoRuleOnlySitesNotOpening && !_autoRuleShowAll
         _autoRuleOnlySitesNotOpening = false
         if (onlySitesNotOpening) {
-            // Under the rule the tray started for one card keeps too: the
-            // mute, one card per half hour, a site once a day unanswered.
             ordered = ordered.filter(function(r) {
-                return String((r || {}).signal || "") === "main-link-blocked"
-                    && tray._siteNoticeDue(String((r || {})["proposed-match"] || ""))
+                var id = String((r || {}).id || "")
+                var alreadyShown = existingIds.indexOf(id) >= 0
+                if (!alreadyShown && Pure.siteOfferReach(String((r || {}).signal || ""), r["secondary-reach"]) === "") return false
+                if (!showNotifications || !notifySuggestionChanges
+                        || tray._noticeMutedNow("site-not-opening")) {
+                    mutedIds.push(id)
+                    return false
+                }
+                if (!alreadyShown && !tray._siteNoticeDue(String((r || {})["proposed-match"] || ""), updatingReview)) {
+                    pacedIds.push(id)
+                    return false
+                }
+                return true
             })
         }
         for (var i = 0; i < ordered.length; i += 1) {
-            if (ids.length >= _autoRuleMaxPerNotice) break
             var c = ordered[i] || {}
             var id = String(c.id || c["id"] || "")
             if (id === "") continue
-            if (_autoRuleShowAll
-                    ? noticeLedger.isDecided(_autoRuleRefusedId(id))
-                    : _autoRuleAnswered(id)) continue
+            if (existingIds.indexOf(id) < 0 && !_autoRuleShowAll && _autoRuleAnswered(id)) {
+                filteredIds.push(id)
+                continue
+            }
+            if (ids.length >= _autoRuleMaxPerNotice) {
+                heldIds.push(id)
+                continue
+            }
             var candidateAnchor = String(c.anchor || c["anchor"] || "")
             var selfSigned = _isSelfSigned(c)
             shownRows.push(c)
@@ -1161,6 +1274,7 @@ SystemTrayIcon {
                         "The same site in another zone: it can be added as {site}.* instead, every zone at once.")
                     .replace("{site}", anyZoneSite)
             items.push({
+                key: id,
                 primaryText: Pure.displayText(c["proposed-match"] || c.proposedMatch || ""),
                 secondaryText: [_companionRowSubtitle(
                         candidateAnchor, routes.length > 1 ? candidateRoute : "", selfSigned),
@@ -1170,6 +1284,15 @@ SystemTrayIcon {
                     .filter(function(s) { return s !== "" }).join("\n")
             })
         }
+        _reportDiscovery(mutedIds, "hidden", "notifications-muted")
+        _reportDiscovery(pacedIds, "deferred", "notification-pacing")
+        if (pacedIds.length > 0) {
+            if (!_siteNoticeRetryTimer.running) _siteNoticeRetryTimer.start()
+        } else {
+            _siteNoticeRetryTimer.stop()
+        }
+        _reportDiscovery(filteredIds, "hidden", "client-filter")
+        _reportDiscovery(heldIds, "deferred", "client-busy")
         var anchorNames = Object.keys(anchorCounts)
         anchorNames.sort(function(a, b) {
             var d = anchorCounts[b] - anchorCounts[a]
@@ -1177,7 +1300,18 @@ SystemTrayIcon {
         })
         var anchor = anchorNames.length > 0 ? anchorNames[0] : ""
         if (ids.length === 0) {
-            console.log("tray auto-rules: every candidate was already answered — nothing to show")
+            if (updatingReview) {
+                _autoRuleActiveIds = []
+                _autoRuleDeclineIds = []
+                _autoRuleSiteById = ({})
+                _autoRuleReviewSerial = -1
+                promptWindow.retire()
+                _scheduleDrain()
+                return
+            }
+            console.log("tray auto-rules: no eligible candidates; received", (candidates || []).length,
+                "visible", ordered.length, "muted", mutedIds.length, "paced", pacedIds.length,
+                "answered", filteredIds.length, "held", heldIds.length)
             // A click that produces no window reads as a broken menu item, so
             // an explicit request always gets an answer.
             if (_autoRuleShowAll) {
@@ -1202,14 +1336,14 @@ SystemTrayIcon {
         _autoRuleShowAll = false
         console.log("tray auto-rules: offering", ids.length, "addresses for", anchor)
         _autoRuleActiveIds = ids
+        var sitesById = ({})
+        shownRows.forEach(function(row) {
+            if (Pure.siteOfferReach(String(row.signal || ""), row["secondary-reach"]) !== "")
+                sitesById[String(row.id || "")] = String(row["proposed-match"] || "")
+        })
+        _autoRuleSiteById = sitesById
         _activeNoticeId = ""
-        if (onlySitesNotOpening) {
-            _recordSitesShown(shownRows.map(function(r) {
-                return String((r || {})["proposed-match"] || "")
-            }))
-        } else {
-            _siteHostsOnScreen = []
-        }
+        _siteHostsOnScreen = []
 
         var siteName = anchor !== ""
             ? Pure.displayText(anchor)
@@ -1219,7 +1353,11 @@ SystemTrayIcon {
         // site rules is not failing on the main route.
         var noticeKind = Pure.autoRuleNoticeKind(shownRows)
         var programNames = items.map(function(it) { return it.primaryText }).join(", ")
-        var titleText = noticeKind === "programs-own-resolver"
+        var titleText = noticeKind === "http-path"
+            ? tr("tray.auto-rules.title-http-path", "HTTPS answers differ between connections")
+            : noticeKind === "shared-address"
+            ? tr("tray.auto-rules.title-shared-address", "Checked names on a shared address")
+            : noticeKind === "programs-own-resolver"
             ? tr("tray.auto-rules.title-app-own-resolver", "Programs your site rules do not reach")
             : noticeKind === "assorted"
             ? tr("tray.auto-rules.title-assorted", "Suggested rules")
@@ -1232,7 +1370,13 @@ SystemTrayIcon {
                     "Sites the main connection will not carry")
             : tr("tray.auto-rules.title", "Addresses a site needs")
         var bodyText
-        if (noticeKind === "programs-own-resolver") {
+        if (noticeKind === "http-path") {
+            bodyText = tr("tray.auto-rules.body-http-path",
+                "An HTTPS request to these names failed on the main connection and answered on the additional connection. Review the names before adding a rule; this check does not verify the browser page.")
+        } else if (noticeKind === "shared-address") {
+            bodyText = tr("tray.auto-rules.body-shared-address",
+                    "These DNS names passed the TLS check only over the additional connection. The shared address does not identify which site you opened. Review the names before adding a rule; page loading has not been verified.")
+        } else if (noticeKind === "programs-own-resolver") {
             bodyText = tr("tray.auto-rules.body-app-own-resolver",
                     "{name} looks up site names on its own, so rules by site name do not apply to it. A rule for the program sends all of its connections over the additional connection.")
                 .replace("{name}", programNames)
@@ -1278,7 +1422,11 @@ SystemTrayIcon {
         }
         bodyText = bodyText + "\n" + tr("tray.auto-rules.unchecked-declined",
             "Unchecked rows will be declined; you can bring them back later in the app.")
-        _presentPrompt({
+        if (updatingReview) {
+            bodyText += "\n" + tr("tray.auto-rules.new-rows-pending",
+                "Newly arrived rows stay pending unless you select them.")
+        }
+        var config = {
             titleText: titleText,
             bodyText: bodyText,
             items: items,
@@ -1316,7 +1464,35 @@ SystemTrayIcon {
             // buried the addresses for good.
             dismissActionId: "auto-rules-later",
             autoRetireMs: _promptAutoRetireMs
-        })
+        }
+        var presented
+        if (updatingReview) {
+            promptWindow.replaceContent(config)
+            presented = _autoRuleReviewOnScreen()
+        } else {
+            presented = _presentPrompt(config)
+            if (presented) {
+                _autoRuleReviewSerial = promptWindow.presentationSerial
+                _autoRuleDeclineIds = ids.slice()
+            }
+        }
+        if (presented) {
+            var newlyShown = shownRows.filter(function(row) {
+                return existingIds.indexOf(String(row.id || "")) < 0
+            })
+            if (onlySitesNotOpening && newlyShown.length > 0) {
+                _recordSitesShown(newlyShown.map(function(r) {
+                    return String((r || {})["proposed-match"] || "")
+                }))
+            }
+            _reportDiscovery(newlyShown.map(function(row) {return String(row.id || "")}), "delivered", "shown")
+        } else {
+            _reportDiscovery(ids, "deferred", "client-busy")
+            _autoRuleActiveIds = []
+            _autoRuleDeclineIds = []
+            _autoRuleReviewSerial = -1
+            _scheduleDrain()
+        }
     }
 
     // ── External address of the additional route ─────────────────────────────
@@ -2114,7 +2290,7 @@ SystemTrayIcon {
             case "ipv6-blocked":
                 return tr("tray.block-notice.reason-short.ipv6-blocked", "IPv6 held by leak protection")
             case "dns-lockdown":
-                return tr("tray.block-notice.reason-short.dns-lockdown", "Own encrypted DNS")
+                return tr("tray.block-notice.reason-short.dns-lockdown", "Known DNS endpoint")
             case "unattributed":
                 return tr("tray.block-notice.reason-short.unattributed", "Blocked, reason unclear")
             default:
@@ -2136,9 +2312,7 @@ SystemTrayIcon {
                     + "connection, and this IPv6 address could not. No rule blocked it — the switch is in Settings.")
             case "dns-lockdown":
                 return tr("tray.block-notice.reason.dns-lockdown",
-                    "This app tried to reach a public DNS resolver of its own instead of the one "
-                    + "NetRuleRouter provides, and encrypted-DNS blocking closed it. "
-                    + "No rule blocked it — the switch is in Settings, under Routing behavior.")
+                    "Our DNS protection blocked a connection to a known resolver endpoint. This does not prove encrypted DNS use or explain a particular site's failure. Check DNS compatibility in Routing settings; keep your routing rules enabled.")
             case "unattributed":
                 return tr("tray.block-notice.reason.unattributed",
                     "NetRuleRouter blocked this address, but could not tell what exactly stopped it.")
@@ -4299,19 +4473,19 @@ SystemTrayIcon {
         }
         if (action === "auto-rules-mode-confirm") {
             var confirmedIds = _autoRulesModePendingIds
+            var confirmedSites = confirmedIds.map(function(id) {
+                return String(tray._autoRuleSiteById[id] || "")
+            }).filter(function(host) { return host !== "" })
             _autoRulesModePendingIds = []
             _autoRuleActiveIds = []
             _activeNoticeId = ""
-            noticeLedger.recordAll(confirmedIds.map(function(id) {
-                return tray._autoRuleNoticeId(id)
-            }))
-            _autoRulesApplyAutomatically(confirmedIds)
+            _autoRuleSiteById = ({})
+            _autoRulesApplyAutomatically(confirmedIds, confirmedSites)
             _scheduleDrain()
             return
         }
         if (action === "auto-rules-mode-cancel") {
-            // Declined — nothing changes. Treat it like "not now" so the same
-            // candidates do not immediately reappear.
+            // A cancelled confirmation gets the same pause as "not now".
             _snoozeCandidates(_autoRuleActiveIds)
             _autoRulesModePendingIds = []
             _autoRuleActiveIds = []
@@ -4320,12 +4494,17 @@ SystemTrayIcon {
             return
         }
         var ids = _autoRuleActiveIds
+        var declineConsent = _autoRuleDeclineIds
+        _autoRuleDeclineIds = []
+        _autoRuleReviewSerial = -1
         var picked = _pickIds(ids, selectedIndexes)
+        var hostsById = _autoRuleSiteById
+        var pickedSites = picked.map(function(id) {
+            return String(hostsById[id] || "")
+        }).filter(function(host) { return host !== "" })
         _autoRuleActiveIds = []
-        // Closing without pressing anything is not an answer. Re-offering the
-        // same rows on the next push would be nagging, so THOSE rows are held
-        // back for a while instead of being recorded as decided — addresses the
-        // user has not been shown yet are unaffected.
+        _autoRuleSiteById = ({})
+        // Closing pauses only the shown rows; it never refuses them.
         if (action === "auto-rules-later") {
             _activeNoticeId = ""
             _siteHostsOnScreen = []
@@ -4333,63 +4512,39 @@ SystemTrayIcon {
             _scheduleDrain()
             return
         }
-        // "Add checked" is a decision about the WHOLE list, not just the rows
-        // that got checked: a row the user looked at and left unchecked is a
-        // refusal, same as pressing "Never suggest checked" on it — it must
-        // not keep coming back every push. It leaves through the same dismiss
-        // path the explicit refusal button uses, so the service (and the
-        // suggestions inbox) learn about it too, not just this tray process.
+        // Unchecked rows are refused through the service, like an explicit refusal.
         var declined = []
         if (action === "auto-rules-accept") {
             for (var d = 0; d < ids.length; d += 1) {
-                if (picked.indexOf(ids[d]) < 0) declined.push(ids[d])
+                if (declineConsent.indexOf(ids[d]) >= 0 && picked.indexOf(ids[d]) < 0)
+                    declined.push(ids[d])
             }
         }
-        // An answer belongs to the shared ledger so the other surface stops
-        // offering the same thing. Pressing the button decides every row on
-        // screen — checked ones by acceptance, the rest by refusal.
         var answered = _activeNoticeId !== "" ? [_activeNoticeId] : []
         _activeNoticeId = ""
-        for (var i = 0; i < picked.length; i += 1) {
-            answered.push(_autoRuleNoticeId(picked[i]))
-            // Only an explicit refusal is remembered for good. Recording an
-            // acceptance the same way silenced the candidate forever: after the
-            // user later dropped the rule, the service kept proposing it and
-            // the tray kept throwing it away — a whole session with the
-            // suggestions the user was waiting for going into the bin.
-            if (action === "auto-rules-dismiss") {
-                answered.push(_autoRuleRefusedId(picked[i]))
-            }
-        }
-        for (var j = 0; j < declined.length; j += 1) {
-            answered.push(_autoRuleNoticeId(declined[j]))
-            answered.push(_autoRuleRefusedId(declined[j]))
-        }
-        if (action === "auto-rules-accept" || action === "auto-rules-dismiss") {
-            answered = answered.concat(_siteHostsOnScreen.map(_siteAnsweredId))
-        }
         _siteHostsOnScreen = []
-        noticeLedger.recordAll(answered)
+        if (action !== "auto-rules-accept" && action !== "auto-rules-dismiss")
+            noticeLedger.recordAll(answered)
         switch (action) {
             case "auto-rules-accept":
-                _autoRulesAccept(picked)
-                if (declined.length > 0) _autoRulesDismiss(declined)
+                _autoRulesAccept(picked, pickedSites)
+                if (declined.length > 0) {
+                    var declinedSites = declined.map(function(id) {
+                        return String(hostsById[id] || "")
+                    }).filter(function(host) { return host !== "" })
+                    _autoRulesDismiss(declined, declinedSites)
+                }
                 break
             case "auto-rules-dismiss":
-                _autoRulesDismiss(picked)
+                _autoRulesDismiss(picked, pickedSites)
                 break
             case "rules-drift-apply":
-                // The apply pipeline (review, elevation, activation) lives in
-                // the main window; reproducing it here would mean a second,
-                // unreviewed writer of routing policy. The tray hands over the
-                // intent instead and the window runs its normal flow.
+                // The window owns review, elevation and activation.
                 _rulesDriftNoticeId = ""
                 triggerAction("rules-drift-apply")
                 break
             case "rules-drift-open":
-                // Not a plain "go to Rules": the window has to re-measure and
-                // SHOW the divergence this notice is about, so the intent
-                // travels with the hand-off.
+                // Carry the intent so the window re-measures and shows the difference.
                 _rulesDriftNoticeId = ""
                 triggerAction("rules-drift-compare")
                 break
@@ -4416,29 +4571,37 @@ SystemTrayIcon {
         return out
     }
 
-    function _autoRulesAccept(ids) {
+    function _autoRulesAccept(ids, sites) {
         if (!ids || ids.length === 0) return
         if (!rpc || typeof rpc.rpcAutoRuleCandidatesAccept !== "function") return
         var corr = rpc.rpcAutoRuleCandidatesAccept({ "ids": ids })
+        if (!corr) return
         rpc.registerRpcCallback(corr, function(ok, p, code, msg) {
             if (!ok) {
                 console.warn("auto-rule accept failed:", code, msg)
                 return
+            }
+            if (p && Number(p.applied || 0) === ids.length && Number(p.unknown || 0) === 0) {
+                noticeLedger.recordAll(ids.map(function(id) { return tray._autoRuleNoticeId(id) })
+                    .concat((sites || []).map(tray._siteAnsweredId)))
             }
             tray._notePendingCount(p)
             if (p && p["anchor-skipped"] === true) tray._noteReloadAfterAccept()
         })
     }
 
-    function _autoRulesDismiss(ids) {
+    function _autoRulesDismiss(ids, sites) {
         if (!ids || ids.length === 0) return
         if (!rpc || typeof rpc.rpcAutoRuleCandidatesDismiss !== "function") return
         var corr = rpc.rpcAutoRuleCandidatesDismiss({ "ids": ids })
+        if (!corr) return
         rpc.registerRpcCallback(corr, function(ok, p, code, msg) {
             if (!ok) {
                 console.warn("auto-rule dismiss failed:", code, msg)
                 return
             }
+            if (p && Number(p.applied || 0) === ids.length && Number(p.unknown || 0) === 0)
+                noticeLedger.recordAll((sites || []).map(tray._siteAnsweredId))
             tray._notePendingCount(p)
         })
     }
@@ -4548,8 +4711,8 @@ SystemTrayIcon {
     /// and the present. Only reached after the user confirms
     /// `_confirmAutoRulesAlways` below — flipping to `auto` means the app
     /// starts writing rules unattended, which is worth a real yes/no.
-    function _autoRulesApplyAutomatically(ids) {
-        _setAutoRulesMode("auto", function() { tray._autoRulesAccept(ids) })
+    function _autoRulesApplyAutomatically(ids, sites) {
+        _setAutoRulesMode("auto", function() { tray._autoRulesAccept(ids, sites) })
     }
 
     /// Second step of "Add automatically from now on": explain what `auto`

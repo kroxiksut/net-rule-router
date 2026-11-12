@@ -1,0 +1,16 @@
+{
+  "cases": [
+    { "name": "missing service verdict is unknown", "input": {}, "expected": "unconfirmed" },
+    { "name": "null offline verdict is unknown", "input": { "doh-lockdown-effective": null }, "expected": "unconfirmed" },
+    { "name": "a string is not a confirmed verdict", "input": { "doh-lockdown-effective": "false" }, "expected": "unconfirmed" },
+    { "name": "automatic activation ignores the parked manual toggle", "input": { "doh-lockdown-auto": true, "doh-lockdown-enabled": false, "leak-protection": "off", "doh-lockdown-effective": true }, "expected": "auto-on" },
+    { "name": "automatic inactivity ignores the parked manual toggle", "input": { "doh-lockdown-auto": true, "doh-lockdown-enabled": true, "doh-lockdown-effective": false }, "expected": "auto-off" },
+    { "name": "sites protection activates the manual scope", "input": { "doh-lockdown-auto": false, "doh-lockdown-enabled": true, "leak-protection": "sites", "doh-lockdown-effective": true }, "expected": "manual-protected" },
+    { "name": "everything protection activates the manual scope", "input": { "doh-lockdown-auto": false, "doh-lockdown-enabled": true, "leak-protection": "everything", "doh-lockdown-effective": true }, "expected": "manual-protected" },
+    { "name": "off protection leaves the manual choice waiting", "input": { "doh-lockdown-auto": false, "doh-lockdown-enabled": true, "leak-protection": "off", "doh-lockdown-effective": false }, "expected": "manual-waiting" },
+    { "name": "always applies without leak protection", "input": { "doh-lockdown-auto": false, "doh-lockdown-enabled": true, "doh-lockdown-scope": "always", "leak-protection": "off", "doh-lockdown-effective": true }, "expected": "manual-always" },
+    { "name": "disabled manual choice is confirmed off", "input": { "doh-lockdown-auto": false, "doh-lockdown-enabled": false, "doh-lockdown-effective": false }, "expected": "manual-disabled" },
+    { "name": "contradictory disabled choice is not claimed as off", "input": { "doh-lockdown-auto": false, "doh-lockdown-enabled": false, "doh-lockdown-effective": true }, "expected": "unconfirmed" },
+    { "name": "contradictory scoped choice is not claimed as off", "input": { "doh-lockdown-auto": false, "doh-lockdown-enabled": true, "leak-protection": "sites", "doh-lockdown-effective": false }, "expected": "unconfirmed" }
+  ]
+}

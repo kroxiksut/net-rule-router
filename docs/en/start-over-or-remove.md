@@ -19,22 +19,15 @@ This page helps you choose the right kind of fresh start.
 1. Click **Rules**, then **More...**, then **Clear all rules...**.
 2. Confirm **Clear all rules**.
 
-Every rule is gone and your internet works the ordinary way. This cannot be
-undone, so save your rules first if you might want them back:
-[Save your rules and load them back](rule-sets.md).
+Every rule is gone and your internet works the ordinary way. This cannot be undone, so save your rules first if you might want them back: [Save your rules and load them back](rule-sets.md).
 
 ## Reset application settings
 
-Click **Settings**. At the bottom click **Reset application settings**. The
-program's own preferences (theme, language, notices, connection names) go back
-to defaults. Your rules stay. Check **Connections** afterwards.
+Click **Settings**. At the bottom click **Reset application settings**. The program's own preferences (theme, language, notices, connection names) go back to defaults. Your rules stay. Check **Connections** afterwards.
 
 ## Full reset
 
-Click **Settings**. At the bottom click **Full reset…**. This puts all settings
-back, deletes the rules the program keeps for you, clears logs and restarts the
-background service. Your own rule files on disk are not touched. It cannot be
-undone.
+Click **Settings**. At the bottom click **Full reset…**. This puts all settings back, deletes the rules the program keeps for you, clears logs and restarts the background service. Your own rule files on disk are not touched. It cannot be undone.
 
 1. Read the window.
 2. If other people use this computer, choose **Only my data** or **Every user on this computer**.
@@ -44,25 +37,16 @@ undone.
 
 ## Remove the program
 
-- **Installed with the EXE or the MSI:** open Windows Settings → Apps →
-  NetRuleRouter → Uninstall. The installer asks how:
-  **Remove the program** keeps your settings and rules for a later reinstall,
-  **Remove completely** erases them too. Rule files you saved in your own
-  folders stay either way.
-- **Portable copy:** **Settings** → **Service management** → **Uninstall service**,
-  close the program, delete its folder.
+- **Installed with the EXE or the MSI:** open Windows Settings → Apps → NetRuleRouter → Uninstall. The installer asks how: **Remove the program** keeps your settings and rules for a later reinstall, **Remove completely** erases them too. Rule files you saved in your own folders stay either way.
+- **Portable copy:** **Settings** → **Service management** → **Uninstall service**, close the program, delete its folder.
 
 Both ways put back the network settings the program changed.
 
 ## If you need more
 
-- Removing without a window, and what each way keeps:
-  [Quick start](quickstart.md#removal) and
-  [Packaging for Windows](packaging-windows.md#removing-an-installed-copy).
+- Removing without a window, and what each way keeps: [Quick start](quickstart.md#removal) and [Packaging for Windows](packaging-windows.md#removing-an-installed-copy).
 - Where the files live: [Where NetRuleRouter keeps its files](where-files-live.md).
-- In the terminal interface, `W` on the **Rules** screen clears all rules; the
-  service is removed with `nrr-cli uninstall`: [the terminal interface](tui.md),
-  [the console](cli.md).
+- In the terminal interface, `W` on the **Rules** screen clears all rules; the service is removed with `nrr-cli uninstall`: [the terminal interface](tui.md), [the console](cli.md).
 
 ## See also
 

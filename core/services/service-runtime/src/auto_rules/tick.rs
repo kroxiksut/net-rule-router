@@ -209,6 +209,35 @@ impl AutoRulesEngine {
                 None => Vec::new(),
             }
         };
+        let proposals: Vec<_> = proposals
+            .into_iter()
+            .flat_map(|mut proposal| {
+                use nrr_domain::companion_affinity::ProposedCompanionMatch;
+                if !matches!(proposal.proposed, ProposedCompanionMatch::SuffixDomain(_)) {
+                    return vec![proposal];
+                }
+                let base = proposal.proposed.value().to_string();
+                let suffix = format!(".{base}");
+                let members = std::mem::take(&mut proposal.observed_members);
+                members
+                    .into_iter()
+                    .filter(|host| {
+                        (host.as_str() == base || host.ends_with(&suffix))
+                            && !exclusions.is_rule_host(host)
+                            && !exclusions.is_matched_by_existing_rule(host)
+                    })
+                    .take(MAX_PENDING_PER_PRINCIPAL * 16)
+                    .map(|host| {
+                        let mut exact = proposal.clone();
+                        exact.proposed = ProposedCompanionMatch::ExactHost(host.clone());
+                        exact.primary_behavior = self.main_link_behavior(sid, &host);
+                        exact.observed_members = vec![host];
+                        exact
+                    })
+                    .collect()
+            })
+            .take(MAX_PENDING_PER_PRINCIPAL * 16)
+            .collect();
         if proposals.is_empty() {
             summary.pending = self.pending_count_under(sid, &snapshot);
             // A site that signed its own offer while nobody listened has no
@@ -247,7 +276,8 @@ impl AutoRulesEngine {
         for proposal in proposals.iter() {
             // The kind is part of the id only because it used to vary; it is
             // now fixed, and keeping it keeps ids stable across the change.
-            let id = candidate_id(sid, AUTO_RULE_MATCH_KIND_SUFFIX, proposal.proposed.value());
+            let (kind, _) = host_offer_kind(proposal.proposed.value());
+            let id = candidate_id(sid, kind, proposal.proposed.value());
             consumers.entry(id.clone()).or_default().push((
                 proposal.nearest_share,
                 AutoRuleConsumerDto {
@@ -266,10 +296,19 @@ impl AutoRulesEngine {
                 }
                 continue;
             }
-            if suppressed.contains(&id) {
+            if suppressed.contains(&id)
+                || suppressed.contains(&candidate_id(
+                    sid,
+                    AUTO_RULE_MATCH_KIND_SUFFIX,
+                    proposal.proposed.value(),
+                ))
+            {
                 continue;
             }
-            let candidate = to_candidate(proposal, id.clone());
+            let mut candidate = to_candidate(proposal, id.clone());
+            if self.companion_responds(sid, &candidate.dto.proposed_match) {
+                candidate.dto.primary_behavior = AUTO_RULE_PRIMARY_BEHAVIOR_RESPONDS.to_string();
+            }
             let pulled = proposal.nearest_share;
             match strongest.get(&id) {
                 Some((held_pulled, held))
@@ -362,27 +401,26 @@ impl AutoRulesEngine {
         (summary, true)
     }
 
-    /// Announce everything still on offer for `sid` when any of it has not been
-    /// announced yet.
-    ///
-    /// Runs on EVERY `suggest` tick, not only on the tick that parked something:
-    /// an arrival that lands inside the quiet gap would otherwise wait for the
-    /// next arrival to be mentioned, and there may not be one.
+    /// Revisit held offers even when no new observation arrives.
     pub(super) fn announce_pending(&self, sid: &str, now: SystemTime) -> bool {
         let offered = self.pending_snapshot(sid);
         if offered.is_empty() {
             return false;
         }
-        // With the additional link down there is no half-loaded page to fix:
-        // everything, routed or not, is already going out the main link and
-        // working. Offering to "add these to the additional route" then states
-        // a problem the user does not have. Learning continues — what is found
-        // while the tunnel is off is offered once it comes back.
+        // Retain observations until the additional route can be checked.
         if self
             .secondary_ready
             .as_ref()
             .is_some_and(|ready| !ready(sid))
         {
+            for candidate in &offered {
+                self.record_candidate_discovery(
+                    sid,
+                    &candidate.dto,
+                    DiscoveryDecision::new("probe", "deferred", "secondary-unavailable"),
+                    now,
+                );
+            }
             tracing::debug!(
                 target: "nrr::auto-rules",
                 sid = %sid,
@@ -391,11 +429,7 @@ impl AutoRulesEngine {
             );
             return false;
         }
-        // Only what the inbox lists by default (`shown_by_default`) is news: a
-        // push for hidden rows opens a popup with nothing to show. The verdict
-        // is recomputed every tick, so a later stall re-opens the question.
-        // Value: the site refuses main-link addresses, which skips the wait
-        // below — answering with a refusal is still answering.
+        // A push for hidden rows would open an empty card.
         let listed: HashMap<String, bool> = self
             .candidates(sid)
             .into_iter()
@@ -410,7 +444,13 @@ impl AutoRulesEngine {
         let (worth_a_popup, settled): (Vec<PendingCandidate>, Vec<PendingCandidate>) = offered
             .into_iter()
             .partition(|c| match listed.get(&c.dto.id) {
-                Some(&refuses) => refuses || !awaiting_the_main_link(&c.dto, pass_can_answer),
+                Some(&refuses) => {
+                    let confirmation_pending = pass_can_answer
+                        && c.dto.signal == AUTO_RULE_SIGNAL_MAIN_LINK_BLOCKED
+                        && c.dto.secondary_reach.is_none();
+                    !confirmation_pending
+                        && (refuses || !awaiting_the_main_link(&c.dto, pass_can_answer))
+                }
                 None => false,
             });
         if !settled.is_empty() {
@@ -429,7 +469,7 @@ impl AutoRulesEngine {
         self.publish(sid, listed.len() as u64, &worth_a_popup, false, now)
     }
 
-    fn pending_snapshot(&self, sid: &str) -> Vec<PendingCandidate> {
+    pub(super) fn pending_snapshot(&self, sid: &str) -> Vec<PendingCandidate> {
         let mut offers: Vec<PendingCandidate> = self
             .pending
             .lock()
@@ -451,15 +491,24 @@ impl AutoRulesEngine {
             .map_or(PrimaryBehavior::Unknown, |read| read(sid, hostname))
     }
 
-    /// Re-stamp a self-signed offer with the main link's CURRENT verdict.
-    ///
-    /// A companion offer is rebuilt from the ledger on every tick and so
-    /// carries fresh evidence by construction. An offer a host made about
-    /// itself is parked once and never recomputed, so without this it would
-    /// keep asserting a failure that has since stopped happening.
+    pub(super) fn companion_responds(&self, sid: &str, host: &str) -> bool {
+        if self.main_link_behavior(sid, host) == PrimaryBehavior::Responds {
+            return true;
+        }
+        self.http_primary
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .get(&(sid.to_string(), host.to_string()))
+            .is_some_and(|(answered, at)| {
+                *answered && at.elapsed() < crate::primary_stall_registry::ENTRY_TTL
+            })
+    }
+
+    /// Refresh flow-based standalone offers from current host health.
+    /// Independent shared-address findings retain their own measurements.
     pub(super) fn refresh_self_signed_behavior(&self, sid: &str, dto: &mut AutoRuleCandidateDto) {
         // A program has no host verdict; its own measure withdraws the offer.
-        if !is_self_signed_signal(&dto.signal) || is_app_offer(dto) {
+        if !is_self_signed_signal(&dto.signal) || is_app_offer(dto) || independent_finding(dto) {
             return;
         }
         let behavior = self.main_link_behavior(sid, &dto.proposed_match);

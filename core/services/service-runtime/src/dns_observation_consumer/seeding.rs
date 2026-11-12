@@ -4,33 +4,22 @@
 use super::*;
 
 impl DnsObservationConsumer {
-    /// seed the FQDN cache from the OS resolver cache.
-    ///
-    /// Reads what the OS has already resolved (via the injected
-    /// [`DnsCacheReadPort`]) and caches the rule-matching hosts with source
-    /// [`StorageResolutionSource::OsCacheSeed`]. This closes the observability
-    /// gap where a rule host (e.g. a `.ru` zone member) was resolved *before*
-    /// the service started, or served straight from the OS cache so no wire
-    /// query fired and the ETW observer never saw it — leaving its zone permit
-    /// uncompiled and the host blocked under a catch-all.
-    ///
-    /// Same keep-logic as [`consume`](Self::consume): active-SID gate,
-    /// active-rules match (primary OR secondary), and the non-routable filter
-    /// (an ad-blocked `127.0.0.1` pin in the OS cache must never become a
-    /// `/32`). Collateral detection is intentionally NOT run here — that is a
-    /// property of live observation, not of a cache snapshot. Best-effort: a
-    /// read error is logged at debug and yields an empty summary.
+    /// Cache existing rule resolutions without network queries; keep other names diagnostic.
+    /// Shared OS cache entries carry no user's visit attribution.
     pub fn seed_from_os_cache(&self, now: SystemTime) -> ConsumeSummary {
         let mut summary = ConsumeSummary::default();
         let books = self.present_rule_books();
         if books.is_empty() {
             return summary;
         }
-        // Filter before the per-name OS lookup: most cache names match no rule.
+        let diagnostic_budget = std::sync::atomic::AtomicUsize::new(0);
         let in_rules = |name: &str| {
             books
                 .iter()
                 .any(|b| rule_set_matches(name, &b.primary) || rule_set_matches(name, &b.secondary))
+                || (self.observed_names.is_some()
+                    && diagnostic_budget.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                        < crate::recent_rule_addresses::MAX_ENTRIES)
         };
         let entries = match self.dns_cache_read.read_resolver_cache_matching(&in_rules) {
             Ok(e) => e,
@@ -48,12 +37,17 @@ impl DnsObservationConsumer {
             if entry.addresses.is_empty() {
                 continue;
             }
+            if let Some(names) = &self.observed_names {
+                names.record(
+                    &entry.canonical_hostname,
+                    &crate::dns_wire::only_v4(&entry.addresses),
+                );
+            }
             let matches = books.iter().any(|book| {
                 rule_set_matches(&entry.canonical_hostname, &book.primary)
                     || rule_set_matches(&entry.canonical_hostname, &book.secondary)
             });
             if !matches {
-                summary.ignored = summary.ignored.saturating_add(1);
                 continue;
             }
             self.upsert_counted(

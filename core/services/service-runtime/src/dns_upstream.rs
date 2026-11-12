@@ -191,12 +191,16 @@ struct PoolState {
     last_exclusion_check: Option<Instant>,
 }
 
-/// The live choice of upstream DNS server.
-///
-/// Cloneable handle semantics: wrap in `Arc` and share — every consumer sees the
-/// same active server, and a rotation triggered by one is immediately visible to
-/// the others.
+#[derive(Default)]
+struct AnswerEvidence {
+    epoch: u64,
+    primary: Option<Instant>,
+    secondary: Option<(Instant, bool)>,
+}
+
+/// Shared live upstream choice; a rotation is visible to every caller.
 pub struct UpstreamDnsPool {
+    answers: Mutex<AnswerEvidence>,
     servers: Arc<dyn SystemDnsServersPort>,
     probe: Arc<dyn UpstreamProbe>,
     /// What every candidate is reached on; only an explicitly dictated
@@ -239,6 +243,7 @@ pub struct UpstreamDnsPool {
 impl UpstreamDnsPool {
     pub fn new(servers: Arc<dyn SystemDnsServersPort>, probe: Arc<dyn UpstreamProbe>) -> Self {
         Self {
+            answers: Mutex::new(AnswerEvidence::default()),
             servers,
             probe,
             port: DNS_PORT,
@@ -357,6 +362,7 @@ impl UpstreamDnsPool {
             }
         };
         Self {
+            answers: Mutex::new(AnswerEvidence::default()),
             servers: Arc::new(servers),
             probe: Arc::new(AcceptingProbe),
             port: server.port(),
@@ -476,10 +482,55 @@ impl UpstreamDnsPool {
         false
     }
 
-    /// A forward succeeded — the active server is good.
-    pub fn note_success(&self) {
+    #[cfg(test)]
+    pub(crate) fn note_success(&self) {
+        self.note_success_in_epoch(self.readiness_epoch());
+    }
+
+    pub(crate) fn readiness_epoch(&self) -> u64 {
+        self.answers.lock().unwrap_or_else(|p| p.into_inner()).epoch
+    }
+
+    pub(crate) fn note_success_in_epoch(&self, epoch: u64) {
+        let mut answers = self.answers.lock().unwrap_or_else(|p| p.into_inner());
+        if answers.epoch != epoch || epoch == u64::MAX {
+            return;
+        }
+        answers.primary = Some(Instant::now());
         self.lock().failures = 0;
         self.dark.store(false, Ordering::Relaxed);
+    }
+
+    #[must_use]
+    pub fn has_recent_answer(&self) -> bool {
+        self.answers
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .primary
+            .as_ref()
+            .is_some_and(|at| at.elapsed() <= Duration::from_secs(60))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn note_secondary_answer(&self, answered: bool) {
+        self.note_secondary_answer_in_epoch(self.readiness_epoch(), answered);
+    }
+
+    pub(crate) fn note_secondary_answer_in_epoch(&self, epoch: u64, answered: bool) {
+        let mut answers = self.answers.lock().unwrap_or_else(|p| p.into_inner());
+        if answers.epoch == epoch && epoch != u64::MAX {
+            answers.secondary = Some((Instant::now(), answered));
+        }
+    }
+
+    pub(crate) fn recent_secondary_answer(&self) -> Option<bool> {
+        self.answers
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .secondary
+            .as_ref()
+            .filter(|(at, _)| at.elapsed() <= Duration::from_secs(60))
+            .map(|(_, answered)| *answered)
     }
 
     /// A forward failed. Returns the replacement once the failure streak retires
@@ -554,7 +605,7 @@ impl UpstreamDnsPool {
     pub fn note_network_change(&self) -> Option<SocketAddr> {
         // Before the gap check: a reused socket would keep asking from the
         // old network's address until it ages out.
-        self.sockets.drain();
+        self.close_idle_sockets();
         *self
             .preferred_cache
             .lock()
@@ -615,6 +666,12 @@ impl UpstreamDnsPool {
     /// source address of a network that may be gone. Cheap enough for the
     /// OS change callback; selects nothing.
     pub fn close_idle_sockets(&self) {
+        {
+            let mut answers = self.answers.lock().unwrap_or_else(|p| p.into_inner());
+            answers.epoch = answers.epoch.saturating_add(1);
+            answers.primary = None;
+            answers.secondary = None;
+        }
         self.sockets.drain();
     }
 
@@ -1698,6 +1755,79 @@ mod tests {
                 .expect("second"),
             Some(SocketAddr::from((ip(2), 53))),
             "the change reported during the sweep was dropped"
+        );
+    }
+
+    #[test]
+    fn a_vpn_change_invalidates_dns_readiness_before_a_busy_worker_can_reselect() {
+        let probe = ParkingProbe::new();
+        let (pool, _) = switching_pool(Arc::clone(&probe) as Arc<dyn UpstreamProbe>);
+        pool.note_network_change_in_background(|_| {});
+        probe.wait_until_inside();
+        pool.note_success();
+        pool.note_secondary_answer(true);
+        pool.note_network_change_in_background(|_| {});
+        let primary_ready = pool.has_recent_answer();
+        let secondary_ready = pool.recent_secondary_answer();
+        probe.release();
+        assert!(
+            !primary_ready,
+            "an answer on the previous network cannot certify the new DNS path"
+        );
+        assert_eq!(
+            secondary_ready, None,
+            "a previous VPN address cannot certify the returned tunnel"
+        );
+    }
+
+    #[test]
+    fn a_reply_already_in_flight_before_a_vpn_change_cannot_certify_the_new_dns_path() {
+        use crate::dns_resolver::UpstreamResolver;
+        use nrr_platform_api::dns::AddressFamily;
+        let server = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).expect("DNS socket");
+        server
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .expect("DNS timeout");
+        let address = server.local_addr().expect("DNS address");
+        let (seen, received) = std::sync::mpsc::channel();
+        let (release, proceed) = std::sync::mpsc::channel();
+        let answer = std::thread::spawn(move || {
+            let mut query = [0_u8; 4096];
+            let (size, client) = server.recv_from(&mut query).expect("query on old network");
+            seen.send(()).expect("query observed");
+            proceed
+                .recv_timeout(Duration::from_secs(5))
+                .expect("network changes before reply");
+            let reply = crate::dns_wire::build_a_response(
+                &query[..size],
+                &[Ipv4Addr::new(192, 0, 2, 1)],
+                60,
+            )
+            .expect("DNS answer");
+            server
+                .send_to(&reply, client)
+                .expect("late old-network answer");
+        });
+        let pool = Arc::new(UpstreamDnsPool::fixed(address));
+        let resolver = crate::dns_resolver_ports::DirectUdpUpstreamResolver::new(
+            address,
+            Duration::from_secs(5),
+            1,
+        )
+        .with_upstream_pool(Arc::clone(&pool));
+        let query = std::thread::spawn(move || {
+            resolver.resolve_within("site.example", AddressFamily::Ipv4, Duration::from_secs(5))
+        });
+        received
+            .recv_timeout(Duration::from_secs(5))
+            .expect("old-network query started");
+        pool.close_idle_sockets();
+        release.send(()).expect("release old-network reply");
+        assert!(query.join().expect("query worker").is_ok());
+        answer.join().expect("DNS worker");
+        assert!(
+            !pool.has_recent_answer(),
+            "a late reply from the previous network cannot certify the new DNS path"
         );
     }
 

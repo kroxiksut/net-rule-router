@@ -710,18 +710,9 @@ pub(super) fn build(inputs: PerSidApplyInputs<'_>) -> PerSidApplyStack {
                     let coord = Arc::clone(&route_coord);
                     Arc::new(move |sid: &str| coord.resolve_egress_ifindexes(sid).1.is_some())
                 })
-                // What the main link currently does with a host, by
-                // name. An offer a host made about ITSELF is parked
-                // once and never rebuilt from the ledger, so this is
-                // its only way to learn that the site started working
-                // — and the offer is withdrawn when it does.
-                .with_primary_behavior_source({
-                    let stalls =
-                        nrr_service_runtime::primary_stall_registry::global_primary_stalls();
-                    Arc::new(move |sid: &str, hostname: &str| {
-                        stalls.behavior_of_subtree(sid, hostname)
-                    })
-                }),
+                .with_primary_health_registry(
+                    nrr_service_runtime::primary_stall_registry::global_primary_stalls(),
+                ),
             );
             let observe_consumer = Arc::new(
                 nrr_service_runtime::dns_observation_consumer::DnsObservationConsumer::new(

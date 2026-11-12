@@ -82,6 +82,10 @@ pub const TRACE_BLOCK_BY_OTHER: Key = key(
     "diag.conn-trace.verdict.block-by-other",
     "Blocked (another program)",
 );
+pub const TRACE_BLOCK_BY_UNKNOWN: Key = key(
+    "diag.conn-trace.verdict.block-by-unknown",
+    "Blocked (owner could not be verified)",
+);
 pub const TRACE_FROM: Key = key("diag.conn-trace.entries-from", "from");
 pub const TRACE_RELAY_FOR: Key = key("diag.conn-trace.relay-for", "relay for %1");
 pub const TRACE_LEARNED_ROUTE: Key = key(
@@ -221,7 +225,7 @@ pub const HISTORY_FAILED: Key = key(
 
 pub const OUTAGE_INTRO: Key = key(
     "diag.outage-blocks.intro",
-    "What leak protection held back while the additional connection was down. Your rules send these addresses there, so they were blocked instead of leaving through the main connection.",
+    "These connection attempts were blocked because the additional connection required by your rules was unavailable. The list stays available after it returns. Names marked “did not resolve” got no address during the outage, so no connection was made.",
 );
 pub const OUTAGE_ACTIVE: Key = key(
     "diag.outage-blocks.episode-active",
@@ -498,7 +502,7 @@ pub const SITE_COOKIES_EDGE: Key = key("diag.site-check.cookies.edge", "Edge");
 pub const SITE_COOKIES_FIREFOX: Key = key("diag.site-check.cookies.firefox", "Firefox");
 pub const SITE_COOKIES_NOTE: Key = key(
     "diag.site-check.cookies.note",
-    "NetRuleRouter never reads or changes browser data.",
+    "NetRuleRouter does not read or change your cookies.",
 );
 pub const SITE_MOVE: Key = key(
     "tui.diagnostics.site-move",
@@ -739,6 +743,7 @@ pub const ALL: &[Key] = &[
     TRACE_SEARCH_LABEL,
     TRACE_BLOCK_BY_NRR,
     TRACE_BLOCK_BY_OTHER,
+    TRACE_BLOCK_BY_UNKNOWN,
     TRACE_FROM,
     TRACE_RELAY_FOR,
     TRACE_LEARNED_ROUTE,

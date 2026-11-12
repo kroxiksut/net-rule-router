@@ -234,6 +234,7 @@ fn bare_file_name(name: &str) -> String {
 }
 
 fn write_sections(input: &ArchiveInput, dir: &Path) -> DiagnosticsResult<StagedSections> {
+    let aliases = crate::archive::correlation::ArchiveAliases::new()?;
     let mut staged = StagedSections::default();
     let written = &mut staged.files;
 
@@ -246,7 +247,7 @@ fn write_sections(input: &ArchiveInput, dir: &Path) -> DiagnosticsResult<StagedS
         if section == ArchiveSection::Logs && raw_logs_replace_listing(input) {
             continue;
         }
-        let outcome = write_section(input, dir, section)?;
+        let outcome = write_section(input, dir, section, &aliases)?;
         if let Some(entries) = outcome.entries {
             match section {
                 ArchiveSection::Logs => staged.log_entries = entries,
@@ -290,11 +291,15 @@ fn write_sections(input: &ArchiveInput, dir: &Path) -> DiagnosticsResult<StagedS
             }
             let mut content = String::new();
             let mut shipped: u32 = 0;
-            for line in &file.lines {
-                let Some(line) = crate::logs::privacy::cap_stored_line(line, ceiling) else {
+            for original in &file.lines {
+                let Some(line) = crate::logs::privacy::cap_stored_line(original, ceiling) else {
                     continue;
                 };
-                content.push_str(&line);
+                content.push_str(&aliases.log_line(
+                    original,
+                    line.as_ref(),
+                    input.request.redaction_mode,
+                ));
                 content.push('\n');
                 shipped += 1;
             }
@@ -387,19 +392,18 @@ fn write_section(
     input: &ArchiveInput,
     dir: &Path,
     section: ArchiveSection,
+    aliases: &crate::archive::correlation::ArchiveAliases,
 ) -> DiagnosticsResult<SectionWrite> {
     let path = dir.join(section.filename());
     match section {
         ArchiveSection::Health => {
-            // Merge `health` (the live DiagnosticsStatusDto snapshot) with
-            // `health_enrichment` (behavior mode / state-schema version /
-            // adapters snapshot) into a single flat JSON object. Both sides
-            // serialize as objects; enrichment keys are only present when
-            // populated (`skip_serializing_if = "Option::is_none"`), so an
-            // unpopulated enrichment DTO leaves `health.json` byte-identical
-            // to the pre-enrichment shape.
+            // Optional evidence shares the health object and the archive's aliases.
             let mut merged = serde_json::to_value(&input.health).map_err(ser_err)?;
             let mut enrichment_dto = input.health_enrichment.clone();
+            if let Some(discovery) = enrichment_dto.suggestion_discovery.as_mut() {
+                aliases.discovery(discovery, input.request.redaction_mode);
+            }
+            redact_dns_evidence(&mut enrichment_dto, input.request.redaction_mode, aliases);
             if let Some(snapshot) = enrichment_dto.adapters_snapshot.as_mut() {
                 redact_adapters_snapshot(snapshot, input.request.redaction_mode);
             }
@@ -631,11 +635,14 @@ fn count_markers(dir: &Path) -> MarkerCounts {
         let Ok(text) = std::fs::read_to_string(dir.join(name)) else {
             continue;
         };
-        counts.hostnames += text.matches(MARKER_MASKED_HOST).count() as u32;
+        counts.hostnames +=
+            (text.matches(MARKER_MASKED_HOST).count() + text.matches("<host:").count()) as u32;
         counts.values += text.matches(MARKER_REDACTED).count() as u32;
         counts.ips += (text.matches(MARKER_MASKED_IPV4).count()
             + text.matches(MARKER_PRIVATE_IPV4).count()
-            + text.matches(MARKER_PUBLIC_IPV4).count()) as u32;
+            + text.matches(MARKER_PUBLIC_IPV4).count()
+            + text.matches("<endpoint:").count()
+            + text.matches("<flow:").count()) as u32;
         counts.paths += text.matches(MARKER_MASKED_PATH).count() as u32;
     }
     counts
@@ -655,13 +662,60 @@ fn redaction_mode_slug(mode: crate::privacy::RedactionMode) -> String {
     }
 }
 
-/// Reduces the adapter snapshot embedded in `health.json` to what the chosen
-/// redaction mode allows.
-///
-/// The snapshot carries MAC addresses, local addresses, gateways and DNS
-/// servers, and it went into every default export untouched while the
-/// manifest in the same zip promised no credential-like content. The adapter
-/// redaction helper written for exactly this shape had no production caller.
+/// Apply the export's privacy ceiling to the caller's DNS evidence.
+fn redact_dns_evidence(
+    enrichment: &mut DiagnosticArchiveHealthEnrichmentDto,
+    mode: crate::privacy::RedactionMode,
+    aliases: &crate::archive::correlation::ArchiveAliases,
+) {
+    use crate::privacy::redact::{redact_ipv4_str, redact_process_path};
+    if let Some(dns) = enrichment.dns_compatibility.as_mut() {
+        if let Some(program) = dns.verified_program.as_mut() {
+            *program = redact_process_path(program, mode).display_or_marker();
+        }
+        for issue in &mut dns.issues {
+            issue.program = redact_process_path(&issue.program, mode).display_or_marker();
+        }
+    }
+    let Some(status) = enrichment.site_check.as_mut() else {
+        return;
+    };
+    let host = |value: &mut String| {
+        if !value.is_empty() && !mode.shows_full_hostname() {
+            *value = aliases.host(value);
+        }
+    };
+    let ip = |value: &mut String| {
+        if !value.is_empty() && !mode.shows_ip() {
+            *value = redact_ipv4_str(value, mode).display_or_marker();
+        }
+    };
+    host(&mut status.host);
+    if let Some(report) = status.report.as_mut() {
+        host(&mut report.site);
+        for value in &mut report.move_names {
+            host(value);
+        }
+        for name in &mut report.names {
+            host(&mut name.name);
+            ip(&mut name.address);
+            for value in &mut name.redirects {
+                host(value);
+            }
+            for value in &mut name.real_addresses {
+                ip(value);
+            }
+            if let Some(value) = name.fake_address.as_mut() {
+                ip(value);
+            }
+            if !mode.is_elevated() && name.rule_id.is_some() {
+                name.rule_id = Some(crate::privacy::redact::MARKER_REDACTED.to_owned());
+            }
+        }
+    }
+}
+
+/// Apply the same ceiling to adapter identities and addresses.
 fn redact_adapters_snapshot(
     snapshot: &mut nrr_shared::ipc_payloads::SnapshotInterfacesResponse,
     mode: crate::privacy::RedactionMode,

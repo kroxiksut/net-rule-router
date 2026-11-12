@@ -30,6 +30,11 @@ pub(crate) fn simulate_sleep(by: Duration) {
     SLEPT.with(|slept| slept.set(slept.get().saturating_add(by)));
 }
 
+#[cfg(test)]
+pub(crate) fn simulated_sleep() -> Duration {
+    SLEPT.with(std::cell::Cell::get)
+}
+
 /// Install the platform's suspend-aware clock (time since boot). Only the first
 /// call counts.
 pub fn install_source(source: fn() -> Duration) {

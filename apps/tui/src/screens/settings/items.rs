@@ -26,6 +26,8 @@ pub enum Words {
     Fill(Key, Vec<(&'static str, String)>),
     /// A key whose placeholders are themselves words.
     Nested(Key, Vec<(&'static str, Words)>),
+    /// Outside values stay literal and cannot alter the surrounding label.
+    SafeNested(Key, Vec<(&'static str, Words)>),
     /// A key named by a service slug, with the slug as its fallback.
     Dynamic(String),
     Raw(String),
@@ -94,6 +96,18 @@ impl Words {
             Self::Dynamic(id) => {
                 let fallback = id.rsplit('.').next().unwrap_or(id);
                 texts.dynamic(id, fallback)
+            }
+            Self::SafeNested(key, values) => {
+                let args = values
+                    .iter()
+                    .map(|(name, value)| ((*name).to_owned(), value.resolve(texts)))
+                    .collect();
+                nrr_client_logic::placeholders::format_log_line(
+                    &texts.get(*key),
+                    key.en,
+                    &args,
+                    &[] as &[String],
+                )
             }
             Self::Raw(text) => text.clone(),
             Self::Failed(key, failure) => {
@@ -230,6 +244,10 @@ pub enum ItemId {
     SharedExemptionsDetails,
     /// Opens or closes the machine-wide DoH/DoT resolver list.
     DohManage,
+    DnsCompatibilityRecheck,
+    DnsCompatibilityHelp,
+    DnsCompatibilitySecondary,
+    DnsCompatibilitySite,
     DohResolver(usize),
     DohResolverRemove(usize),
     DohNewTarget,
@@ -953,21 +971,139 @@ fn default_route_note(mode: &str) -> Words {
     ])
 }
 
+fn dns_compatibility_rows(app: &AppState) -> Vec<Item> {
+    use crate::dns_compatibility as dns;
+    let state = &app.dns_compatibility;
+    let mut rows = vec![heading(dns::TITLE), info(Words::Key(dns::status(state)))];
+    if state.history_incomplete {
+        rows.push(info(Words::Key(dns::HISTORY_INCOMPLETE)));
+    }
+    if state.recovery_pending {
+        rows.push(info(Words::Key(dns::CHECKING)));
+    }
+    if let Some(failure) = &app.dns_compatibility_error {
+        rows.push(info(Words::Key(dns::CHECK_FAILED)));
+        rows.push(info(Words::Failed(t::LOAD_FAILED, failure.clone())));
+    }
+    if let Some(at) = state.last_checked_ms {
+        rows.push(info(Words::Fill(
+            dns::CHECKED_AT,
+            vec![(
+                "time",
+                crate::screens::inspect::wall_clock(i64::try_from(at).unwrap_or(i64::MAX)),
+            )],
+        )));
+    }
+    for issue in state.issues.iter().take(8) {
+        let timestamp = |ms| {
+            raw(crate::screens::inspect::wall_clock(
+                i64::try_from(ms).unwrap_or(i64::MAX),
+            ))
+        };
+        rows.push(info(Words::SafeNested(
+            dns::ISSUE,
+            vec![
+                ("program", raw(display_text(&issue.program).into_owned())),
+                ("reason", Words::Key(dns::reason(&issue.reason))),
+                ("evidence", Words::Key(dns::evidence(&issue.evidence))),
+                ("attempts", raw(issue.attempts.to_string())),
+                ("first", timestamp(issue.first_seen_ms)),
+                ("last", timestamp(issue.last_seen_ms)),
+            ],
+        )));
+    }
+    rows.push(info(Words::Nested(
+        dns::RESOLVER,
+        vec![
+            (
+                "listener",
+                Words::Key(dns::readiness(&state.resolver.listener)),
+            ),
+            (
+                "redirect",
+                Words::Key(dns::readiness(&state.resolver.redirect)),
+            ),
+            (
+                "upstream",
+                Words::Key(dns::readiness(&state.resolver.upstream)),
+            ),
+        ],
+    )));
+    rows.push(info(Words::Nested(
+        dns::SECONDARY_STATE,
+        vec![(
+            "state",
+            Words::Key(dns::readiness(&state.secondary_readiness)),
+        )],
+    )));
+    use nrr_shared::ipc_payloads::DnsCompatibilityAction;
+    for (offered, id, label) in [
+        (
+            DnsCompatibilityAction::Recheck,
+            ItemId::DnsCompatibilityRecheck,
+            dns::CHECK,
+        ),
+        (
+            DnsCompatibilityAction::BrowserInstructions,
+            ItemId::DnsCompatibilityHelp,
+            dns::HELP,
+        ),
+        (
+            DnsCompatibilityAction::CheckSecondary,
+            ItemId::DnsCompatibilitySecondary,
+            dns::CHECK_SECONDARY,
+        ),
+        (
+            DnsCompatibilityAction::DiagnoseSite,
+            ItemId::DnsCompatibilitySite,
+            crate::i18n::key("diag.site-check.run", "Check site"),
+        ),
+    ] {
+        if state.available_actions.contains(&offered) {
+            rows.push(action(id, label, false));
+        }
+    }
+    if app.settings.dns_help_open {
+        for settings in state.browser_settings.iter().take(3) {
+            rows.push(info(Words::Nested(
+                dns::BROWSER_SETTING,
+                vec![
+                    ("browser", Words::Key(dns::browser_name(settings.browser))),
+                    (
+                        "mode",
+                        Words::Key(dns::browser_mode(settings.configured_mode)),
+                    ),
+                    ("policy", Words::Key(dns::browser_policy(settings.policy))),
+                    ("source", Words::Key(dns::browser_source(settings.source))),
+                ],
+            )));
+        }
+        rows.push(info(Words::Key(dns::BROWSER_READ_ONLY)));
+        rows.push(info(Words::Key(dns::INSTRUCTIONS)));
+        rows.push(info(Words::Key(dns::verification_instructions(app))));
+    }
+    rows
+}
+
 fn routing(app: &AppState) -> Vec<Item> {
+    let mut v = dns_compatibility_rows(app);
     let s = &app.settings;
     let policy = match &s.data.policy {
         Loadable::Ready(policy) => policy,
-        other => return vec![pending(app, other)],
+        other => {
+            v.push(pending(app, other));
+            return v;
+        }
     };
     let stability_row = match &s.data.stability {
         Loadable::Ready(config) => Ok(config),
         other => Err(other),
     };
     let paused = app.routing_state() == crate::state::RoutingState::Paused;
-    let mut v = vec![
+    v.extend([
         heading(t::RULES_PAUSE_TITLE),
         toggle(ItemId::RulesPause, t::RULES_PAUSE_TITLE, !paused),
-    ];
+    ]);
     if paused {
         v.extend(pause_rows(app));
     }
@@ -1017,16 +1153,14 @@ fn routing(app: &AppState) -> Vec<Item> {
 
     v.push(heading(t::DOH_TITLE));
     v.push(policy_toggle(policy, "doh-lockdown-auto", t::DOH_AUTO).note(t::DOH_AUTO_NOTE));
-    if policy_bool(policy, "doh-lockdown-auto") {
-        // What the service decided, read back rather than guessed.
-        v.push(info(Words::Key(
-            if policy_bool(policy, "doh-lockdown-effective") {
-                t::DOH_AUTO_ON
-            } else {
-                t::DOH_AUTO_OFF
-            },
-        )));
+    let dns_status = if app.link == crate::link::Link::Connected {
+        routing_settings::doh_lockdown_status(policy)
     } else {
+        "unconfirmed"
+    };
+    v.push(info(Words::Key(t::doh_status(dns_status))));
+    v.push(info(Words::Key(t::DOH_NOTE)));
+    if !policy_bool(policy, "doh-lockdown-auto") {
         v.push(policy_toggle(policy, "doh-lockdown-enabled", t::DOH_ENABLE));
         if policy_bool(policy, "doh-lockdown-enabled") {
             v.push(choice(

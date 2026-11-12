@@ -199,7 +199,8 @@ fn client_bound_after_udp_datagrams(
         outbound: Arc::clone(&s2c),
         mtu: MTU,
     });
-    let mut stack = FakeIpStack::new(stack_device, &pool, relay, dialer, StackWaker::new())
+    let waker = StackWaker::new();
+    let mut stack = FakeIpStack::new(stack_device, &pool, relay, dialer, Arc::clone(&waker))
         .with_health(Arc::clone(health));
 
     let mut client_device = PipeClientDevice {
@@ -236,9 +237,8 @@ fn client_bound_after_udp_datagrams(
     // EARLIER datagram, which is a reply this caller has already seen — the
     // stack then never gets the steps its last datagram needs.
     let mut depth_at_last_send: Option<usize> = None;
-    // The dial and the reader run on worker threads. While the stack waits on
-    // one, the loop waits too, on a frozen clock and without spending a tick:
-    // a loaded machine then costs wall time, never the outcome.
+    // Workers wake this helper through the production path, so scheduler load
+    // consumes wall time rather than virtual ticks.
     let deadline = std::time::Instant::now() + Duration::from_secs(60);
     let mut ticks = 0;
     while ticks < 1000 {
@@ -247,12 +247,19 @@ fn client_bound_after_udp_datagrams(
             .values()
             .any(|bind| !bind.pending.is_empty());
         let next_held = sent > 0 && sent < datagrams && !ready_for_next(&stack);
-        if dial_pending || next_held {
+        let waiting_for_output = depth_at_last_send.is_some_and(|depth| guard(&s2c).len() == depth);
+        let reader_pending = (next_held || waiting_for_output)
+            && stack
+                .udp_binds
+                .values()
+                .any(|bind| bind.clients.values().any(|flow| !flow.replies.is_dead()));
+        if dial_pending || reader_pending {
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
             assert!(
-                std::time::Instant::now() < deadline,
+                !remaining.is_zero(),
                 "the relay's worker never reported back"
             );
-            std::thread::sleep(Duration::from_millis(1));
+            waker.wait(remaining);
         } else {
             now_ms += 5;
             ticks += 1;

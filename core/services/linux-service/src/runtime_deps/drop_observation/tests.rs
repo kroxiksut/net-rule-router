@@ -22,6 +22,8 @@ use nrr_service_runtime::service_tasks::{fold_observations, AppObservationWiring
 
 use super::*;
 
+mod discovery;
+
 const ETH: u32 = 2;
 const WG: u32 = 9;
 
@@ -94,6 +96,13 @@ impl Rig {
 /// Alice's additional route is down, Bob's is up. `reports_start` decides
 /// whether the drop reports come up.
 fn rig(reports_start: bool) -> Rig {
+    rig_with_discovery(reports_start, None)
+}
+
+fn rig_with_discovery(
+    reports_start: bool,
+    pipeline: Option<Arc<nrr_service_runtime::discovery_observation::DiscoveryObservationPipeline>>,
+) -> Rig {
     let api = nrr_platform_api::windows_api::MockWindowsApi::new();
     api.set_adapter_infos(vec![
         adapter(ETH, "eth0", Ipv4Addr::new(192, 168, 0, 5)),
@@ -101,11 +110,11 @@ fn rig(reports_start: bool) -> Rig {
     ]);
     let api: Arc<dyn nrr_platform_api::route_table::RouteTablePort> = Arc::new(api);
     let ring = Arc::new(ConnectionTraceRing::new(64));
-    let tee = Arc::new(ConnTraceTee::new(
-        Arc::clone(&ring),
-        Arc::clone(&api),
-        Arc::new(NoBindings),
-    ));
+    let tee = ConnTraceTee::new(Arc::clone(&ring), Arc::clone(&api), Arc::new(NoBindings));
+    let tee = Arc::new(match pipeline {
+        Some(pipeline) => tee.with_discovery_observation(pipeline),
+        None => tee,
+    });
     let (alice, bob) = (alice(), bob());
     let journal = Arc::new(InMemoryBlockNoticeJournalStore::new());
     let center = Arc::new(

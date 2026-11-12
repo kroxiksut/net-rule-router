@@ -100,11 +100,15 @@ impl IpcHandler for AutoRuleCandidatesListHandler {
         let sid = principal(ctx)?;
         let quiet = self.engine.quiet_note_for(sid);
         let candidates = self.engine.candidates(sid);
+        let discovery = self.engine.discovery_snapshot(sid, SystemTime::now());
         serde_json::to_value(AutoRuleCandidatesListResponse {
             pending_count: shown_by_default_count(&candidates) as u64,
             candidates,
             inert_dropped: quiet.inert,
             inert_sample: quiet.sample,
+            discovery_episodes: discovery.episodes,
+            discovery_omitted: discovery.omitted,
+            discovery_limitations: discovery.limitations,
         })
         .map_err(|e| IpcError {
             code: IpcErrorCode::Internal,
@@ -115,6 +119,55 @@ impl IpcHandler for AutoRuleCandidatesListHandler {
 }
 
 // ── accept ───────────────────────────────────────────────────────────────────
+
+pub struct AutoRuleDiscoveryFeedbackHandler {
+    engine: Arc<AutoRulesEngine>,
+}
+
+impl AutoRuleDiscoveryFeedbackHandler {
+    pub fn new(engine: Arc<AutoRulesEngine>) -> Self {
+        Self { engine }
+    }
+}
+
+impl CheckedIpcHandler for AutoRuleDiscoveryFeedbackHandler {
+    type Checked = nrr_shared::ipc_payloads::DiscoveryFeedbackRequest;
+
+    fn precheck(
+        &self,
+        request: &IpcRequestEnvelope,
+        ctx: &IpcRequestContext,
+    ) -> Result<Self::Checked, IpcError> {
+        principal(ctx)?;
+        Self::Checked::checked_from_payload(&request.payload).map_err(|message| IpcError {
+            code: IpcErrorCode::MalformedRequest,
+            message: message.to_owned(),
+            diagnostics_id: None,
+        })
+    }
+
+    fn execute(
+        &self,
+        checked: Prechecked<Self::Checked>,
+        _request: &IpcRequestEnvelope,
+        ctx: &IpcRequestContext,
+    ) -> HandlerOutcome {
+        let feedback = checked.into_inner();
+        let recorded = self.engine.record_discovery_feedback(
+            principal(ctx)?,
+            &feedback.ids,
+            &feedback.state,
+            &feedback.reason,
+            SystemTime::now(),
+        );
+        serde_json::to_value(nrr_shared::ipc_payloads::DiscoveryFeedbackResponse { recorded })
+            .map_err(|error| IpcError {
+                code: IpcErrorCode::Internal,
+                message: error.to_string(),
+                diagnostics_id: None,
+            })
+    }
+}
 
 pub struct AutoRuleCandidatesAcceptHandler {
     engine: Arc<AutoRulesEngine>,
@@ -326,6 +379,49 @@ mod tests {
 
     fn engine() -> Arc<AutoRulesEngine> {
         engine_with_store().0
+    }
+
+    #[test]
+    fn discovery_a_refused_unknown_site_has_an_owner_scoped_explanation_without_an_offer() {
+        let e = engine();
+        assert!(!e.note_placeholder_answer_host("S-A", "missing.example", SystemTime::now()));
+        let h = AutoRuleCandidatesListHandler::new(e);
+        let own = h
+            .handle(&req(serde_json::Value::Null), &ctx(Some("S-A")))
+            .expect("own list");
+        assert!(own["candidates"].as_array().expect("offers").is_empty());
+        let episodes = own["discovery-episodes"]
+            .as_array()
+            .expect("explanation even without an offer");
+        assert_eq!(episodes.len(), 1);
+        assert_eq!(episodes[0]["host"], "missing.example");
+        assert_eq!(episodes[0]["reason"], "no-active-rules");
+        assert_eq!(episodes[0]["state"], "not-created");
+        let other = h
+            .handle(&req(serde_json::Value::Null), &ctx(Some("S-B")))
+            .expect("other list");
+        assert!(other["discovery-episodes"]
+            .as_array()
+            .expect("other episodes")
+            .is_empty());
+    }
+
+    #[test]
+    fn discovery_disabled_collection_explains_the_users_attempt_without_creating_a_rule() {
+        let e = Arc::new(AutoRulesEngine::new(
+            Arc::new(NoopRulesProvider),
+            Arc::new(|_| AutoRulesMode::Off),
+            Arc::new(InMemoryDismissalStore::new()),
+            Arc::new(InMemoryPendingStore::new()),
+            SystemTime::now(),
+        ));
+        assert!(!e.note_placeholder_answer_host("S-A", "missing.example", SystemTime::now()));
+        let value = AutoRuleCandidatesListHandler::new(e)
+            .handle(&req(serde_json::Value::Null), &ctx(Some("S-A")))
+            .expect("list");
+        assert!(value["candidates"].as_array().expect("offers").is_empty());
+        let episodes = value["discovery-episodes"].as_array().expect("explanation");
+        assert_eq!(episodes[0]["reason"], "discovery-disabled");
     }
 
     /// Also hands back the durable store, so a test can seed a refusal

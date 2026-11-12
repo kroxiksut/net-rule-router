@@ -517,6 +517,19 @@ impl EventBus {
             .any(|s| s.principal.as_deref() == Some(principal))
     }
 
+    pub fn subscriber_ids_for(&self, principal: &str) -> Vec<String> {
+        let mut ids: Vec<_> = self
+            .subscribers
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .iter()
+            .filter(|(_, state)| state.principal.as_deref() == Some(principal))
+            .map(|(id, _)| id.clone())
+            .collect();
+        ids.sort();
+        ids
+    }
+
     pub fn buffer_len(&self) -> usize {
         self.buffer
             .lock()

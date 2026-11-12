@@ -26,11 +26,16 @@ pub const SITE_CHECK_VERDICT_ROUTE_DOWN: &str = "route-down";
 pub const SITE_CHECK_VERDICT_BLOCKED: &str = "blocked";
 /// Nothing could be measured, most often because no address is known yet.
 pub const SITE_CHECK_VERDICT_UNCLEAR: &str = "unclear";
+/// The local resolver is known unavailable; cached addresses do not prove DNS works.
+pub const SITE_CHECK_VERDICT_DNS_UNAVAILABLE: &str = "dns-unavailable";
+pub const SITE_CHECK_VERDICT_SERVER_ERROR: &str = "server-error";
+/// The HTTPS server answered with an HTTP access/request refusal.
+pub const SITE_CHECK_VERDICT_HTTP_REFUSED: &str = "http-refused";
 /// The site's certificate does not verify on its route: something there
 /// answers in the site's place.
 pub const SITE_CHECK_VERDICT_CERTIFICATE_UNTRUSTED: &str = "certificate-untrusted";
 
-pub const SITE_CHECK_VERDICTS: [&str; 7] = [
+pub const SITE_CHECK_VERDICTS: [&str; 10] = [
     SITE_CHECK_VERDICT_FINE,
     SITE_CHECK_VERDICT_SIGN_IN_SPLIT,
     SITE_CHECK_VERDICT_CERTIFICATE_UNTRUSTED,
@@ -38,10 +43,13 @@ pub const SITE_CHECK_VERDICTS: [&str; 7] = [
     SITE_CHECK_VERDICT_ROUTE_DOWN,
     SITE_CHECK_VERDICT_BLOCKED,
     SITE_CHECK_VERDICT_UNCLEAR,
+    SITE_CHECK_VERDICT_DNS_UNAVAILABLE,
+    SITE_CHECK_VERDICT_SERVER_ERROR,
+    SITE_CHECK_VERDICT_HTTP_REFUSED,
 ];
 
 /// What one name's check found.
-pub const SITE_CHECK_ANSWERS: [&str; 7] = [
+pub const SITE_CHECK_ANSWERS: [&str; 8] = [
     "answered",
     "certificate-untrusted",
     "silent",
@@ -49,6 +57,7 @@ pub const SITE_CHECK_ANSWERS: [&str; 7] = [
     "no-address",
     "route-down",
     "blocked",
+    "https-unconfirmed",
 ];
 
 /// Why a name is part of the check.
@@ -75,7 +84,7 @@ pub struct SiteCheckRequest {
 }
 
 /// One name the check examined.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub struct SiteCheckNameDto {
     pub name: String,
@@ -88,12 +97,26 @@ pub struct SiteCheckNameDto {
     pub route: String,
     /// One of [`SITE_CHECK_ANSWERS`].
     pub answer: String,
+    /// Why no request was sent. This is separate from DNS availability.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub not_run_reason: Option<String>,
     /// The HTTPS status code, when this build reads the answer.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub status: Option<u16>,
     /// The hosts the `Location` chain went through, in order.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub redirects: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rule_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub revision: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub real_addresses: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fake_address: Option<String>,
+    /// `cached`, `not-observed` or `unavailable`; never a claim of a fresh lookup.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub dns: String,
 }
 
 /// What one finished check found.

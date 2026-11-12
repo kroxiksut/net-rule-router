@@ -293,6 +293,7 @@ ScrollView {
     Component.onCompleted: {
         _refreshServiceHealth()
         _consumePendingExplainHost()
+        _consumePendingSiteCheck()
         _consumeAlertsFocus()
         root.refreshDiagnosticsOnPageOpen()
     }
@@ -315,6 +316,10 @@ ScrollView {
                 Qt.callLater(section._consumePendingExplainHost)
         }
         function onPendingSiteCheckHostChanged() {
+            if (section.visible)
+                Qt.callLater(section._consumePendingSiteCheck)
+        }
+        function onPendingSiteCheckFocusChanged() {
             if (section.visible)
                 Qt.callLater(section._consumePendingSiteCheck)
         }
@@ -380,13 +385,15 @@ ScrollView {
     function _consumePendingSiteCheck() {
         var nc = root.notificationsController
         var host = String(nc.pendingSiteCheckHost || "").trim()
-        if (host === "") return
+        if (host === "" && !nc.pendingSiteCheckFocus) return
         nc.pendingSiteCheckHost = ""
-        siteCheckPanel.check(host)
+        nc.pendingSiteCheckFocus = false
+        if (host !== "") siteCheckPanel.check(host)
         Qt.callLater(function() {
             var flick = section.contentItem
             flick.contentY = Math.max(0,
                 Math.min(siteCheckPanel.y, flick.contentHeight - flick.height))
+            siteCheckPanel.focusInput()
         })
     }
     Connections {

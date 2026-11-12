@@ -166,6 +166,8 @@ pub(super) struct VpnLearningDeps<'a> {
     /// over the primary while a routed site is open names an address that
     /// site needed and did not get. `None` keeps the observer diagnostic.
     pub(super) auto_rules_engine: Option<&'a Arc<nrr_service_runtime::auto_rules::AutoRulesEngine>>,
+    pub(super) discovery_observation:
+        Option<Arc<nrr_service_runtime::discovery_observation::DiscoveryObservationPipeline>>,
     /// Block-notice reporting — unrelated to VPN learning, bundled here for
     /// the same "keep the argument count sane" reason as `auto_rules_engine`
     /// above. Always wired (unlike the VPN learners, it needs no gate).
@@ -470,43 +472,27 @@ pub(super) fn build_conn_trace_pair(
         main_link_engine = Some(Arc::new(
             move |health: nrr_service_runtime::conn_observation_consumer::MainLinkHealth<'_>| {
                 engine_health.note_primary_health(health.sid, health.hostname, health.event);
-                // A verdict that just turned to "stalls" is the product
-                // finding out, by measurement, that the main link will not
-                // carry this site. Only on the CHANGE: the register stays
-                // silent while the verdict holds.
-                let turned_to_stalls = health.report.is_some_and(|r| {
-                    r.behavior == nrr_domain::companion_affinity::PrimaryBehavior::Stalls
-                });
-                // A host refused as pulled in is asked again on its next stall:
-                // the verdict holds, so nothing else would.
-                let asks_again = !turned_to_stalls
-                    && matches!(
-                        health.event,
-                        nrr_domain::companion_affinity::PrimaryHealthEvent::Stalled
-                    )
-                    && engine_health.awaits_main_link_recheck(health.sid, health.hostname);
-                if turned_to_stalls || asks_again {
+                let currently_stalls = matches!(
+                    health.event,
+                    nrr_domain::companion_affinity::PrimaryHealthEvent::Stalled
+                )
+                    && nrr_service_runtime::primary_stall_registry::global_primary_stalls()
+                        .behavior_of(health.sid, health.hostname)
+                        == nrr_domain::companion_affinity::PrimaryBehavior::Stalls;
+                // Settings or rules can change while the measured failure stays the same.
+                if currently_stalls {
                     let nav = nrr_service_runtime::navigation_registry::global_navigation();
                     // Bursts whose window has passed are settled before reading.
                     nav.sweep(nrr_service_runtime::conn_observation_consumer::now_unix_ms());
                     let reached = nav.counts_of(health.owner, health.hostname);
                     nrr_service_runtime::navigation_registry::log_counts(health.hostname, &reached);
                     let now = std::time::SystemTime::now();
-                    if asks_again {
-                        engine_health.recheck_main_link_blocked_host(
-                            health.sid,
-                            health.hostname,
-                            reached,
-                            now,
-                        );
-                    } else {
-                        engine_health.note_main_link_blocked_host(
-                            health.sid,
-                            health.hostname,
-                            reached,
-                            now,
-                        );
-                    }
+                    engine_health.note_main_link_blocked_host(
+                        health.sid,
+                        health.hostname,
+                        reached,
+                        now,
+                    );
                 }
             },
         ));
@@ -619,6 +605,9 @@ pub(super) fn build_conn_trace_pair(
             engine: main_link_engine,
         },
     );
+    if let Some(pipeline) = vpn_learning.discovery_observation {
+        consumer_builder = consumer_builder.with_discovery_observation(pipeline);
+    }
     // Block-notice reporting: the observer decides which OUR drops are
     // notice-worthy (see `conn_observation_consumer::block_reason_for`); the
     // center folds them into episodes and logs the survivors. Always wired —

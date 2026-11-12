@@ -4,16 +4,12 @@
 //! engine is watching carried traffic, and whether it stalled on the main
 //! route. Neither decides anything here — they are observations handed
 //! upward, which is why they sit apart from the drop path.
-//!
-//! Same inherent impl, split across files. Behaviour is unchanged.
 
 use super::*;
 
 impl ConnectionObservationConsumer {
-    /// A resend or an orderly close on the primary link, reported as at most
-    /// one outcome per connection: the verdict counts connections, and one loss
-    /// burst resends many segments at once. NOT deduped per address — the
-    /// verdict is built from how often each outcome happened.
+    /// One main-link outcome per connection, so a loss burst cannot count as
+    /// several failed connections.
     // `pub(super)`: the impl is split across files.
     pub(super) fn note_companion_primary_health(&self, obs: &ConnectionObservation, now_ms: u64) {
         if self.companion_primary_health.is_none() && self.app_main_link.is_none() {
@@ -31,18 +27,6 @@ impl ConnectionObservationConsumer {
         else {
             return;
         };
-        // Rule hosts first, then the rule-less ones. A host with a rule
-        // is named by the memory that also drives enforcement; anything
-        // else is named only well enough to be talked about.
-        let hostname = self
-            .name_for_address
-            .as_ref()
-            .and_then(|name_of| name_of(ip))
-            .or_else(|| {
-                self.health_name_fallback
-                    .as_ref()
-                    .and_then(|name_of| name_of(ip))
-            });
         let remembered = self
             .connection_programs
             .lock()
@@ -54,6 +38,18 @@ impl ConnectionObservationConsumer {
             .user_sid
             .clone()
             .or_else(|| remembered.as_ref().and_then(|(_, owner)| owner.clone()));
+        let hostname = if let Some(pipeline) = &self.discovery_observation {
+            pipeline.name_for_owner(owner.as_deref(), ip)
+        } else {
+            self.name_for_address
+                .as_ref()
+                .and_then(|name_of| name_of(ip))
+                .or_else(|| {
+                    self.health_name_fallback
+                        .as_ref()
+                        .and_then(|name_of| name_of(ip))
+                })
+        };
         if let (Some(app), Some((program, _))) = (self.app_main_link.as_ref(), remembered.as_ref())
         {
             app(
@@ -140,6 +136,10 @@ impl ConnectionObservationConsumer {
             return;
         };
         let hostname = match remote {
+            IpAddr::V4(ip) if self.discovery_observation.is_some() => self
+                .discovery_observation
+                .as_ref()
+                .and_then(|pipeline| pipeline.name_for_owner(owner, ip)),
             IpAddr::V4(ip) => self
                 .name_for_address
                 .as_ref()

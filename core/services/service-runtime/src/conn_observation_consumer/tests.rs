@@ -11,6 +11,8 @@ use nrr_domain::block_notice::BlockReason;
 use nrr_platform_api::conn_observe::TransportProtocol;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddrV4};
 
+mod nov10_regressions;
+
 const ETHERNET: u32 = 16;
 const VPN: u32 = 20;
 
@@ -1047,7 +1049,8 @@ fn an_unattributed_drop_never_produces_a_block_notice() {
     // `None` means ownership could not be resolved — not evidence enough
     // to tell the user "we blocked this".
     let (consumer, notices) = block_notice_consumer(None);
-    consumer.consume(&[block_obs(None, Some(42))], SystemTime::now());
+    let summary = consumer.consume(&[block_obs(None, Some(42))], SystemTime::now());
+    assert_eq!(summary.blocked_unknown, 1);
     assert!(notices.lock().unwrap_or_else(|p| p.into_inner()).is_empty());
 }
 
@@ -1558,6 +1561,149 @@ fn logged_lines(run: impl FnOnce()) -> Vec<(String, u64)> {
         }
     }
     lines
+}
+
+fn diagnostic_owner_lines(
+    run: impl FnOnce(),
+    audience: nrr_shared::diagnostics_dto::DiagnosticsAudience,
+) -> Vec<serde_json::Value> {
+    use tracing_subscriber::layer::SubscriberExt;
+
+    let dir = tempfile::tempdir().expect("logs dir");
+    let writer = Arc::new(nrr_diagnostics::LogWriter::open(
+        nrr_diagnostics::LogWriterConfig::new(dir.path()),
+    ));
+    writer
+        .filter()
+        .set_mode(nrr_diagnostics::logs::filter::LoggingMode::Diagnostic);
+    let subscriber =
+        tracing_subscriber::registry().with(nrr_diagnostics::NdjsonTracingLayer::new(writer));
+    tracing::subscriber::with_default(subscriber, run);
+    nrr_diagnostics::logs::reader::LogReader::new(dir.path())
+        .recent_raw_lines_for(usize::MAX, &audience, None)
+        .into_iter()
+        .map(|line| serde_json::from_str(&line).expect("log event"))
+        .collect()
+}
+
+#[test]
+fn diagnostic_owner_stall_report_survives_its_users_export_without_leaking_to_another_user() {
+    use nrr_shared::diagnostics_dto::DiagnosticsAudience;
+
+    for (reader, expected) in [(STAGE0_USER, 1), ("S-1-5-21-OTHER", 0)] {
+        let stalls = Arc::new(crate::primary_stall_registry::PrimaryStallRegistry::new());
+        let consumer = consumer_on_both_links().with_main_link_diagnostics(stage0(&stalls, None));
+        let lines = diagnostic_owner_lines(
+            || {
+                for port in 0..3 {
+                    let mut batch = stalled_main_link_connection(51_000 + port);
+                    batch[0].user_sid = Some(STAGE0_USER.to_string());
+                    consumer.consume(&batch, SystemTime::now());
+                }
+            },
+            DiagnosticsAudience::Principal(reader.to_string()),
+        );
+        let reports: Vec<_> = lines
+            .iter()
+            .filter(|line| line["message_key"] == "diag.event.stallreg-destination-stalling")
+            .collect();
+        assert_eq!(reports.len(), expected, "reader={reader}: {lines:?}");
+        for report in reports {
+            assert_eq!(report["principal"], STAGE0_USER);
+            assert_eq!(report["payload"]["hostname"], STAGE0_HOST);
+        }
+    }
+}
+
+#[test]
+fn diagnostic_owner_unanswered_connections_keep_each_users_ownerless_resends_in_their_export() {
+    use nrr_shared::diagnostics_dto::DiagnosticsAudience;
+
+    let owners = ["S-1-5-21-ONE", "S-1-5-21-TWO"];
+    for (owner_index, reader) in owners.iter().enumerate() {
+        let consumer = consumer_on_both_links();
+        let lines = diagnostic_owner_lines(
+            || {
+                let mut batches = [silent_connection(51_100), silent_connection(51_101)];
+                for (batch, owner) in batches.iter_mut().zip(owners) {
+                    batch[0].user_sid = Some(owner.to_string());
+                }
+                for index in 0..batches[0].len() {
+                    for batch in &batches {
+                        consumer.consume(&[batch[index].clone()], SystemTime::now());
+                    }
+                }
+            },
+            DiagnosticsAudience::Principal(reader.to_string()),
+        );
+        let reports: Vec<_> = lines
+            .iter()
+            .filter(|line| {
+                matches!(
+                    line["message_key"].as_str(),
+                    Some("diag.event.conn-unanswered" | "diag.event.conn-unanswered-closed")
+                )
+            })
+            .collect();
+        assert_eq!(reports.len(), 2, "reader={reader}: {lines:?}");
+        for report in reports {
+            assert_eq!(report["principal"], *reader);
+            assert_eq!(report["payload"]["local_port"], 51_100 + owner_index);
+            assert_ne!(report["payload"]["remote"], "<redacted>");
+        }
+    }
+}
+
+#[test]
+fn diagnostic_owner_unknown_connections_are_not_assigned_to_the_active_user() {
+    use nrr_shared::diagnostics_dto::DiagnosticsAudience;
+
+    let lines = diagnostic_owner_lines(
+        || {
+            consumer_on_both_links().consume(&silent_connection(51_200), SystemTime::now());
+        },
+        DiagnosticsAudience::Principal(STAGE0_USER.to_string()),
+    );
+    assert!(lines.iter().all(|line| !matches!(
+        line["message_key"].as_str(),
+        Some("diag.event.conn-unanswered" | "diag.event.conn-unanswered-closed")
+    )));
+}
+
+#[test]
+fn diagnostic_owner_reused_socket_does_not_assign_an_old_silence_to_its_new_user() {
+    use nrr_shared::diagnostics_dto::DiagnosticsAudience;
+
+    let owners = ["S-1-5-21-OLD", "S-1-5-21-NEW"];
+    for (reader, expected) in [(owners[0], 1), (owners[1], 2)] {
+        let consumer = consumer_on_both_links();
+        let lines = diagnostic_owner_lines(
+            || {
+                let mut old = silent_connection(51_300);
+                old[0].user_sid = Some(owners[0].to_string());
+                consumer.consume(&old[..old.len() - 1], SystemTime::now());
+                let mut new = silent_connection(51_300);
+                new[0].user_sid = Some(owners[1].to_string());
+                for observation in &mut new {
+                    observation.observed_unix_ms =
+                        observation.observed_unix_ms.map(|at| at + 50_000);
+                }
+                consumer.consume(&new, SystemTime::now());
+            },
+            DiagnosticsAudience::Principal(reader.to_string()),
+        );
+        let reports: Vec<_> = lines
+            .iter()
+            .filter(|line| {
+                matches!(
+                    line["message_key"].as_str(),
+                    Some("diag.event.conn-unanswered" | "diag.event.conn-unanswered-closed")
+                )
+            })
+            .collect();
+        assert_eq!(reports.len(), expected, "reader={reader}: {lines:?}");
+        assert!(reports.iter().all(|report| report["principal"] == reader));
+    }
 }
 
 /// A main-link connection from `port` whose peer went silent: established,

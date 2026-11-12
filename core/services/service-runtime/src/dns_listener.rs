@@ -37,7 +37,7 @@ use crate::dns_resolver::{
 use crate::dns_wire::{
     build_a_response, build_error_response, build_negative_response, only_v4,
     parse_address_response, parse_question, AddressResponseOutcome, ParsedQuestion, QTYPE_A,
-    QTYPE_AAAA, QTYPE_HTTPS, RCODE_NOERROR, RCODE_NXDOMAIN, RCODE_SERVFAIL,
+    QTYPE_AAAA, QTYPE_HTTPS, QTYPE_SRV, RCODE_NOERROR, RCODE_NXDOMAIN, RCODE_SERVFAIL,
 };
 
 /// TTL (seconds) stamped on resolver-built `A` responses. Deliberately SHORT so
@@ -614,9 +614,9 @@ impl DnsInterceptListener {
         self
     }
 
-    /// Wire the machine's private resolvers so a "no such name" from one
-    /// server is re-asked of the resolvers that could hold an internal
-    /// namespace. Without it the listener keeps its single-server behaviour.
+    /// Wire the machine's private resolvers so a missing name or a direct
+    /// host's empty A/SRV answer can be re-asked inside its internal namespace.
+    /// Without it the listener keeps its single-server behaviour.
     #[must_use]
     pub fn with_private_resolvers(mut self, servers: PrivateResolversFn) -> Self {
         self.private_resolvers = Some(servers);
@@ -1668,6 +1668,7 @@ impl DnsInterceptListener {
         budget: Duration,
         transport: Transport,
     ) -> Option<Vec<u8>> {
+        let epoch = self.upstream_dns.readiness_epoch();
         let started = Instant::now();
         let left = || budget.saturating_sub(started.elapsed());
         if left().is_zero() {
@@ -1678,87 +1679,113 @@ impl DnsInterceptListener {
             Transport::Udp => self.forward_to(query, target, window),
             Transport::Tcp => self.forward_tcp_to(query, target, window),
         };
-        if let Some(reply) = forward(upstream, self.forward_timeout.min(left())) {
-            self.upstream_dns.note_success();
-            // "No such name" from ONE server is not "no such name". The
-            // machine may hold a resolver for a namespace the public
-            // internet never heard of, and Windows would have asked it —
-            // that is what asking every interface's server means. Pointing
-            // the whole system at us took that away, and a corporate host
-            // or a machine on the LAN stopped resolving.
-            if reply_is_nxdomain(&reply) {
-                // A name with no dot was never going to be found by a
-                // resolver that answers for the public internet. Complete it
-                // first — that is the step the OS lost when every name was
-                // pointed at loopback — and only then ask around.
-                if let Some(label) = single_label_of(query) {
-                    if let Some(done) = self.complete_single_label(query, &label, left()) {
-                        return Some(done);
-                    }
+        let (upstream, reply) = match forward(upstream, self.forward_timeout.min(left())) {
+            Some(reply) => (upstream, reply),
+            None => {
+                if left().is_zero() {
+                    return None;
                 }
-                if let Some(better) = self.ask_private_resolvers(query, upstream, left()) {
-                    return Some(better);
+                // Rotation and its retry spend this same query's budget.
+                let replacement = self.upstream_dns.note_failure()?;
+                let window = self.forward_timeout.min(left());
+                if window.is_zero() {
+                    return None;
                 }
-                // Nobody we can ask knows it. "No such name" would be a
-                // claim about the whole of DNS, and for a bare label we are
-                // not the one who gets to make it: the OS still has ways of
-                // its own — the multicast and broadcast lookups that find a
-                // machine on the local link, which never touch a DNS server.
-                // Saying "I cannot answer" hands the question back intact,
-                // and unlike a non-existence it is not remembered as a fact.
-                if single_label_of(query).is_some() {
-                    if let Some(servfail) = build_error_response(query, RCODE_SERVFAIL) {
-                        return Some(servfail);
+                (replacement, forward(replacement, window)?)
+            }
+        };
+        self.upstream_dns.note_success_in_epoch(epoch);
+        // Public DNS may know neither a gateway's A nor its domain's SRV
+        // records. Ordinary AAAA NODATA and rule-controlled names stay intact.
+        let direct_answer_missing = reply.len() >= 12
+            && reply[6] == 0
+            && reply[7] == 0
+            && parse_question(query).is_some_and(|q| {
+                !self.oracle.is_rule_host(&q.qname)
+                    && match q.qtype {
+                        QTYPE_A => matches!(
+                            parse_address_response(
+                                u16::from_be_bytes([query[0], query[1]]),
+                                &q.qname,
+                                QTYPE_A,
+                                &reply,
+                            ),
+                            AddressResponseOutcome::NoRecords
+                        ),
+                        QTYPE_SRV => {
+                            reply[2] & 0x82 == 0x80
+                                && reply[3] & 0x0F == RCODE_NOERROR
+                                && reply_answers_query(query, &reply)
+                                && crate::dns_wire::question_key(query)
+                                    .is_some_and(|(_, _, class)| class == 1)
+                        }
+                        _ => false,
                     }
+            });
+        let nxdomain = reply_is_nxdomain(&reply);
+        if nxdomain || direct_answer_missing {
+            if let Some(label) = single_label_of(query) {
+                if let Some(done) = self.complete_single_label(query, &label, left()) {
+                    return Some(done);
                 }
             }
-            return Some(reply);
+            if let Some(better) = self.ask_private_resolvers(query, upstream, left(), transport) {
+                return Some(better);
+            }
+            // A bare name may still be found by the OS's multicast/broadcast
+            // lookup. Do not cache a global non-existence on its behalf.
+            if nxdomain && single_label_of(query).is_some() {
+                if let Some(servfail) = build_error_response(query, RCODE_SERVFAIL) {
+                    return Some(servfail);
+                }
+            }
         }
-        if left().is_zero() {
-            return None;
-        }
-        // Rotation probes the candidates, which costs time of its own.
-        let replacement = self.upstream_dns.note_failure()?;
-        let window = self.forward_timeout.min(left());
-        if window.is_zero() {
-            return None;
-        }
-        let reply = forward(replacement, window)?;
-        self.upstream_dns.note_success();
         Some(reply)
     }
 
-    /// Re-ask the machine's PRIVATE resolvers for a name one server called
-    /// non-existent. `None` when nobody had a better answer.
+    /// Re-ask the machine's PRIVATE resolvers after a missing name or a direct
+    /// host's empty A/SRV answer. `None` when nobody had a better answer.
     ///
     /// Private only: a public resolver answers from the same global data as
     /// the one already asked, so re-asking buys latency and no knowledge. A
     /// resolver on a private address is the one that can hold an internal
     /// namespace — a corporate domain, or the names of machines on the LAN.
     ///
-    /// Costs nothing on the answered path: this runs only for names that
-    /// already came back as non-existent.
+    /// Positive upstream answers never take this path.
     fn ask_private_resolvers(
         &self,
         query: &[u8],
         already_asked: SocketAddr,
         budget: Duration,
+        transport: Transport,
     ) -> Option<Vec<u8>> {
-        self.ask_private_resolvers_via(already_asked, budget, Instant::now, |target, window| {
-            self.forward_to(query, target, window)
-        })
+        self.ask_private_resolvers_via(
+            query,
+            already_asked,
+            budget,
+            Instant::now,
+            |target, window| match transport {
+                Transport::Udp => self.forward_to(query, target, window),
+                Transport::Tcp => self.forward_tcp_to(query, target, window),
+            },
+        )
     }
 
     /// [`Self::ask_private_resolvers`] with the clock and the network passed
     /// in, so a test can spend a budget without waiting it out.
     fn ask_private_resolvers_via(
         &self,
+        query: &[u8],
         already_asked: SocketAddr,
         budget: Duration,
         now: impl Fn() -> Instant,
         mut ask: impl FnMut(SocketAddr, Duration) -> Option<Vec<u8>>,
     ) -> Option<Vec<u8>> {
         let servers = self.private_resolvers.as_ref()?;
+        let address_question =
+            parse_question(query).filter(|q| matches!(q.qtype, QTYPE_A | QTYPE_AAAA));
+        let service_question = crate::dns_wire::question_key(query)
+            .is_some_and(|(_, qtype, class)| qtype == QTYPE_SRV && class == 1);
         let started = now();
         let mut tried = 0usize;
         for server in servers(budget) {
@@ -1775,7 +1802,33 @@ impl DnsInterceptListener {
             let Some(reply) = ask(target, self.forward_timeout.min(left)) else {
                 continue;
             };
-            if !reply_is_nxdomain(&reply) {
+            // Keep trying after empty or failed answers. SRV is relayed as
+            // opaque DNS data, never learned as a hostname or routing address.
+            let usable = address_question.as_ref().map_or_else(
+                || {
+                    if service_question {
+                        reply.len() >= 12
+                            && reply[2] & 0x82 == 0x80
+                            && reply[3] & 0x0F == RCODE_NOERROR
+                            && u16::from_be_bytes([reply[6], reply[7]]) > 0
+                            && reply_answers_query(query, &reply)
+                    } else {
+                        !reply_is_nxdomain(&reply)
+                    }
+                },
+                |q| {
+                    matches!(
+                        parse_address_response(
+                            u16::from_be_bytes([query[0], query[1]]),
+                            &q.qname,
+                            q.qtype,
+                            &reply,
+                        ),
+                        AddressResponseOutcome::Answers { addresses, .. } if !addresses.is_empty()
+                    )
+                },
+            );
+            if usable {
                 if let Some(not_logged) = self
                     .query_notes
                     .admit(&format!("resolver {server}"), Instant::now())
@@ -1785,7 +1838,7 @@ impl DnsInterceptListener {
                         msg_key = "dns-listener-local-resolver-knows-name",
                         server = %server,
                         not_logged,
-                        "a resolver on this machine knows a name the upstream called non-existent",
+                        "a resolver on this machine supplied an answer missing from the upstream response",
                     );
                 }
                 return Some(reply);

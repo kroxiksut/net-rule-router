@@ -60,6 +60,14 @@ pub const SECONDARY_DEFERRED: Key = key(
     "dialog.first-run-wizard.secondary-adapter-deferred",
     "You can assign it any time in Connections. Until then, with leak protection on, the traffic your rules send that way is blocked instead of leaking to the main connection.",
 );
+pub const FINISH_SECONDARY_NOT_CHOSEN: Key = key(
+    "dialog.first-run-wizard.finish-secondary-not-chosen",
+    "These starting rules use the additional connection. Turn on your VPN in TUN mode, refresh the list, and choose the connection. System proxy mode does not create a connection NetRuleRouter can route through.",
+);
+pub const FINISH_SECONDARY_UNAVAILABLE: Key = key(
+    "dialog.first-run-wizard.finish-secondary-unavailable",
+    "These starting rules use the additional connection, but it is not connected. Turn on your VPN in TUN mode and refresh the list. System proxy mode is not a routable connection in this version.",
+);
 pub const VPN_HINT: Key = key(
     "dialog.first-run-wizard.secondary-adapter-vpn-hint",
     "{name} looks like your VPN. We recommend making it the additional connection: choose it above and press \"Set as additional\".",
@@ -149,6 +157,10 @@ pub const SITE_NOTICE_NOTE: Key = key(
 pub const DOH_LOCKDOWN: Key = key(
     "dialog.first-run-wizard.protection-doh-lockdown",
     "Keep browsers from resolving routed sites past NetRuleRouter",
+);
+pub const DOH_LOCKDOWN_NOTE: Key = key(
+    "dialog.first-run-wizard.protection-doh-lockdown-note",
+    "A browser using strict encrypted DNS may stop opening sites while this protection is active. Configure that browser to use system DNS; keep your routing rules and leak protection enabled.",
 );
 pub const FAKE_IP: Key = key(
     "dialog.first-run-wizard.protection-fake-ip",
@@ -386,6 +398,8 @@ pub const ALL: &[Key] = &[
     SECONDARY_ASSIGNED_DOWN,
     SECONDARY_LATER,
     SECONDARY_DEFERRED,
+    FINISH_SECONDARY_NOT_CHOSEN,
+    FINISH_SECONDARY_UNAVAILABLE,
     VPN_HINT,
     VPN_NONE,
     VPN_INSTALLED,
@@ -414,6 +428,7 @@ pub const ALL: &[Key] = &[
     LEAK_HOLDS_NOW,
     SITE_NOTICE_NOTE,
     DOH_LOCKDOWN,
+    DOH_LOCKDOWN_NOTE,
     FAKE_IP,
     DIAGNOSTIC_LOGS,
     LOGS_ONE_HOUR,

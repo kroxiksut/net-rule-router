@@ -140,6 +140,9 @@ pub struct AppState {
     /// The last snapshot the service gave; kept, and marked stale, while the
     /// service is away.
     pub snapshot: Option<SnapshotInitialResponse>,
+    pub dns_compatibility: nrr_shared::ipc_payloads::DnsCompatibilityDto,
+    pub dns_compatibility_error: Option<crate::screens::settings::Failure>,
+    pub dns_connection_generation: u64,
     pub fetch_error: Option<String>,
     /// Keyed by role slug; an empty key is a report about no single role.
     pub enforcement_down: BTreeMap<String, EnforcementDown>,
@@ -241,6 +244,9 @@ impl AppState {
         Self {
             link: Link::Connecting,
             snapshot: None,
+            dns_compatibility: Default::default(),
+            dns_compatibility_error: None,
+            dns_connection_generation: 0,
             fetch_error: None,
             enforcement_down: BTreeMap::new(),
             routes_held: None,
@@ -305,13 +311,44 @@ impl AppState {
         let Some(snapshot) = self.snapshot.as_ref().filter(|_| self.link.is_connected()) else {
             return RoutingState::Disconnected;
         };
+        let status = |role: &str| {
+            self.enforcement_down
+                .get(role)
+                .map_or("ok", |down| down.status.as_str())
+        };
+        let readiness = nrr_client_logic::routing_readiness::snapshot_routing_readiness_with_status(
+            snapshot,
+            status("primary"),
+            status("secondary"),
+        );
         if snapshot.routing_paused {
             RoutingState::Paused
-        } else if !self.enforcement_down.is_empty() {
+        } else if !self.enforcement_down.is_empty() || readiness.routing != "ready" {
             RoutingState::Limited
         } else {
             RoutingState::Active
         }
+    }
+
+    pub fn routing_readiness(
+        &self,
+    ) -> Option<nrr_client_logic::routing_readiness::RoutingReadiness> {
+        let snapshot = self
+            .snapshot
+            .as_ref()
+            .filter(|_| self.link.is_connected())?;
+        let status = |role: &str| {
+            self.enforcement_down
+                .get(role)
+                .map_or("ok", |down| down.status.as_str())
+        };
+        Some(
+            nrr_client_logic::routing_readiness::snapshot_routing_readiness_with_status(
+                snapshot,
+                status("primary"),
+                status("secondary"),
+            ),
+        )
     }
 
     /// `q`: quit, unless rules on screen are not applied yet — then the rules
@@ -347,6 +384,12 @@ impl AppState {
             BackendEvent::Link(link) => {
                 let reconnected = link.is_connected() && !self.link.is_connected();
                 if !link.is_connected() {
+                    self.dns_connection_generation =
+                        self.dns_connection_generation.saturating_add(1);
+                    self.dns_compatibility = nrr_client_logic::dns_compatibility::merge(
+                        &self.dns_compatibility,
+                        nrr_shared::ipc_payloads::DnsCompatibilityDto::default(),
+                    );
                     // A service coming back gets the whole settle window again.
                     self.policy_idle_since = None;
                 }
@@ -395,7 +438,12 @@ impl AppState {
                 }
                 effects
             }
-            BackendEvent::Snapshot(snapshot) => {
+            BackendEvent::Snapshot(mut snapshot) => {
+                self.dns_compatibility = nrr_client_logic::dns_compatibility::merge(
+                    &self.dns_compatibility,
+                    std::mem::take(&mut snapshot.dns_compatibility),
+                );
+                snapshot.dns_compatibility = self.dns_compatibility.clone();
                 let reports = snapshot.enforcement_status.clone();
                 let held = snapshot.routes_held_by_another_user.clone();
                 let carried = snapshot
@@ -471,6 +519,12 @@ impl AppState {
 
     fn apply_push(&mut self, event: StatusUpdateEvent, texts: &Texts, now: Instant) -> Vec<Effect> {
         match event {
+            StatusUpdateEvent::DnsCompatibilityChanged { state, .. } => {
+                self.dns_compatibility_error = None;
+                self.dns_compatibility =
+                    nrr_client_logic::dns_compatibility::merge(&self.dns_compatibility, state);
+                Vec::new()
+            }
             StatusUpdateEvent::EnforcementStatusChanged {
                 status,
                 role,
@@ -604,7 +658,9 @@ impl AppState {
                     &top_anchor,
                     texts,
                 ) {
-                    Some((title, body)) => self.note_in_feed(NoticeLevel::Info, title, body),
+                    Some((title, body)) => {
+                        crate::screens::suggestions::post_notice(self, &top_anchor, title, body)
+                    }
                     None => Vec::new(),
                 }
             }

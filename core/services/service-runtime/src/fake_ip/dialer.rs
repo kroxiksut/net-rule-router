@@ -202,6 +202,10 @@ pub trait RelayStream: Read + Write + Send {
 /// The write half of a split [`RelayStream`], plus the half-close signal the
 /// stack needs when the client stops sending.
 pub trait RelayWriteHalf: Write + Send {
+    fn local_source_ip(&self) -> Option<IpAddr> {
+        None
+    }
+
     /// Mirror the client's half-close upstream (see [`RelayStream::shutdown_write`]).
     fn shutdown_write(&mut self) -> Result<(), RelayError>;
 }
@@ -790,6 +794,10 @@ impl Write for TcpWriteHalf {
 }
 
 impl RelayWriteHalf for TcpWriteHalf {
+    fn local_source_ip(&self) -> Option<IpAddr> {
+        self.stream.local_addr().ok().map(|address| address.ip())
+    }
+
     fn shutdown_write(&mut self) -> Result<(), RelayError> {
         self.stream.shutdown(std::net::Shutdown::Write)?;
         Ok(())

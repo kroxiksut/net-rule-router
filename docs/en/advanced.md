@@ -2,8 +2,7 @@
 
 **English** · [Русский](../ru/advanced.md)
 
-Everything here is more technical than the [everyday guides](../README.md). You
-do not need any of it to use the program.
+Everything here is more technical than the [everyday guides](../README.md). You do not need any of it to use the program.
 
 ## Using the program in depth
 

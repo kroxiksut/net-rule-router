@@ -154,9 +154,7 @@ fn service() -> FakeService {
     fake
 }
 
-/// A site that does not open over the main route is offered the additional
-/// one, and the offer says only what was found there: it opens, it may help,
-/// or it does not open there either.
+/// A transport check never proves that the HTTPS page loaded.
 #[test]
 fn a_site_that_does_not_open_is_worded_by_what_the_additional_route_did() {
     let blocked = |id: &str, host: &str, reach: Value| {
@@ -200,7 +198,7 @@ fn a_site_that_does_not_open_is_worded_by_what_the_additional_route_did() {
             .join("\n")
     };
     assert!(
-        text_of("opens.example").contains("it opens over the additional connection"),
+        text_of("opens.example").contains("the connection check passed over the additional connection; page loading has not been verified"),
         "{}",
         text_of("opens.example")
     );
@@ -209,11 +207,14 @@ fn a_site_that_does_not_open_is_worded_by_what_the_additional_route_did() {
         unasked.contains("the additional connection may help"),
         "{unasked}"
     );
-    assert!(!unasked.contains("it opens over"), "{unasked}");
+    assert!(
+        !unasked.contains("the connection check passed"),
+        "{unasked}"
+    );
     let nowhere = text_of("nowhere.example");
     assert!(
         nowhere.is_empty()
-            || nowhere.contains("does not open over the additional connection either"),
+            || nowhere.contains("the connection check failed over the additional connection too"),
         "{nowhere}"
     );
 }
@@ -223,6 +224,59 @@ fn on_screen(fake: &FakeService) -> AppState {
     app.open(ScreenId::Suggestions);
     drain(&mut app, fake);
     app
+}
+
+#[test]
+fn an_empty_offer_list_still_explains_an_unidentified_connection() {
+    let fake = service();
+    fake.answer(
+        IpcOperationName::AutoRuleCandidatesList,
+        json!({
+            "candidates": [], "pending-count": 0,
+            "discovery-episodes": [{
+                "id": "opaque-1", "host": null, "destination": "192.0.2.1:443",
+                "state": "not-created", "reason": "name-unknown", "stage": "identity",
+                "first-seen-unix-ms": 1, "last-seen-unix-ms": 2,
+                "history": []
+            }],
+            "discovery-omitted": 3
+        }),
+    );
+    let app = on_screen(&fake);
+    let view = SuggestionsScreen.view(&app, &texts_en());
+    let text = view
+        .panels
+        .iter()
+        .flat_map(|p| &p.lines)
+        .map(ViewLine::plain_text)
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        text.contains("192.0.2.1:443"),
+        "the failed connection vanished: {text}"
+    );
+    assert!(
+        text.contains("The service could not identify the site name"),
+        "{text}"
+    );
+    assert!(
+        text.contains("3 older episodes"),
+        "bounded history must disclose omitted records: {text}"
+    );
+}
+
+#[test]
+fn a_site_with_no_candidate_can_be_checked_by_its_entered_domain() {
+    let fake = service();
+    fake.answer(
+        IpcOperationName::AutoRuleCandidatesList,
+        json!({"candidates": []}),
+    );
+    let mut app = on_screen(&fake);
+    assert!(SuggestionsScreen.on_line(&mut app, "h unknown.example"));
+    drain(&mut app, &fake);
+    assert_eq!(app.screen, ScreenId::Diagnostics);
+    assert!(fake.operations().contains(&IpcOperationName::SiteCheckRun));
 }
 
 #[test]

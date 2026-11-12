@@ -10,6 +10,10 @@ pub const ROLE_EXPLANATION: Key = key(
     "interfaces.role-explanation",
     "The main connection is your usual internet. The additional connection (e.g. VPN) carries what your rules send to it.",
 );
+pub const SYSTEM_PROXY_NOTE: Key = key(
+    "interfaces.secondary.system-proxy-note",
+    "A VPN in system proxy mode does not create a network connection NetRuleRouter can assign. Use the VPN's TUN mode when you want rules to use it as the additional connection.",
+);
 pub const NO_ADAPTERS: Key = key(
     "tui.interfaces.no-adapters",
     "The service reports no adapters that can take a role.",
@@ -249,6 +253,7 @@ pub const ALL: &[Key] = &[
     DETAILS_TITLE,
     RESULT_TITLE,
     ROLE_EXPLANATION,
+    SYSTEM_PROXY_NOTE,
     NO_ADAPTERS,
     PLACEHOLDER_TITLE,
     PLACEHOLDER_BODY,

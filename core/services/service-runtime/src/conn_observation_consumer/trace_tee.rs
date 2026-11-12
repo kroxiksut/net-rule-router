@@ -18,9 +18,19 @@ pub struct ConnTraceTee {
     /// Whether each row is also written to the operational log. Shared with
     /// the settings writer so a save applies without a restart.
     log_ndjson: Arc<AtomicBool>,
+    discovery_observation: Option<Arc<crate::discovery_observation::DiscoveryObservationPipeline>>,
 }
 
 impl ConnTraceTee {
+    #[must_use]
+    pub fn with_discovery_observation(
+        mut self,
+        pipeline: Arc<crate::discovery_observation::DiscoveryObservationPipeline>,
+    ) -> Self {
+        self.discovery_observation = Some(pipeline);
+        self
+    }
+
     /// Marks the ring as fed: the tee exists only where a source runs.
     pub fn new(
         ring: Arc<ConnectionTraceRing>,
@@ -33,6 +43,7 @@ impl ConnTraceTee {
             api,
             bindings,
             log_ndjson: Arc::new(AtomicBool::new(false)),
+            discovery_observation: None,
         }
     }
 
@@ -47,14 +58,20 @@ impl ConnTraceTee {
         Arc::clone(&self.ring)
     }
 
+    /// Preserve queued checks and cooldowns when another consumer takes over.
+    pub fn discovery_observation(
+        &self,
+    ) -> Option<Arc<crate::discovery_observation::DiscoveryObservationPipeline>> {
+        self.discovery_observation.clone()
+    }
+
     /// Append one row per connection in `batch`, stamped `now_ms` when the
     /// backend gave no time of its own.
     pub fn record(&self, batch: &[ConnectionObservation], now_ms: u64) {
-        let mut attempts = batch
-            .iter()
-            .filter(|o| o.progress == ConnectionProgress::Attempt)
-            .peekable();
-        if attempts.peek().is_none() {
+        if batch.is_empty() {
+            if let Some(pipeline) = &self.discovery_observation {
+                pipeline.pump();
+            }
             return;
         }
         let adapters = self.api.get_adapter_infos().unwrap_or_default();
@@ -66,7 +83,7 @@ impl ConnTraceTee {
         // people on one machine can bind different links.
         let mut roles: HashMap<&str, (Option<u32>, Option<u32>)> = HashMap::new();
         let log_ndjson = self.log_ndjson.load(Ordering::Relaxed);
-        for obs in attempts {
+        for obs in batch {
             let (primary, secondary) = match obs.user_sid.as_deref() {
                 Some(sid) => *roles
                     .entry(sid)
@@ -74,6 +91,12 @@ impl ConnTraceTee {
                 None => (None, None),
             };
             let mut rec = classify_connection(obs, &unicast, primary, secondary);
+            if let Some(pipeline) = &self.discovery_observation {
+                pipeline.enqueue_observation(obs, rec.egress.role);
+            }
+            if obs.progress != ConnectionProgress::Attempt {
+                continue;
+            }
             rec.observed_unix_ms.get_or_insert(now_ms);
             if log_ndjson {
                 log_observed_connection(&rec);
@@ -81,6 +104,9 @@ impl ConnTraceTee {
             // No verdict reaches this tee, so the outage list is not fed here:
             // it is the path for when the drop reports could not start.
             self.ring.push(rec);
+        }
+        if let Some(pipeline) = &self.discovery_observation {
+            pipeline.pump();
         }
     }
 

@@ -20,13 +20,16 @@
 use std::ffi::c_void;
 use std::net::{Ipv4Addr, SocketAddr};
 
-use windows::Win32::Foundation::ERROR_INSUFFICIENT_BUFFER;
+use windows::Win32::Foundation::{CloseHandle, ERROR_INSUFFICIENT_BUFFER, FILETIME};
 use windows::Win32::NetworkManagement::IpHelper::{
     GetExtendedTcpTable, GetExtendedUdpTable, MIB_TCP6ROW_OWNER_PID, MIB_TCP6TABLE_OWNER_PID,
     MIB_TCPROW_OWNER_PID, MIB_TCPTABLE_OWNER_PID, MIB_UDPROW_OWNER_PID, MIB_UDPTABLE_OWNER_PID,
     TCP_TABLE_OWNER_PID_ALL, UDP_TABLE_OWNER_PID,
 };
 use windows::Win32::Networking::WinSock::{AF_INET, AF_INET6};
+use windows::Win32::System::Threading::{
+    GetProcessTimes, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
+};
 
 use nrr_platform_api::fake_ip::FlowTransport;
 use nrr_platform_api::FlowOwnerLookup;
@@ -43,6 +46,41 @@ impl WindowsFlowOwnerLookup {
 }
 
 impl FlowOwnerLookup for WindowsFlowOwnerLookup {
+    fn owner_identity(&self, local: SocketAddr, remote: SocketAddr) -> Option<(String, String)> {
+        let before = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .ok()?;
+        let before_ticks = u64::try_from(before.as_nanos() / 100)
+            .ok()?
+            .checked_add(116_444_736_000_000_000)?;
+        let pid = tcp_flow_pid(local, remote)?;
+        // One held handle keeps SID and path tied to one process.
+        // SAFETY: query-only handle, closed below on every result.
+        let process = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) }.ok()?;
+        let identity = (|| {
+            let (mut created, mut exited, mut kernel, mut user) = (
+                FILETIME::default(),
+                FILETIME::default(),
+                FILETIME::default(),
+                FILETIME::default(),
+            );
+            // SAFETY: the query-only handle and all four output buffers remain live.
+            unsafe { GetProcessTimes(process, &mut created, &mut exited, &mut kernel, &mut user) }
+                .ok()?;
+            let created_ticks =
+                (u64::from(created.dwHighDateTime) << 32) | u64::from(created.dwLowDateTime);
+            if created_ticks > before_ticks {
+                return None;
+            }
+            let principal = crate::win32_ffi::console_session::process_handle_user_sid(process)?;
+            let program = crate::win32_ffi::process::image_path_of(process).ok()?;
+            (tcp_flow_pid(local, remote) == Some(pid)).then_some((principal, program))
+        })();
+        // SAFETY: this handle was opened above and is never used after closing.
+        let _ = unsafe { CloseHandle(process) };
+        identity
+    }
+
     fn owner_image_name(&self, local: SocketAddr, remote: SocketAddr) -> Option<String> {
         let (SocketAddr::V4(local_v4), SocketAddr::V4(remote_v4)) = (local, remote) else {
             return None; // IPv4 relay only (see module doc)

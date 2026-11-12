@@ -715,7 +715,13 @@ pub fn probe(app: &mut AppState, input: &str, sample_ip: &str, sample_process: &
     let (hostname, ip) = if is_ip(&raw) {
         (None, raw)
     } else {
-        (Some(raw), sample_ip.to_owned())
+        (
+            Some(nrr_client_logic::rules_table::normalize_host_input(
+                &nrr_client_logic::rules_table::RuleType::ExactFqdn,
+                &raw,
+            )),
+            sample_ip.to_owned(),
+        )
     };
     let request = ExplainGetRequest {
         decision_id: None,
@@ -815,6 +821,12 @@ pub fn check_site(app: &mut AppState, host: &str) {
     state.part = Part::Overview;
     state.typing = None;
     super::site_check::start(app, host);
+}
+
+pub fn focus_site_input(app: &mut AppState) {
+    let host = app.inspect.site.host().to_owned();
+    app.inspect.diag.part = Part::Overview;
+    app.inspect.diag.typing = Some((Field::Site, host));
 }
 
 // ── Archive ──────────────────────────────────────────────────────────────────

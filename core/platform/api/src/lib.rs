@@ -32,6 +32,7 @@ pub mod autostart;
 // Opt-in browser-history read (visited hostnames → seed rule-matching hosts
 // into the FQDN cache, closing the pre-service-start blind spot). Neutral
 // port; per-OS mechanism in the platform crates.
+pub mod browser_dns_settings;
 pub mod browser_history;
 pub mod conn_observe;
 // Is an adapter absent, or here and refusing to start? The ordinary

@@ -1,0 +1,44 @@
+{
+  "cases": [
+    {
+      "name": "healthy primary-only routing is ready",
+      "input": { "serviceHealthy": true, "primaryBound": true, "primaryStatus": "ok", "secondaryRequired": false, "secondaryBound": false, "secondaryStatus": "", "activeRuleCount": 4, "secondaryRuleCount": 0 },
+      "expected": { "service": "healthy", "routing": "ready", "primary": "ready", "secondary": "not-required", "affectedAssignments": 0 }
+    },
+    {
+      "name": "healthy service with missing required secondary is limited",
+      "input": { "serviceHealthy": true, "primaryBound": true, "primaryStatus": "ok", "secondaryRequired": true, "secondaryBound": false, "secondaryStatus": "adapter-gone", "activeRuleCount": 7, "secondaryRuleCount": 3 },
+      "expected": { "service": "healthy", "routing": "limited", "primary": "ready", "secondary": "not-chosen", "affectedAssignments": 3 }
+    },
+    {
+      "name": "bound secondary that is down is limited",
+      "input": { "serviceHealthy": true, "primaryBound": true, "primaryStatus": "ok", "secondaryRequired": true, "secondaryBound": true, "secondaryStatus": "secondary-down", "activeRuleCount": 7, "secondaryRuleCount": 3 },
+      "expected": { "service": "healthy", "routing": "limited", "primary": "ready", "secondary": "not-ready", "affectedAssignments": 3 }
+    },
+    {
+      "name": "both required routes are ready",
+      "input": { "serviceHealthy": true, "primaryBound": true, "primaryStatus": "ok", "secondaryRequired": true, "secondaryBound": true, "secondaryStatus": "ok", "activeRuleCount": 7, "secondaryRuleCount": 3 },
+      "expected": { "service": "healthy", "routing": "ready", "primary": "ready", "secondary": "ready", "affectedAssignments": 0 }
+    },
+    {
+      "name": "service health stays separate from ready routing",
+      "input": { "serviceHealthy": false, "primaryBound": true, "primaryStatus": "ok", "secondaryRequired": true, "secondaryBound": true, "secondaryStatus": "ok", "activeRuleCount": 7, "secondaryRuleCount": 3 },
+      "expected": { "service": "unhealthy", "routing": "ready", "primary": "ready", "secondary": "ready", "affectedAssignments": 0 }
+    },
+    {
+      "name": "unreadable status and counts stay unknown",
+      "input": { "serviceHealthy": true, "primaryBound": true, "primaryStatus": "", "secondaryRequired": true, "secondaryBound": true, "secondaryStatus": "", "activeRuleCount": null, "secondaryRuleCount": null },
+      "expected": { "service": "healthy", "routing": "unknown", "primary": "unknown", "secondary": "unknown", "affectedAssignments": null }
+    },
+    {
+      "name": "missing primary affects every active assignment",
+      "input": { "serviceHealthy": true, "primaryBound": false, "primaryStatus": "no-primary-route", "secondaryRequired": true, "secondaryBound": true, "secondaryStatus": "ok", "activeRuleCount": 5, "secondaryRuleCount": 2 },
+      "expected": { "service": "healthy", "routing": "limited", "primary": "not-chosen", "secondary": "ready", "affectedAssignments": 5 }
+    },
+    {
+      "name": "failed primary remains limited without secondary rules",
+      "input": { "serviceHealthy": true, "primaryBound": true, "primaryStatus": "primary-no-way-out", "secondaryRequired": false, "secondaryBound": false, "secondaryStatus": "", "activeRuleCount": 4, "secondaryRuleCount": 0 },
+      "expected": { "service": "healthy", "routing": "limited", "primary": "not-ready", "secondary": "not-required", "affectedAssignments": 4 }
+    }
+  ]
+}

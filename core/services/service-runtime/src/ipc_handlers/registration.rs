@@ -13,6 +13,19 @@ pub fn register_production_handlers(registry: &mut IpcHandlerRegistry, deps: Arc
     attach_own_resolver_offers(&deps);
     for op in IpcOperationName::ALL {
         match op {
+            IpcOperationName::DnsCompatibilityRecheck => {
+                let center = deps
+                    .block_notice_center
+                    .as_ref()
+                    .map(|center| center.dns_compatibility())
+                    .unwrap_or_else(|| {
+                        Arc::new(crate::dns_compatibility::DnsCompatibilityCenter::default())
+                    });
+                registry.register_checked(
+                    op,
+                    dns_compatibility::DnsCompatibilityRecheckHandler::new(center),
+                );
+            }
             IpcOperationName::ContractNegotiate => {
                 registry.register(op, ContractNegotiateHandler::new());
             }
@@ -57,6 +70,9 @@ pub fn register_production_handlers(registry: &mut IpcHandlerRegistry, deps: Arc
                     deps.block_all_posture.clone(),
                 )
                 .with_route_enforcement_status(deps.route_enforcement.clone());
+                if let Some(center) = deps.block_notice_center.as_ref() {
+                    handler = handler.with_dns_compatibility(center.dns_compatibility());
+                }
                 if let Some(probe) = deps.fake_ip_datapath_probe.as_ref() {
                     handler = handler.with_fake_ip_datapath_probe(Arc::clone(probe));
                 }
@@ -314,7 +330,19 @@ pub fn register_production_handlers(registry: &mut IpcHandlerRegistry, deps: Arc
                                 deps.file_handoff.clone().unwrap_or_else(|| {
                                     Arc::new(nrr_platform_api::file_handoff::NoopFileHandoff)
                                 }),
-                            ),
+                            )
+                            .with_runtime_routing(
+                                deps.policy.clone(),
+                                deps.route_enforcement.clone(),
+                                deps.fake_ip_datapath_probe.clone(),
+                            )
+                            .with_dns_evidence(
+                                deps.block_notice_center
+                                    .as_ref()
+                                    .map(|center| center.dns_compatibility()),
+                                deps.site_check.clone(),
+                            )
+                            .with_discovery_evidence(deps.auto_rules.clone()),
                         );
                     }
                     _ => {
@@ -585,6 +613,12 @@ pub fn register_production_handlers(registry: &mut IpcHandlerRegistry, deps: Arc
             },
             IpcOperationName::SiteCheckRun => match deps.site_check.clone() {
                 Some(checker) => {
+                    checker.attach_diagnostics(
+                        deps.fake_ip_bindings.clone(),
+                        deps.block_notice_center
+                            .as_ref()
+                            .map(|center| center.dns_compatibility()),
+                    );
                     registry.register_checked(op, SiteCheckRunHandler::new(checker));
                 }
                 None => {
@@ -678,6 +712,14 @@ pub fn register_production_handlers(registry: &mut IpcHandlerRegistry, deps: Arc
             IpcOperationName::AutoRuleCandidatesList => match deps.auto_rules.clone() {
                 Some(engine) => {
                     registry.register(op, AutoRuleCandidatesListHandler::new(engine));
+                }
+                None => {
+                    registry.register_checked(op, UnimplementedHandler::new(op));
+                }
+            },
+            IpcOperationName::AutoRuleDiscoveryFeedback => match deps.auto_rules.clone() {
+                Some(engine) => {
+                    registry.register_checked(op, AutoRuleDiscoveryFeedbackHandler::new(engine));
                 }
                 None => {
                     registry.register_checked(op, UnimplementedHandler::new(op));

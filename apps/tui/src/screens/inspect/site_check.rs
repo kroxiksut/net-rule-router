@@ -66,7 +66,7 @@ pub fn start(app: &mut AppState, host: &str) {
             .map_err(unencodable)
             .and_then(|payload| call(client, IpcOperationName::SiteCheckRun, payload))
             .and_then(|v| serde_json::from_value::<SiteCheckStatus>(v).map_err(bad_response));
-        Reply::new(move |app| followed(app, generation, answer))
+        Reply::new(move |app| followed(app, generation, answer, true))
     });
 }
 
@@ -74,11 +74,16 @@ fn poll_job(generation: u64) -> Job {
     Box::new(move |client: &dyn IpcClient| {
         let answer = call(client, IpcOperationName::SiteCheckResultGet, json!({}))
             .and_then(|v| serde_json::from_value::<SiteCheckStatus>(v).map_err(bad_response));
-        Reply::new(move |app| followed(app, generation, answer))
+        Reply::new(move |app| followed(app, generation, answer, false))
     })
 }
 
-fn followed(app: &mut AppState, generation: u64, answer: Result<SiteCheckStatus, String>) {
+fn followed(
+    app: &mut AppState,
+    generation: u64,
+    answer: Result<SiteCheckStatus, String>,
+    accepted_start: bool,
+) {
     let state = &mut app.inspect.site;
     if state.generation != generation || !state.running {
         return;
@@ -91,15 +96,17 @@ fn followed(app: &mut AppState, generation: u64, answer: Result<SiteCheckStatus,
             return;
         }
     };
+    if accepted_start && !status.host.is_empty() {
+        state.host = status.host.clone();
+    }
     if status.state == SITE_CHECK_STATE_DONE {
         if let Some(report) = status.report {
-            state.running = false;
-            state.result = Some(Ok(report));
-            return;
+            if status.host == state.host && report.site == state.host {
+                state.running = false;
+                state.result = Some(Ok(report));
+                return;
+            }
         }
-    }
-    if !status.host.is_empty() {
-        state.host = status.host;
     }
     if state.started.is_some_and(|at| at.elapsed() > FOLLOW_FOR) {
         state.running = false;
@@ -127,6 +134,12 @@ fn route_text(texts: &Texts, route: &str) -> String {
     texts.get(match route {
         "secondary" => keys::SECONDARY,
         "blocked" => keys::ROUTE_DENIED,
+        "unknown" => {
+            return texts.dynamic(
+                "diag.site-check.route-unknown",
+                "Required connection could not be determined",
+            )
+        }
         _ => keys::PRIMARY,
     })
 }
@@ -146,6 +159,53 @@ fn name_line(texts: &Texts, n: &SiteCheckNameDto) -> String {
         route_text(texts, &n.route),
         texts.dynamic(&format!("diag.site-check.answer.{}", n.answer), &n.answer),
     ];
+    if !n.dns.is_empty() {
+        parts.push(texts.dynamic(&format!("diag.site-check.dns.{}", n.dns), &n.dns));
+    }
+    if let Some(reason) = n.not_run_reason.as_deref() {
+        parts.push(texts.dynamic(
+            &format!("diag.site-check.not-run.{reason}"),
+            "The check was withheld; the routing rule remains in force.",
+        ));
+    }
+    for (value, key, fallback, placeholder) in [
+        (
+            n.revision.as_deref(),
+            "diag.site-check.revision",
+            "Rules revision: {revision}",
+            "revision",
+        ),
+        (
+            n.rule_id.as_deref(),
+            "diag.site-check.rule",
+            "Rule: {rule}",
+            "rule",
+        ),
+        (
+            n.fake_address.as_deref(),
+            "diag.site-check.fake-address",
+            "Virtual address: {address}",
+            "address",
+        ),
+    ] {
+        if let Some(value) = value {
+            parts.push(
+                texts
+                    .dynamic(key, fallback)
+                    .replace(&format!("{{{placeholder}}}"), &display_text(value)),
+            );
+        }
+    }
+    if !n.real_addresses.is_empty() {
+        parts.push(
+            texts
+                .dynamic(
+                    "diag.site-check.real-addresses",
+                    "Known real addresses: {addresses}",
+                )
+                .replace("{addresses}", &n.real_addresses.join(", ")),
+        );
+    }
     if let Some(code) = n.status {
         parts.push(texts.fill(keys::SITE_STATUS, &[("code", code.to_string())]));
     }
@@ -167,9 +227,10 @@ pub fn lines(app: &AppState, texts: &Texts, typing: Option<&str>) -> Vec<ViewLin
         return super::typing_lines(texts, &texts.get(keys::SITE_INPUT), buffer);
     }
     if state.running {
-        return vec![ViewLine::text(
-            texts.fill(keys::SITE_RUNNING, &[("host", display_text(&state.host))]),
-        )];
+        return vec![
+            ViewLine::text(texts.fill(keys::SITE_RUNNING, &[("host", display_text(&state.host))])),
+            ViewLine::text(texts.get(crate::dns_compatibility::verification_instructions(app))),
+        ];
     }
     let report = match &state.result {
         None => return vec![ViewLine::text(texts.get(keys::SITE_SUBTITLE))],

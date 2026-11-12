@@ -67,6 +67,26 @@ bringing back any you removed yourself. If you leave
 encrypted DNS on in your browser, expect routing for browser traffic to be
 less reliable than for everything else.
 
+Blocking a resolver does not guarantee that a browser switches to system DNS.
+A browser configured to require encrypted DNS may stop opening sites instead.
+Configure that browser to use system DNS; keep the additional-route rule and
+leak protection enabled. A blocked connection to a known resolver alone does
+not prove the cause of a particular site's failure.
+
+Settings shows the service's effective blocking state separately from your
+choice. Automatic mode follows whether the rules need site names. In manual
+mode, the leak-protection scope applies to both Routed sites and Everything;
+Always also applies with protection off. If the service has not confirmed the
+state, the clients say so instead of showing blocking as disabled.
+
+The DNS compatibility card in the window and terminal keeps a detected
+restriction visible and offers a fresh check, browser instructions, and a
+site check through its assigned connection. Closing a notification does not
+mark the problem fixed. Saved browser preferences are shown when readable;
+organization policies remain under your administrator's control. An
+unverified browser is never reported as recovered merely because system DNS
+works. These checks keep your routing rules and leak protection in force.
+
 ## Names of your home network stay at home
 
 A printer, a router or a NAS is reached by a short local name (`printer.lan`,

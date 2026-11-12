@@ -149,6 +149,20 @@ pub const DETAIL_PAUSED: Key = key(
     "routing.status.detail-paused",
     "Rules are off for the time chosen; they come back on their own when it is up, or when you turn them back on.",
 );
+pub const ROUTING_SERVICE_HEALTHY: Key =
+    key("routing.readiness.service-healthy", "Service: healthy");
+pub const ROUTING_SERVICE_UNHEALTHY: Key = key(
+    "routing.readiness.service-unhealthy",
+    "Service: needs attention",
+);
+pub const ROUTING_AFFECTED_ASSIGNMENTS: Key = key(
+    "routing.readiness.affected-assignments",
+    "Active assignments affected: {count}",
+);
+pub const ROUTING_AFFECTED_UNKNOWN: Key = key(
+    "routing.readiness.affected-unknown",
+    "Active assignments affected: unknown",
+);
 
 // ── Connections (roles) ──────────────────────────────────────────────────────
 
@@ -728,6 +742,10 @@ pub const ALL: &[Key] = &[
     ROUTING_LIMITED,
     ROUTING_PAUSED,
     ROUTING_DISCONNECTED,
+    ROUTING_SERVICE_HEALTHY,
+    ROUTING_SERVICE_UNHEALTHY,
+    ROUTING_AFFECTED_ASSIGNMENTS,
+    ROUTING_AFFECTED_UNKNOWN,
     DETAIL_ACTIVE,
     DETAIL_LIMITED,
     DETAIL_PAUSED,

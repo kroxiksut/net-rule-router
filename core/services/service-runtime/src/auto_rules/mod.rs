@@ -60,7 +60,8 @@ use nrr_shared::ipc_payloads::{
     AUTO_RULE_MATCH_KIND_SUFFIX, AUTO_RULE_PRIMARY_BEHAVIOR_RESPONDS,
     AUTO_RULE_PRIMARY_BEHAVIOR_STALLS, AUTO_RULE_SIGNAL_BRAND_RELATED,
     AUTO_RULE_SIGNAL_CO_ACTIVITY, AUTO_RULE_SIGNAL_DELIVERY_NAME,
-    AUTO_RULE_SIGNAL_MAIN_LINK_BLOCKED, AUTO_RULE_SIGNAL_PLACEHOLDER_ANSWER,
+    AUTO_RULE_SIGNAL_HTTP_PATH_REACHABILITY, AUTO_RULE_SIGNAL_MAIN_LINK_BLOCKED,
+    AUTO_RULE_SIGNAL_PLACEHOLDER_ANSWER, AUTO_RULE_SIGNAL_SHARED_ADDRESS_REACHABILITY,
 };
 use nrr_shared::{AutoRuleReason, RouteBehaviorMode, RouteRole};
 use nrr_storage::auto_rule_dismissals::AutoRuleDismissal;
@@ -267,10 +268,14 @@ struct PendingCandidate {
 
 impl PendingCandidate {
     fn authored_rule(&self) -> AuthoredRule {
+        let value = match self.match_kind {
+            AuthoredMatchKind::SuffixDomain => automatic_suffix_target(&self.dto.proposed_match),
+            _ => self.dto.proposed_match.as_str(),
+        };
         AuthoredRule {
             route: self.route,
             match_kind: self.match_kind,
-            value: self.dto.proposed_match.clone(),
+            value: value.to_string(),
             anchor: self.dto.anchor.clone(),
         }
     }
@@ -312,6 +317,12 @@ impl PendingCandidate {
     }
 }
 
+fn automatic_suffix_target(host: &str) -> &str {
+    host.strip_prefix("www.")
+        .filter(|parent| registrable_domain(parent).is_some())
+        .unwrap_or(host)
+}
+
 /// Per-principal announcement bookkeeping — the debounce state.
 #[derive(Clone, Debug, Default)]
 struct PublishState {
@@ -319,6 +330,9 @@ struct PublishState {
     /// lowers the pending total, so "more than last time" silences every later
     /// arrival that stays under the session's high-water mark.
     announced: HashSet<String>,
+    delivered: HashSet<String>,
+    in_flight: HashMap<String, SystemTime>,
+    audience: Vec<String>,
     announced_at: Option<SystemTime>,
     /// The count the clients were last told, so a count that moves without
     /// news (expiry, a covering rule, an answer from another surface) still
@@ -377,6 +391,39 @@ fn covered_by_rules(snapshot: Option<&ActiveRulesSnapshot>, hostname: &str) -> b
 /// Is this an offer about a whole program rather than a name?
 fn is_app_offer(dto: &AutoRuleCandidateDto) -> bool {
     dto.match_kind == nrr_shared::ipc_payloads::AUTO_RULE_MATCH_KIND_APPLICATION
+}
+
+fn is_own_application_offer(dto: &AutoRuleCandidateDto) -> bool {
+    let own = crate::app_observation_lookup::own_process_key();
+    is_app_offer(dto)
+        && !own.is_empty()
+        && crate::app_observation_lookup::app_key(&dto.proposed_match) == own
+}
+
+fn independent_finding(dto: &AutoRuleCandidateDto) -> bool {
+    matches!(
+        dto.signal.as_str(),
+        AUTO_RULE_SIGNAL_SHARED_ADDRESS_REACHABILITY | AUTO_RULE_SIGNAL_HTTP_PATH_REACHABILITY
+    )
+}
+
+/// Older wider records cannot authorize names their evidence never identified.
+/// WWW normalization is the explicit user-requested exception.
+fn unconfirmed_scope(dto: &AutoRuleCandidateDto) -> bool {
+    dto.match_kind == AUTO_RULE_MATCH_KIND_SUFFIX
+        && automatic_suffix_target(&dto.proposed_match) == dto.proposed_match
+        && !(dto.signal == AUTO_RULE_SIGNAL_HTTP_PATH_REACHABILITY
+            && automatic_suffix_target(&dto.anchor) != dto.anchor
+            && automatic_suffix_target(&dto.anchor) == dto.proposed_match
+            && dto.observed_members.contains(&dto.anchor))
+}
+
+fn host_offer_kind(host: &str) -> (&'static str, AuthoredMatchKind) {
+    if automatic_suffix_target(host) != host {
+        (AUTO_RULE_MATCH_KIND_SUFFIX, AuthoredMatchKind::SuffixDomain)
+    } else {
+        (AUTO_RULE_MATCH_KIND_EXACT, AuthoredMatchKind::ExactHost)
+    }
 }
 
 /// Is the offer already done by the rules — its name matched, or its program
@@ -508,8 +555,14 @@ fn still_waiting(since: SystemTime, wait: Duration, now: SystemTime) -> bool {
 }
 
 pub struct AutoRulesEngine {
+    discovery_queue: Mutex<Option<DiscoveryQueueSource>>,
+    discovery_namespace: Option<String>,
+    discovery: Mutex<nrr_domain::suggestion_discovery::DiscoveryLedger>,
+    discovery_limitations: Mutex<Vec<String>>,
     ledgers: Mutex<HashMap<String, SidLedger>>,
     pending: Mutex<HashMap<String, Vec<PendingCandidate>>>,
+    /// Active HTTP responses are separate from passive browser outcomes.
+    http_primary: Mutex<HashMap<(String, String), (bool, Instant)>>,
     /// Refusals, read once per principal per session and then kept here.
     dismissed: Mutex<HashMap<String, HashSet<String>>>,
     /// Ids authored recently, with the moment they were. The rule itself is the
@@ -597,6 +650,7 @@ pub type SiteNotOpeningFn = Arc<dyn Fn(&str, &str) + Send + Sync>;
 /// link will not carry was just parked for review.
 pub type MainLinkBlockedParkedFn = Arc<dyn Fn(&str, &str, &str) + Send + Sync>;
 
+mod discovery;
 mod inbox;
 mod intake;
 mod ledger;
@@ -604,6 +658,17 @@ mod tick;
 mod verify_primary;
 mod wiring;
 
+use discovery::cap_publish_states;
+pub use discovery::DiscoveryDecision;
+pub(crate) struct QueuedProbeSnapshot {
+    pub status: nrr_shared::ipc_payloads::ProbeQueueStatusDto,
+    pub destination: String,
+    pub first_seen_unix_ms: i64,
+    pub last_seen_unix_ms: i64,
+    pub sequence: u64,
+}
+pub(crate) type DiscoveryQueueSource =
+    Arc<dyn Fn(&str) -> HashMap<String, QueuedProbeSnapshot> + Send + Sync>;
 pub use verify_primary::VerifyPrimaryWiring;
 
 /// `value (anchor)` for the first few suggestions — enough to recognise them in
@@ -648,17 +713,16 @@ fn top_anchor(candidates: &[PendingCandidate]) -> String {
 /// `id` is computed once by the caller (it is also the consumer-map key), so
 /// this never re-hashes it.
 ///
-/// Every offer is written as a suffix, whatever shape the engine proposed:
-/// `*.x` covers the apex and everything under it, so the rule means the same
-/// thing whether or not "cover subdomains" is on. An exact rule would silently
-/// narrow the moment that setting is turned off.
+/// Observed names remain exact; only the user's leading-WWW canonicalization
+/// retains a suffix shape. Sibling correlation never widens the match.
 fn to_candidate(proposal: &CompanionProposal, id: String) -> PendingCandidate {
+    let (kind, authored_kind) = host_offer_kind(proposal.proposed.value());
     PendingCandidate {
         dto: AutoRuleCandidateDto {
             id,
             anchor: proposal.anchor_hostname.clone(),
             proposed_match: proposal.proposed.value().to_string(),
-            match_kind: AUTO_RULE_MATCH_KIND_SUFFIX.to_string(),
+            match_kind: kind.to_string(),
             route: proposal.route.slug().to_string(),
             affinity: proposal.affinity,
             observations: Some(proposal.distinct_windows),
@@ -689,7 +753,7 @@ fn to_candidate(proposal: &CompanionProposal, id: String) -> PendingCandidate {
                 .to_string(),
         },
         route: proposal.route,
-        match_kind: AuthoredMatchKind::SuffixDomain,
+        match_kind: authored_kind,
     }
 }
 
@@ -712,6 +776,10 @@ fn less_certain_slug(basis: LessCertainBasis) -> &'static str {
 /// An offer only a person may take: never written unasked, whatever the mode.
 fn is_less_certain(dto: &AutoRuleCandidateDto) -> bool {
     !dto.less_certain.is_empty()
+}
+
+fn requires_review(dto: &AutoRuleCandidateDto) -> bool {
+    is_less_certain(dto) || independent_finding(dto) || unconfirmed_scope(dto)
 }
 
 /// Orders one candidate's consumers: `winner` (the anchor that signs the
@@ -793,11 +861,8 @@ fn awaiting_the_main_link(dto: &AutoRuleCandidateDto, pass_can_answer: bool) -> 
 /// A host that answers the main link has settled its OWN offer.
 ///
 /// Kept apart from [`settled_by_the_main_link`] because the reasoning differs.
-/// For a companion, "it answers" only settles a name of another brand — the
-/// routed site's own delivery name can complete a connection and serve a
-/// refusal. A self-signed offer has no anchor to be a companion of: its entire
-/// claim is "the main link will not carry me", and one main-link answer
-/// contradicts it outright.
+/// Passive completion settles this host's own failure. Independent path
+/// findings retain their separate active measurements instead.
 fn settled_self_signed(dto: &AutoRuleCandidateDto) -> bool {
     is_self_signed_signal(&dto.signal)
         && dto.primary_behavior == AUTO_RULE_PRIMARY_BEHAVIOR_RESPONDS
@@ -805,27 +870,13 @@ fn settled_self_signed(dto: &AutoRuleCandidateDto) -> bool {
 
 /// Is this candidate answered by the main link already?
 ///
-/// "It answers" is not proof the address is unwanted: a site can complete the
-/// connection and serve a refusal, so a name of the ANCHOR'S OWN brand still
-/// opens the question. A name of someone else's brand does not: a shared CDN
-/// or an ad endpoint that loads nearby works without the tunnel.
+/// Actual host evidence outranks correlation with any anchor. TLS-only probes
+/// do not populate this completed/HTTP-response evidence.
 ///
 /// One declaration, because two callers must agree: the tray decides whether to
 /// ask, and the answer path decides whether to keep the host on the main link.
 fn settled_by_the_main_link(dto: &AutoRuleCandidateDto) -> bool {
-    if dto.primary_behavior != AUTO_RULE_PRIMARY_BEHAVIOR_RESPONDS {
-        return false;
-    }
-    if is_self_signed_signal(&dto.signal) {
-        return true;
-    }
-    if !matches!(
-        dto.signal.as_str(),
-        AUTO_RULE_SIGNAL_CO_ACTIVITY | AUTO_RULE_SIGNAL_DELIVERY_NAME
-    ) {
-        return false;
-    }
-    !shares_registrable_domain(&dto.anchor, &dto.proposed_match)
+    dto.primary_behavior == AUTO_RULE_PRIMARY_BEHAVIOR_RESPONDS
 }
 
 /// Same registrable domain on both sides — the candidate is the anchor's own
@@ -842,11 +893,10 @@ fn shares_registrable_domain(anchor: &str, proposed: &str) -> bool {
     }
 }
 
-/// The inbox's "the main route already handles it" mark. A site the user marked
-/// as refusing main-link addresses is the exception: answering with a refusal
-/// is still answering, so its companions stay work — as they do for the popup.
-fn served_by_main_link(dto: &AutoRuleCandidateDto, anchor_refuses_main_link: bool) -> bool {
-    !anchor_refuses_main_link && settled_by_the_main_link(dto)
+/// The host-specific primary reachability mark. An anchor's refusal cannot
+/// transfer a healthy companion onto its route.
+fn served_by_main_link(dto: &AutoRuleCandidateDto, _anchor_refuses_main_link: bool) -> bool {
+    settled_by_the_main_link(dto)
 }
 
 /// Does the inbox list this offer without being asked to show more?
@@ -1007,13 +1057,6 @@ fn hydrate_pending(
             .filter_map(|r| {
                 let dto: AutoRuleCandidateDto = serde_json::from_str(&r.dto_json).ok()?;
                 if now_ms.saturating_sub(dto.last_seen_unix_ms) > PENDING_TTL_MS {
-                    return None;
-                }
-                // Offers are written as suffixes now. An exact row predates
-                // that and would sit beside its own suffix twin, since the
-                // kind is part of the id. Dropping it costs nothing: a live
-                // candidate is re-proposed on the next tick in the new shape.
-                if dto.match_kind == AUTO_RULE_MATCH_KIND_EXACT {
                     return None;
                 }
                 if is_self_signed_signal(&dto.signal) {

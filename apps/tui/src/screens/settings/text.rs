@@ -393,14 +393,42 @@ pub const DOH_AUTO_NOTE: Key = key(
     "settings.routing.doh-lockdown.auto-note",
     "Blocks encrypted DNS in browsers while your rules need to see site names, so the sites you route or block are seen and handled. Turn this off to set the blocking by hand.",
 );
-pub const DOH_AUTO_ON: Key = key(
-    "settings.routing.doh-lockdown.auto-on",
-    "On: your rules route or block sites by name.",
+pub const DOH_NOTE: Key = key(
+    "settings.routing.doh-lockdown.note",
+    "Blocks known encrypted-DNS endpoints. A browser using strict encrypted DNS may stop resolving sites instead of switching to system DNS. Configure that browser to use system DNS; keep the additional-route rule in place.",
 );
-pub const DOH_AUTO_OFF: Key = key(
-    "settings.routing.doh-lockdown.auto-off",
-    "Off: none of your rules needs site names.",
-);
+pub fn doh_status(status: &str) -> Key {
+    match status {
+        "auto-on" => key(
+            "settings.routing.doh-lockdown.auto-on",
+            "On: your rules route or block sites by name.",
+        ),
+        "auto-off" => key(
+            "settings.routing.doh-lockdown.auto-off",
+            "Off: none of your rules needs site names.",
+        ),
+        "manual-disabled" => key(
+            "settings.routing.doh-lockdown.manual-disabled",
+            "Blocking inactive: disabled manually.",
+        ),
+        "manual-always" => key(
+            "settings.routing.doh-lockdown.manual-always",
+            "Blocking active: manual choice applies at all times.",
+        ),
+        "manual-protected" => key(
+            "settings.routing.doh-lockdown.manual-protected",
+            "Blocking active: manual choice, leak protection is on.",
+        ),
+        "manual-waiting" => key(
+            "settings.routing.doh-lockdown.manual-waiting",
+            "Blocking inactive: manual choice applies only while leak protection is on.",
+        ),
+        _ => key(
+            "settings.routing.doh-lockdown.unconfirmed",
+            "Blocking state has not been confirmed by the service.",
+        ),
+    }
+}
 pub const SUFFIX_TITLE: Key = key(
     "settings.routing.local-suffixes.title",
     "Home and local network names",
@@ -1608,8 +1636,7 @@ pub fn all() -> Vec<Key> {
         DOH_ALWAYS,
         DOH_AUTO,
         DOH_AUTO_NOTE,
-        DOH_AUTO_ON,
-        DOH_AUTO_OFF,
+        DOH_NOTE,
         SUFFIX_TITLE,
         SUFFIX_DESCRIPTION,
         SUFFIX_EMPTY,
@@ -1848,6 +1875,19 @@ pub fn all() -> Vec<Key> {
         NEEDS_ELEVATION_UNIX,
     ];
     keys.extend(ERRORS.iter().map(|(_, k)| *k));
+    keys.extend(
+        [
+            "auto-on",
+            "auto-off",
+            "manual-disabled",
+            "manual-always",
+            "manual-protected",
+            "manual-waiting",
+            "unconfirmed",
+        ]
+        .map(doh_status),
+    );
     keys.extend_from_slice(STATUS_LINES);
+    keys.extend(crate::dns_compatibility::keys());
     keys
 }

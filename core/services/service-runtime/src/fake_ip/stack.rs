@@ -729,6 +729,21 @@ const UNREACHABLE_MAX_BYTES: usize = 96;
 /// `owner` is the served user the flow is carried for, `None` for the routing
 /// user: what the flow teaches belongs to whoever opened it.
 pub trait FlowObserver: Send + Sync {
+    fn network_generation(&self) -> Option<u64> {
+        None
+    }
+
+    /// An upstream socket connected and its splice workers started on the assigned route.
+    fn on_upstream_connected(
+        &self,
+        _client: std::net::SocketAddr,
+        _fake: std::net::SocketAddr,
+        _target: &super::dialer::UpstreamTarget,
+        _generation: Option<u64>,
+        _source: Option<std::net::IpAddr>,
+    ) {
+    }
+
     fn on_flow_opened(
         &self,
         client: std::net::SocketAddr,
@@ -1680,6 +1695,30 @@ impl Drop for TcpDialVerdict {
 /// stall the pool exists to prevent. The job owns nothing but `Arc`s; when
 /// the flow died while it waited or dialed, it does nothing or drops the
 /// fresh upstream.
+struct UpstreamObservation {
+    observer: Arc<dyn FlowObserver>,
+    client: std::net::SocketAddr,
+    fake: std::net::SocketAddr,
+    generation: Option<u64>,
+}
+
+impl UpstreamObservation {
+    fn new(
+        observer: Arc<dyn FlowObserver>,
+        client: std::net::SocketAddr,
+        fake: std::net::SocketAddr,
+    ) -> Self {
+        let generation = observer.network_generation();
+        Self {
+            observer,
+            client,
+            fake,
+            generation,
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 fn submit_tcp_dial(
     pool: &Arc<DialPool>,
     shared: Arc<FlowShared>,
@@ -1688,6 +1727,7 @@ fn submit_tcp_dial(
     log_gate: Arc<DialLogGate>,
     health: Arc<super::health::FakeIpHealth>,
     instant_rst: Arc<AtomicBool>,
+    observation: UpstreamObservation,
 ) -> Result<(), DialRefusal> {
     let verdict = TcpDialVerdict(Arc::clone(&shared));
     pool.submit(Box::new(move || {
@@ -1703,6 +1743,7 @@ fn submit_tcp_dial(
             &log_gate,
             &health,
             instant_rst.as_ref(),
+            &observation,
         );
     }))
 }
@@ -1715,6 +1756,7 @@ fn run_tcp_dial(
     log_gate: &DialLogGate,
     health: &super::health::FakeIpHealth,
     instant_rst: &AtomicBool,
+    observation: &UpstreamObservation,
 ) {
     let started = std::time::Instant::now();
     let (split, mode, attempts) = dial_tcp_with_hold(
@@ -1750,8 +1792,20 @@ fn run_tcp_dial(
                     "fake-IP dial succeeded after holding for the secondary to resolve",
                 );
             }
+            let source = split.writer.local_source_ip();
             match spawn_upstream_workers(Arc::clone(shared), split) {
-                Ok(workers) => shared.complete_dial(workers),
+                Ok(workers) => {
+                    shared.complete_dial(workers);
+                    if target.book_route == Some(target.route) {
+                        observation.observer.on_upstream_connected(
+                            observation.client,
+                            observation.fake,
+                            target,
+                            observation.generation,
+                            source,
+                        );
+                    }
+                }
                 // The upstream is open but nothing can pump it: a flow error,
                 // reported like a failed dial. The verdict guard resets it.
                 Err(error) => {

@@ -66,6 +66,7 @@ fn the_answer_reads_as_the_clients_expect() {
             answer: "answered".into(),
             status: Some(302),
             redirects: vec!["site.example".into()],
+            ..SiteCheckNameDto::default()
         }],
         move_names: vec!["login.site.example".into()],
         reads_answer: true,

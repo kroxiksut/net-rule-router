@@ -2,18 +2,18 @@ Service: OK
 ╭> Screens────────────────╮╭Rules status───────────────────────────────────────╮
 │> 1 Status               ││Rules are working                                  │
 │  2 First run            ││Your rules are working.                            │
-│  3 Connections          │╰───────────────────────────────────────────────────╯
-│  4 Rules                │╭Connections────────────────────────────────────────╮
-│  5 Overlaps             ││Main connection: Ethernet — Example Network Adapter│
-│  6 Suggested addresses  ││— Available — Rules applied                        │
-│  7 Connection trace     ││Additional connection (e.g. VPN): Example Tunnel — │
-│  8 Cache                ││Example Network Adapter — Available — Rules applied│
-│  9 Diagnostics and logs ││                                                   │
+│  3 Connections          ││Service: healthy                                   │
+│  4 Rules                │╰───────────────────────────────────────────────────╯
+│  5 Overlaps             │╭Connections────────────────────────────────────────╮
+│  6 Suggested addresses  ││Main connection: Ethernet — Example Network Adapter│
+│  7 Connection trace     ││— Available — Rules applied                        │
+│  8 Cache                ││Additional connection (e.g. VPN): Example Tunnel — │
+│  9 Diagnostics and logs ││Example Network Adapter — Available — Rules applied│
 │  0 Settings             ││                                                   │
+│                         ││                                                   │
 │                         │╰───────────────────────────────────────────────────╯
 │                         │╭Notifications──────────────────────────────────────╮
 │                         ││No notifications.                                  │
-│                         ││                                                   │
 │                         ││                                                   │
 │                         ││                                                   │
 │                         ││                                                   │

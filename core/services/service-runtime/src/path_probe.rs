@@ -16,9 +16,8 @@
 //!
 //! - **not a judgement about the site.** A connection that completes proves the
 //!   packet arrives, nothing more: a service can answer a main-link address with
-//!   a refusal (an assistant service does exactly that). The verdict feeds the same
-//!   `PrimaryHealthEvent` channel the observed traffic feeds, and the wording in
-//!   the GUI stays a statement of connectivity.
+//!   a refusal. Active measurements remain separate from passive browser
+//!   outcomes; neither TLS nor a response head proves page content loaded.
 //! - **not on the data path.** It runs when the user asks (or on their opt-in),
 //!   from its own thread, bounded in count and time.
 
@@ -37,6 +36,69 @@ pub enum PathVerdict {
     /// open). Reported as its own outcome — guessing either way would put a
     /// verdict on the screen that nothing measured.
     Indeterminate,
+}
+
+/// A separate application measurement, never a passive browser completion.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HttpProbeVerdict {
+    Answered(u16),
+    ClientError(u16),
+    ServerError(u16),
+    NoAnswer,
+    Untrusted,
+    Unconfirmed,
+    Unavailable,
+}
+
+impl HttpProbeVerdict {
+    pub fn reason(self) -> &'static str {
+        match self {
+            Self::Answered(_) => "http-answered",
+            Self::ClientError(_) => "http-client-error",
+            Self::ServerError(_) => "http-server-error",
+            Self::NoAnswer => "http-no-answer",
+            Self::Untrusted => "certificate-untrusted",
+            Self::Unconfirmed => "https-unconfirmed",
+            Self::Unavailable => "probe-inconclusive",
+        }
+    }
+    fn path(self) -> PathVerdict {
+        match self {
+            Self::Answered(_) => PathVerdict::Answered,
+            Self::NoAnswer => PathVerdict::Silent,
+            _ => PathVerdict::Indeterminate,
+        }
+    }
+}
+
+/// One bound HTTP exchange replaces a TLS-only connection. Redirects are not followed.
+pub fn http_probe(
+    head: &dyn crate::site_check::HttpsHead,
+    target: Ipv4Addr,
+    host: &str,
+    source: Option<Ipv4Addr>,
+    timeout: Duration,
+) -> HttpProbeVerdict {
+    let Some(source) = source else {
+        return HttpProbeVerdict::Unavailable;
+    };
+    let Some(request) = crate::site_check::http_answer::request_for(host) else {
+        return HttpProbeVerdict::Unavailable;
+    };
+    match head.fetch(target, host, source, &request, timeout) {
+        Ok(bytes) => match crate::site_check::http_answer::parse_head(&bytes) {
+            Ok(answer) => match answer.status {
+                200..=399 => HttpProbeVerdict::Answered(answer.status),
+                400..=499 => HttpProbeVerdict::ClientError(answer.status),
+                500..=599 => HttpProbeVerdict::ServerError(answer.status),
+                _ => HttpProbeVerdict::Unconfirmed,
+            },
+            Err(_) => HttpProbeVerdict::Unconfirmed,
+        },
+        Err(crate::site_check::HeadFailure::NoAnswer) => HttpProbeVerdict::NoAnswer,
+        Err(crate::site_check::HeadFailure::Untrusted) => HttpProbeVerdict::Untrusted,
+        Err(crate::site_check::HeadFailure::Unavailable) => HttpProbeVerdict::Unavailable,
+    }
 }
 
 /// The mechanism: one bounded TCP connect attempt, optionally from a chosen
@@ -338,9 +400,8 @@ pub struct ProbePassSummary {
 /// Runs bounded probing passes and remembers when each host was last examined.
 ///
 /// The verdict is reported through a caller-supplied sink — in production the
-/// auto-rules engine's `note_primary_health`, which is the same channel the
-/// observed traffic uses. One channel means the GUI has one story to tell,
-/// whether the evidence arrived by itself or was asked for.
+/// callers' active-measurement sinks, without fabricating passive browser
+/// completions or navigation events.
 pub struct PathProber {
     probe: Arc<dyn PathProbe>,
     last_probed: Mutex<std::collections::HashMap<String, Instant>>,
@@ -349,6 +410,27 @@ pub struct PathProber {
 /// `(hostname, answered)` — `answered == false` means definitely silent.
 /// Indeterminate outcomes are never reported: they are not evidence.
 pub type ProbeVerdictSink = dyn Fn(&str, bool) + Send + Sync;
+pub type PrimaryProbeGuard = Arc<dyn Fn(&str, &str, Ipv4Addr) -> bool + Send + Sync>;
+
+#[derive(Clone, Copy)]
+enum ProbeProtocol<'a> {
+    Tcp(u16),
+    Tls(ProbeScope<'a>),
+    Http(HttpProbeScope<'a>),
+}
+
+#[derive(Clone, Copy)]
+pub struct HttpProbeScope<'a> {
+    pub scope: ProbeScope<'a>,
+    pub https: &'a dyn crate::site_check::HttpsHead,
+    pub detail: &'a (dyn Fn(&str, HttpProbeVerdict) + Send + Sync),
+}
+
+#[derive(Clone, Copy)]
+pub struct ProbeScope<'a> {
+    pub owner: &'a str,
+    pub allowed: Option<&'a PrimaryProbeGuard>,
+}
 
 impl PathProber {
     pub fn new(probe: Arc<dyn PathProbe>) -> Self {
@@ -379,13 +461,98 @@ impl PathProber {
         now: Instant,
         report: &ProbeVerdictSink,
     ) -> ProbePassSummary {
+        self.run_with(
+            targets,
+            ProbeProtocol::Tcp(port),
+            source,
+            limits,
+            now,
+            report,
+        )
+    }
+
+    /// Hostnames need a TLS response; a literal address has no SNI and remains TCP-only.
+    pub fn run_tls_pass_for(
+        &self,
+        owner: &str,
+        targets: &[ProbeTarget],
+        source: Option<Ipv4Addr>,
+        limits: ProbeLimits,
+        now: Instant,
+        report: &ProbeVerdictSink,
+    ) -> ProbePassSummary {
+        self.run_tls_guarded_pass(
+            ProbeScope {
+                owner,
+                allowed: None,
+            },
+            targets,
+            source,
+            limits,
+            now,
+            report,
+        )
+    }
+
+    pub fn run_tls_guarded_pass(
+        &self,
+        scope: ProbeScope<'_>,
+        targets: &[ProbeTarget],
+        source: Option<Ipv4Addr>,
+        limits: ProbeLimits,
+        now: Instant,
+        report: &ProbeVerdictSink,
+    ) -> ProbePassSummary {
+        self.run_with(
+            targets,
+            ProbeProtocol::Tls(scope),
+            source,
+            limits,
+            now,
+            report,
+        )
+    }
+
+    pub fn run_https_guarded_pass(
+        &self,
+        scope: HttpProbeScope<'_>,
+        targets: &[ProbeTarget],
+        source: Option<Ipv4Addr>,
+        limits: ProbeLimits,
+        now: Instant,
+        report: &ProbeVerdictSink,
+    ) -> ProbePassSummary {
+        self.run_with(
+            targets,
+            ProbeProtocol::Http(scope),
+            source,
+            limits,
+            now,
+            report,
+        )
+    }
+
+    fn run_with(
+        &self,
+        targets: &[ProbeTarget],
+        protocol: ProbeProtocol<'_>,
+        source: Option<Ipv4Addr>,
+        limits: ProbeLimits,
+        now: Instant,
+        report: &ProbeVerdictSink,
+    ) -> ProbePassSummary {
         let mut summary = ProbePassSummary::default();
         let mut examined = 0usize;
         for target in targets {
             if target.hostname.is_empty() || target.addresses.is_empty() {
                 continue;
             }
-            if self.recently_probed(&target.hostname, limits.repeat_after, now) {
+            let memory_key = match protocol {
+                ProbeProtocol::Tcp(_) => target.hostname.clone(),
+                ProbeProtocol::Tls(scope) => format!("{}\0{}", scope.owner, target.hostname),
+                ProbeProtocol::Http(scope) => format!("{}\0{}", scope.scope.owner, target.hostname),
+            };
+            if self.recently_probed(&memory_key, limits.repeat_after, now) {
                 summary.skipped_recent += 1;
                 continue;
             }
@@ -396,20 +563,62 @@ impl PathProber {
             examined += 1;
             let mut verdict = PathVerdict::Indeterminate;
             for address in &target.addresses {
-                verdict = self.probe.probe(*address, port, source, limits.timeout);
-                if verdict != PathVerdict::Indeterminate {
+                verdict = match protocol {
+                    ProbeProtocol::Http(http) => {
+                        if source.is_none()
+                            || http.scope.allowed.is_some_and(|allowed| {
+                                !allowed(http.scope.owner, &target.hostname, *address)
+                            })
+                        {
+                            PathVerdict::Indeterminate
+                        } else {
+                            let answer = http_probe(
+                                http.https,
+                                *address,
+                                &target.hostname,
+                                source,
+                                limits.timeout,
+                            );
+                            (http.detail)(&target.hostname, answer);
+                            answer.path()
+                        }
+                    }
+                    ProbeProtocol::Tcp(port) => {
+                        self.probe.probe(*address, port, source, limits.timeout)
+                    }
+                    ProbeProtocol::Tls(_) if source.is_none() => PathVerdict::Indeterminate,
+                    ProbeProtocol::Tls(scope)
+                        if scope.allowed.is_some_and(|allowed| {
+                            !allowed(scope.owner, &target.hostname, *address)
+                        }) =>
+                    {
+                        PathVerdict::Indeterminate
+                    }
+                    ProbeProtocol::Tls(_)
+                        if target.hostname.parse::<std::net::IpAddr>().is_ok() =>
+                    {
+                        self.probe.probe(*address, 443, source, limits.timeout)
+                    }
+                    ProbeProtocol::Tls(_) => {
+                        self.probe
+                            .probe_tls(*address, &target.hostname, source, limits.timeout)
+                    }
+                };
+                if matches!(protocol, ProbeProtocol::Http(_))
+                    || verdict != PathVerdict::Indeterminate
+                {
                     break;
                 }
             }
             match verdict {
                 PathVerdict::Answered => {
                     summary.answered += 1;
-                    self.mark_probed(&target.hostname, now);
+                    self.mark_probed(&memory_key, now);
                     report(&target.hostname, true);
                 }
                 PathVerdict::Silent => {
                     summary.silent += 1;
-                    self.mark_probed(&target.hostname, now);
+                    self.mark_probed(&memory_key, now);
                     report(&target.hostname, false);
                 }
                 // Not remembered: an attempt that established nothing must not
@@ -441,6 +650,116 @@ impl PathProber {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn one_users_tls_check_never_spends_another_users_repeat_window() {
+        let mechanism = Arc::new(MockPathProbe::new(PathVerdict::Answered));
+        let prober = PathProber::new(mechanism.clone());
+        let targets = [ProbeTarget {
+            hostname: "same-site.example".into(),
+            addresses: vec![Ipv4Addr::new(203, 0, 113, 31)],
+        }];
+        let limits = ProbeLimits::default();
+        let now = Instant::now();
+        let report = |_: &str, _: bool| {};
+        assert_eq!(
+            prober
+                .run_tls_pass_for(
+                    "alice",
+                    &targets,
+                    Some(Ipv4Addr::LOCALHOST),
+                    limits,
+                    now,
+                    &report
+                )
+                .answered,
+            1
+        );
+        assert_eq!(
+            prober
+                .run_tls_pass_for(
+                    "bob",
+                    &targets,
+                    Some(Ipv4Addr::LOCALHOST),
+                    limits,
+                    now,
+                    &report
+                )
+                .answered,
+            1
+        );
+        assert_eq!(
+            prober
+                .run_tls_pass_for(
+                    "alice",
+                    &targets,
+                    Some(Ipv4Addr::LOCALHOST),
+                    limits,
+                    now,
+                    &report
+                )
+                .skipped_recent,
+            1
+        );
+        assert_eq!(mechanism.attempts().len(), 2);
+    }
+
+    #[test]
+    fn a_missing_source_or_a_policy_refusal_never_uses_the_services_default_route() {
+        let mechanism = Arc::new(MockPathProbe::new(PathVerdict::Answered));
+        let prober = PathProber::new(mechanism.clone());
+        let targets = [ProbeTarget {
+            hostname: "protected-site.example".into(),
+            addresses: vec![Ipv4Addr::new(203, 0, 113, 32)],
+        }];
+        let report = |_: &str, _: bool| {};
+        let now = Instant::now();
+        assert_eq!(
+            prober
+                .run_tls_pass_for(
+                    "alice",
+                    &targets,
+                    None,
+                    ProbeLimits::default(),
+                    now,
+                    &report
+                )
+                .indeterminate,
+            1
+        );
+        let denied: PrimaryProbeGuard = Arc::new(|_, _, _| false);
+        assert_eq!(
+            prober
+                .run_tls_guarded_pass(
+                    ProbeScope {
+                        owner: "alice",
+                        allowed: Some(&denied)
+                    },
+                    &targets,
+                    Some(Ipv4Addr::LOCALHOST),
+                    ProbeLimits::default(),
+                    now,
+                    &report
+                )
+                .indeterminate,
+            1
+        );
+        assert!(mechanism.attempts().is_empty());
+        assert_eq!(
+            prober
+                .run_tls_pass_for(
+                    "alice",
+                    &targets,
+                    Some(Ipv4Addr::LOCALHOST),
+                    ProbeLimits::default(),
+                    now,
+                    &report
+                )
+                .answered,
+            1,
+            "an unmeasured refusal must not suppress a later permitted retry"
+        );
+    }
 
     /// A local server that reads the hello and then does `respond`.
     fn exchange_with(respond: fn(&mut std::net::TcpStream)) -> PathVerdict {

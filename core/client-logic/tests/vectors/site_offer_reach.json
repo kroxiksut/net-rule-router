@@ -1,6 +1,8 @@
 {
   "description": "pure.js siteOfferReach",
   "cases": [
+    { "name": "HTTP differential check reached the additional route", "input": { "signal": "http-path-reachability", "reach": true }, "expected": "confirmed" },
+    { "name": "independent shared address check reached the additional route", "input": { "signal": "shared-address-reachability", "reach": true }, "expected": "confirmed" },
     { "name": "the additional route answered", "input": { "signal": "main-link-blocked", "reach": true }, "expected": "confirmed" },
     { "name": "it did not answer there either", "input": { "signal": "main-link-blocked", "reach": false }, "expected": "unreachable" },
     { "name": "never asked", "input": { "signal": "main-link-blocked", "reach": null }, "expected": "unconfirmed" },

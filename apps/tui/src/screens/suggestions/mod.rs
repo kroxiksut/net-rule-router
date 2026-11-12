@@ -7,6 +7,7 @@
 //! The list is re-read on every visit and on every `auto-rule-candidates-changed`
 //! push, never patched locally: the service re-derives its pending set.
 
+mod episodes;
 mod keys;
 #[cfg(test)]
 pub(crate) mod tests;
@@ -25,7 +26,8 @@ use nrr_shared::ipc_payloads::{
     AutoRuleCandidateDto, AutoRuleCandidatesActionRequest, AutoRuleCandidatesActionResponse,
     AutoRuleCandidatesListResponse, AutoRuleCandidatesProbeRequest,
     AutoRuleCandidatesProbeResponse, AutoRuleDismissedEntryDto, AutoRuleDismissedListResponse,
-    AutoRuleDismissedRestoreRequest, AutoRuleDismissedRestoreResponse,
+    AutoRuleDismissedRestoreRequest, AutoRuleDismissedRestoreResponse, DiscoveryEpisodeDto,
+    DiscoveryFeedbackRequest, DiscoveryFeedbackResponse,
 };
 use serde::de::DeserializeOwned;
 use serde::Serialize;
@@ -132,6 +134,10 @@ pub struct Suggestions {
     dismissed: Vec<AutoRuleDismissedEntryDto>,
     inert_dropped: u64,
     inert_sample: Vec<String>,
+    discovery_episodes: Vec<DiscoveryEpisodeDto>,
+    discovery_omitted: u64,
+    discovery_limitations: Vec<String>,
+    episodes_open: bool,
     /// Offers shown by default, as the service last counted them.
     pending_count: u64,
     loaded: bool,
@@ -141,6 +147,11 @@ pub struct Suggestions {
     /// An announcement about a site the list did not hold yet, told once the
     /// list is read: `(top anchor, pending count)`.
     announce_owed: Option<(String, u64)>,
+    /// A paced ready batch gets one local retry, without another server push.
+    notice_retry: Option<(i64, String, u64)>,
+    notice_retry_in_flight: bool,
+    /// Names in the current feed batch; a new name takes room before old ones.
+    notice_batch: Vec<String>,
     /// Index into the shown groups, as last put; read through
     /// [`Suggestions::chosen`].
     selected: usize,
@@ -160,6 +171,7 @@ pub struct Suggestions {
     /// What the list is narrowed to, and a search being typed.
     query: String,
     typing: Option<String>,
+    typing_host: bool,
     /// Only what this site relies on, by its exact name; empty shows all.
     consumer: String,
     /// Groups marked for one answer to all, by [`group_key`].
@@ -227,8 +239,21 @@ impl Screen for SuggestionsScreen {
                     feed: false,
                 },
                 Panel {
-                    title: list_title(app, texts),
-                    lines: list_lines(app, texts),
+                    title: if app.suggestions.episodes_open {
+                        texts.get(episodes::TITLE)
+                    } else {
+                        list_title(app, texts)
+                    },
+                    lines: if app.suggestions.episodes_open {
+                        episodes::lines(
+                            &app.suggestions.discovery_episodes,
+                            app.suggestions.discovery_omitted,
+                            &app.suggestions.discovery_limitations,
+                            texts,
+                        )
+                    } else {
+                        list_lines(app, texts)
+                    },
                     feed: true,
                 },
             ],
@@ -258,17 +283,58 @@ impl Screen for SuggestionsScreen {
         s.confirm.is_some() || s.clearing || s.typing.is_some()
     }
 
+    fn text_target(&self, app: &AppState) -> crate::paste::TextTarget {
+        if app.suggestions.typing.is_some() {
+            crate::paste::TextTarget::Line
+        } else {
+            crate::paste::TextTarget::None
+        }
+    }
+
     fn on_key(&self, app: &mut AppState, key: KeyEvent) -> bool {
+        let typing_host = app.suggestions.typing_host;
         if let Some(buffer) = app.suggestions.typing.as_mut() {
+            if typing_host && buffer.len() >= 253 && matches!(key.code, KeyCode::Char(_)) {
+                return true;
+            }
             match crate::screens::inspect::edit(buffer, key) {
                 crate::screens::inspect::Edit::Typing => {}
                 crate::screens::inspect::Edit::Done(text) => {
                     app.suggestions.typing = None;
-                    set_query(app, &text);
+                    app.suggestions.typing_host = false;
+                    if typing_host {
+                        check_entered_site(app, &text);
+                    } else {
+                        set_query(app, &text);
+                    }
                 }
-                crate::screens::inspect::Edit::Cancelled => app.suggestions.typing = None,
+                crate::screens::inspect::Edit::Cancelled => {
+                    app.suggestions.typing = None;
+                    app.suggestions.typing_host = false;
+                }
             }
             return true;
+        }
+        if app.suggestions.episodes_open
+            && !app.suggestions.clearing
+            && app.suggestions.confirm.is_none()
+        {
+            return match key.code {
+                KeyCode::Char(letter @ ('e' | 'h')) => command(app, letter, 0),
+                KeyCode::Up => {
+                    app.scroll = app.scroll.saturating_sub(1);
+                    true
+                }
+                KeyCode::Down => {
+                    app.scroll = app.scroll.saturating_add(1);
+                    true
+                }
+                KeyCode::Home => {
+                    app.scroll = 0;
+                    true
+                }
+                _ => false,
+            };
         }
         if app.suggestions.clearing {
             return match key.code {
@@ -312,6 +378,18 @@ impl Screen for SuggestionsScreen {
     }
 
     fn on_line(&self, app: &mut AppState, line: &str) -> bool {
+        if !app.suggestions.clearing && app.suggestions.confirm.is_none() {
+            if line.trim() == "e" {
+                return command(app, 'e', 0);
+            }
+            if let Some(host) = line.trim().strip_prefix("h ") {
+                check_entered_site(app, host);
+                return true;
+            }
+            if app.suggestions.episodes_open {
+                return false;
+            }
+        }
         if app.suggestions.clearing {
             match line.trim() {
                 "y" => forget_all(app),
@@ -384,7 +462,11 @@ impl Screen for SuggestionsScreen {
     }
 
     fn on_printed(&self, app: &mut AppState) {
-        app.suggestions.printed = app.suggestions.shown().iter().map(group_key).collect();
+        app.suggestions.printed = if app.suggestions.episodes_open {
+            Vec::new()
+        } else {
+            app.suggestions.shown().iter().map(group_key).collect()
+        };
     }
 }
 
@@ -408,6 +490,16 @@ fn scroll_for(state: &Suggestions) -> u16 {
 /// screen does not use.
 fn command(app: &mut AppState, letter: char, index: usize) -> bool {
     let action = match letter {
+        'e' => {
+            app.suggestions.episodes_open = !app.suggestions.episodes_open;
+            app.scroll = 0;
+            return true;
+        }
+        'h' => {
+            app.suggestions.typing_host = true;
+            app.suggestions.typing = Some(String::new());
+            return true;
+        }
         'a' => Action::Add,
         'z' => Action::AddAnyZone,
         'n' => Action::Never,
@@ -436,6 +528,7 @@ fn command(app: &mut AppState, letter: char, index: usize) -> bool {
             return true;
         }
         '/' => {
+            app.suggestions.typing_host = false;
             app.suggestions.typing = Some(app.suggestions.query.clone());
             return true;
         }
@@ -473,7 +566,7 @@ fn check_site(app: &mut AppState, index: usize) -> bool {
         group
             .hosts
             .iter()
-            .find(|h| h.signal == nrr_shared::ipc_payloads::AUTO_RULE_SIGNAL_MAIN_LINK_BLOCKED)
+            .find(|h| nrr_client_logic::site_notice::site_offer_reach(&h.signal, None).is_some())
             .map(|h| h.match_value.clone())
     }) else {
         return false;
@@ -481,6 +574,14 @@ fn check_site(app: &mut AppState, index: usize) -> bool {
     app.open(crate::screens::ScreenId::Diagnostics);
     crate::screens::inspect::diagnostics::check_site(app, &site);
     true
+}
+
+fn check_entered_site(app: &mut AppState, host: &str) {
+    if host.trim().is_empty() {
+        return;
+    }
+    app.open(crate::screens::ScreenId::Diagnostics);
+    crate::screens::inspect::diagnostics::check_site(app, host.trim());
 }
 
 /// After the list changed shape: the first item, at the top.
@@ -670,13 +771,28 @@ fn loaded(
             state.pending_count = pending.pending_count;
             state.inert_dropped = pending.inert_dropped;
             state.inert_sample = pending.inert_sample;
+            state.discovery_episodes = pending.discovery_episodes;
+            state.discovery_omitted = pending.discovery_omitted;
+            state.discovery_limitations = pending.discovery_limitations;
+            if state.candidates.is_empty()
+                && !state.discovery_episodes.is_empty()
+                && !state.clearing
+                && state.confirm.is_none()
+            {
+                state.episodes_open = true;
+            }
             state.dismissed = answered.dismissed;
             state.loaded = true;
             let shown = state.shown();
             let at = state.chosen(&shown);
             state.select(at, &shown);
         }
-        (Err(error), _) | (_, Err(error)) => state.note = Some(Note::Failed(error)),
+        (Err(error), _) | (_, Err(error)) => {
+            state.note = Some(Note::Failed(error));
+            if std::mem::take(&mut state.notice_retry_in_flight) {
+                state.announce_owed = None;
+            }
+        }
     }
     if std::mem::take(&mut state.reload_owed) {
         load(app);
@@ -886,6 +1002,12 @@ pub fn changed(
     if !notice_due(announces, pending_count) {
         return None;
     }
+    if app.suggestions.loading
+        && is_site_notice_kind(notice_kind_of(&app.suggestions.candidates, top_anchor))
+    {
+        app.suggestions.announce_owed = Some((top_anchor.to_owned(), pending_count));
+        return None;
+    }
     // Read before told: until the list holds the offer, what it is about is
     // unknown, and a site that did not open would read as a site's companions.
     let unread = !top_anchor.is_empty()
@@ -910,10 +1032,97 @@ pub fn changed(
 /// A notice about a site that does not open waits under the rule the tray and
 /// the service keep; any other is told as it comes.
 fn paced(app: &mut AppState, top_anchor: &str) -> bool {
-    if notice_kind_of(&app.suggestions.candidates, top_anchor) != NoticeKind::SitesBlocked {
+    if !is_site_notice_kind(notice_kind_of(&app.suggestions.candidates, top_anchor)) {
         return true;
     }
-    crate::site_notices::tell(app, top_anchor)
+    let hosts = site_notice_hosts(app);
+    let continuing = app.notices.iter().any(|notice| {
+        notice.about
+            == crate::feed::About::Kind(nrr_client_logic::notice_mutes::SITE_NOT_OPENING_KIND)
+    });
+    let mut fresh = crate::site_notices::tell_batch(app, &hosts, continuing);
+    if !fresh.is_empty() {
+        app.suggestions.notice_retry = None;
+        if continuing {
+            for host in &app.suggestions.notice_batch {
+                if fresh.len() >= 50 {
+                    break;
+                }
+                if hosts.contains(host) && !fresh.contains(host) {
+                    fresh.push(host.clone());
+                }
+            }
+        }
+        app.suggestions.notice_batch = fresh;
+        return true;
+    }
+    let muted =
+        crate::notice_mutes::muted(app, nrr_client_logic::notice_mutes::SITE_NOT_OPENING_KIND);
+    if muted {
+        app.suggestions.notice_retry = None;
+    } else if !hosts.is_empty() && app.suggestions.notice_retry.is_none() {
+        let due = app
+            .settings
+            .clock
+            .now()
+            .saturating_add(nrr_client_logic::site_notice::SITE_NOTICE_GAP_MS);
+        app.suggestions.notice_retry =
+            Some((due, top_anchor.to_owned(), app.suggestions.pending_count));
+    }
+    let ids = app
+        .suggestions
+        .candidates
+        .iter()
+        .filter(|row| row.anchor == top_anchor)
+        .map(|row| row.id.clone())
+        .take(50)
+        .collect::<Vec<_>>();
+    if !ids.is_empty() {
+        app.outbox.push(Box::new(move |client: &dyn IpcClient| {
+            let recorded: Result<DiscoveryFeedbackResponse, _> = call(
+                client,
+                IpcOperationName::AutoRuleDiscoveryFeedback,
+                &DiscoveryFeedbackRequest {
+                    ids,
+                    state: if muted { "hidden" } else { "deferred" }.into(),
+                    reason: if muted {
+                        "notifications-muted"
+                    } else {
+                        "notification-pacing"
+                    }
+                    .into(),
+                },
+            );
+            Reply::new(move |app| {
+                if recorded.is_ok() && app.screen == ScreenId::Suggestions {
+                    load(app);
+                }
+            })
+        }));
+    }
+    false
+}
+
+/// Re-read before retrying: a withdrawn, accepted or muted offer cannot be
+/// resurrected from the old batch. Called by both terminal rendering loops.
+pub fn retry_paced_notice(app: &mut AppState) -> bool {
+    if app.suggestions.loading || !app.link.is_connected() {
+        return false;
+    }
+    let Some((due, _, _)) = app.suggestions.notice_retry.as_ref() else {
+        return false;
+    };
+    let left = due.saturating_sub(app.settings.clock.now());
+    if left > 0 && left <= nrr_client_logic::site_notice::SITE_NOTICE_GAP_MS {
+        return false;
+    }
+    let Some((_, anchor, count)) = app.suggestions.notice_retry.take() else {
+        return false;
+    };
+    app.suggestions.announce_owed = Some((anchor, count));
+    app.suggestions.notice_retry_in_flight = true;
+    load(app);
+    true
 }
 
 /// The sites among `ids` whose offer was that they do not open.
@@ -934,10 +1143,57 @@ pub fn announce(app: &mut AppState, texts: &Texts) -> Vec<crate::state::Effect> 
     let Some((top_anchor, _)) = app.suggestions.announce_owed.take() else {
         return Vec::new();
     };
+    if std::mem::take(&mut app.suggestions.notice_retry_in_flight)
+        && site_notice_hosts(app).is_empty()
+    {
+        return Vec::new();
+    }
     if !paced(app, &top_anchor) {
         return Vec::new();
     }
     let (title, body) = notice_text(app, &top_anchor, texts);
+    post_notice(app, &top_anchor, title, body)
+}
+
+fn site_notice_hosts(app: &AppState) -> Vec<String> {
+    let mut hosts: Vec<String> = rows_shown_by_default(&app.suggestions.candidates)
+        .into_iter()
+        .filter(|row| row.match_kind != nrr_shared::ipc_payloads::AUTO_RULE_MATCH_KIND_APPLICATION)
+        .filter(|row| {
+            nrr_client_logic::site_notice::site_offer_reach(&row.signal, row.secondary_reach)
+                .is_some()
+        })
+        .map(|row| row.proposed_match.clone())
+        .collect();
+    hosts.sort();
+    hosts.dedup();
+    hosts
+}
+
+pub(crate) fn post_notice(
+    app: &mut AppState,
+    top_anchor: &str,
+    title: String,
+    body: String,
+) -> Vec<crate::state::Effect> {
+    let kind = notice_kind_of(&app.suggestions.candidates, top_anchor);
+    if is_site_notice_kind(kind) {
+        let about = crate::feed::About::Kind(nrr_client_logic::notice_mutes::SITE_NOT_OPENING_KIND);
+        if let Some(notice) = app
+            .notices
+            .iter_mut()
+            .rev()
+            .find(|notice| notice.about == about)
+        {
+            notice.title = title;
+            notice.body = body;
+            return Vec::new();
+        }
+        return app.post(
+            crate::state::Notice::new(crate::state::NoticeLevel::Info, title, body).about(about),
+            None,
+        );
+    }
     app.note_in_feed(crate::state::NoticeLevel::Info, title, body)
 }
 
@@ -960,6 +1216,18 @@ fn notice_text(app: &AppState, top_anchor: &str, texts: &Texts) -> (String, Stri
             ],
         )
     );
+    let body = if is_site_notice_kind(notice_kind_of(&app.suggestions.candidates, top_anchor)) {
+        let names = app
+            .suggestions
+            .notice_batch
+            .iter()
+            .map(|host| display_text(host).into_owned())
+            .collect::<Vec<_>>()
+            .join(", ");
+        format!("{names}\n{body}")
+    } else {
+        body
+    };
     (texts.get(title), body)
 }
 
@@ -975,9 +1243,21 @@ fn notice_kind_of(candidates: &[AutoRuleCandidateDto], top_anchor: &str) -> Noti
     notice_kind(&named)
 }
 
+fn is_site_notice_kind(kind: NoticeKind) -> bool {
+    matches!(
+        kind,
+        NoticeKind::SitesBlocked | NoticeKind::SharedAddress | NoticeKind::HttpPath
+    )
+}
+
 fn notice_keys(kind: NoticeKind) -> (Key, Key) {
     match kind {
         NoticeKind::Companions => (keys::NOTICE_TITLE, keys::NOTICE_BODY),
+        NoticeKind::HttpPath => (keys::NOTICE_TITLE_HTTP_PATH, keys::NOTICE_BODY_HTTP_PATH),
+        NoticeKind::SharedAddress => (
+            keys::NOTICE_TITLE_SHARED_ADDRESS,
+            keys::NOTICE_BODY_SHARED_ADDRESS,
+        ),
         NoticeKind::SitesBlocked => (
             keys::NOTICE_TITLE_SITES_BLOCKED,
             keys::NOTICE_BODY_SITES_BLOCKED,
@@ -1003,6 +1283,7 @@ fn notice_keys(kind: NoticeKind) -> (Key, Key) {
 fn head_lines(app: &AppState, texts: &Texts) -> Vec<ViewLine> {
     let state = &app.suggestions;
     let mut lines = vec![ViewLine::text(texts.get(keys::INTRO))];
+    lines.push(ViewLine::text(texts.get(keys::EPISODES_TOGGLE)));
     if let Some(mode) = app
         .snapshot
         .as_ref()
@@ -1058,7 +1339,11 @@ fn head_lines(app: &AppState, texts: &Texts) -> Vec<ViewLine> {
     if let Some(buffer) = &state.typing {
         lines.extend(crate::screens::inspect::typing_lines(
             texts,
-            &texts.get(keys::SEARCH),
+            &texts.get(if state.typing_host {
+                keys::ENTER_HOST
+            } else {
+                keys::SEARCH
+            }),
             buffer,
         ));
     } else if !state.query.is_empty() {

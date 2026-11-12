@@ -3,13 +3,14 @@ Service: OK
 │> 1 Status               ││Some rules not working                             │
 │  2 First run            ││Some rules are not being applied right now. The    │
 │  3 Connections          ││notices say why.                                   │
-│  4 Rules                ││                                                   │
-│  5 Overlaps             │╰───────────────────────────────────────────────────╯
-│  6 Suggested addresses  │╭Connections────────────────────────────────────────╮
-│  7 Connection trace     ││Main connection: Ethernet — Example Network Adapter│
-│  8 Cache                ││— Available — Rules applied                        │
-│  9 Diagnostics and logs ││Additional connection (e.g. VPN): Example Tunnel — │
-│  0 Settings             ││Example Network Adapter — Available — Rules not    │
+│  4 Rules                ││Service: healthy                                   │
+│  5 Overlaps             ││                                                   │
+│  6 Suggested addresses  │╰───────────────────────────────────────────────────╯
+│  7 Connection trace     │╭Connections────────────────────────────────────────╮
+│  8 Cache                ││Main connection: Ethernet — Example Network Adapter│
+│  9 Diagnostics and logs ││— Available — Rules applied                        │
+│  0 Settings             ││Additional connection (e.g. VPN): Example Tunnel — │
+│                         ││Example Network Adapter — Available — Rules not    │
 │                         ││applied                                            │
 │                         ││  The additional connection is not up              │
 │                         ││                                                   │
@@ -18,7 +19,6 @@ Service: OK
 │                         │╭Notifications──────────────────────────────────────╮
 │                         ││1. Warning: The additional connection is not up    │
 │                         ││Sites your rules send there go over the main       │
-│                         ││connection until it comes back: leak protection is │
 ╰─────────────────────────╯╰───────────────────────────────────────────────────╯
 Warning: The additional connection is not up
 F1: help   q: quit

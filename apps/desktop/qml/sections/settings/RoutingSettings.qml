@@ -136,23 +136,40 @@ ColumnLayout {
     // Resolve rule domains bypassing the OS hosts/adblock file.
     // Default true. Per-SID service setting, mirrored in prefs.
     property bool resolveHostsBypass: true
-    // DoH/DoT lockdown MASTER toggle (default off). When on, the
-    // service blocks known DoH/DoT resolver endpoints so browser DNS falls back to
-    // plaintext the observer can see. Per-SID service setting; read from the live
-    // per-SID policy on mount (no prefs mirror — the service snapshot is the SSOT).
+    // The service snapshot owns the DNS-blocking choice and verdict.
     property bool dohLockdownEnabled: false
     // When the lockdown applies: "leak-protection-only" (default,
     // recommended — only while leak protection is on) | "always".
     property string dohLockdownScope: "leak-protection-only"
-    // The lockdown decides itself (on while the user has rules for the
-    // additional route); the service reports what it decided.
     property bool dohLockdownAuto: true
-    property bool dohLockdownEffective: false
+    property var dohLockdownEffective: null
+    readonly property var confirmedDohPolicy: root._serviceRoutePolicy
+    onConfirmedDohPolicyChanged: {
+        var cur = panel.confirmedDohPolicy || {}
+        if (typeof root._routingBackendConnected !== "function"
+                || !root._routingBackendConnected()) {
+            panel.dohLockdownEffective = null
+            return
+        }
+        panel.dohLockdownAuto = root._routePolicyEffective(cur, "doh-lockdown-auto")
+        panel.dohLockdownEnabled = root._routePolicyEffective(cur, "doh-lockdown-enabled")
+        panel.dohLockdownScope = root._routePolicyEffective(cur, "doh-lockdown-scope")
+        panel.leakProtection = root._routePolicyEffective(cur, "leak-protection")
+        panel.dohLockdownEffective = typeof cur["doh-lockdown-effective"] === "boolean"
+            ? cur["doh-lockdown-effective"] : null
+    }
+    readonly property string dohLockdownStatus: Pure.dohLockdownStatus({
+        "doh-lockdown-auto": panel.dohLockdownAuto,
+        "doh-lockdown-enabled": panel.dohLockdownEnabled,
+        "doh-lockdown-scope": panel.dohLockdownScope,
+        "leak-protection": panel.leakProtection,
+        "doh-lockdown-effective": panel.dohLockdownEffective
+    })
     // Hand-set controls show only when the user took the decision over.
     readonly property bool dohLockdownManual: !panel.dohLockdownAuto && panel.dohLockdownEnabled
     // Details and the resolver list follow whether the lockdown applies.
     readonly property bool dohLockdownShown: panel.dohLockdownAuto
-        ? panel.dohLockdownEffective : panel.dohLockdownEnabled
+        ? panel.dohLockdownEffective === true : panel.dohLockdownEnabled
     // Additional-tunnel liveness window (seconds): how long the tunnel's next
     // hop must stay unreachable before the tunnel counts as down. `0` disables
     // it (the default); anything else is clamped to [5, 3600]. Machine-wide.
@@ -509,7 +526,7 @@ ColumnLayout {
         panel.dohLockdownAuto = _offlineRoutePolicyPick(parked, mirror,
             "doh-lockdown-auto", root.routePolicyDefault("doh-lockdown-auto"))
         // Only the service knows what it decided; nothing is claimed offline.
-        panel.dohLockdownEffective = false
+        panel.dohLockdownEffective = null
         panel.ksStrictSharedIps = _offlineRoutePolicyPick(parked, mirror,
             "kill-switch-strict-shared-ips",
             root.routePolicyDefault("kill-switch-strict-shared-ips"))
@@ -553,15 +570,7 @@ ColumnLayout {
     }
 
     function _loadKillSwitchPosture() {
-        // ALWAYS show the persisted intent first, then let a live
-        // service snapshot override it below. Previously the prefs seed ran only
-        // when the bridge was entirely absent (mock/preview); with the service
-        // STOPPED but the real bridge present we fell into the RPC branch, the RPC
-        // failed, `if (!ok) return` left the mirrors at their QML defaults, and the
-        // checkbox rendered unchecked even though the setting was saved — the
-        // "toggle resets after restart" report. Seeding unconditionally fixes it
-        // and also covers the empty-correlation case (registerRpcCallback drops
-        // empty ids, so the callback would never run to seed).
+        // Persisted intent remains visible while the service cannot confirm it.
         _seedKillSwitchFromPrefs()
         if (!root.bridgeAvailable
                 || typeof nrrNativeBridge === "undefined" || nrrNativeBridge === null
@@ -587,7 +596,8 @@ ColumnLayout {
             panel.dohLockdownEnabled = root._routePolicyEffective(cur, "doh-lockdown-enabled")
             panel.dohLockdownScope = root._routePolicyEffective(cur, "doh-lockdown-scope")
             panel.dohLockdownAuto = root._routePolicyEffective(cur, "doh-lockdown-auto")
-            panel.dohLockdownEffective = cur["doh-lockdown-effective"] === true
+            panel.dohLockdownEffective = typeof cur["doh-lockdown-effective"] === "boolean"
+                ? cur["doh-lockdown-effective"] : null
             panel.ksStrictSharedIps =
                 root._routePolicyEffective(cur, "kill-switch-strict-shared-ips")
             panel.autoRulesMode = root._routePolicyEffective(cur, "auto-rules-mode")
@@ -642,6 +652,7 @@ ColumnLayout {
             "shared-ip-policy": ["sharedIpPolicy", null],
             "resolve-hosts-bypass": ["resolveHostsBypass", hostsBypassCheck],
             "doh-lockdown-enabled": ["dohLockdownEnabled", dohEnableCheck],
+            "doh-lockdown-auto": ["dohLockdownAuto", dohAutoCheck],
             "doh-lockdown-scope": ["dohLockdownScope", null],
             "kill-switch-strict-shared-ips": ["ksStrictSharedIps", ksStrictSharedCheck],
             "auto-rules-mode": ["autoRulesMode", null],
@@ -663,6 +674,7 @@ ColumnLayout {
             panel[field[0]] = confirmed[key]
             if (field[1]) field[1].checked = confirmed[key] === true
         }
+        panel.dohLockdownEffective = null
     }
 
     // Read the persisted enforcement mode from the
@@ -1502,6 +1514,7 @@ ColumnLayout {
                 && root._routingBackendConnected()
             if (connected && !panel._backendWasConnected)
                 panel._reloadServiceBackedControls()
+            if (!connected) panel.dohLockdownEffective = null
             panel._backendWasConnected = connected
         }
         // A recorded choice may just have been applied to the service; re-read,
@@ -4256,16 +4269,17 @@ ColumnLayout {
                 details: root.uiRevision >= 0 && visible ? panel._focusDetails() : ""
                 whatItDoes: root.uiRevision >= 0
                     ? root.tr("settings.routing.focus.doh-lockdown.what",
-                        "This switch keeps programs from using DNS servers of their own, so every name lookup goes through NetRuleRouter and your domain rules can see it.")
+                        "Blocks known encrypted-DNS endpoints so domain rules can observe system DNS. A browser using strict encrypted DNS may need its DNS settings changed before sites open.")
                     : ""
                 whenSafe: root.uiRevision >= 0
                     ? root.tr("settings.routing.focus.doh-lockdown.when-safe",
-                        "Turning it off is safe if this program does not open the sites your rules route: its lookups will then simply go past your domain rules. Leave it on if you rely on leak protection for everything.")
+                        "To restore DNS without bypassing domain rules, configure the browser to use system DNS. Disabling this block may let name lookups bypass your rules; it does not confirm that the additional connection works.")
                     : ""
                 onDismissed: panel._focusId = ""
             }
 
             // ── Part A: automatic by default ──
+            DnsCompatibilityCard { root: panel.root }
             CheckBox {
                 id: dohAutoCheck
                 Layout.fillWidth: true
@@ -4283,7 +4297,9 @@ ColumnLayout {
                 }
                 onToggled: {
                     // Taking the decision over keeps what applies right now.
-                    var enabled = checked ? panel.dohLockdownEnabled : panel.dohLockdownEffective
+                    var enabled = checked || typeof panel.dohLockdownEffective !== "boolean"
+                        ? panel.dohLockdownEnabled : panel.dohLockdownEffective
+                    panel.dohLockdownEffective = null
                     panel.dohLockdownAuto = checked
                     panel.dohLockdownEnabled = enabled
                     if (typeof root.routePolicyController.applyDohLockdownChoice === "function")
@@ -4304,14 +4320,27 @@ ColumnLayout {
                 Layout.fillWidth: true
                 Layout.preferredWidth: 0
                 Layout.leftMargin: root.uiTheme.spacingSm
-                visible: panel.dohLockdownAuto
                 color: root.textColor
                 wrapMode: Text.WordWrap
-                text: (root.uiRevision >= 0 && panel.dohLockdownEffective)
-                    ? root.tr("settings.routing.doh-lockdown.auto-on",
+                text: {
+                    if (root.uiRevision < 0) return ""
+                    switch (panel.dohLockdownStatus) {
+                    case "auto-on": return root.tr("settings.routing.doh-lockdown.auto-on",
                         "On: your rules route or block sites by name.")
-                    : root.tr("settings.routing.doh-lockdown.auto-off",
+                    case "auto-off": return root.tr("settings.routing.doh-lockdown.auto-off",
                         "Off: none of your rules needs site names.")
+                    case "manual-disabled": return root.tr("settings.routing.doh-lockdown.manual-disabled",
+                        "Blocking inactive: disabled manually.")
+                    case "manual-always": return root.tr("settings.routing.doh-lockdown.manual-always",
+                        "Blocking active: manual choice applies at all times.")
+                    case "manual-protected": return root.tr("settings.routing.doh-lockdown.manual-protected",
+                        "Blocking active: manual choice, leak protection is on.")
+                    case "manual-waiting": return root.tr("settings.routing.doh-lockdown.manual-waiting",
+                        "Blocking inactive: manual choice applies only while leak protection is on.")
+                    default: return root.tr("settings.routing.doh-lockdown.unconfirmed",
+                        "Blocking state has not been confirmed by the service.")
+                    }
+                }
             }
 
             // ── Part A: per-SID master toggle (hand-set) ──
@@ -4335,6 +4364,7 @@ ColumnLayout {
                     font.bold: true
                 }
                 onToggled: {
+                    panel.dohLockdownEffective = null
                     panel.dohLockdownEnabled = checked
                     if (typeof root.routePolicyController.applyDohLockdownChoice === "function")
                         root.routePolicyController.applyDohLockdownChoice(false, checked)
@@ -4344,12 +4374,11 @@ ColumnLayout {
                 Layout.fillWidth: true
                 Layout.preferredWidth: 0
                 Layout.leftMargin: root.uiTheme.spacingSm
-                visible: !panel.dohLockdownAuto
                 color: root.mutedTextColor
                 wrapMode: Text.WordWrap
                 font.pixelSize: root.uiTheme.baseFontSizePx - 1
                 text: root.tr("settings.routing.doh-lockdown.note",
-                    "Browsers that resolve names over DNS-over-HTTPS (DoH) or DNS-over-TLS (DoT) hide their queries, so routed sites resolved that way bypass your rules and leak protection. Turning this on blocks known encrypted-DNS endpoints so name resolution falls back to plaintext DNS that NetRuleRouter can observe.")
+                    "Blocks known encrypted-DNS endpoints. A browser using strict encrypted DNS may stop resolving sites instead of switching to system DNS. Configure that browser to use system DNS; keep the additional-route rule in place.")
             }
 
             // ── Part A: scope selector (gated on the master toggle) ──
@@ -4399,6 +4428,7 @@ ColumnLayout {
                 onActivated: {
                     var slug = String(model.get(currentIndex).slug)
                     displayText = _slugLabel(slug)
+                    panel.dohLockdownEffective = null
                     panel.dohLockdownScope = slug
                     if (typeof root.routePolicyController.applyDohLockdownScope === "function")
                         root.routePolicyController.applyDohLockdownScope(slug)
@@ -4422,9 +4452,9 @@ ColumnLayout {
                 font.pixelSize: root.uiTheme.baseFontSizePx - 1
                 text: (root.uiRevision >= 0 && String(panel.dohLockdownScope) === "always")
                     ? root.tr("settings.routing.doh-lockdown.scope-always-note",
-                        "Blocks encrypted DNS at all times, even when leak protection is off — maximum observability, but it breaks DoH/HTTP-3 for every app and can slow name resolution.")
+                        "Blocks known encrypted-DNS endpoints even when leak protection is off. Browsers using strict encrypted DNS may need their DNS settings changed.")
                     : root.tr("settings.routing.doh-lockdown.scope-leak-protection-only-note",
-                        "Blocks encrypted DNS only while leak protection blocks all traffic, where DoH would otherwise defeat observation. Leaves DoH working the rest of the time. Recommended.")
+                        "Blocks known encrypted-DNS endpoints while leak protection is set to Routed sites or Everything. With protection off, this manual scope does not block them.")
             }
 
             // ── Part A: details disclosure ──
@@ -4447,7 +4477,7 @@ ColumnLayout {
                 wrapMode: Text.WordWrap
                 font.pixelSize: root.uiTheme.baseFontSizePx - 1
                 text: root.tr("settings.routing.doh-lockdown.details",
-                    "Blocking works by denying connections to a known list of DoH/DoT resolver endpoints (edited below). Apps then fall back to the operating system's plaintext DNS, which the observer reads to keep routing and leak protection accurate. Some apps pin their own resolver and may show connection errors until DoH is turned off in their own settings; this does not affect apps that use the system resolver.")
+                    "Blocking denies connections to the known DoH/DoT endpoints listed below. Browsers that support fallback can then use system DNS. Strict encrypted DNS may instead fail: configure that browser to use system DNS. A blocked resolver address alone does not prove why a particular site failed. The additional-route rule and leak protection remain in force.")
             }
 
             // ── Part B: resolver-list editor disclosure ──

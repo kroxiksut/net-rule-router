@@ -1,47 +1,12 @@
-//! Keep a user-confirmed VPN client's own traffic off the relay's secondary
-//! egress.
-//!
-//! A VPN client's connections ARE the tunnel's transport. Carrying one over the
-//! secondary link means carrying the tunnel through itself: while the adapter is
-//! coming up the dialer's source policy refuses (correctly — dialing would leak
-//! via the primary), so the client's own connectivity/external-address probe
-//! fails on every reconnect — observed as refusals clustered one-for-one on
-//! the adapter's unavailable windows.
-//!
-//! So when a relayed flow belongs to a confirmed VPN client, it leaves over the
-//! PRIMARY link — direct, which is the only way a tunnel can be established in
-//! the first place.
-//!
-//! # Why the verdict is per-FLOW, not per-hostname
-//!
-//! Overriding by hostname would be cheaper (one classification per host, like
-//! the self-heal exclusion set), but it would mean a host the user routed to the
-//! secondary could silently egress the primary for EVERY process merely because
-//! a VPN client once touched it — a leak. Keying on the flow's owning process
-//! keeps the exemption exactly as wide as its justification: this process's
-//! traffic, because this process is the link itself.
-//!
-//! # Hot path
-//!
-//! [`RelayCore::decide`](super::relay::RelayCore::decide) runs on the stack's
-//! single poll thread, so the owner lookup — a connection-table read plus a
-//! process query — must not be paid per flow unconditionally. Three guards, in
-//! order of cost:
-//!
-//! 1. nothing confirmed → one relaxed atomic load, and that is the whole cost
-//!    for every user who never confirmed a client;
-//! 2. the flow is already leaving over the primary → the override cannot change
-//!    anything, so nothing is looked up;
-//! 3. a minimum interval between lookups bounds the worst case (a burst of new
-//!    flows) to a few probes per second. A skipped probe is not a failure: the
-//!    flow keeps today's routing, and the client's next attempt gets a probe.
+//! A confirmed tunnel client's TCP transport leaves over its user's main link.
+//! Authorization belongs to one authenticated flow, never a hostname or UDP bind.
 
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use nrr_platform_api::FlowOwnerLookup;
+use nrr_platform_api::{AppPathResolver, FlowOwnerLookup};
 
 use crate::vpn_client_registry::ConfirmedVpnClients;
 
@@ -49,7 +14,13 @@ use crate::vpn_client_registry::ConfirmedVpnClients;
 pub trait VpnClientFlowBypass: Send + Sync {
     /// `client` is the application's own endpoint, `fake` the pool address it
     /// dialed — the same pair the OS connection table is keyed by.
-    fn owned_by_confirmed_client(&self, client: SocketAddr, fake: SocketAddr) -> bool;
+    fn owned_by_confirmed_client(
+        &self,
+        client: SocketAddr,
+        fake: SocketAddr,
+        principal: &str,
+        allow_service_owner: bool,
+    ) -> bool;
 }
 
 /// The inert default: nothing is ever bypassed (tests, and any composition that
@@ -58,14 +29,12 @@ pub trait VpnClientFlowBypass: Send + Sync {
 pub struct NoVpnClientBypass;
 
 impl VpnClientFlowBypass for NoVpnClientBypass {
-    fn owned_by_confirmed_client(&self, _client: SocketAddr, _fake: SocketAddr) -> bool {
+    fn owned_by_confirmed_client(&self, _: SocketAddr, _: SocketAddr, _: &str, _: bool) -> bool {
         false
     }
 }
 
-/// Default floor between two owner lookups. A VPN client opens its probe flows
-/// seconds apart, so it is never the one throttled; a browser opening a burst of
-/// flows pays at most one lookup per interval.
+/// Bound process-table reads on the shared packet-processing thread.
 pub const DEFAULT_MIN_PROBE_INTERVAL: Duration = Duration::from_millis(20);
 
 /// Production [`VpnClientFlowBypass`]: names the flow's owner through the OS
@@ -73,20 +42,27 @@ pub const DEFAULT_MIN_PROBE_INTERVAL: Duration = Duration::from_millis(20);
 pub struct OwnerLookupVpnClientBypass {
     owner: Arc<dyn FlowOwnerLookup>,
     confirmed: Arc<ConfirmedVpnClients>,
+    service_programs: Option<Arc<dyn AppPathResolver>>,
     min_probe_interval: Duration,
-    /// Monotonic base plus the elapsed-millis stamp of the last probe. An
-    /// `Instant` cannot live in an atomic, so the pair is: `started` (fixed) and
-    /// `last_probe_ms` (relative). `u64::MAX` means "never probed".
+    /// `u64::MAX` means no probe has claimed the monotonic clock yet.
     started: Instant,
     last_probe_ms: AtomicU64,
 }
 
 impl OwnerLookupVpnClientBypass {
+    /// Service identities qualify only where the platform verifies a protected install.
+    #[must_use]
+    pub fn with_service_programs(mut self, programs: Arc<dyn AppPathResolver>) -> Self {
+        self.service_programs = Some(programs);
+        self
+    }
+
     #[must_use]
     pub fn new(owner: Arc<dyn FlowOwnerLookup>, confirmed: Arc<ConfirmedVpnClients>) -> Self {
         Self {
             owner,
             confirmed,
+            service_programs: None,
             min_probe_interval: DEFAULT_MIN_PROBE_INTERVAL,
             started: Instant::now(),
             last_probe_ms: AtomicU64::new(u64::MAX),
@@ -101,9 +77,7 @@ impl OwnerLookupVpnClientBypass {
         self
     }
 
-    /// Claim the right to run one lookup now, or decline because the previous
-    /// one was too recent. Lock-free: a lost race just means the other caller
-    /// probes and this one does not.
+    /// A lost race leaves the existing route in force.
     fn claim_probe_slot(&self) -> bool {
         if self.min_probe_interval.is_zero() {
             return true;
@@ -121,22 +95,28 @@ impl OwnerLookupVpnClientBypass {
 }
 
 impl VpnClientFlowBypass for OwnerLookupVpnClientBypass {
-    fn owned_by_confirmed_client(&self, client: SocketAddr, fake: SocketAddr) -> bool {
-        if !self.confirmed.is_armed() || !self.claim_probe_slot() {
+    fn owned_by_confirmed_client(
+        &self,
+        client: SocketAddr,
+        fake: SocketAddr,
+        principal: &str,
+        allow_service_owner: bool,
+    ) -> bool {
+        if principal.is_empty() || !self.confirmed.is_armed() || !self.claim_probe_slot() {
             return false;
         }
-        let Some(image) = self.owner.owner_image_name(client, fake) else {
+        let Some((owner, image)) = self.owner.owner_identity(client, fake) else {
             return false;
         };
-        // Whose confirmation counts is the flow owner's: a second table read,
-        // paid only once the image already matched someone's pick.
-        let matched = self.confirmed.matches_image(&image)
-            && self.confirmed.matches_image_for(
-                self.owner
-                    .owner_principal(client, fake, nrr_platform_api::fake_ip::FlowTransport::Tcp)
-                    .as_deref(),
-                &image,
-            );
+        if !self.confirmed.matches_path_for(principal, &image) {
+            return false;
+        }
+        let matched = owner.eq_ignore_ascii_case(principal)
+            || (allow_service_owner
+                && nrr_platform_api::types::is_service_account_sid(&owner)
+                && self.service_programs.as_ref().is_some_and(|programs| {
+                    programs.is_protected_install(std::path::Path::new(&image))
+                }));
         if matched {
             tracing::debug!(
                 target: "nrr::fake-ip",
@@ -154,6 +134,19 @@ mod tests {
     use nrr_platform_api::MockFlowOwnerLookup;
 
     const VPN_CLIENT: &str = r"C:\Program Files\ExampleVPN 3.0\examplevpn 3.0.exe";
+    const PRINCIPAL: &str = "S-1-5-21-1";
+
+    struct IdentityOwner(&'static str);
+
+    impl FlowOwnerLookup for IdentityOwner {
+        fn owner_identity(&self, _: SocketAddr, _: SocketAddr) -> Option<(String, String)> {
+            Some((PRINCIPAL.into(), self.0.into()))
+        }
+
+        fn owner_image_name(&self, _: SocketAddr, _: SocketAddr) -> Option<String> {
+            panic!("authorization must use one authenticated identity");
+        }
+    }
 
     fn addr(s: &str) -> SocketAddr {
         s.parse().expect("addr")
@@ -170,48 +163,47 @@ mod tests {
     fn a_confirmed_client_flow_is_bypassed() {
         let client = addr("10.88.1.41:51000");
         let fake = addr("198.18.0.7:443");
-        let owner = MockFlowOwnerLookup::new();
-        owner.set_owner(client, fake, "examplevpn 3.0.exe");
+        let owner = IdentityOwner(VPN_CLIENT);
         let confirmed = Arc::new(ConfirmedVpnClients::new());
         confirmed.publish("S-1-5-21-1", &[VPN_CLIENT.to_string()]);
 
         let gate = bypass(Arc::new(owner), confirmed);
-        assert!(gate.owned_by_confirmed_client(client, fake));
+        assert!(gate.owned_by_confirmed_client(client, fake, PRINCIPAL, false));
     }
 
     #[test]
     fn an_ordinary_process_is_not_bypassed() {
         let client = addr("10.88.1.41:51001");
         let fake = addr("198.18.0.8:443");
-        let owner = MockFlowOwnerLookup::new();
-        owner.set_owner(client, fake, "chrome.exe");
+        let owner = IdentityOwner(r"C:\Program Files\Browser\chrome.exe");
         let confirmed = Arc::new(ConfirmedVpnClients::new());
         confirmed.publish("S-1-5-21-1", &[VPN_CLIENT.to_string()]);
 
         let gate = bypass(Arc::new(owner), confirmed);
-        assert!(!gate.owned_by_confirmed_client(client, fake));
+        assert!(!gate.owned_by_confirmed_client(client, fake, PRINCIPAL, false));
     }
 
     #[test]
     fn a_vpn_named_process_the_user_never_confirmed_is_not_bypassed() {
-        // The exemption keys on the user's confirmation, NOT on the `looks_like_vpn`
-        // keyword heuristic — a process is not handed a way around our routing
-        // just for having "vpn" in its name.
+        // A VPN-looking name alone authorizes nothing.
         let client = addr("10.88.1.41:51002");
         let fake = addr("198.18.0.9:443");
-        let owner = MockFlowOwnerLookup::new();
-        owner.set_owner(client, fake, "somevpn.exe");
+        let owner = IdentityOwner(r"C:\Program Files\Other\somevpn.exe");
         let confirmed = Arc::new(ConfirmedVpnClients::new());
         confirmed.publish("S-1-5-21-1", &[VPN_CLIENT.to_string()]);
 
         let gate = bypass(Arc::new(owner), confirmed);
-        assert!(!gate.owned_by_confirmed_client(client, fake));
+        assert!(!gate.owned_by_confirmed_client(client, fake, PRINCIPAL, false));
     }
 
     #[test]
     fn an_unarmed_registry_never_looks_the_owner_up() {
         struct PanickingLookup;
         impl FlowOwnerLookup for PanickingLookup {
+            fn owner_identity(&self, _: SocketAddr, _: SocketAddr) -> Option<(String, String)> {
+                panic!("the unarmed hot path must not read the connection table");
+            }
+
             fn owner_image_name(&self, _l: SocketAddr, _r: SocketAddr) -> Option<String> {
                 panic!("the unarmed hot path must not read the connection table");
             }
@@ -220,7 +212,12 @@ mod tests {
             Arc::new(PanickingLookup),
             Arc::new(ConfirmedVpnClients::new()),
         );
-        assert!(!gate.owned_by_confirmed_client(addr("10.88.1.41:51003"), addr("198.18.0.10:443")));
+        assert!(!gate.owned_by_confirmed_client(
+            addr("10.88.1.41:51003"),
+            addr("198.18.0.10:443"),
+            PRINCIPAL,
+            false
+        ));
     }
 
     #[test]
@@ -229,24 +226,28 @@ mod tests {
         confirmed.publish("S-1-5-21-1", &[VPN_CLIENT.to_string()]);
         // No entries → the lookup answers None (the row vanished / no rights).
         let gate = bypass(Arc::new(MockFlowOwnerLookup::new()), confirmed);
-        assert!(!gate.owned_by_confirmed_client(addr("10.88.1.41:51004"), addr("198.18.0.11:443")));
+        assert!(!gate.owned_by_confirmed_client(
+            addr("10.88.1.41:51004"),
+            addr("198.18.0.11:443"),
+            PRINCIPAL,
+            false
+        ));
     }
 
     #[test]
     fn the_rate_limit_declines_a_second_probe_inside_the_window() {
         let client = addr("10.88.1.41:51005");
         let fake = addr("198.18.0.12:443");
-        let owner = MockFlowOwnerLookup::new();
-        owner.set_owner(client, fake, "examplevpn 3.0.exe");
+        let owner = IdentityOwner(VPN_CLIENT);
         let confirmed = Arc::new(ConfirmedVpnClients::new());
         confirmed.publish("S-1-5-21-1", &[VPN_CLIENT.to_string()]);
         // A very long floor makes the second call deterministically declined.
         let gate = OwnerLookupVpnClientBypass::new(Arc::new(owner), confirmed)
             .with_min_probe_interval(Duration::from_secs(3600));
 
-        assert!(gate.owned_by_confirmed_client(client, fake));
+        assert!(gate.owned_by_confirmed_client(client, fake, PRINCIPAL, false));
         assert!(
-            !gate.owned_by_confirmed_client(client, fake),
+            !gate.owned_by_confirmed_client(client, fake, PRINCIPAL, false),
             "a declined probe falls back to today's routing rather than blocking the poll thread",
         );
     }

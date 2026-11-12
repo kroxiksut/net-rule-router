@@ -26,6 +26,7 @@ target
 !**/README_RU.md
 !**/README_ru.md
 !/ROADMAP_RU.md
+!/CHANGELOG_RU.md
 !docs/**/*_RU.md
 !docs/**/*_ru.md
 TASKS.md

@@ -7,10 +7,8 @@ import "../lib/pure.js" as Pure
 
 // First-run wizard, one question per page in the terminal setup's order:
 // main connection, additional connection, starting rules, protection and
-// options, review. Opens once when `!prefs.firstRunCompleted`; every way out
-// marks the flag so it never reappears. The protection is written when the
-// review page is reached and on every way out, before the starting rules go:
-// rules never run without the protection chosen with them.
+// options, review. Opens while `!prefs.firstRunCompleted`; Finish becomes
+// available only when every route needed by the starting rules is live.
 // The window keeps its `firstRunWindow` id so Main.qml's wiring (property
 // alias, overlays/children arrays, openChildWindow, and licenseWindow's
 // transient-parent reference) is unchanged. Shared state comes in through
@@ -143,6 +141,38 @@ Window {
     // The bound additional adapter is not up yet (a VPN before it connects).
     readonly property bool secondaryAssignedDown: secondaryAssigned && root.uiRevision >= 0
         && String(root.interfacesModel.get(assignedSecondaryIndex).availability || "") !== "available"
+
+    function _chosenRequiresSecondary() {
+        if (chosenStart === null) return false
+        var route = String(chosenStart.route || "")
+        return route === "secondary" || route === "both"
+    }
+
+    function _secondaryFinishAvailability() {
+        var index = assignedSecondaryIndex
+        if (index < 0)
+            index = Pure.firstRunPickToCommit(_modelRows(), "secondary", pickedSecondaryKey)
+        return index >= 0
+            && String(root.interfacesModel.get(index).availability || "") === "available"
+    }
+
+    function _finishState() {
+        var assigned = secondaryAssigned
+            || Pure.firstRunPickToCommit(_modelRows(), "secondary", pickedSecondaryKey) >= 0
+        return Pure.firstRunFinishState(_chosenRequiresSecondary(), assigned,
+            _secondaryFinishAvailability())
+    }
+
+    function _finishBlockedText() {
+        var state = _finishState()
+        if (state === "secondary-not-chosen")
+            return root.tr("dialog.first-run-wizard.finish-secondary-not-chosen",
+                "These starting rules use the additional connection. Turn on your VPN in TUN mode, refresh the list, and choose the connection. System proxy mode does not create a connection NetRuleRouter can route through.")
+        if (state === "secondary-unavailable")
+            return root.tr("dialog.first-run-wizard.finish-secondary-unavailable",
+                "These starting rules use the additional connection, but it is not connected. Turn on your VPN in TUN mode and refresh the list. System proxy mode is not a routable connection in this version.")
+        return ""
+    }
 
     // The adapter picked in each list, by id (name when it has none). The list
     // is rebuilt on every adapter change, which resets a combo's index; the
@@ -802,6 +832,8 @@ Window {
                 ? chosenStart.label
                 : root.tr("dialog.first-run-wizard.review-rules-current",
                     "the rules already applied to you")))
+        var blocked = _finishBlockedText()
+        if (blocked !== "") lines.push(blocked)
         var level = root.tr("settings.routing.leak-protection.option-" + leakProtectionChoice,
             leakProtectionChoice)
         lines.push((protectionInForce
@@ -941,10 +973,7 @@ Window {
         }
     }
 
-    // Every way out — Finish, the Escape overlay handler
-    // (`applyActiveOverlay`) or the title-bar X — commits what was chosen, in
-    // the order the service needs it: connections, protection, then the
-    // starting rules, which never run without the protection.
+    // A completed run commits connections, protection, then starting rules.
     function _commitRun() {
         _commitPendingPicks()
         _applyProtectionChoices()
@@ -962,8 +991,13 @@ Window {
     }
 
     onClosing: {
-        _commitRun()
-        if (!root.prefs.firstRunCompleted) {
+        var complete = _finishState() === "ready"
+        if (complete) _commitRun()
+        else {
+            _commitPendingPicks()
+            _applyProtectionChoices()
+        }
+        if (complete && !root.prefs.firstRunCompleted) {
             root.updatePrefs({ firstRunCompleted: true })
         }
         // Flushed HERE, on every close path. Waiting for the main
@@ -1537,7 +1571,7 @@ Window {
                             ? root.tr("dialog.first-run-wizard.secondary-adapter-deferred",
                                 "You can assign it any time in Connections. Until then, with leak protection on, the traffic your rules send that way is blocked instead of leaking to the main connection.")
                             : root.tr("dialog.first-run-wizard.secondary-adapter-description",
-                                "The connection your rules send traffic to — a VPN or a second network. Rules that name it do nothing until it is assigned."))
+                                "The connection your rules send traffic to — a VPN in TUN mode or a second network. System proxy mode does not create a connection NetRuleRouter can route through."))
                 }
                 Label {
                     Layout.fillWidth: true
@@ -2148,8 +2182,7 @@ Window {
                 }
             }
 
-            // Protection defaults: sent when the review page is reached and on
-            // every way out, so they are in force before the first rules apply.
+            // Protection is saved before starting rules can apply.
             ColumnLayout {
                 id: wizardStepOptions
                 visible: firstRunWindow.step === 3
@@ -2241,6 +2274,14 @@ Window {
                         firstRunWindow._protectionTouched = true
                         firstRunWindow.wantDohLockdown = checked
                     }
+                }
+                Label {
+                    Layout.fillWidth: true
+                    Layout.preferredWidth: 0
+                    color: root.mutedTextColor
+                    wrapMode: Text.WordWrap
+                    text: root.tr("dialog.first-run-wizard.protection-doh-lockdown-note",
+                        "A browser using strict encrypted DNS may stop opening sites while this protection is active. Configure that browser to use system DNS; keep your routing rules and leak protection enabled.")
                 }
                 CheckBox {
                     id: firstRunFakeIpCheck
@@ -2388,8 +2429,7 @@ Window {
 
     // The way on from the window, pinned under the scrolling area so it never
     // needs scrolling; declared after it so Tab reaches it last. Next and Back
-    // only turn pages: the connections, the starting rules and the protection
-    // are committed by `onClosing`.
+    // only turn pages; a ready Finish commits the run through `onClosing`.
     Rectangle {
         id: finishBar
         anchors {
@@ -2431,8 +2471,10 @@ Window {
                 // Kept in the row on every page as its spacer; worded only
                 // where Finish is.
                 opacity: finishButton.visible ? 1 : 0
-                text: root.tr("dialog.first-run-wizard.finish-hint",
-                    "Applies the choices above: connections, starting rules and protection.")
+                text: firstRunWindow._finishBlockedText() !== ""
+                    ? firstRunWindow._finishBlockedText()
+                    : root.tr("dialog.first-run-wizard.finish-hint",
+                        "Applies the choices above: connections, starting rules and protection.")
                 Accessible.ignored: !finishButton.visible
             }
             ThemedButton {
@@ -2454,6 +2496,7 @@ Window {
                 text: root.tr("action.finish", "Finish")
                 visible: firstRunWindow.step === firstRunWindow.stepCount - 1
                 highlighted: true
+                enabled: firstRunWindow._finishState() === "ready"
                 attention: firstRunWindow.pulseTarget === "finish" ? firstRunWindow.pulse : 0
                 Accessible.role: Accessible.Button
                 Accessible.name: text

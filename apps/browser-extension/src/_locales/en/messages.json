@@ -1,0 +1,323 @@
+{
+  "app_name": {
+    "message": "NetRuleRouter"
+  },
+  "app_description": {
+    "message": "Choose website language and browser settings explicitly, with local site profiles."
+  },
+  "popup_title": {
+    "message": "NetRuleRouter — current site"
+  },
+  "options_title": {
+    "message": "Website profiles and browser settings"
+  },
+  "settings": {
+    "message": "Settings"
+  },
+  "standalone": {
+    "message": "Standalone"
+  },
+  "standalone_description": {
+    "message": "Your profiles are stored in this browser. Connection to the NRR application is not available in this version."
+  },
+  "current_site": {
+    "message": "Current site"
+  },
+  "site_profile": {
+    "message": "Exact-host profile"
+  },
+  "language_mode": {
+    "message": "Website language"
+  },
+  "mode_inherit": {
+    "message": "Restore inheritance (remove this profile)"
+  },
+  "mode_global_inherit": {
+    "message": "Inherited (no override)"
+  },
+  "broader_profile": {
+    "message": "A broader saved profile matches this site: $HOST$, $VALUE$. Saving a manual language or browser default creates an exception.",
+    "placeholders": { "host": { "content": "$1" }, "value": { "content": "$2" } }
+  },
+  "scope_inherited": {
+    "message": "Remove the saved profile for $VALUE$. The nearest broader site profile or global profile will apply.",
+    "placeholders": { "value": { "content": "$1" } }
+  },
+  "mode_system": {
+    "message": "Browser default"
+  },
+  "mode_manual": {
+    "message": "Choose language"
+  },
+  "mode_route": {
+    "message": "Follow route"
+  },
+  "mode_route_unavailable": {
+    "message": "Follow route — unavailable"
+  },
+  "language_tag": {
+    "message": "Language tag"
+  },
+  "language_tag_help": {
+    "message": "For example, fr, en-US or ru. Choose one language."
+  },
+  "include_subdomains": {
+    "message": "Include subdomains"
+  },
+  "scope_exact": {
+    "message": "Applies to $VALUE$ only.",
+    "placeholders": {
+      "value": {
+        "content": "$1"
+      }
+    }
+  },
+  "scope_subdomains": {
+    "message": "Applies to $VALUE$ and its subdomains.",
+    "placeholders": {
+      "value": {
+        "content": "$1"
+      }
+    }
+  },
+  "language_partial": {
+    "message": "Changes Accept-Language for requests whose destination host matches the profile. Resources from other hosts are outside that profile. Page scripts retain the browser language (navigator.language). Sites may use account or cookie preferences instead."
+  },
+  "save_apply": {
+    "message": "Save and apply"
+  },
+  "restore_inheritance": {
+    "message": "Restore inheritance"
+  },
+  "route": {
+    "message": "Route"
+  },
+  "route_unavailable": {
+    "message": "Unavailable without an NRR connection"
+  },
+  "timezone": {
+    "message": "Time zone"
+  },
+  "timezone_unavailable": {
+    "message": "Browser default · changing it is unavailable"
+  },
+  "webrtc": {
+    "message": "WebRTC"
+  },
+  "webrtc_unchanged": {
+    "message": "Browser default"
+  },
+  "webrtc_owned": {
+    "message": "Non-proxied UDP restricted for this browser profile"
+  },
+  "explicit_only": {
+    "message": "Browser settings change only when you explicitly apply an option. Installing or opening the extension does not enable these changes."
+  },
+  "pending_changes": {
+    "message": "Saved changes have not finished applying. Check the result before relying on them."
+  },
+  "saved_reload": {
+    "message": "Saved. Reload matching pages for new HTTP requests to use this choice."
+  },
+  "inherited_reload": {
+    "message": "The explicit profile was removed. The broader site profile or global profile now applies. Reload the page."
+  },
+  "inherit_confirm": {
+    "message": "Remove this explicit profile? The nearest broader site profile or global profile will apply to its scope."
+  },
+  "unsupported_page": {
+    "message": "Open an HTTP or HTTPS website"
+  },
+  "open_website": {
+    "message": "Browser pages and extension pages cannot have a website profile. Global settings are available in Settings."
+  },
+  "global_profile": {
+    "message": "Global browser profile"
+  },
+  "global_description": {
+    "message": "Used for websites without an explicit profile. Route-based NRR profiles will be available with the desktop connection."
+  },
+  "scope_global": {
+    "message": "Scope — all HTTP and HTTPS websites in this browser profile."
+  },
+  "hostname": {
+    "message": "Host"
+  },
+  "hostname_help": {
+    "message": "Enter a hostname such as meet.example.com, without a URL path or port."
+  },
+  "system_override_help": {
+    "message": "Browser default stops language inheritance for this scope. Removing the profile restores inheritance."
+  },
+  "clear_form": {
+    "message": "New profile"
+  },
+  "profiles_title": {
+    "message": "Saved website profiles"
+  },
+  "profile_precedence": {
+    "message": "The most specific matching hostname wins. Each profile shows whether it also includes subdomains."
+  },
+  "no_profiles": {
+    "message": "No site profiles yet. Websites use the global browser profile."
+  },
+  "list_subdomains": {
+    "message": "Host and subdomains"
+  },
+  "list_exact": {
+    "message": "Exact host"
+  },
+  "list_manual": {
+    "message": "Language — $VALUE$",
+    "placeholders": {
+      "value": {
+        "content": "$1"
+      }
+    }
+  },
+  "edit": {
+    "message": "Edit"
+  },
+  "edit_host": {
+    "message": "Edit $VALUE$",
+    "placeholders": {
+      "value": {
+        "content": "$1"
+      }
+    }
+  },
+  "inherit_host": {
+    "message": "Restore inheritance for $VALUE$",
+    "placeholders": {
+      "value": {
+        "content": "$1"
+      }
+    }
+  },
+  "webrtc_title": {
+    "message": "WebRTC for the whole browser profile"
+  },
+  "webrtc_scope": {
+    "message": "This change affects every website in this browser profile, including other tabs. Incognito windows may inherit it too."
+  },
+  "webrtc_consequence": {
+    "message": "Restricting non-proxied UDP can interrupt calls and screen sharing. Applying the browser setting does not prove which network route a call uses."
+  },
+  "webrtc_acknowledge": {
+    "message": "I want to apply this change to the entire browser profile and understand that calls may stop working."
+  },
+  "webrtc_enable": {
+    "message": "Restrict non-proxied UDP"
+  },
+  "webrtc_restore": {
+    "message": "Release this extension's setting"
+  },
+  "webrtc_unavailable": {
+    "message": "WebRTC control is unavailable for this browser in this version."
+  },
+  "webrtc_confirm_required": {
+    "message": "Confirm the whole-browser scope and its effect on calls before applying."
+  },
+  "webrtc_saved": {
+    "message": "WebRTC setting applied to this browser profile. Check any ongoing calls."
+  },
+  "webrtc_restored": {
+    "message": "The extension released its WebRTC setting."
+  },
+  "capabilities": {
+    "message": "Available scope"
+  },
+  "fingerprint": {
+    "message": "Browser fingerprint"
+  },
+  "fingerprint_unchanged": {
+    "message": "No fingerprint changes enabled"
+  },
+  "nrr_sync": {
+    "message": "NRR sync"
+  },
+  "nrr_sync_unavailable": {
+    "message": "Not available in this version"
+  },
+  "appearance": {
+    "message": "Appearance"
+  },
+  "theme": {
+    "message": "Theme"
+  },
+  "theme_system": {
+    "message": "System"
+  },
+  "theme_light": {
+    "message": "Light"
+  },
+  "theme_dark": {
+    "message": "Dark"
+  },
+  "theme_contrast": {
+    "message": "High contrast"
+  },
+  "font": {
+    "message": "Font"
+  },
+  "font_system": {
+    "message": "System font"
+  },
+  "error_generic": {
+    "message": "The result could not be confirmed. Reload this view and review the current settings before trying again."
+  },
+  "webrtc_drift": {
+    "message": "Restriction requested, but the browser is not applying it. Check permissions and other extensions before applying again."
+  },
+  "error_unavailable": {
+    "message": "The extension background is unavailable. Reopen this window."
+  },
+  "error_invalid_request": {
+    "message": "The requested operation is invalid."
+  },
+  "error_invalid_host": {
+    "message": "Enter a valid hostname without a URL path, credentials or port."
+  },
+  "error_invalid_language": {
+    "message": "Enter one valid language tag, such as fr or en-US."
+  },
+  "error_invalid_state": {
+    "message": "The profile state is invalid. Reload the view before editing."
+  },
+  "error_storage_corrupt": {
+    "message": "Saved profiles could not be read safely. They have been preserved for recovery."
+  },
+  "error_storage_failed": {
+    "message": "The browser could not save the changes. Free storage space and try again."
+  },
+  "error_conflict": {
+    "message": "Another window changed the profiles. Reopen this view and review the latest values before saving."
+  },
+  "error_permission_required": {
+    "message": "Website access is required for this scope. Apply again and grant access when prompted."
+  },
+  "error_permission_denied": {
+    "message": "Browser permission was declined. The change has not been applied."
+  },
+  "error_unsupported": {
+    "message": "This setting is not supported in this browser."
+  },
+  "error_route_unavailable": {
+    "message": "An NRR route is unavailable. Choose the browser default or a manual language."
+  },
+  "error_consent_required": {
+    "message": "Review the scope and explicitly apply the change."
+  },
+  "error_apply_failed": {
+    "message": "The browser refused the change. Check permissions and other extensions controlling this setting."
+  },
+  "error_policy_unavailable": {
+    "message": "The profile engine could not load. Reinstall the complete extension package."
+  },
+  "error_too_many_profiles": {
+    "message": "The profile limit has been reached. Remove an unused profile first."
+  },
+  "error_untrusted_sender": {
+    "message": "The request did not come from this extension's settings."
+  }
+}

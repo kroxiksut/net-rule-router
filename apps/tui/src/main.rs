@@ -11,6 +11,7 @@ mod args;
 mod backend;
 mod block_backlog;
 mod block_route;
+mod dns_compatibility;
 mod elevation_prompt;
 mod feed;
 mod forwarded_traffic;

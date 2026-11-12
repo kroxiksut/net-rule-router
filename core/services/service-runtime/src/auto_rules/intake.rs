@@ -1,12 +1,238 @@
-//! What the engine is TOLD: observed flows, health, blocks and reachability.
-//!
-//! Nothing here decides anything — intake only records evidence against a
-//! principal's ledger. The verdict is [`super::tick`]'s job, which is what
-//! keeps the observation path cheap.
+//! Observations and independent reachability findings recorded per principal.
 
 use super::*;
 
 impl AutoRulesEngine {
+    /// Independent name-specific TLS evidence; it never attributes a browser flow.
+    pub(crate) fn note_shared_address_reachability(
+        &self,
+        sid: &str,
+        hostname: &str,
+        now: SystemTime,
+    ) -> bool {
+        self.note_independent_path_reachability(
+            sid,
+            hostname,
+            AUTO_RULE_SIGNAL_SHARED_ADDRESS_REACHABILITY,
+            now,
+        )
+    }
+
+    /// A bounded HTTP exchange differed across the owner's actual links.
+    /// No passive completion or navigation credit is inferred from this measurement.
+    pub fn note_http_path_reachability(&self, sid: &str, hostname: &str, now: SystemTime) -> bool {
+        self.note_independent_path_reachability(
+            sid,
+            hostname,
+            AUTO_RULE_SIGNAL_HTTP_PATH_REACHABILITY,
+            now,
+        )
+    }
+
+    fn note_independent_path_reachability(
+        &self,
+        sid: &str,
+        hostname: &str,
+        signal: &str,
+        now: SystemTime,
+    ) -> bool {
+        let host = normalized_host(hostname);
+        if host.is_empty()
+            || host.len() > 253
+            || !host.is_ascii()
+            || matches!(
+                nrr_domain::rule_value_validation::validate_rule_value("domain", &host),
+                nrr_domain::rule_value_validation::RuleValueValidation::Error { .. }
+            )
+            || !self.learns_for(sid)
+            || self.default_route_role(sid) != RouteRole::Primary
+        {
+            return false;
+        }
+        let Some(snapshot) = self.rules.active_rules_for(sid) else {
+            return false;
+        };
+        let exclusions = RuleBookExclusions {
+            book: &snapshot.rule_book,
+        };
+        if exclusions.is_rule_host(&host)
+            || exclusions.is_matched_by_existing_rule(&host)
+            || exclusions.is_platform_infrastructure(&host)
+        {
+            return false;
+        }
+        let www = signal == AUTO_RULE_SIGNAL_HTTP_PATH_REACHABILITY
+            && automatic_suffix_target(&host) != host;
+        let proposed = if www {
+            automatic_suffix_target(&host).to_string()
+        } else {
+            host.clone()
+        };
+        let (kind, authored_kind) = if www {
+            (AUTO_RULE_MATCH_KIND_SUFFIX, AuthoredMatchKind::SuffixDomain)
+        } else {
+            (AUTO_RULE_MATCH_KIND_EXACT, AuthoredMatchKind::ExactHost)
+        };
+        let id = candidate_id(sid, kind, &proposed);
+        let suppressed = self.suppressed_ids(sid);
+        if suppressed.contains(&id)
+            || suppressed.contains(&candidate_id(sid, AUTO_RULE_MATCH_KIND_SUFFIX, &host))
+        {
+            return false;
+        }
+        let now_ms = unix_ms(now);
+        let candidate = PendingCandidate {
+            dto: AutoRuleCandidateDto {
+                id,
+                anchor: host.clone(),
+                proposed_match: proposed,
+                match_kind: kind.to_string(),
+                route: RouteRole::Secondary.slug().to_string(),
+                affinity: 0.0,
+                observations: None,
+                first_seen_unix_ms: now_ms,
+                last_seen_unix_ms: now_ms,
+                signal: signal.to_string(),
+                consumers: Vec::new(),
+                consumers_changed_unix_ms: 0,
+                primary_behavior: AUTO_RULE_PRIMARY_BEHAVIOR_STALLS.to_string(),
+                anchor_refuses_main_link: false,
+                observed_members: if www { vec![host] } else { Vec::new() },
+                served_by_main_link: false,
+                third_party: None,
+                secondary_reach: Some(true),
+                any_zone_site: String::new(),
+                less_certain: String::new(),
+            },
+            route: RouteRole::Secondary,
+            match_kind: authored_kind,
+        };
+        let checked = www.then(|| {
+            let mut observed = candidate.dto.clone();
+            observed.proposed_match = observed.anchor.clone();
+            observed
+        });
+        self.park(sid, vec![candidate], now_ms);
+        if let Some(observed) = checked {
+            self.record_candidate_discovery(
+                sid,
+                &observed,
+                DiscoveryDecision::new("candidate", "ready", "offer-ready"),
+                now,
+            );
+        }
+        self.announce_pending(sid, now);
+        true
+    }
+
+    pub(crate) fn withdraw_shared_address_reachability(
+        &self,
+        sid: &str,
+        hostname: &str,
+        now: SystemTime,
+    ) {
+        self.withdraw_independent_path(
+            sid,
+            hostname,
+            AUTO_RULE_SIGNAL_SHARED_ADDRESS_REACHABILITY,
+            now,
+        );
+    }
+
+    pub fn withdraw_http_path_reachability(&self, sid: &str, hostname: &str, now: SystemTime) {
+        self.withdraw_independent_path(sid, hostname, AUTO_RULE_SIGNAL_HTTP_PATH_REACHABILITY, now);
+    }
+
+    fn withdraw_independent_path(&self, sid: &str, hostname: &str, signal: &str, now: SystemTime) {
+        let host = normalized_host(hostname);
+        let target = if signal == AUTO_RULE_SIGNAL_HTTP_PATH_REACHABILITY {
+            automatic_suffix_target(&host)
+        } else {
+            host.as_str()
+        };
+        let mut guard = self.pending.lock().unwrap_or_else(|p| p.into_inner());
+        let Some(entry) = guard.get_mut(sid) else {
+            return;
+        };
+        let before = entry.len();
+        entry.retain(|candidate| {
+            candidate.dto.signal != signal || candidate.dto.proposed_match != target
+        });
+        let updated = (before != entry.len()).then(|| entry.clone());
+        drop(guard);
+        if let Some(updated) = updated {
+            self.persist_pending(sid, &updated, unix_ms(now));
+        }
+    }
+
+    /// Active HTTP reachability is carried on a companion's parked evidence,
+    /// never inserted into passive browser outcomes or navigation counters.
+    pub(crate) fn note_measured_http_primary(
+        &self,
+        sid: &str,
+        hostname: &str,
+        answered: bool,
+        now: SystemTime,
+    ) {
+        let host = normalized_host(hostname);
+        let at = Instant::now();
+        {
+            let mut cache = self.http_primary.lock().unwrap_or_else(|p| p.into_inner());
+            cache.retain(|_, (_, measured)| {
+                at.saturating_duration_since(*measured) < crate::primary_stall_registry::ENTRY_TTL
+            });
+            let key = (sid.to_string(), host.clone());
+            if !cache.contains_key(&key) {
+                let owners: HashSet<_> = cache.keys().map(|(owner, _)| owner.as_str()).collect();
+                if !owners.contains(sid) && owners.len() >= MAX_TRACKED_PRINCIPALS {
+                    if let Some(owner) = cache
+                        .iter()
+                        .min_by_key(|(_, (_, measured))| *measured)
+                        .map(|((owner, _), _)| owner.clone())
+                    {
+                        cache.retain(|(held, _), _| held != &owner);
+                    }
+                }
+                if cache.keys().filter(|(owner, _)| owner == sid).count()
+                    >= MAX_PENDING_PER_PRINCIPAL
+                {
+                    if let Some(key) = cache
+                        .iter()
+                        .filter(|((owner, _), _)| owner == sid)
+                        .min_by_key(|(_, (_, measured))| *measured)
+                        .map(|(key, _)| key.clone())
+                    {
+                        cache.remove(&key);
+                    }
+                }
+            }
+            cache.insert(key, (answered, at));
+        }
+        if !answered {
+            return;
+        }
+        let updated = {
+            let mut guard = self.pending.lock().unwrap_or_else(|p| p.into_inner());
+            let Some(entry) = guard.get_mut(sid) else {
+                return;
+            };
+            let mut changed = false;
+            for candidate in entry.iter_mut().filter(|candidate| {
+                candidate.dto.proposed_match == host
+                    && !is_self_signed_signal(&candidate.dto.signal)
+            }) {
+                let behavior = AUTO_RULE_PRIMARY_BEHAVIOR_RESPONDS;
+                changed |= candidate.dto.primary_behavior != behavior;
+                candidate.dto.primary_behavior = behavior.to_string();
+            }
+            changed.then(|| entry.clone())
+        };
+        if let Some(updated) = updated {
+            self.persist_pending(sid, &updated, unix_ms(now));
+            self.publish_count(sid, self.pending_count(sid) as u64);
+        }
+    }
+
     /// Opens an observation batch for `sid`, or returns `None` when this
     /// principal collects nothing (`auto_rules_mode = off`) — the caller then
     /// does no work at all, which is what "off" has to mean.
@@ -187,6 +413,13 @@ impl AutoRulesEngine {
     ) -> bool {
         let key = (sid.to_string(), normalized_host(hostname));
         if reached.only_pulled_in() {
+            self.note_discovery(
+                sid,
+                Some(hostname),
+                None,
+                DiscoveryDecision::new("candidate", "not-created", "pulled-in"),
+                now,
+            );
             self.pulled_in_refusals
                 .lock()
                 .unwrap_or_else(|p| p.into_inner())
@@ -331,6 +564,10 @@ impl AutoRulesEngine {
     fn app_offer_gate(&self, sid: &str, program: &str) -> Option<AppOfferGate> {
         use nrr_shared::ipc_payloads::AUTO_RULE_MATCH_KIND_APPLICATION;
         let program = program.trim().to_ascii_lowercase();
+        let own = crate::app_observation_lookup::own_process_key();
+        if !own.is_empty() && crate::app_observation_lookup::app_key(&program) == own {
+            return None;
+        }
         if program.is_empty() || self.mode(sid) == AutoRulesMode::Off {
             return None;
         }
@@ -454,6 +691,7 @@ impl AutoRulesEngine {
         let now_ms = unix_ms(now);
         let mut withheld = false;
         let mut not_opening = false;
+        let mut measured = Vec::new();
         let updated = {
             let mut guard = self.pending.lock().unwrap_or_else(|p| p.into_inner());
             let Some(entry) = guard.get_mut(sid) else {
@@ -463,6 +701,7 @@ impl AutoRulesEngine {
             for candidate in entry.iter_mut() {
                 if candidate.dto.proposed_match == host {
                     candidate.dto.secondary_reach = Some(answered);
+                    measured.push(candidate.dto.clone());
                     touched = true;
                     withheld |= !answered && is_self_signed_signal(&candidate.dto.signal);
                     // Measured on both links: the site the user opened fails
@@ -475,6 +714,14 @@ impl AutoRulesEngine {
         };
         if let Some(updated) = updated {
             self.persist_pending(sid, &updated, now_ms);
+        }
+        for dto in measured {
+            let decision = if answered {
+                DiscoveryDecision::new("candidate", "ready", "offer-ready")
+            } else {
+                DiscoveryDecision::new("probe", "hidden", "secondary-failed")
+            };
+            self.record_candidate_discovery(sid, &dto, decision, now);
         }
         if withheld {
             self.announce_unreachable(sid, &host, now_ms);
@@ -516,95 +763,17 @@ impl AutoRulesEngine {
         );
     }
 
-    /// The name a self-signed offer should carry: `host` itself, or the
-    /// registrable domain when the evidence already reaches that far.
-    ///
-    /// It reaches that far when a SECOND name under the same domain is already
-    /// parked for failing, or when the failing name IS the domain. One failing
-    /// subdomain proves nothing about its neighbours: measured on the field
-    /// case, one subdomain was cut while the apex and `www` answered normally,
-    /// so rolling up on that evidence would move working traffic into the
-    /// tunnel.
-    ///
-    /// Two of them do prove it, and the proof is about the DOMAIN rather than
-    /// about the apex: a provider cutting two unrelated names under one domain
-    /// is cutting the domain, and the apex still answering is a detail of how
-    /// far it has got. One site is one question, so the apex travels with the
-    /// site it belongs to. Platform infrastructure never reaches here — it is
-    /// refused before any of this — so a roll-up cannot swallow a domain that
-    /// belongs to everybody.
-    fn rolled_up_target(&self, sid: &str, host: String) -> String {
-        let Some(apex) = registrable_domain(&host).map(str::to_string) else {
-            return host;
-        };
-        if apex == host {
-            return host;
-        }
-        if !self.another_name_under(sid, &apex, &host) {
-            return host;
-        }
-        tracing::info!(
-            target: "nrr::auto-rules",
-            msg_key = "autorules-intake-domain-offer",
-            sid = %sid,
-            host = %host,
-            domain = %apex,
-            "a second name under this domain fails on the main link — offering the domain instead of each name",
-        );
-        apex
-    }
-
-    /// Is a DIFFERENT self-signed offer already parked under `apex`?
-    fn another_name_under(&self, sid: &str, apex: &str, host: &str) -> bool {
-        self.pending
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .get(sid)
-            .is_some_and(|offers| {
-                offers.iter().any(|c| {
-                    is_self_signed_signal(&c.dto.signal)
-                        && c.dto.proposed_match != host
-                        && registrable_domain(&c.dto.proposed_match) == Some(apex)
-                })
-            })
-    }
-
-    /// Withdraw self-signed offers the domain-wide one now covers, so the user
-    /// is not shown the domain and its parts side by side.
-    fn absorb_names_under(&self, sid: &str, apex: &str, now_ms: i64) {
-        let mut guard = self.pending.lock().unwrap_or_else(|p| p.into_inner());
-        let Some(entry) = guard.get_mut(sid) else {
-            return;
-        };
-        let before = entry.len();
-        entry.retain(|c| {
-            !(is_self_signed_signal(&c.dto.signal)
-                && c.dto.proposed_match != apex
-                && registrable_domain(&c.dto.proposed_match) == Some(apex))
-        });
-        let absorbed = before - entry.len();
-        let updated = (absorbed > 0).then(|| entry.clone());
-        drop(guard);
-        if let Some(updated) = updated {
-            tracing::debug!(
-                target: "nrr::auto-rules",
-                sid = %sid,
-                domain = %apex,
-                absorbed,
-                "single names withdrawn in favour of the offer for their domain",
-            );
-            self.persist_pending(sid, &updated, now_ms);
-        }
-    }
-
-    /// Park an offer a host makes about ITSELF: no anchor, no companion
-    /// arithmetic, just "this host does not work over the main link, and here
-    /// is how we know". Shared by every such signal so they cannot drift on the
-    /// exclusions — a host already covered by a rule, or a machine whose
-    /// default route IS the tunnel, must not be offered anything.
+    /// A standalone offer uses the same exclusions as companion proposals.
     fn park_self_signed(&self, sid: &str, hostname: &str, signal: &str, now: SystemTime) -> bool {
         let host = hostname.trim().trim_end_matches('.').to_ascii_lowercase();
         if host.is_empty() || self.mode(sid) == AutoRulesMode::Off {
+            self.note_discovery(
+                sid,
+                Some(&host),
+                None,
+                DiscoveryDecision::new("candidate", "not-created", "discovery-disabled"),
+                now,
+            );
             tracing::debug!(
                 target: "nrr::auto-rules",
                 host = %host,
@@ -619,6 +788,13 @@ impl AutoRulesEngine {
             .qualify(&host)
             .map(std::borrow::Cow::into_owned)
         else {
+            self.note_discovery(
+                sid,
+                Some(&host),
+                None,
+                DiscoveryDecision::new("name", "not-created", "name-unknown"),
+                now,
+            );
             tracing::debug!(
                 target: "nrr::auto-rules",
                 host = %host,
@@ -626,11 +802,16 @@ impl AutoRulesEngine {
             );
             return false;
         };
-        // A host the main link carries has nothing to move. Checked BEFORE
-        // parking, not only before the popup: an offer sitting in the inbox for
-        // a site that works is the same false statement, made quietly.
+        // A measured response removes the evidence for a standalone failure.
         let behavior = self.main_link_behavior(sid, &host);
         if behavior == PrimaryBehavior::Responds {
+            self.note_discovery(
+                sid,
+                Some(&host),
+                None,
+                DiscoveryDecision::new("health", "not-created", "primary-responds"),
+                now,
+            );
             tracing::debug!(
                 target: "nrr::auto-rules",
                 host = %host,
@@ -640,6 +821,13 @@ impl AutoRulesEngine {
             return false;
         }
         let Some(snapshot) = self.rules.active_rules_for(sid) else {
+            self.note_discovery(
+                sid,
+                Some(&host),
+                None,
+                DiscoveryDecision::new("candidate", "not-created", "no-active-rules"),
+                now,
+            );
             tracing::debug!(
                 target: "nrr::auto-rules",
                 host = %host,
@@ -651,19 +839,28 @@ impl AutoRulesEngine {
         let exclusions = RuleBookExclusions {
             book: &snapshot.rule_book,
         };
-        // Already covered, or a rule would change nothing (same reasoning
-        // `tick` applies to companion proposals).
-        //
-        // Shared platform infrastructure is refused here for the same reason
-        // it is refused as a companion: it belongs to everybody, so routing
-        // it drags unrelated traffic along. That it fails on the main link
-        // does not change whose host it is — an ad or telemetry endpoint the
-        // provider cuts is not a site the user was trying to open.
+        // Shared infrastructure cannot identify the site the user intended.
         if exclusions.is_rule_host(&host)
             || exclusions.is_matched_by_existing_rule(&host)
             || exclusions.is_platform_infrastructure(&host)
             || self.default_route_role(sid) == RouteRole::Secondary
         {
+            let reason = if exclusions.is_rule_host(&host)
+                || exclusions.is_matched_by_existing_rule(&host)
+            {
+                "already-covered"
+            } else if exclusions.is_platform_infrastructure(&host) {
+                "platform-infrastructure"
+            } else {
+                "default-secondary"
+            };
+            self.note_discovery(
+                sid,
+                Some(&host),
+                None,
+                DiscoveryDecision::new("candidate", "not-created", reason),
+                now,
+            );
             tracing::debug!(
                 target: "nrr::auto-rules",
                 host = %host,
@@ -675,13 +872,39 @@ impl AutoRulesEngine {
             );
             return false;
         }
-        // One site, one question. A provider that cuts two different names
-        // under a domain is cutting the domain, and asking about each name
-        // separately makes the user answer the same question twice.
-        let host = self.rolled_up_target(sid, host);
+        // Failures name this host, never its healthy neighbours. Leading WWW
+        // retains the user's explicit canonical suffix exception.
+        let (kind, authored_kind) = host_offer_kind(&host);
         let now_ms = unix_ms(now);
-        let id = candidate_id(sid, AUTO_RULE_MATCH_KIND_SUFFIX, &host);
-        if self.suppressed_ids(sid).contains(&id) {
+        let id = candidate_id(sid, kind, &host);
+        if self.suppressed_ids(sid).contains(&id)
+            || self.suppressed_ids(sid).contains(&candidate_id(
+                sid,
+                AUTO_RULE_MATCH_KIND_SUFFIX,
+                &host,
+            ))
+        {
+            let authored = self
+                .authored
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .get(sid)
+                .is_some_and(|ids| ids.contains_key(&id));
+            self.note_discovery(
+                sid,
+                Some(&host),
+                None,
+                DiscoveryDecision::new(
+                    "candidate",
+                    "hidden",
+                    if authored {
+                        "already-covered"
+                    } else {
+                        "user-dismissed"
+                    },
+                ),
+                now,
+            );
             tracing::debug!(
                 target: "nrr::auto-rules",
                 host = %host,
@@ -694,7 +917,7 @@ impl AutoRulesEngine {
                 id,
                 anchor: host.clone(),
                 proposed_match: host,
-                match_kind: AUTO_RULE_MATCH_KIND_SUFFIX.to_string(),
+                match_kind: kind.to_string(),
                 route: RouteRole::Secondary.slug().to_string(),
                 affinity: 0.0,
                 // No pair, no visits — the signal below is what this offer knows.
@@ -719,9 +942,9 @@ impl AutoRulesEngine {
                 less_certain: String::new(),
             },
             route: RouteRole::Secondary,
-            match_kind: AuthoredMatchKind::SuffixDomain,
+            match_kind: authored_kind,
         };
-        self.absorb_names_under(sid, &candidate.dto.proposed_match, now_ms);
+
         let parked = (signal == AUTO_RULE_SIGNAL_MAIN_LINK_BLOCKED).then(|| {
             (
                 candidate.dto.id.clone(),

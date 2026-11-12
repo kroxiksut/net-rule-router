@@ -283,6 +283,7 @@ impl ShortNameUpkeep {
 /// Owns the Mode-B intercept listener plus the system-DNS redirect port and
 /// drives their combined lifecycle in one blocking call.
 pub struct DnsResolverService {
+    readiness: Arc<Mutex<ResolverPulse>>,
     listener: DnsInterceptListener,
     redirect: Arc<dyn SystemDnsRedirectPort>,
     listen_addr: SocketAddr,
@@ -310,6 +311,7 @@ impl DnsResolverService {
         listen_addr: SocketAddr,
     ) -> Self {
         Self {
+            readiness: Arc::new(Mutex::new(ResolverPulse::default())),
             listener,
             redirect,
             listen_addr,
@@ -830,6 +832,11 @@ impl DnsResolverService {
             }
         };
         // From here on the restore is owed, whatever happens.
+        {
+            let mut pulse = self.readiness.lock().unwrap_or_else(|p| p.into_inner());
+            pulse.handle = Some(handle.clone());
+            pulse.beat = Some(BootInstant::now());
+        }
         let latch = Arc::new(RedirectLatch::default());
         let generation = latch.next_generation();
         confirm_in_background(
@@ -919,6 +926,10 @@ impl DnsResolverService {
         // with the guard re-installing that redirect every interval. The drop
         // guard covers it; catching here only keeps the outcome readable.
         let beat = || {
+            self.readiness
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .beat = Some(BootInstant::now());
             if let Some(lease) = lease {
                 lease.beat();
             }
@@ -1177,7 +1188,22 @@ pub struct DnsResolverController {
 }
 
 #[derive(Default)]
+struct ResolverPulse {
+    handle: Option<RedirectHandle>,
+    beat: Option<BootInstant>,
+}
+
+#[derive(Clone)]
+struct ResolverInspection {
+    pulse: Arc<Mutex<ResolverPulse>>,
+    redirect: Arc<dyn SystemDnsRedirectPort>,
+    upstream: Arc<crate::dns_upstream::UpstreamDnsPool>,
+    listener: SocketAddr,
+}
+
+#[derive(Default)]
 struct ControllerInner {
+    inspection: Option<ResolverInspection>,
     factory: Option<DnsResolverFactory>,
     running: Option<(Arc<AtomicBool>, JoinHandle<()>)>,
     /// Terminal latch set by [`DnsResolverController::shutdown`] on service
@@ -1209,6 +1235,48 @@ struct ControllerInner {
     /// No sign-in event will come (no observer, or it failed to register):
     /// the watchdog asks the probe instead.
     poll_sign_in: bool,
+}
+
+fn listener_answers(listener: SocketAddr) -> bool {
+    use crate::dns_wire::{
+        build_address_query, parse_address_response, AddressResponseOutcome, QTYPE_A,
+    };
+    let id = crate::dns_resolver_ports::next_query_id();
+    let Some(query) = build_address_query(id, crate::dns_resolver::DOH_CANARY_DOMAIN, QTYPE_A)
+    else {
+        return false;
+    };
+    let bind: SocketAddr = match listener {
+        SocketAddr::V4(_) => ([127, 0, 0, 1], 0).into(),
+        SocketAddr::V6(_) => (std::net::Ipv6Addr::LOCALHOST, 0).into(),
+    };
+    let Ok(socket) = UdpSocket::bind(bind) else {
+        return false;
+    };
+    if socket.connect(listener).is_err()
+        || socket
+            .set_read_timeout(Some(Duration::from_millis(250)))
+            .is_err()
+        || socket
+            .set_write_timeout(Some(Duration::from_millis(250)))
+            .is_err()
+        || socket.send(&query).is_err()
+    {
+        return false;
+    }
+    let mut reply = [0_u8; 4096];
+    let Ok(size) = socket.recv(&mut reply) else {
+        return false;
+    };
+    matches!(
+        parse_address_response(
+            id,
+            crate::dns_resolver::DOH_CANARY_DOMAIN,
+            QTYPE_A,
+            &reply[..size]
+        ),
+        AddressResponseOutcome::NoRecords
+    )
 }
 
 impl DnsResolverController {
@@ -1318,6 +1386,81 @@ impl DnsResolverController {
         let mut inner = self.lock();
         Self::reap_finished(&mut inner);
         inner.running.is_some()
+    }
+
+    /// Observe existing mechanisms without changing the selected enforcement mode.
+    pub fn inspect_readiness(&self) -> nrr_shared::ipc_payloads::DnsResolverReadinessDto {
+        use nrr_shared::ipc_payloads::DnsResolverReadinessDto;
+        let (desired, running, inspection) = {
+            let mut inner = self.lock();
+            Self::reap_finished(&mut inner);
+            (
+                inner.desired,
+                inner.running.is_some(),
+                inner.inspection.clone(),
+            )
+        };
+        let same = |value: &str| DnsResolverReadinessDto {
+            listener: value.to_owned(),
+            redirect: value.to_owned(),
+            upstream: value.to_owned(),
+        };
+        if !desired {
+            return same("not-required");
+        }
+        if !running {
+            return same("unavailable");
+        }
+        let Some(inspection) = inspection else {
+            return same("unchecked");
+        };
+        let (handle, responsive) = {
+            let pulse = inspection.pulse.lock().unwrap_or_else(|p| p.into_inner());
+            (
+                pulse.handle.clone(),
+                pulse
+                    .beat
+                    .as_ref()
+                    .is_some_and(|beat| beat.elapsed() < Duration::from_secs(5)),
+            )
+        };
+        let redirect = match handle {
+            Some(handle) => match inspection.redirect.verify(&handle) {
+                Ok(RedirectState::Active) => match inspection.redirect.confirm(&handle) {
+                    Ok(RedirectState::Active) => "ready",
+                    Ok(RedirectState::Inactive) => "unavailable",
+                    Err(_) => "unchecked",
+                },
+                Ok(RedirectState::Inactive) => "unavailable",
+                Err(_) => "unchecked",
+            },
+            None => "unchecked",
+        };
+        DnsResolverReadinessDto {
+            listener: if responsive && listener_answers(inspection.listener) {
+                "ready"
+            } else {
+                "unavailable"
+            }
+            .to_owned(),
+            redirect: redirect.to_owned(),
+            upstream: if inspection.upstream.recent_secondary_answer() == Some(false)
+                || inspection.upstream.upstream_dark()
+            {
+                "unavailable"
+            } else if crate::dns_egress::global_dns_via_secondary().load(Ordering::Relaxed) {
+                match inspection.upstream.recent_secondary_answer() {
+                    Some(true) => "ready",
+                    Some(false) => "unavailable",
+                    None => "unchecked",
+                }
+            } else if inspection.upstream.has_recent_answer() {
+                "ready"
+            } else {
+                "unchecked"
+            }
+            .to_owned(),
+        }
     }
 
     /// Reap a thread that already exited on its own (e.g. `BindFailed` — `:53`
@@ -1452,6 +1595,12 @@ impl DnsResolverController {
         if self.shutting_down.load(Ordering::SeqCst) {
             return; // built while teardown began: never redirected, dropped here
         }
+        inner.inspection = Some(ResolverInspection {
+            pulse: Arc::clone(&service.readiness),
+            redirect: Arc::clone(&service.redirect),
+            upstream: Arc::clone(service.listener.upstream_pool()),
+            listener: service.listen_addr,
+        });
         let stop = Arc::new(AtomicBool::new(false));
         let thread_stop = Arc::clone(&stop);
         match std::thread::Builder::new()
@@ -1707,6 +1856,41 @@ mod tests {
             Duration::from_millis(150),
             Duration::from_millis(500),
         )
+    }
+
+    #[test]
+    fn a_working_primary_resolver_cannot_hide_a_failed_required_secondary_query() {
+        let pool = Arc::new(crate::dns_upstream::UpstreamDnsPool::fixed(
+            "127.0.0.1:5353".parse().expect("upstream"),
+        ));
+        pool.note_success();
+        pool.note_secondary_answer(false);
+        let (stop, stopped) = std::sync::mpsc::channel();
+        let running = std::thread::spawn(move || {
+            let _ = stopped.recv_timeout(Duration::from_secs(5));
+        });
+        let controller = DnsResolverController::default();
+        {
+            let mut inner = controller.lock();
+            inner.desired = true;
+            inner.running = Some((Arc::new(AtomicBool::new(false)), running));
+            inner.inspection = Some(ResolverInspection {
+                pulse: Arc::new(Mutex::new(ResolverPulse {
+                    handle: None,
+                    beat: Some(BootInstant::now()),
+                })),
+                redirect: Arc::new(RecordingRedirect::default()),
+                upstream: pool,
+                listener: "127.0.0.1:0".parse().expect("listener"),
+            });
+        }
+        let readiness = controller.inspect_readiness();
+        stop.send(()).expect("stop fixture");
+        controller.stop();
+        assert_eq!(
+            readiness.upstream, "unavailable",
+            "a primary DNS answer says nothing about the failed rule-host DNS path"
+        );
     }
 
     #[test]

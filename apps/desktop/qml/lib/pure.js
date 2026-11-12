@@ -803,11 +803,93 @@ function formRuleValue(ruleType, raw) {
     return a === b ? v : v.substring(a, b)
 }
 
-// The routing settings a window offers, in display order: each row exactly
-// where the service acts on it. Leak-protection refinements follow the level;
-// routing refinements do not. `leakProtection` is the level settled against
-// the default route, `enforcementMode` and `fakeIpEnabled` the effective
-// values. Twin of `routing_settings::offered`.
+// Twin of routing_settings::doh_lockdown_status; never guesses the service verdict.
+function dohLockdownStatus(policy) {
+    var p = policy || {}
+    var effective = p["doh-lockdown-effective"]
+    if (typeof effective !== "boolean") return "unconfirmed"
+    if (routePolicyEffective(p, "doh-lockdown-auto") === true)
+        return effective ? "auto-on" : "auto-off"
+    if (routePolicyEffective(p, "doh-lockdown-enabled") !== true)
+        return effective ? "unconfirmed" : "manual-disabled"
+    var scope = routePolicyEffective(p, "doh-lockdown-scope")
+    if (scope === "always") return effective ? "manual-always" : "unconfirmed"
+    if (scope !== "leak-protection-only") return "unconfirmed"
+    var level = routePolicyEffective(p, "leak-protection")
+    if (level !== "off" && level !== "sites" && level !== "everything") return "unconfirmed"
+    var protectionOn = level === "sites" || level === "everything"
+    if (protectionOn !== effective) return "unconfirmed"
+    return effective ? "manual-protected" : "manual-waiting"
+}
+
+// Twin of dns_compatibility::merge: absent history is not proof of recovery.
+function mergeDnsCompatibility(previous, incoming) {
+    var next = incoming || { status: "unchecked", issues: [], "recovery-pending": false }
+    var old = previous || {}
+    var instance = String(old["instance-id"] || "")
+    var sameInstance = instance !== "" && instance === String(next["instance-id"] || "")
+    var oldSequence = Number(old.sequence || 0)
+    var nextSequence = Number(next.sequence || 0)
+    if (sameInstance && nextSequence < oldSequence) return old
+    if (next.status === "verified"
+            && ((instance !== "" && !sameInstance
+                    && ((old.issues || []).length > 0 || old.status === "limited" || old.status === "needs-recheck"))
+                || (sameInstance && nextSequence === oldSequence && old.status !== "verified"))) return old
+    next = JSON.parse(JSON.stringify(next))
+    var freshIssues = next.issues || []
+    var resolver = next.resolver || {}
+    var checked = next["last-checked-ms"] !== null && next["last-checked-ms"] !== undefined
+    var resolverReady = checked && resolver.listener === "ready"
+        && resolver.redirect === "ready" && resolver.upstream === "ready"
+    var cached = (old.issues || []).filter(function(issue) {
+        if (sameInstance && issue["needs-recheck"] !== true && freshIssues.length > 0) return false
+        var generic = issue.reason === "resolver-contact" || issue.reason === "our-dns-block" || issue.reason === "unknown"
+        var superseded = freshIssues.some(function(fresh) {
+            return fresh.program === issue.program && (fresh.reason === issue.reason
+                || (fresh.reason === "strict-browser-dns" && generic))
+        })
+        var connectionConfirmed = next["verified-program"] === issue.program && generic
+        var resolverConfirmed = resolverReady && issue.reason === "local-resolver-unavailable"
+        var secondaryConfirmed = checked && next["secondary-readiness"] === "ready" && issue.reason === "secondary-unavailable"
+        return !(superseded || connectionConfirmed || resolverConfirmed || secondaryConfirmed)
+    }).map(function(issue) {
+        var copy = JSON.parse(JSON.stringify(issue))
+        copy["needs-recheck"] = true
+        return copy
+    })
+    var incomplete = next["history-incomplete"] === true || old["history-incomplete"] === true
+    var programs = Object.create(null)
+    var identities = Object.create(null)
+    var programCount = 0
+    var kept = []
+    freshIssues.concat(cached).forEach(function(issue) {
+        var program = String(issue.program || "")
+        var reason = String(issue.reason || "")
+        var evidence = String(issue.evidence || "")
+        var knownProgram = Object.prototype.hasOwnProperty.call(programs, program)
+        if (!program || _ctUtf8Over(program, 4096) || _ctUtf8Over(reason, 64) || _ctUtf8Over(evidence, 32)
+                || kept.length >= 384 || (!knownProgram && programCount >= 64)) {
+            incomplete = true
+            return
+        }
+        var identity = JSON.stringify([program, reason])
+        if (Object.prototype.hasOwnProperty.call(identities, identity)) return
+        identities[identity] = true
+        if (!knownProgram) { programs[program] = true; programCount += 1 }
+        kept.push(issue)
+    })
+    next.issues = kept
+    next["history-incomplete"] = incomplete
+    if (cached.length > 0 || incomplete) next.status = "needs-recheck"
+    if (!next["instance-id"] && next.status !== "verified" && instance !== "") {
+        next = JSON.parse(JSON.stringify(next))
+        next["instance-id"] = instance
+        next.sequence = oldSequence
+    }
+    return next
+}
+
+// Rows follow the effective policy. Twin of routing_settings::offered.
 function offeredRoutingSettings(supports, enforcementMode, leakProtection, secondaryBound, fakeIpEnabled) {
     var guards = _profileSupports(supports, "killSwitch")
     var stability = _profileSupports(supports, "serviceStabilityConfig")
@@ -919,6 +1001,44 @@ function mergeStabilityWrite(live, intent, parked, partial) {
     }
     for (key in (partial || {})) out[key] = partial[key]
     return out
+}
+
+// Presentation facts only. A time gate is not an estimate of worker capacity.
+// Twin: nrr_client_logic::discovery_probe::discovery_probe_queue.
+function discoveryProbeQueue(queue) {
+    if (!queue || ["rate", "workers", "cooldown", "ahead", "scheduled", "resources", "rules"].indexOf(queue["wait-kind"]) < 0)
+        return null
+    var ahead = queue["queued-ahead"]
+    if (typeof ahead !== "number" || !isFinite(ahead) || Math.floor(ahead) !== ahead || ahead < 0 || ahead > 4294967295)
+        return null
+    var kind = queue["wait-kind"]
+    var ms = queue["eligible-in-ms"]
+    var seconds = null
+    if ((kind === "rate" || kind === "cooldown") && typeof ms === "number"
+            && isFinite(ms) && Math.floor(ms) === ms && ms >= 0 && ms <= 9007199254740991)
+        seconds = Math.ceil(ms / 1000)
+    var started = queue["last-probe-started-unix-ms"]
+    if (typeof started !== "number" || !isFinite(started) || Math.floor(started) !== started || started <= 0 || started > 8640000000000000)
+        started = null
+    return {kind:kind, ahead:ahead, seconds:seconds, started:started}
+}
+
+// Only explicitly measured outcomes in the bounded discovery history. A
+// missing result means the history does not retain one, never "not checked".
+// Twin: nrr_client_logic::discovery_probe::discovery_previous_probe.
+function discoveryPreviousProbe(history) {
+    if (!Array.isArray(history)) return null
+    for (var i = history.length - 1; i >= Math.max(0, history.length - 8); --i) {
+        var step = history[i] || {}
+        if (step.stage !== "probe" || ["primary-responds", "secondary-failed", "https-unconfirmed",
+                "http-answered", "http-no-answer", "http-client-error", "http-server-error"].indexOf(step.reason) < 0)
+            continue
+        var at = step["at-unix-ms"]
+        if (typeof at !== "number" || !isFinite(at) || Math.floor(at) !== at || at <= 0 || at > 8640000000000000)
+            continue
+        return {reason: step.reason, "at-unix-ms": at}
+    }
+    return null
 }
 
 // Wall-clock stamp for a table cell: "YYYY-MM-DD HH:MM", or an em dash when
@@ -3058,6 +3178,45 @@ function firstRunCountry(region, locales) {
     return territoryOf(l) || l.split("-")[0]
 }
 
+// Whether Finish may apply a chosen starting set. Twin of
+// `first_run::first_run_finish_state`.
+function firstRunFinishState(requiresSecondary, secondaryAssigned, secondaryAvailable) {
+    if (!requiresSecondary) return "ready"
+    if (!secondaryAssigned) return "secondary-not-chosen"
+    return secondaryAvailable ? "ready" : "secondary-unavailable"
+}
+
+// Service health and the calling user's routing readiness are separate facts.
+function routingReadiness(serviceHealthy, primaryBound, primaryStatus,
+                          secondaryRequired, secondaryBound, secondaryStatus,
+                          activeRuleCount, secondaryRuleCount) {
+    function roleState(bound, status) {
+        if (!bound) return "not-chosen"
+        if (String(status || "") === "ok") return "ready"
+        if (String(status || "") === "") return "unknown"
+        return "not-ready"
+    }
+    var primary = roleState(primaryBound === true, primaryStatus)
+    var secondary = secondaryRequired === true
+        ? roleState(secondaryBound === true, secondaryStatus)
+        : "not-required"
+    var routing = primary === "ready"
+            && (secondary === "ready" || secondary === "not-required")
+        ? "ready"
+        : (primary === "unknown" || secondary === "unknown" ? "unknown" : "limited")
+    var affected = routing === "ready" ? 0
+        : (primary !== "ready" ? activeRuleCount : secondaryRuleCount)
+    if (affected === undefined || affected === null) affected = null
+    else affected = Math.max(0, Math.floor(Number(affected) || 0))
+    return {
+        service: serviceHealthy === true ? "healthy" : "unhealthy",
+        routing: routing,
+        primary: primary,
+        secondary: secondary,
+        affectedAssignments: affected
+    }
+}
+
 // The row a first-run pick for `role` commits when the window closes, -1 for
 // none. `pickKey` is the picked adapter's id (its name when it has none), so a
 // list rebuilt since still finds it. Availability is not asked: a VPN adapter
@@ -3801,11 +3960,9 @@ function autoRuleNoticeDue(event) {
 
 // ---- "A site does not open" ----
 
-// The pacing every surface shares, the service's included (`nrr_shared::
-// site_notice`): one card per half hour, the same site once a day unless its
-// card was answered, nothing once muted.
-var SITE_NOTICE_GAP_MS = 30 * 60 * 1000
-var SAME_SITE_GAP_MS = 24 * 60 * 60 * 1000
+// Shared with nrr_shared::site_notice: short batches, per-site repeats.
+var SITE_NOTICE_GAP_MS = 15 * 1000
+var SAME_SITE_GAP_MS = SITE_NOTICE_GAP_MS
 
 /// Is `stamp` at least `gap` behind `now`? None (null, undefined) is; a stamp
 /// from the future is a clock that went back and must not silence the card.
@@ -3825,7 +3982,7 @@ function siteNoticeDue(muted, lastAnyMs, siteShownMs, siteAnswered, nowMs) {
 /// additional route was found to do: "confirmed", "unreachable" or
 /// "unconfirmed"; "" for any other offer.
 function siteOfferReach(signal, secondaryReach) {
-    if (String(signal || "") !== "main-link-blocked") return ""
+    if (["main-link-blocked", "shared-address-reachability", "http-path-reachability"].indexOf(String(signal || "")) < 0) return ""
     if (secondaryReach === true) return "confirmed"
     if (secondaryReach === false) return "unreachable"
     return "unconfirmed"
@@ -3833,7 +3990,7 @@ function siteOfferReach(signal, secondaryReach) {
 
 /// `AUTO_RULE_SELF_SIGNED_SIGNALS`: offers a host or program made about itself.
 var AUTO_RULE_SELF_SIGNED_SIGNALS = [
-    "placeholder-answer", "main-link-blocked", "app-main-link-blocked", "app-own-resolver"
+    "placeholder-answer", "main-link-blocked", "shared-address-reachability", "http-path-reachability", "app-main-link-blocked", "app-own-resolver"
 ]
 
 /// Is this wire row an offer the host or program made about itself? A slug
@@ -3853,12 +4010,18 @@ function autoRuleNoticeKind(rows) {
     var own = 0
     var blocked = 0
     var selfSigned = 0
+    var shared = 0
+    var http = 0
     for (var i = 0; i < list.length; i += 1) {
         var signal = String(list[i].signal || "")
         if (signal === "app-own-resolver") own += 1
+        if (signal === "shared-address-reachability") shared += 1
+        if (signal === "http-path-reachability") http += 1
         if (signal === "app-main-link-blocked") blocked += 1
         if (autoRuleIsSelfSigned(list[i])) selfSigned += 1
     }
+    if (http > 0) return http === list.length ? "http-path" : "assorted"
+    if (shared > 0) return shared === list.length ? "shared-address" : "assorted"
     if (own > 0) return own === list.length ? "programs-own-resolver" : "assorted"
     if (blocked > 0) return blocked === list.length ? "programs-blocked" : "mixed-blocked"
     return selfSigned === list.length ? "sites-blocked" : "companions"

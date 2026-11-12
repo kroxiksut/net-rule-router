@@ -4,9 +4,8 @@
 //! Joins four things that already exist: the pending suggestions (auto-rules
 //! engine), the addresses behind their hostnames (FQDN cache), the main link's
 //! own source address (route coordinator) and the bounded probe itself. The
-//! verdict goes back through `note_primary_health` — the same channel observed
-//! traffic uses — so the GUI has one story to tell regardless of how the
-//! evidence was obtained.
+//! result is an active measurement, separate from passive browser health.
+//! A TLS reply cannot clear a real browser failure.
 //!
 //! The pass runs on its own thread and answers the IPC request immediately:
 //! eight addresses at a second and a half each is not something an IPC reply
@@ -26,14 +25,11 @@ use crate::fqdn_cache_lookup::FqdnCacheLookup;
 use crate::ipc_handlers::providers::AutoRuleProbeRunner;
 use crate::main_route_verdicts::{MainRouteVerdict, MainRouteVerdicts};
 use crate::observed_host_names::ObservedHostNames;
-use crate::path_probe::{PathProber, ProbeLimits, ProbePassSummary, ProbeTarget};
+use crate::path_probe::{
+    HttpProbeScope, HttpProbeVerdict, PathProber, ProbeLimits, ProbePassSummary, ProbeTarget,
+};
 use crate::per_sid_orchestrator::RoutePolicySource;
 use crate::route_coordinator::SecondaryRouteCoordinator;
-
-/// Port 443 is where a companion host lives in practice — these are CDN, media
-/// and API endpoints. Probing the port the browser would use is the only answer
-/// worth having; a reachable ICMP or port 80 would say something else.
-const PROBE_PORT: u16 = 443;
 
 /// Addresses taken from the observed-name memory per host. The pass stops at
 /// the first one that answers either way, so a few only cover one that is down.
@@ -53,6 +49,8 @@ const RULE_CHECK_WORKERS: usize = 4;
 pub trait EgressSources: Send + Sync {
     fn egress_source_ips(&self, sid: &str) -> (Option<Ipv4Addr>, Option<Ipv4Addr>);
 }
+
+pub use crate::path_probe::PrimaryProbeGuard;
 
 impl EgressSources for SecondaryRouteCoordinator {
     fn egress_source_ips(&self, sid: &str) -> (Option<Ipv4Addr>, Option<Ipv4Addr>) {
@@ -81,6 +79,8 @@ pub struct ProductionAutoRuleProbe {
     /// every host that makes an offer about itself, since no rule covers it.
     /// `None` keeps the runner cache-only.
     observed: Option<Arc<ObservedHostNames>>,
+    primary_guard: Option<PrimaryProbeGuard>,
+    https: Option<Arc<dyn crate::site_check::HttpsHead>>,
 }
 
 impl ProductionAutoRuleProbe {
@@ -113,7 +113,15 @@ impl ProductionAutoRuleProbe {
             verdicts: None,
             secondary_prober: None,
             observed: None,
+            primary_guard: None,
+            https: None,
         }
+    }
+
+    #[must_use]
+    pub fn with_https(mut self, https: Option<Arc<dyn crate::site_check::HttpsHead>>) -> Self {
+        self.https = https;
+        self
     }
 
     /// Wire the second pass: hosts the main link did not answer for are asked
@@ -129,6 +137,12 @@ impl ProductionAutoRuleProbe {
     #[must_use]
     pub fn with_observed_names(mut self, observed: Arc<ObservedHostNames>) -> Self {
         self.observed = Some(observed);
+        self
+    }
+
+    #[must_use]
+    pub fn with_primary_probe_guard(mut self, guard: PrimaryProbeGuard) -> Self {
+        self.primary_guard = Some(guard);
         self
     }
 
@@ -158,7 +172,12 @@ impl ProductionAutoRuleProbe {
             if !seen.insert(hostname.clone()) {
                 continue;
             }
-            let addresses = crate::dns_wire::only_v4(&self.cache.ips_for_hostname(&hostname));
+            let addresses = hostname
+                .parse::<Ipv4Addr>()
+                .map(|address| vec![address])
+                .unwrap_or_else(|_| {
+                    crate::dns_wire::only_v4(&self.cache.ips_for_hostname(&hostname))
+                });
             if addresses.is_empty() {
                 unknown.push(hostname);
             } else {
@@ -178,9 +197,25 @@ impl ProductionAutoRuleProbe {
             return AutoRuleCandidatesProbeResponse::default();
         };
         let (mut targets, unknown) = self.rule_targets(hostnames);
+        for target in &mut targets {
+            target.addresses.retain(|address| {
+                self.primary_guard
+                    .as_ref()
+                    .is_none_or(|guard| guard(sid, &target.hostname, *address))
+            });
+        }
+        let refused: Vec<_> = targets
+            .iter()
+            .filter(|target| target.addresses.is_empty())
+            .map(|target| target.hostname.clone())
+            .collect();
+        targets.retain(|target| !target.addresses.is_empty());
         let now = std::time::Instant::now();
         for host in &unknown {
             verdicts.record(sid, host, MainRouteVerdict::NoAddress, now);
+        }
+        for host in &refused {
+            verdicts.record(sid, host, MainRouteVerdict::Unclear, now);
         }
         let over_limit = targets.len().saturating_sub(RULE_CHECK_MAX_HOSTS) as u32;
         targets.truncate(RULE_CHECK_MAX_HOSTS);
@@ -191,9 +226,14 @@ impl ProductionAutoRuleProbe {
             };
         }
         let accepted = targets.len() as u32;
+        let failed_hosts: Vec<_> = targets
+            .iter()
+            .map(|target| target.hostname.clone())
+            .collect();
         let limits = (self.limits_for)(sid);
         let (source, _) = self.egress.egress_source_ips(sid);
         let prober = Arc::clone(&self.rule_prober);
+        let guard = self.primary_guard.clone();
         let sid_owned = sid.to_string();
         let no_address = unknown.len();
         verdicts.begin(sid, accepted);
@@ -222,9 +262,12 @@ impl ProductionAutoRuleProbe {
                                     std::time::Instant::now(),
                                 );
                             };
-                            let summary = prober.run_pass(
+                            let summary = prober.run_tls_guarded_pass(
+                                crate::path_probe::ProbeScope {
+                                    owner: &sid_owned,
+                                    allowed: guard.as_ref(),
+                                },
                                 chunk,
-                                PROBE_PORT,
                                 source,
                                 limits,
                                 std::time::Instant::now(),
@@ -267,6 +310,15 @@ impl ProductionAutoRuleProbe {
             });
         if let Err(e) = spawned {
             verdicts.settle(sid, accepted);
+            for host in &failed_hosts {
+                verdicts.record(
+                    sid,
+                    host,
+                    MainRouteVerdict::Unclear,
+                    std::time::Instant::now(),
+                );
+            }
+            self.note_probe_start_failure(sid, &failed_hosts);
             tracing::warn!(
                 target: "nrr::auto-rules",
                 msg_key = "prod-autorule-probe-spawn-failed",
@@ -281,6 +333,23 @@ impl ProductionAutoRuleProbe {
         }
     }
 
+    fn note_probe_start_failure(&self, sid: &str, hosts: &[String]) {
+        let now = std::time::SystemTime::now();
+        for host in hosts.iter().take(RULE_CHECK_MAX_HOSTS) {
+            self.engine.note_discovery(
+                sid,
+                Some(host),
+                None,
+                crate::auto_rules::DiscoveryDecision::new(
+                    "probe",
+                    "not-created",
+                    "probe-start-failed",
+                ),
+                now,
+            );
+        }
+    }
+
     /// The hosts to examine: the named suggestions, or every pending one.
     ///
     /// Addresses come from the FQDN cache, else from the observed-name memory.
@@ -292,15 +361,33 @@ impl ProductionAutoRuleProbe {
         &self,
         sid: &str,
         ids: &[String],
-    ) -> (Vec<ProbeTarget>, std::collections::HashSet<String>) {
+    ) -> (
+        Vec<ProbeTarget>,
+        std::collections::HashSet<String>,
+        std::collections::HashSet<String>,
+    ) {
         let mut tunnel_askable = std::collections::HashSet::new();
+        let mut shared_hosts = std::collections::HashSet::new();
         let targets = self
             .engine
-            .candidates(sid)
+            .candidates_for_probe(sid)
             .into_iter()
             .filter(|c| ids.is_empty() || ids.contains(&c.id))
             .filter_map(|c| {
-                let hostname = c.proposed_match.trim_start_matches("*.").to_string();
+                let hostname = if c.signal
+                    == nrr_shared::ipc_payloads::AUTO_RULE_SIGNAL_HTTP_PATH_REACHABILITY
+                    && c.anchor.starts_with("www.")
+                    && c.observed_members.contains(&c.anchor)
+                {
+                    c.anchor.clone()
+                } else {
+                    c.proposed_match.trim_start_matches("*.").to_string()
+                };
+                if c.signal
+                    == nrr_shared::ipc_payloads::AUTO_RULE_SIGNAL_SHARED_ADDRESS_REACHABILITY
+                {
+                    shared_hosts.insert(hostname.clone());
+                }
                 if tunnel_may_ask(&c.anchor, &hostname) {
                     tunnel_askable.insert(hostname.clone());
                 }
@@ -308,16 +395,22 @@ impl ProductionAutoRuleProbe {
                     crate::dns_wire::only_v4(&self.cache.ips_for_hostname(&hostname));
                 if addresses.is_empty() {
                     if let Some(observed) = &self.observed {
-                        addresses = observed.addresses_under(&hostname, MAX_OBSERVED_ADDRESSES);
+                        addresses =
+                            observed.addresses_exact_for(sid, &hostname, MAX_OBSERVED_ADDRESSES);
                     }
                 }
+                addresses.retain(|address| {
+                    self.primary_guard
+                        .as_ref()
+                        .is_none_or(|guard| guard(sid, &hostname, *address))
+                });
                 (!addresses.is_empty()).then_some(ProbeTarget {
                     hostname,
                     addresses,
                 })
             })
             .collect();
-        (targets, tunnel_askable)
+        (targets, tunnel_askable, shared_hosts)
     }
 }
 
@@ -344,38 +437,78 @@ impl AutoRuleProbeRunner for ProductionAutoRuleProbe {
             return self.probe_rule_hosts(sid, rule_hostnames);
         }
         let limits = (self.limits_for)(sid);
-        let (targets, tunnel_askable) = self.targets(sid, ids);
+        let (targets, tunnel_askable, shared_hosts) = self.targets(sid, ids);
         if targets.is_empty() {
             return AutoRuleCandidatesProbeResponse::default();
         }
         let over_limit = targets.len().saturating_sub(limits.max_targets) as u32;
         let accepted = targets.len().min(limits.max_targets) as u32;
+        let failed_hosts: Vec<_> = targets
+            .iter()
+            .take(limits.max_targets)
+            .map(|target| target.hostname.clone())
+            .collect();
+        for target in targets.iter().skip(limits.max_targets) {
+            self.engine.note_discovery(
+                sid,
+                Some(&target.hostname),
+                None,
+                crate::auto_rules::DiscoveryDecision::new(
+                    "probe",
+                    "deferred",
+                    "probe-budget-exhausted",
+                ),
+                std::time::SystemTime::now(),
+            );
+        }
         // The main link's own address — without it the OS would route by the
         // pin, which points at the tunnel and would answer a different question.
         let (source, secondary_source) = self.egress.egress_source_ips(sid);
         let engine = Arc::clone(&self.engine);
         let prober = Arc::clone(&self.prober);
+        let base_guard = self.primary_guard.clone();
+        let egress = Arc::clone(&self.egress);
+        let permitted = Arc::clone(&self.engine);
+        let expected = (source, secondary_source);
+        let guard: Option<PrimaryProbeGuard> = Some(Arc::new(move |owner, host, address| {
+            permitted.learns_for(owner)
+                && egress.egress_source_ips(owner) == expected
+                && base_guard
+                    .as_ref()
+                    .is_none_or(|guard| guard(owner, host, address))
+        }));
+        let https = self.https.clone();
+        let engine_for_http = Arc::clone(&self.engine);
+        let http_sid = sid.to_string();
         let sid_owned = sid.to_string();
         // The second question is only worth asking when there is a tunnel to
         // ask over.
-        let secondary = self.secondary_prober.clone().zip(secondary_source);
+        let secondary = self
+            .secondary_prober
+            .clone()
+            .zip(secondary_source)
+            .filter(|(_, secondary)| Some(*secondary) != source);
         let targets_for_second = targets.clone();
         let engine_for_second = Arc::clone(&self.engine);
         let sid_for_second = sid.to_string();
+        let shared_hosts_for_second = shared_hosts.clone();
         let spawned = std::thread::Builder::new()
             .name("nrr-main-link-probe".into())
             .spawn(move || {
-                use nrr_domain::companion_affinity::PrimaryHealthEvent;
+                let probe_owner = sid_owned.clone();
+                let http_mode = https.is_some();
+                let report_guard = guard.clone();
+                let report_targets = targets.clone();
                 let report = move |hostname: &str, answered: bool| {
-                    engine.note_primary_health(
-                        &sid_owned,
-                        hostname,
+                    if !report_targets.iter().find(|target| target.hostname == hostname).and_then(|target| target.addresses.first())
+                        .is_some_and(|address| report_guard.as_ref().is_none_or(|guard| guard(&sid_owned, hostname, *address))) { return; }
+                    if shared_hosts.contains(hostname) {
                         if answered {
-                            PrimaryHealthEvent::Completed
-                        } else {
-                            PrimaryHealthEvent::Stalled
-                        },
-                    );
+                            engine.withdraw_shared_address_reachability(&sid_owned, hostname, std::time::SystemTime::now());
+                        }
+                        return;
+                    }
+                    if !http_mode { engine.note_discovery(&sid_owned, Some(hostname), None, crate::auto_rules::DiscoveryDecision::new("probe", "deferred", "https-unconfirmed"), std::time::SystemTime::now()); }
                 };
                 let unanswered = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
                 let report_and_collect = {
@@ -390,14 +523,29 @@ impl AutoRuleProbeRunner for ProductionAutoRuleProbe {
                         report(hostname, answered);
                     }
                 };
-                let summary = prober.run_pass(
+                let detail = |hostname: &str, answer: HttpProbeVerdict| {
+                    let current = targets.iter().find(|target| target.hostname == hostname).and_then(|target| target.addresses.first())
+                        .is_some_and(|address| guard.as_ref().is_none_or(|guard| guard(&http_sid, hostname, *address)));
+                    if !current { return; }
+                    tracing::debug!(target:"nrr::auto-rules", sid=%http_sid, host=hostname, route="primary", outcome=?answer, "HTTP reachability measurement for a suggestion");
+                    engine_for_http.note_discovery(&http_sid, Some(hostname), None, crate::auto_rules::DiscoveryDecision::new("probe", "deferred", answer.reason()), std::time::SystemTime::now());
+                    if !matches!(answer, HttpProbeVerdict::Unavailable | HttpProbeVerdict::Unconfirmed) {
+                        engine_for_http.note_measured_http_primary(&http_sid, hostname, matches!(answer, HttpProbeVerdict::Answered(_)), std::time::SystemTime::now());
+                    }
+                    if matches!(answer, HttpProbeVerdict::Answered(_) | HttpProbeVerdict::ClientError(_) | HttpProbeVerdict::ServerError(_) | HttpProbeVerdict::Untrusted) {
+                        engine_for_http.withdraw_http_path_reachability(&http_sid, hostname, std::time::SystemTime::now());
+                    }
+                };
+                let summary = if let Some(https) = https.as_deref() {
+                    prober.run_https_guarded_pass(HttpProbeScope { scope:crate::path_probe::ProbeScope { owner:&probe_owner, allowed:guard.as_ref() }, https, detail:&detail }, &targets, source, limits, std::time::Instant::now(), &report_and_collect)
+                } else { prober.run_tls_guarded_pass(
+                    crate::path_probe::ProbeScope { owner: &probe_owner, allowed: guard.as_ref() },
                     &targets,
-                    PROBE_PORT,
                     source,
                     limits,
                     std::time::Instant::now(),
                     &report_and_collect,
-                );
+                ) };
                 tracing::info!(
                     target: "nrr::auto-rules",
                     msg_key = "prod-autorule-main-link-checked",
@@ -427,22 +575,41 @@ impl AutoRuleProbeRunner for ProductionAutoRuleProbe {
                     .filter(|t| silent.contains(&t.hostname))
                     .filter(|t| tunnel_askable.contains(&t.hostname))
                     .collect();
+                let probe_owner = sid_for_second.clone();
+                let record_guard = guard.clone();
+                let record_targets = second_targets.clone();
                 let record = move |hostname: &str, answered: bool| {
-                    engine_for_second.note_secondary_reach(
+                    if !record_targets.iter().find(|target| target.hostname == hostname).and_then(|target| target.addresses.first())
+                        .is_some_and(|address| record_guard.as_ref().is_none_or(|guard| guard(&sid_for_second, hostname, *address))) { return; }
+                    if !answered && shared_hosts_for_second.contains(hostname) {
+                        engine_for_second.withdraw_shared_address_reachability(&sid_for_second, hostname, std::time::SystemTime::now());
+                        return;
+                    }
+                    if http_mode { engine_for_second.note_secondary_reach(
                         &sid_for_second,
                         hostname,
                         answered,
                         std::time::SystemTime::now(),
-                    );
+                    ); }
                 };
-                let second = secondary_prober.run_pass(
+                let detail = |hostname: &str, answer: HttpProbeVerdict| {
+                    let current = second_targets.iter().find(|target| target.hostname == hostname).and_then(|target| target.addresses.first())
+                        .is_some_and(|address| guard.as_ref().is_none_or(|guard| guard(&probe_owner, hostname, *address)));
+                    if !current { return; }
+                    tracing::debug!(target:"nrr::auto-rules", sid=%probe_owner, host=hostname, route="secondary", outcome=?answer, "HTTP reachability measurement for a suggestion");
+                    engine_for_http.note_discovery(&probe_owner, Some(hostname), None, crate::auto_rules::DiscoveryDecision::new("probe", "deferred", answer.reason()), std::time::SystemTime::now());
+                    if matches!(answer, HttpProbeVerdict::NoAnswer | HttpProbeVerdict::ClientError(_) | HttpProbeVerdict::ServerError(_) | HttpProbeVerdict::Untrusted) { engine_for_http.withdraw_http_path_reachability(&probe_owner, hostname, std::time::SystemTime::now()); }
+                };
+                let second = if let Some(https) = https.as_deref() {
+                    secondary_prober.run_https_guarded_pass(HttpProbeScope { scope:crate::path_probe::ProbeScope { owner:&probe_owner, allowed:guard.as_ref() }, https, detail:&detail }, &second_targets, Some(secondary_source), limits, std::time::Instant::now(), &record)
+                } else { secondary_prober.run_tls_guarded_pass(
+                    crate::path_probe::ProbeScope { owner: &probe_owner, allowed: guard.as_ref() },
                     &second_targets,
-                    PROBE_PORT,
                     Some(secondary_source),
                     limits,
                     std::time::Instant::now(),
                     &record,
-                );
+                ) };
                 tracing::info!(
                     target: "nrr::auto-rules",
                     msg_key = "prod-autorule-secondary-reach-checked",
@@ -453,6 +620,7 @@ impl AutoRuleProbeRunner for ProductionAutoRuleProbe {
                 );
             });
         if let Err(e) = spawned {
+            self.note_probe_start_failure(sid, &failed_hosts);
             tracing::warn!(
                 target: "nrr::auto-rules",
                 msg_key = "prod-autorule-probe-spawn-failed",
@@ -660,6 +828,58 @@ mod tests {
         fn egress_source_ips(&self, _sid: &str) -> (Option<Ipv4Addr>, Option<Ipv4Addr>) {
             (Some(Ipv4Addr::new(192, 0, 2, 10)), None)
         }
+    }
+
+    #[test]
+    fn a_requested_primary_recheck_withdraws_a_shared_address_finding_when_tls_answers() {
+        use crate::auto_rules::{InMemoryDismissalStore, InMemoryPendingStore};
+        struct EmptyRules;
+        impl crate::per_sid_orchestrator::RulesProvider for EmptyRules {
+            fn active_rules(&self) -> Option<crate::per_sid_orchestrator::ActiveRulesSnapshot> {
+                Some(crate::per_sid_orchestrator::ActiveRulesSnapshot::default())
+            }
+        }
+        let sid = "shared-requested-recheck-owner";
+        let host = "shared-requested-recheck.example";
+        let stalls = crate::primary_stall_registry::global_primary_stalls();
+        let before = stalls.behavior_of(sid, host);
+        let engine = Arc::new(AutoRulesEngine::new(
+            Arc::new(EmptyRules),
+            Arc::new(|_| nrr_storage::auto_rules::AutoRulesMode::Suggest),
+            Arc::new(InMemoryDismissalStore::new()),
+            Arc::new(InMemoryPendingStore::new()),
+            std::time::SystemTime::now(),
+        ));
+        assert!(engine.note_shared_address_reachability(sid, host, std::time::SystemTime::now()));
+        assert_eq!(engine.candidates(sid).len(), 1);
+        let cache = Arc::new(crate::fqdn_cache_lookup::MockFqdnCacheLookup::new());
+        cache.set_ips(host, vec![Ipv4Addr::new(203, 0, 113, 44)]);
+        let mechanism = Arc::new(crate::path_probe::MockPathProbe::new(
+            crate::path_probe::PathVerdict::Answered,
+        ));
+        let runner = ProductionAutoRuleProbe::over(
+            Arc::clone(&engine),
+            cache,
+            Arc::new(MainLinkOnly),
+            Arc::new(PathProber::new(mechanism.clone())),
+            Arc::new(|_| ProbeLimits::default()),
+        );
+        assert_eq!(runner.probe(sid, &[], &[]).accepted, 1);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        while !engine.candidates(sid).is_empty() && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        assert_eq!(
+            mechanism.attempts().len(),
+            1,
+            "the requested TLS check must actually run"
+        );
+        assert!(engine.candidates(sid).is_empty(), "an independently answered primary TLS check contradicts the existing shared-path finding");
+        assert_eq!(
+            stalls.behavior_of(sid, host),
+            before,
+            "a requested diagnostic check must not become browser-flow health evidence"
+        );
     }
 
     fn rule_check(

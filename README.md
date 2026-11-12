@@ -396,6 +396,7 @@ The full order of work, without dates: [ROADMAP.md](ROADMAP.md).
 
 | File | What's in it |
 |------|--------------|
+| [`CHANGELOG.md`](CHANGELOG.md) | Notable changes planned for the next release and the history of published releases |
 | [`SECURITY.md`](SECURITY.md) | Security model & trust boundaries |
 | [`STRUCTURE.md`](STRUCTURE.md) | Repository layout |
 | [`docs/en/quickstart.md`](docs/en/quickstart.md) | Quick start: from install to the first applied rule |

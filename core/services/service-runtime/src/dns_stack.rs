@@ -58,6 +58,8 @@ pub struct DnsStackPlatform {
 /// behaviour it would add off.
 #[derive(Clone)]
 pub struct DnsStackInputs {
+    pub dns_compatibility:
+        Option<std::sync::Weak<crate::dns_compatibility::DnsCompatibilityCenter>>,
     pub settings_conn: Arc<Mutex<Connection>>,
     pub cache: Arc<Mutex<dyn nrr_storage::repository::CacheRepository + Send>>,
     pub active_sid: crate::supervised_runtime::ActiveRoutingSidFn,
@@ -163,6 +165,7 @@ pub fn build_dns_resolver_factory(
     let sockets_closed_on_change = close_upstream_sockets_on_change(
         platform.network_changes.as_ref(),
         &platform.upstream_pool,
+        inputs.dns_compatibility.clone(),
     );
     // Only a foreign tunnel's claim is honoured by itself; the main link's is
     // offered, the administrator's list is left to the main link's resolvers,
@@ -267,19 +270,46 @@ pub(crate) fn watch_dns_changes(
     }
 }
 
-/// Close the upstream sockets kept for reuse on every link or route change,
-/// before any pass notices it: each was connected from an address the change
-/// may have taken away, and a query on it waits out its timeout. Our own
-/// route writes are no news to them. A feed that cannot be watched is
-/// reported by [`watch_dns_changes`]; the sockets then retire by age.
+/// Foreign topology changes revoke sockets and proofs tied to the old network.
+/// A missing feed is reported by [`watch_dns_changes`]; sockets still retire by age.
 pub(crate) fn close_upstream_sockets_on_change(
     network: &dyn NetworkChangeObserver,
     pool: &Arc<UpstreamDnsPool>,
+    compatibility: Option<std::sync::Weak<crate::dns_compatibility::DnsCompatibilityCenter>>,
 ) -> Option<NetworkChangeSubscription> {
     let pool = Arc::clone(pool);
-    let close: nrr_platform_api::network_change::NetworkChangeCallback =
-        Arc::new(move || pool.close_idle_sockets());
-    network.subscribe_foreign(close).ok()
+    let registration_center = compatibility.clone();
+    let close: nrr_platform_api::network_change::NetworkChangeCallback = Arc::new(move || {
+        pool.close_idle_sockets();
+        if let Some(center) = compatibility.as_ref().and_then(std::sync::Weak::upgrade) {
+            center.invalidate_network();
+        }
+    });
+    match network.subscribe_foreign(close) {
+        Ok(subscription) => {
+            if let Some(center) = registration_center
+                .as_ref()
+                .and_then(std::sync::Weak::upgrade)
+            {
+                center.set_network_watch_available(true);
+            }
+            Some(subscription)
+        }
+        Err(error) => {
+            if let Some(center) = registration_center
+                .as_ref()
+                .and_then(std::sync::Weak::upgrade)
+            {
+                center.set_network_watch_available(false);
+            }
+            tracing::warn!(
+                target: "nrr::dns-compatibility",
+                error = %error,
+                "Network changes cannot be watched; DNS compatibility remains unchecked",
+            );
+            None
+        }
+    }
 }
 
 /// Adapts the auto-rules engine to the resolver's companion-candidate port.
@@ -971,7 +1001,7 @@ mod tests {
         let server: SocketAddr = "127.0.0.1:53".parse().expect("addr");
         let pool = Arc::new(UpstreamDnsPool::fixed(server).with_sockets(sockets));
         let network = ManualObserver::default();
-        let watch = close_upstream_sockets_on_change(&network, &pool);
+        let watch = close_upstream_sockets_on_change(&network, &pool, None);
         assert!(watch.is_some());
         sockets
             .checkout(UpstreamKey { bind: None, server }, || {

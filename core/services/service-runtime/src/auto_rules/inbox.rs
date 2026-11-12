@@ -46,10 +46,16 @@ impl AutoRulesEngine {
             .get(sid)
             .map(|v| {
                 v.iter()
+                    .filter(|c| !is_own_application_offer(&c.dto) && !unconfirmed_scope(&c.dto))
                     .filter(|c| !offer_covered(snapshot, &c.dto))
                     .filter_map(|c| {
                         let mut dto = c.dto.clone();
                         self.refresh_self_signed_behavior(sid, &mut dto);
+                        if !is_self_signed_signal(&dto.signal)
+                            && self.companion_responds(sid, &dto.proposed_match)
+                        {
+                            dto.primary_behavior = AUTO_RULE_PRIMARY_BEHAVIOR_RESPONDS.to_string();
+                        }
                         // A host that answers on the main link has nothing left
                         // to offer about itself — the inbox drops it outright
                         // rather than showing it greyed out, because unlike a
@@ -105,18 +111,50 @@ impl AutoRulesEngine {
             book: &snapshot.rule_book,
         };
         let mut answered = 0_usize;
+        let mut retired_offers = Vec::new();
         entry.retain(|c| {
             let host = c.dto.proposed_match.as_str();
+            if unconfirmed_scope(&c.dto) || is_own_application_offer(&c.dto) {
+                retired_offers.push((
+                    c.dto.clone(),
+                    DiscoveryDecision::new(
+                        "candidate",
+                        "hidden",
+                        if is_own_application_offer(&c.dto) {
+                            "own-process"
+                        } else {
+                            "scope-unconfirmed"
+                        },
+                    ),
+                ));
+                return false;
+            }
             if is_app_offer(&c.dto) {
-                return !app_covered(&snapshot.rule_book, host);
+                if app_covered(&snapshot.rule_book, host) {
+                    retired_offers.push((
+                        c.dto.clone(),
+                        DiscoveryDecision::new("candidate", "hidden", "already-covered"),
+                    ));
+                    return false;
+                }
+                return true;
             }
             if exclusions.is_rule_host(host) || exclusions.is_matched_by_existing_rule(host) {
+                retired_offers.push((
+                    c.dto.clone(),
+                    DiscoveryDecision::new("candidate", "hidden", "already-covered"),
+                ));
                 return false;
             }
             if is_self_signed_signal(&c.dto.signal)
+                && !independent_finding(&c.dto)
                 && self.main_link_behavior(sid, host) == PrimaryBehavior::Responds
             {
                 answered += 1;
+                retired_offers.push((
+                    c.dto.clone(),
+                    DiscoveryDecision::new("health", "hidden", "primary-responds"),
+                ));
                 return false;
             }
             true
@@ -133,6 +171,10 @@ impl AutoRulesEngine {
                 "suggestions with nothing left to ask were withdrawn",
             );
             self.persist_pending(sid, &updated, now_ms);
+        }
+        let now = SystemTime::UNIX_EPOCH + Duration::from_millis(now_ms.max(0) as u64);
+        for (dto, decision) in retired_offers {
+            self.record_candidate_discovery(sid, &dto, decision, now);
         }
     }
 
@@ -160,9 +202,8 @@ impl AutoRulesEngine {
             // where traffic goes: leaving it "pinned as if accepted" routed a
             // host the user reaches perfectly well on the main link.
             .filter(|c| !settled_by_the_main_link(&c.dto))
-            // Nor one resting on a single look-alike sighting: until a person
-            // says yes, it must not move traffic a hostile page could name.
-            .filter(|c| !is_less_certain(&c.dto))
+            // Review-only findings cannot steer traffic before acceptance.
+            .filter(|c| !requires_review(&c.dto))
             .any(|c| {
                 let m = c.dto.proposed_match.trim_matches('.').to_ascii_lowercase();
                 if m.is_empty() {
@@ -236,6 +277,14 @@ impl AutoRulesEngine {
             Ok(outcome) => {
                 self.remember_authored(sid, &selected);
                 self.forget_answered(sid, &selected);
+                for candidate in &selected {
+                    self.record_candidate_discovery(
+                        sid,
+                        &candidate.dto,
+                        DiscoveryDecision::new("candidate", "hidden", "already-covered"),
+                        now,
+                    );
+                }
                 tracing::info!(
                     target: "nrr::auto-rules",
                     msg_key = "autorules-inbox-accepted",
@@ -294,6 +343,14 @@ impl AutoRulesEngine {
         // The refusal record keeps the offer for "restore"; the counters are
         // not needed for it.
         self.forget_answered(sid, &selected);
+        for candidate in &selected {
+            self.record_candidate_discovery(
+                sid,
+                &candidate.dto,
+                DiscoveryDecision::new("candidate", "hidden", "user-dismissed"),
+                now,
+            );
+        }
         tracing::info!(
             target: "nrr::auto-rules",
             msg_key = "autorules-inbox-dismissed",
@@ -430,6 +487,7 @@ impl AutoRulesEngine {
                 entry.retain(|id, _| !wanted.contains(id.as_str()));
             }
         }
+        self.forget_discovery_candidates(sid, &wanted);
         if forgotten > 0 {
             tracing::info!(
                 target: "nrr::auto-rules",

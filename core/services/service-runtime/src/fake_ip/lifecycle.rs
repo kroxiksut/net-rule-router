@@ -336,6 +336,18 @@ pub enum FakeIpBuildFailure {
     /// The adapter refused this time, as one left behind by a killed process
     /// does until Windows lets it go: the watchdog asks again.
     Transient,
+    /// The live route and adapter snapshot could not be read safely.
+    PoolInspectFailed,
+    /// A live local subnet overlaps the configured virtual-address pool.
+    PoolCollision(nrr_platform_api::fake_ip::PoolCollision),
+    /// The platform TUN existed but could not be opened for this attempt.
+    TunOpenFailed,
+}
+
+impl FakeIpBuildFailure {
+    const fn retryable(self) -> bool {
+        !matches!(self, Self::Unavailable)
+    }
 }
 
 /// How long the watchdog waits before asking the factory again after a
@@ -348,6 +360,7 @@ pub struct FakeIpDatapathStatus {
     pub desired: bool,
     pub running: bool,
     pub zombies: usize,
+    pub last_failure: Option<FakeIpBuildFailure>,
 }
 
 /// Runtime start/stop for the fake-IP stack thread, so toggling the feature
@@ -390,6 +403,8 @@ struct ControllerInner {
     /// Not before this moment does the watchdog ask the factory again after a
     /// transient refusal.
     retry_build_at: Option<crate::boot_clock::BootInstant>,
+    /// Last factory refusal while the feature is still requested.
+    last_failure: Option<FakeIpBuildFailure>,
     /// The datapath went DOWN outside a clean user toggle. The next watchdog
     /// tick reports a bring-up-style `true` even when no fresh stack could
     /// start, so the caller replans enforcement and flushes the OS DNS cache —
@@ -534,11 +549,15 @@ impl FakeIpController {
             return;
         };
         let mut stack = match factory() {
-            Ok(stack) => stack,
+            Ok(stack) => {
+                inner.last_failure = None;
+                stack
+            }
             Err(failure) => {
                 // The factory logs WHY it could not build; this line records
                 // that a start was attempted and whether it is tried again.
-                let retry = failure == FakeIpBuildFailure::Transient;
+                inner.last_failure = Some(failure);
+                let retry = failure.retryable();
                 tracing::warn!(
                     target: "nrr::fake-ip",
                     msg_key = "fakeip-start-build-failed",
@@ -600,6 +619,7 @@ impl FakeIpController {
     pub fn stop(&self) {
         let mut inner = self.lock();
         inner.desired = false;
+        inner.last_failure = None;
         Self::stop_locked(&mut inner);
     }
 
@@ -666,6 +686,7 @@ impl FakeIpController {
             desired: inner.desired && !inner.disarmed,
             running: inner.running.is_some(),
             zombies: inner.zombies.len(),
+            last_failure: inner.last_failure,
         }
     }
 
@@ -681,6 +702,7 @@ impl FakeIpController {
         let mut inner = self.lock();
         inner.desired = false;
         inner.disarmed = true;
+        inner.last_failure = None;
         Self::stop_locked(&mut inner);
     }
 
@@ -1191,6 +1213,22 @@ mod tests {
         missing.apply(true);
         missing.watchdog_tick();
         assert_eq!(asked.load(Ordering::SeqCst), 1, "no driver, no second try");
+    }
+
+    #[test]
+    fn datapath_status_keeps_the_last_build_failure_until_the_feature_is_disabled() {
+        let controller = FakeIpController::new();
+        controller.set_factory(Arc::new(|| Err(FakeIpBuildFailure::Transient)));
+        controller.apply(true);
+
+        assert_eq!(
+            controller.datapath_status().last_failure,
+            Some(FakeIpBuildFailure::Transient),
+            "the status must explain why desired fake-IP is not running"
+        );
+
+        controller.apply(false);
+        assert_eq!(controller.datapath_status().last_failure, None);
     }
 
     #[test]

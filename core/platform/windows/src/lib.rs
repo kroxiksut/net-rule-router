@@ -48,6 +48,7 @@ mod adapter_kind;
 mod alloc_count;
 pub mod app_path_resolver;
 pub mod autostart;
+pub mod browser_dns_settings;
 // Runs a system tool under a budget, draining its pipes while it runs.
 #[cfg(windows)]
 mod bounded_command;

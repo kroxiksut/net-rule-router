@@ -189,11 +189,16 @@ pub const AUTO_RULE_SIGNAL_SLUGS: &[&str] = &[
 /// [`AUTO_RULE_SIGNAL_SLUGS`].
 pub const AUTO_RULE_SIGNAL_PLACEHOLDER_ANSWER: &str = "placeholder-answer";
 
-/// [`AutoRuleCandidateDto::signal`]: connections to this host kept failing on
-/// the main link while nothing about it ever completed there. Measured, not
-/// inferred from an address — the one honest way to say "the main link will not
-/// carry this site". Also outside [`AUTO_RULE_SIGNAL_SLUGS`].
+/// Connections to this host kept failing on the main link without a completion.
 pub const AUTO_RULE_SIGNAL_MAIN_LINK_BLOCKED: &str = "main-link-blocked";
+
+/// Independent TLS checks of an owner-observed name on a shared address.
+/// It does not attribute a browser visit and always requires confirmation.
+pub const AUTO_RULE_SIGNAL_SHARED_ADDRESS_REACHABILITY: &str = "shared-address-reachability";
+
+/// A bounded HTTPS request failed on primary and answered on secondary.
+/// This independent check does not certify the browser page; review is required.
+pub const AUTO_RULE_SIGNAL_HTTP_PATH_REACHABILITY: &str = "http-path-reachability";
 
 /// [`AutoRuleCandidateDto::signal`]: a program none of whose connections
 /// completed on the main link while it stalled on several unnamed addresses.
@@ -205,14 +210,13 @@ pub const AUTO_RULE_SIGNAL_APP_MAIN_LINK_BLOCKED: &str = "app-main-link-blocked"
 /// offer is about the program itself and says nothing about the main link.
 pub const AUTO_RULE_SIGNAL_APP_OWN_RESOLVER: &str = "app-own-resolver";
 
-/// The signals where the host makes the offer about ITSELF: `anchor` is the
-/// host, there is no companion arithmetic, and the question is only whether the
-/// main link carries it. The GUI reads this to know it must not say "a site
-/// needs this address", and the engine reads it to know the main-link verdict
-/// settles the offer outright.
+/// Offers about the named host or program, without companion attribution.
+/// Each signal defines which measurements can settle its offer.
 pub const AUTO_RULE_SELF_SIGNED_SIGNALS: &[&str] = &[
     AUTO_RULE_SIGNAL_PLACEHOLDER_ANSWER,
     AUTO_RULE_SIGNAL_MAIN_LINK_BLOCKED,
+    AUTO_RULE_SIGNAL_SHARED_ADDRESS_REACHABILITY,
+    AUTO_RULE_SIGNAL_HTTP_PATH_REACHABILITY,
     AUTO_RULE_SIGNAL_APP_MAIN_LINK_BLOCKED,
     AUTO_RULE_SIGNAL_APP_OWN_RESOLVER,
 ];
@@ -419,6 +423,168 @@ pub struct AutoRuleCandidatesListResponse {
     /// A few of those names, for a concrete "your site was among them".
     #[serde(default)]
     pub inert_sample: Vec<String>,
+    #[serde(default)]
+    pub discovery_episodes: Vec<DiscoveryEpisodeDto>,
+    #[serde(default)]
+    pub discovery_omitted: u64,
+    #[serde(default)]
+    pub discovery_limitations: Vec<String>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub struct DiscoveryStepDto {
+    pub stage: String,
+    pub state: String,
+    pub reason: String,
+    pub at_unix_ms: i64,
+}
+
+/// Why a retained automatic investigation cannot start in this snapshot.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ProbeQueueWaitKindDto {
+    Rate,
+    Workers,
+    Cooldown,
+    Ahead,
+    Resources,
+    Rules,
+    Scheduled,
+}
+
+/// An owner-scoped queue snapshot; it never contains another owner's position
+/// or identity. Time gates describe eligibility, never a completion estimate.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub struct ProbeQueueStatusDto {
+    pub wait_kind: ProbeQueueWaitKindDto,
+    /// Preceding work belonging to this caller, never a global queue position.
+    pub queued_ahead: u32,
+    /// Remaining time gate at snapshot creation; not a worker/start/finish ETA.
+    #[serde(default)]
+    pub eligible_in_ms: Option<u64>,
+    #[serde(default)]
+    pub last_probe_started_unix_ms: Option<i64>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub struct DiscoveryEpisodeDto {
+    pub id: String,
+    pub host: Option<String>,
+    pub destination: Option<String>,
+    pub state: String,
+    pub reason: String,
+    pub stage: String,
+    pub first_seen_unix_ms: i64,
+    pub last_seen_unix_ms: i64,
+    pub candidate_id: Option<String>,
+    pub platform_limitation: Option<String>,
+    #[serde(default)]
+    pub history: Vec<DiscoveryStepDto>,
+    /// Absent when the peer predates queue diagnostics or no work is queued.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub probe_queue: Option<ProbeQueueStatusDto>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub struct DiscoveryEpisodesSnapshotDto {
+    pub episodes: Vec<DiscoveryEpisodeDto>,
+    pub omitted: u64,
+    pub limitations: Vec<String>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case", deny_unknown_fields)]
+pub struct DiscoveryFeedbackRequest {
+    pub ids: Vec<String>,
+    pub state: String,
+    pub reason: String,
+}
+
+impl DiscoveryFeedbackRequest {
+    pub fn checked_from_payload(value: &serde_json::Value) -> Result<Self, &'static str> {
+        let object = value.as_object().ok_or("expected an object")?;
+        if object.len() != 3
+            || object
+                .keys()
+                .any(|key| !matches!(key.as_str(), "ids" | "state" | "reason"))
+        {
+            return Err("unexpected discovery feedback fields");
+        }
+        let ids = object
+            .get("ids")
+            .and_then(serde_json::Value::as_array)
+            .ok_or("expected candidate ids")?;
+        if ids.len() > 50 {
+            return Err("too many candidate ids");
+        }
+        let state = object
+            .get("state")
+            .and_then(serde_json::Value::as_str)
+            .ok_or("expected a state")?;
+        let reason = object
+            .get("reason")
+            .and_then(serde_json::Value::as_str)
+            .ok_or("expected a reason")?;
+        if !matches!(
+            (state, reason),
+            ("delivered", "shown")
+                | ("deferred", "notification-pacing" | "client-busy")
+                | ("hidden", "notifications-muted" | "client-filter")
+        ) {
+            return Err("unsupported discovery feedback");
+        }
+        let ids = ids
+            .iter()
+            .map(|id| {
+                id.as_str()
+                    .filter(|id| {
+                        !id.is_empty()
+                            && id.len() <= 128
+                            && id.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
+                    })
+                    .map(str::to_owned)
+                    .ok_or("invalid candidate id")
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(Self {
+            ids,
+            state: state.to_owned(),
+            reason: reason.to_owned(),
+        })
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub struct DiscoveryFeedbackResponse {
+    pub recorded: u32,
+}
+
+#[cfg(test)]
+mod discovery_feedback_tests {
+    use super::*;
+
+    #[test]
+    fn discovery_feedback_rejects_a_flood_owner_override_and_invented_delivery_claims() {
+        for value in [
+            serde_json::json!({"ids":vec!["arc-one";51],"state":"delivered","reason":"shown"}),
+            serde_json::json!({"ids":["arc-one"],"state":"delivered","reason":"no-subscriber"}),
+            serde_json::json!({"ids":["arc-one"],"state":"delivered","reason":"shown","sid":"other-user"}),
+            serde_json::json!({"ids":["x".repeat(129)],"state":"delivered","reason":"shown"}),
+        ] {
+            assert!(DiscoveryFeedbackRequest::checked_from_payload(&value).is_err());
+        }
+        assert!(
+            DiscoveryFeedbackRequest::checked_from_payload(&serde_json::json!({
+                "ids":["arc-one"],"state":"delivered","reason":"shown"
+            }))
+            .is_ok()
+        );
+    }
 }
 
 /// Request shared by `autorules.candidates.accept` and

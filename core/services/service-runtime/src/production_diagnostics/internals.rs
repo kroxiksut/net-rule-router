@@ -56,30 +56,17 @@ impl ProductionDiagnosticsFacade {
         let host = sample.hostname.as_deref();
         let ip = sample.observed_ip.as_deref();
 
-        // Load the caller's active rule book. When NONE is active (no own
-        // revision, empty baseline), fall back to an EMPTY rule book rather
-        // than reporting "service unavailable / save a rule first". With no
-        // rules, every destination follows the DEFAULT route (primary) — so
-        // the probe must answer "<query> → primary", never "no route". A user
-        // never needs to save a rule for traffic to flow via the primary NIC;
-        // claiming otherwise was misleading and looked like broken routing.
-        // Paused rules route nothing: the answer is the default route, said
-        // to be so because of the pause.
+        // No book or paused rules uses the caller's default route. Keep the
+        // revision with its decoded book so a concurrent apply cannot mislabel it.
         let paused = self.routing_paused_for(caller_sid);
+        let active = self.load_active_rule_book(caller_sid);
+        let revision = active.as_ref().map(|(_, revision)| revision.clone());
         let mut rule_book = if paused {
             Default::default()
         } else {
-            self.load_active_rule_book(caller_sid).unwrap_or_default()
+            active.map(|(book, _)| book).unwrap_or_default()
         };
-        // The routing-check must model ENFORCEMENT, not the
-        // bare stored rules. `ProductionRulesProvider::active_rules_for` applies
-        // subdomain coverage before the WFP/route codegen and the DNS seeder ever
-        // see the rules, so a probe for a subdomain (e.g. `www.site.example`)
-        // of a bare-domain rule (`site.example`) must expand the SAME way here —
-        // otherwise the routing-check reports `primary` while enforcement actually
-        // routes it `secondary`, and the "cover subdomains" toggle looks broken.
-        // Read for the caller's own policy, mirroring the provider. Enforcement-
-        // only: the stored/hashed rule book (drift, `rules.list`) is untouched.
+        // Match the same effective coverage as enforcement without storing it.
         rule_book = crate::verify_overlay::effective(&rule_book, caller_sid);
         if self.reads_include_subdomains(caller_sid) {
             rule_book = rule_book.with_subdomain_coverage();
@@ -374,6 +361,23 @@ impl ProductionDiagnosticsFacade {
                     ttl_seconds: None,
                 }),
             ),
+            (
+                nrr_domain::decision_matching::RequestedRouteDecision::MatchedRoute { candidate },
+                _,
+            ) => (
+                Some(ExplainMatchSection {
+                    outcome_key: "explain.match.rule_matched".to_owned(),
+                    matched_rule_id: Some(candidate.rule_id.as_str().to_owned()),
+                    match_class_label: Some(
+                        match_class_reason_slug(candidate.match_class).to_owned(),
+                    ),
+                    route_role: route_role.clone(),
+                    conflict_resolved: false,
+                    default_reason_key: None,
+                    matched_network: None,
+                }),
+                None,
+            ),
             _ => (None, None),
         };
 
@@ -388,28 +392,24 @@ impl ProductionDiagnosticsFacade {
             availability_section: None,
             final_action_section: Some(final_action_section),
             warnings: Vec::new(),
-            correlation: ExplainCorrelationSection::empty(),
+            correlation: ExplainCorrelationSection {
+                revision_id: revision,
+                ..ExplainCorrelationSection::empty()
+            },
         }
     }
 
-    /// The caller's stored rule book (own revision, else the baseline), read
-    /// through the rules provider so a revision mid-activation answers rather
-    /// than the one it replaces. Bare: the caller applies the enforcement
-    /// widening itself. `None` when no state DB is wired, nothing is active,
-    /// or the stored JSON does not decode.
+    /// The caller's book and its identity, including a revision mid-apply.
     fn load_active_rule_book(
         &self,
         caller_sid: &str,
-    ) -> Option<nrr_domain::canonical::CanonicalRuleBook> {
-        use crate::per_sid_orchestrator::RulesProvider;
-        // A fresh provider per probe: the bare read skips its decode cache, so
-        // there is nothing a long-lived one would keep.
+    ) -> Option<(nrr_domain::canonical::CanonicalRuleBook, String)> {
         let provider = crate::production_rules_provider::ProductionRulesProvider::new(Arc::clone(
             self.state_conn.as_ref()?,
         ));
         provider
-            .stored_rules_for(caller_sid)
-            .map(|snapshot| snapshot.rule_book)
+            .stored_with_revision_for(caller_sid)
+            .map(|(snapshot, revision)| (snapshot.rule_book, revision))
     }
 
     /// The caller's Zone-vs-ExactIp order, as enforcement reads it.

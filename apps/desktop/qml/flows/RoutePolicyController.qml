@@ -345,16 +345,13 @@ QtObject {
                 "Could not update rule-domain resolution: ")
         })
     }
-    /// DoH/DoT lockdown MASTER switch. When ON, the service blocks known DoH/DoT
-    /// resolver endpoints so browser DNS-over-HTTPS falls back to plaintext the
-    /// DNS observer can see (otherwise routed sites resolved over DoH are
-    /// invisible to leak protection).
+    /// Only the service confirms whether the chosen DNS blocking applies.
     function applyDohLockdownEnabled(enabled) {
         var want = enabled === true
         _applyRoutePolicyKey("doh-lockdown-enabled", want, {
             ok: want
                 ? root.tr("status.doh-lockdown-on",
-                    "Browser DoH/DoT blocking enabled: DNS falls back to plaintext so routed sites are seen.")
+                    "Browser DoH/DoT blocking enabled. Browsers using strict encrypted DNS may need their DNS settings changed.")
                 : root.tr("status.doh-lockdown-off",
                     "Browser DoH/DoT blocking disabled."),
             uac: root.tr("status.route-policy-uac-declined",
@@ -651,7 +648,7 @@ QtObject {
                     "Browser DoH/DoT blocking now decides itself: on while your rules need to see site names.")
                 : want
                     ? root.tr("status.doh-lockdown-on",
-                        "Browser DoH/DoT blocking enabled: DNS falls back to plaintext so routed sites are seen.")
+                        "Browser DoH/DoT blocking enabled. Browsers using strict encrypted DNS may need their DNS settings changed.")
                     : root.tr("status.doh-lockdown-off",
                         "Browser DoH/DoT blocking disabled."),
             uac: root.tr("status.route-policy-uac-declined",

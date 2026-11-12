@@ -2,14 +2,9 @@
 
 **English** · [Русский](../ru/building-linux.md)
 
-This guide is for those who want to build NetRuleRouter themselves on Linux.
-The Windows guide is [a separate page](building-windows.md); macOS is later in
-the plan.
+This guide is for those who want to build NetRuleRouter themselves on Linux. The Windows guide is [a separate page](building-windows.md); macOS is later in the plan.
 
-Ready packages (`.deb`, `.rpm`, `.tar.gz`) come with every release; see
-[Supported systems](supported-systems.md). Everything below starts from a
-checkout. To turn your own build into packages, see
-[Packaging for Linux](packaging-linux.md).
+Ready packages (`.deb`, `.rpm`, `.tar.gz`) come with every release; see [Supported systems](supported-systems.md). Everything below starts from a checkout. To turn your own build into packages, see [Packaging for Linux](packaging-linux.md).
 
 ## What to install
 
@@ -36,12 +31,9 @@ sudo dnf install gcc gcc-c++ cmake nftables \
      qt6-qtbase-devel qt6-qtdeclarative-devel
 ```
 
-These systems usually run SELinux in enforcing mode. Nothing extra is needed
-for it: the service is installed where SELinux expects a service's programs
-(see [Run](#run)).
+These systems usually run SELinux in enforcing mode. Nothing extra is needed for it: the service is installed where SELinux expects a service's programs (see [Run](#run)).
 
-The toolchain version is pinned in `rust-toolchain.toml`, so rustup downloads
-the right one by itself on the first build.
+The toolchain version is pinned in `rust-toolchain.toml`, so rustup downloads the right one by itself on the first build.
 
 > Debian and Ubuntu suffix the Qt 6 tools (`qmake6`, `qtpaths6`) so they can sit
 > beside Qt 5. The build looks for both spellings; what it actually needs is the
@@ -55,24 +47,17 @@ the right one by itself on the first build.
 ./scripts/build.sh --profile release
 ```
 
-`bootstrap.sh --strict-qt` fails instead of warning when Qt or CMake are
-missing — useful in CI, where a missing GUI dependency should stop the run
-rather than produce a service-only build.
+`bootstrap.sh --strict-qt` fails instead of warning when Qt or CMake are missing — useful in CI, where a missing GUI dependency should stop the run rather than produce a service-only build.
 
-To build without the Qt host at all (the service, the console and every library,
-but no GUI):
+To build without the Qt host at all (the service, the console and every library, but no GUI):
 
 ```bash
 NRR_SKIP_QT_HOST=1 cargo build --workspace
 ```
 
-That is what the CI job does, and it is the right switch on a headless machine.
-Do not set it when you intend to run the GUI: the launcher would have no host to
-start.
+That is what the CI job does, and it is the right switch on a headless machine. Do not set it when you intend to run the GUI: the launcher would have no host to start.
 
-A debug build with debug information takes about 9 GB in `target/`. On a small
-virtual machine, build without it — the programs work the same, only crash
-backtraces lose their line numbers — and the tree stays under 2 GB:
+A debug build with debug information takes about 9 GB in `target/`. On a small virtual machine, build without it — the programs work the same, only crash backtraces lose their line numbers — and the tree stays under 2 GB:
 
 ```bash
 CARGO_PROFILE_DEV_DEBUG=0 ./scripts/build.sh
@@ -94,33 +79,20 @@ The service normally runs as a systemd unit rather than from a terminal:
 ./scripts/uninstall-service.sh
 ```
 
-The unit is staged into `/usr/libexec/netrulerouter` before it is registered:
-a service running as root is never started from `/home`, where the user who
-owns the folder could replace it. `libexec` is where systems with SELinux enforcing (Fedora,
-RHEL and their relatives) expect a service's programs, so the service can
-manage the firewall and routes there without a policy change. Only the staging
-copy and the registration step use `sudo` — the build stays unprivileged, so
-nothing in `target/` ends up owned by root.
+The unit is staged into `/usr/libexec/netrulerouter` before it is registered: a service running as root is never started from `/home`, where the user who owns the folder could replace it. `libexec` is where systems with SELinux enforcing (Fedora, RHEL and their relatives) expect a service's programs, so the service can manage the firewall and routes there without a policy change. Only the staging copy and the registration step use `sudo` — the build stays unprivileged, so nothing in `target/` ends up owned by root.
 
-The same script installs the two terminal programs, the `nrr-cli` console and
-the [`nrr-tui` terminal interface](tui.md), and makes both available by name
-from any shell; `uninstall-service.sh` removes them again. A program of the
-same name that some other package already put there is left alone.
+The same script installs the two terminal programs, the `nrr-cli` console and the [`nrr-tui` terminal interface](tui.md), and makes both available by name from any shell; `uninstall-service.sh` removes them again. A program of the same name that some other package already put there is left alone.
 
-Desktop integration (the application menu entry and the icon) is per-user
-session data and installs separately:
+Desktop integration (the application menu entry and the icon) is per-user session data and installs separately:
 
 ```bash
 ./scripts/install-desktop.sh            # for your user
 ./scripts/install-desktop.sh --system   # for everyone, needs root
 ```
 
-Run the per-user form as yourself, not through `sudo`: the paths it writes to
-are resolved from your own session, and under `sudo` they would resolve for
-root.
+Run the per-user form as yourself, not through `sudo`: the paths it writes to are resolved from your own session, and under `sudo` they would resolve for root.
 
-On a machine where NetRuleRouter was installed from a package, these scripts
-refuse to install or remove the service: the package manager owns it there.
+On a machine where NetRuleRouter was installed from a package, these scripts refuse to install or remove the service: the package manager owns it there.
 
 ## Packages
 
@@ -129,8 +101,7 @@ refuse to install or remove the service: the package manager owns it there.
 ./scripts/package-linux.sh --headless --build   # without the GUI: no Qt needed
 ```
 
-What the packages contain, which machine to build them on, and how they
-install and uninstall: [Packaging for Linux](packaging-linux.md).
+What the packages contain, which machine to build them on, and how they install and uninstall: [Packaging for Linux](packaging-linux.md).
 
 ## Quality gate
 
@@ -138,22 +109,13 @@ install and uninstall: [Packaging for Linux](packaging-linux.md).
 bash scripts/check.sh --require-cargo-deny
 ```
 
-Same gates in the same order as on Windows: formatting, clippy with warnings
-denied, the full test suite, then `cargo deny`. Enforcement tests that need root
-(nftables, live routes) skip loudly on their own. The suite runs through
-cargo-nextest when it is installed (`scripts/bootstrap.sh` installs it): about
-twice as fast, and a hung test is ended rather than stalling the gate.
+Same gates in the same order as on Windows: formatting, clippy with warnings denied, the full test suite, then `cargo deny`. Enforcement tests that need root (nftables, live routes) skip loudly on their own. The suite runs through cargo-nextest when it is installed (`scripts/bootstrap.sh` installs it): about twice as fast, and a hung test is ended rather than stalling the gate.
 
-If you develop on Windows and build Linux through WSL, run this gate before
-pushing: code that compiles on one platform is not evidence about the other.
+If you develop on Windows and build Linux through WSL, run this gate before pushing: code that compiles on one platform is not evidence about the other.
 
 ## Fuzzing
 
-Every parser that reads bytes another party can shape (DNS, STUN and TLS
-replies, dropped-packet reports, packets entering the user-space stack, IPC
-frames and payloads, rules and preset files, the per-user settings file) has a
-fuzz target under `fuzz/`. The run is Linux-only and opt-in, since it needs the
-nightly toolchain:
+Every parser that reads bytes another party can shape (DNS, STUN and TLS replies, dropped-packet reports, packets entering the user-space stack, IPC frames and payloads, rules and preset files, the per-user settings file) has a fuzz target under `fuzz/`. The run is Linux-only and opt-in, since it needs the nightly toolchain:
 
 ```bash
 rustup toolchain install nightly
@@ -162,9 +124,7 @@ bash scripts/fuzz.sh --seconds 60          # every target, one minute each
 bash scripts/check.sh --fuzz 60            # the same, after the regular gate
 ```
 
-A crash, hang or memory blow-up fails the run and leaves the input under
-`fuzz/artifacts/<target>/`. Run it before a release; a minute per target is the
-floor, not the ceiling.
+A crash, hang or memory blow-up fails the run and leaves the input under `fuzz/artifacts/<target>/`. Run it before a release; a minute per target is the floor, not the ceiling.
 
 ## Removing everything
 
@@ -173,11 +133,6 @@ floor, not the ceiling.
 ./scripts/purge-data.sh --yes
 ```
 
-The audit trail is kept unless you add `--purge-audit`. Before deleting
-anything it gives the network back — the packet filters and the DNS redirect
-the service set up — and it stops there if that fails. Where each file lives is
-listed in [Where NetRuleRouter keeps its files](where-files-live.md).
+The audit trail is kept unless you add `--purge-audit`. Before deleting anything it gives the network back — the packet filters and the DNS redirect the service set up — and it stops there if that fails. Where each file lives is listed in [Where NetRuleRouter keeps its files](where-files-live.md).
 
-If a crashed service left the machine without network, `./scripts/reset-network.sh`
-undoes only that, and keeps everything else; see
-[Recovering network access](recovering-network-access.md).
+If a crashed service left the machine without network, `./scripts/reset-network.sh` undoes only that, and keeps everything else; see [Recovering network access](recovering-network-access.md).

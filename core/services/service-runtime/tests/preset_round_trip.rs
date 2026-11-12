@@ -59,18 +59,21 @@ impl ActivationAuditEmitter for NoopActivationAudit {
     fn emit(&self, _: nrr_service_runtime::activation_coordinator::ActivationAuditEvent) {}
 }
 
-// Unique apply-marker dir under the cargo target tmp dir (NOT the shared
-// system temp). Using `std::env::temp_dir()` collided with marker files the
-// real service writes there as LocalSystem — the test process then can't
-// remove them (access denied, os error 5). `CARGO_TARGET_TMPDIR` is per-
-// package and `cargo clean`-able; the atomic counter isolates parallel tests.
+// Nextest gives each test its own process, so the process id separates their
+// marker directories; the counter separates helpers inside one process.
 fn unique_marker_dir() -> std::path::PathBuf {
     use std::sync::atomic::{AtomicU64, Ordering};
     static SEQ: AtomicU64 = AtomicU64::new(0);
     let dir = std::path::Path::new(env!("CARGO_TARGET_TMPDIR")).join(format!(
-        "preset_round_trip_markers_{}",
+        "preset_round_trip_markers_{}_{}",
+        std::process::id(),
         SEQ.fetch_add(1, Ordering::Relaxed)
     ));
+    match std::fs::remove_dir_all(&dir) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => panic!("clear unique marker dir: {error}"),
+    }
     std::fs::create_dir_all(&dir).expect("create unique marker dir");
     dir
 }

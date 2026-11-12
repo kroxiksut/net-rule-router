@@ -1678,6 +1678,8 @@ ScrollView {
                                             return root.tr("diag.conn-trace.verdict.block-by-nrr", "Blocked (NetRuleRouter)")
                                         if (by === "other")
                                             return root.tr("diag.conn-trace.verdict.block-by-other", "Blocked (another program)")
+                                        if (by === "unknown")
+                                            return root.tr("diag.conn-trace.verdict.block-by-unknown", "Blocked (owner could not be verified)")
                                     }
                                     return section._connVerdictLabel(modelData && modelData.verdict)
                                 }

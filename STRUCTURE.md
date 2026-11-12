@@ -15,6 +15,11 @@ Maintenance rules:
 Application entry points and UI shells:
 - **`apps/cli`** — Administrative console crate (`nrr-cli`): service lifecycle management, diagnostics, and network recovery. Never mutates policy.
 - **`apps/tui`** — Terminal interface crate (`nrr-tui`): the GUI's screens for a live terminal, full-screen or line mode (`--plain`) for screen readers; refuses to run without a terminal. No Qt.
+- **`apps/browser-extension`** — Browser extension sources, Chromium/Firefox manifests, localized UI, packaging script, and its isolated Rust policy crate.
+  - `src/` — Background/controller code and localized popup/options UI
+  - `manifests/` — Chromium and Firefox extension variants
+  - `policy/` — Standalone Rust policy crate
+  - `scripts/` and `tests/` — Package build and extension behavior checks
 - **`apps/desktop`** — Desktop runtime: Rust launcher process that spawns the C++ Qt host, Rust library crates for UI integration (`gui`, `tray`, `broker`), and build-only crate (`qt-host`) that compiles the C++ native host. Produces three binaries: `NetRuleRouter.exe` (main GUI), `NetRuleRouterTray.exe` (system tray), and `nrr_qt_native_host.exe` (C++ Qt rendering host).
   - `launcher` — User-facing Rust entry point, single-instance lock holder, preferences persistence, child process lifecycle. Also a library (`nrr_launcher`) consumed by tests and the broker
   - `gui` — GUI context and preference round-trip library
@@ -33,11 +38,11 @@ Core product domain logic and service runtime:
 - **`core/platform/nftlink`** — Crate `nftlink`: a standalone nf_tables netlink library, deliberately free of any product dependency so it can leave this repository as its own published crate (enforced by `tests/independence.rs`)
 - **`core/services/windows-service`** — Windows service entrypoint: SCM/console entry, named-pipe server host, production dependency wiring. Orchestration logic belongs in `service-runtime`
 - **`core/services/linux-service`** — Linux daemon entrypoint; produces `nrr-serviced` with an `nrr-service` alias
-- **`core/services/service-runtime`** — Service orchestration shared by both OS entrypoints: enforcement planning and codegen, route coordination, DNS listener/resolver and fake-IP, kill-switch, auto-rules, IPC handlers, per-SID orchestration, session registry
+- **`core/services/service-runtime`** — Service orchestration shared by both OS entrypoints: enforcement planning and codegen, route coordination, DNS listener/resolver and fake-IP, DNS compatibility checks, discovery observations and episodes, manual site checks, kill-switch, auto-rules, IPC handlers, per-SID orchestration, session registry
 - **`core/sqlite-support`** — The one SQLite migration runner and connection setup, shared by `storage` and `storage-sidecar`, plus the reading of browser-history copies both OS platform crates share; depends on no `nrr-*` crate
 - **`core/storage`** — SQLite persistence (domain cache, service state, traffic stats)
 - **`core/storage-sidecar`** — GUI-owned SQLite sidecar (rule labels, passthrough, not-yet-applied edits); never holds routing policy
-- **`core/diagnostics`** — Audit logs, operational logs, retention, archive generation
+- **`core/diagnostics`** — Audit logs, operational logs, retention, and diagnostic archive generation with event correlation
 - **`core/ipc-client`** — IPC client (named pipe on Windows, `AF_UNIX` socket on Unix) the GUI, tray, console and broker use to reach the service; depends on `contracts` only
 - **`core/client-logic`** — Client-side decisions of the GUI's `qml/lib/*.js` (rules-table wire form, rules files, route-policy request, adapter eligibility, placeholders) for clients without QML; pure functions, depends on `contracts` only, parity with the JS pinned by shared test vectors
 - **`core/ui-support`** — UI-runtime-only modules (theme, first-run flow, preferences, tray)
@@ -108,6 +113,7 @@ Core configuration files:
 - `.gitignore` — Git exclusions
 - `clippy.toml` — Lint configuration
 - `README.md` / `README_RU.md` — Project overview
+- `CHANGELOG.md` / `CHANGELOG_RU.md` — English and Russian release history
 - `ROADMAP.md` / `ROADMAP_RU.md` — Order of upcoming work
 - `SECURITY.md` — Security model and trust boundaries
 - `CONTRIBUTING.md` — How to contribute

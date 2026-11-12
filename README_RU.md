@@ -403,6 +403,7 @@ explain mode, защита от утечки, предлагаемые адре�
 
 | Файл | Содержание |
 |------|------------|
+| [`CHANGELOG_RU.md`](CHANGELOG_RU.md) | Существенные изменения следующей версии и история выпущенных версий |
 | [`SECURITY.md`](SECURITY.md) | Модель безопасности и границы доверия |
 | [`STRUCTURE.md`](STRUCTURE.md) | Структура репозитория |
 | [`docs/ru/rules-file-format.md`](docs/ru/rules-file-format.md) | Формат файлов пресетов и правил |

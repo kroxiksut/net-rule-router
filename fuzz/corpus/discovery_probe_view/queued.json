@@ -1,0 +1,1 @@
+{"probe-queue":{"wait-kind":"rate","queued-ahead":3,"eligible-in-ms":1875,"last-probe-started-unix-ms":1000},"history":[null,{"stage":"probe","reason":"primary-responds","at-unix-ms":1000},{"stage":"probe","reason":"probe-queued","at-unix-ms":2000}]}

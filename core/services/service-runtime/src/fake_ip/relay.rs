@@ -89,10 +89,30 @@ pub enum FlowOwner {
     Refused(&'static str),
 }
 
+/// The routing principal captured alongside the flow-owner classification.
+#[derive(Clone, Debug)]
+pub struct FlowOwnerContext {
+    pub owner: FlowOwner,
+    pub routing_principal: Option<String>,
+}
+
 /// Who opened a relayed flow. The relay's dial is the service's own traffic
 /// and passes every user's filters, so carrying another user's flow by the
 /// routing user's rules would let one user's traffic leave by another's.
 pub trait FlowOwners: Send + Sync {
+    /// Classify against one routing-principal snapshot. Unknown means no VPN exemption.
+    fn context_for(
+        &self,
+        client: SocketAddr,
+        destination: SocketAddr,
+        transport: Option<FlowTransport>,
+    ) -> FlowOwnerContext {
+        FlowOwnerContext {
+            owner: self.owner_of(client, destination, transport),
+            routing_principal: None,
+        }
+    }
+
     /// `transport` is `None` for traffic no socket table lists (an echo).
     fn owner_of(
         &self,
@@ -290,38 +310,23 @@ impl RelayCore {
     /// its addresses alone (pass port 0), and must leave the way a connection
     /// to the same name would.
     #[must_use]
-    pub fn decide_endpoints(&self, source: SocketAddr, destination: SocketAddr) -> RelayDecision {
-        // FIRST, and before any lock: a destination nobody owns can never be a
-        // binding, and answering it is actively harmful (see `NotAFlow`). It is
-        // also the cheapest possible check, which matters on a data path.
+    pub fn decide_endpoints(&self, _source: SocketAddr, destination: SocketAddr) -> RelayDecision {
+        // Reject non-unicast before locking: these addresses name no relay endpoint.
         if !is_unicast_host(destination.ip()) {
             return RelayDecision::NotAFlow;
         }
         let hostname = {
-            // A poisoned allocator must not take the decision path with it: the
-            // panic would be re-raised on every packet, and the poller's own
-            // restart loop would re-enter it forever with the block armed.
+            // Recover poison so one allocation failure cannot wedge every later flow.
             let mut allocator = self.allocator.lock().unwrap_or_else(|p| p.into_inner());
-            // Inside the range but not a host — the pool's own network or
-            // broadcast address. Nobody owns it, so it is not a flow and must
-            // not be answered.
+            // The pool's network and broadcast addresses are not endpoints either.
             if allocator.is_fake_address(destination.ip())
                 && !allocator.holds_host(destination.ip())
             {
                 return RelayDecision::NotAFlow;
             }
             if !allocator.is_fake_address(destination.ip()) {
-                // In-tunnel rescue: a VPN client that enumerates
-                // TUN adapters can bind its in-tunnel control socket to OUR
-                // adapter instead of its own (two wintun devices look alike),
-                // so its API/status calls (private addresses like 10.117.0.1)
-                // would otherwise land here and die with a reset — the client
-                // then shows no external IP and no session stats. A private
-                // destination can only mean "meant for the tunnel", so carry
-                // it literally over the SECONDARY link: the dialer's source
-                // policy already refuses when the secondary is unresolved,
-                // and no route ever points private ranges into this adapter,
-                // so the rescue cannot loop back into itself.
+                // Some clients bind private tunnel probes to our TUN by mistake.
+                // Carry them only through Secondary; an unavailable tunnel still refuses.
                 if let std::net::IpAddr::V4(v4) = destination.ip() {
                     if is_private_or_cgnat_v4(v4) {
                         let literal = v4.to_string();
@@ -343,11 +348,7 @@ impl RelayCore {
             }
         };
 
-        // The scope check is a consistency guard, not the primary gate: a
-        // hostname only holds a fake address because the resolver decided it
-        // was in scope. If the two ever disagree — policy changed while a flow
-        // was live — the newer answer wins and the flow is dropped rather than
-        // silently carried under the old policy.
+        // A scope change invalidates outstanding fake answers; newer policy wins.
         if let FakeIpVerdict::RealIp(reason) = self.scope.decide(&hostname, None) {
             return RelayDecision::OutOfScope {
                 hostname,
@@ -355,8 +356,7 @@ impl RelayCore {
             };
         }
 
-        // Keep the address family the application used: an app that opened an
-        // IPv4 socket cannot be handed an IPv6 upstream.
+        // The upstream must use the application's address family.
         let mut cached = self
             .resolver
             .addresses_for(&hostname)
@@ -366,10 +366,7 @@ impl RelayCore {
             .map(|ip| SocketAddr::new(ip, destination.port()));
         let address = cached.next();
         let fallbacks: Vec<SocketAddr> = cached.collect();
-        // Nothing cached is not the same as nowhere to go: the name is the
-        // durable fact, the address is a lookup nobody has performed yet. With
-        // dial-time resolution the flow proceeds and the dialer finds out; the
-        // poll loop must not, which is why the lookup is not attempted here.
+        // Uncached names resolve on dial workers, never the shared packet thread.
         if address.is_none() && !self.resolve_at_dial {
             return RelayDecision::NoUpstreamAddress { hostname };
         }
@@ -377,9 +374,7 @@ impl RelayCore {
         // A host the routing user's book blocks is still decided: the flow may
         // be another served user's, whose own book `for_owner` asks.
         let book_route = self.routes.route_for(&hostname);
-        let route = book_route.map_or(RouteRole::Primary, |route| {
-            self.unless_vpn_client(route, source, destination)
-        });
+        let route = book_route.unwrap_or(RouteRole::Primary);
         RelayDecision::Relay {
             target: UpstreamTarget {
                 hostname: hostname.clone(),
@@ -397,22 +392,22 @@ impl RelayCore {
         }
     }
 
-    /// A confirmed VPN client's own flow leaves over the PRIMARY link. Its
-    /// traffic IS the tunnel's transport, so carrying it over the secondary
-    /// routes the tunnel through itself: while the adapter is coming up the
-    /// dialer refuses the dial (it would otherwise leak via the primary) and
-    /// the client's own probes fail on every reconnect. The lookup is skipped
-    /// unless the secondary was selected and a client was confirmed.
+    /// Authorize once, after the owner's book has chosen the route.
     fn unless_vpn_client(
         &self,
         route: RouteRole,
         source: SocketAddr,
         destination: SocketAddr,
+        principal: &str,
+        allow_service_owner: bool,
     ) -> RouteRole {
         if route == RouteRole::Secondary
-            && self
-                .vpn_bypass
-                .owned_by_confirmed_client(source, destination)
+            && self.vpn_bypass.owned_by_confirmed_client(
+                source,
+                destination,
+                principal,
+                allow_service_owner,
+            )
         {
             RouteRole::Primary
         } else {
@@ -420,10 +415,7 @@ impl RelayCore {
         }
     }
 
-    /// `target` as the owner of the flow from `client` to `destination` may
-    /// take it: unchanged for the routing user, re-routed by another served
-    /// user's own book and bound to their links, or refused. Asked once per
-    /// new flow, after [`Self::decide`], which stays free of the lookup.
+    /// Bind authorization, book and egress to the same captured principal.
     pub fn for_owner(
         &self,
         mut target: UpstreamTarget,
@@ -431,17 +423,11 @@ impl RelayCore {
         destination: SocketAddr,
         transport: Option<FlowTransport>,
     ) -> Result<UpstreamTarget, OwnerRefusal> {
-        let principal = match self.owners.owner_of(client, destination, transport) {
-            // The relay's dial is the service's own traffic and passes the
-            // routing user's filters: their block is honoured here or nowhere.
-            FlowOwner::RoutingUser if target.book_route.is_none() => {
-                return Err(OwnerRefusal {
-                    hostname: target.hostname,
-                    reason: "blocked-host",
-                })
-            }
-            FlowOwner::RoutingUser => return Ok(target),
-            FlowOwner::Principal(principal) => principal,
+        let context = self.owners.context_for(client, destination, transport);
+        let routing_user = matches!(context.owner, FlowOwner::RoutingUser);
+        let principal = match context.owner {
+            FlowOwner::RoutingUser => context.routing_principal,
+            FlowOwner::Principal(principal) => Some(principal),
             FlowOwner::Refused(reason) => {
                 return Err(OwnerRefusal {
                     hostname: target.hostname,
@@ -449,26 +435,39 @@ impl RelayCore {
                 })
             }
         };
-        // The in-tunnel rescue carries a literal private address no book
-        // names; it keeps its route, on the owner's links.
+        // Literal tunnel interiors stay on the tunnel, including for its own client.
         if target.hostname.parse::<IpAddr>().is_err() {
-            let Some(route) = self
-                .routes
-                .route_for_principal(&principal, &target.hostname)
-            else {
+            let book_route = match principal.as_deref() {
+                Some(principal) => self.routes.route_for_principal(principal, &target.hostname),
+                None => target.book_route,
+            };
+            let Some(route) = book_route else {
                 return Err(OwnerRefusal {
                     hostname: target.hostname,
-                    reason: "owner-blocks-host",
+                    reason: if routing_user {
+                        "blocked-host"
+                    } else {
+                        "owner-blocks-host"
+                    },
                 });
             };
-            target.route = self.unless_vpn_client(route, client, destination);
+            target.route = route;
             target.book_route = Some(route);
+            if transport == Some(FlowTransport::Tcp) {
+                if let Some(principal) = principal.as_deref() {
+                    target.route =
+                        self.unless_vpn_client(route, client, destination, principal, routing_user);
+                }
+            }
             target.held_only_by_public_zone = target.route == RouteRole::Secondary
-                && self
-                    .routes
-                    .held_only_by_public_zone_for(&principal, &target.hostname);
+                && match principal.as_deref() {
+                    Some(principal) => self
+                        .routes
+                        .held_only_by_public_zone_for(principal, &target.hostname),
+                    None => self.routes.held_only_by_public_zone(&target.hostname),
+                };
         }
-        target.owner = Some(principal);
+        target.owner = principal;
         Ok(target)
     }
 
@@ -767,7 +766,13 @@ mod tests {
     /// Bypass double: reports every flow as owned by a confirmed VPN client.
     struct AlwaysConfirmedClient;
     impl crate::fake_ip::vpn_client_bypass::VpnClientFlowBypass for AlwaysConfirmedClient {
-        fn owned_by_confirmed_client(&self, _client: SocketAddr, _fake: SocketAddr) -> bool {
+        fn owned_by_confirmed_client(
+            &self,
+            _client: SocketAddr,
+            _fake: SocketAddr,
+            _: &str,
+            _: bool,
+        ) -> bool {
             true
         }
     }
@@ -775,23 +780,36 @@ mod tests {
     /// Bypass double that fails the test if it is ever consulted.
     struct NeverAsked;
     impl crate::fake_ip::vpn_client_bypass::VpnClientFlowBypass for NeverAsked {
-        fn owned_by_confirmed_client(&self, _client: SocketAddr, _fake: SocketAddr) -> bool {
+        fn owned_by_confirmed_client(
+            &self,
+            _client: SocketAddr,
+            _fake: SocketAddr,
+            _: &str,
+            _: bool,
+        ) -> bool {
             panic!("the bypass must not be consulted for a primary-routed flow");
         }
     }
 
     #[test]
     fn a_confirmed_vpn_clients_flow_leaves_over_the_primary() {
-        // The host is routed to the secondary, but this flow belongs to the
-        // client that ESTABLISHES the secondary — sending it through the tunnel
-        // it is bringing up is the loop that broke its external-address probe.
+        // The tunnel's own transport must not depend on that tunnel being up.
         let (allocator, fake) = allocator_with("check.example");
         let resolver = StaticUpstreamResolver::new().with("check.example", &[ip("203.0.113.9")]);
-        let relay = core(allocator, resolver, RouteRole::Secondary)
+        let mut relay = core(allocator, resolver, RouteRole::Secondary)
             .with_vpn_client_bypass(Arc::new(AlwaysConfirmedClient));
-
-        match relay.decide(&packet(SocketAddr::new(fake, 443), true)) {
+        relay.set_flow_owners(Arc::new(BootstrapFlowOwners(bootstrap_routing_context())));
+        let request = packet(SocketAddr::new(fake, 443), true);
+        match relay.decide(&request) {
             RelayDecision::Relay { target, .. } => {
+                let target = relay
+                    .for_owner(
+                        target,
+                        request.key.source,
+                        request.key.destination,
+                        Some(FlowTransport::Tcp),
+                    )
+                    .expect("carried");
                 assert_eq!(target.route, RouteRole::Primary);
                 assert_eq!(target.address, "203.0.113.9:443".parse().ok());
             }
@@ -817,12 +835,22 @@ mod tests {
     fn a_primary_routed_flow_never_pays_for_an_owner_lookup() {
         let (allocator, fake) = allocator_with("example.com");
         let resolver = StaticUpstreamResolver::new().with("example.com", &[ip("203.0.113.138")]);
-        let relay = core(allocator, resolver, RouteRole::Primary)
+        let mut relay = core(allocator, resolver, RouteRole::Primary)
             .with_vpn_client_bypass(Arc::new(NeverAsked));
-        assert!(matches!(
-            relay.decide(&packet(SocketAddr::new(fake, 443), true)),
-            RelayDecision::Relay { .. }
-        ));
+        relay.set_flow_owners(Arc::new(BootstrapFlowOwners(bootstrap_routing_context())));
+        let request = packet(SocketAddr::new(fake, 443), true);
+        let RelayDecision::Relay { target, .. } = relay.decide(&request) else {
+            panic!("the primary host is carried");
+        };
+        let target = relay
+            .for_owner(
+                target,
+                request.key.source,
+                request.key.destination,
+                Some(FlowTransport::Tcp),
+            )
+            .expect("carried");
+        assert_eq!(target.route, RouteRole::Primary);
     }
 
     #[test]
@@ -1006,6 +1034,381 @@ mod tests {
     }
 
     struct OwnersByPort;
+
+    struct VpnBootstrapOwner {
+        identity: Option<(&'static str, &'static str)>,
+        legacy_image: &'static str,
+        legacy_principal: &'static str,
+    }
+
+    impl nrr_platform_api::FlowOwnerLookup for VpnBootstrapOwner {
+        fn owner_identity(&self, _: SocketAddr, _: SocketAddr) -> Option<(String, String)> {
+            self.identity.map(|(sid, path)| (sid.into(), path.into()))
+        }
+
+        fn owner_image_name(&self, _: SocketAddr, _: SocketAddr) -> Option<String> {
+            Some(self.legacy_image.into())
+        }
+
+        fn owner_principal(
+            &self,
+            _: SocketAddr,
+            _: SocketAddr,
+            _: FlowTransport,
+        ) -> Option<String> {
+            Some(self.legacy_principal.into())
+        }
+    }
+
+    const BOOTSTRAP_CLIENT: &str = r"C:\Program Files\ExampleVPN\client.exe";
+    const BOOTSTRAP_PRINCIPAL: &str = "S-1-5-21-2";
+
+    fn vpn_bootstrap_target(
+        owner: VpnBootstrapOwner,
+        confirmed_sid: Option<&str>,
+        second_user: bool,
+    ) -> UpstreamTarget {
+        vpn_bootstrap_target_for_transport(owner, confirmed_sid, second_user, FlowTransport::Tcp)
+    }
+
+    fn vpn_bootstrap_target_for_transport(
+        owner: VpnBootstrapOwner,
+        confirmed_sid: Option<&str>,
+        second_user: bool,
+        transport: FlowTransport,
+    ) -> UpstreamTarget {
+        let context = FlowOwnerContext {
+            owner: if second_user {
+                FlowOwner::Principal(BOOTSTRAP_PRINCIPAL.into())
+            } else {
+                FlowOwner::RoutingUser
+            },
+            routing_principal: Some(
+                if second_user {
+                    "S-1-5-21-1"
+                } else {
+                    BOOTSTRAP_PRINCIPAL
+                }
+                .into(),
+            ),
+        };
+        vpn_bootstrap_with_context(owner, confirmed_sid, transport, context, true, false)
+    }
+
+    struct BootstrapFlowOwners(FlowOwnerContext);
+
+    impl FlowOwners for BootstrapFlowOwners {
+        fn owner_of(&self, _: SocketAddr, _: SocketAddr, _: Option<FlowTransport>) -> FlowOwner {
+            self.0.owner.clone()
+        }
+
+        fn context_for(
+            &self,
+            _: SocketAddr,
+            _: SocketAddr,
+            _: Option<FlowTransport>,
+        ) -> FlowOwnerContext {
+            self.0.clone()
+        }
+    }
+
+    struct BootstrapChangedRoutingBook;
+
+    impl RouteSelector for BootstrapChangedRoutingBook {
+        fn route_for(&self, _: &str) -> Option<RouteRole> {
+            Some(RouteRole::Primary)
+        }
+
+        fn route_for_principal(&self, _: &str, _: &str) -> Option<RouteRole> {
+            Some(RouteRole::Secondary)
+        }
+    }
+
+    fn vpn_bootstrap_with_context(
+        owner: VpnBootstrapOwner,
+        confirmed_sid: Option<&str>,
+        transport: FlowTransport,
+        context: FlowOwnerContext,
+        protected_install: bool,
+        changed_book: bool,
+    ) -> UpstreamTarget {
+        use crate::fake_ip::vpn_client_bypass::OwnerLookupVpnClientBypass;
+        use crate::vpn_client_registry::ConfirmedVpnClients;
+
+        let (allocator, fake) = allocator_with("check.example");
+        let confirmed = Arc::new(ConfirmedVpnClients::new());
+        if let Some(sid) = confirmed_sid {
+            confirmed.publish(sid, &[BOOTSTRAP_CLIENT.into()]);
+        }
+        // A long interval makes duplicate probes fail deterministically, even on a busy host.
+        let programs = nrr_platform_api::MockAppPathResolver::new();
+        let programs = if protected_install {
+            programs.with_protected_root(r"C:\Program Files")
+        } else {
+            programs
+        };
+        let bypass = OwnerLookupVpnClientBypass::new(Arc::new(owner), confirmed)
+            .with_min_probe_interval(std::time::Duration::from_secs(3600))
+            .with_service_programs(Arc::new(programs));
+        let resolver = StaticUpstreamResolver::new().with("check.example", &[ip("203.0.113.9")]);
+        let mut relay = core(allocator, resolver, RouteRole::Secondary)
+            .with_vpn_client_bypass(Arc::new(bypass));
+        relay.set_flow_owners(Arc::new(BootstrapFlowOwners(context)));
+        if changed_book {
+            relay.routes = Arc::new(BootstrapChangedRoutingBook);
+        }
+        let mut request = packet(SocketAddr::new(fake, 443), true);
+        request.key.source.set_port(50002);
+        if transport == FlowTransport::Udp {
+            request.key.protocol = FlowProtocol::Udp;
+        }
+        let RelayDecision::Relay { target, .. } = relay.decide(&request) else {
+            panic!("the known hostname must reach owner-specific routing");
+        };
+        relay
+            .for_owner(
+                target,
+                request.key.source,
+                request.key.destination,
+                Some(transport),
+            )
+            .expect("a served user's permitted hostname")
+    }
+
+    fn bootstrap_owner(path: &'static str) -> VpnBootstrapOwner {
+        VpnBootstrapOwner {
+            identity: Some((BOOTSTRAP_PRINCIPAL, path)),
+            legacy_image: "client.exe",
+            legacy_principal: BOOTSTRAP_PRINCIPAL,
+        }
+    }
+
+    #[test]
+    fn vpn_bootstrap_second_users_confirmation_survives_owner_rerouting() {
+        let target = vpn_bootstrap_target(
+            bootstrap_owner(BOOTSTRAP_CLIENT),
+            Some(BOOTSTRAP_PRINCIPAL),
+            true,
+        );
+        assert_eq!(target.owner.as_deref(), Some(BOOTSTRAP_PRINCIPAL));
+        assert_eq!(target.book_route, Some(RouteRole::Secondary));
+        assert_eq!(
+            target.route,
+            RouteRole::Primary,
+            "the second user's VPN must establish its tunnel over the main link"
+        );
+    }
+
+    #[test]
+    fn vpn_bootstrap_same_basename_in_another_folder_keeps_secondary() {
+        let target = vpn_bootstrap_target(
+            bootstrap_owner(r"C:\Users\test\Downloads\client.exe"),
+            Some(BOOTSTRAP_PRINCIPAL),
+            false,
+        );
+        assert_eq!(
+            target.route,
+            RouteRole::Secondary,
+            "a file name is not authorization"
+        );
+    }
+
+    #[test]
+    fn vpn_bootstrap_another_users_confirmation_keeps_secondary() {
+        let target =
+            vpn_bootstrap_target(bootstrap_owner(BOOTSTRAP_CLIENT), Some("S-1-5-21-1"), false);
+        assert_eq!(target.route, RouteRole::Secondary);
+    }
+
+    #[test]
+    fn vpn_bootstrap_an_unconfirmed_client_keeps_secondary() {
+        let target = vpn_bootstrap_target(bootstrap_owner(BOOTSTRAP_CLIENT), None, false);
+        assert_eq!(target.route, RouteRole::Secondary);
+    }
+
+    #[test]
+    fn vpn_bootstrap_unverified_identity_does_not_join_separate_process_reads() {
+        let mut owner = bootstrap_owner(BOOTSTRAP_CLIENT);
+        owner.identity = None;
+        let target = vpn_bootstrap_target(owner, Some(BOOTSTRAP_PRINCIPAL), false);
+        assert_eq!(
+            target.route,
+            RouteRole::Secondary,
+            "independent image and SID reads do not authenticate one process"
+        );
+    }
+
+    #[test]
+    fn vpn_bootstrap_authenticated_identity_is_not_replaced_by_a_later_process() {
+        let mut owner = bootstrap_owner(BOOTSTRAP_CLIENT);
+        owner.legacy_image = "unrelated.exe";
+        owner.legacy_principal = "S-1-5-21-1";
+        let target = vpn_bootstrap_target(owner, Some(BOOTSTRAP_PRINCIPAL), false);
+        assert_eq!(target.route, RouteRole::Primary);
+    }
+
+    #[test]
+    fn vpn_bootstrap_udp_does_not_borrow_a_confirmed_tcp_sockets_identity() {
+        let target = vpn_bootstrap_target_for_transport(
+            bootstrap_owner(BOOTSTRAP_CLIENT),
+            Some(BOOTSTRAP_PRINCIPAL),
+            false,
+            FlowTransport::Udp,
+        );
+        assert_eq!(
+            target.route,
+            RouteRole::Secondary,
+            "a matching TCP tuple cannot authorize a datagram from another socket"
+        );
+    }
+
+    fn bootstrap_service_owner(principal: &'static str) -> VpnBootstrapOwner {
+        VpnBootstrapOwner {
+            identity: Some((principal, BOOTSTRAP_CLIENT)),
+            legacy_image: "client.exe",
+            legacy_principal: principal,
+        }
+    }
+
+    fn bootstrap_routing_context() -> FlowOwnerContext {
+        FlowOwnerContext {
+            owner: FlowOwner::RoutingUser,
+            routing_principal: Some(BOOTSTRAP_PRINCIPAL.into()),
+        }
+    }
+
+    #[test]
+    fn vpn_bootstrap_protected_service_uses_only_its_routing_users_confirmation() {
+        for service in ["S-1-5-18", "S-1-5-19", "S-1-5-20"] {
+            let target = vpn_bootstrap_with_context(
+                bootstrap_service_owner(service),
+                Some(BOOTSTRAP_PRINCIPAL),
+                FlowTransport::Tcp,
+                bootstrap_routing_context(),
+                true,
+                false,
+            );
+            assert_eq!(
+                target.route,
+                RouteRole::Primary,
+                "the user's confirmed system VPN must reconnect"
+            );
+            assert_eq!(target.owner.as_deref(), Some(BOOTSTRAP_PRINCIPAL));
+            assert_eq!(target.book_route, Some(RouteRole::Secondary));
+        }
+    }
+
+    #[test]
+    fn vpn_bootstrap_service_does_not_use_another_users_confirmation() {
+        let target = vpn_bootstrap_with_context(
+            bootstrap_service_owner("S-1-5-18"),
+            Some("S-1-5-21-1"),
+            FlowTransport::Tcp,
+            bootstrap_routing_context(),
+            true,
+            false,
+        );
+        assert_eq!(target.route, RouteRole::Secondary);
+    }
+
+    #[test]
+    fn vpn_bootstrap_service_without_a_routing_principal_keeps_secondary() {
+        let mut context = bootstrap_routing_context();
+        context.routing_principal = None;
+        let target = vpn_bootstrap_with_context(
+            bootstrap_service_owner("S-1-5-18"),
+            Some(BOOTSTRAP_PRINCIPAL),
+            FlowTransport::Tcp,
+            context,
+            true,
+            false,
+        );
+        assert_eq!(target.route, RouteRole::Secondary);
+    }
+
+    #[test]
+    fn vpn_bootstrap_service_from_an_unprotected_install_keeps_secondary() {
+        let target = vpn_bootstrap_with_context(
+            bootstrap_service_owner("S-1-5-18"),
+            Some(BOOTSTRAP_PRINCIPAL),
+            FlowTransport::Tcp,
+            bootstrap_routing_context(),
+            false,
+            false,
+        );
+        assert_eq!(target.route, RouteRole::Secondary);
+    }
+
+    #[test]
+    fn vpn_bootstrap_service_cannot_borrow_a_nonrouting_principals_confirmation() {
+        let context = FlowOwnerContext {
+            owner: FlowOwner::Principal(BOOTSTRAP_PRINCIPAL.into()),
+            routing_principal: Some("S-1-5-21-1".into()),
+        };
+        let target = vpn_bootstrap_with_context(
+            bootstrap_service_owner("S-1-5-18"),
+            Some(BOOTSTRAP_PRINCIPAL),
+            FlowTransport::Tcp,
+            context,
+            true,
+            false,
+        );
+        assert_eq!(target.route, RouteRole::Secondary);
+    }
+
+    #[test]
+    fn vpn_bootstrap_service_with_another_image_path_keeps_secondary() {
+        let mut owner = bootstrap_service_owner("S-1-5-18");
+        owner.identity = Some(("S-1-5-18", r"C:\Program Files\Other\client.exe"));
+        let target = vpn_bootstrap_with_context(
+            owner,
+            Some(BOOTSTRAP_PRINCIPAL),
+            FlowTransport::Tcp,
+            bootstrap_routing_context(),
+            true,
+            false,
+        );
+        assert_eq!(target.route, RouteRole::Secondary);
+    }
+
+    #[test]
+    fn vpn_bootstrap_captured_routing_user_owns_the_book_and_the_service_grant() {
+        let target = vpn_bootstrap_with_context(
+            bootstrap_service_owner("S-1-5-18"),
+            Some(BOOTSTRAP_PRINCIPAL),
+            FlowTransport::Tcp,
+            bootstrap_routing_context(),
+            true,
+            true,
+        );
+        assert_eq!(target.route, RouteRole::Primary);
+        assert_eq!(
+            target.book_route,
+            Some(RouteRole::Secondary),
+            "read the captured user's book"
+        );
+        assert_eq!(target.owner.as_deref(), Some(BOOTSTRAP_PRINCIPAL));
+    }
+
+    #[test]
+    fn vpn_bootstrap_does_not_authorize_one_users_process_under_anothers_book() {
+        let mut owner = bootstrap_owner(BOOTSTRAP_CLIENT);
+        owner.identity = Some(("S-1-5-21-1", BOOTSTRAP_CLIENT));
+        owner.legacy_principal = "S-1-5-21-1";
+        let context = FlowOwnerContext {
+            owner: FlowOwner::Principal(BOOTSTRAP_PRINCIPAL.into()),
+            routing_principal: Some("S-1-5-21-1".into()),
+        };
+        let target = vpn_bootstrap_with_context(
+            owner,
+            Some("S-1-5-21-1"),
+            FlowTransport::Tcp,
+            context,
+            true,
+            false,
+        );
+        assert_eq!(target.route, RouteRole::Secondary);
+    }
 
     impl FlowOwners for OwnersByPort {
         fn owner_of(

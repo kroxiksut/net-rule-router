@@ -144,6 +144,22 @@ fn conn_trace_gui_switch_gates_the_answer_not_the_ring() {
     assert!(resp.gui_stream_enabled);
 }
 
+#[test]
+fn a_block_with_no_verified_filter_owner_stays_unknown() {
+    use nrr_platform_api::conn_observe::ConnectionVerdict;
+
+    let ring = Arc::new(crate::conn_observation_consumer::ConnectionTraceRing::new(
+        8,
+    ));
+    let mut row = trace_row();
+    row.verdict = ConnectionVerdict::Block;
+    row.blocked_by_nrr = None;
+    ring.push(row);
+
+    let resp = conn_trace_list(&ConnTraceEntriesListHandler::new(ring));
+    assert_eq!(resp.page.items[0].blocked_by, "unknown");
+}
+
 /// An empty page means two different things, and the viewer can only tell
 /// them apart if the answer carries the observer's state. Both directions
 /// are asserted: without the positive control, a field wired to a constant
@@ -1326,6 +1342,11 @@ fn health_json_carries_enrichment_from_providers() {
     let health: serde_json::Value = serde_json::from_str(&body).expect("json");
     assert_eq!(health["behavior_mode"], "prefer-secondary-when-available");
     assert_eq!(health["state_schema_version"], 29);
+    assert_eq!(health["route_bindings"]["primary_bound"], false);
+    assert_eq!(health["route_bindings"]["secondary_bound"], false);
+    assert_eq!(health["routing_readiness"]["primary"], "not-chosen");
+    assert_eq!(health["routing_readiness"]["secondary"], "not-required");
+    assert_eq!(health["protection_filters_on_machine"], 0);
     assert_eq!(
         health["adapters_snapshot"]["adapters"][0]["adapter-name"],
         "eth0"

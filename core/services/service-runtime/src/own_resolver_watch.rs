@@ -66,7 +66,7 @@ impl KnownResolvers {
         known
     }
 
-    fn lists(&self, rec: &ConnectionTraceRecord) -> bool {
+    pub(crate) fn lists(&self, rec: &ConnectionTraceRecord) -> bool {
         self.addresses.contains(&rec.remote.ip())
             || rec.remote_names.as_ref().is_some_and(|n| {
                 n.names

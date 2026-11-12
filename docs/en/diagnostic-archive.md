@@ -42,13 +42,11 @@ The export offers two levels, chosen next to the export button:
 - **Standard** (default, recommended) — the files listed above. This is what a normal bug report needs.
 - **Full diagnostics** — everything in Standard plus three extra detail files, and a relaxed privacy mode. Choose this only when walking through a problem with support:
 
-  - `cache_health.json` — FQDN/IP resolution-cache health detail.
-  - `storage_health.json` — SQLite storage health detail.
-  - `explain_samples.json` — a handful of recent routing-decision explanations. Unlike the other files, this one **can** include the destination hostname of the sampled decisions (that is its purpose — showing why a specific decision was made), subject to the applied privacy mode.
+- `cache_health.json` — FQDN/IP resolution-cache health detail. - `storage_health.json` — SQLite storage health detail. - `explain_samples.json` — a handful of recent routing-decision explanations. Unlike the other files, this one **can** include the destination hostname of the sampled decisions (that is its purpose — showing why a specific decision was made), subject to the applied privacy mode.
 
-  A file appears only when it has something in it: with nothing to explain, or an audit trail this export may not carry whole, the file is left out and named in `redaction_report.json` instead of shipping empty.
+A file appears only when it has something in it: with nothing to explain, or an audit trail this export may not carry whole, the file is left out and named in `redaction_report.json` instead of shipping empty.
 
-  Because the full level is less redacted, review the archive before sharing it.
+Because the full level is less redacted, review the archive before sharing it.
 
 The whole archive is capped at 50 MiB.
 

@@ -6,6 +6,16 @@ Working rules for any coding agent in this repository. Agent-specific additions 
 
 NetRuleRouter is a **Windows-first** network policy and traffic routing manager. It controls traffic routing across existing network interfaces (e.g., primary + VPN, Wi-Fi + Ethernet). It is **not** a VPN client, anonymity tool, censorship bypass tool, or proxy manager.
 
+## Markdown Formatting
+
+Do not hard-wrap Markdown prose to a fixed column width. Keep each paragraph, list item and table cell on one physical line and let the renderer wrap it to the available width. Use explicit line breaks only where Markdown structure or the intended presentation requires them, such as between paragraphs, list items, headings, table rows and code-block lines. Apply this rule to every new or edited Markdown file; when touching existing wrapped prose, remove the manual wrapping in the part being edited instead of extending it.
+
+## Code Search
+
+**HARD RULE — use XERJ for code navigation and cross-module investigation.** Use definition-first searches to locate implementations, callers and related mechanisms when investigating or changing behavior; do not silently replace this step with only `rg` and file reads. Use `rg` for exact text/file searches and verify indexed findings against current source before editing. An index can miss recent changes even without a stale-index hint. If XERJ is unavailable or malfunctioning, diagnose and restore XERJ first; do not immediately fall back to `rg` or direct file inspection. Only after a concrete recovery attempt fails or access is explicitly blocked may unaffected work continue with direct inspection, and the agent must report the failure and fallback. Never bypass an access rejection. This rule does not authorize running repository indexing scripts on the primary workstation.
+
+For local recovery, reuse the installed XERJ and the existing configuration/data directory. Preserve loopback binding, authentication and indexes; check disk reserve before starting the node. MCP client processes alone do not establish server availability: verify an actual search after recovery.
+
 ## Build Commands
 
 ```powershell
@@ -34,6 +44,10 @@ powershell -ExecutionPolicy Bypass -File .\scripts\purge-data.ps1
 
 ## Quality Checks
 
+**HARD RULE — repository code runs only on the test laptops.** Builds, tests, linters, formatters, generators, packaging, repository scripts, and product binaries run on the designated Ubuntu and Windows 10 laptops, using the cheapest capable agent for mechanical execution and result relay. Running any of them on the primary Windows workstation requires the owner's explicit approval for that specific run. Read-only inspection and file editing on the workstation are allowed. Agents may use Recall/Hansard and execute Hansard commands themselves to reach the shared remote-device context.
+
+**HARD RULE — keep at least 5 GiB free on the Windows system drive (C:).** Check free space before builds, downloads, staging and captures, budget their expected growth above this reserve, and monitor space during long runs. If the reserve is threatened, stop your own space-consuming work and reclaim your disposable artifacts before continuing; prefer a non-system drive for large outputs when practical. After a run, remove your obsolete build targets, duplicate dependency caches, temporary browser profiles and staging files, retaining required evidence outside C:. Before deletion, verify exact resolved paths, ownership and absence of active users or processes; never follow reparse points or delete another agent's active outputs, user data, installed binaries or audit records. Report space before and after cleanup. Do not leave growing background jobs behind.
+
 ```powershell
 # Canonical local quality gate (fmt + clippy + test + cargo-deny)
 powershell -ExecutionPolicy Bypass -File .\scripts\check.ps1 -RequireCargoDeny
@@ -44,6 +58,24 @@ The gate wraps the standard `cargo fmt --check` / `cargo clippy -D warnings` / `
 A `.ps1` holding any non-ASCII character is saved as UTF-8 with BOM: Windows PowerShell 5.1 reads a BOM-less file as ANSI, and nothing in the gate catches it.
 
 **HARD RULE — tests are written from a failure.** A test names what can break and how — hostile bytes, a failing port, a race, a clock jump, a full disk, a second user, a tunnel that drops or comes back on a new adapter — and asserts the promise to the user, not what the code does today. A test that breaks the code is fixed in the code; an expectation changes only when the owner changes the expectation, never to turn the gate green. A test that catches no breakage is deleted, not kept as coverage. A fix comes with its test written first, and that test is seen failing on the old code: a test that never failed proves nothing.
+
+## Audit with Reproduction
+
+**HARD RULE — a network guarantee is accepted only with evidence from the real enforcement path.** Source review and unit tests identify risks but do not prove OS behaviour. For every applicable bypass or recovery claim record the OS and version, NRR mode, exact attempt, promised result, observed result, evidence and one verdict: protected, vulnerable, untested or outside the threat model. Distinguish unit tests, integration tests and a real OS run. An external-IP check alone never proves per-application routing; use the relevant packet capture, filter events, routes, ownership observations and logs. If the required device is unavailable, leave a reproducible procedure and the observation points instead of reporting success.
+
+Every enforcement change audits the ways a program can choose a path other than the policy assigned:
+
+- explicit socket binding to an interface or source address (`SO_BINDTODEVICE`, `IP_UNICAST_IF` / `IPV6_UNICAST_IF` where applicable), in both Primary-to-Secondary and Secondary-to-Primary directions;
+- missing, delayed or wrong PID/UID/SID attribution, a socket disappearing during lookup, PID or port reuse, TCP versus UDP and simultaneous users;
+- a local SOCKS/HTTP proxy, system service or IPC intermediary that originates the external connection under a different owner;
+- a live flow surviving a rule, role or adapter change, a tunnel returning on a new adapter, and a stale cache decision being reused for a new flow;
+- queue, worker or poll-loop exhaustion caused by connection bursts, slow ownership lookup or repeated unknown owners;
+- IPv4 and IPv6 plus every protocol covered by the promise, including DNS and UDP paths such as WebRTC/STUN;
+- coexistence with third-party VPN/TUN clients, their transport exceptions, normal service shutdown, route and DNS restoration, Primary availability when selected and Fail-Closed while Secondary is unavailable.
+
+An unknown owner is never silently treated as permission merely because attribution failed. Do not replace every unknown-owner outcome with a blanket block either: derive the posture from the active NRR mode and verify that system traffic, VPN transports and recovery still work. Process ancestry alone does not prove ownership after a proxy or external service takes over. Administrator/root behaviour is outside the normal threat model unless the product explicitly promises otherwise.
+
+When a bypass is reproduced, state the violated user promise, add the regression test first and observe it fail on the old code, implement the smallest correction in the existing policy/mechanism boundary, and rerun the surrounding compatibility and recovery scenarios. Never disable Fail-Closed or weaken another guard to make the reproduction pass.
 
 ## Architecture
 

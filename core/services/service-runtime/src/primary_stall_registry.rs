@@ -114,6 +114,44 @@ impl Default for PrimaryStallRegistry {
 }
 
 impl PrimaryStallRegistry {
+    /// A complete active measurement starts a new epoch; old TCP closes cannot refute it.
+    pub fn note_verified_tls(
+        &self,
+        owner: &str,
+        hostname: &str,
+        answered: bool,
+        failures: u32,
+    ) -> Option<StallReport> {
+        if owner.is_empty() || hostname.is_empty() {
+            return None;
+        }
+        if !answered && primary_behavior_from(0, failures) != PrimaryBehavior::Stalls {
+            return None;
+        }
+        let now = Instant::now();
+        let mut hosts = self.hosts.lock().unwrap_or_else(|p| p.into_inner());
+        Self::expire(&mut hosts, now, self.ttl);
+        let tally = Tally {
+            stalls: if answered { 0 } else { failures },
+            completions: u32::from(answered),
+            last_seen: now,
+            reported: Some(if answered {
+                PrimaryBehavior::Responds
+            } else {
+                PrimaryBehavior::Stalls
+            }),
+        };
+        let report = StallReport {
+            hostname: hostname.to_owned(),
+            behavior: tally.behavior(),
+            stalls: tally.stalls,
+            completions: tally.completions,
+        };
+        hosts.insert((owner.to_owned(), hostname.to_owned()), tally);
+        Self::evict_to_cap(&mut hosts, self.cap);
+        Some(report)
+    }
+
     #[must_use]
     pub fn new() -> Self {
         Self {
@@ -200,6 +238,7 @@ impl PrimaryStallRegistry {
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .get(&(owner.to_string(), hostname.to_string()))
+            .filter(|tally| tally.last_seen.elapsed() < self.ttl)
             .map_or(PrimaryBehavior::Unknown, Tally::behavior)
     }
 
@@ -223,6 +262,7 @@ impl PrimaryStallRegistry {
             .unwrap_or_else(|p| p.into_inner())
             .iter()
             .filter(|((o, host), _)| o == owner && (host == hostname || host.ends_with(&suffix)))
+            .filter(|(_, tally)| tally.last_seen.elapsed() < self.ttl)
             .map(|(_, tally)| tally.subtree_behavior())
             .fold(PrimaryBehavior::Unknown, PrimaryBehavior::merge)
     }
@@ -234,7 +274,11 @@ impl PrimaryStallRegistry {
         let hosts = self.hosts.lock().unwrap_or_else(|p| p.into_inner());
         let mut rows: Vec<(&String, &Tally)> = hosts
             .iter()
-            .filter(|((o, _), t)| o == owner && t.behavior() == PrimaryBehavior::Stalls)
+            .filter(|((o, _), t)| {
+                o == owner
+                    && t.last_seen.elapsed() < self.ttl
+                    && t.behavior() == PrimaryBehavior::Stalls
+            })
             .map(|((_, h), t)| (h, t))
             .collect();
         rows.sort_by(|a, b| b.1.last_seen.cmp(&a.1.last_seen));
@@ -275,23 +319,26 @@ impl PrimaryStallRegistry {
 /// not a fault of ours, and a warning the user cannot act on is noise. The
 /// registry only hands out a report when the verdict actually moved, so this
 /// cannot repeat while the state holds.
-pub fn log_report(report: &StallReport) {
+pub fn log_report(sid: &str, report: &StallReport) {
     match report.behavior {
         PrimaryBehavior::Stalls => tracing::info!(
             target: "nrr::primary-stall",
             msg_key = "stallreg-destination-stalling",
+            sid,
             hostname = %report.hostname,
             stalls = report.stalls,
             "destination does not answer on the main link — connections start and nothing comes back",
         ),
         PrimaryBehavior::Responds => tracing::debug!(
             target: "nrr::primary-stall",
+            sid,
             hostname = %report.hostname,
             completions = report.completions,
             "destination answers on the main link",
         ),
         PrimaryBehavior::Unknown => tracing::debug!(
             target: "nrr::primary-stall",
+            sid,
             hostname = %report.hostname,
             stalls = report.stalls,
             completions = report.completions,
@@ -318,6 +365,33 @@ pub fn global_primary_stalls() -> std::sync::Arc<PrimaryStallRegistry> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_verified_tls_epoch_supersedes_old_tcp_success_only_after_three_failures() {
+        let registry = PrimaryStallRegistry::new();
+        registry.note(A, "verified.example", PrimaryHealthEvent::Completed);
+        assert!(registry
+            .note_verified_tls(A, "verified.example", false, 2)
+            .is_none());
+        assert_eq!(
+            registry.behavior_of(A, "verified.example"),
+            PrimaryBehavior::Responds
+        );
+        registry.note_verified_tls(A, "verified.example", false, 3);
+        assert_eq!(
+            registry.behavior_of(A, "verified.example"),
+            PrimaryBehavior::Stalls
+        );
+        assert_eq!(
+            registry.behavior_of(B, "verified.example"),
+            PrimaryBehavior::Unknown
+        );
+        registry.note_verified_tls(A, "verified.example", true, 0);
+        assert_eq!(
+            registry.behavior_of(A, "verified.example"),
+            PrimaryBehavior::Responds
+        );
+    }
 
     const A: &str = "S-1-5-21-1-2-3-1001";
     const B: &str = "S-1-5-21-1-2-3-1002";

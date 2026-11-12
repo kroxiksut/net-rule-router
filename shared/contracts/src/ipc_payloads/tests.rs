@@ -13,6 +13,7 @@ fn service_health_response_fake_ip_datapath_round_trips_as_kebab_case() {
             desired: true,
             running: false,
             zombies: 2,
+            last_failure: None,
         }),
     };
     let json = serde_json::to_value(&resp).expect("serialise");
@@ -301,6 +302,23 @@ fn every_status_update_event() -> Vec<StatusUpdateEvent> {
         },
         StatusUpdateEvent::RetentionSettingsChanged,
         StatusUpdateEvent::SystemDnsNotRestored,
+        StatusUpdateEvent::DnsCompatibilityChanged {
+            sid: "S-1-5-21".into(),
+            state: DnsCompatibilityDto {
+                status: DnsCompatibilityStatus::Limited,
+                issues: vec![DnsCompatibilityIssueDto {
+                    program: "browser.exe".into(),
+                    reason: "our-dns-block".into(),
+                    evidence: "confirmed".into(),
+                    first_seen_ms: 1,
+                    last_seen_ms: 2,
+                    attempts: 1,
+                    needs_recheck: true,
+                }],
+                last_checked_ms: Some(2),
+                ..DnsCompatibilityDto::default()
+            },
+        },
         StatusUpdateEvent::MutationProgress {
             correlation_id: "corr-1".into(),
             mutation_kind: "rules-update".into(),
@@ -1124,6 +1142,7 @@ fn auto_rule_signal_slugs_are_pinned() {
         [
             "placeholder-answer",
             "main-link-blocked",
+            "shared-address-reachability",
             "app-main-link-blocked",
             "app-own-resolver"
         ]

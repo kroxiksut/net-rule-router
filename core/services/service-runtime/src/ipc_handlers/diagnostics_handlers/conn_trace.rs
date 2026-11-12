@@ -3,6 +3,7 @@
 
 use super::*;
 
+use nrr_platform_api::conn_observe::ConnectionVerdict;
 use nrr_shared::ipc_payloads::{
     ConnTraceOutageBlocksRequest, ConnTraceOutageBlocksResponse, OutageBlockDto, OutageEpisodeDto,
     OutageUnresolvedNameDto,
@@ -269,6 +270,7 @@ impl IpcHandler for ConnTraceEntriesListHandler {
                     blocked_by: match r.blocked_by_nrr {
                         Some(true) => "netrulerouter".to_string(),
                         Some(false) => "other".to_string(),
+                        None if r.verdict == ConnectionVerdict::Block => "unknown".to_string(),
                         None => String::new(),
                     },
                     block_reason: r.nrr_block_reason.unwrap_or_default().to_string(),

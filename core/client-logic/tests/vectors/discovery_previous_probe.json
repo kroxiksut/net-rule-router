@@ -1,0 +1,17 @@
+{
+  "description": "A waiting episode shows only a retained actual probe outcome, never a queue or permission decision as a measurement.",
+  "cases": [
+    {"name":"HTTP response error is retained while the next check waits", "input":{"history":[{"stage":"probe","reason":"http-client-error","at-unix-ms":1000},{"stage":"probe","reason":"probe-queued","at-unix-ms":2000}]}, "expected":{"reason":"http-client-error","at-unix-ms":1000}},
+    {"name":"old service without history", "input":{}, "expected":null},
+    {"name":"integral JSON timestamp matches JavaScript", "input":{"history":[{"stage":"probe","reason":"primary-responds","at-unix-ms":1000.0}]}, "expected":{"reason":"primary-responds","at-unix-ms":1000}},
+    {"name":"no retained result", "input":{"history":[{"stage":"probe","reason":"probe-queued","at-unix-ms":2000}]}, "expected":null},
+    {"name":"waiting preserves previous answer", "input":{"history":[{"stage":"probe","reason":"primary-responds","at-unix-ms":1000},{"stage":"probe","reason":"probe-pending","at-unix-ms":2000},{"stage":"probe","reason":"probe-queued","at-unix-ms":3000}]}, "expected":{"reason":"primary-responds","at-unix-ms":1000}},
+    {"name":"last measured failure wins", "input":{"history":[{"stage":"probe","reason":"primary-responds","at-unix-ms":1000},{"stage":"probe","reason":"secondary-failed","at-unix-ms":2000},{"stage":"probe","reason":"auto-probe-disabled","at-unix-ms":3000}]}, "expected":{"reason":"secondary-failed","at-unix-ms":2000}},
+    {"name":"inconclusive can be a preflight refusal", "input":{"history":[{"stage":"probe","reason":"probe-inconclusive","at-unix-ms":1000}]}, "expected":null},
+    {"name":"candidate ready is not a probe result", "input":{"history":[{"stage":"candidate","reason":"offer-ready","at-unix-ms":1000}]}, "expected":null},
+    {"name":"nonprobe observation is not a check", "input":{"history":[{"stage":"observation","reason":"primary-responds","at-unix-ms":1000}]}, "expected":null},
+    {"name":"missing and malformed timestamps do not establish time", "input":{"history":[null,{}, {"stage":"probe","reason":"primary-responds","at-unix-ms":0},{"stage":"probe","reason":"secondary-failed","at-unix-ms":"2000"}]}, "expected":null},
+    {"name":"only bounded retained tail is read", "input":{"history":[{"stage":"probe","reason":"primary-responds","at-unix-ms":1000},{},{},{},{},{},{},{},{}]}, "expected":null},
+    {"name":"unconfirmed HTTPS stays unconfirmed", "input":{"history":[{"stage":"probe","reason":"https-unconfirmed","at-unix-ms":1000}]}, "expected":{"reason":"https-unconfirmed","at-unix-ms":1000}}
+  ]
+}

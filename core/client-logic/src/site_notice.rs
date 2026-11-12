@@ -12,7 +12,12 @@ pub use nrr_shared::site_notice::{site_notice_due, SAME_SITE_GAP_MS, SITE_NOTICE
 /// `None` for any other offer.
 #[must_use]
 pub fn site_offer_reach(signal: &str, secondary_reach: Option<bool>) -> Option<&'static str> {
-    if signal != nrr_shared::ipc_payloads::AUTO_RULE_SIGNAL_MAIN_LINK_BLOCKED {
+    if !matches!(
+        signal,
+        nrr_shared::ipc_payloads::AUTO_RULE_SIGNAL_MAIN_LINK_BLOCKED
+            | nrr_shared::ipc_payloads::AUTO_RULE_SIGNAL_SHARED_ADDRESS_REACHABILITY
+            | nrr_shared::ipc_payloads::AUTO_RULE_SIGNAL_HTTP_PATH_REACHABILITY
+    ) {
         return None;
     }
     Some(match secondary_reach {

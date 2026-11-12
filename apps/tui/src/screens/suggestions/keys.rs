@@ -62,7 +62,7 @@ pub const EMPTY_INERT: Key = key(
 );
 pub const EMPTY_SERVED: Key = key(
     "rules.suggestions.inbox.empty-served-by-main-link",
-    "Connections to these {n} address(es) complete over your main connection. If a site still refuses to open, what you are seeing is not a routing failure — the traffic gets through, so a rule here would not change it.",
+    "These {n} hosts have answered on the main connection and are hidden from pending work. A connection response does not certify the browser page. Check the specific site if it still fails; the report distinguishes HTTP refusals from connection failures.",
 );
 
 pub const APP_GROUP: Key = key("rules.suggestions.inbox.app-group", "Application {name}");
@@ -92,7 +92,7 @@ pub const BEHAVIOR_RESPONDS: Key = key(
 );
 pub const BEHAVIOR_RESPONDS_REFUSING: Key = key(
     "rules.suggestions.inbox.behavior-responds-refusing",
-    "the main connection reaches it, but the site refuses addresses there",
+    "the main connection reaches this host; the linked site is marked as refusing addresses",
 );
 pub const BEHAVIOR_STALLS: Key = key(
     "rules.suggestions.inbox.behavior-stalls",
@@ -123,7 +123,7 @@ pub const AFFINITY: Key = key(
 pub const ADDITIONAL_REACH: [Key; 3] = [
     key(
         "tray.auto-rules.reach.confirmed",
-        "it opens over the additional connection",
+        "the connection check passed over the additional connection; page loading has not been verified",
     ),
     key(
         "tray.auto-rules.reach.unconfirmed",
@@ -131,10 +131,15 @@ pub const ADDITIONAL_REACH: [Key; 3] = [
     ),
     key(
         "tray.auto-rules.reach.unreachable",
-        "it does not open over the additional connection either",
+        "the connection check failed over the additional connection too",
     ),
 ];
-pub const SIGNALS: [Key; 7] = [
+pub const SIGNALS: [Key; 9] = [
+    key("tray.auto-rules.signal.http-path-reachability", "an HTTPS request failed on the main connection and answered on the additional connection; review this exact name before adding a rule. The browser page has not been verified"),
+    key(
+        "tray.auto-rules.signal.shared-address-reachability",
+        "an independent TLS check of this DNS name failed on the main connection and passed on the additional connection; its IP is shared, so the browser's destination is uncertain. Add it only if you need this site",
+    ),
     key("tray.auto-rules.signal.brand-related", "shares a name with the site"),
     key(
         "tray.auto-rules.signal.delivery-name",
@@ -164,7 +169,7 @@ pub const SIGNALS: [Key; 7] = [
 
 pub const LESS_CERTAIN: Key = key("rules.suggestions.inbox.less-certain", "less certain");
 /// What a less certain offer rests on, one per `AUTO_RULE_LESS_CERTAIN_SLUGS`.
-pub const LESS_CERTAIN_BASES: [Key; 1] = [key(
+pub const LESS_CERTAIN_BASES: [Key; 2] = [key("rules.suggestions.less-certain.scope-unconfirmed", "the scope of this old proposal has not been confirmed; check the exact name before adding a rule"), key(
     "rules.suggestions.less-certain.brand-seen-once",
     "named like {site}, seen once",
 )];
@@ -204,6 +209,19 @@ pub const NOTICE_BODY: Key = key(
 pub const NOTICE_TITLE_SITES_BLOCKED: Key = key(
     "tray.auto-rules.title-blocked",
     "Sites the main connection will not carry",
+);
+pub const NOTICE_TITLE_SHARED_ADDRESS: Key = key(
+    "tray.auto-rules.title-shared-address",
+    "Checked names on a shared address",
+);
+pub const NOTICE_TITLE_HTTP_PATH: Key = key(
+    "tray.auto-rules.title-http-path",
+    "HTTPS answers differ between connections",
+);
+pub const NOTICE_BODY_HTTP_PATH: Key = key("tray.auto-rules.body-http-path", "An HTTPS request to these names failed on the main connection and answered on the additional connection. Review the names before adding a rule; this check does not verify the browser page.");
+pub const NOTICE_BODY_SHARED_ADDRESS: Key = key(
+    "tray.auto-rules.body-shared-address",
+    "These DNS names passed the TLS check only over the additional connection. The shared address does not identify which site you opened. Review the names before adding a rule; page loading has not been verified.",
 );
 pub const NOTICE_BODY_SITES_BLOCKED: Key = key(
     "tray.auto-rules.body-blocked",
@@ -302,8 +320,18 @@ pub const SEARCH_EMPTY: Key = key(
     "rules.suggestions.inbox.search-empty",
     "No addresses match your search.",
 );
+pub const ENTER_HOST: Key = key(
+    "rules.suggestions.episode.enter-host",
+    "Enter a site domain",
+);
+pub const EPISODES_TOGGLE: Key = key(
+    "tui.suggestions.episodes-toggle",
+    "e: switch between suggestions and recent decisions explaining their absence",
+);
 
 pub const HELP_KEYS: &[Key] = &[
+    EPISODES_TOGGLE,
+    key("tui.suggestions.help.check-entered-site", "h: enter a domain to check, even when no suggestion exists"),
     key(
         "tui.suggestions.help.select",
         "Enter or Tab: go to the list; Up and Down: choose an item",
@@ -359,6 +387,8 @@ pub const HELP_KEYS: &[Key] = &[
 ];
 
 pub const PLAIN_KEYS: &[Key] = &[
+    EPISODES_TOGGLE,
+    key("tui.suggestions.plain.check-entered-site", "h and a domain: check that site, even when no suggestion exists"),
     key(
         "tui.suggestions.plain.add",
         "a and an item number, for example a 2: add that item to the additional connection",
@@ -458,6 +488,10 @@ pub fn all() -> Vec<Key> {
         NOTICE_TITLE,
         NOTICE_BODY,
         NOTICE_TITLE_SITES_BLOCKED,
+        NOTICE_TITLE_SHARED_ADDRESS,
+        NOTICE_BODY_SHARED_ADDRESS,
+        NOTICE_TITLE_HTTP_PATH,
+        NOTICE_BODY_HTTP_PATH,
         NOTICE_BODY_SITES_BLOCKED,
         NOTICE_TITLE_APP_BLOCKED,
         NOTICE_BODY_APP_BLOCKED,
@@ -488,11 +522,13 @@ pub fn all() -> Vec<Key> {
         SEARCH_EMPTY,
         MARKED,
         FILTER_ACTIVE,
+        ENTER_HOST,
     ];
     keys.extend(SIGNALS);
     keys.extend(ADDITIONAL_REACH);
     keys.extend(LESS_CERTAIN_BASES);
     keys.extend_from_slice(HELP_KEYS);
     keys.extend_from_slice(PLAIN_KEYS);
+    keys.extend(super::episodes::all_keys());
     keys
 }

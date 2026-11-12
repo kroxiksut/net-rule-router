@@ -18,7 +18,7 @@ use nrr_client_logic::adapters::{
     first_run_just_connected, first_run_suggestion, held_other_role, looks_like_tunnel,
     offered_for_role, unroutable_reason, IdleVpns,
 };
-use nrr_client_logic::first_run::first_run_country;
+use nrr_client_logic::first_run::{first_run_country, first_run_finish_state};
 use nrr_client_logic::route_policy::{
     first_run_held_protection, first_run_writes, leak_protection_choices_at_least,
     leak_protection_holds_now, raise_leak_protection,
@@ -776,7 +776,10 @@ fn actions(app: &AppState) -> Vec<Action> {
             }
             actions.push(Action::Back);
         }
-        Step::Summary => actions.extend([Action::Next, Action::Back]),
+        Step::Summary if finish_state(app) == "ready" => {
+            actions.extend([Action::Next, Action::Back]);
+        }
+        Step::Summary => actions.extend([Action::ChooseNow, Action::Refresh, Action::Back]),
     }
     actions.push(Action::Close);
     actions
@@ -1018,7 +1021,7 @@ fn perform(app: &mut AppState, action: Action) {
         }
         Action::Accept => accept_licence(app),
         Action::Decline => app.quit = true,
-        Action::Close => finish(app),
+        Action::Close => close(app),
         Action::StartEmpty => {
             app.wizard.chosen = Some(Chosen::Empty);
             app.wizard.chosen_action = Some(Action::StartEmpty);
@@ -1031,7 +1034,11 @@ fn perform(app: &mut AppState, action: Action) {
         }
         Action::ChooseNow => {
             app.wizard.secondary_deferred = false;
-            app.wizard.cursor = 0;
+            if app.wizard.step == Step::Summary {
+                app.wizard.go(Step::Secondary);
+            } else {
+                app.wizard.cursor = 0;
+            }
         }
         Action::Change(route) => {
             app.wizard.changing = Some(route);
@@ -1624,9 +1631,13 @@ fn after_setup() -> ScreenId {
     }
 }
 
-/// Every way out of the setup applies its answers, as closing the GUI's
-/// window does: the protection first, the starting rules once it is in force.
 fn finish(app: &mut AppState) {
+    if finish_state(app) != "ready" {
+        app.wizard.secondary_deferred = false;
+        app.wizard.go(Step::Secondary);
+        app.outbox.push(adapters_read(true, |_, _| {}));
+        return;
+    }
     let rules = match app.wizard.chosen.take() {
         Some(Chosen::Set(pending)) => Some(*pending),
         Some(Chosen::Empty) | None => None,
@@ -1639,6 +1650,29 @@ fn finish(app: &mut AppState) {
     if target == ScreenId::Interfaces {
         super::interfaces::setup_finished(app, None);
     }
+}
+
+fn close(app: &mut AppState) {
+    if finish_state(app) == "ready" {
+        finish(app);
+        return;
+    }
+    app.wizard.reset();
+    app.open(after_setup());
+}
+
+fn finish_state(app: &AppState) -> &'static str {
+    let requires_secondary = matches!(
+        app.wizard.chosen.as_ref(),
+        Some(Chosen::Set(pending)) if pending.files[1].is_some()
+    );
+    let rows = adapters(app, true);
+    let secondary = rows.iter().find(|row| holds(row, Route::Secondary));
+    first_run_finish_state(
+        requires_secondary,
+        secondary.is_some(),
+        secondary.is_some_and(|row| row.availability == "available"),
+    )
 }
 
 impl Screen for WizardScreen {
@@ -1916,6 +1950,7 @@ fn step_lines(app: &AppState, texts: &Texts) -> Vec<ViewLine> {
         },
         Step::Protection => {
             lines.push(texts.get(k::PROTECTION_DESCRIPTION));
+            lines.push(texts.get(k::DOH_LOCKDOWN_NOTE));
             lines.push(texts.get(level_note(shown_level(app))));
             if leak_protection_holds_now(shown_level(app), secondary_row(app).as_ref()) {
                 lines.push(texts.get(k::LEAK_HOLDS_NOW));
@@ -2026,6 +2061,11 @@ fn summary_lines(app: &AppState, texts: &Texts) -> Vec<String> {
         k::REVIEW_LEAK_NOT_YET
     };
     lines.push(named(leak, texts.get(level_label(shown_level(app)))));
+    match finish_state(app) {
+        "secondary-not-chosen" => lines.push(texts.get(k::FINISH_SECONDARY_NOT_CHOSEN)),
+        "secondary-unavailable" => lines.push(texts.get(k::FINISH_SECONDARY_UNAVAILABLE)),
+        _ => {}
+    }
     lines
 }
 

@@ -129,6 +129,11 @@ impl FakeIpStack {
             Arc::clone(&self.log_gate),
             Arc::clone(&self.health),
             Arc::clone(&self.instant_rst),
+            UpstreamObservation::new(
+                Arc::clone(&self.flow_observer),
+                packet.key.source,
+                packet.key.destination,
+            ),
         );
         // No worker for the dial is a failed dial: the flow is kept so the
         // next step resets the client instead of leaving its SYN hanging.

@@ -223,16 +223,15 @@ pub(crate) fn build_supervised_runtime_deps(
                 let cell = nrr_service_runtime::secondary_subnets::global_secondary_subnets();
                 std::sync::Arc::new(move || cell.current())
             })
-            // A relayed flow owned by the VPN client the user confirmed leaves
-            // over the PRIMARY link: that client's traffic is the tunnel's own
-            // transport, so carrying it over the secondary routes the tunnel
-            // through itself and its probes die on every reconnect. Costs one
-            // atomic load per flow until a client is actually confirmed.
+            // The confirmed tunnel client's transport must not depend on its tunnel.
             .with_vpn_client_bypass(Arc::new(
                 nrr_service_runtime::fake_ip::OwnerLookupVpnClientBypass::new(
                     Arc::new(nrr_platform_windows::flow_owner::WindowsFlowOwnerLookup::new()),
                     nrr_service_runtime::vpn_client_registry::global_confirmed_vpn_clients(),
-                ),
+                )
+                .with_service_programs(Arc::new(
+                    nrr_platform_windows::WindowsAppPathResolver::new(),
+                )),
             ))
             // A service restart leaves the fake-IP addresses in place (they are
             // the hostname's stable identity) but rebuilds the userspace stack
@@ -355,6 +354,29 @@ pub(crate) fn build_supervised_runtime_deps(
         settings_conn: settings_conn.clone(),
         sid_registry: Arc::clone(&sid_registry),
     });
+
+    block_notice_center
+        .dns_compatibility()
+        .attach_resolver(Arc::clone(&dns_resolver_controller));
+    block_notice_center
+        .dns_compatibility()
+        .attach_browser_settings(Arc::new(
+            nrr_platform_windows::browser_dns_settings::WindowsBrowserDnsSettings,
+        ));
+    block_notice_center
+        .dns_compatibility()
+        .attach_program_normalizer(Arc::new(|program| {
+            nrr_platform_windows::win32_path_from_nt_path_cached(program)
+                .map(|path| path.to_string_lossy().to_lowercase())
+        }));
+    if let Some(coordinator) = route_coordinator.as_ref() {
+        let coordinator = Arc::clone(coordinator);
+        block_notice_center
+            .dns_compatibility()
+            .attach_secondary_status(Arc::new(move |sid| {
+                Some(coordinator.resolve_egress_source_ips(sid).1.is_some())
+            }));
+    }
 
     // A full reset must empty what these hold in memory, or they write it back.
     if let Some(engine) = auto_rules_engine.as_ref() {
@@ -1303,6 +1325,9 @@ pub(crate) fn build_supervised_runtime_deps(
             }
         })
     };
+    if let Some(ring) = conn_trace_ring.as_ref() {
+        ring.attach_dns_compatibility(block_notice_center.dns_compatibility());
+    }
     let (conn_observation_source, conn_observation_consumer, conn_observer_shutdown) =
         build_conn_trace_pair(
         &api,
@@ -1366,6 +1391,25 @@ pub(crate) fn build_supervised_runtime_deps(
             learned_vpn_client_apps: &learned_vpn_client_apps,
             vpn_client_app_persist,
             auto_rules_engine: auto_rules_engine.as_ref(),
+            discovery_observation: match (auto_rules_engine.as_ref(), settings_conn.as_ref(), route_coordinator.as_ref()) {
+                (Some(engine), Some(conn), Some(coord)) => Some(Arc::new(nrr_service_runtime::discovery_observation::DiscoveryObservationPipeline::new(
+                    nrr_service_runtime::discovery_observation::DiscoveryObservationWiring {
+                        engine: Arc::clone(engine),
+                        rules: Arc::new(ProductionRulesProvider::new(Arc::clone(conn))),
+                        names: nrr_service_runtime::observed_host_names::global_observed_host_names(),
+                        egress: Arc::clone(coord) as Arc<dyn nrr_service_runtime::production_auto_rule_probe::EgressSources>,
+                        probe: Arc::new(nrr_service_runtime::path_probe::SystemPathProbe),
+                        cadence: nrr_service_runtime::service_tasks::stored_auto_probe_cadence(Arc::clone(conn)),
+                        limits: nrr_service_runtime::discovery_observation::stored_probe_limits(Arc::clone(conn)),
+                        primary_default: nrr_service_runtime::discovery_observation::stored_primary_default(Arc::clone(conn)),
+                        passive_reset_available: false,
+                        os_cache_available: true,
+                    }
+                ).with_https(nrr_service_runtime::site_check::https_head::RustlsHttpsHead::new(
+                    Arc::new(nrr_service_runtime::path_probe::SystemPathProbe),
+                ).map(|head| Arc::new(head) as Arc<dyn nrr_service_runtime::site_check::HttpsHead>)))),
+                _ => None,
+            },
             block_notice_center: &block_notice_center,
             block_all_posture: &block_all_posture,
         },
@@ -1580,6 +1624,7 @@ pub(crate) fn build_supervised_runtime_deps(
     };
     let fake_ip_armed = if let Some(stack_factory) = build_fake_ip_stack_factory(
         Arc::clone(&fake_ip_assembly),
+        &api,
         cache_store.as_ref(),
         settings_conn.as_ref(),
         active_routing_sid.as_ref(),
@@ -1588,6 +1633,7 @@ pub(crate) fn build_supervised_runtime_deps(
         Arc::clone(&served_principals),
         Arc::clone(&task_liveness),
         pause_coordinator.as_ref().map(|c| c.paused_view()),
+        block_notice_center.dns_compatibility(),
     ) {
         fake_ip_controller.set_factory(stack_factory);
         true
@@ -1759,6 +1805,7 @@ pub(crate) fn build_supervised_runtime_deps(
             .map(|ring| Arc::clone(ring.outage_blocks())),
         Arc::clone(&task_liveness),
         pause_coordinator.as_ref().map(|c| c.paused_view()),
+        Some(Arc::downgrade(&block_notice_center.dns_compatibility())),
     ) {
         dns_resolver_controller.set_factory(factory);
         dns_resolver_controller.set_sign_in_probe(resolver_may_arm);

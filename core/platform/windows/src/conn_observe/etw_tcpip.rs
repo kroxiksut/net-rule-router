@@ -66,13 +66,7 @@ const KEYWORD_IPV6: u64 = 0x20;
 const EVENT_ID_TCP_CONNECT_V4: u16 = 12;
 const EVENT_ID_TCP_CONNECT_V6: u16 = 28;
 
-/// Event ids for "connection torn down in order" and "segment sent again".
-/// Both share the connect payload layout (the `TcpIp_TypeGroup1` shape), so the
-/// same parsers read them. They answer "does this peer work over this link?" —
-/// a resend means it was not acknowledging, an orderly close means it carried
-/// traffic. Per-connection rather than per-segment, so they cost about what
-/// connects do. Same caveat as the IPv6 connect id — manifest-derived, not
-/// hardware-verified; a wrong id yields no events rather than garbage.
+/// Disconnect has no FIN/RST cause in this payload; it never proves success.
 const EVENT_ID_TCP_DISCONNECT_V4: u16 = 13;
 const EVENT_ID_TCP_DISCONNECT_V6: u16 = 29;
 const EVENT_ID_TCP_RETRANSMIT_V4: u16 = 14;
@@ -91,12 +85,12 @@ const SUBSCRIBED_EVENTS: [(u16, bool, ConnectionProgress); 8] = [
     (
         EVENT_ID_TCP_DISCONNECT_V4,
         false,
-        ConnectionProgress::ClosedInOrder,
+        ConnectionProgress::ClosedUnknown,
     ),
     (
         EVENT_ID_TCP_DISCONNECT_V6,
         true,
-        ConnectionProgress::ClosedInOrder,
+        ConnectionProgress::ClosedUnknown,
     ),
     (
         EVENT_ID_TCP_RETRANSMIT_V4,
@@ -378,6 +372,8 @@ unsafe fn handle_record(record: *mut EVENT_RECORD) {
         ConnectionProgress::Attempt => unix_now_ms(),
         ConnectionProgress::Retransmit
         | ConnectionProgress::ClosedInOrder
+        | ConnectionProgress::ClosedUnknown
+        | ConnectionProgress::Reset
         | ConnectionProgress::HandshakeRetransmit => unix_now_ms().map(|now| {
             lock(&context.clock).stamp(now, ticks_to_unix_ms(rec.EventHeader.TimeStamp))
         }),
@@ -910,6 +906,16 @@ mod tests {
         attach_process_paths(&mut batch, &KnownProcesses::default(), &mut live);
         assert_eq!(live.lookups, vec![10, 14]);
         assert_eq!(batch[2].process_path, None);
+    }
+
+    #[test]
+    fn a_generic_disconnect_does_not_claim_an_orderly_or_successful_response() {
+        for id in [EVENT_ID_TCP_DISCONNECT_V4, EVENT_ID_TCP_DISCONNECT_V6] {
+            assert_ne!(
+                classify_event(id).map(|(_, progress)| progress),
+                Some(ConnectionProgress::ClosedInOrder)
+            );
+        }
     }
 
     const OTHER: &str = r"C:\Apps\other.exe";

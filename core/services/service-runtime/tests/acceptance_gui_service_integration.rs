@@ -129,23 +129,15 @@ use std::collections::HashSet;
 
 // ── Gate 1: catalog consistency ──────────────────────────────────────────────
 
-/// Every operation the service will answer, pinned.
-///
-/// This is the whole surface an unelevated client can reach in a process
-/// running as LocalSystem, so growing it is a decision, not a detail. The list
-/// is what makes it one: a new variant in `IpcOperationName::ALL` fails this
-/// test until somebody writes its slug here.
-///
-/// It replaced a pinned COUNT, which could not see an operation removed and
-/// another added in the same change — and a prose comment that tried to
-/// enumerate the catalog and had drifted to naming 33 of 70.
-const PINNED_OPERATION_SLUGS: [&str; 86] = [
+/// Pin the full privileged surface so every new operation needs explicit review.
+const PINNED_OPERATION_SLUGS: [&str; 88] = [
     "audit.list",
     "autorules.candidates.accept",
     "autorules.candidates.dismiss",
     "autorules.candidates.forget",
     "autorules.candidates.list",
     "autorules.candidates.probe",
+    "autorules.discovery.feedback",
     "autorules.dismissed.list",
     "autorules.dismissed.restore",
     "autorules.refusing-anchor.set",
@@ -170,6 +162,7 @@ const PINNED_OPERATION_SLUGS: [&str; 86] = [
     "diagnostics.seed-from-browser-history",
     "diagnostics.site-check.result",
     "diagnostics.site-check.run",
+    "dns.compatibility.recheck",
     "dns.local-suffixes.get",
     "dns.local-suffixes.set",
     "doh.resolvers.get",

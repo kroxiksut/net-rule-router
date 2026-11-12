@@ -437,7 +437,8 @@ fn interfaces_screen_snapshot() {
     let wide = render(&app, 140, 50);
     assert!(wide.contains("> 3. Wi-Fi"), "{wide}");
     assert!(wide.contains("Main connection: Ethernet"), "{wide}");
-    assert!(!wide.contains(TUN_ADAPTER_NAME), "{wide}");
+    let adapters_panel = wide.split("╭Adapters").nth(1).expect("adapters panel");
+    assert!(!adapters_panel.contains(TUN_ADAPTER_NAME), "{wide}");
     assert_snapshot("interfaces-80x24", &render(&app, 80, 24));
 }
 

@@ -27,6 +27,8 @@ pub const QTYPE_A: u16 = 1;
 pub const QTYPE_CNAME: u16 = 5;
 /// `QTYPE`/`TYPE` value for a `PTR` record (reverse DNS).
 pub const QTYPE_PTR: u16 = 12;
+/// Service location records used for domain-controller and Kerberos discovery.
+pub const QTYPE_SRV: u16 = 33;
 /// `QTYPE`/`TYPE` value for an `HTTPS` record (RFC 9460). Its `ipv4hint` /
 /// `ipv6hint` service parameters carry addresses a client may connect to
 /// without ever asking for `A`.

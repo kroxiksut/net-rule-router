@@ -1,15 +1,6 @@
-//! "A site does not open" while none of the user's surfaces runs.
-//!
-//! A site the user opened that the main link will not carry is worth one card
-//! even with the tray closed: the user is looking at a page that does not load
-//! and has nothing on screen to say why. The service starts their tray for that card, at most once per
-//! [`SITE_NOTICE_GAP_MS`] and per site once per [`SAME_SITE_GAP_MS`] (the
-//! rule a running tray applies too), never while a surface of theirs listens (it says so
-//! itself), and never once they muted the kind. The launch is the OS's
-//! ([`SiteNoticeLauncher`]); everything here is neutral.
-//!
-//! The report comes from the connection observer, which must never wait: the
-//! decision is taken there, the start itself on a worker of its own.
+//! Starts a user's tray for an unserved site when no surface is listening.
+//! Neutral pacing shares the clients' short batch window and per-site repeat
+//! limit. Platform launch runs on a worker so observation never waits for it.
 
 use std::collections::HashMap;
 use std::sync::mpsc::{self, SyncSender, TrySendError};
@@ -48,7 +39,7 @@ pub enum SiteNoticeOutcome {
     /// A card was offered less than [`SITE_NOTICE_GAP_MS`] ago.
     TooSoon,
     /// This site had its card less than [`SAME_SITE_GAP_MS`] ago.
-    ShownToday,
+    ShownRecently,
     Refused(SiteNoticeRefused),
 }
 
@@ -75,7 +66,7 @@ impl Shown {
             .get(&(sid.to_owned(), host.to_owned()))
             .copied();
         if !nrr_shared::site_notice::site_notice_due(false, None, site, false, now_ms) {
-            return Err(SiteNoticeOutcome::ShownToday);
+            return Err(SiteNoticeOutcome::ShownRecently);
         }
         Ok(())
     }
@@ -329,6 +320,23 @@ mod tests {
     }
 
     #[test]
+    fn another_sites_card_does_not_delay_starting_the_tray_for_minutes() {
+        let f = fixture();
+        let t0 = 1_000_000;
+        assert_eq!(
+            f.gate.site_not_opening(ALICE, "first.example", t0),
+            SiteNoticeOutcome::Queued
+        );
+        assert_eq!(
+            f.gate
+                .site_not_opening(ALICE, "newly-confirmed.example", t0 + 60_000),
+            SiteNoticeOutcome::Queued,
+            "a closed tray must not postpone a different confirmed host for half an hour"
+        );
+        assert_eq!(wait_started(&f, 2).len(), 2);
+    }
+
+    #[test]
     fn at_most_one_card_per_window_whatever_the_site() {
         let f = fixture();
         let t0 = 1_000_000;
@@ -354,32 +362,32 @@ mod tests {
         assert_eq!(wait_started(&f, 3).len(), 3);
     }
 
-    /// Past the half hour another site may be told, but the same one waits a
-    /// day: the user saw it and did nothing, and a card a day is the most a
-    /// site that keeps failing may cost them.
+    /// Repeated failures become eligible within twenty seconds, including
+    /// after a card the user left unanswered yesterday.
     #[test]
-    fn the_same_site_is_not_told_twice_in_a_day() {
+    fn the_same_site_does_not_wait_until_tomorrow() {
         let f = fixture();
         let t0 = 10_000_000;
         assert_eq!(
             f.gate.site_not_opening(ALICE, "site.example", t0),
             SiteNoticeOutcome::Queued
         );
-        let later = t0 + SITE_NOTICE_GAP_MS;
-        assert!(!f.gate.would_tell(ALICE, "site.example", later));
+        let early = t0 + SITE_NOTICE_GAP_MS - 1;
+        assert!(!f.gate.would_tell(ALICE, "site.example", early));
         assert_eq!(
-            f.gate.site_not_opening(ALICE, "site.example", later),
-            SiteNoticeOutcome::ShownToday
+            f.gate.site_not_opening(ALICE, "site.example", early),
+            SiteNoticeOutcome::TooSoon
         );
+        let later = t0 + SITE_NOTICE_GAP_MS;
         assert!(f.gate.would_tell(ALICE, "other.example", later));
         assert_eq!(
             f.gate.site_not_opening(ALICE, "other.example", later),
             SiteNoticeOutcome::Queued,
-            "a day for one site holds back no other"
+            "one site's repeat window holds back no other"
         );
         assert_eq!(
             f.gate
-                .site_not_opening(ALICE, "site.example", t0 + SAME_SITE_GAP_MS),
+                .site_not_opening(ALICE, "site.example", later + SAME_SITE_GAP_MS),
             SiteNoticeOutcome::Queued
         );
         assert_eq!(wait_started(&f, 3).len(), 3);

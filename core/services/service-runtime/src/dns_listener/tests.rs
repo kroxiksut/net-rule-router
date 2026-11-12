@@ -2,6 +2,8 @@ use super::*;
 use crate::secondary_address_owners::SecondaryAddressOwners;
 use nrr_platform_api::dns::AddressFamily;
 
+mod split_dns;
+
 /// A name one server calls non-existent is not settled: the machine may
 /// hold a resolver for a namespace nobody outside has heard of. The field
 /// case is a corporate host and a machine on the LAN, both of which
@@ -1178,6 +1180,7 @@ fn ask_on_a_manual_clock(
     let spent = std::cell::Cell::new(Duration::ZERO);
     let mut asked = Vec::new();
     let reply = listener.ask_private_resolvers_via(
+        &q,
         "192.0.2.1:53".parse().expect("addr"),
         budget,
         || start + spent.get(),

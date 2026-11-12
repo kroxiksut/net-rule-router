@@ -397,10 +397,20 @@ QtObject {
         var subject = String(host || "").trim()
         if (subject === "") return
         pendingSiteCheckHost = subject
-        root.section = "diagnostics"
+        pendingSiteCheckFocus = true
+        pendingExplainHost = subject
+        pendingExplainIp = ""
+        pendingExplainProcess = ""
+        root.requestSectionChange("diagnostics")
     }
     /// Consumed by the Diagnostics page on its next load, like the sample below.
     property string pendingSiteCheckHost: ""
+    property bool pendingSiteCheckFocus: false
+
+    function openSiteCheckInDiagnostics() {
+        pendingSiteCheckFocus = true
+        root.requestSectionChange("diagnostics")
+    }
 
     /// Sample handed to the Diagnostics probe on its next load. Cleared once
     /// consumed, so re-opening the page does not re-probe.

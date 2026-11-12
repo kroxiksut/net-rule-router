@@ -1,0 +1,16 @@
+{
+  "manifest_version": 3,
+  "name": "__MSG_app_name__",
+  "description": "__MSG_app_description__",
+  "version": "0.1.0",
+  "default_locale": "en",
+  "permissions": ["storage", "activeTab", "declarativeNetRequestWithHostAccess"],
+  "optional_host_permissions": ["http://*/*", "https://*/*"],
+  "background": { "scripts": ["background.js"], "type": "module" },
+  "action": { "default_popup": "ui/popup.html", "default_title": "__MSG_app_name__", "default_icon": { "16": "icons/icon-16.png", "32": "icons/icon-32.png" } },
+  "options_ui": { "page": "ui/options.html", "open_in_tab": true },
+  "icons": { "16": "icons/icon-16.png", "32": "icons/icon-32.png", "48": "icons/icon-48.png", "128": "icons/icon-128.png" },
+  "incognito": "not_allowed",
+  "browser_specific_settings": { "gecko": { "id": "browser-extension@netrulerouter.local", "strict_min_version": "128.0" } },
+  "content_security_policy": { "extension_pages": "script-src 'self' 'wasm-unsafe-eval'; object-src 'none'" }
+}

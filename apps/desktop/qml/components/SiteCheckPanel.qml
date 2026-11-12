@@ -22,6 +22,7 @@ Frame {
     // How long the panel follows one check before saying it took too long.
     readonly property int _followMs: 30000
     property double _startedAt: 0
+    property int _generation: 0
     // Set while the rule window opened from here is up.
     property bool _movePending: false
 
@@ -30,7 +31,13 @@ Frame {
         _run()
     }
 
+    function focusInput() { hostInput.forceActiveFocus(Qt.TabFocusReason) }
+
     function _run() {
+        _generation += 1
+        var generation = _generation
+        followTimer.stop()
+        _running = false
         var host = hostInput.text.trim()
         _report = null
         _errorCode = ""
@@ -51,6 +58,7 @@ Frame {
         _host = host
         _startedAt = Date.now()
         root.rpc.registerRpcCallback(corr, function(ok, payload, errorCode) {
+            if (panel._generation !== generation) return
             if (!ok) {
                 panel._running = false
                 panel._errorCode = String(errorCode || "unknown")
@@ -62,6 +70,7 @@ Frame {
     }
 
     function _poll() {
+        var generation = _generation
         if (Date.now() - _startedAt > _followMs) {
             _running = false
             _errorCode = "timeout"
@@ -74,13 +83,18 @@ Frame {
             return
         }
         root.rpc.registerRpcCallback(corr, function(ok, payload, errorCode) {
-            if (!panel._running) return
+            if (!panel._running || panel._generation !== generation) return
             if (!ok) {
                 panel._running = false
                 panel._errorCode = String(errorCode || "unknown")
                 return
             }
             if (String((payload && payload.state) || "") === "done" && payload.report) {
+                if (String(payload.host || "") !== panel._host
+                        || String(payload.report.site || "") !== panel._host) {
+                    followTimer.restart()
+                    return
+                }
                 panel._running = false
                 panel._report = payload.report
                 return
@@ -100,6 +114,7 @@ Frame {
 
     function _routeText(route) {
         if (route === "blocked") return root.tr("label.block", "Denied")
+        if (route === "unknown") return root.tr("diag.site-check.route-unknown", "Required connection could not be determined")
         return root.routeLabel(route === "secondary" ? "secondary" : "primary")
     }
     function _nameLine(n) {
@@ -109,6 +124,17 @@ Frame {
             : root.tr("diag.site-check.no-address", "address not known: not opened lately"))
         parts.push(_routeText(String(n.route || "")))
         parts.push(root.tr("diag.site-check.answer." + n.answer, String(n.answer || "")))
+        if (n["not-run-reason"]) parts.push(root.tr("diag.site-check.not-run." + n["not-run-reason"],
+            root.tr("diag.site-check.not-run.unknown", "The check was withheld; the routing rule remains in force.")))
+        if (n.dns) parts.push(root.tr("diag.site-check.dns." + n.dns, String(n.dns)))
+        if (n.revision) parts.push(root.tr("diag.site-check.revision", "Rules revision: {revision}")
+            .replace("{revision}", Pure.displayText(String(n.revision))))
+        if (n["rule-id"]) parts.push(root.tr("diag.site-check.rule", "Rule: {rule}")
+            .replace("{rule}", Pure.displayText(String(n["rule-id"]))))
+        if (n["fake-address"]) parts.push(root.tr("diag.site-check.fake-address", "Virtual address: {address}")
+            .replace("{address}", String(n["fake-address"])))
+        if ((n["real-addresses"] || []).length > 0) parts.push(root.tr("diag.site-check.real-addresses", "Known real addresses: {addresses}")
+            .replace("{addresses}", n["real-addresses"].join(", ")))
         var line = parts.join(" · ")
         if (n.status !== undefined && n.status !== null)
             line += " · " + root.tr("diag.site-check.status", "answer {code}")
@@ -142,6 +168,16 @@ Frame {
     ColumnLayout {
         anchors.fill: parent
         spacing: root.uiTheme.spacingSm - root.uiTheme.spacingXxs
+        Label {
+            Layout.fillWidth: true
+            text: root.supports("fakeIp") ? root.tr("settings.routing.dns-compatibility.verify-site",
+                "Choose Check site and start a check for the affected host, then open or reload that host in the affected browser within a minute. A fresh browser connection through the additional route can confirm recovery. Direct or reused connections may remain unverified; the site-check report is separate.")
+                : root.tr("settings.routing.dns-compatibility.browser-verification-unavailable",
+                    "This platform cannot confirm the browser's own successful connection yet. Use Check site for a report through the assigned route; a successful system query or service probe does not certify the browser.")
+            color: root.mutedTextColor
+            wrapMode: Text.WordWrap
+            textFormat: Text.PlainText
+        }
         Label {
             text: root.tr("diag.site-check.title", "Check a site")
             color: root.textColor
@@ -177,6 +213,7 @@ Frame {
         Label {
             Layout.fillWidth: true
             visible: panel._running
+            textFormat: Text.PlainText
             text: root.tr("diag.site-check.running", "Checking {host}…")
                 .replace("{host}", Pure.displayText(panel._host))
             color: root.mutedTextColor
@@ -219,8 +256,9 @@ Frame {
             delegate: Label {
                 Layout.fillWidth: true
                 text: panel._nameLine(modelData)
+                textFormat: Text.PlainText
                 color: root.textColor
-                wrapMode: Text.WordWrap
+                wrapMode: Text.Wrap
             }
         }
         // (a): the network is fine, so what is left lives in the browser.
@@ -247,7 +285,7 @@ Frame {
             Label {
                 Layout.fillWidth: true
                 text: root.tr("diag.site-check.cookies.note",
-                    "NetRuleRouter never reads or changes browser data.")
+                    "NetRuleRouter does not read or change your cookies.")
                 color: root.mutedTextColor
                 wrapMode: Text.WordWrap
             }

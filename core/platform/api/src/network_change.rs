@@ -16,6 +16,9 @@ use std::sync::Arc;
 
 use crate::error::PlatformError;
 
+mod shared_feed;
+pub use shared_feed::SharedNetworkChangeFeed;
+
 /// A callback invoked (raw, once per OS change — the caller debounces) whenever
 /// the OS reports a network-topology change.
 pub type NetworkChangeCallback = Arc<dyn Fn() + Send + Sync>;

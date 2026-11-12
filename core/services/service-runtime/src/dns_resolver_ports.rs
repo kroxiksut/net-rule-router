@@ -666,7 +666,15 @@ impl DirectUdpUpstreamResolver {
     /// Report an attempt's outcome to the pool — but only for attempts that
     /// actually went to the pool's server. A failure on the secondary link (or
     /// to a public resolver) says nothing about the primary upstream's health.
-    fn note_attempt(&self, egress: &crate::dns_egress::DnsEgress, ok: bool) {
+    fn note_attempt(&self, egress: &crate::dns_egress::DnsEgress, ok: bool, epoch: Option<u64>) {
+        if self
+            .pool
+            .as_ref()
+            .zip(epoch)
+            .is_some_and(|(pool, epoch)| pool.readiness_epoch() != epoch)
+        {
+            return;
+        }
         // The policy needs its own attempts back, whichever way they went: it
         // is the only thing that can stop feeding a tunnel that has stopped
         // carrying traffic.
@@ -676,11 +684,18 @@ impl DirectUdpUpstreamResolver {
         let Some(pool) = self.pool.as_ref() else {
             return;
         };
+        if egress.via_secondary && egress.bind.is_some() {
+            if let Some(epoch) = epoch {
+                pool.note_secondary_answer_in_epoch(epoch, ok);
+            }
+        }
         if egress.via_secondary || Some(egress.server) != pool.current() {
             return;
         }
         if ok {
-            pool.note_success();
+            if let Some(epoch) = epoch {
+                pool.note_success_in_epoch(epoch);
+            }
         } else {
             pool.note_failure();
         }
@@ -1012,6 +1027,7 @@ impl DirectUdpUpstreamResolver {
             if window.is_zero() {
                 return Err(ResolveError::Unavailable("budget exhausted".into()));
             }
+            let epoch = self.pool.as_ref().map(|pool| pool.readiness_epoch());
             let egress = self.egress_for_name(hostname, attempt);
             if tunnel_only && !egress.via_secondary {
                 last = ResolveError::Unavailable("tunnel not available for the query".into());
@@ -1030,15 +1046,15 @@ impl DirectUdpUpstreamResolver {
                         family = family.as_str(),
                         "direct upstream address query answered",
                     );
-                    self.note_attempt(&egress, true);
+                    self.note_attempt(&egress, true, epoch);
                     return Ok(resolved);
                 }
                 Err(ResolveError::NoRecords) => {
-                    self.note_attempt(&egress, true); // an answer, just an empty one
+                    self.note_attempt(&egress, true, epoch);
                     return Err(ResolveError::NoRecords);
                 }
                 Err(e) => {
-                    self.note_attempt(&egress, false);
+                    self.note_attempt(&egress, false, epoch);
                     tracing::debug!(
                         target: "nrr::dns-resolver",
                         host = %hostname,

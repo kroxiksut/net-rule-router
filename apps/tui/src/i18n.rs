@@ -67,6 +67,14 @@ pub fn available_languages() -> Vec<Language> {
 }
 
 impl Texts {
+    #[cfg(test)]
+    pub(crate) fn fallback_only() -> Self {
+        Self {
+            map: BTreeMap::new(),
+            language: "en".to_owned(),
+        }
+    }
+
     /// Loads the locale files once and picks the language: the explicit choice,
     /// else the first system candidate this build translates, else English.
     pub fn load(explicit: Option<&str>, system_candidates: &[String]) -> Self {

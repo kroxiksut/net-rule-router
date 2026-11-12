@@ -192,6 +192,12 @@ pub fn own_process_key() -> &'static str {
     })
 }
 
+/// Observer PIDs are supplied by the platform. A similarly named executable
+/// is never enough to exempt another process from diagnostic attribution.
+pub(crate) fn is_own_process(pid: u32) -> bool {
+    pid != 0 && pid == std::process::id()
+}
+
 /// Reduce a process path or rule pattern to the one key both sides of a match
 /// are compared on — see [`nrr_shared::app_identity::app_match_key`].
 pub fn app_key(raw: &str) -> String {

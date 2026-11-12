@@ -54,6 +54,7 @@ pub struct SnapshotInitialHandler {
     /// Standing per-role enforcement reports the route coordinator pushes on
     /// change. Empty when no coordinator is wired.
     route_enforcement: crate::app_enforcement_status::RouteEnforcementStatus,
+    dns_compatibility: Option<Arc<crate::dns_compatibility::DnsCompatibilityCenter>>,
 }
 
 impl SnapshotInitialHandler {
@@ -87,7 +88,17 @@ impl SnapshotInitialHandler {
             block_all_posture,
             fake_ip_datapath: None,
             route_enforcement: crate::app_enforcement_status::RouteEnforcementStatus::new(),
+            dns_compatibility: None,
         }
+    }
+
+    #[must_use]
+    pub fn with_dns_compatibility(
+        mut self,
+        center: Arc<crate::dns_compatibility::DnsCompatibilityCenter>,
+    ) -> Self {
+        self.dns_compatibility = Some(center);
+        self
     }
 
     /// Share the route coordinator's standing enforcement reports.
@@ -255,6 +266,15 @@ impl IpcHandler for SnapshotInitialHandler {
         };
 
         let resp = SnapshotInitialResponse {
+            dns_compatibility: self.dns_compatibility.as_ref().map_or_else(
+                Default::default,
+                |center| {
+                    center.snapshot(
+                        ctx.caller_principal.as_ref().map(|p| p.as_stored()),
+                        crate::dns_compatibility::now_ms(),
+                    )
+                },
+            ),
             health,
             adapters,
             diagnostics: diag_status,
@@ -389,6 +409,29 @@ mod tests {
         assert!(parsed.unenforced_app_rules.is_empty());
         assert_eq!(parsed.kill_switch_shared_ip_exemptions, 0);
         assert!(!parsed.kill_switch_block_all_armed, "disarmed by default");
+    }
+
+    #[test]
+    fn a_client_does_not_mistake_unchecked_dns_for_a_working_browser() {
+        let h = SnapshotInitialHandler::new(
+            Arc::new(FakeHealth {
+                state: ServiceRuntimeState::Running,
+                severity: ServiceHealthSeverity::Ok,
+            }),
+            Arc::new(FakePolicy { revision: None }),
+            Arc::new(FakeAdapters::empty()),
+            Arc::new(FakeDiagnostics::healthy()),
+            Arc::new(crate::ipc_handlers::test_fakes::FakeRoutePolicy::default()),
+            Arc::new(crate::ipc_handlers::test_fakes::FakeApplyFailurePolicy),
+            Arc::new(crate::ipc_handlers::test_fakes::FakeRoutingPause),
+            Arc::new(crate::ipc_handlers::test_fakes::FakeAutostart),
+            Arc::new(crate::ipc_handlers::test_fakes::FakeRetention),
+            AppEnforcementStatus::new(),
+            crate::app_enforcement_status::SharedIpExemptionStatus::new(),
+            crate::app_enforcement_status::BlockAllPostureStatus::new(),
+        );
+        let response = h.handle(&req(), &ctx()).unwrap();
+        assert_eq!(response["dns-compatibility"]["status"], "unchecked");
     }
 
     #[test]

@@ -9,6 +9,9 @@ license = "MPL-2.0"
 [lib]
 path = "src/lib.rs"
 
+[features]
+fuzzing = []
+
 [dependencies]
 nrr-domain  = { path = "../domain"  }
 nrr-storage = { path = "../storage" }
@@ -27,6 +30,7 @@ serde_json = "1"
 sha2       = "0.10"
 # Seals a chain restart with the service's key.
 hmac       = "0.12"
+getrandom  = "0.3"
 tempfile   = "3"
 zip        = { version = "9", default-features = false, features = ["deflate"] }
 # Local wall-clock timestamps for zip entry mtimes. `chrono::Local::now()` is

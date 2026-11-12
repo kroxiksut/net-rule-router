@@ -106,6 +106,59 @@ fn hold_test_target() -> dialer::UpstreamTarget {
 }
 
 #[test]
+fn a_refused_upstream_never_emits_the_browser_recovery_signal() {
+    struct Observations(AtomicU32);
+    impl FlowObserver for Observations {
+        fn on_flow_opened(&self, _: SocketAddr, _: SocketAddr, _: &str, _: Option<&str>) {}
+        fn on_upstream_connected(
+            &self,
+            _: SocketAddr,
+            _: SocketAddr,
+            _: &dialer::UpstreamTarget,
+            _: Option<u64>,
+            _: Option<std::net::IpAddr>,
+        ) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+    let observed = Arc::new(Observations(AtomicU32::new(0)));
+    let notice = UpstreamObservation::new(
+        observed.clone(),
+        "127.0.0.1:40000".parse().expect("client"),
+        "198.18.0.1:443".parse().expect("fake"),
+    );
+    let target = hold_test_target();
+    let log = DialLogGate::new();
+    let health = super::super::super::health::FakeIpHealth::new();
+    let failed = FlowShared::new(StackWaker::new());
+    run_tcp_dial(
+        &failed,
+        &FlakyPolicyDialer::new(u32::MAX),
+        &target,
+        &log,
+        &health,
+        &AtomicBool::new(true),
+        &notice,
+    );
+    assert_eq!(observed.0.load(Ordering::SeqCst), 0);
+    let connected = FlowShared::new(StackWaker::new());
+    run_tcp_dial(
+        &connected,
+        &FlakyPolicyDialer::new(0),
+        &target,
+        &log,
+        &health,
+        &AtomicBool::new(true),
+        &notice,
+    );
+    assert_eq!(observed.0.load(Ordering::SeqCst), 1);
+    connected.mark_dead();
+    for worker in connected.take_workers() {
+        let _ = worker.join();
+    }
+}
+
+#[test]
 fn dial_tcp_with_hold_instant_refuses_when_instant_rst_is_on() {
     let dialer = FlakyPolicyDialer::new(u32::MAX); // always refuses
     let shared = FlowShared::new(StackWaker::new());

@@ -94,6 +94,7 @@ fn event_loop(
                 }
             }
         }
+        crate::screens::suggestions::retry_paced_notice(app);
         backend.send_outbox(&mut app.outbox);
         // The window writes the shared settings file too: one stat a tick.
         if now.duration_since(followed_at) >= IDLE_REDRAW {

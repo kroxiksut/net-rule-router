@@ -271,6 +271,7 @@ public:
     /// quietened by "it answers on the main route".
     Q_INVOKABLE QString rpcRefusingAnchorSet(const QVariantMap &payload);
     Q_INVOKABLE QString rpcAutoRuleCandidatesProbe(const QVariantMap &payload);
+    Q_INVOKABLE QString rpcAutoRuleDiscoveryFeedback(const QVariantMap &payload);
     Q_INVOKABLE QString rpcAutoRuleCandidatesForget(const QVariantMap &payload);
 
     /// Refusals the user recorded via `rpcAutoRuleCandidatesDismiss`, for a
@@ -293,6 +294,7 @@ public:
     /// (absent = indefinite). Every response carries the caller's full mute
     /// list. Wire shapes live in `nrr_shared::ipc_payloads::BlockNoticeMutes*`.
     Q_INVOKABLE QString rpcBlockNoticeMutesList();
+    Q_INVOKABLE QString rpcDnsCompatibilityRecheck();
     Q_INVOKABLE QString rpcBlockNoticeMutesSet(const QVariantMap &payload);
     Q_INVOKABLE QString rpcBlockNoticeMutesRemove(const QVariantMap &payload);
     Q_INVOKABLE QString rpcBlockNoticeMutesClear();

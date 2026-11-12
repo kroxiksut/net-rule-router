@@ -264,6 +264,72 @@ fn announcements(bus: &EventBus, subscription: &str) -> Vec<u64> {
         .collect()
 }
 
+#[test]
+fn discovery_a_client_that_died_before_showing_the_card_does_not_lose_the_offer() {
+    let f = fixture(AutoRulesMode::Suggest);
+    let bus = Arc::new(EventBus::new());
+    let engine = AutoRulesEngine::new(
+        Arc::clone(&f.rules) as Arc<dyn RulesProvider>,
+        mode_fn(AutoRulesMode::Suggest),
+        Arc::clone(&f.dismissals) as Arc<dyn DismissalStore>,
+        Arc::new(InMemoryPendingStore::new()),
+        SystemTime::UNIX_EPOCH,
+    )
+    .with_event_bus(Arc::clone(&bus));
+    let old = bus.subscribe_as("old-tray".into(), Some(SID.into()), None);
+    two_visits(&engine, &["cdn.example"]);
+    assert!(engine.tick(SID, later()).published);
+    bus.unsubscribe(&old.subscription_id);
+    let new = bus.subscribe_as("new-tray".into(), Some(SID.into()), None);
+    assert!(
+        engine
+            .tick(SID, later() + Duration::from_secs(61))
+            .published,
+        "a push without a shown acknowledgement must be retried after reconnect"
+    );
+    assert_eq!(announcements(&bus, &new.subscription_id), vec![1]);
+}
+
+#[test]
+fn discovery_feedback_is_owned_and_a_muted_second_client_cannot_erase_a_visible_card() {
+    let f = fixture(AutoRulesMode::Suggest);
+    two_visits(&f.engine, &["cdn.example"]);
+    f.engine.tick(SID, later());
+    let offers = f.engine.candidates(SID);
+    let ids: Vec<_> = offers.iter().map(|offer| offer.id.clone()).collect();
+    assert!(!ids.is_empty());
+    assert_eq!(
+        f.engine
+            .record_discovery_feedback("another", &ids, "delivered", "shown", later()),
+        0
+    );
+    assert_eq!(
+        f.engine
+            .record_discovery_feedback(SID, &ids, "delivered", "shown", later()),
+        ids.len() as u32
+    );
+    f.engine.record_discovery_feedback(
+        SID,
+        &ids,
+        "hidden",
+        "notifications-muted",
+        later() + Duration::from_secs(1),
+    );
+    let episodes = f
+        .engine
+        .discovery_snapshot(SID, later() + Duration::from_secs(1));
+    assert!(episodes
+        .episodes
+        .iter()
+        .filter(|episode| episode.candidate_id.is_some())
+        .all(|episode| episode.state == "delivered"));
+    assert!(f
+        .engine
+        .discovery_snapshot("another", later())
+        .episodes
+        .is_empty());
+}
+
 /// The service and the tray start together and the service usually wins. An
 /// offer announced into that gap reached nobody, yet counted as announced —
 /// and the tray, whose subscription begins at the CURRENT head, never learned
@@ -592,6 +658,12 @@ fn an_answer_on_one_surface_moves_every_badge_to_the_lists_count() {
         vec![(2, true)]
     );
 
+    let shown: Vec<String> = engine.candidates(SID).into_iter().map(|c| c.id).collect();
+    assert_eq!(
+        engine.record_discovery_feedback(SID, &shown, "delivered", "shown", later()),
+        2
+    );
+
     let one: Vec<String> = engine
         .candidates(SID)
         .into_iter()
@@ -658,11 +730,9 @@ fn turning_suggestions_off_tells_the_badges_zero() {
     assert!(engine.candidates(SID).is_empty());
 }
 
-/// A site the user marked as refusing main-link addresses is the one case where
-/// "it answers on the main route" proves nothing — answering with a refusal is
-/// still answering. Its companions keep being offered.
+/// An anchor's refusal cannot override the actual companion's healthy response.
 #[test]
-fn a_site_marked_as_refusing_keeps_its_companions_on_offer() {
+fn a_refusing_anchor_does_not_announce_its_healthy_companion() {
     let f = fixture(AutoRulesMode::Suggest);
     let bus = subscribed_bus();
     let engine = AutoRulesEngine::new(
@@ -676,23 +746,17 @@ fn a_site_marked_as_refusing_keeps_its_companions_on_offer() {
     .with_refusing_anchors(Arc::new(|_sid: &str| vec!["site.example".to_string()]));
     let sub = bus.subscribe_as("client".into(), Some(SID.to_string()), None);
 
-    // A third-party neighbour that answers on the main route: normally quietened.
     two_visits(&engine, &["cdn.example"]);
     engine.note_primary_health(SID, "cdn.example", PrimaryHealthEvent::Completed);
 
     let summary = engine.tick(SID, later());
-    assert_eq!(summary.pending, 1);
-    assert!(
-        summary.published,
-        "the anchor refuses main-link addresses, so its companions are still worth asking about"
-    );
-    assert_eq!(announcements(&bus, &sub.subscription_id), vec![1]);
-    // The popup, the count and the inbox agree: a row that popped and is
-    // counted must not hide behind the "main route handles it" toggle.
+    assert_eq!(summary.pending, 0);
+    assert!(!summary.published);
+    assert!(announcements(&bus, &sub.subscription_id).is_empty());
     let listed = engine.candidates(SID);
     assert_eq!(listed.len(), 1);
     assert!(listed[0].anchor_refuses_main_link);
-    assert!(!listed[0].served_by_main_link);
+    assert!(listed[0].served_by_main_link);
 }
 
 /// While the additional route is down, everything already travels the main
@@ -739,12 +803,9 @@ fn suggestions_wait_for_the_additional_route_and_arrive_when_it_returns() {
     assert_eq!(announcements(&bus, &sub.subscription_id), vec![1]);
 }
 
-/// "It answers on the main route" settles a third-party neighbour, never an
-/// address of the routed site itself: a site can complete the connection and
-/// still serve a refusal to a main-link address, which is the exact case the
-/// user routes it for.
+/// A shared brand does not override the actual host's healthy response.
 #[test]
-fn an_address_of_the_site_itself_still_pops_even_when_the_main_route_answers() {
+fn a_healthy_address_of_the_site_itself_does_not_announce_a_move() {
     let f = fixture(AutoRulesMode::Suggest);
     let bus = subscribed_bus();
     let engine = AutoRulesEngine::new(
@@ -757,17 +818,16 @@ fn an_address_of_the_site_itself_still_pops_even_when_the_main_route_answers() {
     .with_event_bus(Arc::clone(&bus));
     let sub = bus.subscribe_as("client".into(), Some(SID.to_string()), None);
 
-    // Same registrable domain as the anchor `site.example` → brand-related.
     two_visits(&engine, &["assets.site.example"]);
     engine.note_primary_health(SID, "assets.site.example", PrimaryHealthEvent::Completed);
 
     let summary = engine.tick(SID, later());
-    assert_eq!(summary.pending, 1);
-    assert!(
-        summary.published,
-        "an address belonging to the routed site is not settled by a completed connection"
-    );
-    assert_eq!(announcements(&bus, &sub.subscription_id), vec![1]);
+    assert_eq!(summary.pending, 0);
+    assert!(!summary.published);
+    assert!(announcements(&bus, &sub.subscription_id).is_empty());
+    let listed = engine.candidates(SID);
+    assert_eq!(listed.len(), 1);
+    assert!(listed[0].served_by_main_link);
 }
 
 // ── Eager delivery-name suggestions (per-SID opt-in) ─────────────────────────
@@ -795,10 +855,8 @@ fn the_eager_opt_in_reaches_the_learner_and_offers_from_the_first_visit() {
     assert_eq!(summary.parked, 1);
     let candidates = f.engine.candidates(SID);
     assert_eq!(candidates.len(), 1);
-    // A delivery name generalizes to its domain, so what the user is offered
-    // covers the whole CDN rather than the one host seen so far.
-    assert_eq!(candidates[0].proposed_match, "edgefarm.example");
-    assert_eq!(candidates[0].match_kind, AUTO_RULE_MATCH_KIND_SUFFIX);
+    assert_eq!(candidates[0].proposed_match, "assets.edgefarm.example");
+    assert_eq!(candidates[0].match_kind, AUTO_RULE_MATCH_KIND_EXACT);
     assert_eq!(candidates[0].signal, AUTO_RULE_SIGNAL_DELIVERY_NAME);
 }
 

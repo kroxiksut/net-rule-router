@@ -81,6 +81,50 @@ fn every_key_is_in_both_locale_files() {
 }
 
 #[test]
+fn a_service_restart_keeps_the_dns_problem_visible_until_fresh_browser_evidence() {
+    let mut app = on_settings();
+    app.settings.data.policy = Loadable::Ready(policy_of(json!({
+        "mode":"prefer-primary", "leak-protection":"sites"
+    })));
+    let texts = texts_en();
+    let mut wire = snapshot_json(&Fixture::healthy());
+    wire["dns-compatibility"] = json!({
+        "status":"limited", "recovery-pending":false, "last-checked-ms":null,
+        "resolver":{"listener":"unchecked","redirect":"unchecked","upstream":"unchecked"},
+        "issues":[{"program":"browser.exe","reason":"our-dns-block","evidence":"confirmed",
+            "first-seen-ms":1,"last-seen-ms":2,"attempts":3,"needs-recheck":false}]
+    });
+    app.apply(
+        crate::backend::BackendEvent::Snapshot(Box::new(
+            serde_json::from_value(wire).expect("snapshot"),
+        )),
+        &texts,
+        std::time::Instant::now(),
+    );
+    let before = section_text(&mut app, Category::Routing);
+    assert!(
+        before.contains("Our filter blocked a connection to a known DNS endpoint"),
+        "{before}"
+    );
+    app.apply(
+        crate::backend::BackendEvent::Link(Link::Offline),
+        &texts,
+        std::time::Instant::now(),
+    );
+    app.apply(
+        crate::backend::BackendEvent::Snapshot(Box::new(Fixture::healthy().snapshot())),
+        &texts,
+        std::time::Instant::now(),
+    );
+    let after = section_text(&mut app, Category::Routing);
+    assert!(
+        after.contains("browser.exe"),
+        "the lost episode must stay visible: {after}"
+    );
+    assert!(after.contains("recovery is not confirmed"), "{after}");
+}
+
+#[test]
 fn zero_lists_the_sections() {
     let mut app = app_at(Link::Connected, Some(&Fixture::healthy()));
     press(&mut app, KeyCode::Char('0'));
@@ -300,6 +344,82 @@ fn a_protection_change_made_elsewhere_is_read_before_the_route_pick_decides() {
 
 fn policy_of(value: serde_json::Value) -> Map<String, Value> {
     value.as_object().cloned().expect("an object")
+}
+
+#[test]
+fn manual_dns_blocking_explains_whether_the_selected_scope_is_active() {
+    let texts = crate::i18n::Texts::fallback_only();
+    for (enabled, scope, level, effective, expected) in [
+        (
+            true,
+            "leak-protection-only",
+            "sites",
+            true,
+            "Blocking active: manual choice, leak protection is on.",
+        ),
+        (
+            true,
+            "leak-protection-only",
+            "everything",
+            true,
+            "Blocking active: manual choice, leak protection is on.",
+        ),
+        (
+            true,
+            "leak-protection-only",
+            "off",
+            false,
+            "Blocking inactive: manual choice applies only while leak protection is on.",
+        ),
+        (
+            true,
+            "always",
+            "off",
+            true,
+            "Blocking active: manual choice applies at all times.",
+        ),
+        (
+            false,
+            "always",
+            "sites",
+            false,
+            "Blocking inactive: disabled manually.",
+        ),
+    ] {
+        let mut app = on_settings();
+        app.settings.data.policy = Loadable::Ready(policy_of(json!({
+            "mode": "prefer-primary",
+            "leak-protection": level,
+            "doh-lockdown-auto": false,
+            "doh-lockdown-enabled": enabled,
+            "doh-lockdown-scope": scope,
+            "doh-lockdown-effective": effective,
+        })));
+        let rows = items::items(&app, Category::Routing);
+        assert!(
+            rows.iter().any(|row| row.label.resolve(&texts) == expected),
+            "{enabled}/{scope}/{level}: the selected toggle is not the effective state"
+        );
+    }
+}
+
+#[test]
+fn missing_effective_dns_state_is_not_reported_as_successfully_disabled() {
+    let texts = crate::i18n::Texts::fallback_only();
+    let mut app = on_settings();
+    app.settings.data.policy = Loadable::Ready(policy_of(json!({
+        "doh-lockdown-auto": true,
+        "doh-lockdown-enabled": false,
+        "leak-protection": "sites",
+    })));
+    let rows = items::items(&app, Category::Routing);
+    assert!(rows
+        .iter()
+        .any(|row| row.label.resolve(&texts)
+            == "Blocking state has not been confirmed by the service."));
+    assert!(!rows
+        .iter()
+        .any(|row| row.label.resolve(&texts) == "Off: none of your rules needs site names."));
 }
 
 fn leak_row(app: &AppState) -> Option<items::Item> {

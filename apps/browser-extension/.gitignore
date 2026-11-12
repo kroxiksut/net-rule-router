@@ -1,0 +1,13 @@
+node_modules/
+/policy/target/
+/build/
+/dist/
+/artifacts/
+/web-ext-artifacts/
+/.output/
+/.cache/
+/coverage/
+*.tsbuildinfo
+/*.crx
+/*.xpi
+/*.zip

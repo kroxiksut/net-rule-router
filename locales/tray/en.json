@@ -188,7 +188,7 @@
         "route-unavailable": "The connection these addresses should go through is down right now, so none of them open. This is one notice for the whole connection.",
         "blocked-by-rule": "A rule denies this address directly.",
         "ipv6-blocked": "With leak protection set to Everything, IPv6 goes out only through the additional connection, and this IPv6 address could not. No rule blocked it — the switch is in Settings.",
-        "dns-lockdown": "This app tried to reach a public DNS resolver of its own instead of the one NetRuleRouter provides, and encrypted-DNS blocking closed it. No rule blocked it — the switch is in Settings, under Routing behavior.",
+        "dns-lockdown": "Our DNS protection blocked a connection to a known resolver endpoint. This does not prove encrypted DNS use or explain a particular site's failure. Check DNS compatibility in Routing settings; keep your routing rules enabled.",
         "unattributed": "NetRuleRouter blocked this address, but could not tell what exactly stopped it.",
         "unspecified": "No further detail available."
       },
@@ -196,7 +196,7 @@
         "route-unavailable": "Connection is down",
         "blocked-by-rule": "Denied by a rule",
         "ipv6-blocked": "IPv6 held by leak protection",
-        "dns-lockdown": "Own encrypted DNS",
+        "dns-lockdown": "Known DNS endpoint",
         "unattributed": "Blocked, reason unclear",
         "unspecified": "Blocked"
       },

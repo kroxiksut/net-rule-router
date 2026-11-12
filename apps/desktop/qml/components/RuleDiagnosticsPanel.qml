@@ -141,7 +141,7 @@ Frame {
         if (_isIpv4(raw) || _isIpv6(raw)) {
             observedIp = raw
         } else {
-            hostname = raw
+            hostname = Rules.normalizeHostInput("exact-fqdn", raw)
         }
         if (observedIp === "")
             observedIp = sampleIp

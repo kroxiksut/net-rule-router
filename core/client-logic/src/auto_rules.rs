@@ -2,8 +2,8 @@
 //! refusals merged into one list grouped by registrable domain, as the GUI's
 //! suggestions screen shows them (`groupAutoRuleRows` and its filters).
 //!
-//! A rule of "domain + *.domain" acts on the whole group, so the answers key
-//! on the group's id lists, never on a single host the user cannot see.
+//! Answers use the group's candidate IDs; each proposed rule keeps its own
+//! exact or suffix scope. Presentation grouping never widens a rule.
 
 use std::collections::HashMap;
 
@@ -11,7 +11,8 @@ use nrr_shared::ipc_payloads::{
     is_self_signed_signal, AutoRuleCandidateDto, AutoRuleConsumerDto, AutoRuleDismissedEntryDto,
     AUTO_RULE_MATCH_KIND_APPLICATION, AUTO_RULE_PRIMARY_BEHAVIOR_RESPONDS,
     AUTO_RULE_PRIMARY_BEHAVIOR_STALLS, AUTO_RULE_SIGNAL_APP_MAIN_LINK_BLOCKED,
-    AUTO_RULE_SIGNAL_APP_OWN_RESOLVER,
+    AUTO_RULE_SIGNAL_APP_OWN_RESOLVER, AUTO_RULE_SIGNAL_HTTP_PATH_REACHABILITY,
+    AUTO_RULE_SIGNAL_SHARED_ADDRESS_REACHABILITY,
 };
 
 use crate::js;
@@ -73,6 +74,9 @@ pub enum NoticeKind {
     Companions,
     /// Sites the main route will not carry.
     SitesBlocked,
+    /// Owner-observed names independently checked at a shared address.
+    SharedAddress,
+    HttpPath,
     /// Programs the main route will not carry.
     ProgramsBlocked,
     /// Programs that look names up on their own, out of reach of site rules.
@@ -88,6 +92,8 @@ impl NoticeKind {
         match self {
             Self::Companions => "companions",
             Self::SitesBlocked => "sites-blocked",
+            Self::SharedAddress => "shared-address",
+            Self::HttpPath => "http-path",
             Self::ProgramsBlocked => "programs-blocked",
             Self::ProgramsOwnResolver => "programs-own-resolver",
             Self::MixedBlocked => "mixed-blocked",
@@ -103,6 +109,22 @@ pub fn notice_kind(rows: &[AutoRuleCandidateDto]) -> NoticeKind {
         return NoticeKind::Companions;
     }
     let count = |signal: &str| rows.iter().filter(|r| r.signal == signal).count();
+    let http = count(AUTO_RULE_SIGNAL_HTTP_PATH_REACHABILITY);
+    if http > 0 {
+        return if http == rows.len() {
+            NoticeKind::HttpPath
+        } else {
+            NoticeKind::Assorted
+        };
+    }
+    let shared = count(AUTO_RULE_SIGNAL_SHARED_ADDRESS_REACHABILITY);
+    if shared > 0 {
+        return if shared == rows.len() {
+            NoticeKind::SharedAddress
+        } else {
+            NoticeKind::Assorted
+        };
+    }
     let own = count(AUTO_RULE_SIGNAL_APP_OWN_RESOLVER);
     if own > 0 {
         return if own == rows.len() {

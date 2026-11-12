@@ -947,6 +947,9 @@ fn main_link_probe(
         reapply: Some(reapply),
     });
     // The user's own bounds, clamped by `ProbeLimits::new`.
+    let primary_guard = nrr_service_runtime::discovery_observation::stored_primary_probe_guard(
+        Arc::clone(&state_conn),
+    );
     let limits_for = Arc::new(move |sid: &str| {
         let guard = state_conn.lock().unwrap_or_else(|p| p.into_inner());
         match nrr_storage::route_bindings::RouteBindingsRepository::new(&guard).load_for_sid(sid) {
@@ -967,6 +970,13 @@ fn main_link_probe(
             limits_for,
         )
         .with_verdicts(verdicts)
+        .with_https(
+            nrr_service_runtime::site_check::https_head::RustlsHttpsHead::new(Arc::new(
+                LinkBoundPathProbe,
+            ))
+            .map(|head| Arc::new(head) as Arc<dyn nrr_service_runtime::site_check::HttpsHead>),
+        )
+        .with_primary_probe_guard(primary_guard)
         // Its own prober: repeat-suppression is per instance.
         .with_secondary_prober(Arc::new(PathProber::new(Arc::new(LinkBoundPathProbe))))
         .with_observed_names(
@@ -1001,14 +1011,16 @@ fn site_check(
     let egress = nrr_service_runtime::production_auto_rule_probe::StoredBindingEgress::new(
         Arc::new(
             nrr_service_runtime::production_handlers_misc::ProductionRoutePolicySource::new(
-                state_conn,
+                Arc::clone(&state_conn),
             ),
         ),
         route_table,
     );
-    Arc::new(SiteChecker::new(SiteCheckWiring {
+    let egress: Arc<dyn nrr_service_runtime::production_auto_rule_probe::EgressSources> =
+        Arc::new(egress);
+    let checker = Arc::new(SiteChecker::new(SiteCheckWiring {
         probe: Arc::new(LinkBoundPathProbe),
-        egress: Arc::new(egress),
+        egress: Arc::clone(&egress),
         cache: nrr_service_runtime::production_principal_plan::cache_lookup_over(cache),
         routes: Arc::new(ExplainRoutes::new(diagnostics)),
         engine: Some(engine),
@@ -1018,12 +1030,21 @@ fn site_check(
         ))
         .map(|h| Arc::new(h) as Arc<dyn nrr_service_runtime::site_check::HttpsHead>),
         traffic_held,
-    }))
+    }));
+    checker.attach_manual(
+        nrr_service_runtime::site_check::ManualSiteCheckWiring::production(
+            state_conn,
+            egress,
+            Arc::new(nrr_platform_linux::dns_cache_read::LinuxDnsCacheRead::new()),
+            Arc::new(nrr_service_runtime::site_check::captured_dns_upstream),
+        ),
+    );
+    checker
 }
 
 /// The neutral probe over a socket pinned to the link that carries the source
 /// address.
-struct LinkBoundPathProbe;
+pub(crate) struct LinkBoundPathProbe;
 
 impl nrr_service_runtime::path_probe::PathProbe for LinkBoundPathProbe {
     fn probe(

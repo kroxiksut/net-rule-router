@@ -2,15 +2,13 @@ use super::*;
 
 // ── Pending durability ───────────────────────────────────────────────────────
 
-/// A candidate DTO built directly, without going through the learner — for
-/// tests that exercise the durable store rather than the discovery flow. Uses
-/// the suffix form, matching what `to_candidate` now always writes.
+/// Durable-store fixture independent of the discovery flow.
 fn candidate_dto(id: &str, affinity: f64, last_seen_unix_ms: i64) -> AutoRuleCandidateDto {
     AutoRuleCandidateDto {
         id: id.to_string(),
         anchor: "site.example".to_string(),
         proposed_match: format!("{id}.example"),
-        match_kind: AUTO_RULE_MATCH_KIND_SUFFIX.to_string(),
+        match_kind: AUTO_RULE_MATCH_KIND_EXACT.to_string(),
         route: RouteRole::Secondary.slug().to_string(),
         affinity,
         observations: Some(2),
@@ -190,27 +188,29 @@ fn an_expired_pending_suggestion_is_not_restored() {
 }
 
 #[test]
-fn a_record_parked_in_the_retired_exact_form_does_not_survive_a_restart() {
+fn a_restored_exact_offer_survives_while_unproven_broad_scope_is_not_actionable() {
     let store = Arc::new(InMemoryPendingStore::new());
     let now = later();
     let now_ms = unix_ms(now);
-    let stale_exact = AutoRuleCandidateDto {
-        match_kind: AUTO_RULE_MATCH_KIND_EXACT.to_string(),
-        ..candidate_dto("arc-old-exact", 0.9, now_ms)
+    let unproven_suffix = AutoRuleCandidateDto {
+        match_kind: AUTO_RULE_MATCH_KIND_SUFFIX.to_string(),
+        ..candidate_dto("arc-unproven-suffix", 0.9, now_ms)
     };
-    let live_suffix = candidate_dto("arc-new-suffix", 0.9, now_ms);
+    let live_exact = candidate_dto("arc-exact", 0.9, now_ms);
     store.replace(
         SID,
-        &[pending_record(&stale_exact), pending_record(&live_suffix)],
+        &[
+            pending_record(&unproven_suffix),
+            pending_record(&live_exact),
+        ],
     );
 
     let engine = engine_over(store, now);
     let ids: Vec<String> = engine.candidates(SID).into_iter().map(|c| c.id).collect();
     assert_eq!(
         ids,
-        vec!["arc-new-suffix".to_string()],
-        "a row written before offers switched to the suffix form must not sit \
-         beside its own suffix twin after a restart"
+        vec!["arc-exact".to_string()],
+        "restoring an exact host must not revive an unproven wider proposal"
     );
 }
 

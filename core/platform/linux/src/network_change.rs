@@ -44,8 +44,15 @@ impl NetworkChangeObserver for LinuxNetworkChangeObserver {
         &self,
         on_change: NetworkChangeCallback,
     ) -> Result<NetworkChangeSubscription, PlatformError> {
-        let watcher = NetlinkWatcher::start(on_change, true)?;
-        Ok(NetworkChangeSubscription::new(Box::new(watcher)))
+        static FOREIGN: std::sync::OnceLock<
+            nrr_platform_api::network_change::SharedNetworkChangeFeed,
+        > = std::sync::OnceLock::new();
+        FOREIGN
+            .get_or_init(Default::default)
+            .subscribe(on_change, |callback| {
+                let watcher = NetlinkWatcher::start(callback, true)?;
+                Ok(NetworkChangeSubscription::new(Box::new(watcher)))
+            })
     }
 
     #[cfg(not(target_os = "linux"))]

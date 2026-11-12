@@ -47,6 +47,7 @@ pub(super) struct Silence {
     pub(super) local: SocketAddr,
     pub(super) remote: SocketAddr,
     pub(super) program: Option<String>,
+    pub(super) owner: Option<String>,
     pub(super) pid: u32,
     pub(super) role: EgressRole,
     pub(super) ifindex: u32,
@@ -97,6 +98,7 @@ impl Episode {
 #[derive(Debug)]
 struct Entry {
     program: Option<String>,
+    owner: Option<String>,
     pid: u32,
     role: EgressRole,
     ifindex: u32,
@@ -107,9 +109,10 @@ struct Entry {
 }
 
 impl Entry {
-    fn new(role: EgressRole, ifindex: u32, pid: u32, at_ms: u64) -> Self {
+    fn new(role: EgressRole, ifindex: u32, pid: u32, owner: Option<&str>, at_ms: u64) -> Self {
         Self {
             program: None,
+            owner: owner.map(str::to_owned),
             pid,
             role,
             ifindex,
@@ -120,11 +123,18 @@ impl Entry {
         }
     }
 
+    fn clear_conflicting_owner(&mut self, owner: Option<&str>) {
+        if owner.is_some_and(|owner| self.owner.as_deref() != Some(owner)) {
+            self.owner = None;
+        }
+    }
+
     fn silence(&self, key: ConnectionKey, episode: &Episode) -> Silence {
         Silence {
             local: key.0,
             remote: key.1,
             program: self.program.clone(),
+            owner: self.owner.clone(),
             pid: self.pid,
             role: self.role,
             ifindex: self.ifindex,
@@ -145,6 +155,7 @@ pub(super) struct Seen<'a> {
     pub(super) pid: u32,
     /// Set on the establishment only; resends carry a pid alone.
     pub(super) program: Option<&'a str>,
+    pub(super) owner: Option<&'a str>,
     pub(super) at_ms: u64,
 }
 
@@ -184,12 +195,18 @@ impl UnansweredTracker {
             ConnectionProgress::HandshakeRetransmit => None,
             ConnectionProgress::Attempt => {
                 let entry = self.entry(key, seen);
+                if entry.owner.as_deref() != seen.owner {
+                    *entry = Entry::new(seen.role, seen.ifindex, seen.pid, seen.owner, at_ms);
+                }
                 entry.program = seen.program.map(str::to_owned);
                 entry.pid = seen.pid;
                 None
             }
-            ConnectionProgress::ClosedInOrder => {
-                let entry = self.connections.remove(&key)?;
+            ConnectionProgress::ClosedInOrder
+            | ConnectionProgress::ClosedUnknown
+            | ConnectionProgress::Reset => {
+                let mut entry = self.connections.remove(&key)?;
+                entry.clear_conflicting_owner(seen.owner);
                 let episode = entry.episode.filter(|_| entry.reported && !entry.ours)?;
                 Some(Outcome::Closed {
                     silence: entry.silence(key, &episode),
@@ -198,6 +215,7 @@ impl UnansweredTracker {
             }
             ConnectionProgress::Retransmit => {
                 let entry = self.entry(key, seen);
+                entry.clear_conflicting_owner(seen.owner);
                 if entry.pid == 0 {
                     entry.pid = seen.pid;
                 }
@@ -244,7 +262,7 @@ impl UnansweredTracker {
         }
         self.connections
             .entry(key)
-            .or_insert_with(|| Entry::new(EgressRole::Unknown, 0, 0, at_ms))
+            .or_insert_with(|| Entry::new(EgressRole::Unknown, 0, 0, None, at_ms))
             .ours = true;
     }
 
@@ -271,13 +289,11 @@ impl UnansweredTracker {
         if !self.connections.contains_key(&key) {
             self.make_room(seen.at_ms);
         }
-        let entry = self
-            .connections
-            .entry(key)
-            .or_insert_with(|| Entry::new(seen.role, seen.ifindex, seen.pid, seen.at_ms));
-        if seen.at_ms.saturating_sub(entry.last_ms) >= IDLE_TTL_MS && entry.episode.is_some() {
-            entry.episode = None;
-            entry.reported = false;
+        let entry = self.connections.entry(key).or_insert_with(|| {
+            Entry::new(seen.role, seen.ifindex, seen.pid, seen.owner, seen.at_ms)
+        });
+        if seen.at_ms.saturating_sub(entry.last_ms) >= IDLE_TTL_MS {
+            *entry = Entry::new(seen.role, seen.ifindex, seen.pid, seen.owner, seen.at_ms);
         }
         if seen.role != EgressRole::Unknown {
             entry.role = seen.role;
@@ -349,6 +365,7 @@ impl super::ConnectionObservationConsumer {
                 ifindex: rec.egress.ifindex,
                 pid: obs.pid,
                 program: program.as_deref(),
+                owner: obs.user_sid.as_deref().filter(|owner| !owner.is_empty()),
                 at_ms,
             }) else {
                 return;
@@ -387,12 +404,14 @@ impl super::ConnectionObservationConsumer {
             .map(|a| a.friendly_name)
             .unwrap_or_default();
         let program = silence.program.as_deref().unwrap_or("?");
+        let sid = silence.owner.as_deref().unwrap_or_default();
         let link = super::role_str(silence.role);
         let silent_s = at_ms.saturating_sub(silence.since_ms) / 1_000;
         match outcome {
             Outcome::Unanswered(_) => tracing::info!(
                 target: "nrr::conn-trace",
                 msg_key = "conn-unanswered",
+                sid,
                 program,
                 pid = silence.pid,
                 link,
@@ -407,6 +426,7 @@ impl super::ConnectionObservationConsumer {
             Outcome::Closed { .. } => tracing::info!(
                 target: "nrr::conn-trace",
                 msg_key = "conn-unanswered-closed",
+                sid,
                 program,
                 pid = silence.pid,
                 link,
@@ -445,6 +465,7 @@ mod tests {
             ifindex: IFINDEX,
             pid: 4242,
             program: (progress == ConnectionProgress::Attempt).then_some("client.exe"),
+            owner: None,
             at_ms,
         }
     }

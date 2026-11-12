@@ -1,0 +1,51 @@
+<!doctype html>
+<html lang="en">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'self'; style-src 'unsafe-inline'; connect-src 'self'; base-uri 'none'; form-action 'none'">
+<title>NRR WebRTC diagnostic fixture</title>
+<style>
+  body { font: 16px system-ui; max-width: 900px; margin: 2rem auto; padding: 0 1rem; }
+  label { display: block; margin-top: 1rem; }
+  input, textarea, select, button { font: inherit; padding: .45rem; }
+  input, textarea { box-sizing: border-box; width: 100%; }
+  button { margin: .8rem .3rem .3rem 0; }
+  pre { white-space: pre-wrap; overflow-wrap: anywhere; max-height: 28rem; overflow: auto; }
+  :focus-visible { outline: 3px solid #075ac5; outline-offset: 2px; }
+</style>
+<h1>NRR WebRTC diagnostic fixture</h1>
+<p>Test laptops only. Start packet capture on both interfaces first. No camera,
+microphone, public ICE server, automatic upload or persistent browser storage is used.
+Candidates and downloaded reports can contain private network addresses.</p>
+<label for="case">Case identifier (no personal data)</label>
+<input id="case" maxlength="80" placeholder="windows-app-secondary-up-v4">
+<label for="servers">ICE URLs, one per line; at most 8</label>
+<textarea id="servers" rows="3" maxlength="4096" spellcheck="false"
+  placeholder="stun:YOUR_CONTROLLED_HOST:3478&#10;turn:YOUR_CONTROLLED_HOST:3478?transport=tcp"></textarea>
+<label for="username">TURN test username</label>
+<input id="username" maxlength="256" autocomplete="off">
+<label for="credential">TURN test password (excluded from report)</label>
+<input id="credential" type="password" maxlength="256" autocomplete="off">
+<label for="policy">ICE transport policy</label>
+<select id="policy"><option value="all">all — direct or relay</option><option value="relay">relay — TURN only</option></select>
+<label for="duration">Maximum run time, seconds (10–300)</label>
+<input id="duration" type="number" value="90" min="10" max="300">
+<p>Gathering proves neither a connection nor its route. A nominated pair is not
+labelled selected unless the browser reports selection. Compare with packet captures.</p>
+<button id="offer">Start / create offer</button>
+<button id="answer">Accept pasted offer / create answer</button>
+<button id="apply">Apply pasted answer</button>
+<button id="stop">Stop</button>
+<button id="export">Download report</button>
+<p id="status" role="status" aria-live="polite">Idle</p>
+<label for="local">Local SDP — copy after gathering completes, or after its 15-second timeout</label>
+<textarea id="local" rows="5" readonly spellcheck="false"></textarea>
+<label for="remote">Remote SDP — paste from the other test peer (maximum 64 KiB)</label>
+<textarea id="remote" rows="5" maxlength="65536" spellcheck="false"></textarea>
+<p>Offer: start here, copy local SDP to the second laptop, accept it there, then
+paste its answer here and apply it. Use a new run for each rule/transport case.
+Each connected peer sends one small counter per second. Run time includes signalling.</p>
+<h2>Events and selected pair</h2>
+<pre id="log" aria-label="Diagnostic events"></pre>
+<script src="probe.js"></script>
+</html>

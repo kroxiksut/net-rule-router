@@ -1,10 +1,4 @@
-// What leak protection blocked during the user's last outage of the additional
-// route: one row per program and address, with how many attempts it made, then
-// the routed names that never resolved, so no connection was made at all.
-//
-// The service keeps the list (the connection trace is too short for an
-// outage and mixes in permitted traffic); this page only reads it, on open,
-// on Refresh, and slowly while the outage lasts.
+// Reads the service's bounded report of drops during an additional-route outage.
 import QtQuick 2.15
 import QtQuick.Controls 2.15
 import QtQuick.Layouts 1.15
@@ -19,6 +13,7 @@ ColumnLayout {
     property var _answer: null
     property bool _loading: false
     property string _error: ""
+    property string _searchText: ""
 
     readonly property var _episode: _answer ? (_answer.episode || null) : null
     readonly property bool _active: !!_episode && _episode["until-unix-ms"] === undefined
@@ -29,6 +24,19 @@ ColumnLayout {
         return { unresolved: true, name: String(n.name || ""), attempts: n.attempts,
                  "first-seen-ms": n["first-seen-ms"], "last-seen-ms": n["last-seen-ms"] }
     }))
+    readonly property var _visibleRows: {
+        var query = section._searchText.trim().toLowerCase()
+        if (query === "") return section._rows
+        return section._rows.filter(function(row) {
+            var fields = row.unresolved
+                ? [row.name]
+                : [row.process, row["process-path"], row.host, row["rule-host"],
+                   row["remote-ip"], row["remote-port"]]
+            return fields.some(function(value) {
+                return String(value || "").toLowerCase().indexOf(query) >= 0
+            })
+        })
+    }
     readonly property int _omitted: _answer ? Number(_answer.omitted || 0) : 0
     readonly property bool _observerActive: !_answer || _answer["observer-active"] !== false
     readonly property bool _streamEnabled: !_answer || _answer["gui-stream-enabled"] !== false
@@ -105,7 +113,7 @@ ColumnLayout {
             color: root.textColor
             text: root.uiRevision >= 0
                 ? root.tr("diag.outage-blocks.intro",
-                    "What leak protection held back while the additional connection was down. Your rules send these addresses there, so they were blocked instead of leaving through the main connection.")
+                    "These connection attempts were blocked because the additional connection required by your rules was unavailable. The list stays available after it returns. Names marked “did not resolve” got no address during the outage, so no connection was made.")
                 : ""
             Accessible.role: Accessible.StaticText
             Accessible.name: text
@@ -169,6 +177,30 @@ ColumnLayout {
         }
     }
 
+    ThemedTextField {
+        Layout.fillWidth: true
+        id: outageSearchField
+        theme: section.root.uiTheme
+        visible: section.root.uiRevision >= 0
+        accessibleLabel: section.root.uiRevision >= 0
+            ? section.root.tr("action.search", "Search") : ""
+        text: section._searchText
+        placeholderText: section.root.tr("diag.conn-trace.entries-search-placeholder",
+            "Search all fields…")
+        onTextEdited: section._searchText = outageSearchField.text
+    }
+
+    Label {
+        Layout.fillWidth: true
+        visible: section._rows.length > 0 && section._searchText.trim() !== ""
+            && section._visibleRows.length === 0
+        color: section.root.mutedTextColor
+        text: section.root.tr("diag.conn-trace.entries-no-match",
+            "No connections match the current filters")
+        Accessible.role: Accessible.StaticText
+        Accessible.name: text
+    }
+
     Frame {
         Layout.fillWidth: true
         Layout.fillHeight: true
@@ -212,7 +244,7 @@ ColumnLayout {
                 Layout.fillHeight: true
                 Layout.minimumHeight: 120
                 clip: true
-                model: section._rows
+                model: section._visibleRows
                 boundsBehavior: Flickable.StopAtBounds
                 ScrollBar.vertical: ScrollBar {}
                 Accessible.role: Accessible.List

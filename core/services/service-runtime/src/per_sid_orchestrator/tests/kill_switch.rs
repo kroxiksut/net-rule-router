@@ -1,5 +1,7 @@
 use super::*;
 
+mod shared_ip;
+
 // ── Kill-switch ───────────────────────────────
 
 /// Same as [`fixture_with_resolution`], plus a wired kill-switch drop
@@ -1298,6 +1300,22 @@ fn filters_observing(
     book: CanonicalRuleBook,
     observations: Arc<crate::app_observation_lookup::AppObservationStore>,
 ) -> Vec<WfpFilterSpec> {
+    filters_observing_ipv6(
+        snap,
+        resolution,
+        book,
+        observations,
+        crate::enforcement_planner::Ipv6Guard::Off,
+    )
+}
+
+fn filters_observing_ipv6(
+    snap: PerSidPolicySnapshot,
+    resolution: KillSwitchResolution,
+    book: CanonicalRuleBook,
+    observations: Arc<crate::app_observation_lookup::AppObservationStore>,
+    ipv6: crate::enforcement_planner::Ipv6Guard,
+) -> Vec<WfpFilterSpec> {
     let api = Arc::new(MockWindowsApi::new());
     let session = Arc::new(WfpSession::open(Arc::clone(&api) as Arc<dyn WindowsApiPort>).unwrap());
     let source = Arc::new(ScriptedSource::default());
@@ -1316,6 +1334,7 @@ fn filters_observing(
     )
     .with_app_resolver(Arc::new(resolver))
     .with_app_observations(observations)
+    .with_ipv6_guard_resolver(Arc::new(move |_, _| ipv6))
     .with_kill_switch_resolver(Arc::new(move |_, _| Some(resolution.clone())));
     rules.set(ActiveRulesSnapshot { rule_book: book });
     source.set("S-1-5-21-A", snap);
@@ -1372,12 +1391,9 @@ fn program_may_connect(
 
 const OTHER_PINNED_APP: &str = r"C:\Apps\mail.exe";
 
-/// Telegram on the owner's PC: another program rode the tunnel to an address
-/// the app rule had pinned, so the pin was withdrawn and may not be relearnt
-/// this session. The app's own traffic there must take the main link, as the
-/// withdrawal promises; the per-app block dropped it for good instead.
+// Smart protection permits fallback only for the app that lost its shared destination.
 #[test]
-fn a_withdrawn_app_destination_reaches_the_main_link_under_leak_protection() {
+fn smart_protection_allows_only_the_withdrawn_app_destination_on_primary() {
     const WITHDRAWN: Ipv4Addr = Ipv4Addr::new(149, 154, 167, 51);
     const STILL_PINNED: Ipv4Addr = Ipv4Addr::new(149, 154, 175, 50);
     let mut rules = rules_with_one_app("tg.exe")
@@ -1404,6 +1420,7 @@ fn a_withdrawn_app_destination_reaches_the_main_link_under_leak_protection() {
         }
         assert!(observations.retract("tg.exe", WITHDRAWN));
         let snap = PerSidPolicySnapshot {
+            kill_switch_strict_shared_ips: false,
             app_rules_take_all_addresses: takeover,
             ..snap_block("Wi-Fi", "TAP")
         };
@@ -1429,8 +1446,7 @@ fn a_withdrawn_app_destination_reaches_the_main_link_under_leak_protection() {
     }
 }
 
-/// A withdrawn address the user's own additional-link rule names is the rule's
-/// to hold: the fallback must not open it on the main link when the tunnel goes.
+// Even smart fallback must respect an explicit additional-link rule.
 #[test]
 fn a_withdrawn_destination_an_additional_rule_names_stays_held() {
     const NAMED: Ipv4Addr = Ipv4Addr::new(149, 154, 167, 99);
@@ -1456,7 +1472,10 @@ fn a_withdrawn_destination_an_additional_rule_names_stays_held() {
     observations.record(PINNED_APP, NAMED);
     observations.retract("tg.exe", NAMED);
     let filters = filters_observing(
-        snap_block("Wi-Fi", "TAP"),
+        PerSidPolicySnapshot {
+            kill_switch_strict_shared_ips: false,
+            ..snap_block("Wi-Fi", "TAP")
+        },
         full_ks_resolution(),
         book,
         observations,

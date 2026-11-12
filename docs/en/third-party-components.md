@@ -2,15 +2,9 @@
 
 [Русский](../ru/third-party-components.md)
 
-NetRuleRouter is built mostly from its own code, but a few pieces come from
-other authors. This page lists them, explains why they are there, and shows how
-you can check for yourself that the copy on your computer is the genuine one.
+NetRuleRouter is built mostly from its own code, but a few pieces come from other authors. This page lists them, explains why they are there, and shows how you can check for yourself that the copy on your computer is the genuine one.
 
-You can see the same information inside the application: **Help → Licenses →
-Third-party components** (the Licenses window also opens from the About window
-and from the tray menu). For every component the app shows the author, the
-version, the licence, and — for executable components — where the file is, its
-checksum, and who signed it.
+You can see the same information inside the application: **Help → Licenses → Third-party components** (the Licenses window also opens from the About window and from the tray menu). For every component the app shows the author, the version, the licence, and — for executable components — where the file is, its checksum, and who signed it.
 
 ## What is shipped, and why
 
@@ -20,50 +14,29 @@ checksum, and who signed it.
 | Tabler Icons | Tabler | MIT | All | The icons in the interface |
 | Qt | The Qt Company and contributors | LGPLv3 | Windows packages (Linux uses the system's) | The graphical interface |
 
-Nothing else is shipped as a separate file. The Rust libraries the application
-is built from are compiled into its executables and are covered by permissive
-licences; the full list is verified on every build.
+Nothing else is shipped as a separate file. The Rust libraries the application is built from are compiled into its executables and are covered by permissive licences; the full list is verified on every build.
 
 ### Wintun (Windows only)
 
-The fake-IP feature gives each site its own address inside the application, so
-routing and leak protection can be decided per site instead of per IP address.
-Doing that requires a network adapter the application can read traffic from.
-Linux and macOS provide such an adapter in the operating system itself, so
-builds for those systems ship nothing extra. Windows does not, so the Windows
-build includes Wintun — the same adapter used by WireGuard and by several
-well-known commercial VPN clients.
+The fake-IP feature gives each site its own address inside the application, so routing and leak protection can be decided per site instead of per IP address. Doing that requires a network adapter the application can read traffic from. Linux and macOS provide such an adapter in the operating system itself, so builds for those systems ship nothing extra. Windows does not, so the Windows build includes Wintun — the same adapter used by WireGuard and by several well-known commercial VPN clients.
 
 Practical consequences:
 
-- Wintun is used **only** by the fake-IP feature. If the feature is off, the
-  adapter is not created.
-- If the component is missing, fake-IP reports itself unavailable and
-  **everything else keeps working** — routing, rules, leak protection.
-- The file is shipped exactly as its author published it, signed by them. It is
-  never modified, rebuilt, or repackaged by this project.
+- Wintun is used **only** by the fake-IP feature. If the feature is off, the adapter is not created.
+- If the component is missing, fake-IP reports itself unavailable and **everything else keeps working** — routing, rules, leak protection.
+- The file is shipped exactly as its author published it, signed by them. It is never modified, rebuilt, or repackaged by this project.
 
 ### Tabler Icons
 
-The icons in the interface come from the Tabler set, under the MIT licence,
-which asks only that the authors are credited — which is what the Licenses
-window does. The application's own logo is not part of that set.
+The icons in the interface come from the Tabler set, under the MIT licence, which asks only that the authors are credited — which is what the Licenses window does. The application's own logo is not part of that set.
 
 ### Qt
 
-The graphical interface is built with Qt. The Windows packages carry its
-libraries as ordinary shared libraries, unmodified, under the GNU Lesser General
-Public License version 3. You may replace them with a build of your own from the
-same Qt version; the Qt source code is available from <https://download.qt.io/>.
-The packages include the licence texts and a short notice in the `licenses`
-folder. On Linux the interface uses the Qt of your distribution, and the
-terminal tools and the service do not use Qt at all.
+The graphical interface is built with Qt. The Windows packages carry its libraries as ordinary shared libraries, unmodified, under the GNU Lesser General Public License version 3. You may replace them with a build of your own from the same Qt version; the Qt source code is available from <https://download.qt.io/>. The packages include the licence texts and a short notice in the `licenses` folder. On Linux the interface uses the Qt of your distribution, and the terminal tools and the service do not use Qt at all.
 
 ## Checking that a component is genuine
 
-Claiming "this is the original file" in an About box proves nothing, so the
-application checks it instead and shows you the result. Open **Help → Licenses →
-Third-party components**. For each executable component you will see one of:
+Claiming "this is the original file" in an About box proves nothing, so the application checks it instead and shows you the result. Open **Help → Licenses → Third-party components**. For each executable component you will see one of:
 
 | Verdict | What it means |
 |---------|---------------|
@@ -71,39 +44,24 @@ Third-party components**. For each executable component you will see one of:
 | Does not match | The file is not the build shipped with the product, or its signature could not be confirmed. Reinstall the product. |
 | Not installed | The component is absent. The feature that needs it is unavailable; nothing else is affected. |
 
-The check is the same one the application performs before it loads the
-component, so the window cannot show a green verdict for a file the application
-would refuse to use.
+The check is the same one the application performs before it loads the component, so the window cannot show a green verdict for a file the application would refuse to use.
 
-If you would rather verify by hand on Windows, the shown file path and checksum
-are all you need:
+If you would rather verify by hand on Windows, the shown file path and checksum are all you need:
 
 ```powershell
 Get-AuthenticodeSignature "<path shown in the window>" | Format-List Status, SignerCertificate
 Get-FileHash "<path shown in the window>" -Algorithm SHA256
 ```
 
-The signature must be `Valid` and issued to WireGuard LLC, and the checksum must
-match the one shown in the window. Both can also be compared against the copy
-published by the author at <https://www.wintun.net/>.
+The signature must be `Valid` and issued to WireGuard LLC, and the checksum must match the one shown in the window. Both can also be compared against the copy published by the author at <https://www.wintun.net/>.
 
 ## Licence texts
 
-The full licence texts are shipped with the product and are also in the
-repository:
+The full licence texts are shipped with the product and are also in the repository:
 
-- [`THIRD_PARTY_LICENSES.md`](../../THIRD_PARTY_LICENSES.md) — the notice that
-  travels with every distribution
-- [`third_party/qt/NOTICE.txt`](../../third_party/qt/NOTICE.txt) — the Qt
-  notice; the Windows packages also carry the full LGPLv3 and GPLv3 texts in
-  their `licenses` folder
-- [`third_party/wintun/LICENSE.txt`](../../third_party/wintun/LICENSE.txt) —
-  Wintun, verbatim
-- [`third_party/wintun/PROVENANCE.md`](../../third_party/wintun/PROVENANCE.md) —
-  where the files came from, their checksums, and how to re-verify them
-- [`third_party/tappers/`](../../third_party/tappers/PROVENANCE.md) — the
-  `tappers` library by Nathaniel Bennett (MIT or Apache-2.0), compiled into the
-  Linux build for the fake-IP feature and kept in the repository as unmodified
-  source, with its licence texts and where it came from
-- [`assets/icons/THIRD_PARTY.md`](../../assets/icons/THIRD_PARTY.md) — the icon
-  set attribution
+- [`THIRD_PARTY_LICENSES.md`](../../THIRD_PARTY_LICENSES.md) — the notice that travels with every distribution
+- [`third_party/qt/NOTICE.txt`](../../third_party/qt/NOTICE.txt) — the Qt notice; the Windows packages also carry the full LGPLv3 and GPLv3 texts in their `licenses` folder
+- [`third_party/wintun/LICENSE.txt`](../../third_party/wintun/LICENSE.txt) — Wintun, verbatim
+- [`third_party/wintun/PROVENANCE.md`](../../third_party/wintun/PROVENANCE.md) — where the files came from, their checksums, and how to re-verify them
+- [`third_party/tappers/`](../../third_party/tappers/PROVENANCE.md) — the `tappers` library by Nathaniel Bennett (MIT or Apache-2.0), compiled into the Linux build for the fake-IP feature and kept in the repository as unmodified source, with its licence texts and where it came from
+- [`assets/icons/THIRD_PARTY.md`](../../assets/icons/THIRD_PARTY.md) — the icon set attribution

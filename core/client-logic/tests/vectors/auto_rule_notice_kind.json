@@ -13,6 +13,24 @@
   },
   "cases": [
     {
+      "name": "HTTP path check does not certify the browser page or TLS-only evidence",
+      "input": { "rows": [ { "anchor": "himalayas.app", "proposed-match": "himalayas.app", "match-kind": "exact", "signal": "http-path-reachability" } ] },
+      "expected": { "kind": "http-path", "selfSigned": [true] }
+    },
+    {
+      "name": "shared address verification does not claim which site the browser visited",
+      "input": { "rows": [ { "anchor": "himalayas.app", "proposed-match": "himalayas.app", "match-kind": "exact", "signal": "shared-address-reachability" } ] },
+      "expected": { "kind": "shared-address", "selfSigned": [true] }
+    },
+    {
+      "name": "shared address verification beside another reason makes no common claim",
+      "input": { "rows": [
+        { "anchor": "himalayas.app", "proposed-match": "himalayas.app", "match-kind": "exact", "signal": "shared-address-reachability" },
+        { "id": "c2", "anchor": "other.example", "proposed-match": "other.example", "signal": "main-link-blocked" }
+      ] },
+      "expected": { "kind": "assorted", "selfSigned": [true, true] }
+    },
+    {
       "name": "nothing to show reads as the default heading",
       "input": { "rows": [] },
       "expected": { "kind": "companions", "selfSigned": [] }

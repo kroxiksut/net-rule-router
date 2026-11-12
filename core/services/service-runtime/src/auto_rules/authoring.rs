@@ -1,13 +1,5 @@
-//! Turning an accepted companion-domain suggestion into a real rule.
-//!
-//! The rule lands in the CALLER'S OWN rule set, through the ordinary mutation
-//! path: read the principal's active book, append, re-encode canonically, hash,
-//! and hand a `RulesUpdate` to the [`MutationExecutor`]. Going around the
-//! executor — straight to `ActivationCoordinator::submit_candidate`, which is
-//! `pub(crate)` precisely to discourage that — would skip the Free rule cap, the
-//! tamper gate, the revision audit and the push events, so an auto-authored rule
-//! would be a second-class citizen with different failure modes from a rule the
-//! user typed. It is the same write either way; only the reason differs.
+//! Suggestions use the caller's ordinary mutation path so rule limits,
+//! integrity checks, revision auditing and push events still apply.
 
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -529,10 +521,9 @@ fn hashed_rule_id(route: RouteRole, kind: &str, value: &str) -> String {
     out
 }
 
-/// Local `YYYY-MM-DD` for the provenance comment, through the audit writer's
-/// calendar so the service has one, not two.
+/// UTC keeps a rule's provenance date stable across time zones.
 fn added_date(now: SystemTime) -> String {
-    let compact = nrr_diagnostics::local_date_string(now);
+    let compact = nrr_diagnostics::utc_date_string(now);
     if compact.len() == 8 {
         format!("{}-{}-{}", &compact[0..4], &compact[4..6], &compact[6..8])
     } else {

@@ -4,16 +4,14 @@
 
 ![NetRuleRouter](images/logo-lockup-en.png)
 
-NetRuleRouter sends the sites and programs you choose over a second connection
-(usually a VPN) and everything else over your ordinary internet.
+NetRuleRouter sends the sites and programs you choose over a second connection (usually a VPN) and everything else over your ordinary internet.
 
 [For advanced users and administrators →](en/advanced.md)
 
 ## Start here
 
 - **[Quick start](en/quickstart.md)**: download, install, first setup.
-- **[Questions and answers](en/questions.md)**: short answers to the questions
-  people ask first.
+- **[Questions and answers](en/questions.md)**: short answers to the questions people ask first.
 
 ## How do I...
 
@@ -35,5 +33,4 @@ NetRuleRouter sends the sites and programs you choose over a second connection
 
 ---
 
-All language trees are kept in sync. When a page changes, its counterparts
-change in the same edit.
+All language trees are kept in sync. When a page changes, its counterparts change in the same edit.

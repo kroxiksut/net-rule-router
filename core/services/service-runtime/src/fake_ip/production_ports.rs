@@ -289,6 +289,30 @@ impl CompositeFlowObserver {
 }
 
 impl super::stack::FlowObserver for CompositeFlowObserver {
+    fn network_generation(&self) -> Option<u64> {
+        let mut generations = self
+            .observers
+            .iter()
+            .filter_map(|observer| observer.network_generation());
+        let generation = generations.next()?;
+        generations
+            .all(|other| other == generation)
+            .then_some(generation)
+    }
+
+    fn on_upstream_connected(
+        &self,
+        client: SocketAddr,
+        fake: SocketAddr,
+        target: &super::dialer::UpstreamTarget,
+        generation: Option<u64>,
+        source: Option<std::net::IpAddr>,
+    ) {
+        for observer in &self.observers {
+            observer.on_upstream_connected(client, fake, target, generation, source);
+        }
+    }
+
     fn on_flow_opened(
         &self,
         client: SocketAddr,
@@ -548,29 +572,45 @@ impl FlowOwners for ServedFlowOwners {
         destination: SocketAddr,
         transport: Option<FlowTransport>,
     ) -> FlowOwner {
+        self.context_for(client, destination, transport).owner
+    }
+
+    fn context_for(
+        &self,
+        client: SocketAddr,
+        destination: SocketAddr,
+        transport: Option<FlowTransport>,
+    ) -> super::relay::FlowOwnerContext {
+        let routing_principal = (self.routing)();
         let served = (self.served)();
-        if served.len() < 2 {
-            return FlowOwner::RoutingUser;
-        }
-        let Some(transport) = transport else {
-            return FlowOwner::Refused("owner-unreadable");
-        };
-        let Some(owner) = self.lookup.owner_principal(client, destination, transport) else {
-            return FlowOwner::Refused("owner-unknown");
-        };
-        if is_service_account(&owner) {
-            return FlowOwner::RoutingUser;
-        }
-        let Some(principal) = served
-            .into_iter()
-            .find(|sid| sid.eq_ignore_ascii_case(&owner))
-        else {
-            return FlowOwner::Refused("owner-not-served");
-        };
-        if (self.routing)().is_some_and(|routing| routing == principal) {
-            FlowOwner::RoutingUser
-        } else {
-            FlowOwner::Principal(principal)
+        let owner = (|| {
+            if served.len() < 2 {
+                return FlowOwner::RoutingUser;
+            }
+            let Some(transport) = transport else {
+                return FlowOwner::Refused("owner-unreadable");
+            };
+            let Some(owner) = self.lookup.owner_principal(client, destination, transport) else {
+                return FlowOwner::Refused("owner-unknown");
+            };
+            if is_service_account(&owner) {
+                return FlowOwner::RoutingUser;
+            }
+            let Some(principal) = served
+                .into_iter()
+                .find(|sid| sid.eq_ignore_ascii_case(&owner))
+            else {
+                return FlowOwner::Refused("owner-not-served");
+            };
+            if routing_principal.as_deref() == Some(principal.as_str()) {
+                FlowOwner::RoutingUser
+            } else {
+                FlowOwner::Principal(principal)
+            }
+        })();
+        super::relay::FlowOwnerContext {
+            owner,
+            routing_principal,
         }
     }
 

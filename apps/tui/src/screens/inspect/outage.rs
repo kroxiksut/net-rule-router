@@ -1,9 +1,4 @@
-//! «Blocked while the route was down»: what leak protection held back during
-//! the last outage of the additional route, one row per program and address,
-//! then the routed names that never resolved, as the GUI lists them.
-//! The same `conn-trace.outage-blocks.list` the GUI reads, on every visit and
-//! on `r`; it never refreshes by itself, so a row is not pulled from under
-//! someone reading it.
+//! The service's bounded report of drops while a user's additional route was unavailable.
 
 use std::borrow::Cow;
 
@@ -17,8 +12,8 @@ use nrr_shared::ipc_payloads::{
 };
 
 use super::{
-    bad_response, call, clock_time, command, error_text, keys, page_lines, queue, unencodable,
-    Pager,
+    bad_response, call, clock_time, command, edit, error_text, keys, page_lines, queue,
+    typing_lines, unencodable, Edit, Pager,
 };
 use crate::backend::Reply;
 use crate::i18n::{Key, Texts};
@@ -33,6 +28,8 @@ pub struct OutageState {
     error: Option<String>,
     pager: Pager,
     generation: u64,
+    query: String,
+    typing: Option<String>,
 }
 
 /// One line of the list: a blocked address, or a name that got none.
@@ -71,6 +68,16 @@ impl OutageState {
                 .get(index - entries.len())
                 .map(Row::Unresolved),
         }
+    }
+
+    fn visible_rows(&self) -> Vec<usize> {
+        let query = self.query.trim().to_lowercase();
+        (0..self.row_count())
+            .filter(|&index| {
+                self.row(index)
+                    .is_some_and(|row| query.is_empty() || search_blob(row).contains(&query))
+            })
+            .collect()
     }
 
     /// The route is down right now.
@@ -123,22 +130,27 @@ pub struct OutageScreen;
 impl Screen for OutageScreen {
     fn view(&self, app: &AppState, texts: &Texts) -> ScreenView {
         let state = &app.inspect.outage;
-        let count = state.row_count();
+        let visible = state.visible_rows();
+        let count = visible.len();
         let mut pager = state.pager;
         pager.clamp(count);
-        let detail = state
-            .row(pager.selected)
+        let detail = visible
+            .get(pager.selected)
+            .and_then(|&index| state.row(index))
             .map(|row| detail_lines(texts, row))
             .unwrap_or_default();
         let mut list = Vec::new();
         if count > 0 {
             list.push(ViewLine::new(vec![Segment::accent(header(texts))]));
             list.extend(page_lines(texts, pager, count, false, |index| {
-                state
-                    .row(index)
+                visible
+                    .get(index)
+                    .and_then(|&row_index| state.row(row_index))
                     .map(|row| row_text(texts, row))
                     .unwrap_or_default()
             }));
+        } else if !state.query.is_empty() {
+            list.push(ViewLine::text(texts.get(keys::TRACE_NO_MATCH)));
         }
         let title = texts.get(ScreenId::OutageBlocks.title());
         ScreenView {
@@ -164,13 +176,18 @@ impl Screen for OutageScreen {
     }
 
     fn help(&self) -> &'static [Key] {
-        &[keys::HELP_PAGES, keys::HELP_REFRESH]
+        &[
+            keys::TRACE_HELP_SEARCH,
+            keys::HELP_PAGES,
+            keys::HELP_REFRESH,
+        ]
     }
 
     fn plain_help(&self) -> &'static [Key] {
         &[
             keys::PLAIN_PAGES,
             keys::TRACE_PLAIN_DETAILS,
+            keys::TRACE_PLAIN_SEARCH,
             keys::HELP_REFRESH,
         ]
     }
@@ -186,25 +203,57 @@ impl Screen for OutageScreen {
         true
     }
 
+    fn captures_keys(&self, app: &AppState) -> bool {
+        app.inspect.outage.typing.is_some()
+    }
+
+    fn text_target(&self, app: &AppState) -> crate::paste::TextTarget {
+        if app.inspect.outage.typing.is_some() {
+            crate::paste::TextTarget::Line
+        } else {
+            crate::paste::TextTarget::None
+        }
+    }
+
     fn on_key(&self, app: &mut AppState, key: KeyEvent) -> bool {
+        let state = &mut app.inspect.outage;
+        if let Some(buffer) = state.typing.as_mut() {
+            match edit(buffer, key) {
+                Edit::Typing => {}
+                Edit::Done(text) => {
+                    state.typing = None;
+                    state.query = text.trim().to_owned();
+                    state.pager = Pager::default();
+                }
+                Edit::Cancelled => state.typing = None,
+            }
+            return true;
+        }
         if key.code == KeyCode::Char('r') {
             load(app);
             return true;
         }
-        let state = &mut app.inspect.outage;
-        let len = state.row_count();
-        state.pager.on_key(key.code, len)
+        let len = state.visible_rows().len();
+        match key.code {
+            KeyCode::Char('/') => state.typing = Some(state.query.clone()),
+            code => return state.pager.on_key(code, len),
+        }
+        true
     }
 
     fn on_line(&self, app: &mut AppState, line: &str) -> bool {
         let state = &mut app.inspect.outage;
-        let len = state.row_count();
+        let len = state.visible_rows().len();
         match command(line) {
             ("n", "") => {
                 state.pager.next_page(len);
             }
             ("p", "") => state.pager.previous_page(),
             ("r", "") => load(app),
+            ("/", text) => {
+                state.query = text.trim().to_owned();
+                state.pager = Pager::default();
+            }
             ("d", number) => return state.pager.pick(number, len),
             _ => return false,
         }
@@ -216,6 +265,17 @@ impl Screen for OutageScreen {
 fn summary_lines(app: &AppState, texts: &Texts) -> Vec<ViewLine> {
     let state = &app.inspect.outage;
     let mut lines = vec![ViewLine::text(texts.get(keys::OUTAGE_INTRO))];
+    match &state.typing {
+        Some(buffer) => lines.extend(typing_lines(
+            texts,
+            texts.get(keys::TRACE_SEARCH_LABEL).trim_end_matches('…'),
+            buffer,
+        )),
+        None if !state.query.is_empty() => lines.push(ViewLine::text(
+            texts.fill(keys::TRACE_SEARCH, &[("text", &state.query)]),
+        )),
+        None => {}
+    }
     if !app.link.is_connected() {
         let word = if state.answer.is_some() {
             keys::STALE
@@ -317,6 +377,17 @@ fn row_text(texts: &Texts, row: Row<'_>) -> String {
             clock_time(n.last_seen_ms),
         ),
     }
+}
+
+fn search_blob(row: Row<'_>) -> String {
+    match row {
+        Row::Blocked(e) => format!(
+            "{} {} {} {} {} {}",
+            e.process, e.process_path, e.host, e.rule_host, e.remote_ip, e.remote_port
+        ),
+        Row::Unresolved(n) => n.name.clone(),
+    }
+    .to_lowercase()
 }
 
 /// The name with the word that says why it has no address — never a colour

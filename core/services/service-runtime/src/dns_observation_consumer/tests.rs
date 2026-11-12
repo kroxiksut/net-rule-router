@@ -367,6 +367,30 @@ fn caches_subdomain_matching_a_suffix_rule() {
 }
 
 #[test]
+fn an_unruled_os_cached_host_can_be_named_without_becoming_enforced() {
+    use nrr_platform_api::dns::{MockDnsCacheRead, OsCachedResolution};
+    let (cache, lookup) = in_memory_cache();
+    let names = Arc::new(crate::observed_host_names::ObservedHostNames::new());
+    let reader = Arc::new(MockDnsCacheRead::new());
+    let address = Ipv4Addr::new(100, 64, 8, 8);
+    reader.set_entries(vec![OsCachedResolution {
+        canonical_hostname: "unruled.test".into(),
+        addresses: vec![IpAddr::V4(address)],
+    }]);
+    let c = consumer(
+        vec![zone_rule("r1", "example")],
+        cache,
+        Arc::clone(&lookup) as Arc<dyn FqdnCacheLookup>,
+        active_sid("S-A"),
+    )
+    .with_dns_cache_read(reader)
+    .with_observed_host_names(Arc::clone(&names));
+    c.seed_from_os_cache(SystemTime::now());
+    assert_eq!(names.lookup(address).as_deref(), Some("unruled.test"));
+    assert!(lookup.ips_for_hostname("unruled.test").is_empty());
+}
+
+#[test]
 fn seed_from_os_cache_caches_rule_matches_skips_others_and_loopback() {
     use nrr_platform_api::dns::{MockDnsCacheRead, OsCachedResolution};
     let (cache, lookup) = in_memory_cache();

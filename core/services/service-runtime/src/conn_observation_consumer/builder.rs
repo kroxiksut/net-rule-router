@@ -10,6 +10,15 @@
 use super::*;
 
 impl ConnectionObservationConsumer {
+    #[must_use]
+    pub fn with_discovery_observation(
+        mut self,
+        pipeline: Arc<crate::discovery_observation::DiscoveryObservationPipeline>,
+    ) -> Self {
+        self.discovery_observation = Some(pipeline);
+        self
+    }
+
     pub fn new(
         api: Arc<dyn RouteTablePort>,
         coordinator: Arc<SecondaryRouteCoordinator>,
@@ -66,6 +75,7 @@ impl ConnectionObservationConsumer {
             placeholder_confirmed: None,
             companion_reported: Mutex::new(HashSet::new()),
             primary_stall_evidence: Mutex::new(stall_evidence::ConnectionStallTracker::default()),
+            discovery_observation: None,
             unanswered: Mutex::new(unanswered::UnansweredTracker::default()),
             own_flow_resets: crate::own_flow_resets::global_own_flow_resets(),
             app_main_link: None,

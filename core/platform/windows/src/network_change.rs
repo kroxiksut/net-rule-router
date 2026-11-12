@@ -193,7 +193,12 @@ impl NetworkChangeObserver for WindowsNetworkChangeObserver {
         &self,
         on_change: NetworkChangeCallback,
     ) -> Result<NetworkChangeSubscription, PlatformError> {
-        subscribe_with(on_change, true)
+        static FOREIGN: std::sync::OnceLock<
+            nrr_platform_api::network_change::SharedNetworkChangeFeed,
+        > = std::sync::OnceLock::new();
+        FOREIGN
+            .get_or_init(Default::default)
+            .subscribe(on_change, |callback| subscribe_with(callback, true))
     }
 }
 

@@ -20,7 +20,7 @@ use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
-use crate::ipc_payloads::SnapshotInterfacesResponse;
+use crate::ipc_payloads::{FakeIpDatapathDto, SnapshotInterfacesResponse};
 
 // ── DiagnosticsStatusDto ──────────────────────────────────────────────────────
 
@@ -482,6 +482,34 @@ pub struct DiagnosticArchiveHealthEnrichmentDto {
     /// adapters provider was unavailable at the archive call site.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub adapters_snapshot: Option<SnapshotInterfacesResponse>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub route_bindings: Option<DiagnosticRouteBindingsDto>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub routing_readiness: Option<DiagnosticRoutingReadinessDto>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub protection_filters_on_machine: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fake_ip_datapath: Option<FakeIpDatapathDto>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dns_compatibility: Option<crate::ipc_payloads::DnsCompatibilityDto>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub site_check: Option<crate::ipc_payloads::SiteCheckStatus>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub suggestion_discovery: Option<crate::ipc_payloads::DiscoveryEpisodesSnapshotDto>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct DiagnosticRouteBindingsDto {
+    pub primary_bound: bool,
+    pub secondary_bound: bool,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct DiagnosticRoutingReadinessDto {
+    pub primary: String,
+    pub secondary: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub affected_active_assignments: Option<u32>,
 }
 
 #[cfg(test)]

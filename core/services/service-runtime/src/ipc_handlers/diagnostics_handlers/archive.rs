@@ -37,6 +37,12 @@ pub struct DiagnosticsExportArchiveHandler {
     /// written. The service's own tree is closed to ordinary users, so without
     /// this the export is a file its requester cannot open.
     file_handoff: Arc<dyn nrr_platform_api::file_handoff::FileHandoffPort>,
+    policy: Option<Arc<dyn crate::managers::PolicyManager>>,
+    route_enforcement: Option<crate::app_enforcement_status::RouteEnforcementStatus>,
+    fake_ip_datapath: Option<crate::ipc_handlers::FakeIpDatapathProbe>,
+    dns_compatibility: Option<Arc<crate::dns_compatibility::DnsCompatibilityCenter>>,
+    site_check: Option<Arc<crate::site_check::SiteChecker>>,
+    discovery: Option<Arc<crate::auto_rules::AutoRulesEngine>>,
 }
 
 impl DiagnosticsExportArchiveHandler {
@@ -60,7 +66,43 @@ impl DiagnosticsExportArchiveHandler {
             route_policy,
             state_schema_version,
             file_handoff,
+            policy: None,
+            route_enforcement: None,
+            fake_ip_datapath: None,
+            dns_compatibility: None,
+            site_check: None,
+            discovery: None,
         }
+    }
+
+    pub fn with_runtime_routing(
+        mut self,
+        policy: Arc<dyn crate::managers::PolicyManager>,
+        route_enforcement: crate::app_enforcement_status::RouteEnforcementStatus,
+        fake_ip_datapath: Option<crate::ipc_handlers::FakeIpDatapathProbe>,
+    ) -> Self {
+        self.policy = Some(policy);
+        self.route_enforcement = Some(route_enforcement);
+        self.fake_ip_datapath = fake_ip_datapath;
+        self
+    }
+
+    pub fn with_dns_evidence(
+        mut self,
+        center: Option<Arc<crate::dns_compatibility::DnsCompatibilityCenter>>,
+        checker: Option<Arc<crate::site_check::SiteChecker>>,
+    ) -> Self {
+        self.dns_compatibility = center;
+        self.site_check = checker;
+        self
+    }
+
+    pub fn with_discovery_evidence(
+        mut self,
+        engine: Option<Arc<crate::auto_rules::AutoRulesEngine>>,
+    ) -> Self {
+        self.discovery = engine;
+        self
     }
 
     /// Best-effort discovery of recent decision ids to seed
@@ -194,9 +236,9 @@ impl DiagnosticsExportArchiveHandler {
     /// value that cannot be sourced at this call site stays `None` rather
     /// than being fabricated.
     fn collect_health_enrichment(&self, caller_sid: &str) -> DiagnosticArchiveHealthEnrichmentDto {
-        let behavior_mode = self
-            .route_policy
-            .get_for_sid(caller_sid)
+        let route_policy = self.route_policy.get_for_sid(caller_sid);
+        let behavior_mode = route_policy
+            .as_ref()
             .and_then(|policy| serde_json::to_value(policy.mode).ok())
             .and_then(|v| v.as_str().map(str::to_string));
         // `force_refresh = false` — the archive reads the adapter monitor's
@@ -204,10 +246,96 @@ impl DiagnosticsExportArchiveHandler {
         // re-enumeration, keeping export latency independent of adapter
         // enumeration cost.
         let adapters_snapshot = Some(self.adapters.adapters_snapshot_for(false, caller_sid));
+        let counts = self
+            .policy
+            .as_ref()
+            .and_then(|policy| policy.active_rule_counts_for(caller_sid));
+        let reports = self
+            .route_enforcement
+            .as_ref()
+            .map(|status| status.for_principal(caller_sid))
+            .unwrap_or_default();
+        let primary_bound = route_policy
+            .as_ref()
+            .and_then(|policy| policy.primary.as_ref())
+            .is_some();
+        let secondary_bound = route_policy
+            .as_ref()
+            .and_then(|policy| policy.secondary.as_ref())
+            .is_some();
+        let report_state = |role: &str, bound: bool| {
+            reports.iter().find(|report| report.role == role).map_or(
+                if bound { "unknown" } else { "not-chosen" },
+                |report| {
+                    if report.status == "ok" {
+                        "ready"
+                    } else {
+                        "not-ready"
+                    }
+                },
+            )
+        };
+        let primary = if counts.is_some_and(|counts| counts.total == 0) {
+            "not-required"
+        } else {
+            report_state("primary", primary_bound)
+        };
+        let secondary = match (
+            secondary_bound,
+            counts.map(|counts| counts.enabled_secondary),
+        ) {
+            (false, _) => "not-required",
+            (true, Some(0)) => "not-required",
+            (true, Some(_)) => report_state("secondary", secondary_bound),
+            (true, None) => "unknown",
+        };
+        let affected_active_assignments = match (counts, primary, secondary) {
+            (Some(_), "ready" | "not-required", "ready" | "not-required") => Some(0),
+            (Some(counts), "ready" | "not-required", _) => {
+                Some(u32::try_from(counts.enabled_secondary).unwrap_or(u32::MAX))
+            }
+            (Some(counts), _, _) => Some(u32::try_from(counts.total).unwrap_or(u32::MAX)),
+            (None, _, _) => None,
+        };
+        let fake_ip_datapath = self
+            .fake_ip_datapath
+            .as_ref()
+            .map(|probe| crate::ipc_handlers::service_health::fake_ip_datapath_to_dto(probe()));
         DiagnosticArchiveHealthEnrichmentDto {
             behavior_mode,
             state_schema_version: self.state_schema_version,
             adapters_snapshot,
+            route_bindings: Some(nrr_shared::diagnostics_dto::DiagnosticRouteBindingsDto {
+                primary_bound,
+                secondary_bound,
+            }),
+            routing_readiness: Some(nrr_shared::diagnostics_dto::DiagnosticRoutingReadinessDto {
+                primary: primary.to_owned(),
+                secondary: secondary.to_owned(),
+                affected_active_assignments,
+            }),
+            protection_filters_on_machine: Some(
+                u32::try_from(crate::standing_volume::global_standing_volume().total())
+                    .unwrap_or(u32::MAX),
+            ),
+            fake_ip_datapath,
+            dns_compatibility: self
+                .dns_compatibility
+                .as_ref()
+                .filter(|_| !caller_sid.is_empty())
+                .map(|center| {
+                    center.snapshot(Some(caller_sid), crate::dns_compatibility::now_ms())
+                }),
+            site_check: self
+                .site_check
+                .as_ref()
+                .filter(|_| !caller_sid.is_empty())
+                .map(|checker| checker.status(caller_sid)),
+            suggestion_discovery: self
+                .discovery
+                .as_ref()
+                .filter(|_| !caller_sid.is_empty())
+                .map(|engine| engine.discovery_snapshot(caller_sid, SystemTime::now())),
         }
     }
 }

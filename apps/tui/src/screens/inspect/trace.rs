@@ -600,6 +600,7 @@ fn verdict_label(texts: &Texts, e: &ConnTraceEntryDto) -> String {
         match e.blocked_by.as_str() {
             "netrulerouter" => return texts.get(keys::TRACE_BLOCK_BY_NRR),
             "other" => return texts.get(keys::TRACE_BLOCK_BY_OTHER),
+            "unknown" => return texts.get(keys::TRACE_BLOCK_BY_UNKNOWN),
             _ => {}
         }
     }

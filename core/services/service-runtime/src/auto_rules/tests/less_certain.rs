@@ -7,6 +7,38 @@ use super::*;
 /// brand fallback able to offer it.
 const LOOK_ALIKE: &str = "login.site.test";
 
+#[test]
+fn shared_address_reachability_never_authors_or_steers_a_pending_name() {
+    let f = fixture(AutoRulesMode::Auto);
+    let host = "www.shared-review.example";
+    let mut dto = main_link_dto(host, host, "shared-address-reachability", "stalls");
+    dto.id = candidate_id(SID, AUTO_RULE_MATCH_KIND_EXACT, host);
+    dto.match_kind = AUTO_RULE_MATCH_KIND_EXACT.into();
+    dto.secondary_reach = Some(true);
+    let candidate = PendingCandidate::from_dto(dto).expect("stored exact host");
+    assert_eq!(f.engine.author_now(SID, &[candidate], later()), 0);
+    assert!(
+        f.author.calls().is_empty(),
+        "verified path evidence still needs a person's approval"
+    );
+    assert_eq!(parked(&f.engine), 1);
+    assert!(
+        !f.engine.covers_pending_secondary_host(host),
+        "a suggestion must not change DNS routing before acceptance"
+    );
+    let candidate = f.engine.candidates(SID).pop().expect("reviewable finding");
+    f.engine
+        .accept(SID, &[candidate.id], true, later())
+        .expect("explicit approval");
+    let calls = f.author.calls();
+    assert_eq!(calls.len(), 1);
+    assert_eq!(calls[0].1[0].match_kind, AuthoredMatchKind::ExactHost);
+    assert_eq!(
+        calls[0].1[0].value, host,
+        "even an any-zone request cannot widen a measured exact name"
+    );
+}
+
 /// A fixture whose mode the test can switch, as the settings screen does.
 fn switchable(mode: &Arc<Mutex<AutoRulesMode>>) -> Fixture {
     let mut f = fixture(AutoRulesMode::Suggest);

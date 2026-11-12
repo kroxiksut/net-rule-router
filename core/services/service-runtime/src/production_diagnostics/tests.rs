@@ -1965,6 +1965,23 @@ fn the_routing_check_reads_a_revision_mid_activation() {
     assert_eq!(route_of("old.example").as_deref(), Some("secondary"));
     assert_eq!(route_of("new.example").as_deref(), Some("primary"));
 
+    let describe = |host: &str| {
+        facade
+            .get_explain(
+                &ExplainQuery::Synthetic {
+                    input_sample: nrr_diagnostics::explain::RuntimeInputSample::new()
+                        .with_hostname(host),
+                },
+                ExplainDetailLevel::Diagnostics,
+                "",
+            )
+            .expect("explain identity")
+    };
+    assert_eq!(
+        describe("old.example").correlation.revision_id.as_deref(),
+        Some("rev-1")
+    );
+
     let applying = {
         let guard = conn.lock().expect("lock");
         crate::applying_revision_overlay::publish(
@@ -1979,6 +1996,23 @@ fn the_routing_check_reads_a_revision_mid_activation() {
         "mid-activation the check must answer for the revision being installed"
     );
     assert_eq!(route_of("old.example").as_deref(), Some("primary"));
+
+    let during = describe("new.example");
+    assert!(
+        during
+            .correlation
+            .revision_id
+            .as_deref()
+            .is_some_and(|id| id.starts_with("applying:")),
+        "an applying rule book must never be labelled with the previous revision"
+    );
+    assert_eq!(
+        during
+            .match_section
+            .and_then(|matched| matched.matched_rule_id)
+            .as_deref(),
+        Some("R-0001")
+    );
 
     drop(applying);
     assert_eq!(route_of("old.example").as_deref(), Some("secondary"));

@@ -21,7 +21,19 @@ const HOUR: i64 = 60 * 60 * 1000;
 const DAY: i64 = 24 * HOUR;
 
 #[test]
-fn a_second_site_inside_the_half_hour_is_held() {
+fn another_sites_notice_does_not_hide_a_newly_confirmed_site_for_minutes() {
+    let mut log = SiteNoticeLog::default();
+    log.told("already-shown.example", T0);
+    assert!(
+        log.due("new-failure.example", false, T0 + 60_000),
+        "the terminal must offer a new confirmed host promptly too"
+    );
+    assert!(log.due("already-shown.example", false, T0 + 60_000));
+    assert!(!log.due("new-failure.example", true, T0 + 60_000));
+}
+
+#[test]
+fn a_burst_of_sites_shares_the_short_batch_window() {
     let mut log = SiteNoticeLog::default();
     assert!(log.due("one.example", false, T0));
     log.told("one.example", T0);
@@ -34,24 +46,15 @@ fn a_second_site_inside_the_half_hour_is_held() {
 }
 
 #[test]
-fn the_same_site_waits_a_day_and_its_answer_lifts_the_wait() {
+fn the_same_unanswered_site_is_eligible_within_twenty_seconds() {
     let mut log = SiteNoticeLog::default();
     log.told("site.example", T0);
-    assert!(!log.due("site.example", false, T0 + HOUR));
-    assert!(
-        log.due("site.example", false, T0 + DAY),
-        "next day it shows"
-    );
-    log.answered("site.example", T0 + 1);
-    assert!(
-        log.due("site.example", false, T0 + HOUR),
-        "an answered site comes back before its day"
-    );
-    log.told("site.example", T0 + HOUR);
-    assert!(
-        !log.due("site.example", false, T0 + 3 * HOUR),
-        "a new notice puts it back under its day"
-    );
+    assert!(!log.due("site.example", false, T0 + 14_999));
+    assert!(log.due("site.example", false, T0 + 15_000));
+    assert!(log.due("site.example", false, T0 + 20_000));
+    assert!(!log.due("site.example", true, T0 + 20_000));
+    log.told("site.example", T0 + 20_000);
+    assert!(!log.due("site.example", false, T0 + 20_001));
 }
 
 #[test]
@@ -65,7 +68,8 @@ fn the_log_reads_back_and_the_settings_save_keeps_it() {
     // The Settings screen writes the same file afterwards.
     prefs::save(&path, app.settings.prefs).expect("prefs saved");
     assert_eq!(load(&path), app.site_notices);
-    assert!(!load(&path).due("site.example", false, T0 + HOUR));
+    assert!(!load(&path).due("site.example", false, T0 + 10_000));
+    assert!(load(&path).due("site.example", false, T0 + 20_000));
 }
 
 /// The file is anybody's to break: whatever it holds, reading it never
@@ -182,9 +186,99 @@ fn on_status(fake: &FakeService) -> AppState {
     app
 }
 
-/// The terminal's feed keeps the rule the tray keeps: a second site inside
-/// the half hour waits, the same site waits its day, and an answer (the rule
-/// added from Suggestions) lifts that day.
+#[test]
+fn a_paced_ready_site_is_retried_without_another_service_push() {
+    set_now(T0);
+    let fake = service(&["himalayas.app"]);
+    let mut app = on_status(&fake);
+    app.site_notices.told("himalayas.app", T0);
+    set_now(T0 + 1);
+    assert_eq!(pushed(&mut app, &fake, "himalayas.app"), 0);
+    set_now(T0 + 15_001);
+    assert!(crate::screens::suggestions::retry_paced_notice(&mut app));
+    drain(&mut app, &fake);
+    assert!(app
+        .notices
+        .iter()
+        .any(|notice| notice.body.contains("himalayas.app")));
+    assert!(!crate::screens::suggestions::retry_paced_notice(&mut app));
+}
+
+#[test]
+fn a_pacing_retry_cannot_resurrect_a_withdrawn_site_offer() {
+    set_now(T0);
+    let fake = service(&["himalayas.app"]);
+    let mut app = on_status(&fake);
+    app.site_notices.told("himalayas.app", T0);
+    set_now(T0 + 1);
+    assert_eq!(pushed(&mut app, &fake, "himalayas.app"), 0);
+    fake.answer(
+        IpcOperationName::AutoRuleCandidatesList,
+        json!({"candidates": [], "pending-count": 0, "inert-dropped": 0, "inert-sample": []}),
+    );
+    set_now(T0 + 15_001);
+    assert!(crate::screens::suggestions::retry_paced_notice(&mut app));
+    drain(&mut app, &fake);
+    assert!(
+        app.notices.is_empty(),
+        "a fresh list no longer offers the site"
+    );
+}
+
+#[test]
+fn a_known_top_anchor_cannot_hide_a_newly_confirmed_name_in_the_same_batch() {
+    set_now(T0);
+    let fake = service(&["one.example"]);
+    let mut app = on_status(&fake);
+    assert_eq!(pushed(&mut app, &fake, "one.example"), 1);
+    set_now(T0 + 60_000);
+    fake.answer(
+        IpcOperationName::AutoRuleCandidatesList,
+        json!({
+            "candidates": [blocked("one.example"), blocked("new.example")],
+            "pending-count": 2, "inert-dropped": 0, "inert-sample": []
+        }),
+    );
+    assert_eq!(pushed(&mut app, &fake, "one.example"), 0);
+    assert!(
+        app.notices
+            .last()
+            .expect("updated batch")
+            .body
+            .contains("new.example"),
+        "the old top anchor must not silence a new actual host after the list reloads"
+    );
+}
+
+#[test]
+fn successive_confirmed_sites_update_one_feed_notice_instead_of_stacking_cards() {
+    set_now(T0);
+    let fake = service(&["one.example"]);
+    let mut app = on_status(&fake);
+    assert_eq!(pushed(&mut app, &fake, "one.example"), 1);
+    let original_id = app.notices.last().expect("first card").id;
+    set_now(T0 + HOUR);
+    fake.answer(
+        IpcOperationName::AutoRuleCandidatesList,
+        json!({
+            "candidates": [blocked("one.example"), blocked("two.example")],
+            "pending-count": 2, "inert-dropped": 0, "inert-sample": []
+        }),
+    );
+    assert_eq!(
+        pushed(&mut app, &fake, "two.example"),
+        0,
+        "the existing batch is updated in place"
+    );
+    let card = app.notices.last().expect("updated card");
+    assert_eq!(
+        card.id, original_id,
+        "new names must not move the user's feed selection"
+    );
+    assert!(card.body.contains("one.example") && card.body.contains("two.example"));
+}
+
+/// New names share one feed card; an unanswered name is not repeated.
 #[test]
 fn the_feed_tells_of_sites_that_do_not_open_as_the_tray_does() {
     set_now(T0);
@@ -195,7 +289,7 @@ fn the_feed_tells_of_sites_that_do_not_open_as_the_tray_does() {
     assert_eq!(
         pushed(&mut app, &fake, "two.example"),
         0,
-        "inside the half hour"
+        "already included in the first batch"
     );
     set_now(T0 + HOUR);
     assert_eq!(
@@ -205,8 +299,8 @@ fn the_feed_tells_of_sites_that_do_not_open_as_the_tray_does() {
     );
     assert_eq!(
         pushed(&mut app, &fake, "two.example"),
-        1,
-        "another site later"
+        0,
+        "a site already shown in the batch still waits its own day"
     );
 
     // Added from Suggestions: one.example's notice was answered.
@@ -218,8 +312,12 @@ fn the_feed_tells_of_sites_that_do_not_open_as_the_tray_does() {
     set_now(T0 + 2 * HOUR);
     assert_eq!(
         pushed(&mut app, &fake, "one.example"),
-        1,
-        "answered, so back"
+        0,
+        "an answered site returns to the existing feed batch"
+    );
+    assert_eq!(
+        app.site_notices.sites["one.example"].shown,
+        Some(T0 + 2 * HOUR)
     );
 }
 
@@ -239,7 +337,8 @@ fn never_suggest_answers_the_notice_as_the_tray_counts_it() {
     set_now(T0 + HOUR);
     assert_eq!(
         pushed(&mut app, &fake, "one.example"),
-        1,
-        "refused, so its notice was answered"
+        0,
+        "an answered notice updates the existing feed batch"
     );
+    assert_eq!(app.site_notices.sites["one.example"].shown, Some(T0 + HOUR));
 }

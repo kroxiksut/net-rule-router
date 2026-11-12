@@ -67,7 +67,7 @@ impl super::ConnectionObservationConsumer {
             };
             let report = stalls.note(&sid, hostname, event);
             if let Some(report) = report.as_ref() {
-                crate::primary_stall_registry::log_report(report);
+                crate::primary_stall_registry::log_report(&sid, report);
             }
             if let Some(engine) = engine.as_ref() {
                 engine(MainLinkHealth {

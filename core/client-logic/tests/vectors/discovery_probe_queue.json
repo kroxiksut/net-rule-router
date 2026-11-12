@@ -1,0 +1,21 @@
+{
+  "description":"Both surfaces show the same owner-only queue snapshot; a worker or queue wait never becomes a time estimate.",
+  "cases":[
+    {"name":"old service", "input":{}, "expected":null},
+    {"name":"history capacity cannot promise a start", "input":{"queue":{"wait-kind":"resources","queued-ahead":0,"eligible-in-ms":1000}}, "expected":{"kind":"resources","ahead":0,"seconds":null,"started":null}},
+    {"name":"unavailable rules cannot promise a start", "input":{"queue":{"wait-kind":"rules","queued-ahead":0,"eligible-in-ms":1000}}, "expected":{"kind":"rules","ahead":0,"seconds":null,"started":null}},
+    {"name":"integral JSON numbers match JavaScript", "input":{"queue":{"wait-kind":"rate","queued-ahead":1.0,"eligible-in-ms":1000.0,"last-probe-started-unix-ms":1000.0}}, "expected":{"kind":"rate","ahead":1,"seconds":1,"started":1000}},
+    {"name":"timegate rounds up seconds", "input":{"queue":{"wait-kind":"rate","queued-ahead":3,"eligible-in-ms":1875,"last-probe-started-unix-ms":1000}}, "expected":{"kind":"rate","ahead":3,"seconds":2,"started":1000}},
+    {"name":"largest safe integer delay rounds up", "input":{"queue":{"wait-kind":"rate","queued-ahead":0,"eligible-in-ms":9007199254740991}}, "expected":{"kind":"rate","ahead":0,"seconds":9007199254741,"started":null}},
+    {"name":"large delay one millisecond past exact seconds", "input":{"queue":{"wait-kind":"cooldown","queued-ahead":0,"eligible-in-ms":9007199254740001}}, "expected":{"kind":"cooldown","ahead":0,"seconds":9007199254741,"started":null}},
+    {"name":"cooldown snapshot can be ready", "input":{"queue":{"wait-kind":"cooldown","queued-ahead":0,"eligible-in-ms":0}}, "expected":{"kind":"cooldown","ahead":0,"seconds":0,"started":null}},
+    {"name":"workers cannot promise start", "input":{"queue":{"wait-kind":"workers","queued-ahead":0,"eligible-in-ms":1000}}, "expected":{"kind":"workers","ahead":0,"seconds":null,"started":null}},
+    {"name":"ahead cannot promise finish", "input":{"queue":{"wait-kind":"ahead","queued-ahead":5,"eligible-in-ms":1000}}, "expected":{"kind":"ahead","ahead":5,"seconds":null,"started":null}},
+    {"name":"logical check quota waits for next pump", "input":{"queue":{"wait-kind":"scheduled","queued-ahead":0,"eligible-in-ms":0}}, "expected":{"kind":"scheduled","ahead":0,"seconds":null,"started":null}},
+    {"name":"unknown kind is not interpreted", "input":{"queue":{"wait-kind":"elsewhere","queued-ahead":1}}, "expected":null},
+    {"name":"negative count rejected", "input":{"queue":{"wait-kind":"rate","queued-ahead":-1}}, "expected":null},
+    {"name":"oversized count rejected", "input":{"queue":{"wait-kind":"rate","queued-ahead":4294967296}}, "expected":null},
+    {"name":"wrong scalar types not coerced", "input":{"queue":{"wait-kind":"rate","queued-ahead":0,"eligible-in-ms":"1000","last-probe-started-unix-ms":-10}}, "expected":{"kind":"rate","ahead":0,"seconds":null,"started":null}},
+    {"name":"oversized timestamp and delay ignored", "input":{"queue":{"wait-kind":"rate","queued-ahead":0,"eligible-in-ms":9007199254740992,"last-probe-started-unix-ms":8640000000000001}}, "expected":{"kind":"rate","ahead":0,"seconds":null,"started":null}}
+  ]
+}

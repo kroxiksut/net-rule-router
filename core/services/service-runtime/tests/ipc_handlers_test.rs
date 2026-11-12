@@ -786,7 +786,8 @@ fn production_handlers_register_every_operation_in_catalog() {
     /// Every other one is dependency-gated and falls back to
     /// `UnimplementedHandler` (RecoveryRequired) when its provider is not
     /// wired; the fully-wired paths are exercised by `cross_cutting_4b4.rs`.
-    const REAL: [IpcOperationName; 34] = [
+    const REAL: [IpcOperationName; 35] = [
+        IpcOperationName::DnsCompatibilityRecheck,
         // Always registered: with no inspector wired it reports the
         // attribution-only assets, which is a valid answer, not a degraded one.
         IpcOperationName::ThirdPartyComponentsList,

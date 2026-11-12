@@ -669,6 +669,7 @@ fn fixed_operation_class(op: IpcOperationName) -> IpcOperationClass {
         // sees a timeout instead of addresses. DiagnosticQuery dispatches
         // immediately and still requires no elevation.
         IpcOperationName::InterfacesRefreshRequest => IpcOperationClass::DiagnosticQuery,
+        IpcOperationName::DnsCompatibilityRecheck => IpcOperationClass::DiagnosticAction,
         // The baseline form; the payload branch above picks between the two.
         IpcOperationName::RollbackRequest => IpcOperationClass::MutationRequest,
         IpcOperationName::ProductImpactDisableTemporary => IpcOperationClass::SafeDisable,
@@ -729,6 +730,7 @@ fn fixed_operation_class(op: IpcOperationName) -> IpcOperationClass {
         // caller's behalf, so it travels the same envelope as their other
         // configuration commands.
         IpcOperationName::AutoRuleCandidatesProbe => IpcOperationClass::UserScopedConfiguration,
+        IpcOperationName::AutoRuleDiscoveryFeedback => IpcOperationClass::UserScopedConfiguration,
         // Marking a site as refusing main-link addresses records the caller's
         // own observation about their own site: per-SID configuration.
         IpcOperationName::RefusingAnchorSet => IpcOperationClass::UserScopedConfiguration,

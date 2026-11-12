@@ -419,7 +419,7 @@ fn main_link_dto(
         id: format!("{anchor}|{proposed}"),
         anchor: anchor.to_string(),
         proposed_match: proposed.to_string(),
-        match_kind: AUTO_RULE_MATCH_KIND_SUFFIX.to_string(),
+        match_kind: AUTO_RULE_MATCH_KIND_EXACT.to_string(),
         route: RouteRole::Secondary.slug().to_string(),
         affinity: 0.9,
         observations: Some(3),
@@ -461,12 +461,17 @@ fn candidate_ids_are_pinned() {
 
 mod accept_dismiss;
 mod consumers;
+mod discovery_lifecycle;
 mod durability;
 mod less_certain;
 mod main_link_works;
+mod nov10_host_health;
+mod nov10_http_cache;
+mod nov10_regressions;
 mod offer_signals;
 mod proposal;
 mod verify_primary;
+mod www_rules;
 
 /// The id outlives restarts (persisted refusals, the tray's offered set), so a
 /// crypto-crate upgrade must not change a single digit.

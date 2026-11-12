@@ -323,7 +323,9 @@ pub fn run(
     session.start(app, &current)?;
     while !app.quit {
         let texts = &current;
-        match incoming.recv() {
+        crate::screens::suggestions::retry_paced_notice(app);
+        backend.send_outbox(&mut app.outbox);
+        match incoming.recv_timeout(std::time::Duration::from_millis(250)) {
             Ok(Incoming::Backend(event)) => {
                 let shown = app.screen;
                 for effect in app.apply(event, texts, Instant::now()) {
@@ -352,7 +354,8 @@ pub fn run(
                     session.start(app, &current)?;
                 }
             }
-            Ok(Incoming::Line(None)) | Err(_) => {
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+            Ok(Incoming::Line(None)) | Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
                 session.input_ended(app, texts)?;
                 app.quit = true;
             }

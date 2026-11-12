@@ -401,6 +401,48 @@
       "remove": "Remove the allowed VPN server {address}"
     },
     "routing": {
+      "dns-compatibility": {
+        "title": "DNS compatibility",
+        "status": {
+          "unchecked": "DNS compatibility has not been verified.",
+          "limited": "Connection restrictions were observed. Check the evidence and DNS settings below.",
+          "needs-recheck": "The previous problem needs a fresh check; recovery is not confirmed.",
+          "verified": "A real connection by the affected program through its required route was verified."
+        },
+        "reason": {
+          "resolver-contact": "Contact with a known DNS endpoint; encrypted DNS use is not established",
+          "our-dns-block": "Our filter blocked a connection to a known DNS endpoint",
+          "strict-browser-dns": "The browser requires encrypted DNS without system DNS fallback",
+          "local-resolver-unavailable": "Our DNS listener, redirect or upstream is unavailable",
+          "secondary-unavailable": "The required additional connection is unavailable",
+          "unknown": "The cause has not been established"
+        },
+        "evidence": { "confirmed": "Observed fact", "suspected": "Needs verification" },
+        "readiness": {
+          "ready": "Ready", "unavailable": "Unavailable", "unchecked": "Not checked",
+          "not-required": "Not required in the selected mode"
+        },
+        "issue": "{program}: {reason} ({evidence}). Attempts: {attempts}; first: {first}; last: {last}.",
+        "resolver": "Our DNS listener: {listener}; system redirect: {redirect}; upstream DNS: {upstream}.",
+        "checked-at": "Last check: {time}",
+        "browser-help": "Configure browser DNS",
+        "check-secondary": "Check additional connection",
+        "secondary-state": "Additional connection: {state}. This does not establish which connection a particular program requires.",
+        "browser-setting": "{browser}: saved DNS mode: {mode}; policy: {policy}; settings: {source}.",
+        "browser-name": {"chrome":"Chrome / Chromium", "edge":"Microsoft Edge", "firefox":"Firefox"},
+        "browser-mode": {"off":"System DNS selected", "automatic":"Encrypted DNS with fallback selected", "secure":"Strict encrypted DNS selected", "unknown":"Could not determine"},
+        "browser-policy": {"detected":"Organization policy detected", "unknown":"Management status could not be verified"},
+        "browser-source": {"local-state":"Saved preference read", "unavailable":"Could not read settings", "unsupported":"Manual instructions available"},
+        "browser-read-only": "Saved preferences do not prove the running browser's effective DNS mode. Automatic changes are unavailable when policy and profile ownership cannot be verified. Follow the instructions, reload the site, and check again; organization policies remain under your administrator's control.",
+        "browser-instructions": "Chrome/Chromium: Settings → Privacy and security → Security → turn off Use secure DNS. Edge: find Secure DNS in Settings and use system DNS. Firefox: Settings → Privacy & Security → DNS over HTTPS → Off. If your organization controls this setting, contact its administrator; do not override its policy. Reload the affected site, then check again. Keep the additional-route rule and leak protection enabled.",
+        "verification-note": "A successful system DNS query does not prove that this browser has recovered. The problem stays visible until fresh browser evidence confirms recovery.",
+        "checking": "Checking DNS; your routing rules remain in force.",
+        "check-failed": "Could not check DNS compatibility.",
+        "browser-verification-unavailable": "This platform cannot confirm the browser's own successful connection yet. Use Check site for a report through the assigned route; a successful system query or service probe does not certify the browser.",
+        "history-incomplete": "Some earlier DNS evidence is no longer available. Full recovery has not been verified; check affected sites individually.",
+        "verify-site": "Choose Check site and start a check for the affected host, then open or reload that host in the affected browser within a minute. A fresh browser connection through the additional route can confirm recovery. Direct or reused connections may remain unverified; the site-check report is separate.",
+        "help-check": "d: Check DNS compatibility"
+      },
       "zone-ip-priority": {
         "label": "Zone vs. IP priority",
         "description": "When a Zone rule and an Exact IP rule both match the same destination, choose which takes priority.",
@@ -497,17 +539,22 @@
       "doh-lockdown": {
         "title": "Block browser DoH/DoT",
         "label": "Block browser DoH/DoT",
-        "note": "Browsers that resolve names over DNS-over-HTTPS (DoH) or DNS-over-TLS (DoT) hide their queries, so routed sites resolved that way bypass your rules and leak protection. Turning this on blocks known encrypted-DNS endpoints so name resolution falls back to plaintext DNS that NetRuleRouter can observe.",
+        "note": "Blocks known encrypted-DNS endpoints. A browser using strict encrypted DNS may stop resolving sites instead of switching to system DNS. Configure that browser to use system DNS; keep the additional-route rule in place.",
         "scope-label": "When to apply",
         "scope-leak-protection-only": "Only while leak protection is active (recommended)",
         "scope-always": "Always",
-        "scope-leak-protection-only-note": "Blocks encrypted DNS only while leak protection blocks all traffic, where DoH would otherwise defeat observation. Leaves DoH working the rest of the time. Recommended.",
-        "scope-always-note": "Blocks encrypted DNS at all times, even when leak protection is off — maximum observability, but it breaks DoH/HTTP-3 for every app and can slow name resolution.",
+        "scope-leak-protection-only-note": "Blocks known encrypted-DNS endpoints while leak protection is set to Routed sites or Everything. With protection off, this manual scope does not block them.",
+        "scope-always-note": "Blocks known encrypted-DNS endpoints even when leak protection is off. Browsers using strict encrypted DNS may need their DNS settings changed.",
         "auto-label": "Decide automatically (recommended)",
         "auto-note": "Blocks encrypted DNS in browsers while your rules need to see site names, so the sites you route or block are seen and handled. Turn this off to set the blocking by hand.",
         "auto-on": "On: your rules route or block sites by name.",
         "auto-off": "Off: none of your rules needs site names.",
-        "details": "Blocking works by denying connections to a known list of DoH/DoT resolver endpoints (edited below). Apps then fall back to the operating system's plaintext DNS, which the observer reads to keep routing and leak protection accurate. Some apps pin their own resolver and may show connection errors until DoH is turned off in their own settings; this does not affect apps that use the system resolver.",
+        "unconfirmed": "Blocking state has not been confirmed by the service.",
+        "manual-disabled": "Blocking inactive: disabled manually.",
+        "manual-always": "Blocking active: manual choice applies at all times.",
+        "manual-protected": "Blocking active: manual choice, leak protection is on.",
+        "manual-waiting": "Blocking inactive: manual choice applies only while leak protection is on.",
+        "details": "Blocking denies connections to the known DoH/DoT endpoints listed below. Browsers that support fallback can then use system DNS. Strict encrypted DNS may instead fail: configure that browser to use system DNS. A blocked resolver address alone does not prove why a particular site failed. The additional-route rule and leak protection remain in force.",
         "resolvers": {
           "manage": "Manage resolver list",
           "hide": "Hide resolver list",
@@ -690,8 +737,8 @@
       "focus": {
         "blocked": "Just blocked: {apps}.",
         "doh-lockdown": {
-          "what": "This switch keeps programs from using DNS servers of their own, so every name lookup goes through NetRuleRouter and your domain rules can see it.",
-          "when-safe": "Turning it off is safe if this program does not open the sites your rules route: its lookups will then simply go past your domain rules. Leave it on if you rely on leak protection for everything."
+          "what": "Blocks known encrypted-DNS endpoints so domain rules can observe system DNS. A browser using strict encrypted DNS may need its DNS settings changed before sites open.",
+          "when-safe": "To restore DNS without bypassing domain rules, configure the browser to use system DNS. Disabling this block may let name lookups bypass your rules; it does not confirm that the additional connection works."
         },
         "leak-protection": {
           "what": "With leak protection set to Everything, IPv6 goes out only through the additional connection: while that connection is down or carries no IPv6, IPv6 waits. With Routed sites, only the IPv6 addresses of your routed sites are held, and only while the additional connection carries no IPv6.",
@@ -1141,6 +1188,19 @@
       "detail-no-tray": "Start the tray icon so your rules work.",
       "detail-no-rules": "Add rules in the Rules section, then press Apply.",
       "detail-disconnected": "This is an example view. Install and start the NetRuleRouter service so your rules work."
+    },
+    "readiness": {
+      "service-healthy": "Service: healthy",
+      "service-unhealthy": "Service: needs attention",
+      "primary": "Main connection: {state}",
+      "secondary": "Additional connection: {state}",
+      "role-ready": "ready",
+      "role-not-required": "not needed by current rules",
+      "role-not-chosen": "not selected",
+      "role-not-ready": "not ready",
+      "role-unknown": "unknown",
+      "affected-assignments": "Active assignments affected: {count}",
+      "affected-unknown": "Active assignments affected: unknown"
     },
     "pause": {
       "until-restart": "until restart"
@@ -1727,6 +1787,7 @@
       "protection-title": "Protection",
       "protection-description": "Recommended for everyone. Each of these can be changed later in Settings.",
       "protection-doh-lockdown": "Keep browsers from resolving routed sites past NetRuleRouter",
+      "protection-doh-lockdown-note": "A browser using strict encrypted DNS may stop opening sites while this protection is active. Configure that browser to use system DNS; keep your routing rules and leak protection enabled.",
       "protection-fake-ip": "Route sites by name, so an address shared with another site is not dragged along (uses a virtual network adapter; on Windows this loads its Wintun driver)",
       "protection-diagnostic-logs": "Write detailed diagnostic logs (only needed to report a problem)",
       "protection-mute-block-notices": "Do not show notifications about blocked traffic (rule suggestions still arrive)",
@@ -1737,7 +1798,7 @@
       "primary-adapter-placeholder": "Choose a connection",
       "primary-adapter-assign": "Set as main",
       "primary-adapter-unavailable": "No connections to choose from yet — the background service reports them once it is running. You can set this later in Connections.",
-      "secondary-adapter-description": "The connection your rules send traffic to — a VPN or a second network. Rules that name it do nothing until it is assigned.",
+      "secondary-adapter-description": "The connection your rules send traffic to — a VPN in TUN mode or a second network. System proxy mode does not create a connection NetRuleRouter can route through.",
       "secondary-adapter-assigned": "Additional connection: {name}. You can change it later in Connections.",
       "secondary-adapter-assigned-down": "Additional connection: {name} — chosen, not connected yet. Your rules use it as soon as it connects. You can change it later in Connections.",
       "other-countries": "Rule set of another country",
@@ -1762,6 +1823,8 @@
       "secondary-adapter-just-connected": "Just connected: {name} — probably your VPN.",
       "secondary-adapter-just-connected-program": "Just connected: {name} — probably your VPN ({program}).",
       "secondary-adapter-deferred": "You can assign it any time in Connections. Until then, with leak protection on, the traffic your rules send that way is blocked instead of leaking to the main connection.",
+      "finish-secondary-not-chosen": "These starting rules use the additional connection. Turn on your VPN in TUN mode, refresh the list, and choose the connection. System proxy mode does not create a connection NetRuleRouter can route through.",
+      "finish-secondary-unavailable": "These starting rules use the additional connection, but it is not connected. Turn on your VPN in TUN mode and refresh the list. System proxy mode is not a routable connection in this version.",
       "step-of": "Step {step} of {total}: {name}",
       "step-rules": "Starting rules",
       "step-options": "Protection and options",
@@ -2180,7 +2243,7 @@
     "auto-rules-suggest": "Suggested addresses will wait for your confirmation.",
     "auto-rules-auto": "Suggested addresses will be added to your rules automatically.",
     "auto-rules-failed": "Could not update the auto-rules setting: ",
-    "doh-lockdown-on": "Browser DoH/DoT blocking enabled: DNS falls back to plaintext so routed sites are seen.",
+    "doh-lockdown-on": "Browser DoH/DoT blocking enabled. Browsers using strict encrypted DNS may need their DNS settings changed.",
     "doh-lockdown-off": "Browser DoH/DoT blocking disabled.",
     "doh-lockdown-auto": "Browser DoH/DoT blocking now decides itself: on while your rules need to see site names.",
     "doh-lockdown-scope-set": "DoH/DoT blocking scope updated.",
@@ -2274,6 +2337,9 @@
       "other": "Other"
     },
     "role-explanation": "The main connection is your usual internet. The additional connection (e.g. VPN) carries what your rules send to it.",
+    "secondary": {
+      "system-proxy-note": "A VPN in system proxy mode does not create a network connection NetRuleRouter can assign. Use the VPN's TUN mode when you want rules to use it as the additional connection."
+    },
     "fail-closed": {
       "banner-title": "Leak protection is blocking traffic",
       "banner-body": "The additional connection is unavailable. What your rules send through it is blocked for now instead of leaking through the main connection."
@@ -2766,12 +2832,100 @@
       }
     },
     "suggestions": {
+      "episode": {
+        "title": "Why no site suggestion?",
+        "intro": "Recent decisions for your connections. A TCP or TLS response alone does not prove that a page loaded. You can check a domain even when its name was not observed.",
+        "enter-host": "Enter a site domain",
+        "empty": "No recent discovery evidence is available. This does not establish whether the site works. Enter its domain to check it.",
+        "unknown-host": "Site name unknown",
+        "state-unknown": "State unavailable",
+        "reason-unknown": "No further detail is available.",
+        "limitation-unknown": "An observation capability is unavailable on this platform.",
+        "omitted": "{count} older episodes are no longer retained.",
+        "queue": {
+          "ahead": "Your queued checks ahead: {count}.",
+          "pause": "Pause before another check: at least {seconds} s.",
+          "snapshot": "At the last update. This is not a start or completion estimate.",
+          "started": "Last check started: {time}.",
+          "previous": "Retained check result at {time}: {result}",
+          "previous-absent": "No previous check result is retained in this history.",
+          "wait": {
+            "resources": "Waiting for space to track automatic checks. This check stays queued.",
+            "rate": "Waiting for the automatic check rate limit.",
+            "workers": "Waiting for other automatic checks to finish.",
+            "cooldown": "Waiting for this site's repeat-check pause.",
+            "ahead": "Waiting behind your earlier queued checks.",
+            "scheduled": "Waiting for the next automatic check."
+          }
+        },
+        "state": {
+          "not-created": "No offer created",
+          "deferred": "Deferred",
+          "hidden": "Hidden",
+          "ready": "Ready to offer",
+          "delivered": "Delivered to a client surface"
+        },
+        "reason": {
+          "name-unknown": "The service could not identify the site name. Enter its domain to check it.",
+          "name-ambiguous": "Several site names share this address. The service cannot safely choose one.",
+          "insufficient-evidence": "There is not enough repeated failure evidence yet.",
+          "primary-responds": "The main connection answered the probe. This does not prove that the HTTPS page loaded.",
+          "connection-reset": "A connection reset was observed. Repeated failures still need confirmation.",
+          "close-unknown": "The connection closed for an unknown reason. A successful page load is not established.",
+          "own-block": "NetRuleRouter blocked this connection. It is not counted as an external failure.",
+          "already-covered": "An existing rule already covers this destination.",
+          "user-dismissed": "You asked not to suggest this site again.",
+          "discovery-disabled": "Site suggestions are turned off.",
+          "no-active-rules": "Discovery has no active rule book to evaluate.",
+          "rules-unavailable": "Waiting for the rule set to become available. No probe is sent until it can be evaluated.",
+          "default-secondary": "The default route already uses the additional connection.",
+          "platform-infrastructure": "This connection belongs to network infrastructure rather than a site offer.",
+          "pulled-in": "This was a background resource loaded by another site, not a site you opened.",
+          "auto-probe-disabled": "Automatic connection checks are off. The additional connection has not been verified.",
+          "probe-pending": "The connection check has not finished.",
+          "probe-queued": "The site is queued for an automatic check. It will start when capacity is available, if DNS evidence and your permissions remain valid.",
+          "probe-inconclusive": "The connection check did not produce a reliable result.",
+          "http-answered": "An HTTPS request returned a response on the checked connection. This does not certify the browser page.",
+          "http-no-answer": "No usable HTTPS response was received on the checked connection.",
+          "http-client-error": "The server returned an HTTP access or request error. This is not proof of a network block.",
+          "http-server-error": "The server returned an HTTP server error. This is not proof of a network block.",
+          "certificate-untrusted": "The HTTPS certificate was not trusted on the checked connection. No successful page response was confirmed; the routing rule remains in force.",
+          "scope-unconfirmed": "The observed names do not establish that the whole domain fails. A fresh check of the exact name is required.",
+          "own-process": "This is NetRuleRouter's own service traffic. It is not used to learn application rules or browser outcomes.",
+          "probe-cooldown": "This site was checked recently. The next automatic check is delayed.",
+          "probe-budget-exhausted": "The automatic check limit for this period has been reached.",
+          "probe-memory-limit": "The automatic check queue is full. This check was not started.",
+          "probe-workers-busy": "All automatic check workers are busy. This check was not started.",
+          "probe-start-failed": "The automatic check could not be started.",
+          "probe-no-address": "No address was available for the domain you entered. The connection check could not start.",
+          "https-unconfirmed": "The connection check answered, but a successful HTTPS page response has not been established.",
+          "secondary-unavailable": "The additional connection is unavailable.",
+          "secondary-failed": "The site did not answer the additional connection check.",
+          "offer-ready": "An offer is ready for review.",
+          "no-subscriber": "No client was connected to receive the offer. It remains available when a client reconnects.",
+          "awaiting-client": "A client received the offer but has not reported displaying it yet.",
+          "notification-pacing": "The notification is deferred by the time limit between notices.",
+          "notifications-muted": "Notifications are muted. The offer remains in Suggested addresses.",
+          "client-busy": "The client is showing another notice. This offer has not been shown yet.",
+          "client-filter": "The client filtered this offer from its current notice.",
+          "shown": "A client surface reported that it presented this offer.",
+          "expired": "The discovery episode expired.",
+          "capacity-limit": "Older evidence was dropped to keep discovery memory bounded.",
+          "unsupported-observation": "This platform cannot observe this kind of connection failure."
+        },
+        "limitation": {
+          "os-dns-cache-unavailable": "This platform cannot read the system DNS cache. Browser cache or encrypted DNS may leave the site name unknown.",
+          "passive-reset-unavailable": "Passive connection reset observation is unavailable on this platform.",
+          "discovery-identity-unavailable": "Recent discovery evidence cannot be recorded because a private session identity could not be created. Routing and suggestions continue to work."
+        }
+      },
       "body": "Without these addresses the sites in your rules may not work fully. Checked ones will be added to your rules.",
       "open": "Review",
       "rejected": {
         "restore": "Allow again"
       },
       "inbox": {
+        "proposed-hosts": "Proposed names: {hosts}",
         "add-any-zone": "Add {site}.*",
         "any-zone": "The same site in another zone: it can be added as {site}.* instead, every zone at once.",
         "nav-label": "Suggested addresses",
@@ -2814,18 +2968,18 @@
         "sort-main-route": "What the main connection can't reach first",
         "action-check-main-route-busy": "Checking...",
         "action-check-main-route-tooltip": "Tries to reach these addresses over the main connection and marks what it finds. Answering there does not mean the site works there — it only means the address is reachable.",
-        "behavior-responds-refusing": "the main connection reaches it, but the site refuses addresses there",
+        "behavior-responds-refusing": "the main connection reaches this host; the linked site is marked as refusing addresses",
         "mark-refusing": "This site refuses addresses on the main connection",
-        "mark-refusing-tooltip": "Use this when the site opens over the main connection but answers that your address is not served. Its addresses then keep being offered even though they are reachable.",
+        "mark-refusing-tooltip": "Record an access refusal by the selected site. This mark does not override successful main-connection evidence for another host. Check the specific site to distinguish an HTTP refusal from a connection failure.",
         "show-dismissed": "Show answered ({n})",
         "show-dismissed-tooltip": "Also list the addresses you told the app not to suggest again, so you can change your mind about one.",
         "empty-but-answered": "Nothing is waiting for an answer. {n} address(es) you answered earlier are hidden — turn on \"Show answered\" to revisit one.",
         "show-served-by-main-link": "Show ones the main connection already handles ({n})",
-        "show-served-by-main-link-tooltip": "These addresses answer over your main connection, so sending them through the additional one changes nothing. They are listed for completeness, not as work.",
+        "show-served-by-main-link-tooltip": "These hosts have positive evidence on the main connection and are hidden from pending work. That does not certify the browser page. Check the specific site if it still fails.",
         "ownership-third-party": "a third-party service the site pulls in",
         "ownership-own-name": "one of the site's own names",
         "less-certain": "less certain",
-        "empty-served-by-main-link": "Connections to these {n} address(es) complete over your main connection. If a site still refuses to open, what you are seeing is not a routing failure — the traffic gets through, so a rule here would not change it."
+        "empty-served-by-main-link": "These {n} hosts have answered on the main connection and are hidden from pending work. A connection response does not certify the browser page. Check the specific site if it still fails; the report distinguishes HTTP refusals from connection failures."
       },
       "table": {
         "intro": "Every address below was pulled in by a site you route. Adding one <b>sends it through the additional connection together with the site that needs it</b> — <i>anything you leave alone keeps going through the main connection</i>. A dismissed address <i>only stops being offered</i>; \"Allow again\" lifts that suppression and nothing else.",
@@ -2837,6 +2991,7 @@
         "reload-page": "The rule is applied. Reload the page you were on (F5) so it takes effect."
       },
       "less-certain": {
+        "scope-unconfirmed": "the scope of this old proposal has not been confirmed; check the exact name before adding a rule",
         "brand-seen-once": "named like {site}, seen once"
       }
     },
@@ -3129,20 +3284,27 @@
       "detail-observations": "seen in {count} visits",
       "detail-affinity": "belongs to this site {percent}% of the time",
       "signal": {
+        "http-path-reachability": "an HTTPS request failed on the main connection and answered on the additional connection; review this exact name before adding a rule. The browser page has not been verified",
         "brand-related": "shares a name with the site",
         "delivery-name": "looks like a delivery address of the site",
         "co-activity": "keeps appearing together with the site",
         "placeholder-answer": "your provider answered with an address nothing can be reached at",
         "app-main-link-blocked": "most of the addresses it reached for on the main connection kept failing, and none of its traffic goes over the additional connection yet",
         "app-own-resolver": "it looks up site names on its own, so rules by site name do not reach it",
-        "main-link-blocked": "connections to it kept failing on the main connection and none went through"
+        "main-link-blocked": "connections to it kept failing on the main connection and none went through",
+        "shared-address-reachability": "an independent TLS check of this DNS name failed on the main connection and passed on the additional connection; its IP is shared, so the browser's destination is uncertain. Add it only if you need this site"
       },
       "reach": {
-        "confirmed": "it opens over the additional connection",
+        "confirmed": "the connection check passed over the additional connection; page loading has not been verified",
         "unconfirmed": "the additional connection may help",
-        "unreachable": "it does not open over the additional connection either"
+        "unreachable": "the connection check failed over the additional connection too"
       },
       "title-blocked": "Sites the main connection will not carry",
+      "title-shared-address": "Checked names on a shared address",
+      "title-http-path": "HTTPS answers differ between connections",
+      "new-rows-pending": "Newly arrived rows stay pending unless you select them.",
+      "body-http-path": "An HTTPS request to these names failed on the main connection and answered on the additional connection. Review the names before adding a rule; this check does not verify the browser page.",
+      "body-shared-address": "These DNS names passed the TLS check only over the additional connection. The shared address does not identify which site you opened. Review the names before adding a rule; page loading has not been verified.",
       "body-blocked": "Connections to {name} keep failing on the main connection.",
       "title-app-blocked": "Programs the main connection will not carry",
       "body-app-blocked": "Most connections of {name} fail on the main connection.",
@@ -3197,7 +3359,7 @@
     "site-not-opening": {
       "title": "A site does not open",
       "body-unconfirmed": "{host} does not open over the main connection; the additional connection may help.",
-      "body-confirmed": "{host} does not open over the main connection, but opens over the additional connection."
+      "body-confirmed": "{host} keeps failing on the main connection. The connection check passed over the additional connection; page loading has not been verified."
     }
   },
   "diag": {
@@ -3331,7 +3493,9 @@
         "conn-trace": "Connection trace",
         "decision-engine": "Rule decisions",
         "diagnostics": "Diagnostics",
+        "discovery": "Site suggestion decisions",
         "dns": "DNS",
+        "dns-compatibility": "DNS compatibility",
         "dns-observe": "DNS observation",
         "dns-redirect": "DNS redirect",
         "dns-resolver": "DNS resolver",
@@ -3599,6 +3763,7 @@
         "block": "Blocked",
         "block-by-nrr": "Blocked (NetRuleRouter)",
         "block-by-other": "Blocked (another program)",
+        "block-by-unknown": "Blocked (owner could not be verified)",
         "unknown": "—"
       },
       "proto": {
@@ -3629,6 +3794,23 @@
       "input-required": "Enter a site name to check",
       "failed": "Could not check the site: ",
       "no-address": "address not known: not opened lately",
+      "route-unknown": "Required connection could not be determined",
+      "revision": "Rules revision: {revision}",
+      "rule": "Rule: {rule}",
+      "fake-address": "Virtual address: {address}",
+      "real-addresses": "Known real addresses: {addresses}",
+      "not-run": {
+        "probe-unavailable": "The HTTPS check could not run because local connection setup failed. This is not evidence that the site is blocked; restore the assigned connection and retry.",
+        "application-context-required": "Not sent: application rules may assign a different connection. The browser context is not confirmed; its additional-route rule remains in force.",
+        "rules-unavailable": "Not sent: the active rule set is unavailable. Retry once the service has loaded it.",
+        "route-context-required": "Not sent: the permitted connection could not be confirmed. Check the assigned connections and retry.",
+        "unknown": "The check was withheld; the routing rule remains in force."
+      },
+      "dns": {
+        "cached": "DNS: cached addresses only; fresh resolution has not been verified",
+        "not-observed": "DNS: no usable address observed; DNS failure has not been established",
+        "unavailable": "DNS: the local resolver is unavailable"
+      },
       "status": "answer {code}",
       "redirects": "sends on to {hosts}",
       "move": "Move the sign-in names to the site's connection…",
@@ -3639,6 +3821,7 @@
       },
       "answer": {
         "answered": "answers",
+        "https-unconfirmed": "the connection answered, but no HTTPS page response was confirmed",
         "certificate-untrusted": "certificate not trusted on this connection",
         "silent": "does not answer",
         "unclear": "could not be checked",
@@ -3648,8 +3831,8 @@
       },
       "verdict": {
         "fine": {
-          "title": "The network is fine: the site answers over your connection",
-          "body": "Its names answer over the connections your rules give them. A page that keeps reloading or a sign-in that goes in circles is then usually caused by the site's cookies in the browser."
+          "title": "The site answers over its assigned connection",
+          "body": "The known addresses answer over the connections your rules give them. This does not verify a fresh DNS lookup or the browser's connection. Reload the site in the browser; if sign-in keeps looping, its cookies may be the cause."
         },
         "sign-in-split": {
           "title": "The site's sign-in goes over a different connection than the site",
@@ -3657,11 +3840,11 @@
         },
         "certificate-untrusted": {
           "title": "The site's certificate is not trusted on this connection",
-          "body": "The site answers, but with a certificate the public certificate authorities do not vouch for: something between this computer and the site answers in its place, often an antivirus that scans encrypted traffic or a network filter. Sites can refuse to sign you in through it. Check the HTTPS scanning settings of your antivirus, or open the site over the other connection."
+          "body": "The certificate could not be verified on the assigned connection. Check the site's certificate, system clock and HTTPS inspection settings. Keep the site's routing rule in force while investigating."
         },
         "not-answering": {
           "title": "The site does not answer over its connection",
-          "body": "Nothing gets through to the site over this connection. The connection trace shows what its connections did; if the main connection keeps failing for it, Suggested addresses may offer to send it over the other connection."
+          "body": "The site did not answer on its assigned connection. This measurement cannot distinguish a server outage from a failure along the path. Check the connection trace and retry after restoring the assigned connection; the rule remains in force."
         },
         "route-down": {
           "title": "The connection the site uses is not working",
@@ -3672,8 +3855,20 @@
           "body": "A deny rule in your rules holds the site, so nothing is sent to it. Change or remove that rule in Rules if the site should open."
         },
         "unclear": {
-          "title": "Nothing could be checked",
-          "body": "No address is known for the site yet. Open it in the browser once, then check again."
+          "title": "The check is inconclusive",
+          "body": "The check has no conclusive result. Each name below shows its known address and why it was not checked or did not yield a result. Retry after restoring the required connection; the routing rule remains in force."
+        },
+        "dns-unavailable": {
+          "title": "DNS is unavailable",
+          "body": "The local resolver is known unavailable. A successful connection to a cached address does not restore name resolution. Use the DNS compatibility check, then reload the site and check again; its routing rule remains in force."
+        },
+        "server-error": {
+          "title": "The server returned an error",
+          "body": "The site answered over its assigned connection with a server error. Its response code is shown below. Retry later or contact the site; this result does not require changing the routing rule."
+        },
+        "http-refused": {
+          "title": "The server refused the HTTPS request",
+          "body": "An HTTP error response arrived over the assigned connection; its code is shown below. This is not a connection reset or proof of a network block. Check the site's access restrictions and retry in the browser. The routing rule remains in force."
         }
       },
       "cookies": {
@@ -3681,7 +3876,7 @@
         "chrome": "Chrome: click the icon left of the address, open \"Cookies and site data\", then \"Manage on-device site data\", and delete the site's entries.",
         "edge": "Edge: click the icon left of the address, open \"Cookies and site data\", and delete the site's cookies.",
         "firefox": "Firefox: click the padlock left of the address and choose \"Clear cookies and site data…\".",
-        "note": "NetRuleRouter never reads or changes browser data."
+        "note": "NetRuleRouter does not read or change your cookies."
       }
     },
     "explain": {
@@ -3871,7 +4066,7 @@
       "principal-authority-unavailable": "Could not determine who is currently logged in ({reason}); policy was left exactly as it was — this does not mean nobody is present.",
       "principal-enforcement-failed": "Policy could NOT be applied ({reason}); the rules on file are not currently in effect.",
       "principal-policy-removed-on-stop": "Policy was removed on stop; this pass installed nothing.",
-      "connobs-app-pin-withdrawn": "Withdrew destination {destination} that application {owner} had pinned, because {intruder} was also using it; the address returns to the main link for all applications.",
+      "connobs-app-pin-withdrawn": "Application {owner} no longer pins destination {destination}, because {intruder} was also using it. Leak protection and explicit routing rules still apply.",
       "connobs-outbound-connection-observed": "Observed an outbound connection: process {process}, protocol {proto}, remote {remote}, egress {egress}, verdict {verdict}.",
       "connobs-stale-pin-repeat-drop": "A destination pin is still dropping already-torn-down connections ({count}); the application is retrying with a pre-rule address and needs a fresh DNS lookup.",
       "connobs-stale-pin-live-secondary-drop": "A destination pin dropped {count} connection(s) while the additional link was usable; a socket predating the pin was stuck on the wrong link and has been torn down.",
@@ -3999,6 +4194,8 @@
       "svc-dns-fakeip-wintun-unavailable": "Fake-IP was requested, but the Wintun driver is unavailable — the feature stays off.",
       "svc-dns-fakeip-tun-open-failed": "Fake-IP: could not open the virtual network adapter — the feature stays off: {error}.",
       "svc-dns-fakeip-no-route-coordinator": "No route coordinator available — fake-IP relay traffic is unbound and follows the system's default route.",
+      "svc-dns-fakeip-pool-collision": "Fake-IP stays off because its address pool overlaps local subnet {destination}/{prefix_len}.",
+      "svc-dns-fakeip-pool-inspect-failed": "Fake-IP could not verify that its address pool is free; the feature stays off and will retry. Error: {error}",
       "svc-dns-fakeip-selfheal-persist-failed": "Failed to save a VPN self-heal exception — it will be re-learned next session: {error}.",
       "svc-dns-fakeip-selfheal-flush-ok": "Flushed the OS DNS resolver cache after a VPN self-heal exception.",
       "svc-dns-fakeip-selfheal-flush-failed": "Failed to flush the OS DNS resolver cache after a VPN self-heal exception — the client will reconnect on its own TTL: {error}.",
@@ -4278,6 +4475,8 @@
       "persid-plan-kill-switch-active": "Leak protection active: {kill_switch_filters} filter(s) pinning {pinned_addresses} address(es).",
       "persid-plan-secondary-unresolved-fail-closed": "The additional connection could not be found; leak protection holds traffic until it returns ({fail_closed_filters} filter(s)).",
       "persid-plan-secondary-unresolved-heartbeat": "The additional connection is still not found after {elapsed_minutes} minute(s); leak protection keeps holding traffic ({fail_closed_filters} filter(s)).",
+      "persid-plan-secondary-unresolved-no-held-destinations": "The additional connection could not be found. Its {affected_rules} rule(s) cannot be used yet; leak protection currently holds no destinations.",
+      "persid-plan-secondary-unresolved-no-held-destinations-heartbeat": "The additional connection is still not found after {elapsed_minutes} minute(s). Its {affected_rules} rule(s) cannot be used yet; leak protection currently holds no destinations.",
       "persid-plan-standing-filter-alarm": "Standing filter count reached {filters}, above the alarm level (previous peak {previous_peak}): {by_band}.",
       "persid-plan-standing-filter-recovered": "Standing filter count dropped back to {filters}, below the alarm threshold.",
       "persid-plan-machine-filter-alarm": "Standing filters on the computer, all users together, reached {filters} (previous peak {previous_peak}), above the alarm threshold.",
@@ -4461,7 +4660,7 @@
       "dns-listener-modeb-resolves-caught-up": "Local DNS resolver:rule-host resolution is keeping up again — answering from the upstream as usual.",
       "dns-listener-direct-host-parked-suggestion": "{host}, a site outside your rules, is a parked suggestion for the additional route — left there instead of being steered onto the main route.",
       "dns-listener-modeb-direct-host-shared-address": "Local DNS resolver: {host}, a site outside your rules, shares its addresses with an additional-route rule — answered so that it stays on the main route.",
-      "dns-listener-local-resolver-knows-name": "A private resolver on this machine ({server}) knows a name the main upstream reported as non-existent.",
+      "dns-listener-local-resolver-knows-name": "A private resolver on this machine ({server}) supplied an answer missing from the main upstream response.",
       "dns-listener-rule-host-ipv6-uncovered": "Rule host {host} was queried over IPv6, which this rule cannot cover — its IPv6 traffic leaves outside the rule.",
       "dns-listener-modeb-resolve-slots-saturated": "Local DNS resolver:all {concurrent} rule-host resolve slots are waiting on an unresponsive upstream — serving rule hosts from the cache so the rest of the machine's DNS keeps working.",
       "dns-listener-modeb-unrecognised-recv-error": "Local DNS resolver:an unrecognized error occurred while receiving a query ({error}, {consecutive_errors} in a row) — continuing to serve.",
@@ -4555,7 +4754,7 @@
     },
     "outage-blocks": {
       "title": "Blocked while the additional connection was down",
-      "intro": "What leak protection held back while the additional connection was down. Your rules send these addresses there, so they were blocked instead of leaving through the main connection.",
+      "intro": "These connection attempts were blocked because the additional connection required by your rules was unavailable. The list stays available after it returns. Names marked “did not resolve” got no address during the outage, so no connection was made.",
       "episode-active": "The additional connection has been down since {since}.",
       "episode-ended": "The last outage lasted from {since} to {until}.",
       "no-episode": "The additional connection has not been down since the service started.",
@@ -4685,6 +4884,11 @@
     "rules-locked": "Your administrator manages the routing rules on this computer, so they cannot be changed here.",
     "network-covers-link": "The network covers the VPN server or a network this computer is connected to, so routing it would cut the connection its own traffic uses. Choose a network that does not include them.",
     "network-covers-fake-ip-pool": "The network overlaps the address range the program reserves for name-based routing. Choose a different network.",
+    "fake-ip-driver-unavailable": "Name-based routing is unavailable because its virtual-network driver could not be loaded.",
+    "fake-ip-transient": "Name-based routing stopped unexpectedly and will be retried.",
+    "fake-ip-pool-inspect-failed": "Name-based routing stays off because the program could not safely inspect existing routes.",
+    "fake-ip-pool-collision": "Name-based routing stays off because its virtual address range conflicts with an existing local route.",
+    "fake-ip-tun-open-failed": "Name-based routing stays off because its virtual network adapter could not be opened.",
     "network-covers-link-tunnel-server": "The network {network} includes the VPN server {covers}, so routing it would cut the connection its own traffic uses. Choose a network that does not include it.",
     "network-covers-link-local-network": "The network {network} overlaps {covers}, a network this computer is connected to, so routing it would cut the connection its own traffic uses. Choose a network that does not overlap it.",
     "network-covers-fake-ip-pool-named": "The network {network} overlaps the address range the program reserves for name-based routing. Choose a different network.",
@@ -4853,7 +5057,7 @@
         "route-unavailable": "The connection this traffic should have gone through was unavailable.",
         "blocked-by-rule": "A rule denies this connection.",
         "ipv6-blocked": "With leak protection set to Everything, IPv6 goes out only through the additional connection, so this connection did not go out.",
-        "dns-lockdown": "This app went to its own DNS resolver instead of the one NetRuleRouter provides, and encrypted-DNS blocking closed it.",
+        "dns-lockdown": "Our DNS protection blocked a connection to a known resolver endpoint. This does not prove encrypted DNS use or explain a particular site's failure. Check DNS compatibility in Routing settings; keep your routing rules enabled.",
         "unattributed": "NetRuleRouter blocked this connection, but could not identify which filter did it.",
         "unknown": "This connection was blocked."
       },
@@ -5172,6 +5376,7 @@
       "clear-prompt": "Type y to forget them all or n to cancel, then press Enter.",
       "search": "Search",
       "marked": "Marked: {count}.",
+      "episodes-toggle": "e: switch between suggestions and recent decisions explaining their absence",
       "help": {
         "any-zone": "z: add the chosen item as its site in every zone (site.*), when it names one",
         "select": "Enter or Tab: go to the list; Up and Down: choose an item",
@@ -5181,6 +5386,7 @@
         "always": "m: add the chosen item and add suggestions automatically from now on (asks first)",
         "check": "c: check the addresses over the main connection",
         "check-site": "k: for a site you opened that keeps failing, check whether the network or the site is at fault (opens Diagnostics)",
+        "check-entered-site": "h: enter a domain to check, even when no suggestion exists",
         "toggles": "s: show or hide answered addresses; v: show or hide addresses the main connection handles",
         "order": "o: change the order of the list",
         "forget": "f: forget the chosen item with its answer, so it can be offered again; x: forget them all (asks first)",
@@ -5195,6 +5401,7 @@
         "always": "m and an item number: add that item and add suggestions automatically from now on (asks first)",
         "check": "c: check the addresses over the main connection",
         "check-site": "k and an item number: check that site, whether the network or the site is at fault",
+        "check-entered-site": "h and a domain: check that site, even when no suggestion exists",
         "toggles": "s: show or hide answered addresses; v: show or hide addresses the main connection handles",
         "order": "o: change the order of the list",
         "forget": "f and an item number: forget that item with its answer; x: forget them all (asks first)",

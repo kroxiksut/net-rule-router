@@ -249,9 +249,6 @@ pub fn fold_batch(wiring: &AppObservationWiring) -> Fold {
     let mut learnt = 0usize;
     let mut batch = wiring.source.drain();
     if let Some(consumer) = wiring.consumer.as_ref() {
-        if batch.is_empty() {
-            return Fold::default();
-        }
         // A socket table has no clock of its own: the drain time stands in.
         let now = SystemTime::now();
         let now_ms = crate::conn_observation_consumer::now_unix_ms();
@@ -466,6 +463,7 @@ pub fn build_conn_observe_task_reporting(
                         vpn_client_apps_learned = summary.vpn_client_apps_learned,
                         blocked_nrr = summary.blocked_nrr,
                         blocked_foreign = summary.blocked_foreign,
+                        blocked_unknown = summary.blocked_unknown,
                         // Scope-bug indicator; must stay ~0 (see
                         // `ConnConsumeSummary::killswitch_drops_live_secondary`).
                         // The app-pin half is split out separately below since
@@ -496,6 +494,8 @@ pub fn build_conn_observe_task_reporting(
                         hook();
                     }
                 }
+            } else {
+                consumer.consume(&batch, SystemTime::now());
             }
             TaskOutcome::Continue
         },

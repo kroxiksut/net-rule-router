@@ -980,11 +980,9 @@ fn one_failing_subdomain_is_offered_by_its_own_name() {
     assert_eq!(offered, vec!["forum.talk.example".to_string()]);
 }
 
-/// A SECOND failing name under the same domain is evidence the domain is what
-/// is being cut, so the two questions collapse into one and the names they
-/// replace are withdrawn.
+/// Two failed names remain two exact findings, without claiming their parent.
 #[test]
-fn a_second_failing_name_under_one_domain_collapses_into_one_offer() {
+fn a_second_failing_name_under_one_domain_remains_a_separate_exact_offer() {
     let verdicts = Arc::new(Mutex::new(HashMap::new()));
     let f = fixture_with_main_link_verdicts(Arc::clone(&verdicts));
     for host in ["a.blocked.example", "b.blocked.example"] {
@@ -1002,15 +1000,21 @@ fn a_second_failing_name_under_one_domain_collapses_into_one_offer() {
         .into_iter()
         .map(|c| c.proposed_match)
         .collect();
-    assert_eq!(offered, vec!["blocked.example".to_string()], "{offered:?}");
+    let mut offered = offered;
+    offered.sort();
+    assert_eq!(
+        offered,
+        vec![
+            "a.blocked.example".to_string(),
+            "b.blocked.example".to_string()
+        ],
+        "{offered:?}"
+    );
 }
 
-/// The field case, both halves. Two names under one domain fail while the
-/// apex answers — and the offer is still about the domain, because two cut
-/// names prove the domain is what is being cut. One site, one question; the
-/// apex travels with the site it belongs to.
+/// A healthy apex is never included merely because two children fail.
 #[test]
-fn two_failing_names_roll_up_even_though_the_apex_still_answers() {
+fn two_failing_names_leave_the_healthy_apex_out_of_their_exact_offers() {
     let verdicts = Arc::new(Mutex::new(HashMap::new()));
     let f = fixture_with_main_link_verdicts(Arc::clone(&verdicts));
     set_verdict(&verdicts, "talk.example", PrimaryBehavior::Responds);
@@ -1029,7 +1033,16 @@ fn two_failing_names_roll_up_even_though_the_apex_still_answers() {
         .into_iter()
         .map(|c| c.proposed_match)
         .collect();
-    assert_eq!(offered, vec!["talk.example".to_string()], "{offered:?}");
+    let mut offered = offered;
+    offered.sort();
+    assert_eq!(
+        offered,
+        vec![
+            "forum.talk.example".to_string(),
+            "test.talk.example".to_string()
+        ],
+        "{offered:?}"
+    );
 }
 
 /// The pass may find no address for a self-signed offer — the name memory it
@@ -1055,7 +1068,7 @@ fn a_self_signed_offer_is_never_held_waiting_for_a_pass_that_cannot_answer() {
 /// delivery name can complete a connection and still serve a refusal, so
 /// "it answers" does not settle it. Only the self-signed offers are silenced.
 #[test]
-fn a_main_link_answer_does_not_silence_a_companion_of_the_same_brand() {
+fn an_actual_main_link_answer_settles_even_a_companion_of_the_same_brand() {
     let responding = main_link_dto(
         "site.example",
         "cdn.site.example",
@@ -1063,7 +1076,7 @@ fn a_main_link_answer_does_not_silence_a_companion_of_the_same_brand() {
         AUTO_RULE_PRIMARY_BEHAVIOR_RESPONDS,
     );
     assert!(!settled_self_signed(&responding));
-    assert!(!settled_by_the_main_link(&responding));
+    assert!(settled_by_the_main_link(&responding));
 
     let mut self_signed = responding.clone();
     self_signed.anchor = "cdn.site.example".to_string();
@@ -1120,6 +1133,12 @@ fn a_site_that_did_not_open_while_away_is_told_to_its_own_user_on_connect() {
     assert_eq!(announced_sites(&bus, &own), ["forum.talk.example"]);
     assert!(announced_sites(&bus, &other).is_empty());
     assert!(f.engine.candidates(OTHER).is_empty());
+    let shown: Vec<String> = f.engine.candidates(SID).into_iter().map(|c| c.id).collect();
+    assert_eq!(
+        f.engine
+            .record_discovery_feedback(SID, &shown, "delivered", "shown", wall_clock()),
+        1
+    );
     f.engine.tick(SID, wall_clock() + Duration::from_secs(600));
     assert_eq!(
         announced_sites(&bus, &own).len(),

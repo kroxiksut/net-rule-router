@@ -24,6 +24,11 @@ use std::sync::Mutex;
 
 /// Resolve the process that owns the local end of a TCP connection.
 pub trait FlowOwnerLookup: Send + Sync {
+    /// Principal and full program path from the same owning process, when available.
+    fn owner_identity(&self, _local: SocketAddr, _remote: SocketAddr) -> Option<(String, String)> {
+        None
+    }
+
     /// The image name (lower-cased file basename, e.g. `"wireguard.exe"`) of the
     /// process that owns the TCP socket whose local endpoint is `local` and
     /// whose remote endpoint is `remote`, or `None` when it cannot be

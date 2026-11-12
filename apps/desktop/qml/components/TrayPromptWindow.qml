@@ -391,6 +391,10 @@ Window {
 
     /// Corner clearance, matching what the OS leaves around its own toasts.
     readonly property int _screenMargin: 12
+    readonly property real _heightLimit: {
+        var area = _workArea()
+        return area ? Math.max(120, area.height - _screenMargin * 2) : 440
+    }
 
     /// Work area to sit in: the tray icon's own screen, taskbar excluded.
     /// QML's `Screen.desktopAvailable*` spans EVERY monitor, so on a
@@ -442,9 +446,8 @@ Window {
     // ── Window ───────────────────────────────────────────────────────────────
 
     width: 460
-    // Size to content, capped so a long list scrolls instead of growing the
-    // window off-screen.
-    height: Math.min(440, Math.max(120, layout.implicitHeight + _pad * 2))
+    // Keep actions on screen while long explanations and rows can scroll.
+    height: Math.min(_heightLimit, Math.max(120, layout.implicitHeight + _pad * 2))
     minimumWidth: 380
     visible: false
     modality: Qt.NonModal
@@ -515,6 +518,7 @@ Window {
         // the caller supplies no title at all.
         RowLayout {
             Layout.fillWidth: true
+            Layout.minimumHeight: implicitHeight
             spacing: promptWindow._gapSm
 
             Label {
@@ -555,25 +559,47 @@ Window {
             }
         }
 
-        Label {
+        ScrollView {
+            id: bodyScroll
             Layout.fillWidth: true
+            Layout.fillHeight: true
+            Layout.minimumHeight: 0
+            Layout.preferredHeight: bodyLabel.implicitHeight
+            Layout.maximumHeight: bodyLabel.implicitHeight
             visible: promptWindow.bodyText !== ""
-            text: promptWindow.bodyText
-            textFormat: promptWindow.bodyRichText ? Text.StyledText : Text.PlainText
-            color: promptWindow._mutedColor
-            font.pixelSize: promptWindow._baseFontPx
-            wrapMode: Text.WordWrap
-            Accessible.role: Accessible.StaticText
-            // Screen readers get plain text — strip the styling tags used for visual emphasis.
-            Accessible.name: promptWindow.bodyAccessibleText !== ""
-                ? promptWindow.bodyAccessibleText
-                : (promptWindow.bodyRichText ? Pure.markupToPlain(text) : text)
+            clip: true
+            contentWidth: availableWidth
+            contentHeight: bodyLabel.implicitHeight
+            focusPolicy: contentHeight > availableHeight ? Qt.TabFocus : Qt.NoFocus
+            Accessible.name: bodyLabel.Accessible.name
+            ScrollBar.horizontal.policy: ScrollBar.AlwaysOff
+            ScrollBar.vertical.policy: ScrollBar.AsNeeded
+
+            Label {
+                id: bodyLabel
+                // Reserve space for the scrollbar without covering the text.
+                width: Math.max(1, bodyScroll.availableWidth - 18)
+                height: implicitHeight
+                text: promptWindow.bodyText
+                textFormat: promptWindow.bodyRichText ? Text.StyledText : Text.PlainText
+                color: promptWindow._mutedColor
+                font.pixelSize: promptWindow._baseFontPx
+                wrapMode: Text.WordWrap
+                Accessible.role: Accessible.StaticText
+                Accessible.name: promptWindow.bodyAccessibleText !== ""
+                    ? promptWindow.bodyAccessibleText
+                    : (promptWindow.bodyRichText ? Pure.markupToPlain(text) : text)
+            }
         }
 
         // Compact detail list. Height follows the content up to the cap, past
         // which it scrolls — the window itself never grows beyond `height`.
         Rectangle {
             Layout.fillWidth: true
+            Layout.fillHeight: true
+            Layout.minimumHeight: Math.min(Layout.preferredHeight,
+                promptWindow._baseFontPx * 2 + promptWindow._gapSm)
+            Layout.maximumHeight: promptWindow._listMaxHeight
             visible: promptWindow.items.length > 0
             // `contentHeight` measures the rows only; the list is inset by its
             // own margins, so add them back or the last row is clipped.
@@ -750,6 +776,7 @@ Window {
             Layout.fillWidth: true
             Layout.topMargin: promptWindow._gapSm
             Layout.preferredHeight: actionsFlow.height
+            Layout.minimumHeight: actionsFlow.height
             Flow {
                 id: actionsFlow
                 anchors.left: parent.left

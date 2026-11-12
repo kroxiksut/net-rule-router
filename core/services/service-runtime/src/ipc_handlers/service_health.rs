@@ -9,7 +9,8 @@ use crate::ipc::{
     HandlerOutcome, IpcError, IpcErrorCode, IpcHandler, IpcRequestContext, IpcRequestEnvelope,
 };
 use crate::ipc_handlers::payloads::{
-    FakeIpDatapathDto, HealthComponentResponse, ServiceHealthRequest, ServiceHealthResponse,
+    FakeIpDatapathDto, FakeIpFailureDto, HealthComponentResponse, ServiceHealthRequest,
+    ServiceHealthResponse,
 };
 use crate::managers::{HealthReporter, PolicyManager};
 use crate::state::{ServiceHealthSeverity, ServiceRuntimeState};
@@ -83,11 +84,35 @@ pub fn build_service_health_response(
 /// Project the controller's status onto the wire DTO. `zombies` is
 /// saturated into `u32` — the count is bounded by live threads in
 /// practice, so the clamp can never fire outside of pathological input.
-fn fake_ip_datapath_to_dto(status: FakeIpDatapathStatus) -> FakeIpDatapathDto {
+pub(crate) fn fake_ip_datapath_to_dto(status: FakeIpDatapathStatus) -> FakeIpDatapathDto {
     FakeIpDatapathDto {
         desired: status.desired,
         running: status.running,
         zombies: u32::try_from(status.zombies).unwrap_or(u32::MAX),
+        last_failure: status.last_failure.map(fake_ip_failure_to_dto),
+    }
+}
+
+fn fake_ip_failure_to_dto(failure: crate::fake_ip::FakeIpBuildFailure) -> FakeIpFailureDto {
+    use crate::fake_ip::FakeIpBuildFailure;
+
+    let (code, collision) = match failure {
+        FakeIpBuildFailure::Unavailable => ("driver-unavailable", None),
+        FakeIpBuildFailure::Transient => ("transient", None),
+        FakeIpBuildFailure::PoolInspectFailed => ("pool-inspect-failed", None),
+        FakeIpBuildFailure::PoolCollision(collision) => ("pool-collision", Some(collision)),
+        FakeIpBuildFailure::TunOpenFailed => ("tun-open-failed", None),
+    };
+    FakeIpFailureDto {
+        code: code.to_owned(),
+        family: collision.map(|c| c.family.to_owned()),
+        network: collision.map(|c| c.local.network.to_string()),
+        prefix_len: collision.map(|c| c.local.prefix_len),
+        interface_index: collision.and_then(|c| c.local.interface_index),
+        next_hop: collision
+            .and_then(|c| c.local.next_hop)
+            .map(|ip| ip.to_string()),
+        metric: collision.and_then(|c| c.local.metric),
     }
 }
 
@@ -297,6 +322,18 @@ mod tests {
             desired: true,
             running: false,
             zombies: 1,
+            last_failure: Some(crate::fake_ip::FakeIpBuildFailure::PoolCollision(
+                nrr_platform_api::fake_ip::PoolCollision {
+                    family: "ipv4",
+                    local: nrr_platform_api::fake_ip::LocalSubnet::with_route(
+                        "198.18.4.0".parse().unwrap(),
+                        24,
+                        12,
+                        "192.0.2.1".parse().unwrap(),
+                        7,
+                    ),
+                },
+            )),
         });
         let h = h(
             ServiceRuntimeState::Running,
@@ -309,6 +346,24 @@ mod tests {
         assert_eq!(resp["fake-ip-datapath"]["desired"], true);
         assert_eq!(resp["fake-ip-datapath"]["running"], false);
         assert_eq!(resp["fake-ip-datapath"]["zombies"], 1);
+        assert_eq!(
+            resp["fake-ip-datapath"]["last-failure"]["code"],
+            "pool-collision"
+        );
+        assert_eq!(
+            resp["fake-ip-datapath"]["last-failure"]["network"],
+            "198.18.4.0"
+        );
+        assert_eq!(resp["fake-ip-datapath"]["last-failure"]["prefix-len"], 24);
+        assert_eq!(
+            resp["fake-ip-datapath"]["last-failure"]["interface-index"],
+            12
+        );
+        assert_eq!(
+            resp["fake-ip-datapath"]["last-failure"]["next-hop"],
+            "192.0.2.1"
+        );
+        assert_eq!(resp["fake-ip-datapath"]["last-failure"]["metric"], 7);
         let parsed: ServiceHealthResponse = serde_json::from_value(resp).unwrap();
         let datapath = parsed.fake_ip_datapath.expect("probe wired");
         assert!(datapath.desired);

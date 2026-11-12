@@ -38,6 +38,7 @@ pub mod decision_matching;
 pub mod decision_normalization;
 pub mod decision_pipeline;
 pub mod decision_rules_matching;
+pub mod dns_compatibility;
 pub mod enforcement_mode;
 pub mod extension_channel;
 pub mod import;
@@ -65,6 +66,7 @@ pub mod rules_json_codec;
 pub mod rules_revision;
 pub mod shared_ip;
 pub mod storage_policy;
+pub mod suggestion_discovery;
 // Traffic-counter accounting core: per-interface octet deltas bucketed by
 // route role, with reset detection and prime-on-first-sight.
 pub mod traffic_accountant;

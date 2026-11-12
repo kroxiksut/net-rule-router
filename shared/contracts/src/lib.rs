@@ -3,6 +3,8 @@ use std::str::FromStr;
 
 use serde::{Deserialize, Serialize};
 
+pub mod browser_dns_settings;
+
 /// The line a runtime prints when it comes up, and the one naming what that
 /// runtime is responsible for.
 ///

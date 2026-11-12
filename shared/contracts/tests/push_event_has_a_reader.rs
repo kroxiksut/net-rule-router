@@ -1,13 +1,5 @@
-//! Every push event the service publishes has a reader on every client surface
-//! that is meant to act on it: the main window, the tray and the terminal UI.
-//!
-//! A push nobody reads fails silently — the service is right, the log shows the
-//! publish, and the user sees nothing. The slug list comes from serde's own
-//! variant table, so a new `StatusUpdateEvent` variant joins this gate without
-//! anyone remembering to add it; the table below then has to say, per surface,
-//! whether the event is read, deliberately ignored (and why), or a known gap.
-//! The known-gap entries can only shrink: closing one turns this red until the
-//! entry becomes `Read`.
+//! A push without a reader silently leaves the user with stale state.
+//! Serde's variant list holds each surface to an explicit reader or exemption.
 
 use std::path::{Path, PathBuf};
 
@@ -41,6 +33,12 @@ const NO_SETTINGS_IN_TRAY: Duty =
 /// Event × surface. One row per `StatusUpdateEvent` variant, plus the client's
 /// own `push-gap` marker (see `CLIENT_MARKERS`).
 const TABLE: &[Row] = &[
+    Row {
+        slug: "dns-compatibility-changed",
+        gui: Read,
+        tray: Ignored("DNS compatibility is reviewed in the window or terminal settings"),
+        tui: Read,
+    },
     Row {
         slug: "protection-coverage-changed",
         gui: Read,
