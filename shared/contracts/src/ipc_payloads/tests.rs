@@ -1143,6 +1143,7 @@ fn auto_rule_signal_slugs_are_pinned() {
             "placeholder-answer",
             "main-link-blocked",
             "shared-address-reachability",
+            "http-path-reachability",
             "app-main-link-blocked",
             "app-own-resolver"
         ]

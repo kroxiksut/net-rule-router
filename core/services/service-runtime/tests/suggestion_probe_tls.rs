@@ -11,6 +11,7 @@ use nrr_service_runtime::ipc_handlers::providers::AutoRuleProbeRunner;
 use nrr_service_runtime::path_probe::{PathProbe, PathProber, PathVerdict, ProbeLimits};
 use nrr_service_runtime::per_sid_orchestrator::{ActiveRulesSnapshot, RulesProvider};
 use nrr_service_runtime::production_auto_rule_probe::{EgressSources, ProductionAutoRuleProbe};
+use nrr_service_runtime::site_check::{HeadFailure, HttpsHead};
 
 const OWNER: &str = "S-1-5-21-3212-3001";
 const MAIN: Ipv4Addr = Ipv4Addr::new(192, 0, 2, 10);
@@ -31,6 +32,33 @@ impl EgressSources for Links {
 struct TcpAnswersButTlsResets {
     tcp: AtomicUsize,
     secondary_tls: AtomicUsize,
+}
+#[derive(Default)]
+struct HttpByRoute {
+    primary: AtomicUsize,
+    secondary: AtomicUsize,
+    primary_answers: bool,
+}
+impl HttpsHead for HttpByRoute {
+    fn fetch(
+        &self,
+        _: Ipv4Addr,
+        _: &str,
+        source: Ipv4Addr,
+        _: &[u8],
+        _: Duration,
+    ) -> Result<Vec<u8>, HeadFailure> {
+        if source == SECONDARY {
+            self.secondary.fetch_add(1, Ordering::AcqRel);
+            return Ok(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n".to_vec());
+        }
+        self.primary.fetch_add(1, Ordering::AcqRel);
+        if self.primary_answers {
+            Ok(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n".to_vec())
+        } else {
+            Err(HeadFailure::NoAnswer)
+        }
+    }
 }
 impl PathProbe for TcpAnswersButTlsResets {
     fn probe(&self, _: Ipv4Addr, _: u16, _: Option<Ipv4Addr>, _: Duration) -> PathVerdict {
@@ -74,6 +102,7 @@ fn tcp_connect_cannot_cancel_a_suggestion_for_a_hostname_whose_tls_is_reset() {
         vec![Ipv4Addr::new(203, 0, 113, 31)],
     );
     let mechanism = Arc::new(TcpAnswersButTlsResets::default());
+    let https = Arc::new(HttpByRoute::default());
     let runner = ProductionAutoRuleProbe::over(
         Arc::clone(&engine),
         cache,
@@ -81,11 +110,12 @@ fn tcp_connect_cannot_cancel_a_suggestion_for_a_hostname_whose_tls_is_reset() {
         Arc::new(PathProber::new(mechanism.clone())),
         Arc::new(|_| ProbeLimits::default()),
     )
-    .with_secondary_prober(Arc::new(PathProber::new(mechanism.clone())));
+    .with_secondary_prober(Arc::new(PathProber::new(mechanism.clone())))
+    .with_https(Some(https.clone()));
     assert_eq!(runner.probe(OWNER, &[], &[]).accepted, 1);
     let deadline = Instant::now() + Duration::from_secs(3);
-    while mechanism.tcp.load(Ordering::Acquire) == 0
-        && mechanism.secondary_tls.load(Ordering::Acquire) == 0
+    while https.primary.load(Ordering::Acquire) == 0
+        && https.secondary.load(Ordering::Acquire) == 0
     {
         assert!(Instant::now() < deadline, "hostname probe failed to finish");
         std::thread::sleep(Duration::from_millis(1));
@@ -106,7 +136,7 @@ fn tcp_connect_cannot_cancel_a_suggestion_for_a_hostname_whose_tls_is_reset() {
         );
         std::thread::sleep(Duration::from_millis(1));
     }
-    assert_eq!(mechanism.secondary_tls.load(Ordering::Acquire), 1);
+    assert_eq!(https.secondary.load(Ordering::Acquire), 1);
 }
 
 #[test]
@@ -165,16 +195,21 @@ fn a_working_tls_site_is_not_announced_before_automatic_confirmation_finishes() 
     let mechanism = Arc::new(nrr_service_runtime::path_probe::MockPathProbe::new(
         PathVerdict::Answered,
     ));
+    let https = Arc::new(HttpByRoute {
+        primary_answers: true,
+        ..HttpByRoute::default()
+    });
     let runner = ProductionAutoRuleProbe::over(
         Arc::clone(&engine),
         cache,
         Arc::new(Links),
         Arc::new(PathProber::new(mechanism.clone())),
         Arc::new(|_| ProbeLimits::default()),
-    );
+    )
+    .with_https(Some(https.clone()));
     assert_eq!(runner.probe(OWNER, &[], &[]).accepted, 1);
     let deadline = Instant::now() + Duration::from_secs(3);
-    while mechanism.attempts().is_empty() || !engine.candidates(OWNER).is_empty() {
+    while https.primary.load(Ordering::Acquire) == 0 || !engine.candidates(OWNER).is_empty() {
         assert!(
             Instant::now() < deadline,
             "TLS recovery must clear the pending offer"
@@ -217,13 +252,18 @@ fn a_verified_tls_answer_replaces_old_failure_only_for_the_checked_user() {
     let mechanism = Arc::new(nrr_service_runtime::path_probe::MockPathProbe::new(
         PathVerdict::Answered,
     ));
+    let https = Arc::new(HttpByRoute {
+        primary_answers: true,
+        ..HttpByRoute::default()
+    });
     let runner = ProductionAutoRuleProbe::over(
         Arc::clone(&engine),
         cache,
         Arc::new(Links),
         Arc::new(PathProber::new(mechanism)),
         Arc::new(|_| ProbeLimits::default()),
-    );
+    )
+    .with_https(Some(https));
     assert_eq!(runner.probe(OWNER, &[], &[]).accepted, 1);
     let deadline = Instant::now() + Duration::from_secs(3);
     while registry.behavior_of(OWNER, HOST) != PrimaryBehavior::Responds
@@ -266,6 +306,7 @@ fn a_single_silent_primary_probe_does_not_create_a_verified_failure_epoch() {
     let cache = Arc::new(MockFqdnCacheLookup::new());
     cache.set_ips(HOST, vec![Ipv4Addr::new(203, 0, 113, 34)]);
     let mechanism = Arc::new(TcpAnswersButTlsResets::default());
+    let https = Arc::new(HttpByRoute::default());
     let runner = ProductionAutoRuleProbe::over(
         Arc::clone(&engine),
         cache,
@@ -273,7 +314,8 @@ fn a_single_silent_primary_probe_does_not_create_a_verified_failure_epoch() {
         Arc::new(PathProber::new(mechanism.clone())),
         Arc::new(|_| ProbeLimits::default()),
     )
-    .with_secondary_prober(Arc::new(PathProber::new(mechanism.clone())));
+    .with_secondary_prober(Arc::new(PathProber::new(mechanism.clone())))
+    .with_https(Some(https.clone()));
     assert_eq!(runner.probe(OWNER, &[], &[]).accepted, 1);
     let deadline = Instant::now() + Duration::from_secs(3);
     while engine
@@ -287,6 +329,6 @@ fn a_single_silent_primary_probe_does_not_create_a_verified_failure_epoch() {
         );
         std::thread::sleep(Duration::from_millis(1));
     }
-    assert_eq!(mechanism.secondary_tls.load(Ordering::Acquire), 1);
+    assert_eq!(https.secondary.load(Ordering::Acquire), 1);
     assert_eq!(registry.behavior_of(OWNER, HOST), PrimaryBehavior::Unknown);
 }
