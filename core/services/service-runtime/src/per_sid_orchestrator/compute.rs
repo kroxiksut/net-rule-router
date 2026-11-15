@@ -16,11 +16,16 @@ pub(super) struct FailClosedPosture {
     pub(super) block_all: bool,
 }
 
-/// Filters the orchestrator currently has installed for one SID.
+/// The last acknowledged filter snapshot and additional cleanup candidates.
 #[derive(Clone, Debug, Default)]
 pub struct PerSidFilterSet {
     pub sid: String,
     pub installed: Vec<WfpFilterId>,
+    /// An unacknowledged commit may have published these additional keys.
+    pub(super) uncertain: Vec<WfpFilterId>,
+    /// A failed abort can leave the session open. Even an unchanged policy
+    /// needs a successful replay before its apply can be reported healthy.
+    pub(super) replay_required: bool,
     /// Destinations the installed set scopes to. Kept so the NEXT install can
     /// name what just came under enforcement — see
     /// [`PerSidApplyOrchestrator::tear_down_flows_to_new_destinations`].
@@ -32,6 +37,18 @@ pub struct PerSidFilterSet {
     /// Rule networks the installed set scopes to, compared like
     /// [`Self::destinations`] to name what just came under enforcement.
     pub networks: Vec<nrr_shared::ip_block::IpBlock>,
+}
+
+impl PerSidFilterSet {
+    pub(super) fn owned_ids(&self) -> Vec<WfpFilterId> {
+        let mut seen = HashSet::new();
+        self.installed
+            .iter()
+            .chain(&self.uncertain)
+            .copied()
+            .filter(|id| seen.insert(id.raw))
+            .collect()
+    }
 }
 
 /// What applying a candidate rule set to one SID would do — derived without
@@ -103,6 +120,9 @@ pub(super) enum ComputedFilterSet {
 /// otherwise have to re-derive (a pre-flight asks for exactly these).
 pub(super) struct ComputedPlan {
     pub(super) filters: Vec<WfpFilterSpec>,
+    /// The routing policy was removed; publish its disarmed posture only
+    /// after the old filters have actually been withdrawn.
+    pub(super) without_route_policy: bool,
     /// App-rule patterns that matched no executable, so their filters were not
     /// built — the rules are stored but enforce nothing.
     pub(super) unresolved_apps: Vec<String>,

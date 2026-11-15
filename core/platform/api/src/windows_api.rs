@@ -20,7 +20,7 @@
 //! the entire apply layer unit-testable without admin rights or a live Windows
 //! installation.
 
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use crate::route_table::RouteTablePort;
 use crate::{
@@ -39,11 +39,7 @@ use crate::{
 pub trait WfpEnginePort: Send + Sync {
     // ── WFP engine ───────────────────────────────────────────────────────────
 
-    /// Open a dynamic (volatile, non-persistent) WFP engine session.
-    /// Wraps `FwpmEngineOpen0(NULL, RPC_C_AUTHN_WINNT, NULL, NULL, &handle)`.
-    ///
-    /// Lifecycle: open at start of each apply, close at end (`per-apply`
-    /// strategy).
+    /// Open the service's non-dynamic WFP engine session.
     fn wfp_engine_open(&self) -> Result<WfpEngineToken, PlatformError>;
 
     /// Close a WFP engine session and release the handle.
@@ -61,7 +57,7 @@ pub trait WfpEnginePort: Send + Sync {
     /// Abort the current WFP transaction. Called on `Drop` of
     /// `WfpTransactionGuard` if not already committed.
     /// Wraps `FwpmTransactionAbort0(handle)`.
-    /// Not failable — abort must always succeed (Win32 contract).
+    /// Best-effort during unwinding; an RPC error cannot confirm rollback.
     fn wfp_transaction_abort(&self, token: &WfpEngineToken);
 
     /// Add a WFP filter within the current transaction.
@@ -137,6 +133,9 @@ pub struct MockWindowsApi {
     /// `FWP_E_CONDITION_NOT_FOUND` (an un-materializable filter) — for
     /// exercising the best-effort / strict apply policies selectively.
     fail_add_ids: Mutex<std::collections::HashSet<u64>>,
+    /// Specific removals that fail, so replacement tests can distinguish
+    /// a stale permit from a safely retained block.
+    fail_delete_ids: Mutex<std::collections::HashSet<u64>>,
     /// Filter ids (raw) whose `wfp_filter_add` returns an arbitrary
     /// `PlatformError::Win32 { operation, code }` — for exercising
     /// error-classification seams (e.g. the sub-layer-stage vs
@@ -146,6 +145,11 @@ pub struct MockWindowsApi {
     /// [`Self::record_wfp_history`] is called. Per operation rather than per
     /// commit: stricter than what traffic can observe.
     wfp_history: Mutex<Option<Vec<Vec<u64>>>>,
+    wfp_transactions: Mutex<std::collections::HashMap<u64, Vec<WfpFilterRecord>>>,
+    fail_commit_response: Mutex<Option<bool>>,
+    drop_next_abort: Mutex<bool>,
+    hide_wfp_enumeration: Mutex<bool>,
+    next_wfp_enumeration_hook: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
     next_engine_token: Mutex<u64>,
     #[allow(dead_code)]
     next_filter_id: Mutex<u64>,
@@ -170,8 +174,14 @@ impl MockWindowsApi {
             fail_route_create: Mutex::new(None),
             fail_route_table_read: Mutex::new(None),
             fail_add_ids: Mutex::new(std::collections::HashSet::new()),
+            fail_delete_ids: Mutex::new(std::collections::HashSet::new()),
             fail_add_win32: Mutex::new(None),
             wfp_history: Mutex::new(None),
+            wfp_transactions: Mutex::new(std::collections::HashMap::new()),
+            fail_commit_response: Mutex::new(None),
+            drop_next_abort: Mutex::new(false),
+            hide_wfp_enumeration: Mutex::new(false),
+            next_wfp_enumeration_hook: Mutex::new(None),
             next_engine_token: Mutex::new(1),
             next_filter_id: Mutex::new(1),
             console_user_sid: Mutex::new(None),
@@ -196,6 +206,32 @@ impl MockWindowsApi {
     /// policy decides to skip (best-effort) or abort on (strict).
     pub fn set_fail_add_unmaterializable(&self, ids: &[u64]) {
         *self.fail_add_ids.lock().unwrap() = ids.iter().copied().collect();
+    }
+
+    /// Refuse removal of these IDs while leaving additions and other
+    /// principals' filters usable. An empty list restores normal removal.
+    pub fn set_fail_delete(&self, ids: &[u64]) {
+        *self.fail_delete_ids.lock().unwrap() = ids.iter().copied().collect();
+    }
+
+    /// Lose the next commit response after either publishing or rolling back.
+    pub fn lose_next_commit_response(&self, committed: bool) {
+        *self.fail_commit_response.lock().unwrap() = Some(committed);
+    }
+
+    /// Leave the transaction open as if the next abort request never arrived.
+    pub fn drop_next_wfp_abort_request(&self) {
+        *self.drop_next_abort.lock().unwrap() = true;
+    }
+
+    /// Model enumeration that omits filters even though key deletion works.
+    pub fn hide_wfp_enumeration(&self, hide: bool) {
+        *self.hide_wfp_enumeration.lock().unwrap() = hide;
+    }
+
+    /// Coordinate a bounded race at the next enumeration's engine boundary.
+    pub fn on_next_wfp_enumeration(&self, hook: Arc<dyn Fn() + Send + Sync>) {
+        *self.next_wfp_enumeration_hook.lock().unwrap() = Some(hook);
     }
 
     /// Mark specific filter ids (raw) so their `wfp_filter_add` fails with an
@@ -375,20 +411,48 @@ impl WfpEnginePort for MockWindowsApi {
         Ok(token)
     }
 
-    fn wfp_engine_close(&self, _token: WfpEngineToken) -> Result<(), PlatformError> {
+    fn wfp_engine_close(&self, token: WfpEngineToken) -> Result<(), PlatformError> {
+        self.wfp_transaction_abort(&token);
         Ok(())
     }
 
-    fn wfp_transaction_begin(&self, _token: &WfpEngineToken) -> Result<(), PlatformError> {
-        self.check_error()
+    fn wfp_transaction_begin(&self, token: &WfpEngineToken) -> Result<(), PlatformError> {
+        self.check_error()?;
+        let mut transactions = self.wfp_transactions.lock().unwrap();
+        if transactions.contains_key(&token.raw) {
+            return Err(PlatformError::Win32 {
+                operation: "FwpmTransactionBegin0",
+                code: crate::error::win32_codes::FWP_E_TXN_IN_PROGRESS,
+                message: "transaction already active".into(),
+            });
+        }
+        transactions.insert(token.raw, self.wfp_filters.lock().unwrap().clone());
+        Ok(())
     }
 
-    fn wfp_transaction_commit(&self, _token: &WfpEngineToken) -> Result<(), PlatformError> {
-        self.check_error()
+    fn wfp_transaction_commit(&self, token: &WfpEngineToken) -> Result<(), PlatformError> {
+        self.check_error()?;
+        if let Some(committed) = self.fail_commit_response.lock().unwrap().take() {
+            if committed {
+                self.wfp_transactions.lock().unwrap().remove(&token.raw);
+            }
+            return Err(PlatformError::Transient {
+                operation: "FwpmTransactionCommit0",
+                detail: "lost RPC commit response".into(),
+            });
+        }
+        self.wfp_transactions.lock().unwrap().remove(&token.raw);
+        Ok(())
     }
 
-    fn wfp_transaction_abort(&self, _token: &WfpEngineToken) {
-        // no-op in mock
+    fn wfp_transaction_abort(&self, token: &WfpEngineToken) {
+        if std::mem::take(&mut *self.drop_next_abort.lock().unwrap()) {
+            return;
+        }
+        if let Some(before) = self.wfp_transactions.lock().unwrap().remove(&token.raw) {
+            *self.wfp_filters.lock().unwrap() = before;
+            self.note_wfp_state();
+        }
     }
 
     fn wfp_filter_add(
@@ -469,6 +533,13 @@ impl WfpEnginePort for MockWindowsApi {
         id: WfpFilterId,
     ) -> Result<(), PlatformError> {
         self.check_error()?;
+        if self.fail_delete_ids.lock().unwrap().contains(&id.raw) {
+            return Err(PlatformError::Win32 {
+                operation: "FwpmFilterDeleteByKey0",
+                code: 5,
+                message: "filter removal refused".to_owned(),
+            });
+        }
         self.wfp_filters.lock().unwrap().retain(|f| f.id != id);
         self.note_wfp_state();
         Ok(())
@@ -478,6 +549,13 @@ impl WfpEnginePort for MockWindowsApi {
         &self,
         _token: &WfpEngineToken,
     ) -> Result<Vec<WfpFilterRecord>, PlatformError> {
+        let hook = self.next_wfp_enumeration_hook.lock().unwrap().take();
+        if let Some(hook) = hook {
+            hook();
+        }
+        if *self.hide_wfp_enumeration.lock().unwrap() {
+            return Ok(Vec::new());
+        }
         Ok(self.wfp_filters.lock().unwrap().clone())
     }
 }

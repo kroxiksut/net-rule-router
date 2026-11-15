@@ -1371,6 +1371,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "nrr-browser-native-host"
+version = "0.1.0-alpha.1"
+dependencies = [
+ "nrr-shared",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "nrr-cli"
 version = "0.1.0-alpha.1"
 dependencies = [

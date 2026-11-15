@@ -7,10 +7,8 @@
 //! read-write transaction; flag `FWPM_TXN_READ_ONLY = 1` is the
 //! read-only variant we don't currently use.
 //!
-//! Per the [`crate::windows_api::WindowsApiPort`] contract, abort
-//! must always succeed — Win32 itself enforces this — so it is a
-//! no-result operation. We swallow the raw error code from
-//! `FwpmTransactionAbort0` (treated as advisory only).
+//! Abort during guard destruction is best-effort. An RPC failure cannot
+//! confirm rollback; callers retain attempted keys after an uncertain commit.
 
 #![allow(unsafe_code)]
 
@@ -65,21 +63,13 @@ pub fn transaction_commit(token: &WfpEngineToken) -> Result<(), PlatformError> {
     Ok(())
 }
 
-/// Abort the current transaction. Per the trait contract, this never
-/// fails from the caller's perspective — Win32's documented
-/// invariant is "abort always rolls back the transaction state, even
-/// if an error is returned" (the error indicates a non-existent
-/// transaction or a session-already-corrupted scenario, both of
-/// which leave the engine in a benign state).
-///
-/// On the off chance Win32 returns non-zero, the value is logged
-/// implicitly via the audit pathway upstream — but we never propagate
-/// it.
+/// Request rollback during guard destruction. A failed RPC leaves the outcome
+/// unknown; closing the session also aborts any transaction still in progress.
 pub fn transaction_abort(token: &WfpEngineToken) {
     // The rollback takes a sub-layer this transaction created with it.
     super::wfp_sublayer::forget_ensured_sublayer(token);
     let handle = token_to_handle(token);
-    // SAFETY: handle is valid; abort cleans up regardless of outcome.
+    // SAFETY: the caller owns the valid engine handle.
     let _ = unsafe { FwpmTransactionAbort0(handle) };
 }
 

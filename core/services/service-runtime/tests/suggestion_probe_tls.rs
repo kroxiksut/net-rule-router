@@ -114,8 +114,7 @@ fn tcp_connect_cannot_cancel_a_suggestion_for_a_hostname_whose_tls_is_reset() {
     .with_https(Some(https.clone()));
     assert_eq!(runner.probe(OWNER, &[], &[]).accepted, 1);
     let deadline = Instant::now() + Duration::from_secs(3);
-    while https.primary.load(Ordering::Acquire) == 0
-        && https.secondary.load(Ordering::Acquire) == 0
+    while https.primary.load(Ordering::Acquire) == 0 && https.secondary.load(Ordering::Acquire) == 0
     {
         assert!(Instant::now() < deadline, "hostname probe failed to finish");
         std::thread::sleep(Duration::from_millis(1));

@@ -3786,6 +3786,51 @@ mod tests {
         );
     }
 
+    /// Refusing the home /24 must close it even when a broader /16 was
+    /// allowed. The rest of that /16 must remain available to local traffic.
+    #[test]
+    fn a_refused_lan_stays_closed_inside_a_broader_allowed_network() {
+        use crate::route_coordinator::LocalNetworkPolicy;
+        let plan = plan_with_local_answers(
+            LocalNetworkPolicy {
+                allowed: vec![
+                    nrr_domain::ipv4_network::Ipv4Network::parse("192.168.0.0/16")
+                        .expect("broad network"),
+                ],
+                refused: vec![
+                    nrr_domain::ipv4_network::Ipv4Network::parse("192.168.1.0/24")
+                        .expect("refused home network"),
+                ],
+                ..Default::default()
+            },
+            false,
+        );
+        let permitted = |ip: Ipv4Addr| {
+            plan.flows.iter().any(|flow| {
+                flow.verdict == Verdict::Permit
+                    && flow.precedence.class == PrecedenceClass::CatchAllExempt
+                    && flow.egress == EgressConstraint::Any
+                    && match flow.flow.dst {
+                        DstMatch::HostV4(host) => host == ip,
+                        DstMatch::SubnetV4 { net, prefix } => {
+                            nrr_domain::ipv4_network::Ipv4Network::new(net, prefix)
+                                .is_some_and(|network| network.contains(ip))
+                        }
+                        _ => false,
+                    }
+            })
+        };
+        assert!(blanket_blocks(&plan) > 0, "the guard must remain armed");
+        assert!(
+            !permitted(Ipv4Addr::new(192, 168, 1, 55)),
+            "the refused LAN reopened"
+        );
+        assert!(
+            permitted(Ipv4Addr::new(192, 168, 2, 55)),
+            "the adjacent LAN was lost"
+        );
+    }
+
     /// A public IPv6 prefix is the user's to vouch for: closed until they say
     /// yes. Under "everything" auto-accept does not stand in for that answer.
     #[test]

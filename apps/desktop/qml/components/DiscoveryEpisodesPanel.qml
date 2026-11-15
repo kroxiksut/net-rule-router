@@ -42,6 +42,31 @@ Frame {
         }
         return details
     }
+    function provenanceDetails(episode) {
+        var p = episode && episode.provenance ? episode.provenance : null
+        if (!p) return ""
+        var source = String(p.source || "unknown")
+        var sourceName = panel.root.tr("rules.suggestions.episode.provenance.source." + source,
+            panel.root.tr("rules.suggestions.episode.provenance.source.unknown", "unknown evidence"))
+        var lines = [panel.root.tr("rules.suggestions.episode.provenance.source-label",
+            "Evidence source: {source}.").replace("{source}", sourceName)]
+        var state = String(p["requester-state"] || "unknown")
+        var processes = Array.isArray(p["requester-processes"]) ? p["requester-processes"].slice(0, 3) : []
+        if (state === "single" && processes.length === 1) {
+            lines.push(panel.root.tr("rules.suggestions.episode.provenance.requester.single",
+                "Directly observed requester: {processes}.").replace("{processes}", Pure.displayText(String(processes[0]))))
+        } else if (state === "multiple" && processes.length > 0) {
+            lines.push(panel.root.tr("rules.suggestions.episode.provenance.requester.multiple",
+                "Several requesters were directly observed: {processes}.").replace("{processes}", processes.map(function (name) { return Pure.displayText(String(name)) }).join(", ")))
+        } else {
+            lines.push(panel.root.tr("rules.suggestions.episode.provenance.requester.unknown",
+                "The requesting application was not directly identified. No process is inferred from DNS, shared IP, timing, or the NRR probe."))
+        }
+        if (p["probe-actor"] === "nrr-service")
+            lines.push(panel.root.tr("rules.suggestions.episode.provenance.probe-actor.nrr-service",
+                "The reachability check was sent by NetRuleRouter; it does not identify who initiated the original connection."))
+        return lines.join("\n")
+    }
     Layout.fillWidth: true
     Layout.preferredWidth: 0
     background: Rectangle {
@@ -164,6 +189,8 @@ Frame {
                             var reason = panel.root.tr("rules.suggestions.episode.reason." + String(e.reason || ""),
                                 panel.root.tr("rules.suggestions.episode.reason-unknown", "No further detail is available."))
                             var line = Pure.displayText(name) + " · " + state + "\n" + reason
+                            var provenance = panel.provenanceDetails(e)
+                            if (provenance) line += "\n" + provenance
                             var probe = panel.probeDetails(e)
                             if (probe) line += "\n" + probe
                             if (e["platform-limitation"])

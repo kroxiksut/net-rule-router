@@ -85,8 +85,15 @@ export function setBusy(form, busy) {
   for (const button of form.querySelectorAll('button')) button.disabled = busy;
 }
 
+export function renderIntegration(integration) {
+  const status = String(integration || 'disconnected').replaceAll('-', '_');
+  document.getElementById('connection').textContent = tr(`connection_${status}`);
+  const detail = document.getElementById('connection-detail');
+  if (detail) detail.textContent = tr(`connection_${status}_detail`);
+}
+
 export function renderConnection(reply) {
-  document.getElementById('connection').textContent = tr('standalone');
+  renderIntegration(reply.integration);
   document.getElementById('pending').hidden = !reply.state.pending;
 }
 

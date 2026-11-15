@@ -1,6 +1,15 @@
-import { api, tr, localize, request, reportError, setNotice, readProfile, writeProfile, updateLanguageField, originsFor, setBusy, renderConnection, renderWebRtc } from './common.js';
+import { api, tr, localize, request, reportError, setNotice, readProfile, writeProfile, updateLanguageField, originsFor, setBusy, renderConnection, renderIntegration, renderWebRtc } from './common.js';
 
 localize();
+let connectionRequest = 0;
+setInterval(() => {
+  if (!document.hidden) {
+    const sequence = ++connectionRequest;
+    request({ type: 'getIntegration' }).then(reply => {
+      if (sequence === connectionRequest) renderIntegration(reply.integration);
+    }).catch(() => {});
+  }
+}, 3000);
 const form = document.getElementById('site-form');
 let snapshot;
 let currentHost;

@@ -192,12 +192,9 @@ Commits are plain English, imperative, and under 200 characters in the subject.
 
 ## Licence of contributions
 
-The product is distributed under the **Mozilla Public License 2.0** (see
-[`LICENSE`](LICENSE)), and contributions are accepted under the same licence.
-Third-party components shipped alongside the binaries are listed in
-[`THIRD_PARTY_LICENSES.md`](THIRD_PARTY_LICENSES.md).
+The repository is distributed under the **Mozilla Public License 2.0** (see [`LICENSE`](LICENSE)), except for `apps/browser-extension`, whose source is available under **MIT OR Apache-2.0** at the recipient's option. Contributions are accepted under the applicable licence: contributions to the extension under both MIT and Apache-2.0, and other contributions under MPL-2.0. The extension's icons have separate terms in [`apps/browser-extension/NOTICE.md`](apps/browser-extension/NOTICE.md). Third-party components shipped alongside the binaries are listed in [`THIRD_PARTY_LICENSES.md`](THIRD_PARTY_LICENSES.md).
 
-### One exception: `nftlink`
+### `nftlink` contributions
 
 The Linux enforcement backend drives `nft` today. Its direct-netlink
 replacement is being written as a self-contained crate, **`nftlink`**, which

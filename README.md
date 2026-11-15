@@ -18,14 +18,15 @@ Windows and Linux builds today; macOS next.
 [![linux-quality](https://github.com/kroxiksut/net-rule-router/actions/workflows/linux-quality.yml/badge.svg?branch=main)](https://github.com/kroxiksut/net-rule-router/actions/workflows/linux-quality.yml)
 ![Rust](https://img.shields.io/badge/dynamic/toml?url=https%3A%2F%2Fraw.githubusercontent.com%2Fkroxiksut%2Fnet-rule-router%2Fmain%2Frust-toolchain.toml&query=%24.toolchain.channel&label=rust&color=orange)
 ![Platform: Windows, Linux](https://img.shields.io/badge/platform-Windows%20%7C%20Linux-0078D6.svg)
-![Languages: English, Russian](https://img.shields.io/badge/languages-EN%20%7C%20RU-informational.svg)
+![README languages: English, Russian, Simplified Chinese, Spanish, German](https://img.shields.io/badge/README-EN%20%7C%20RU%20%7C%20ZH--CN%20%7C%20ES%20%7C%20DE-informational.svg)
+![Interface languages: English, Russian](https://img.shields.io/badge/interface-EN%20%7C%20RU-informational.svg)
 [![GUI: Qt 6 / QML](https://img.shields.io/badge/GUI-Qt%206%20%2F%20QML-41CD52.svg)](#quick-start)
 [![TUI: ratatui](https://img.shields.io/badge/TUI-ratatui-8A2BE2.svg)](#terminal-interface)
 [![CLI: nrr-cli](https://img.shields.io/badge/CLI-nrr--cli-555555.svg)](#administrative-console)
 [![Telegram: netrulerouter](https://img.shields.io/badge/Telegram-netrulerouter-26A5E4.svg?logo=telegram)](https://t.me/netrulerouter)
 ![Status: alpha](https://img.shields.io/badge/status-alpha-orange.svg)
 
-**English** · [Русский](README_RU.md) · [Changelog](CHANGELOG.md)
+**English** · [Русский](README_RU.md) · [简体中文](README.zh-CN.md) · [Español](README.es.md) · [Deutsch](README.de.md) · [Changelog](CHANGELOG.md)
 
 <img src="docs/en/images/rules.png" alt="Rules: each rule names what it matches and which route it takes" width="900" />
 
@@ -427,7 +428,7 @@ The full order of work, without dates: [ROADMAP.md](ROADMAP.md).
 
 ## License
 
-NetRuleRouter is licensed under **MPL-2.0**.
+NetRuleRouter is licensed under **MPL-2.0**. The [browser extension](apps/browser-extension/README.md) is available under **MIT OR Apache-2.0**, with separate terms for its icons.
 
 It is designed to be usable both as a standalone application and as an embeddable
 first-layer routing component inside other products — contributions and
@@ -442,5 +443,5 @@ it in the License window (Ctrl+Shift+L).
 ---
 
 <div align="center">
-<sub><code>README.md</code> and <code>README_RU.md</code> are kept in sync — update both in the same change.</sub>
+<sub><code>README.md</code>, <code>README_RU.md</code>, <code>README.zh-CN.md</code>, <code>README.es.md</code> and <code>README.de.md</code> are kept in sync — update all five in the same change.</sub>
 </div>

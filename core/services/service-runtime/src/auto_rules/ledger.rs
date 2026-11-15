@@ -575,6 +575,7 @@ impl AutoRulesEngine {
             },
         );
         for candidate in offered {
+            self.log_candidate_provenance(sid, &candidate.dto);
             self.record_candidate_discovery(
                 sid,
                 &candidate.dto,

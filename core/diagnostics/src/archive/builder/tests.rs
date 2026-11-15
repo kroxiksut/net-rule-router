@@ -1064,6 +1064,7 @@ fn discovery_health_and_log_share_the_archive_identity_without_disclosing_the_si
             episodes: vec![nrr_shared::ipc_payloads::DiscoveryEpisodeDto {
                 id: "discovery-7".into(),
                 host: Some("private.example".into()),
+                candidate_id: Some("candidate-7".into()),
                 state: "not-created".into(),
                 reason: "name-unknown".into(),
                 stage: "name".into(),
@@ -1089,7 +1090,7 @@ fn discovery_health_and_log_share_the_archive_identity_without_disclosing_the_si
         crate::taxonomy::EventLevel::Info,
         crate::reason::service::STARTED,
     )
-    .with_payload(serde_json::json!({"discovery_id":"discovery-7","host":"private.example"}))
+    .with_payload(serde_json::json!({"discovery_id":"discovery-7","candidate_id":"candidate-7","host":"private.example"}))
     .with_privacy(crate::taxonomy::PrivacyClass::Diagnostic)
     .to_ndjson()
     .expect("event");
@@ -1107,6 +1108,7 @@ fn discovery_health_and_log_share_the_archive_identity_without_disclosing_the_si
     let episode = &health["suggestion_discovery"]["episodes"][0];
     assert_eq!(episode["id"], log["payload"]["discovery_id"]);
     assert_eq!(episode["host"], log["payload"]["host"]);
+    assert_eq!(episode["candidate-id"], log["payload"]["candidate_id"]);
     assert_eq!(episode["host"], health["site_check"]["host"]);
     assert_eq!(episode["host"], health["site_check"]["report"]["site"]);
     assert_eq!(
@@ -1118,6 +1120,7 @@ fn discovery_health_and_log_share_the_archive_identity_without_disclosing_the_si
         health["site_check"]["report"]["names"][0]["redirects"][0]
     );
     assert_ne!(episode["id"], "discovery-7");
+    assert_ne!(episode["candidate-id"], "candidate-7");
 }
 
 /// What a Default export may disclose is set by the EXPORT, not by the mode

@@ -116,6 +116,46 @@ fn reading_a_waiting_offer_preserves_the_actual_reason_its_probe_did_not_run() {
 }
 
 #[test]
+fn http_path_episode_identifies_observation_and_nrr_probe_but_never_invents_requester() {
+    let f = fixture(AutoRulesMode::Suggest);
+    let now = wall_clock();
+    let mut dto = main_link_dto(
+        "pbs.yahoo.com",
+        "pbs.yahoo.com",
+        AUTO_RULE_SIGNAL_HTTP_PATH_REACHABILITY,
+        nrr_shared::ipc_payloads::AUTO_RULE_PRIMARY_BEHAVIOR_STALLS,
+    );
+    dto.id = candidate_id(SID, AUTO_RULE_MATCH_KIND_EXACT, &dto.proposed_match);
+    dto.secondary_reach = Some(true);
+    let offer = PendingCandidate {
+        dto: dto.clone(),
+        route: RouteRole::Secondary,
+        match_kind: AuthoredMatchKind::ExactHost,
+    };
+    f.engine.park(SID, vec![offer], unix_ms(now));
+    f.engine.note_discovery(
+        SID,
+        Some("pbs.yahoo.com"),
+        None,
+        DiscoveryDecision::new("probe", "deferred", "http-no-answer"),
+        now,
+    );
+    f.engine.record_candidate_discovery(
+        SID,
+        &dto,
+        DiscoveryDecision::new("candidate", "ready", "offer-ready"),
+        now,
+    );
+
+    let episode = f.engine.discovery_snapshot(SID, now).episodes.remove(0);
+    let provenance = episode.provenance.expect("pending offer has provenance");
+    assert_eq!(provenance.source, "service-http-probe");
+    assert_eq!(provenance.requester_state, "unknown");
+    assert!(provenance.requester_processes.is_empty());
+    assert_eq!(provenance.probe_actor.as_deref(), Some("nrr-service"));
+}
+
+#[test]
 fn a_principal_reset_removes_private_discovery_even_without_pending_rules() {
     let f = fixture(AutoRulesMode::Suggest);
     for owner in [SID, "another-user"] {

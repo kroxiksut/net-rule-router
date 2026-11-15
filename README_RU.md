@@ -18,14 +18,15 @@ Wi-Fi, Ethernet. Без собственного туннеля, без обла
 [![linux-quality](https://github.com/kroxiksut/net-rule-router/actions/workflows/linux-quality.yml/badge.svg?branch=main)](https://github.com/kroxiksut/net-rule-router/actions/workflows/linux-quality.yml)
 ![Rust](https://img.shields.io/badge/dynamic/toml?url=https%3A%2F%2Fraw.githubusercontent.com%2Fkroxiksut%2Fnet-rule-router%2Fmain%2Frust-toolchain.toml&query=%24.toolchain.channel&label=rust&color=orange)
 ![Платформы: Windows, Linux](https://img.shields.io/badge/platform-Windows%20%7C%20Linux-0078D6.svg)
-![Языки: английский, русский](https://img.shields.io/badge/languages-EN%20%7C%20RU-informational.svg)
+![Языки README: английский, русский, упрощённый китайский, испанский, немецкий](https://img.shields.io/badge/README-EN%20%7C%20RU%20%7C%20ZH--CN%20%7C%20ES%20%7C%20DE-informational.svg)
+![Языки интерфейса: английский, русский](https://img.shields.io/badge/%D0%B8%D0%BD%D1%82%D0%B5%D1%80%D1%84%D0%B5%D0%B9%D1%81-EN%20%7C%20RU-informational.svg)
 [![GUI: Qt 6 / QML](https://img.shields.io/badge/GUI-Qt%206%20%2F%20QML-41CD52.svg)](#быстрый-старт)
 [![TUI: ratatui](https://img.shields.io/badge/TUI-ratatui-8A2BE2.svg)](#терминальный-интерфейс)
 [![CLI: nrr-cli](https://img.shields.io/badge/CLI-nrr--cli-555555.svg)](#административная-консоль)
 [![Telegram: netrulerouter](https://img.shields.io/badge/Telegram-netrulerouter-26A5E4.svg?logo=telegram)](https://t.me/netrulerouter)
 ![Status: alpha](https://img.shields.io/badge/status-alpha-orange.svg)
 
-[English](README.md) · **Русский** · [История изменений](CHANGELOG_RU.md)
+[English](README.md) · **Русский** · [简体中文](README.zh-CN.md) · [Español](README.es.md) · [Deutsch](README.de.md) · [История изменений](CHANGELOG_RU.md)
 
 <img src="docs/ru/images/rules.png" alt="«Правила»: у каждого правила — что под него попадает и через какой маршрут" width="900" />
 
@@ -434,7 +435,7 @@ explain mode, защита от утечки, предлагаемые адре�
 
 ## Лицензия
 
-NetRuleRouter распространяется под **MPL-2.0**.
+NetRuleRouter распространяется под **MPL-2.0**. [Браузерное расширение](apps/browser-extension/README_RU.md) доступно по выбору под **MIT или Apache-2.0**; для его иконок действуют отдельные условия.
 
 Он спроектирован так, чтобы быть пригодным и как самостоятельное приложение, и как
 встраиваемый компонент маршрутизации первого слоя внутри других продуктов — вклад и
@@ -449,5 +450,5 @@ ISC); зависимости с неясной лицензией не счит�
 ---
 
 <div align="center">
-<sub><code>README.md</code> и <code>README_RU.md</code> поддерживаются синхронно — обновляйте оба в одном изменении.</sub>
+<sub><code>README.md</code>, <code>README_RU.md</code>, <code>README.zh-CN.md</code>, <code>README.es.md</code> и <code>README.de.md</code> поддерживаются синхронно — обновляйте все пять в одном изменении.</sub>
 </div>

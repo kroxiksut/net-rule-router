@@ -23,6 +23,7 @@ members = [
   "shared/contracts",
   "apps/cli",
   "apps/tui",
+  "apps/browser-native-host",
   "apps/desktop/qt-host",
   "apps/desktop/gui",
   "apps/desktop/tray",

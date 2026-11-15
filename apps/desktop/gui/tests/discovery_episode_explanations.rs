@@ -66,6 +66,34 @@ console.log(probeDetails({{}}) === "");
 }
 
 #[test]
+fn provenance_explains_unknown_requester_without_misattributing_the_nrr_probe() {
+    let functions = qml::functions(
+        "components/DiscoveryEpisodesPanel.qml",
+        &["provenanceDetails"],
+    );
+    let program = format!(
+        r#"
+var panel = {{root:{{tr:function(key, fallback) {{
+    var words = {{
+        "rules.suggestions.episode.provenance.source.service-http-probe":"an NRR HTTP reachability check",
+        "rules.suggestions.episode.provenance.requester.unknown":"The requesting application was not directly identified.",
+        "rules.suggestions.episode.provenance.probe-actor.nrr-service":"The reachability check was sent by NetRuleRouter; it does not identify who initiated the original connection."
+    }};
+    return words[key] || fallback;
+}}}}}};
+{functions}
+var text = provenanceDetails({{provenance:{{source:"service-http-probe",
+    "requester-state":"unknown", "requester-processes":[], "probe-actor":"nrr-service"}}}});
+console.log(text.indexOf("NRR HTTP reachability check") >= 0);
+console.log(text.indexOf("not directly identified") >= 0);
+console.log(text.indexOf("does not identify who initiated") >= 0);
+console.log(text.indexOf("chrome.exe") < 0);
+"#
+    );
+    assert_eq!(js::run_js(&program), "true\ntrue\ntrue\ntrue\n");
+}
+
+#[test]
 fn an_unknown_name_keeps_its_explanation_when_the_offer_list_is_empty() {
     let functions = qml::functions(
         "flows/AutoRuleSuggestionsController.qml",

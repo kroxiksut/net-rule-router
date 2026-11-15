@@ -79,6 +79,10 @@ errors/
 .vscode/
 .codex/
 .claude/
+# Temporary investigation artifacts from local agent sessions.
+/.codex-*/
+/.nrr*
+/scratchpad/
 # Local copy of the assistant skills; the working copy lives in .claude/.
 .agents/skills/book-notes/
 # Visual Studio's own workspace state: a multi-megabyte content index, a

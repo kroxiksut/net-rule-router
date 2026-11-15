@@ -52,7 +52,7 @@ impl ArchiveAliases {
         snapshot: &mut DiscoveryEpisodesSnapshotDto,
         mode: RedactionMode,
     ) {
-        for episode in snapshot.episodes.iter_mut().take(128) {
+        for episode in &mut snapshot.episodes {
             episode.id = self.token("episode", &episode.id);
             if let Some(candidate) = episode.candidate_id.as_mut() {
                 *candidate = self.token("candidate", candidate);
@@ -140,6 +140,9 @@ impl ArchiveAliases {
                 } else if name == "discovery_id" {
                     *value = serde_json::Value::String(self.token("episode", text));
                     changed = true;
+                } else if name == "candidate_id" {
+                    *value = serde_json::Value::String(self.token("candidate", text));
+                    changed = true;
                 }
             } else if original.is_object() && value.is_object() {
                 changed |= self.fields(original, value, mode, depth + 1);
@@ -162,5 +165,40 @@ impl ArchiveAliases {
             }
         }
         changed
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn default_redaction_covers_every_discovery_episode_even_after_the_legacy_cap() {
+        let mut snapshot = DiscoveryEpisodesSnapshotDto {
+            episodes: (0..129)
+                .map(|index| nrr_shared::ipc_payloads::DiscoveryEpisodeDto {
+                    id: format!("discovery-test-{index}"),
+                    host: Some(format!("host-{index}.example")),
+                    candidate_id: Some(format!("candidate-{index}")),
+                    ..Default::default()
+                })
+                .collect(),
+            ..Default::default()
+        };
+        let aliases = ArchiveAliases::new().expect("archive aliases");
+
+        aliases.discovery(&mut snapshot, RedactionMode::Default);
+
+        for episode in &snapshot.episodes {
+            assert!(episode.id.starts_with("<episode:"));
+            assert!(episode
+                .candidate_id
+                .as_deref()
+                .is_some_and(|id| id.starts_with("<candidate:")));
+            assert!(episode
+                .host
+                .as_deref()
+                .is_some_and(|host| host.starts_with("<host:")));
+        }
     }
 }

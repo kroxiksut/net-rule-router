@@ -167,6 +167,7 @@ aqua.exe
 aqua64.exe
 chatgpt.exe
 claude.exe
+cowork-svc.exe  # Claude Desktop
 clion.exe
 clion64.exe
 codex*.exe

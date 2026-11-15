@@ -19,6 +19,7 @@ libfuzzer-sys = "0.4"
 serde_json = "1"
 nrr-shared = { path = "../shared/contracts", features = ["fuzzing"] }
 nrr-client-logic = { path = "../core/client-logic" }
+nrr-browser-native-host = { path = "../apps/browser-native-host", features = ["fuzzing"] }
 nrr-diagnostics = { path = "../core/diagnostics", features = ["fuzzing"] }
 nrr-domain = { path = "../core/domain" }
 nrr-platform-api = { path = "../core/platform/api", features = ["fuzzing"] }
@@ -31,6 +32,13 @@ nrr-service-runtime = { path = "../core/services/service-runtime" }
 debug = 1
 debug-assertions = true
 overflow-checks = true
+
+[[bin]]
+name = "browser_native_message"
+path = "fuzz_targets/browser_native_message.rs"
+test = false
+doc = false
+bench = false
 
 [[bin]]
 name = "browser_dns_settings"

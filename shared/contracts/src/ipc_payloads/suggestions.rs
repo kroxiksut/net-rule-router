@@ -486,6 +486,38 @@ pub struct DiscoveryEpisodeDto {
     /// Absent when the peer predates queue diagnostics or no work is queued.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub probe_queue: Option<ProbeQueueStatusDto>,
+    /// Evidence provenance for a currently pending suggestion. This is a
+    /// separate diagnostic from `history`: the source explains how the offer
+    /// was formed, requester attribution names only a process directly tied
+    /// to the hostname by an observation, and `probe_actor` identifies NRR's
+    /// own reachability check. A DNS owner, shared address, timestamp, or
+    /// probe result is never sufficient to fill in a requester.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provenance: Option<DiscoveryProvenanceDto>,
+}
+
+/// Bounded, one-hour diagnostic provenance displayed beside a suggestion.
+/// Process names are omitted unless the observation itself directly provides
+/// both hostname and requester; current DNS and connection observation
+/// contracts do not provide that pair, so their requester state is `unknown`.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub struct DiscoveryProvenanceDto {
+    /// Why the service formed this suggestion, or `unknown` for older or
+    /// unsupported evidence. Stable slugs are translated by each client.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub source: String,
+    /// `unknown`, `single`, or `multiple`; absence of attribution is explicit.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub requester_state: String,
+    /// At most three directly observed process image names, never paths or
+    /// PIDs. Empty for unknown attribution.
+    #[serde(default)]
+    pub requester_processes: Vec<String>,
+    /// `nrr-service` when a confirmed NRR reachability probe is in the episode.
+    /// This identifies the checker, not the application's requester.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub probe_actor: Option<String>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]

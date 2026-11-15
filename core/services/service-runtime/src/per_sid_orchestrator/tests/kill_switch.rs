@@ -38,6 +38,72 @@ fn fixture_with_resolution_and_registry(
     (api, orch, source, rules, registry)
 }
 
+#[test]
+fn failed_policy_withdrawal_keeps_dns_hold_and_vpn_drop_roles_until_filters_are_removed() {
+    let sid = "S-1-5-21-WITHDRAW-A";
+    let other_sid = "S-1-5-21-WITHDRAW-B";
+    let (api, orch, source, rules, registry) = fixture_with_resolution_and_registry(None);
+    rules.set(rules_with_secondary_ip(Ipv4Addr::new(198, 51, 100, 8)));
+    source.set(sid, snap_block_mode_b("Wi-Fi", "TAP"));
+    source.set(other_sid, snap_block_mode_b("Wi-Fi", "TAP"));
+    orch.install_for_sid(sid).unwrap();
+    orch.install_for_sid(other_sid).unwrap();
+    let guard_for = |owner: &str| {
+        api.wfp_filters
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|record| {
+                record.user_sid.as_deref() == Some(owner)
+                    && record.action == WfpAction::Block
+                    && registry.contains(record.id.raw)
+            })
+            .expect("a live registered IPv4 guard")
+            .id
+    };
+    let guard = guard_for(sid);
+    let other_guard = guard_for(other_sid);
+    assert!(orch.fail_closed_armed_for(sid));
+    assert!(orch.block_all_armed_for(sid));
+    source.per_sid.lock().unwrap().remove(sid);
+    rules.clear();
+    api.set_fail_delete(&[guard.raw]);
+
+    assert!(orch.install_for_sid(sid).is_err());
+    assert!(
+        orch.fail_closed_armed_for(sid),
+        "DNS withholding disarmed while the old guard is still installed"
+    );
+    assert!(orch.block_all_armed_for(sid));
+    assert!(
+        registry.contains(guard.raw),
+        "the live VPN guard lost its role verification before withdrawal committed"
+    );
+    assert!(orch.fail_closed_armed_for(other_sid));
+    assert!(registry.contains(other_guard.raw));
+
+    assert!(
+        orch.install_for_sid(sid).is_err(),
+        "a second withdrawal still fails"
+    );
+    assert!(orch.fail_closed_armed_for(sid));
+    assert!(registry.contains(guard.raw));
+
+    api.set_fail_delete(&[]);
+    orch.install_for_sid(sid).unwrap();
+    assert!(!orch.fail_closed_armed_for(sid));
+    assert!(!orch.block_all_armed_for(sid));
+    assert!(!registry.contains(guard.raw));
+    assert!(orch.fail_closed_armed_for(other_sid));
+    assert!(registry.contains(other_guard.raw));
+    assert!(api
+        .wfp_filters
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|record| record.id == other_guard));
+}
+
 /// The blanket posture blocks the whole of IPv6 too, so what the resolution
 /// says must survive it has to REACH the emitter. It once did not: the
 /// exemptions the orchestrator builds from the resolution dropped the v6
@@ -963,11 +1029,8 @@ fn reconcile_reaps_dead_permits_even_when_new_permit_add_skips() {
 
 #[test]
 fn reconcile_defers_delete_when_replacement_block_add_skipped() {
-    // (gap #2 leak-safety — the DEFECT the adversarial verify
-    // found): if a replacement BLOCK's ADD is best-effort-SKIPPED, the
-    // superseded block must NOT be deleted (else its dest is uncovered → leak).
-    // Here the rule's dest changes IP1→IP2 on a reconnect and IP2's new block
-    // is forced to skip, so IP1's OLD block must survive (delete deferred).
+    // A skipped replacement must keep the old destination guarded; retained
+    // permits also require an incomplete result until retirement can finish.
     use std::sync::atomic::{AtomicU64, Ordering};
     const LUID_A: u64 = 0xAAAA_0000_0000_0001;
     const LUID_B: u64 = 0xBBBB_0000_0000_0002;
@@ -999,6 +1062,7 @@ fn reconcile_defers_delete_when_replacement_block_add_skipped() {
     rules.set(rules_with_secondary_ip(ip1));
     source.set("S-1-5-21-A", snap_block("Wi-Fi", "TAP"));
     orch.install_for_sid("S-1-5-21-A").unwrap();
+    let old_ids = orch.installed_filter_ids("S-1-5-21-A");
 
     // Force IP2's new BLOCK adds to be unmaterializable (its permits add fine).
     let ip2_block_ids: Vec<u64> = crate::killswitch_codegen::kill_switch_filters(
@@ -1017,11 +1081,21 @@ fn reconcile_defers_delete_when_replacement_block_add_skipped() {
     // Rule dest changes IP1→IP2 and the secondary adapter reconnects to LUID_B.
     rules.set(rules_with_secondary_ip(ip2));
     luid_cell.store(LUID_B, Ordering::SeqCst);
-    orch.reconcile_secondary_coverage("S-1-5-21-A").unwrap();
+    assert!(matches!(
+        orch.reconcile_secondary_coverage("S-1-5-21-A"),
+        Err(OrchestratorError::WfpFailed(_))
+    ));
+    assert!(matches!(
+        audit.snapshot().last().unwrap().kind,
+        PerSidApplyAuditKind::Failed
+    ));
+    let tracked = orch.installed_filter_ids("S-1-5-21-A");
+    assert!(old_ids.iter().all(|id| tracked.contains(id)));
+    assert!(api.wfp_filters.lock().unwrap().iter().any(|record| {
+        record.action == WfpAction::Permit && record.local_interface_luid == Some(LUID_A)
+    }));
 
-    // IP2's block add skipped → the whole delete pass is deferred, so IP1's
-    // OLD block survives (over-coverage) rather than being torn down while a
-    // replacement block is missing.
+    // The missing replacement must not expose the old destination.
     assert!(
         api.wfp_filters
             .lock()
@@ -1030,6 +1104,15 @@ fn reconcile_defers_delete_when_replacement_block_add_skipped() {
             .any(|f| f.action == WfpAction::Block && f.covers_v4(ip1)),
         "delete deferred: old block survives when a replacement block add was skipped"
     );
+    api.set_fail_add_unmaterializable(&[]);
+    orch.reconcile_secondary_coverage("S-1-5-21-A").unwrap();
+    let live = api.wfp_filters.lock().unwrap();
+    assert!(old_ids
+        .iter()
+        .all(|id| !live.iter().any(|record| record.id == *id)));
+    assert!(live
+        .iter()
+        .any(|record| record.action == WfpAction::Block && record.covers_v4(ip2)));
 }
 
 #[test]

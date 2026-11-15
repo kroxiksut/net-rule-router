@@ -1126,6 +1126,50 @@ fn auto_rule_candidate_less_certain_is_additive_and_pinned() {
     assert_eq!(back, dto);
 }
 
+#[test]
+fn discovery_provenance_is_additive_and_never_claims_an_unobserved_requester() {
+    let old_peer: DiscoveryEpisodeDto = serde_json::from_value(serde_json::json!({
+        "id": "discovery-private-1",
+        "host": "pbs.yahoo.com",
+        "destination": null,
+        "state": "ready",
+        "reason": "offer-ready",
+        "stage": "candidate",
+        "first-seen-unix-ms": 1,
+        "last-seen-unix-ms": 2,
+        "candidate-id": "arc-1",
+        "platform-limitation": null
+    }))
+    .expect("a peer without provenance still parses");
+    assert!(old_peer.provenance.is_none());
+
+    let provenance = DiscoveryProvenanceDto {
+        source: "connection-observation".into(),
+        requester_state: "unknown".into(),
+        requester_processes: Vec::new(),
+        probe_actor: Some("nrr-service".into()),
+    };
+    let json = serde_json::to_value(&provenance).expect("serialise");
+    assert_eq!(json["source"], "connection-observation");
+    assert_eq!(json["requester-state"], "unknown");
+    assert!(json["requester-processes"]
+        .as_array()
+        .is_some_and(Vec::is_empty));
+    assert_eq!(json["probe-actor"], "nrr-service");
+
+    #[derive(serde::Deserialize)]
+    struct OlderEpisodeClient {
+        id: String,
+    }
+    let newer_episode = serde_json::json!({
+        "id":"discovery-private-1",
+        "provenance": json
+    });
+    let older_client: OlderEpisodeClient = serde_json::from_value(newer_episode)
+        .expect("older clients ignore the additive provenance field");
+    assert_eq!(older_client.id, "discovery-private-1");
+}
+
 /// The badge slugs are a cross-process contract with the tray/GUI text and
 /// with `nrr_domain::companion_affinity::CompanionSignal`. Pin the literals.
 #[test]

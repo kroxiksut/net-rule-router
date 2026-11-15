@@ -6,7 +6,7 @@
 //! from interleaving.
 
 use super::*;
-use nrr_platform_api::wfp::{RetireHeld, WfpReplaceOutcome};
+use nrr_platform_api::wfp::{RetireHeld, WfpReplaceError, WfpReplaceOutcome};
 
 impl PerSidApplyOrchestrator {
     /// Snapshot of the SIDs currently holding filter sets. Sorted for
@@ -18,9 +18,7 @@ impl PerSidApplyOrchestrator {
         out
     }
 
-    /// Number of WFP filter IDs installed for `sid`. Returns 0 if the
-    /// SID has no entry.
-    /// The filter ids this orchestrator tracks for `sid`.
+    /// Last acknowledged IDs; a failed replacement can require full replay.
     pub fn installed_filter_ids(&self, sid: &str) -> Vec<WfpFilterId> {
         self.state
             .lock()
@@ -257,22 +255,12 @@ impl PerSidApplyOrchestrator {
         if sid == nrr_domain::user_principal::BASELINE_PRINCIPAL {
             return Err(OrchestratorError::BaselineNotRoutable);
         }
-        let was_known = self
-            .state
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .contains_key(sid);
-        // What this SID already carries. A full-replace install only ADDS, so
-        // whatever is not in the new set has to be deleted explicitly —
-        // otherwise it stays alive in the engine while dropping out of our
-        // accounting, and keeps dropping traffic nobody can see or reap.
-        let previously_installed: Vec<WfpFilterId> = self
-            .state
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .get(sid)
-            .map(|s| s.installed.clone())
-            .unwrap_or_default();
+        let (was_known, previously_installed, replay_required) = {
+            let state = self.state.lock().unwrap_or_else(|p| p.into_inner());
+            state.get(sid).map_or((false, Vec::new(), false), |entry| {
+                (true, entry.owned_ids(), entry.replay_required)
+            })
+        };
         // Derive the full filter set (rule-driven + leak-guard) via the shared
         // `compute_filters_for_sid` path. No policy installs nothing but still
         // records the SID so a later on_disconnect / recompile stays consistent.
@@ -291,46 +279,44 @@ impl PerSidApplyOrchestrator {
                     return Err(e);
                 }
             };
-        let filters = match computed {
+        let (filters, without_route_policy) = match computed {
             ComputedFilterSet::NoPolicy => {
                 // No policy → record the SID as known (so a later on_disconnect
                 // doesn't panic) but install nothing. Anything this SID was
                 // carrying has to come down: the empty state would otherwise
                 // orphan it.
-                self.delete_superseded_filters(sid, &previously_installed, &[]);
-                self.upsert_state(sid, Vec::new());
-                self.emit_audit(sid, PerSidApplyAuditKind::Applied, 0, "no-policy");
+                self.withdraw_policy_filters(
+                    sid,
+                    &previously_installed,
+                    PerSidApplyAuditKind::Applied,
+                )?;
                 return Ok(0);
             }
-            ComputedFilterSet::Install(plan) => plan.filters,
+            ComputedFilterSet::Install(plan) => (plan.filters, plan.without_route_policy),
         };
         // Route before block — same ordering invariant the reconcile enforces
         // (see `reconcile_to_desired`). A cold install lands the whole pin set
         // at once, so every destination it covers must already be routed.
         self.sync_routes_before_pins(sid, &filters);
-        // The compute above can run for seconds; the latch may have flipped
-        // inside it.
+        let _filter_state = self
+            .filter_state_lock
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        // Check after waiting for teardown's filter-state lock as well.
         if self.adds_refused(sid, "install-apply") {
             return Ok(0);
         }
-        // Journal before the commit: a batch the engine accepted before a later
-        // one failed, or a process killed mid-commit, is otherwise tracked by
-        // nobody. Ids are derived from identity, so an id that never landed is
-        // an idempotent delete at the next reap.
+        // A lost response still owes these keys to retry and crash cleanup.
         if let Some(ledger) = self.ledger.as_ref() {
             let planned: Vec<WfpFilterId> = filters.iter().map(|s| s.id).collect();
             ledger.record(&planned);
         }
         let mode = (self.failure_mode)();
-        // MAKE before BREAK inside the session, as in `reconcile_to_desired`:
-        // what the new set supersedes is deleted only once it is all up.
         let apply_outcome =
-            match self
-                .session
-                .execute_replacement(&filters, &previously_installed, mode)
-            {
+            match self.execute_owned_replacement(sid, &filters, &previously_installed, mode) {
                 Ok(o) => o,
                 Err(e) => {
+                    self.remember_replacement_failure(sid, &previously_installed, &filters, &e);
                     let msg = format!("install for {sid}: {e:?}");
                     self.emit_audit(sid, PerSidApplyAuditKind::Failed, 0, &msg);
                     return Err(OrchestratorError::WfpFailed(msg));
@@ -350,16 +336,18 @@ impl PerSidApplyOrchestrator {
         let count = installed_ids.len();
         let tracked_ids =
             self.tracked_after_install(sid, &previously_installed, &installed_ids, &apply_outcome);
-        // Re-read our live WFP filters and confirm every id we just recorded
-        // as installed is actually present in the engine. A missing id is a
-        // PHANTOM: counted as installed but never materialised in WFP — the
-        // failure mode when an add error gets mis-classified and silently
-        // swallowed while `installed=N` still increments. Logged loud
-        // (error) so a regression shows up in NDJSON instead of trusting the
-        // count. Best-effort: an enumeration failure never fails the apply
-        // (the filters are already committed); runs only on a real install,
-        // not the frequent coverage-reconcile tick, so the cost is one
-        // enumeration per policy change.
+        if apply_outcome.retire_held.is_some()
+            && (without_route_policy
+                || self.has_unretired_permit(&previously_installed, &installed_ids, &apply_outcome))
+        {
+            self.retain_filter_tracking(sid, tracked_ids);
+            return Err(self.retirement_failure(sid));
+        }
+        if without_route_policy {
+            self.publish_withdrawn_route_policy(sid, &filters);
+        }
+        // Enumeration diagnoses phantom installs; an absent response cannot
+        // undo a commit the engine already acknowledged.
         self.verify_installed_filters_live(sid, &installed_ids, count);
         // Destinations this set scopes to, deduplicated. Compared against the
         // previous install BEFORE the state is replaced.
@@ -373,6 +361,9 @@ impl PerSidApplyOrchestrator {
             secondary_resolved,
         );
         Self::publish_enforced_addresses(sid, &filters);
+        let (tracked_ids, uncertain_ids): (Vec<_>, Vec<_>) = tracked_ids
+            .into_iter()
+            .partition(|id| !replay_required || !skipped.contains(&id.raw));
         self.upsert_state_with_destinations(
             sid,
             tracked_ids,
@@ -380,6 +371,9 @@ impl PerSidApplyOrchestrator {
             networks,
             secondary_resolved,
         );
+        if replay_required && !apply_outcome.skipped.is_empty() {
+            self.remember_uncertain_filters(sid, &uncertain_ids, &[]);
+        }
         let kind = if was_known {
             PerSidApplyAuditKind::Updated
         } else {
@@ -461,34 +455,8 @@ impl PerSidApplyOrchestrator {
         run_route_sync(full);
     }
 
-    /// Window-free, make-before-break reconcile of the per-SID filter set
-    /// against the freshly-resolved secondary LUID: grows coverage
-    /// additively (newly observed secondary IPs) and reaps tracked filters
-    /// no longer desired — critically the dead-LUID egress permits left
-    /// after a secondary adapter reconnect. The permit id folds the LUID
-    /// (see `killswitch_codegen::permit_luid_seg`), so a reconnect mints a
-    /// new permit id and the stale one is superseded and deleted here (a WFP
-    /// filter is immutable by key, so an add-only path would swallow the
-    /// collision and the stale permit would stick).
-    ///
-    /// Ordering is strictly ADD-then-DELETE so the kill-switch is never
-    /// briefly lifted. A pure LUID flip keeps every BLOCK's id stable, so
-    /// only dead-LUID permits get deleted (fail-safe — deleting a permit
-    /// only tightens). An up/down mode transition can change a block's
-    /// shape (`block_off_secondary` ↔ `ale_block`), putting a superseded
-    /// block in the delete set; safety then rests on add-before-delete plus
-    /// deferring the whole delete pass whenever a replacement block add was
-    /// skipped, so a block is never removed while its replacement is not
-    /// yet up. A skipped permit never defers the delete, since skipping a
-    /// permit only tightens. The delete set is derived purely from the
-    /// desired-vs-tracked id diff, never from stored metadata the untyped
-    /// id set lacks.
-    ///
-    /// Correct across every secondary adapter transition (reconnect,
-    /// up→down fail-closed, down→up re-arm) because the diff
-    /// drives it. A no-op when desired == tracked. Only acts on an
-    /// already-installed SID — [`Self::reconcile`] owns an inactive one.
-    /// Returns the count of filters added.
+    /// Refresh one held SID's coverage and adapter-dependent permits atomically.
+    /// Unconfirmed sets replay in full; confirmed sets use the ID diff.
     pub fn reconcile_secondary_coverage(&self, sid: &str) -> Result<usize, OrchestratorError> {
         if self.adds_refused(sid, "leak-guard-coverage") {
             return Ok(0);
@@ -496,46 +464,43 @@ impl PerSidApplyOrchestrator {
         let lock = self.apply_lock_for(sid);
         let _apply_guard = lock.lock().unwrap_or_else(|p| p.into_inner());
         // Snapshot the currently-tracked filters; skip SIDs we have not installed.
-        let tracked: Vec<WfpFilterId> = {
+        let (tracked, replay_required) = {
             let g = self.state.lock().unwrap_or_else(|p| p.into_inner());
             match g.get(sid) {
-                Some(s) => s.installed.clone(),
+                Some(s) => (s.owned_ids(), s.replay_required),
                 None => return Ok(0),
             }
         };
         let desired = match self.compute_filters_for_sid(sid, false, None, ComputeIntent::Apply)? {
             ComputedFilterSet::Install(f) => f,
-            // No policy → nothing desired; leave the set as-is (full teardown
-            // is owned by the stop / policy-change paths).
-            ComputedFilterSet::NoPolicy => return Ok(0),
+            ComputedFilterSet::NoPolicy => {
+                if !tracked.is_empty() || replay_required {
+                    self.withdraw_policy_filters(sid, &tracked, PerSidApplyAuditKind::Updated)?;
+                }
+                return Ok(0);
+            }
         };
         self.reconcile_to_desired(
             sid,
             tracked,
             desired.filters,
+            desired.without_route_policy,
             "LUID-aware permit refresh",
             false,
         )
         .map(|(added, _live_total)| added)
     }
 
-    /// The shared MAKE-then-BREAK core: bring the installed set for an
-    /// already-tracked `sid` to exactly `desired`, without ever opening a
-    /// window (adds land first; superseded filters are deleted after; an
-    /// unchanged filter is never touched). Both the adapter-transition
-    /// reconcile and the user-apply recompile funnel through here, so the
-    /// leak-safety reasoning above is written once. `audit_note` labels the
-    /// audit line with the caller's intent. Returns `(added, live_total)` —
-    /// the adds this pass installed, and the tracked set size after the pass
-    /// (the recompile path reports the latter to keep the historical
-    /// "installed count" contract of the full replace it supersedes).
-    /// `audit_no_op` audits even a no-change pass — a user Apply must leave a
-    /// record, while the periodic reconcile tick must not spam one every 30 s.
-    fn reconcile_to_desired(
+    /// Shared add-before-retire reconciliation; unchanged IDs stay installed.
+    /// Returns `(added, live_total)` for incremental and full-apply callers.
+    /// `audit_note` names the intent; `audit_no_op` records quiet user applies
+    /// while keeping unchanged periodic passes silent.
+    pub(super) fn reconcile_to_desired(
         &self,
         sid: &str,
         tracked: Vec<WfpFilterId>,
         desired: Vec<WfpFilterSpec>,
+        without_route_policy: bool,
         audit_note: &str,
         audit_no_op: bool,
     ) -> Result<(usize, usize), OrchestratorError> {
@@ -545,17 +510,21 @@ impl PerSidApplyOrchestrator {
             return Ok((0, 0));
         }
         let tracked_ids: std::collections::HashSet<u64> = tracked.iter().map(|id| id.raw).collect();
+        let replay_required = self
+            .state
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .get(sid)
+            .is_some_and(|entry| entry.replay_required);
         let desired_ids: std::collections::HashSet<u64> =
             desired.iter().map(|s| s.id.raw).collect();
 
         let to_add: Vec<WfpFilterSpec> = desired
             .iter()
-            .filter(|s| !tracked_ids.contains(&s.id.raw))
+            .filter(|s| replay_required || !tracked_ids.contains(&s.id.raw))
             .cloned()
             .collect();
-        // Tracked ids no longer desired — the stale dead-LUID permits (and any
-        // block-all superseded by a per-dest set on re-arm). Blocks keep stable
-        // ids across a LUID flip, so they stay in `desired` and never appear here.
+        // Adapter-dependent permits change identity when the LUID changes.
         let to_remove: Vec<WfpFilterId> = tracked
             .iter()
             .copied()
@@ -563,6 +532,9 @@ impl PerSidApplyOrchestrator {
             .collect();
 
         if to_add.is_empty() && to_remove.is_empty() {
+            if without_route_policy {
+                self.publish_withdrawn_route_policy(sid, &desired);
+            }
             // Once per run of passes that changed nothing.
             let first_quiet = audit_no_op
                 && self
@@ -581,38 +553,29 @@ impl PerSidApplyOrchestrator {
             return Ok((0, tracked.len()));
         }
 
-        // (0) ROUTE BEFORE BLOCK. A destination-scoped block only
-        // tolerates traffic that egresses the secondary, and what puts a
-        // destination on the secondary is its `/32` route. The route pass and
-        // this filter pass read the same live FQDN / app-observation stores but
-        // at different instants, so an address learned in between is pinned
-        // here while the route pass that would have carried it has already run
-        // — and every flow to it is dropped until the next route recompute.
-        // Driving the route pass here, for NEW destination blocks only, closes
-        // that window without ever lifting a block (this runs before the MAKE,
-        // and the BREAK below is unchanged). No lock is held at this point.
-        // Costs nothing in steady state: an unchanged coverage set adds no
-        // destination block and never reaches this call.
+        // A destination pin needs its route before the block can land.
         self.sync_routes_before_pins(sid, &to_add);
 
-        // MAKE then BREAK, both inside the session so a batch boundary cannot
-        // reorder them: every add commits before the first delete. A pure LUID
-        // flip keeps block ids stable, so only dead-LUID permits are retired
-        // (deleting one only tightens). An up/down mode transition swaps a
-        // block's shape and id; if that replacement block was skipped, the
-        // session holds the whole retire pass back — over-coverage until the
-        // block materialises, never a leak. An app-only block with an absent
-        // exe covers no destination and does not hold it, or stale permits
-        // would pile up forever behind a missing program.
-        // Journalled before the commit, as in the install path.
+        let _filter_state = self
+            .filter_state_lock
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        if self.adds_refused(sid, "reconcile-apply") {
+            return Ok((0, 0));
+        }
+
+        // Add before retiring; a missing guard holds retirement back. Retained
+        // permits can defeat the new coverage, so verify them before success.
+        // Journal before committing so cleanup can recover partial batches.
         if let Some(ledger) = self.ledger.as_ref() {
             let planned: Vec<WfpFilterId> = to_add.iter().map(|s| s.id).collect();
             ledger.record(&planned);
         }
         let mode = (self.failure_mode)();
-        let replaced = match self.session.execute_replacement(&to_add, &to_remove, mode) {
+        let replaced = match self.execute_owned_replacement(sid, &to_add, &to_remove, mode) {
             Ok(o) => o,
             Err(e) => {
+                self.remember_replacement_failure(sid, &tracked, &to_add, &e);
                 let msg = format!("reconcile coverage for {sid}: {e:?}");
                 self.emit_audit(sid, PerSidApplyAuditKind::Failed, 0, &msg);
                 return Err(OrchestratorError::WfpFailed(msg));
@@ -625,6 +588,28 @@ impl PerSidApplyOrchestrator {
             .map(|s| s.id)
             .filter(|id| !skipped.contains(&id.raw))
             .collect();
+        if replaced.retire_held.is_some()
+            && (without_route_policy || self.has_unretired_permit(&to_remove, &[], &replaced))
+        {
+            let retired: HashSet<u64> = replaced.retired.iter().map(|id| id.raw).collect();
+            let mut retained: Vec<WfpFilterId> = tracked
+                .iter()
+                .copied()
+                .filter(|id| !retired.contains(&id.raw))
+                .collect();
+            let mut have: HashSet<u64> = retained.iter().map(|id| id.raw).collect();
+            retained.extend(
+                installed_ids
+                    .iter()
+                    .copied()
+                    .filter(|id| have.insert(id.raw)),
+            );
+            self.retain_filter_tracking(sid, retained);
+            return Err(self.retirement_failure(sid));
+        }
+        if without_route_policy {
+            self.publish_withdrawn_route_policy(sid, &desired);
+        }
         // Anything not retired stays tracked: a filter nobody tracks is one
         // `cleanup_wfp` cannot delete by id, and a retry of a delete that
         // already happened is idempotent.
@@ -636,7 +621,7 @@ impl PerSidApplyOrchestrator {
                     msg_key = "persid-apply-delete-deferred",
                     sid,
                     deferred = to_remove.len() as u64,
-                    "reconcile coverage: deferred delete of superseded filters — a replacement block add was skipped this tick (fail-safe over-coverage; retry next tick)",
+                    "reconcile coverage: deferred delete of superseded filters — a replacement block add was skipped this tick; retry next tick",
                 );
                 Vec::new()
             }
@@ -653,19 +638,8 @@ impl PerSidApplyOrchestrator {
             }
         };
 
-        // (3) Update the tracked set = (tracked − removed) ∪ installed. `removed`
-        // reflects what was actually deleted (empty when the delete was deferred),
-        // so deferred ids stay tracked and are retried on the next tick.
-        //
-        // The coverage fields travel with it: they must reflect what this
-        // pass just changed, not what the last install wrote. Otherwise the
-        // addresses this pass starts enforcing never get swept (sockets
-        // already open to them finish on the old link) and the *next*
-        // install sees those same addresses as new, sweeping connections
-        // that had only just been re-established. Likewise `secondary_
-        // resolved` must track this pass's own result, or a tunnel that has
-        // been up all along reads as one that "just came up" — a needless
-        // sweep of every pinned destination.
+        // Publish coverage with the committed set so the next pass does not
+        // mistake steady traffic for newly enforced destinations.
         let (destinations, secondary_resolved) = Self::coverage_of(&desired);
         let networks = Self::rule_networks_of(sid, &desired);
         self.tear_down_flows_to_new_destinations(
@@ -683,6 +657,8 @@ impl PerSidApplyOrchestrator {
             let entry = g.entry(sid.to_string()).or_insert_with(|| PerSidFilterSet {
                 sid: sid.to_string(),
                 installed: Vec::new(),
+                uncertain: Vec::new(),
+                replay_required: false,
                 destinations: Vec::new(),
                 secondary_resolved: false,
                 networks: Vec::new(),
@@ -690,14 +666,22 @@ impl PerSidApplyOrchestrator {
             entry.destinations = destinations;
             entry.networks = networks;
             entry.secondary_resolved = secondary_resolved;
-            entry.installed.retain(|id| !removed_ids.contains(&id.raw));
+            entry.replay_required = replay_required && !replaced.skipped.is_empty();
+            let mut remaining: Vec<WfpFilterId> = tracked
+                .iter()
+                .copied()
+                .filter(|id| !removed_ids.contains(&id.raw))
+                .collect();
             let mut have: std::collections::HashSet<u64> =
-                entry.installed.iter().map(|id| id.raw).collect();
+                remaining.iter().map(|id| id.raw).collect();
             for id in installed_ids.iter().copied() {
                 if have.insert(id.raw) {
-                    entry.installed.push(id);
+                    remaining.push(id);
                 }
             }
+            (entry.installed, entry.uncertain) = remaining
+                .into_iter()
+                .partition(|id| !replay_required || !skipped.contains(&id.raw));
             entry.installed.len()
         };
 
@@ -727,22 +711,26 @@ impl PerSidApplyOrchestrator {
     /// lock. The lock is not reentrant: taking it again from inside a recompile
     /// wedged the SID for good.
     fn remove_for_sid_locked(&self, sid: &str) -> Result<usize, OrchestratorError> {
-        // READ the tracked ids; do not drop the record yet. A delete that fails
-        // leaves those filters installed, and forgetting their ids here left
-        // them enforcing with nobody accounting for them — `cleanup_wfp`
-        // deletes tracked filters BY ID, so an untracked block survives even a
-        // graceful stop and can only be found by an enumerate sweep.
+        let _filter_state = self
+            .filter_state_lock
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        // A failed delete still owes its keys to retry and cleanup.
         let installed: Vec<WfpFilterId> = {
             let g = self.state.lock().unwrap_or_else(|p| p.into_inner());
-            g.get(sid).map(|s| s.installed.clone()).unwrap_or_default()
+            g.get(sid)
+                .map(PerSidFilterSet::owned_ids)
+                .unwrap_or_default()
         };
         let count = installed.len();
         if count > 0 {
-            let actions: Vec<WfpFilterAction> = installed
+            let actions: Vec<WfpFilterAction> = self
+                .unshared_filter_ids(sid, &installed)
                 .into_iter()
                 .map(WfpFilterAction::DeleteFilter)
                 .collect();
             if let Err(e) = self.session.execute_wfp_plan(&actions) {
+                self.remember_uncertain_filters(sid, &installed, &[]);
                 let msg = format!("remove for {sid}: {e:?}");
                 self.emit_audit(sid, PerSidApplyAuditKind::Failed, count as u32, &msg);
                 return Err(OrchestratorError::WfpFailed(msg));
@@ -760,20 +748,8 @@ impl PerSidApplyOrchestrator {
         Ok(count)
     }
 
-    /// Strip **every** WFP filter the service owns (block AND permit, all
-    /// SIDs). Used by the graceful-stop teardown hook. Also clears the
-    /// in-memory SID→filter map so a subsequent reconcile reinstalls from a
-    /// clean slate. Idempotent — a second call deletes nothing.
-    ///
-    /// two-pass, robust against an enumerate that
-    /// under-reports (the `stripped_filters:0` HW anomaly): (1) delete every
-    /// filter we KNOW we installed this session **by id** (`FwpmFilterDeleteBy
-    /// Key0` does not depend on enumeration, so a graceful stop can never leave
-    /// an orphaned block = lockout for this process's filters); (2) enumerate-
-    /// sweep for anything untracked (cross-session orphans from a prior
-    /// hard-killed instance whose in-memory state is gone). The WFP session is
-    /// **non-dynamic** — filters persist until an explicit delete or reboot —
-    /// so this explicit strip (not session close) is what removes them.
+    /// Strip owned keys before sweeping enumerated orphans. Keep tracking and
+    /// the crash ledger until both passes acknowledge completion.
     pub fn cleanup_wfp(&self) -> Result<usize, OrchestratorError> {
         // A stop that came before the engine answered still owes the machine
         // the strip: one more attempt, bounded by the caller's deadline.
@@ -787,19 +763,25 @@ impl PerSidApplyOrchestrator {
             .iter()
             .map(|l| l.lock().unwrap_or_else(|p| p.into_inner()))
             .collect();
+        let _filter_state = self
+            .filter_state_lock
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
         // (1) This session's known filters and a dead instance's inherited
         // ones, by id: the enumerate below can under-report.
         let inherited = self
             .pending_orphans
             .lock()
             .unwrap_or_else(|p| p.into_inner())
-            .take()
+            .as_ref()
+            .cloned()
             .unwrap_or_default();
         let tracked: Vec<WfpFilterId> = {
-            let g = self.state.lock().unwrap_or_else(|p| p.into_inner());
-            g.values()
-                .flat_map(|s| s.installed.iter().copied())
-                .collect()
+            let mut g = self.state.lock().unwrap_or_else(|p| p.into_inner());
+            for entry in g.values_mut() {
+                entry.replay_required = true;
+            }
+            g.values().flat_map(PerSidFilterSet::owned_ids).collect()
         };
         let tracked_deleted = tracked.len();
         let by_id: Vec<WfpFilterAction> = tracked
@@ -807,6 +789,7 @@ impl PerSidApplyOrchestrator {
             .chain(inherited.into_iter().map(|raw| WfpFilterId { raw }))
             .map(WfpFilterAction::DeleteFilter)
             .collect();
+        let mut by_id_error = None;
         if !by_id.is_empty() {
             // Delete-missing is idempotent (FWP_E_FILTER_NOT_FOUND → ok).
             if let Err(e) = self.session.execute_wfp_plan(&by_id) {
@@ -816,6 +799,7 @@ impl PerSidApplyOrchestrator {
                     error = %e,
                     "cleanup_wfp: delete-by-tracked-id best-effort failed",
                 );
+                by_id_error = Some(e);
             }
         }
         // (2) Enumerate-sweep for untracked orphans.
@@ -823,6 +807,15 @@ impl PerSidApplyOrchestrator {
             .session
             .cleanup_all()
             .map_err(|e| OrchestratorError::WfpFailed(format!("cleanup_all: {e:?}")))?;
+        if let Some(error) = by_id_error {
+            return Err(OrchestratorError::WfpFailed(format!(
+                "cleanup by tracked id remains unconfirmed: {error:?}"
+            )));
+        }
+        *self
+            .pending_orphans
+            .lock()
+            .unwrap_or_else(|p| p.into_inner()) = None;
         // Every per-SID record describes filters that no longer exist. Dropping
         // them one SID at a time keeps this in step with `remove_for_sid` —
         // including the block-id registry, which otherwise kept role-verifying
@@ -879,13 +872,21 @@ impl PerSidApplyOrchestrator {
         named.into_iter().map(|(_, l)| Arc::clone(l)).collect()
     }
 
-    /// Strip only **block** (kill-switch / fail-closed) WFP filters, keeping
-    /// permit filters. Used on `routing_stop_policy = persist` graceful stop
-    /// (matched hosts keep egressing the secondary, but no block ever
-    /// persists) and at a start nobody's leak protection asked to hold. Leaves
-    /// the in-memory SID→filter map untouched: any now-gone block IDs it still
-    /// references are handled idempotently on the next `remove_for_sid`.
+    /// Strip blocks for persist-stop, keeping permits. Ownership records stay
+    /// available to cleanup and require replay before later enforcement.
     pub fn cleanup_wfp_blocks_only(&self) -> Result<usize, OrchestratorError> {
+        let _filter_state = self
+            .filter_state_lock
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        for entry in self
+            .state
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .values_mut()
+        {
+            entry.replay_required = true;
+        }
         self.session
             .cleanup_blocks_only()
             .map_err(|e| OrchestratorError::WfpFailed(format!("cleanup_blocks_only: {e:?}")))
@@ -916,6 +917,10 @@ impl PerSidApplyOrchestrator {
         if self.engine_pending("orphan-reap") {
             return 0;
         }
+        let _filter_state = self
+            .filter_state_lock
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
         let Some(inherited) = self
             .pending_orphans
             .lock()
@@ -958,7 +963,7 @@ impl PerSidApplyOrchestrator {
     fn tracked_raw_ids(&self) -> std::collections::BTreeSet<u64> {
         let g = self.state.lock().unwrap_or_else(|p| p.into_inner());
         g.values()
-            .flat_map(|s| s.installed.iter().map(|id| id.raw))
+            .flat_map(|s| s.installed.iter().chain(&s.uncertain).map(|id| id.raw))
             .collect()
     }
 
@@ -981,6 +986,10 @@ impl PerSidApplyOrchestrator {
             .iter()
             .map(|l| l.lock().unwrap_or_else(|p| p.into_inner()))
             .collect();
+        let _filter_state = self
+            .filter_state_lock
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
         let inherited = self
             .pending_orphans
             .lock()
@@ -1040,17 +1049,8 @@ impl PerSidApplyOrchestrator {
     /// when a user submits `RoutePolicyUpdate` so their new bindings take
     /// effect immediately.
     ///
-    /// Window-free: the original remove-then-install replace
-    /// opened a measured 1.4–5.8 s hole with NO NetRuleRouter filter installed
-    /// — three of those applies ran while the secondary was down, so protected
-    /// destinations were reachable off-tunnel for the whole hole. An
-    /// already-installed SID now takes the same MAKE-then-BREAK diff the
-    /// adapter-transition reconcile uses ([`Self::reconcile_to_desired`]):
-    /// adds land first, superseded filters are deleted after, unchanged
-    /// filters are never touched. A never-installed SID takes the plain
-    /// install path (nothing is up — no window to close), and a SID whose
-    /// policy/rules disappeared tears down via the full-replace path so the
-    /// empty state and its audits stay exactly as before.
+    /// Reuses the add-before-retire diff for a tracked SID and the install
+    /// path otherwise. Removing the policy withdraws its tracked filters.
     pub fn recompile_for_sid(&self, sid: &str) -> Result<usize, OrchestratorError> {
         self.settle_if_untracked(sid)?;
         let lock = self.apply_lock_for(sid);
@@ -1139,7 +1139,7 @@ impl PerSidApplyOrchestrator {
         }
         let tracked: Option<Vec<WfpFilterId>> = {
             let g = self.state.lock().unwrap_or_else(|p| p.into_inner());
-            g.get(sid).map(|s| s.installed.clone())
+            g.get(sid).map(PerSidFilterSet::owned_ids)
         };
         // Never installed → nothing is up, so plain install opens no window.
         // Under a decider the install is the decider's alone: the settle that
@@ -1164,7 +1164,14 @@ impl PerSidApplyOrchestrator {
                 self.install_for_sid_with(sid, rules_override)
             }
             ComputedFilterSet::Install(desired) => self
-                .reconcile_to_desired(sid, tracked, desired.filters, "window-free recompile", true)
+                .reconcile_to_desired(
+                    sid,
+                    tracked,
+                    desired.filters,
+                    desired.without_route_policy,
+                    "window-free recompile",
+                    true,
+                )
                 .map(|(_added, live_total)| live_total),
         }
     }
@@ -1315,25 +1322,53 @@ impl PerSidApplyOrchestrator {
                 note(sid, "remove", e);
             }
         }
+        for sid in have.intersection(&want) {
+            let replay_required = self
+                .state
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .get(sid)
+                .is_some_and(|entry| entry.replay_required);
+            if replay_required {
+                if let Err(error) = self.reconcile_secondary_coverage(sid) {
+                    note(sid, "recover", error);
+                }
+            }
+        }
         let outcome = self.follow_route_table_owner(&fresh);
-        // The first pass over somebody present is what a deferred start waits
-        // for; a pass over nobody claims nothing and settles nothing. A user
-        // whose install failed tracks nothing, so the blocks they inherited
-        // are their only protection until their book reads: left standing.
+        // A failed or empty membership pass cannot replace inherited guards.
         if !want.is_empty() && outcome.is_ok() && first_err.is_none() {
             self.adopt_orphans_after_pass();
         }
         outcome.and(first_err.map_or(Ok(()), Err))
     }
 
-    /// Delete filters from `previous` that `kept` no longer contains. A
-    /// full-replace install only adds, so without this pass a
-    /// superseded filter stays live in the engine while dropping out of our
-    /// accounting: it keeps dropping traffic that no recompute can explain and
-    /// no teardown can reach. Best-effort, and deleting a missing id is
-    /// idempotent — an engine error must not fail an install whose filters are
-    /// already committed.
-    fn delete_superseded_filters(&self, sid: &str, previous: &[WfpFilterId], kept: &[WfpFilterId]) {
+    fn withdraw_policy_filters(
+        &self,
+        sid: &str,
+        previous: &[WfpFilterId],
+        kind: PerSidApplyAuditKind,
+    ) -> Result<(), OrchestratorError> {
+        let _filter_state = self
+            .filter_state_lock
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        self.delete_superseded_filters(sid, previous, &[])?;
+        self.publish_withdrawn_route_policy(sid, &[]);
+        Self::publish_enforced_addresses(sid, &[]);
+        self.upsert_state(sid, Vec::new());
+        self.emit_audit(sid, kind, 0, "no-policy");
+        Ok(())
+    }
+
+    /// Release obsolete ownership references, physically deleting only keys
+    /// no other SID still holds. A failure keeps every candidate retryable.
+    fn delete_superseded_filters(
+        &self,
+        sid: &str,
+        previous: &[WfpFilterId],
+        kept: &[WfpFilterId],
+    ) -> Result<(), OrchestratorError> {
         let kept_ids: std::collections::HashSet<u64> = kept.iter().map(|id| id.raw).collect();
         let superseded: Vec<WfpFilterId> = previous
             .iter()
@@ -1341,9 +1376,10 @@ impl PerSidApplyOrchestrator {
             .filter(|id| !kept_ids.contains(&id.raw))
             .collect();
         if superseded.is_empty() {
-            return;
+            return Ok(());
         }
-        let actions: Vec<WfpFilterAction> = superseded
+        let actions: Vec<WfpFilterAction> = self
+            .unshared_filter_ids(sid, &superseded)
             .iter()
             .copied()
             .map(WfpFilterAction::DeleteFilter)
@@ -1356,15 +1392,14 @@ impl PerSidApplyOrchestrator {
                 removed = superseded.len() as u64,
                 "install: removed filters the new set supersedes",
             ),
-            Err(e) => tracing::warn!(
-                target: "nrr::per_sid_orchestrator",
-                msg_key = "persid-apply-delete-superseded-install-failed",
-                sid,
-                superseded = superseded.len() as u64,
-                error = %e,
-                "install: delete of superseded filters best-effort failed",
-            ),
+            Err(e) => {
+                self.remember_uncertain_filters(sid, previous, &[]);
+                let message = format!("withdraw policy for {sid}: {e:?}");
+                self.emit_audit(sid, PerSidApplyAuditKind::Failed, 0, &message);
+                return Err(OrchestratorError::WfpFailed(message));
+            }
         }
+        Ok(())
     }
 
     /// Log an install's retire pass and return what the SID now carries: the
@@ -1400,7 +1435,7 @@ impl PerSidApplyOrchestrator {
                 msg_key = "persid-apply-delete-deferred",
                 sid,
                 deferred = kept,
-                "install: deferred delete of superseded filters — a replacement block add was skipped (fail-safe over-coverage)",
+                "install: deferred delete of superseded filters — a replacement block add was skipped",
             ),
             Some(RetireHeld::Failed(e)) => tracing::warn!(
                 target: "nrr::per_sid_orchestrator",
@@ -1414,7 +1449,167 @@ impl PerSidApplyOrchestrator {
         tracked
     }
 
-    fn upsert_state(&self, sid: &str, installed: Vec<WfpFilterId>) {
+    /// A retained block is conservative over-coverage; a retained permit can
+    /// defeat the new policy. Only inspect this SID's obsolete tracked IDs.
+    /// If enumeration fails, the absence of such a permit is unverified.
+    fn has_unretired_permit(
+        &self,
+        previous: &[WfpFilterId],
+        installed: &[WfpFilterId],
+        outcome: &WfpReplaceOutcome,
+    ) -> bool {
+        let kept: HashSet<u64> = installed
+            .iter()
+            .chain(outcome.retired.iter())
+            .map(|id| id.raw)
+            .collect();
+        let obsolete: HashSet<u64> = previous
+            .iter()
+            .filter(|id| !kept.contains(&id.raw))
+            .map(|id| id.raw)
+            .collect();
+        if obsolete.is_empty() {
+            return false;
+        }
+        match self.session.enumerate_our_filters() {
+            Ok(live) => live.iter().any(|record| {
+                obsolete.contains(&record.id.raw) && record.action == WfpAction::Permit
+            }),
+            Err(_) => true,
+        }
+    }
+
+    /// Keep committed guards and stale IDs reachable by retry and teardown,
+    /// without publishing the desired coverage as successfully enforced.
+    fn retain_filter_tracking(&self, sid: &str, installed: Vec<WfpFilterId>) {
+        let mut state = self.state.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(entry) = state.get_mut(sid) {
+            entry.installed = installed;
+        } else {
+            state.insert(
+                sid.to_string(),
+                PerSidFilterSet {
+                    sid: sid.to_string(),
+                    installed,
+                    uncertain: Vec::new(),
+                    replay_required: false,
+                    destinations: Vec::new(),
+                    secondary_resolved: false,
+                    networks: Vec::new(),
+                },
+            );
+        }
+    }
+
+    fn remember_replacement_failure(
+        &self,
+        sid: &str,
+        previous: &[WfpFilterId],
+        attempted: &[WfpFilterSpec],
+        error: &WfpReplaceError,
+    ) {
+        match error {
+            WfpReplaceError::CommitUnconfirmed(_) => {
+                self.remember_uncertain_filters(sid, previous, attempted);
+            }
+            WfpReplaceError::BeforeCommit(_) => {
+                // Abort is best effort: an unchanged desired set must still
+                // test whether the session can accept another transaction.
+                if let Some(entry) = self
+                    .state
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .get_mut(sid)
+                {
+                    entry.replay_required = true;
+                }
+            }
+        }
+    }
+
+    /// Keep unconfirmed keys owned without adding them to the installed snapshot.
+    fn remember_uncertain_filters(
+        &self,
+        sid: &str,
+        previous: &[WfpFilterId],
+        attempted: &[WfpFilterSpec],
+    ) {
+        let mut state = self.state.lock().unwrap_or_else(|p| p.into_inner());
+        let entry = state
+            .entry(sid.to_string())
+            .or_insert_with(|| PerSidFilterSet {
+                sid: sid.to_string(),
+                ..PerSidFilterSet::default()
+            });
+        let mut have: HashSet<u64> = entry
+            .installed
+            .iter()
+            .chain(&entry.uncertain)
+            .map(|id| id.raw)
+            .collect();
+        for id in previous
+            .iter()
+            .copied()
+            .chain(attempted.iter().map(|spec| spec.id))
+        {
+            if have.insert(id.raw) {
+                entry.uncertain.push(id);
+            }
+        }
+        entry.replay_required = true;
+    }
+
+    /// Caller holds `filter_state_lock` through mutation and state publication.
+    fn unshared_filter_ids(&self, sid: &str, ids: &[WfpFilterId]) -> Vec<WfpFilterId> {
+        let state = self.state.lock().unwrap_or_else(|p| p.into_inner());
+        let held_elsewhere: HashSet<u64> = state
+            .iter()
+            .filter(|(owner, _)| owner.as_str() != sid)
+            .flat_map(|(_, entry)| {
+                entry
+                    .installed
+                    .iter()
+                    .chain(&entry.uncertain)
+                    .map(|id| id.raw)
+            })
+            .collect();
+        ids.iter()
+            .copied()
+            .filter(|id| !held_elsewhere.contains(&id.raw))
+            .collect()
+    }
+
+    fn execute_owned_replacement(
+        &self,
+        sid: &str,
+        adds: &[WfpFilterSpec],
+        retire: &[WfpFilterId],
+        mode: FilterFailureMode,
+    ) -> Result<WfpReplaceOutcome, WfpReplaceError> {
+        let adding: HashSet<u64> = adds.iter().map(|spec| spec.id.raw).collect();
+        let retired: Vec<WfpFilterId> = retire
+            .iter()
+            .copied()
+            .filter(|id| !adding.contains(&id.raw))
+            .collect();
+        let physical = self.unshared_filter_ids(sid, &retired);
+        let mut outcome = self.session.execute_replacement(adds, &physical, mode)?;
+        if outcome.retire_held.is_none() {
+            // Other owners retain the physical key; this owner's reference goes.
+            outcome.retired = retired;
+        }
+        Ok(outcome)
+    }
+
+    fn retirement_failure(&self, sid: &str) -> OrchestratorError {
+        let message = format!(
+            "apply for {sid}: obsolete filters could not be retired or verified; enforcement remains incomplete"
+        );
+        self.emit_audit(sid, PerSidApplyAuditKind::Failed, 0, &message);
+        OrchestratorError::WfpFailed(message)
+    }
+
+    pub(super) fn upsert_state(&self, sid: &str, installed: Vec<WfpFilterId>) {
         // No destinations, so nothing to sweep either way.
         self.upsert_state_with_destinations(sid, installed, Vec::new(), Vec::new(), false);
     }
@@ -1488,6 +1683,8 @@ impl PerSidApplyOrchestrator {
             PerSidFilterSet {
                 sid: sid.to_string(),
                 installed,
+                uncertain: Vec::new(),
+                replay_required: false,
                 destinations,
                 secondary_resolved,
                 networks,

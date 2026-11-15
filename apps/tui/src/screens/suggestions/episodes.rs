@@ -147,6 +147,93 @@ const QUEUE_WAIT: &[Key] = &[
     ),
 ];
 
+const PROVENANCE_SOURCES: &[Key] = &[
+    key(
+        "rules.suggestions.episode.provenance.source.companion-activity",
+        "companion activity",
+    ),
+    key(
+        "rules.suggestions.episode.provenance.source.connection-observation",
+        "a connection observation",
+    ),
+    key(
+        "rules.suggestions.episode.provenance.source.service-http-probe",
+        "an NRR HTTP reachability check",
+    ),
+    key(
+        "rules.suggestions.episode.provenance.source.service-tls-probe",
+        "an NRR TLS reachability check",
+    ),
+    key(
+        "rules.suggestions.episode.provenance.source.dns-observation",
+        "a DNS observation",
+    ),
+    key(
+        "rules.suggestions.episode.provenance.source.application-observation",
+        "an application observation",
+    ),
+    key(
+        "rules.suggestions.episode.provenance.source.unknown",
+        "unknown evidence",
+    ),
+];
+const PROVENANCE_SOURCE_LABEL: Key = key(
+    "rules.suggestions.episode.provenance.source-label",
+    "Evidence source: {source}.",
+);
+
+const PROVENANCE_REQUESTER_UNKNOWN: Key = key(
+    "rules.suggestions.episode.provenance.requester.unknown",
+    "The requesting application was not directly identified. No process is inferred from DNS, shared IP, timing, or the NRR probe.",
+);
+const PROVENANCE_REQUESTER_SINGLE: Key = key(
+    "rules.suggestions.episode.provenance.requester.single",
+    "Directly observed requester: {processes}.",
+);
+const PROVENANCE_REQUESTER_MULTIPLE: Key = key(
+    "rules.suggestions.episode.provenance.requester.multiple",
+    "Several requesters were directly observed: {processes}.",
+);
+const PROVENANCE_PROBE_NRR: Key = key(
+    "rules.suggestions.episode.provenance.probe-actor.nrr-service",
+    "The reachability check was sent by NetRuleRouter; it does not identify who initiated the original connection.",
+);
+
+fn provenance_details(episode: &DiscoveryEpisodeDto, texts: &Texts) -> Vec<ViewLine> {
+    let Some(provenance) = &episode.provenance else {
+        return Vec::new();
+    };
+    let source = PROVENANCE_SOURCES
+        .iter()
+        .find(|entry| entry.id.rsplit('.').next() == Some(provenance.source.as_str()))
+        .copied()
+        .unwrap_or(PROVENANCE_SOURCES[PROVENANCE_SOURCES.len() - 1]);
+    let mut lines = vec![ViewLine::text(
+        texts.fill(PROVENANCE_SOURCE_LABEL, &[("source", texts.get(source))]),
+    )];
+    let names = provenance
+        .requester_processes
+        .iter()
+        .take(3)
+        .map(|name| display_text(name).into_owned())
+        .collect::<Vec<_>>();
+    match provenance.requester_state.as_str() {
+        "single" if names.len() == 1 => lines.push(ViewLine::text(texts.fill(
+            PROVENANCE_REQUESTER_SINGLE,
+            &[("processes", names.join(", "))],
+        ))),
+        "multiple" if !names.is_empty() => lines.push(ViewLine::text(texts.fill(
+            PROVENANCE_REQUESTER_MULTIPLE,
+            &[("processes", names.join(", "))],
+        ))),
+        _ => lines.push(ViewLine::text(texts.get(PROVENANCE_REQUESTER_UNKNOWN))),
+    }
+    if provenance.probe_actor.as_deref() == Some("nrr-service") {
+        lines.push(ViewLine::text(texts.get(PROVENANCE_PROBE_NRR)));
+    }
+    lines
+}
+
 fn probe_details(episode: &DiscoveryEpisodeDto, texts: &Texts) -> Vec<ViewLine> {
     let raw = serde_json::to_value(&episode.probe_queue).unwrap_or_default();
     let queue = discovery_probe_queue(&raw);
@@ -261,6 +348,7 @@ pub fn lines(
         );
         lines.push(ViewLine::text(format!("{name} · {state}")));
         lines.push(ViewLine::text(reason));
+        lines.extend(provenance_details(episode, texts));
         lines.extend(probe_details(episode, texts));
         if let Some(limitation) = &episode.platform_limitation {
             lines.push(ViewLine::text(translated(
@@ -289,6 +377,7 @@ pub fn all_keys() -> Vec<Key> {
     keys.extend_from_slice(REASONS);
     keys.extend_from_slice(LIMITATIONS);
     keys.extend_from_slice(QUEUE_WAIT);
+    keys.extend_from_slice(PROVENANCE_SOURCES);
     keys.extend_from_slice(&[
         QUEUE_AHEAD,
         QUEUE_PAUSE,
@@ -296,6 +385,11 @@ pub fn all_keys() -> Vec<Key> {
         QUEUE_STARTED,
         QUEUE_PREVIOUS,
         QUEUE_PREVIOUS_ABSENT,
+        PROVENANCE_REQUESTER_UNKNOWN,
+        PROVENANCE_SOURCE_LABEL,
+        PROVENANCE_REQUESTER_SINGLE,
+        PROVENANCE_REQUESTER_MULTIPLE,
+        PROVENANCE_PROBE_NRR,
     ]);
     keys
 }
@@ -386,5 +480,43 @@ mod tests {
             "{text}"
         );
         assert!(!text.contains("No previous check result"), "{text}");
+    }
+
+    #[test]
+    fn provenance_separates_observation_requester_and_nrr_probe() {
+        let episode: DiscoveryEpisodeDto = serde_json::from_value(json!({
+            "id":"private", "host":"pbs.yahoo.com", "destination":null,
+            "state":"ready", "reason":"offer-ready", "stage":"candidate",
+            "first-seen-unix-ms":1000, "last-seen-unix-ms":2000,
+            "candidate-id":"arc-private", "platform-limitation":null,
+            "provenance":{
+                "source":"service-http-probe",
+                "requester-state":"unknown",
+                "requester-processes":[],
+                "probe-actor":"nrr-service"
+            }
+        }))
+        .unwrap_or_else(|error| panic!("episode: {error}"));
+        let text = lines(&[episode], 0, &[], &Texts::fallback_only())
+            .iter()
+            .map(ViewLine::plain_text)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            text.contains("Evidence source: an NRR HTTP reachability check"),
+            "{text}"
+        );
+        assert!(
+            text.contains("The requesting application was not directly identified"),
+            "{text}"
+        );
+        assert!(
+            text.contains("The reachability check was sent by NetRuleRouter"),
+            "{text}"
+        );
+        assert!(
+            !text.contains("chrome.exe"),
+            "unknown attribution must not name an app: {text}"
+        );
     }
 }

@@ -104,8 +104,9 @@ export function buildLanguageRules(state, resolveMode) {
   return rules;
 }
 
-export function createController(api, resolveMode, capabilities = { webRtc: true }) {
+export function createController(api, resolveMode, capabilities = { webRtc: true }, connection = null) {
   let queue = Promise.resolve();
+  let connectionIntent = null;
   async function read() {
     const data = await api.storage.local.get(STATE_KEY);
     if (!Object.hasOwn(data, STATE_KEY)) return emptyState();
@@ -172,6 +173,25 @@ export function createController(api, resolveMode, capabilities = { webRtc: true
     if (sender?.id !== api.runtime.id || sender.origin === 'null'
         || !trustedUrls.some(url => sender.url === url || sender.url?.startsWith(`${url}?`))) fail('untrusted_sender');
     if (!message || typeof message !== 'object' || typeof message.type !== 'string') fail('invalid_request');
+    if (message.type === 'getIntegration') return { ok: true, integration: connection?.status() || 'disconnected' };
+    if (['beginConnectNrr', 'connectNrr', 'disconnectNrr'].includes(message.type)) {
+      if (message.confirmed !== true) fail('consent_required');
+      if (!connection) fail('unsupported');
+      if (message.type === 'beginConnectNrr') {
+        connectionIntent = globalThis.crypto.randomUUID();
+        return { ok: true, intent: connectionIntent };
+      }
+      if (message.type === 'connectNrr') {
+        if (!await api.permissions.contains({ permissions: ['nativeMessaging'] })) fail('permission_required');
+        if (typeof message.intent !== 'string' || message.intent !== connectionIntent) fail('conflict');
+        connectionIntent = null;
+        await connection.connect();
+      } else {
+        connectionIntent = null;
+        connection.disconnect();
+      }
+      return { ok: true, integration: connection.status() };
+    }
     const state = await read();
     if (message.type === 'getState') {
       const setting = api.privacy?.network?.webRTCIPHandlingPolicy;
@@ -183,7 +203,7 @@ export function createController(api, resolveMode, capabilities = { webRtc: true
           state.webRtc.owned = false;
         }
       }
-      return { ok: true, state, integration: 'standalone', capabilities: {
+      return { ok: true, state, integration: connection?.status() || 'disconnected', capabilities: {
         language: true, timezone: false, route: false,
         webRtc: capabilities.webRtc,
       } };
@@ -241,7 +261,8 @@ export function createController(api, resolveMode, capabilities = { webRtc: true
     return result;
   }
   return {
-    handle: (message, sender) => serialize(() => execute(message, sender)),
+    handle: (message, sender) => ['getIntegration', 'beginConnectNrr', 'connectNrr', 'disconnectNrr'].includes(message?.type)
+      ? execute(message, sender) : serialize(() => execute(message, sender)),
     recover: () => serialize(async () => {
       const state = await read();
       if (state.pending) await apply(state);

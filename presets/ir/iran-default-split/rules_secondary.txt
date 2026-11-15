@@ -87,6 +87,7 @@ zoom.exe
 slack.exe
 chatgpt.exe
 claude.exe
+cowork-svc.exe  # Claude Desktop
 # poe.exe  # Poe: the process name is too generic, check it on your machine
 codex.exe
 codex*.exe

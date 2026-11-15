@@ -143,6 +143,7 @@ slack.exe  # Messaging and social apps
 
 chatgpt.exe  # AI desktop wrappers and launchers (common names)
 claude.exe  # AI desktop wrappers and launchers (common names)
+cowork-svc.exe  # Claude Desktop
 # poe.exe  # Poe: the process name is too generic, check it on your machine
 codex.exe  # AI desktop wrappers and launchers (common names)
 codex*.exe  # AI desktop wrappers and launchers (common names)

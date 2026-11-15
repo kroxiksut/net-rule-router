@@ -19,6 +19,7 @@ impl PerSidApplyOrchestrator {
     ) -> Self {
         Self {
             apply_locks: Mutex::new(std::collections::HashMap::new()),
+            filter_state_lock: Mutex::new(()),
             membership_lock: Mutex::new(()),
             quiet_since_noop: Mutex::new(std::collections::HashSet::new()),
             enforced_sids: None,

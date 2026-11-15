@@ -206,15 +206,78 @@ pub fn apply_stored_answers(
     }
     for network in &allowed {
         let pair = (network.network(), network.prefix_len());
-        if !out.contains(&pair) {
-            out.push(pair);
-        }
+        out.push(pair);
     }
-    // Compared as NETWORKS, not as pairs: the route table and the user's text
-    // can spell the same network differently.
-    out.retain(|(net, prefix)| {
-        Ipv4Network::new(*net, *prefix).is_none_or(|candidate| !refused.contains(&candidate))
-    });
+    // A refused /24 must remove its addresses from an allowed /16 without
+    // losing the neighboring LAN. Merge overlapping answers before subtraction
+    // so duplicate or nested confirmations cannot multiply live filters. The
+    // u64 upper bound represents 2^32 safely for 0.0.0.0/0.
+    let allowed = union_intervals(
+        std::mem::take(out)
+            .into_iter()
+            .filter_map(|(net, prefix)| Ipv4Network::new(net, prefix))
+            .map(ipv4_interval)
+            .collect(),
+    );
+    let refused = union_intervals(refused.into_iter().map(ipv4_interval).collect());
+    let mut hole_at = 0;
+    for (start, end) in allowed {
+        let mut cursor = start;
+        while hole_at < refused.len() && refused[hole_at].1 <= cursor {
+            hole_at += 1;
+        }
+        let mut scan = hole_at;
+        while scan < refused.len() && refused[scan].0 < end {
+            let (hole_start, hole_end) = refused[scan];
+            if cursor < hole_start {
+                append_interval_as_cidrs(cursor, hole_start.min(end), out);
+            }
+            cursor = cursor.max(hole_end.min(end));
+            if cursor == end {
+                break;
+            }
+            scan += 1;
+        }
+        if cursor < end {
+            append_interval_as_cidrs(cursor, end, out);
+        }
+        hole_at = scan;
+    }
+}
+
+/// Half-open address interval. The endpoint 2^32 represents the end of IPv4.
+fn ipv4_interval(network: Ipv4Network) -> (u64, u64) {
+    let start = u64::from(u32::from(network.network()));
+    (start, start + (1u64 << (32 - network.prefix_len())))
+}
+
+fn union_intervals(mut intervals: Vec<(u64, u64)>) -> Vec<(u64, u64)> {
+    intervals.sort_unstable();
+    let mut union: Vec<(u64, u64)> = Vec::with_capacity(intervals.len());
+    for (start, end) in intervals {
+        if let Some(last) = union.last_mut() {
+            if start <= last.1 {
+                last.1 = last.1.max(end);
+                continue;
+            }
+        }
+        union.push((start, end));
+    }
+    union
+}
+
+fn append_interval_as_cidrs(mut start: u64, end: u64, out: &mut Vec<(Ipv4Addr, u8)>) {
+    while start < end {
+        let alignment_bits = if start == 0 {
+            32
+        } else {
+            (start as u32).trailing_zeros()
+        };
+        let remaining_bits = 63 - (end - start).leading_zeros();
+        let host_bits = alignment_bits.min(remaining_bits);
+        out.push((Ipv4Addr::from(start as u32), (32 - host_bits) as u8));
+        start += 1u64 << host_bits;
+    }
 }
 
 /// The source for a platform without a route coordinator: it reads the route
@@ -471,6 +534,120 @@ mod tests {
         };
         apply_stored_answers(&policy, &home_routes(), &adapters, &mut out);
         assert_eq!(out, vec![(Ipv4Addr::new(10, 9, 0, 0), 16)]);
+    }
+
+    #[test]
+    fn a_refused_prefix_removes_only_its_addresses_from_a_broader_permit() {
+        let mut out = vec![(Ipv4Addr::new(192, 168, 0, 0), 16)];
+        let policy = LocalNetworkPolicy {
+            refused: vec![Ipv4Network::parse("192.168.1.0/24").expect("refusal")],
+            ..Default::default()
+        };
+        apply_stored_answers(&policy, &[], &[], &mut out);
+        let covers = |ip| {
+            out.iter().any(|&(net, prefix)| {
+                Ipv4Network::new(net, prefix).is_some_and(|network| network.contains(ip))
+            })
+        };
+        assert!(!covers(Ipv4Addr::new(192, 168, 1, 55)));
+        assert!(covers(Ipv4Addr::new(192, 168, 0, 55)));
+        assert!(covers(Ipv4Addr::new(192, 168, 2, 55)));
+        assert!(covers(Ipv4Addr::new(192, 168, 255, 55)));
+    }
+
+    #[test]
+    fn a_broad_refusal_closes_a_narrower_confirmation() {
+        let mut out = vec![(Ipv4Addr::new(192, 168, 1, 0), 24)];
+        let policy = LocalNetworkPolicy {
+            allowed: vec![Ipv4Network::parse("192.168.2.0/24").expect("confirmation")],
+            refused: vec![Ipv4Network::parse("192.168.0.0/16").expect("refusal")],
+            ..Default::default()
+        };
+        apply_stored_answers(&policy, &[], &[], &mut out);
+        assert!(
+            out.is_empty(),
+            "a narrow permit cannot reopen a broad refusal"
+        );
+    }
+
+    #[test]
+    fn duplicate_and_nested_answers_produce_one_minimal_network_cover() {
+        let broad = (Ipv4Addr::new(10, 0, 0, 0), 8);
+        let mut out = vec![broad, (Ipv4Addr::new(10, 0, 0, 0), 9), broad];
+        let policy = LocalNetworkPolicy {
+            allowed: vec![Ipv4Network::parse("10.0.0.0/8").expect("confirmation")],
+            refused: vec![
+                Ipv4Network::parse("10.1.0.0/16").expect("refusal"),
+                Ipv4Network::parse("10.1.1.0/24").expect("nested refusal"),
+                Ipv4Network::parse("10.1.0.0/16").expect("duplicate refusal"),
+            ],
+            ..Default::default()
+        };
+        apply_stored_answers(&policy, &[], &[], &mut out);
+        assert_eq!(
+            out,
+            vec![
+                (Ipv4Addr::new(10, 0, 0, 0), 16),
+                (Ipv4Addr::new(10, 2, 0, 0), 15),
+                (Ipv4Addr::new(10, 4, 0, 0), 14),
+                (Ipv4Addr::new(10, 8, 0, 0), 13),
+                (Ipv4Addr::new(10, 16, 0, 0), 12),
+                (Ipv4Addr::new(10, 32, 0, 0), 11),
+                (Ipv4Addr::new(10, 64, 0, 0), 10),
+                (Ipv4Addr::new(10, 128, 0, 0), 9),
+            ],
+            "duplicate permits must not multiply WFP filters"
+        );
+    }
+
+    #[test]
+    fn all_ipv4_minus_boundary_hosts_keeps_both_neighbors_without_overflow() {
+        let mut out = vec![(Ipv4Addr::UNSPECIFIED, 0)];
+        let policy = LocalNetworkPolicy {
+            refused: vec![
+                Ipv4Network::parse("0.0.0.0/32").expect("first host"),
+                Ipv4Network::parse("255.255.255.255/32").expect("last host"),
+            ],
+            ..Default::default()
+        };
+        apply_stored_answers(&policy, &[], &[], &mut out);
+        let covers = |ip| {
+            out.iter().any(|&(net, prefix)| {
+                Ipv4Network::new(net, prefix).is_some_and(|network| network.contains(ip))
+            })
+        };
+        assert!(!covers(Ipv4Addr::UNSPECIFIED));
+        assert!(covers(Ipv4Addr::new(0, 0, 0, 1)));
+        assert!(covers(Ipv4Addr::new(255, 255, 255, 254)));
+        assert!(!covers(Ipv4Addr::BROADCAST));
+    }
+
+    #[test]
+    fn many_host_refusals_keep_adjacent_hosts_once() {
+        let broad = (Ipv4Addr::new(10, 1, 0, 0), 16);
+        let mut out = vec![broad, broad];
+        let policy = LocalNetworkPolicy {
+            refused: (0..=255)
+                .map(|third| {
+                    Ipv4Network::new(Ipv4Addr::new(10, 1, third, 1), 32).expect("host refusal")
+                })
+                .collect(),
+            ..Default::default()
+        };
+        apply_stored_answers(&policy, &[], &[], &mut out);
+        for third in 0..=255 {
+            let refused = Ipv4Addr::new(10, 1, third, 1);
+            let neighbor = Ipv4Addr::new(10, 1, third, 2);
+            let count = |ip| {
+                out.iter()
+                    .filter(|&&(net, prefix)| {
+                        Ipv4Network::new(net, prefix).is_some_and(|network| network.contains(ip))
+                    })
+                    .count()
+            };
+            assert_eq!(count(refused), 0, "refused host {refused} reopened");
+            assert_eq!(count(neighbor), 1, "neighbor {neighbor} lost or duplicated");
+        }
     }
 
     #[test]

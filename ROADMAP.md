@@ -5,12 +5,22 @@ ready and has been tested on real machines.
 
 What already works is listed under **Highlights** in the [README](README.md).
 
+Regression fixes, diagnostics and verification of recovery after failures continue throughout every stage.
+
 ## First public alpha: Windows and Linux
 
 **Linux.** Ships in this alpha next to Windows, as `.deb`, `.rpm` and
 `.tar.gz` packages. What remains is checking more distributions and ARM
 machines; [Supported systems](docs/en/supported-systems.md) says which ones are
 checked.
+
+## Extensibility foundation — targeting 0.1.2-alpha
+
+We plan to begin preparing a shared foundation for external applications, VPN clients, browsers and network devices. 0.1.2-alpha is a target for starting this work, not a commitment to ship every API listed here: fixes, network recovery and higher-priority tasks may change the release scope and timing. This direction complements A0/A1 and R1; capabilities ship as they are verified.
+
+The first outcome is a map of existing interfaces, minimal contract proposals and validation with two different experimental integrations. We will investigate a versioned local Control API with permissions and events; a Plugin API with separate execution and failure recovery; and a network-device adapter contract with capability checks, previews and confirmed application. A mock adapter may be the first device milestone without supporting any particular firmware.
+
+The shared executor model should distinguish rules, egresses, enforcement locations, owners and verified results while reusing the existing policy engine and Windows/Linux implementations. Optional components must not disrupt the core service or weaken protection on failure. Final SDKs and compatibility boundaries follow practical experiments; completing every integration is not a release condition for 0.1.2-alpha.
 
 ## Stabilising the alpha — A0
 
@@ -197,6 +207,10 @@ control; the final screens still require design agreement.
 
 ### Rules
 
+Early rule development will prepare destination-port and protocol conditions: TCP and UDP first, individual ports and ranges, then combinations with applications, domains, IP addresses and subnets. Before applying a rule, check Windows and Linux capabilities, overlaps and precedence; existing rules retain their meaning. If a platform cannot enforce a condition, the rule must not be silently applied with a wider scope. Other protocols depend on research.
+
+In A1, design the model, validate platforms and implement verified combinations as their mechanisms become ready; not every combination is promised at once. Unverified combinations and other protocols remain research below.
+
 | What | What it gives you | Priority |
 |---|---|---|
 | Strict connection pinning and explicit fallback | For a site, address or program you can decide in advance whether another egress must never be tried, the selected one is merely preferred, or the app should ask after a failure. Existing rule meanings do not change silently | high |
@@ -264,6 +278,12 @@ does not promise transparent support for every protocol before that validation.
 | Separate web interface for your instance | Rules, connections, settings and diagnostics in a browser, including Linux without a graphical desktop. Installed separately and built on the shared API; network access is a separate research topic |
 
 #### Local control API
+
+Extensibility starts with an audit of existing rule models, connection roles, IPC and enforcement. From that work, develop the existing local transports into a documented contract with version and capability negotiation, machine-readable errors, limited permissions and confirmation of sensitive actions. Design a separate executor contract: each executor declares its supported conditions, exits and limitations; Windows and Linux remain usable independently.
+
+The order is audit, minimal contracts, a limited integration, then contract validation across different scenarios. An experimental OpenWrt test bed can be prepared in parallel; it need not wait for every plugin category. The complete extension system does not block previously planned features.
+
+We plan to exercise the contracts with different integrations: external diagnostics, a supported VPN client and configuration imports that expose unsupported conditions. An independent developer being able to create a limited extension without changing the core is a readiness goal; extension research does not postpone the planned SOCKS5/HTTP CONNECT exit.
 
 The goal is a documented way for scripts, external apps and alternative
 interfaces to work with NRR without changing its core. Clients will read
@@ -382,7 +402,7 @@ Planned as well; these move up as users ask for them.
 - **Extensions through a shared API** — integrations and automation in different languages, Python among the first SDKs; permissions, isolation and optional HTML panels without a mandatory web engine in a normal installation.
 - **Configuration assistant and external monitoring** — extensions propose verifiable changes and explain events; sending configuration to external services needs consent, automatic actions need pre-approved conditions.
 - **Port and protocol rules** — combinations of application, address, domain, destination port and protocol with clear precedence.
-- **Lightweight Linux and OpenWrt** — assess core portability, networking mechanisms, memory and agent size after higher-priority Linux work.
+- **Lightweight Linux and OpenWrt** — assess core portability, networking mechanisms, memory and agent size after higher-priority Linux work; see the shared section on the lightweight agent and OpenWrt below.
 - **Remote management** — protected access to one instance's web interface; managing multiple instances and organisational policies is a separate direction.
 
 Ideas we are looking into before promising them.
@@ -399,7 +419,7 @@ Ideas we are looking into before promising them.
 - **NetRuleRouter on your VPN server** — installed on a server running WireGuard or AmneziaWG, it routes the traffic of that server's clients by your rules — a phone, a laptop, or a home router connected to the server — with nothing to install on them.
 - **Remote Web UI** — protected management of one remote NetRuleRouter instance; by itself this does not imply central management of several machines.
 - **Central management** — distributing and locking policies, monitoring multiple instances, audit and corporate-monitoring integration without turning NetRuleRouter into a hypervisor or VDI platform.
-- **Running on OpenWrt routers** — if you know how NetRuleRouter would fit on a router — memory, storage, the firewall — we will be glad to hear it.
+- **Running on OpenWrt routers** — the adapter, device management and a possible native agent are described in the shared section below. If you know how NetRuleRouter would fit on a router — memory, storage, the firewall — we will be glad to hear it.
 
 ### Plugin system and SDKs
 
@@ -507,13 +527,17 @@ A third-party rating alone is not evidence of account-blocking risk.
 
 ### Ports, protocols and combined conditions
 
-We will explore routing by destination port and supported protocol, including
-application plus address/domain plus port plus protocol. This needs clear
-precedence for overlapping rules and validation of each OS's capabilities.
-It does not replace existing SOCKS5/HTTP CONNECT egress support planned before
-the full release.
+TCP/UDP, ports and ranges, platform checks and implementation of verified combinations are prepared in A1. Research here covers unverified application plus address/domain plus port plus protocol combinations, other protocols and each executor's capabilities. Overlapping rules need clear precedence and unsupported conditions must not be silently omitted. This does not replace SOCKS5/HTTP CONNECT egress support planned before the full release.
 
 ### Lightweight agent and OpenWrt
+
+First investigate management through existing OpenWrt mechanisms and their documented interfaces. Candidates include Shunt, pbr, mwan3, firewall4, netifd, ubus and UCI; support for any particular component depends on verification. An initial adapter should discover a compatible system, read its capabilities, connections and rules, prepare and validate changes, apply confirmed changes and show the result. Detecting other administrators' changes and safe rollback depend on backend capabilities. Initial experiments are planned in a virtual environment.
+
+Later research includes a network-device section, device groups and policies enforced on a computer, a router or both. Each rule needs a visible executor and clear guarantees; moving a local rule to a router requires a scope preview and confirmation. A router does not always see the application behind a connection, and a message sent after a socket opens may arrive too late for the first packet: strict application rules need separate verification and must not silently bypass protection on failure. Corporate VPNs, DNS and organisational policy are considered alongside personal connections without promising universal compatibility.
+
+Before expanding distributed operation, verify the separation of permissions and local and router policies, and that the stated protection holds when components lose contact. Checks use the relevant real network paths; untested scenarios are identified explicitly.
+
+A compact agent and SDK for device manufacturers remain later research after evaluating existing integrations. Assess device resources, compatibility, updates and recovery, and rule ownership when components coexist. The browser extension first communicates with local NRR; router information is not presented as proof of the browser's actual path.
 
 We will assess reusing the rule engine and Linux backend on compact systems,
 including OpenWrt, without GUI, TUI or optional components. The investigation
@@ -522,7 +546,15 @@ and router networking. Its results will determine whether a separate lightweight
 agent makes sense. Neither a core rewrite nor OpenWrt compatibility is promised
 in advance; Linux desktop/server parity remains the earlier priority.
 
-macOS comes after Linux; its own plan will appear here once the port starts.
+### macOS: staged support
+
+**macOS Companion** will be investigated after the extensibility foundation and a working integration with a compatible OpenWrt router. A lightweight application would manage supported router rules, show network exits and diagnostics, and interact with supported browsers. It does not require a macOS system-routing mechanism, so it may arrive before a full local port. Management capabilities and security depend on a verified adapter and pairing.
+
+Companion needs a suitable control contract and a verified adapter; completion of every plugin category is not required.
+
+Companion assumes an available compatible router and is not planned to work without one. A router cannot necessarily distinguish Mac applications, so device-level rule management does not guarantee per-application routing. That requires an additional verified mechanism.
+
+**Native macOS routing** is a separate later stage: research Network Extension, Apple requirements, system filtering and the possibilities for routing applications and VPNs. The previously planned Safari extension remains, while its packaging, permissions, connection to Companion and available features require separate verification.
 
 ## Contributing
 

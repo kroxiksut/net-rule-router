@@ -110,6 +110,64 @@ fn cleanup_wfp_blocks_only_strips_blocks_and_keeps_permits() {
     assert_eq!(remaining[0].action, WfpAction::Permit);
 }
 
+#[test]
+fn a_refused_cleanup_keeps_the_crash_ledger_for_the_next_service_instance() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("wfp-filters.ledger");
+    let api = Arc::new(MockWindowsApi::new());
+    let session = Arc::new(WfpSession::open(api.clone()).unwrap());
+    seeded_block_permit_block(&session, &api);
+    let ledger = Arc::new(crate::wfp_filter_ledger::WfpFilterLedger::new(path.clone()));
+    ledger.record(&[
+        WfpFilterId { raw: 1 },
+        WfpFilterId { raw: 2 },
+        WfpFilterId { raw: 3 },
+    ]);
+    let make_orchestrator = |session: Arc<WfpSession>, ledger| {
+        PerSidApplyOrchestrator::new(
+            session,
+            Arc::new(ScriptedSource::default()),
+            Arc::new(ScriptedRules::default()),
+            Arc::new(MockFqdnCacheLookup::new()),
+            Arc::new(CollectAudit::default()),
+        )
+        .with_filter_ledger(ledger)
+    };
+    let orch = make_orchestrator(session, ledger);
+    api.set_fail_delete(&[2]);
+    assert!(
+        orch.cleanup_wfp().is_err(),
+        "partial cleanup must not announce completion"
+    );
+    assert_eq!(
+        api.wfp_filters
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|f| f.id.raw)
+            .collect::<Vec<_>>(),
+        vec![2]
+    );
+    drop(orch);
+    let recovered = Arc::new(crate::wfp_filter_ledger::WfpFilterLedger::new(path));
+    assert!(
+        recovered.read().contains(&2),
+        "a crash must not lose the refused filter key"
+    );
+    api.set_fail_delete(&[]);
+    let next = make_orchestrator(
+        Arc::new(WfpSession::open(api.clone()).unwrap()),
+        recovered.clone(),
+    );
+    next.defer_orphans_to_first_pass();
+    next.cleanup_wfp().unwrap();
+    assert!(api.wfp_filters.lock().unwrap().is_empty());
+    assert!(
+        recovered.read().is_empty(),
+        "only confirmed cleanup may clear the ledger"
+    );
+}
+
 /// Leak protection on: a dead instance's blocks hold through the start, and
 /// the first pass over a present user deletes only what it did not claim.
 #[test]

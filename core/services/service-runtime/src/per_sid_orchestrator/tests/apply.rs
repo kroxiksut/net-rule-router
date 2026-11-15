@@ -1,6 +1,359 @@
 use super::*;
 
 #[test]
+fn a_skipped_guard_does_not_report_success_while_an_obsolete_permit_remains() {
+    for periodic in [false, true] {
+        let sid = "S-1-5-21-A";
+        let other_sid = "S-1-5-21-B";
+        let (api, orch, source, rules, audit) = fixture();
+        source.set(sid, snap_full("Wi-Fi", "TAP"));
+        source.set(other_sid, snap_full("Wi-Fi", "TAP"));
+        orch.install_for_sid(sid).unwrap();
+        orch.install_for_sid(other_sid).unwrap();
+        let old = orch.installed_filter_ids(sid);
+        let other = orch.installed_filter_ids(other_sid);
+        assert!(api
+            .wfp_filters
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|record| { old.contains(&record.id) && record.action == WfpAction::Permit }));
+        rules.set(rules_with_secondary_ip(Ipv4Addr::new(192, 0, 2, 11)));
+        let ComputedFilterSet::Install(plan) = orch
+            .compute_filters_for_sid(sid, false, None, ComputeIntent::Preview)
+            .unwrap()
+        else {
+            panic!("the changed policy must have replacement guards");
+        };
+        let skipped = plan
+            .filters
+            .iter()
+            .find(|spec| spec.guards_traffic())
+            .expect("the secondary rule needs a guarding block")
+            .id;
+        api.set_fail_add_unmaterializable(&[skipped.raw]);
+
+        let result = if periodic {
+            orch.reconcile_secondary_coverage(sid).map(|_| ())
+        } else {
+            orch.install_for_sid(sid).map(|_| ())
+        };
+        assert!(
+            result.is_err(),
+            "periodic={periodic}: a skipped guard kept obsolete permits but apply reported success"
+        );
+        assert!(matches!(
+            audit.snapshot().last().unwrap().kind,
+            PerSidApplyAuditKind::Failed
+        ));
+        let tracked = orch.installed_filter_ids(sid);
+        let live = api.wfp_filters.lock().unwrap();
+        assert!(old.iter().all(|id| tracked.contains(id)));
+        assert!(live
+            .iter()
+            .filter(|record| record.user_sid.as_deref() == Some(sid))
+            .all(|record| tracked.contains(&record.id)));
+        assert!(other
+            .iter()
+            .all(|id| live.iter().any(|record| record.id == *id)));
+        drop(live);
+
+        api.set_fail_add_unmaterializable(&[]);
+        if periodic {
+            orch.reconcile_secondary_coverage(sid).unwrap();
+        } else {
+            orch.install_for_sid(sid).unwrap();
+        }
+        let live = api.wfp_filters.lock().unwrap();
+        assert!(old
+            .iter()
+            .all(|id| !live.iter().any(|record| record.id == *id)));
+        assert!(live.iter().any(|record| record.id == skipped));
+        assert!(other
+            .iter()
+            .all(|id| live.iter().any(|record| record.id == *id)));
+    }
+}
+
+#[test]
+fn periodic_reconcile_retries_failed_policy_withdrawal_without_touching_another_user() {
+    let sid = "S-1-5-21-A";
+    let other_sid = "S-1-5-21-B";
+    let (api, orch, source, rules, audit) = fixture();
+    source.set(sid, snap_full("Wi-Fi", "TAP"));
+    source.set(other_sid, snap_full("Wi-Fi", "TAP"));
+    orch.install_for_sid(sid).unwrap();
+    orch.install_for_sid(other_sid).unwrap();
+    let stale = orch.installed_filter_ids(sid)[0];
+    let other_ids = orch.installed_filter_ids(other_sid);
+    api.set_fail_delete(&[stale.raw]);
+    rules.clear();
+    // NoPolicy means no settings row, not merely an empty rule book.
+    source.per_sid.lock().unwrap().remove(sid);
+    assert!(orch.install_for_sid(sid).is_err());
+
+    // The production periodic hook calls this method for every held SID.
+    assert!(
+        orch.reconcile_secondary_coverage(sid).is_err(),
+        "the periodic pass hid the still-failing withdrawal as a successful no-op"
+    );
+    assert!(orch.installed_filter_ids(sid).contains(&stale));
+    assert!(matches!(
+        audit.snapshot().last().unwrap().kind,
+        PerSidApplyAuditKind::Failed
+    ));
+
+    api.set_fail_delete(&[]);
+    orch.reconcile_secondary_coverage(sid).unwrap();
+    assert!(orch.installed_filter_ids(sid).is_empty());
+    let live = api.wfp_filters.lock().unwrap();
+    assert!(!live
+        .iter()
+        .any(|record| record.user_sid.as_deref() == Some(sid)));
+    assert!(other_ids
+        .iter()
+        .all(|id| live.iter().any(|record| record.id == *id)));
+    assert!(matches!(
+        audit.snapshot().last().unwrap().kind,
+        PerSidApplyAuditKind::Updated
+    ));
+    drop(live);
+
+    let records = audit.snapshot().len();
+    orch.reconcile_secondary_coverage(sid).unwrap();
+    assert_eq!(
+        audit.snapshot().len(),
+        records,
+        "quiet no-policy ticks must not spam audits"
+    );
+}
+
+#[test]
+fn removing_the_last_policy_keeps_failed_filter_deletions_tracked_and_reports_failure() {
+    for action in [WfpAction::Permit, WfpAction::Block] {
+        let sid = "S-1-5-21-A";
+        let (api, orch, source, rules, _audit) = fixture();
+        source.set(sid, snap_full("Wi-Fi", "TAP"));
+        orch.install_for_sid(sid).unwrap();
+        let stale = orch.state.lock().unwrap().get(sid).unwrap().installed[0];
+        api.wfp_filters
+            .lock()
+            .unwrap()
+            .iter_mut()
+            .find(|record| record.id == stale)
+            .unwrap()
+            .action = action;
+        api.set_fail_delete(&[stale.raw]);
+        rules.clear();
+        source.per_sid.lock().unwrap().remove(sid);
+
+        assert!(
+            orch.install_for_sid(sid).is_err(),
+            "removing the policy claimed success while a {action:?} filter remained"
+        );
+        assert!(
+            orch.state
+                .lock()
+                .unwrap()
+                .get(sid)
+                .unwrap()
+                .installed
+                .contains(&stale),
+            "a failed {action:?} removal was orphaned"
+        );
+        api.set_fail_delete(&[]);
+        assert_eq!(orch.install_for_sid(sid).unwrap(), 0);
+        assert!(!api
+            .wfp_filters
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|record| record.id == stale));
+    }
+}
+
+#[test]
+fn install_does_not_report_success_when_an_old_lan_permit_cannot_be_removed() {
+    let sid = "S-1-5-21-A";
+    let (api, orch, source, _rules, _audit) = fixture();
+    source.set(sid, snap_full("Wi-Fi", "TAP"));
+    orch.install_for_sid(sid).unwrap();
+    let mut stale = api
+        .wfp_filters
+        .lock()
+        .unwrap()
+        .iter()
+        .find(|f| f.action == WfpAction::Permit && f.user_sid.as_deref() == Some(sid))
+        .expect("fixture has a user permit")
+        .clone();
+    stale.id = WfpFilterId { raw: 900_001 };
+    stale.remote_ip = None;
+    stale.remote_ip_set.clear();
+    stale.remote_subnet = Some((Ipv4Addr::new(192, 168, 0, 0), 16));
+    api.wfp_filters.lock().unwrap().push(stale.clone());
+    orch.state
+        .lock()
+        .unwrap()
+        .get_mut(sid)
+        .unwrap()
+        .installed
+        .push(stale.id);
+    api.set_fail_delete(&[stale.id.raw]);
+
+    assert!(
+        orch.install_for_sid(sid).is_err(),
+        "install reported success while an obsolete broad LAN permit remains"
+    );
+    assert!(
+        orch.state
+            .lock()
+            .unwrap()
+            .get(sid)
+            .unwrap()
+            .installed
+            .contains(&stale.id),
+        "failed removal must stay tracked for retry"
+    );
+    api.set_fail_delete(&[]);
+    orch.install_for_sid(sid)
+        .expect("retry can finish after removal recovers");
+    assert!(!api
+        .wfp_filters
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|f| f.id == stale.id));
+}
+
+#[test]
+fn a_failed_removal_of_a_broad_lan_permit_is_not_reported_as_applied() {
+    let sid = "S-1-5-21-LAN";
+    let api = Arc::new(MockWindowsApi::new());
+    let session = Arc::new(WfpSession::open(api.clone() as Arc<dyn WindowsApiPort>).unwrap());
+    let filter = |raw, owner: &str, action, subnet, weight| WfpFilterSpec {
+        id: WfpFilterId { raw },
+        layer: WfpLayerKey::AleAuthConnectV4,
+        action,
+        user_sid: Some(owner.to_owned()),
+        remote_subnet: subnet,
+        weight,
+        remote_ip: None,
+        remote_ip_set: Vec::new(),
+        remote_ip_set_v6: Vec::new(),
+        remote_port: None,
+        app_pattern: None,
+        local_interface_luid: None,
+        remote_subnet_v6: None,
+        ip_protocol: None,
+        remote_subnet_set: Vec::new(),
+    };
+    let broad = filter(
+        9001,
+        sid,
+        WfpAction::Permit,
+        Some((Ipv4Addr::new(192, 168, 0, 0), 16)),
+        5_242_891,
+    );
+    let block = filter(9002, sid, WfpAction::Block, None, 1_000_000);
+    let other = filter(
+        9003,
+        "S-1-5-21-OTHER",
+        WfpAction::Permit,
+        Some((Ipv4Addr::new(192, 168, 0, 0), 16)),
+        5_242_891,
+    );
+    let adjacent = filter(
+        9004,
+        sid,
+        WfpAction::Permit,
+        Some((Ipv4Addr::new(192, 168, 2, 0), 24)),
+        5_242_891,
+    );
+    session
+        .execute_wfp_plan(
+            &[broad.clone(), block.clone(), other.clone()]
+                .into_iter()
+                .map(WfpFilterAction::AddFilter)
+                .collect::<Vec<_>>(),
+        )
+        .unwrap();
+    let orch = PerSidApplyOrchestrator::new(
+        session,
+        Arc::new(ScriptedSource::default()),
+        Arc::new(ScriptedRules::default()),
+        Arc::new(MockFqdnCacheLookup::new()),
+        Arc::new(CollectAudit::default()),
+    );
+    orch.upsert_state(sid, vec![broad.id, block.id]);
+    api.set_fail_delete(&[broad.id.raw]);
+    let desired = vec![block.clone(), adjacent.clone()];
+    let first = orch.reconcile_to_desired(
+        sid,
+        vec![broad.id, block.id],
+        desired.clone(),
+        false,
+        "refused LAN",
+        false,
+    );
+    assert!(
+        first.is_err(),
+        "the refused LAN still has a broad permit but reconciliation reported success"
+    );
+    let tracked = orch
+        .state
+        .lock()
+        .unwrap()
+        .get(sid)
+        .unwrap()
+        .installed
+        .clone();
+    assert!(
+        tracked.contains(&broad.id),
+        "the retry lost the stale permit"
+    );
+    assert!(
+        !api.wfp_filters
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|record| record.id == adjacent.id),
+        "a refused replacement must not publish a partial new permit"
+    );
+    assert_eq!(
+        tracked,
+        vec![broad.id, block.id],
+        "a refused replacement must keep tracking the previous policy"
+    );
+    assert!(api
+        .wfp_filters
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|record| record.id == block.id));
+    assert!(api
+        .wfp_filters
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|record| record.id == other.id));
+    api.set_fail_delete(&[]);
+    orch.reconcile_to_desired(sid, tracked, desired, false, "retry refused LAN", false)
+        .unwrap();
+    assert!(!api
+        .wfp_filters
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|record| record.id == broad.id));
+    assert!(api
+        .wfp_filters
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|record| record.id == other.id));
+}
+
+#[test]
 fn compute_records_unresolved_app_rules_into_status() {
     // an app rule whose exe resolves to no path (the
     // default NoopAppPathResolver) must publish the app pattern into the

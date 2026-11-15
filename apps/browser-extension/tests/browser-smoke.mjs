@@ -27,11 +27,17 @@ async function connect(url) {
   sockets.push(socket);
   const pending = new Map();
   let nextId = 1;
-  await new Promise((resolveOpen, rejectOpen) => {
-    const timer = setTimeout(() => rejectOpen(new Error('CDP connection timeout')), Math.min(5000, remaining()));
-    socket.addEventListener('open', () => { clearTimeout(timer); resolveOpen(); }, { once: true });
-    socket.addEventListener('error', () => { clearTimeout(timer); rejectOpen(new Error('CDP connection failed')); }, { once: true });
-  });
+  try {
+    await new Promise((resolveOpen, rejectOpen) => {
+      const timer = setTimeout(() => rejectOpen(new Error('CDP connection timeout')), Math.min(5000, remaining()));
+      socket.addEventListener('open', () => { clearTimeout(timer); resolveOpen(); }, { once: true });
+      socket.addEventListener('error', () => { clearTimeout(timer); rejectOpen(new Error('CDP connection failed')); }, { once: true });
+    });
+  } catch (error) {
+    socket.close();
+    sockets.splice(sockets.indexOf(socket), 1);
+    throw error;
+  }
   socket.addEventListener('message', event => {
     const message = JSON.parse(event.data);
     const request = pending.get(message.id);
@@ -48,7 +54,7 @@ async function connect(url) {
     }
     pending.clear();
   });
-  return (method, params = {}) => new Promise((resolveRequest, rejectRequest) => {
+  const call = (method, params = {}) => new Promise((resolveRequest, rejectRequest) => {
     const id = nextId++;
     const timer = setTimeout(() => {
       pending.delete(id);
@@ -57,6 +63,11 @@ async function connect(url) {
     pending.set(id, { resolve: resolveRequest, reject: rejectRequest, timer });
     socket.send(JSON.stringify({ id, method, params }));
   });
+  call.close = () => {
+    socket.close();
+    sockets.splice(sockets.indexOf(socket), 1);
+  };
+  return call;
 }
 
 await access(executable);
@@ -96,8 +107,29 @@ try {
   };
   const version = await get('/json/version');
   browserCdp = await connect(version.webSocketDebuggerUrl);
-  const worker = await poll(async () => (await get('/json/list')).find(target =>
-    target.type === 'service_worker' && target.url.startsWith('chrome-extension:')), 'extension service worker');
+  const worker = await poll(async () => {
+    const candidates = (await get('/json/list')).filter(target => {
+      if (target.type !== 'service_worker') return false;
+      const url = new URL(target.url);
+      return url.protocol === 'chrome-extension:' && url.pathname === '/background.js';
+    });
+    for (const candidate of candidates) {
+      let candidateCdp;
+      try {
+        candidateCdp = await connect(candidate.webSocketDebuggerUrl);
+        await candidateCdp('Runtime.enable');
+        const identity = await candidateCdp('Runtime.evaluate', {
+          expression: "chrome.i18n.getMessage('app_name')", returnByValue: true,
+        });
+        if (identity.result?.value === 'NetRuleRouter') return candidate;
+      } catch {
+        // Workers may stop between the target list and the CDP connection.
+      } finally {
+        candidateCdp?.close();
+      }
+    }
+    return null;
+  }, 'NetRuleRouter extension service worker');
   const extensionId = new URL(worker.url).hostname;
   const created = await browserCdp('Target.createTarget', { url: `chrome-extension://${extensionId}/ui/options.html` });
   const page = await poll(async () => (await get('/json/list')).find(target => target.id === created.targetId), 'options page');

@@ -108,6 +108,9 @@ const PUBLIC: &[&str] = &[
     "destinations",
     "detached",
     "detail",
+    // Closed-set provenance metadata: values are fixed slugs/states, not the
+    // requester identity, hostname, or an arbitrary string from the caller.
+    "delivery",
     "differs_live",
     "differs_neutral",
     "dismissed",
@@ -128,6 +131,7 @@ const PUBLIC: &[&str] = &[
     "event_id",
     "event_type",
     "events",
+    "evidence_source",
     "excluded",
     "expected",
     "fail_closed_active",
@@ -241,6 +245,7 @@ const PUBLIC: &[&str] = &[
     "prior",
     "priority",
     "problem",
+    "probe_actor",
     "profile",
     "proto",
     "protocol",
@@ -263,6 +268,7 @@ const PUBLIC: &[&str] = &[
     "requested_conn_trace_log",
     "requested_enforcement_mode",
     "requested_verbose",
+    "requester_state",
     "resends",
     "resolutions",
     "resolved",

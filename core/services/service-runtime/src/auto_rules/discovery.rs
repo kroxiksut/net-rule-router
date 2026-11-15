@@ -4,7 +4,8 @@ use super::*;
 pub use nrr_domain::suggestion_discovery::DiscoveryDecision;
 use nrr_domain::suggestion_discovery::DiscoveryEpisode;
 use nrr_shared::ipc_payloads::{
-    DiscoveryEpisodeDto, DiscoveryEpisodesSnapshotDto, DiscoveryStepDto,
+    DiscoveryEpisodeDto, DiscoveryEpisodesSnapshotDto, DiscoveryProvenanceDto, DiscoveryStepDto,
+    AUTO_RULE_MATCH_KIND_APPLICATION,
 };
 
 const DISCOVERY_ROWS_PER_GROUP: usize = 64;
@@ -114,6 +115,13 @@ impl AutoRulesEngine {
                 if let Some(host) = episode.host.as_deref() {
                     episode.probe_queue = queued.remove(host).map(|entry| entry.status);
                 }
+                let offer = pending
+                    .iter()
+                    .map(|candidate| &candidate.dto)
+                    .find(|dto| episode.candidate_id.as_deref() == Some(dto.id.as_str()));
+                if let Some(offer) = offer {
+                    episode.provenance = Some(provenance_for_offer(offer, &episode.history));
+                }
                 if episode.probe_queue.as_ref().is_some_and(|queue| {
                     queue.wait_kind == nrr_shared::ipc_payloads::ProbeQueueWaitKindDto::Rules
                 }) {
@@ -130,11 +138,7 @@ impl AutoRulesEngine {
                 if episode.state == "delivered" {
                     return episode;
                 }
-                let Some(offer) = pending
-                    .iter()
-                    .map(|candidate| &candidate.dto)
-                    .find(|dto| episode.candidate_id.as_deref() == Some(dto.id.as_str()))
-                else {
+                let Some(offer) = offer else {
                     return episode;
                 };
                 let waiting = !is_app_offer(offer)
@@ -377,6 +381,26 @@ impl AutoRulesEngine {
         self.emit_discovery(sid, id, decision);
     }
 
+    /// Records the evidence beside the actual service push. This is separate
+    /// from the discovery ledger's rate-limited transition log, so a full
+    /// health snapshot or a busy transition window cannot erase the offer's
+    /// provenance from the diagnostic archive.
+    pub(super) fn log_candidate_provenance(&self, sid: &str, candidate: &AutoRuleCandidateDto) {
+        let provenance = provenance_for_offer(candidate, &[]);
+        tracing::info!(
+            target: "nrr::discovery",
+            sid,
+            candidate_id = %candidate.id,
+            host = %candidate.anchor,
+            evidence_source = %provenance.source,
+            requester_state = %provenance.requester_state,
+            probe_actor = provenance.probe_actor.as_deref().unwrap_or("none"),
+            delivery = "published-to-subscriber",
+            msg_key = "site-suggestion-provenance",
+            "site suggestion evidence provenance",
+        );
+    }
+
     pub(super) fn forget_discovery_candidates(&self, sid: &str, wanted: &HashSet<&str>) {
         let mut states = self.publish_state.lock().unwrap_or_else(|p| p.into_inner());
         if let Some(state) = states.get_mut(sid) {
@@ -465,6 +489,7 @@ fn to_dto(namespace: &str, episode: DiscoveryEpisode) -> DiscoveryEpisodeDto {
         candidate_id: episode.candidate_id,
         platform_limitation: None,
         probe_queue: None,
+        provenance: None,
         state: decision.state.to_owned(),
         stage: decision.stage.to_owned(),
         reason: decision.reason.to_owned(),
@@ -480,5 +505,147 @@ fn to_dto(namespace: &str, episode: DiscoveryEpisode) -> DiscoveryEpisodeDto {
                 at_unix_ms: step.at_ms,
             })
             .collect(),
+    }
+}
+
+fn provenance_for_offer(
+    offer: &nrr_shared::ipc_payloads::AutoRuleCandidateDto,
+    history: &[DiscoveryStepDto],
+) -> DiscoveryProvenanceDto {
+    use nrr_shared::ipc_payloads::{
+        AUTO_RULE_SIGNAL_APP_MAIN_LINK_BLOCKED, AUTO_RULE_SIGNAL_APP_OWN_RESOLVER,
+        AUTO_RULE_SIGNAL_BRAND_RELATED, AUTO_RULE_SIGNAL_CO_ACTIVITY,
+        AUTO_RULE_SIGNAL_DELIVERY_NAME, AUTO_RULE_SIGNAL_HTTP_PATH_REACHABILITY,
+        AUTO_RULE_SIGNAL_MAIN_LINK_BLOCKED, AUTO_RULE_SIGNAL_PLACEHOLDER_ANSWER,
+        AUTO_RULE_SIGNAL_SHARED_ADDRESS_REACHABILITY,
+    };
+
+    // This is the evidence path that formed the offer, not a claim about the
+    // process that initiated the browser request. The current DNS observation
+    // carries a hostname and user owner, while the connection observation
+    // carries a process and socket IP; neither carries the hostname and process
+    // together. Joining those records would infer attribution from DNS/IP and
+    // is deliberately forbidden here.
+    let source = match offer.signal.as_str() {
+        AUTO_RULE_SIGNAL_BRAND_RELATED
+        | AUTO_RULE_SIGNAL_DELIVERY_NAME
+        | AUTO_RULE_SIGNAL_CO_ACTIVITY => "companion-activity",
+        AUTO_RULE_SIGNAL_HTTP_PATH_REACHABILITY => "service-http-probe",
+        AUTO_RULE_SIGNAL_MAIN_LINK_BLOCKED => "connection-observation",
+        AUTO_RULE_SIGNAL_SHARED_ADDRESS_REACHABILITY => "service-tls-probe",
+        AUTO_RULE_SIGNAL_PLACEHOLDER_ANSWER => "dns-observation",
+        AUTO_RULE_SIGNAL_APP_MAIN_LINK_BLOCKED | AUTO_RULE_SIGNAL_APP_OWN_RESOLVER => {
+            "application-observation"
+        }
+        _ => "unknown",
+    };
+    let confirmed_probe = matches!(source, "service-http-probe" | "service-tls-probe")
+        || history.iter().any(|step| {
+            step.stage == "probe"
+                && matches!(
+                    step.reason.as_str(),
+                    "http-answered"
+                        | "http-client-error"
+                        | "http-server-error"
+                        | "http-no-answer"
+                        | "certificate-untrusted"
+                        | "https-unconfirmed"
+                )
+        });
+    let requester_processes = if offer.match_kind == AUTO_RULE_MATCH_KIND_APPLICATION {
+        let name = nrr_shared::app_identity::app_match_key(&offer.proposed_match);
+        if name.is_empty() {
+            Vec::new()
+        } else {
+            vec![name
+                .chars()
+                .filter(|ch| !ch.is_control())
+                .take(64)
+                .collect()]
+        }
+    } else {
+        Vec::new()
+    };
+    let requester_state = if requester_processes.is_empty() {
+        "unknown"
+    } else {
+        "single"
+    };
+    DiscoveryProvenanceDto {
+        source: source.to_owned(),
+        requester_state: requester_state.to_owned(),
+        requester_processes,
+        probe_actor: confirmed_probe.then(|| "nrr-service".to_owned()),
+    }
+}
+
+#[cfg(test)]
+mod provenance_tests {
+    use super::*;
+    use nrr_shared::ipc_payloads::{
+        AUTO_RULE_MATCH_KIND_APPLICATION, AUTO_RULE_MATCH_KIND_EXACT,
+        AUTO_RULE_PRIMARY_BEHAVIOR_STALLS, AUTO_RULE_SIGNAL_APP_MAIN_LINK_BLOCKED,
+        AUTO_RULE_SIGNAL_HTTP_PATH_REACHABILITY,
+    };
+
+    fn http_offer() -> nrr_shared::ipc_payloads::AutoRuleCandidateDto {
+        nrr_shared::ipc_payloads::AutoRuleCandidateDto {
+            id: "arc-1".to_owned(),
+            anchor: "pbs.yahoo.com".to_owned(),
+            proposed_match: "pbs.yahoo.com".to_owned(),
+            match_kind: AUTO_RULE_MATCH_KIND_EXACT.to_owned(),
+            route: "secondary".to_owned(),
+            affinity: 0.0,
+            observations: None,
+            first_seen_unix_ms: 1,
+            last_seen_unix_ms: 2,
+            signal: AUTO_RULE_SIGNAL_HTTP_PATH_REACHABILITY.to_owned(),
+            consumers: Vec::new(),
+            consumers_changed_unix_ms: 0,
+            primary_behavior: AUTO_RULE_PRIMARY_BEHAVIOR_STALLS.to_owned(),
+            anchor_refuses_main_link: false,
+            observed_members: Vec::new(),
+            served_by_main_link: false,
+            third_party: None,
+            secondary_reach: Some(true),
+            any_zone_site: String::new(),
+            less_certain: String::new(),
+        }
+    }
+
+    #[test]
+    fn http_path_provenance_identifies_service_probe_without_claiming_requester() {
+        let episode = provenance_for_offer(&http_offer(), &[]);
+        assert_eq!(episode.source, "service-http-probe");
+        assert_eq!(episode.requester_state, "unknown");
+        assert!(episode.requester_processes.is_empty());
+        assert_eq!(
+            episode.probe_actor.as_deref(),
+            Some("nrr-service"),
+            "this candidate itself was formed by an NRR HTTP reachability check"
+        );
+
+        let history = [DiscoveryStepDto {
+            stage: "probe".to_owned(),
+            state: "deferred".to_owned(),
+            reason: "http-no-answer".to_owned(),
+            at_unix_ms: 3,
+        }];
+        let episode = provenance_for_offer(&http_offer(), &history);
+        assert_eq!(episode.requester_state, "unknown");
+        assert!(episode.requester_processes.is_empty());
+        assert_eq!(episode.probe_actor.as_deref(), Some("nrr-service"));
+    }
+
+    #[test]
+    fn application_offer_exposes_only_the_directly_observed_image_name() {
+        let mut offer = http_offer();
+        offer.match_kind = AUTO_RULE_MATCH_KIND_APPLICATION.to_owned();
+        offer.signal = AUTO_RULE_SIGNAL_APP_MAIN_LINK_BLOCKED.to_owned();
+        offer.proposed_match = r"C:\Users\example\browser\chrome.exe".to_owned();
+        let provenance = provenance_for_offer(&offer, &[]);
+        assert_eq!(provenance.source, "application-observation");
+        assert_eq!(provenance.requester_state, "single");
+        assert_eq!(provenance.requester_processes, ["chrome"]);
     }
 }

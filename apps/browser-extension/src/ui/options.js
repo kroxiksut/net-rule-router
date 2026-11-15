@@ -6,6 +6,8 @@ const profileForm = document.getElementById('profile-form');
 const webRtcForm = document.getElementById('webrtc-form');
 let snapshot;
 let busy = false;
+let connectionIntent = 0;
+let connectionRequest = 0;
 
 function setBusy(value) {
   busy = value;
@@ -70,6 +72,53 @@ async function finishMutation(message, successKey) {
   await refresh();
   setNotice(successKey, 'success');
 }
+
+async function refreshConnection() {
+  const sequence = ++connectionRequest;
+  const reply = await request({ type: 'getIntegration' });
+  if (sequence === connectionRequest) renderConnection({ integration: reply.integration, state: snapshot });
+}
+
+document.getElementById('connect-nrr').addEventListener('click', async event => {
+  const button = event.currentTarget;
+  if (!snapshot || button.disabled) return;
+  const intent = ++connectionIntent;
+  button.disabled = true;
+  try {
+    const reservation = request({ type: 'beginConnectNrr', confirmed: true })
+      .then(reply => ({ intent: reply.intent }), error => ({ error }));
+    if (!await api.permissions.request({ permissions: ['nativeMessaging'] })) throw new Error('permission_denied');
+    const reserved = await reservation;
+    if (reserved.error) throw reserved.error;
+    if (intent !== connectionIntent) return;
+    connectionRequest += 1;
+    renderConnection({ integration: 'connecting', state: snapshot });
+    await request({ type: 'connectNrr', confirmed: true, intent: reserved.intent });
+    await refreshConnection();
+  } catch (error) {
+    await refreshConnection().catch(() => {});
+    reportError(error);
+  } finally {
+    button.disabled = false;
+  }
+});
+
+document.getElementById('disconnect-nrr').addEventListener('click', async () => {
+  connectionIntent += 1;
+  try {
+    await request({ type: 'disconnectNrr', confirmed: true });
+    await refreshConnection();
+  } catch (error) {
+    reportError(error);
+  }
+});
+
+document.addEventListener('visibilitychange', () => {
+  if (!document.hidden && snapshot) refreshConnection().catch(() => {});
+});
+setInterval(() => {
+  if (!document.hidden && snapshot) return refreshConnection().catch(() => {});
+}, 3000);
 
 globalForm.elements.languageMode.addEventListener('change', () => updateLanguageField(globalForm));
 profileForm.elements.languageMode.addEventListener('change', () => updateLanguageField(profileForm));

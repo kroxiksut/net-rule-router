@@ -99,6 +99,9 @@ const DIAGNOSTIC_FIELDS: &[&str] = &[
     "anchor",
     "cidr",
     "bound",
+    // Stable candidate IDs are needed to join the provenance event to the
+    // archive's discovery snapshot, but are diagnostic data rather than public.
+    "candidate_id",
     "dest",
     "destination",
     "domain",
@@ -377,6 +380,7 @@ mod tests {
         assert_eq!(field_class("host"), PrivacyClass::Diagnostic);
         assert_eq!(field_class("qname"), PrivacyClass::Diagnostic);
         assert_eq!(field_class("remote_ip"), PrivacyClass::Diagnostic);
+        assert_eq!(field_class("candidate_id"), PrivacyClass::Diagnostic);
         assert_eq!(field_class("path"), PrivacyClass::Sensitive);
         assert_eq!(field_class("exe_path"), PrivacyClass::Sensitive);
         assert_eq!(field_class("adapter"), PrivacyClass::Sensitive);
@@ -409,6 +413,7 @@ mod tests {
             "hostname",
             "fqdn",
             "qname",
+            "candidate_id",
             "direct_host",
             "secondary_rule_host",
             "shared_ip",

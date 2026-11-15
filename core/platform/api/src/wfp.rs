@@ -22,10 +22,8 @@
 //! batches committed; the next reconcile converges on the intended set, and
 //! `cleanup_all` deletes every filter of ours by provider GUID on stop.
 //!
-//! Because a batch boundary is visible to traffic, replacing one filter set
-//! with another goes through [`WfpSession::execute_replacement`]: every add
-//! commits before the first delete, so each committed state holds the old
-//! set or the new one whole.
+//! Policy replacements use one transaction, regardless of the batching cap:
+//! publishing old permits beside new blocks can widen either policy.
 //!
 //! ## Idempotency (error classification)
 //!
@@ -40,7 +38,7 @@
 //!   `commit()` was called first.
 //! - No raw `HANDLE`/`HFWPENGINE` escapes into business logic.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex, OnceLock};
 
 use crate::{
@@ -51,13 +49,8 @@ use crate::{
     windows_api::WindowsApiPort,
 };
 
-/// Maximum number of WFP filters per transaction. Prevents
-/// `FwpmTransactionCommit0` from timing out on very large rule sets.
-/// Apply plans larger than this are split into multiple transactions.
-///
-/// Neutral batching cap (its former home was the Windows `constants` module);
-/// it travels with the WFP session logic into `nrr-platform-api` and is
-/// re-exported from the Windows crate for source compatibility.
+/// Batch size for independent mutations and teardown, not policy replacement.
+/// This engineering limit is not a WFP transaction-size limit.
 pub const MAX_FILTERS_PER_TRANSACTION: usize = 500;
 
 // ── Apply resilience ──────────────────────────────────────────────────────────
@@ -110,6 +103,48 @@ pub struct WfpReplaceOutcome {
     pub retire_held: Option<RetireHeld>,
 }
 
+/// Whether a failed replacement reached the publication boundary.
+#[derive(Debug)]
+pub enum WfpReplaceError {
+    /// Commit was never requested. This does not confirm that abort completed.
+    BeforeCommit(PlatformError),
+    /// The server may have committed despite the missing acknowledgement.
+    CommitUnconfirmed(PlatformError),
+}
+
+impl From<PlatformError> for WfpReplaceError {
+    fn from(error: PlatformError) -> Self {
+        Self::BeforeCommit(error)
+    }
+}
+
+impl From<WfpReplaceError> for PlatformError {
+    fn from(error: WfpReplaceError) -> Self {
+        match error {
+            WfpReplaceError::BeforeCommit(error) | WfpReplaceError::CommitUnconfirmed(error) => {
+                error
+            }
+        }
+    }
+}
+
+impl std::fmt::Display for WfpReplaceError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::BeforeCommit(error) => write!(f, "before WFP commit: {error}"),
+            Self::CommitUnconfirmed(error) => write!(f, "unconfirmed WFP commit: {error}"),
+        }
+    }
+}
+
+impl std::error::Error for WfpReplaceError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::BeforeCommit(error) | Self::CommitUnconfirmed(error) => Some(error),
+        }
+    }
+}
+
 /// Why a replacement kept the filters it was asked to retire.
 #[derive(Debug)]
 pub enum RetireHeld {
@@ -151,6 +186,9 @@ pub struct WfpSession {
     /// occurrence of an id warns once; subsequent occurrences of the SAME id
     /// stay at `debug!`.
     warned_skips: Mutex<HashSet<u64>>,
+    /// An unacknowledged commit may have installed these keys despite an error.
+    /// Keep them until deletion is confirmed, even if enumeration omits them.
+    pending_cleanup: Mutex<HashMap<u64, WfpAction>>,
 }
 
 impl WfpSession {
@@ -173,6 +211,7 @@ impl WfpSession {
             api,
             apply_lock: Mutex::new(()),
             warned_skips: Mutex::new(HashSet::new()),
+            pending_cleanup: Mutex::new(HashMap::new()),
         }
     }
 
@@ -235,49 +274,44 @@ impl WfpSession {
         Ok(outcome)
     }
 
-    /// Replace filters make-before-break: every one of `adds` commits before
-    /// the first of `retire` is deleted, so no committed state lacks both the
-    /// old filter and its replacement — batching included. A failed add
-    /// retires nothing.
-    ///
-    /// The retire pass is held back when a guarding block among `adds` was
-    /// skipped, and an id that is also being added is never retired: over-
-    /// coverage until the next pass is the safe side of both.
+    /// Publish additions and retirement together. A refused guarding block or
+    /// deletion aborts the replacement; an unacknowledged commit is an error
+    /// whose attempted keys remain available to cleanup and idempotent retry.
     pub fn execute_replacement(
         &self,
         adds: &[WfpFilterSpec],
         retire: &[WfpFilterId],
         mode: FilterFailureMode,
-    ) -> Result<WfpReplaceOutcome, PlatformError> {
+    ) -> Result<WfpReplaceOutcome, WfpReplaceError> {
         let _apply = self.apply_lock.lock().unwrap_or_else(|p| p.into_inner());
-        let add_actions: Vec<WfpFilterAction> = adds
-            .iter()
-            .cloned()
-            .map(WfpFilterAction::AddFilter)
-            .collect();
-        let mut added = WfpApplyOutcome::default();
-        self.execute_batches(&add_actions, mode, &mut added)?;
-
         let adding: HashSet<u64> = adds.iter().map(|s| s.id.raw).collect();
         let retire: Vec<WfpFilterId> = retire
             .iter()
             .copied()
             .filter(|id| !adding.contains(&id.raw))
             .collect();
-        let skipped: HashSet<u64> = added.skipped.iter().map(|s| s.id.raw).collect();
-        let mut outcome = WfpReplaceOutcome {
-            skipped: added.skipped,
-            ..WfpReplaceOutcome::default()
-        };
-        if retire.is_empty() {
-            return Ok(outcome);
+        if adds.is_empty() && retire.is_empty() {
+            return Ok(WfpReplaceOutcome::default());
         }
+        let guard = self.begin_transaction()?;
+        let add_actions: Vec<WfpFilterAction> = adds
+            .iter()
+            .cloned()
+            .map(WfpFilterAction::AddFilter)
+            .collect();
+        let mut added = WfpApplyOutcome::default();
+        self.execute_actions(&add_actions, mode, &mut added)?;
+        let skipped: HashSet<u64> = added.skipped.iter().map(|s| s.id.raw).collect();
         if adds
             .iter()
             .any(|s| skipped.contains(&s.id.raw) && s.guards_traffic())
         {
-            outcome.retire_held = Some(RetireHeld::ReplacementSkipped);
-            return Ok(outcome);
+            return Err(PlatformError::Transient {
+                operation: "replace WFP filters",
+                detail: "a guarding block could not be materialized; replacement was not committed"
+                    .into(),
+            }
+            .into());
         }
         let delete_actions: Vec<WfpFilterAction> = retire
             .iter()
@@ -285,11 +319,20 @@ impl WfpSession {
             .map(WfpFilterAction::DeleteFilter)
             .collect();
         let mut deleted = WfpApplyOutcome::default();
-        match self.execute_batches(&delete_actions, FilterFailureMode::Strict, &mut deleted) {
-            Ok(()) => outcome.retired = retire,
-            Err(e) => outcome.retire_held = Some(RetireHeld::Failed(e)),
+        self.execute_actions(&delete_actions, FilterFailureMode::Strict, &mut deleted)?;
+        if let Err(error) = guard.commit() {
+            let mut pending = self
+                .pending_cleanup
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            pending.extend(adds.iter().map(|spec| (spec.id.raw, spec.action)));
+            return Err(WfpReplaceError::CommitUnconfirmed(error));
         }
-        Ok(outcome)
+        Ok(WfpReplaceOutcome {
+            skipped: added.skipped,
+            retired: retire,
+            retire_held: None,
+        })
     }
 
     /// Caller holds `apply_lock`.
@@ -313,19 +356,24 @@ impl WfpSession {
         outcome: &mut WfpApplyOutcome,
     ) -> Result<(), PlatformError> {
         let guard = self.begin_transaction()?;
+        self.execute_actions(actions, mode, outcome)?;
+        guard.commit()
+    }
+
+    /// Caller owns the current transaction and `apply_lock`.
+    fn execute_actions(
+        &self,
+        actions: &[WfpFilterAction],
+        mode: FilterFailureMode,
+        outcome: &mut WfpApplyOutcome,
+    ) -> Result<(), PlatformError> {
         for action in actions {
             match action {
                 WfpFilterAction::AddFilter(spec) => {
                     match self.add_filter(spec) {
                         Ok(_) => {}
-                        // A failed SUB-LAYER registration must abort,
-                        // and this arm must stay ABOVE the idempotent/conflict
-                        // one: `FWP_E_ALREADY_EXISTS` from the sub-layer stage
-                        // classifies as `Conflict` exactly like a duplicate
-                        // FILTER add, but here NOTHING was installed. Folding
-                        // it into "already present — success" is the phantom-
-                        // filter bug: installed counters grow, WFP stays empty,
-                        // enforcement silently never happens.
+                        // A sub-layer conflict installs nothing. Classify it
+                        // before duplicate-filter success to avoid phantom installs.
                         Err(e) if e.is_sublayer_registration_failure() => {
                             tracing::error!(
                                 target: "nrr::wfp",
@@ -336,37 +384,13 @@ impl WfpSession {
                             );
                             return Err(e);
                         }
-                        // Already present — success. Safe ONLY because the
-                        // sub-layer stage was ruled out above: this error is now
-                        // provably about the filter itself. Classified as an
-                        // ADD, so a "not found" (a missing sub-layer or callout)
-                        // is the failure it is, never a phantom install.
+                        // Only filter conflicts are idempotent adds; a missing
+                        // sub-layer or callout must remain a failure.
                         Err(e) if e.classify_for(MutationIntent::Add) == ErrorClass::Conflict => {}
                         Err(e) if e.is_unmaterializable_filter() => match mode {
-                            // A single filter that can't be materialized
-                            // (absent app, degenerate app-id blob, rejected
-                            // condition). Under best-effort skip just this
-                            // filter so a shared preset listing one bad rule
-                            // (e.g. an uninstalled `citymap.exe`, or a malformed
-                            // condition → FWP_E_CONDITION_NOT_FOUND) does NOT
-                            // roll back the user's ENTIRE policy. The engine
-                            // and transaction stay healthy, so we continue.
                             FilterFailureMode::BestEffort => {
-                                // Expected, handled outcome (e.g. an uninstalled
-                                // app in a shared preset) — debug, not warn, so a
-                                // preset with dozens of app rules does not look
-                                // like "a pile of errors". The count is surfaced
-                                // once in the apply summary ("ok (N skipped)") and
-                                // each skip is recorded in `outcome.skipped`. Run
-                                // with NRR_LOG=nrr=debug to see them individually.
-                                //
-                                // The FIRST time this filter id is
-                                // skipped in the session's lifetime is promoted to
-                                // `warn!` so a persistently-unmaterializable filter
-                                // is visible without needing `NRR_LOG=debug`. Every
-                                // later skip of the SAME id (e.g. the ~2s
-                                // reconcile tick re-proposing the same rule) stays
-                                // at `debug!` so it does not spam the log.
+                                // Warn once so permanent skips remain visible
+                                // without flooding every reconcile tick.
                                 let first_time_this_session = {
                                     let mut warned =
                                         self.warned_skips.lock().unwrap_or_else(|p| p.into_inner());
@@ -403,10 +427,6 @@ impl WfpSession {
                                     reason: e.to_string(),
                                 });
                             }
-                            // Strict (all-or-nothing): even one un-materializable
-                            // filter aborts — the revision applies exactly or
-                            // not at all. Log which filter so the codegen root
-                            // cause is identifiable.
                             FilterFailureMode::Strict => {
                                 tracing::error!(
                                     target: "nrr::wfp",
@@ -424,9 +444,6 @@ impl WfpSession {
                             }
                         },
                         Err(e) => {
-                            // Catastrophic (access denied, transaction/engine
-                            // failure, unknown fatal). Always abort; log the
-                            // filter identity for diagnosis.
                             tracing::error!(
                                 target: "nrr::wfp",
                                 msg_key = "wfp-filter-add-failed",
@@ -435,7 +452,7 @@ impl WfpSession {
                                 "filter add failed with a non-recoverable error — aborting batch"
                             );
                             return Err(e);
-                        } // guard drops here → FwpmTransactionAbort0
+                        }
                     }
                 }
                 WfpFilterAction::DeleteFilter(id) => {
@@ -444,13 +461,8 @@ impl WfpSession {
                         Err(e) if e.classify() == ErrorClass::Idempotent => {
                             // Already gone — idempotent success.
                         }
-                        // Under best-effort, one filter that refuses to go must
-                        // not keep every OTHER block armed. This is the
-                        // anti-lockout path: a user whose machine is already
-                        // cut off, with the service gone or going, and the
-                        // whole point is to remove as much of the block set as
-                        // the engine will let us. Aborting the transaction
-                        // there removes NOTHING and leaves them offline.
+                        // Teardown must still remove the other blocks when
+                        // one refuses deletion, so recovery can make progress.
                         Err(e) if mode == FilterFailureMode::BestEffort => {
                             tracing::warn!(
                                 target: "nrr::wfp",
@@ -469,7 +481,7 @@ impl WfpSession {
                 }
             }
         }
-        guard.commit()
+        Ok(())
     }
 
     /// Delete all filters registered under our provider GUID.
@@ -477,22 +489,7 @@ impl WfpSession {
     /// Called on graceful stop and as an orphan-cleanup step on startup.
     /// Returns the number of filters deleted.
     pub fn cleanup_all(&self) -> Result<usize, PlatformError> {
-        let filters = self.enumerate_our_filters()?;
-        let count = filters.len();
-        if count == 0 {
-            return Ok(0);
-        }
-        // Delete all in one transaction (or in batches if > cap).
-        let delete_actions: Vec<WfpFilterAction> = filters
-            .into_iter()
-            .map(|f| WfpFilterAction::DeleteFilter(f.id))
-            .collect();
-        // Best-effort, not strict: this is a teardown, and one filter that will
-        // not go must not leave the other several thousand installed. The
-        // return counts what actually came off.
-        let outcome =
-            self.execute_wfp_plan_resilient(&delete_actions, FilterFailureMode::BestEffort)?;
-        Ok(count.saturating_sub(outcome.skipped.len()))
+        self.cleanup_filters(false)
     }
 
     /// Delete only **block** filters registered under our provider GUID,
@@ -507,22 +504,51 @@ impl WfpSession {
     /// [`cleanup_all`](Self::cleanup_all) but filters on
     /// `action == WfpAction::Block`.
     pub fn cleanup_blocks_only(&self) -> Result<usize, PlatformError> {
-        let delete_actions: Vec<WfpFilterAction> = self
-            .enumerate_our_filters()?
-            .into_iter()
-            .filter(|f| f.action == WfpAction::Block)
-            .map(|f| WfpFilterAction::DeleteFilter(f.id))
-            .collect();
+        self.cleanup_filters(true)
+    }
+
+    fn cleanup_filters(&self, blocks_only: bool) -> Result<usize, PlatformError> {
+        let _apply = self.apply_lock.lock().unwrap_or_else(|p| p.into_inner());
+        let filters = self.enumerate_our_filters()?;
+        let delete_actions: Vec<WfpFilterAction> = {
+            let mut pending = self
+                .pending_cleanup
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            pending.extend(filters.into_iter().map(|f| (f.id.raw, f.action)));
+            pending
+                .iter()
+                .filter(|(_, action)| !blocks_only || **action == WfpAction::Block)
+                .map(|(&raw, _)| WfpFilterAction::DeleteFilter(WfpFilterId { raw }))
+                .collect()
+        };
         let count = delete_actions.len();
         if count == 0 {
             return Ok(0);
         }
-        // Best-effort for the same reason as `cleanup_all`, and more sharply:
-        // every action here removes a BLOCK. One that sticks must not keep the
-        // rest of them armed on a machine whose service is already gone.
-        let outcome =
-            self.execute_wfp_plan_resilient(&delete_actions, FilterFailureMode::BestEffort)?;
-        Ok(count.saturating_sub(outcome.skipped.len()))
+        // Remove everything possible before reporting failure; the caller must
+        // retain its crash ledger until every requested deletion is confirmed.
+        let mut outcome = WfpApplyOutcome::default();
+        self.execute_batches(&delete_actions, FilterFailureMode::BestEffort, &mut outcome)?;
+        let skipped: HashSet<u64> = outcome.skipped.iter().map(|f| f.id.raw).collect();
+        let mut pending = self
+            .pending_cleanup
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        for action in &delete_actions {
+            if let WfpFilterAction::DeleteFilter(id) = action {
+                if !skipped.contains(&id.raw) {
+                    pending.remove(&id.raw);
+                }
+            }
+        }
+        if !skipped.is_empty() {
+            return Err(PlatformError::Transient {
+                operation: "cleanup WFP filters",
+                detail: format!("{} filter deletions remain unconfirmed", skipped.len()),
+            });
+        }
+        Ok(count)
     }
 
     // ── Low-level accessors ───────────────────────────────────────────────────
@@ -597,6 +623,10 @@ impl<'a> Drop for WfpTransactionGuard<'a> {
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+#[path = "wfp_atomic_tests.rs"]
+mod atomic_tests;
 
 #[cfg(test)]
 mod tests {
@@ -1004,29 +1034,6 @@ mod tests {
             .is_err());
         let live = api.wfp_filters.lock().unwrap();
         assert!((0..3).all(|raw| live.iter().any(|f| f.id.raw == raw)));
-    }
-
-    #[test]
-    fn a_skipped_guarding_block_holds_the_retirement() {
-        let api = mock_api();
-        api.set_fail_add_unmaterializable(&[11]);
-        let s = session(&api);
-        install(&s, 0..2);
-
-        let outcome = s
-            .execute_replacement(
-                &[spec(10), spec(11)],
-                &ids(0..2),
-                FilterFailureMode::BestEffort,
-            )
-            .unwrap();
-
-        assert!(matches!(
-            outcome.retire_held,
-            Some(RetireHeld::ReplacementSkipped)
-        ));
-        assert!(outcome.retired.is_empty());
-        assert_eq!(api.wfp_filters.lock().unwrap().len(), 3);
     }
 
     /// An app-only block whose executable is absent covers no destination,

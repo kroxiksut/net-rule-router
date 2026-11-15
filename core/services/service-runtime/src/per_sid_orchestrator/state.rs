@@ -153,6 +153,9 @@ pub struct PerSidApplyOrchestrator {
     /// for. The per-SID state mutex is not enough: it is taken pointwise, so
     /// two computes interleave between its acquisitions.
     pub(super) apply_locks: Mutex<std::collections::HashMap<String, Arc<Mutex<()>>>>,
+    /// Shared-key ownership checks, WFP writes and tracking publish together.
+    /// Taken after SID locks; never waits for another SID while held.
+    pub(super) filter_state_lock: Mutex<()>,
     /// Held while the SET OF USERS holding filters is decided and changed.
     /// The per-SID locks keep two computes for one user apart; this keeps two
     /// writers with different ideas of who is enforced apart — a tray exit

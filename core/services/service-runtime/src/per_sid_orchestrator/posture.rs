@@ -263,6 +263,23 @@ impl PerSidApplyOrchestrator {
         }
     }
 
+    /// Publish the removal of a routing policy after its old filters retired.
+    /// Explicit denies can remain without routing, so retain their drop roles.
+    pub(super) fn publish_withdrawn_route_policy(&self, sid: &str, filters: &[WfpFilterSpec]) {
+        let flushed = self.note_block_all_state(sid, false);
+        self.note_fail_closed_state(sid, false, flushed);
+        self.note_machine_wide_cut(sid, false);
+        self.update_killswitch_registry(
+            sid,
+            KillswitchBlockIds {
+                rule_blocks: rule_block_ids(filters),
+                ..KillswitchBlockIds::default()
+            },
+        );
+        self.clear_pending_vpn_clients(sid);
+        crate::ipv6_disposition::global_ipv6_dispositions().forget(sid);
+    }
+
     /// Drop every per-SID record describing an enforcement that is gone: the
     /// installed-filter set, both posture latches, the kill-switch block-id
     /// registry and the posture-log throttle (so a later re-arm logs as the

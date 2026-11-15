@@ -18,8 +18,22 @@
     "message": "Standalone"
   },
   "standalone_description": {
-    "message": "Your profiles are stored in this browser. Connection to the NRR application is not available in this version."
+    "message": "Your profiles are stored in this browser. Sync with NRR is not available yet."
   },
+  "connection_title": { "message": "NetRuleRouter connection" },
+  "connection_connect": { "message": "Check local host" },
+  "connection_disconnect": { "message": "Disconnect" },
+  "connection_permission_help": { "message": "Checking requests permission to communicate with a local application. No site addresses or profiles are sent." },
+  "connection_disconnected": { "message": "Standalone" },
+  "connection_disconnected_detail": { "message": "Local host has not been checked. Profiles work independently." },
+  "connection_connecting": { "message": "Checking local host" },
+  "connection_connecting_detail": { "message": "Waiting for the local host to respond." },
+  "connection_host_responded_unverified": { "message": "Host responded · unverified" },
+  "connection_host_responded_unverified_detail": { "message": "A local host responded. Its identity and the NRR service status have not been verified; routing and protection are not confirmed. This diagnostic connection closes after one minute." },
+  "connection_unavailable": { "message": "Host unavailable" },
+  "connection_unavailable_detail": { "message": "No response from the local host. Local profiles continue to work." },
+  "connection_incompatible": { "message": "Incompatible response" },
+  "connection_incompatible_detail": { "message": "The local host returned an incompatible response. Local profiles continue to work." },
   "current_site": {
     "message": "Current site"
   },
@@ -108,7 +122,7 @@
     "message": "Browser default"
   },
   "webrtc_owned": {
-    "message": "Non-proxied UDP restricted for this browser profile"
+    "message": "Browser confirmed the WebRTC setting; network behavior and route are not verified."
   },
   "explicit_only": {
     "message": "Browser settings change only when you explicitly apply an option. Installing or opening the extension does not enable these changes."
@@ -198,7 +212,7 @@
     "message": "WebRTC for the whole browser profile"
   },
   "webrtc_scope": {
-    "message": "This change affects every website in this browser profile, including other tabs. Incognito windows may inherit it too."
+    "message": "The browser setting is requested for the entire browser profile, including other tabs. Incognito windows may also inherit it."
   },
   "webrtc_consequence": {
     "message": "Restricting non-proxied UDP can interrupt calls and screen sharing. Applying the browser setting does not prove which network route a call uses."
@@ -219,7 +233,7 @@
     "message": "Confirm the whole-browser scope and its effect on calls before applying."
   },
   "webrtc_saved": {
-    "message": "WebRTC setting applied to this browser profile. Check any ongoing calls."
+    "message": "Browser confirmed the WebRTC setting; network behavior and route are not verified. Check any ongoing calls."
   },
   "webrtc_restored": {
     "message": "The extension released its WebRTC setting."

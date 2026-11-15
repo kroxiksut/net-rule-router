@@ -2917,6 +2917,12 @@
           "os-dns-cache-unavailable": "This platform cannot read the system DNS cache. Browser cache or encrypted DNS may leave the site name unknown.",
           "passive-reset-unavailable": "Passive connection reset observation is unavailable on this platform.",
           "discovery-identity-unavailable": "Recent discovery evidence cannot be recorded because a private session identity could not be created. Routing and suggestions continue to work."
+        },
+        "provenance": {
+          "source-label": "Evidence source: {source}.",
+          "source": { "companion-activity": "companion activity", "connection-observation": "a connection observation", "service-http-probe": "an NRR HTTP reachability check", "service-tls-probe": "an NRR TLS reachability check", "dns-observation": "a DNS observation", "application-observation": "an application observation", "unknown": "unknown evidence" },
+          "requester": { "unknown": "The requesting application was not directly identified. No process is inferred from DNS, shared IP, timing, or the NRR probe.", "single": "Directly observed requester: {processes}.", "multiple": "Several requesters were directly observed: {processes}." },
+          "probe-actor": { "nrr-service": "The reachability check was sent by NetRuleRouter; it does not identify who initiated the original connection." }
         }
       },
       "body": "Without these addresses the sites in your rules may not work fully. Checked ones will be added to your rules.",
@@ -3959,6 +3965,7 @@
       }
     },
     "event": {
+      "site-suggestion-provenance": "Suggestion evidence for {host}: {evidence_source}; requester {requester_state}; check {probe_actor}; delivery {delivery}.",
       "auto-rules-verify-accepted": "Rules with ? moved to the route that works for them: {count}.",
       "site-check-done": "Site check of {host} finished: {verdict}.",
       "site-notice-started": "Started the tray to say that {host} does not open.",

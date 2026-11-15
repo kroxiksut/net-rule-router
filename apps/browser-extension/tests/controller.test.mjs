@@ -11,7 +11,7 @@ const resolveMode = (site, global, consent, route, capability) => {
   return site || global;
 };
 
-function harness(stored = undefined, overrides = {}) {
+function harness(stored = undefined, overrides = {}, connection = null) {
   const calls = [];
   let current = stored === undefined ? {} : { profilesV1: structuredClone(stored) };
   const api = {
@@ -31,13 +31,39 @@ function harness(stored = undefined, overrides = {}) {
     ...overrides,
   };
   return {
-    controller: createController(api, resolveMode), calls,
+    controller: createController(api, resolveMode, { webRtc: true }, connection), calls,
     readStored: () => structuredClone(current.profilesV1),
     sender: { id: 'test-extension', url: 'moz-extension://test-extension/ui/popup.html' },
   };
 }
 
 const getState = { type: 'getState' };
+
+test('a denied native permission cannot start the local application', async () => {
+  let starts = 0;
+  const connection = { connect: async () => { starts += 1; }, status: () => 'disconnected' };
+  const h = harness(undefined, { permissions: { contains: async () => false } }, connection);
+  await assert.rejects(h.controller.handle({ type: 'connectNrr', confirmed: true }, h.sender), /permission_required/);
+  assert.equal(starts, 0);
+});
+
+test('a stalled native host cannot block local profile reads', async () => {
+  let release;
+  const connection = {
+    connect: () => new Promise(resolve => { release = resolve; }),
+    status: () => 'connecting',
+  };
+  const h = harness(undefined, {}, connection);
+  const { intent } = await h.controller.handle({ type: 'beginConnectNrr', confirmed: true }, h.sender);
+  const connect = h.controller.handle({ type: 'connectNrr', confirmed: true, intent }, h.sender);
+  await new Promise(resolve => setTimeout(resolve, 0));
+  const read = h.controller.handle(getState, h.sender);
+  const result = await Promise.race([read.then(() => 'read'), new Promise(resolve => setTimeout(() => resolve('blocked'), 100))]);
+  release();
+  await connect;
+  assert.equal(result, 'read');
+});
+
 const saveProfile = (baseRevision = 0) => ({
   type: 'saveProfile', baseRevision, confirmed: true,
   profile: { host: 'example.com', includeSubdomains: false, languageMode: 'manual', language: 'fr' },

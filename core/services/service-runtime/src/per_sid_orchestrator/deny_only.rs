@@ -125,17 +125,9 @@ impl PerSidApplyOrchestrator {
         if !filters.iter().any(|f| f.action == WfpAction::Block) {
             return Ok(ComputedFilterSet::NoPolicy);
         }
-        if intent.publishes() {
-            self.update_killswitch_registry(
-                sid,
-                KillswitchBlockIds {
-                    rule_blocks: rule_block_ids(&filters),
-                    ..KillswitchBlockIds::default()
-                },
-            );
-        }
         Ok(ComputedFilterSet::Install(ComputedPlan {
             filters,
+            without_route_policy: true,
             unresolved_apps,
         }))
     }

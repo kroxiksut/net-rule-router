@@ -34,6 +34,132 @@ fn plan(flows: Vec<FlowRule>) -> EnforcementPlan {
     }
 }
 
+#[test]
+fn policy_ipsec_permit_never_becomes_an_unconditional_wfp_permit() {
+    let mut local = route_flow(RouteRole::Primary, 0, Ipv4Addr::new(192, 168, 1, 1));
+    local.precedence.class = PrecedenceClass::CatchAllExempt;
+    local.flow.dst = DstMatch::SubnetV4 {
+        net: Ipv4Addr::new(192, 168, 2, 0),
+        prefix: 24,
+    };
+    let mut ipsec = local.clone();
+    ipsec.flow.dst = DstMatch::SubnetV4 {
+        net: Ipv4Addr::new(192, 168, 0, 0),
+        prefix: 16,
+    };
+    ipsec.egress = EgressConstraint::UnderIpsecPolicy;
+    ipsec.coverage = Coverage::AllPackets;
+    let mut server = local.clone();
+    server.flow.dst = DstMatch::HostV4(Ipv4Addr::new(203, 0, 113, 7));
+    let mut blanket = local.clone();
+    blanket.verdict = Verdict::Block;
+    blanket.precedence.class = PrecedenceClass::CatchAllBlock;
+    blanket.flow.dst = DstMatch::Any;
+
+    let filters = lower_catch_all_kill_switch(&plan(vec![local, ipsec, server, blanket]), 17);
+    assert!(filters.iter().any(|f| f.action == WfpAction::Block));
+    assert!(
+        filters.iter().any(|f| {
+            f.action == WfpAction::Permit
+                && f.remote_subnet == Some((Ipv4Addr::new(192, 168, 2, 0), 24))
+        }),
+        "the adjacent LAN permit was lost"
+    );
+    assert!(
+        filters.iter().any(|f| {
+            f.action == WfpAction::Permit && f.remote_ip == Some(Ipv4Addr::new(203, 0, 113, 7))
+        }),
+        "the tunnel server cannot reconnect"
+    );
+    assert!(
+        !filters.iter().any(|f| {
+            f.action == WfpAction::Permit
+                && f.remote_subnet == Some((Ipv4Addr::new(192, 168, 0, 0), 16))
+        }),
+        "the WFP filter has no IPsec condition and would open the whole /16"
+    );
+}
+
+#[test]
+fn unsupported_ipsec_scope_never_widens_on_either_family_or_coverage() {
+    for coverage in [Coverage::ConnectOnly, Coverage::AllPackets] {
+        for dst in [
+            DstMatch::SubnetV4 {
+                net: Ipv4Addr::new(10, 0, 0, 0),
+                prefix: 8,
+            },
+            DstMatch::SubnetV6 {
+                net: "fd00::".parse().expect("private IPv6 subnet"),
+                prefix: 8,
+            },
+        ] {
+            let mut flow = route_flow(RouteRole::Primary, 0, Ipv4Addr::LOCALHOST);
+            flow.precedence.class = PrecedenceClass::CatchAllExempt;
+            flow.flow.dst = dst;
+            flow.egress = EgressConstraint::UnderIpsecPolicy;
+            flow.coverage = coverage;
+            let filters = lower_catch_all_kill_switch(&plan(vec![flow]), 17);
+            assert!(
+                filters.is_empty(),
+                "unsupported IPsec scope widened for {dst:?} / {coverage:?}: {filters:?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn unsupported_ipsec_scope_preserves_the_vpn_handshake_and_tunnel_guard() {
+    use nrr_platform_api::enforcement::{
+        VPN_HANDSHAKE_IKE_ORDINAL_BASE, VPN_HANDSHAKE_ORDINAL_BASE,
+    };
+
+    let mut tunnel = route_flow(RouteRole::Secondary, 0, Ipv4Addr::LOCALHOST);
+    tunnel.precedence.class = PrecedenceClass::CatchAllExempt;
+    tunnel.flow.dst = DstMatch::Any;
+    tunnel.egress = EgressConstraint::OnlyVia(EgressRef::Secondary);
+    let mut block = tunnel.clone();
+    block.precedence.class = PrecedenceClass::CatchAllBlock;
+    block.verdict = Verdict::Block;
+    block.egress = EgressConstraint::Any;
+    let mut esp = tunnel.clone();
+    esp.precedence.ordinal = VPN_HANDSHAKE_ORDINAL_BASE;
+    esp.egress = EgressConstraint::Any;
+    esp.coverage = Coverage::AllPackets;
+    esp.flow.protocol = Some(L4Proto::Esp);
+    let mut ike = esp.clone();
+    ike.precedence.ordinal = VPN_HANDSHAKE_IKE_ORDINAL_BASE;
+    ike.coverage = Coverage::ConnectOnly;
+    ike.principal = PrincipalScope::ServiceAccounts;
+    ike.app = AppScope::Program {
+        key: "ike-service".into(),
+        exe_paths: vec!["C:\\Windows\\System32\\svchost.exe".into()],
+    };
+    ike.flow.protocol = Some(L4Proto::Udp);
+    ike.flow.dst_port = Some(500);
+    let mut ordinary = plan(vec![tunnel, block, esp, ike]);
+    let egress = EgressLuids {
+        secondary: 17,
+        adapters: Vec::new(),
+    };
+    let expected = lower_plan(&ordinary, &egress);
+    assert!(expected.iter().any(|f| f.ip_protocol == Some(50)));
+    assert!(expected.iter().any(|f| f.remote_port == Some(500)));
+    assert!(expected.iter().any(|f| f.local_interface_luid == Some(17)));
+    let mut unsupported = ordinary.flows[0].clone();
+    unsupported.egress = EgressConstraint::UnderIpsecPolicy;
+    unsupported.coverage = Coverage::AllPackets;
+    unsupported.flow.dst = DstMatch::SubnetV4 {
+        net: Ipv4Addr::new(192, 168, 0, 0),
+        prefix: 16,
+    };
+    ordinary.flows.push(unsupported);
+    assert_eq!(
+        lower_plan(&ordinary, &egress),
+        expected,
+        "an unsupported exemption must neither open a subnet nor remove the supported VPN path"
+    );
+}
+
 fn block_flow(ordinal: u32, ip: Ipv4Addr) -> FlowRule {
     FlowRule {
         verdict: Verdict::Block,

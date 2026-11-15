@@ -16,9 +16,10 @@ for (const catalog of catalogs) {
 for (const browser of ['chromium', 'firefox']) {
   const output = join(root, 'dist', browser);
   await mkdir(join(output, 'icons'), { recursive: true });
+  for (const name of ['LICENSE-MIT', 'LICENSE-APACHE', 'NOTICE.md']) await cp(join(root, name), join(output, name));
   await cp(join(source, 'ui'), join(output, 'ui'), { recursive: true });
   await cp(join(source, '_locales'), join(output, '_locales'), { recursive: true });
-  for (const name of ['background.js', 'controller.js']) await cp(join(source, name), join(output, name));
+  for (const name of ['background.js', 'controller.js', 'native-connection.js']) await cp(join(source, name), join(output, name));
   await cp(join(root, 'policy/target/wasm32-unknown-unknown/release/nrr_browser_policy.wasm'), join(output, 'policy.wasm'));
   for (const size of [16, 24, 32, 48, 64, 128]) {
     const name = `icon-${size}.png`;

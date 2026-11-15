@@ -60,17 +60,9 @@ impl PerSidApplyOrchestrator {
                     // app rules are unenforced; clear any stale unresolved-app set so
                     // the GUI banner does not keep listing a now-phantom app.
                     self.clear_app_enforcement_status(sid);
-                    self.clear_pending_vpn_clients(sid);
-                    // policy gone ⇒ any block-all is disarming.
-                    let flushed = self.note_block_all_state(sid, false);
-                    self.note_fail_closed_state(sid, false, flushed);
-                    self.note_machine_wide_cut(sid, false);
-                    // No policy ⇒ no kill-switch filters either; drop any stale
-                    // entry so the registry never role-verifies a drop for a SID
-                    // whose leak-guard is no longer armed.
-                    self.update_killswitch_registry(sid, KillswitchBlockIds::default());
-                    // Nothing routes or pins this user's IPv6: not "first plan pending".
-                    crate::ipv6_disposition::global_ipv6_dispositions().forget(sid);
+                    // Existing guards can survive a failed withdrawal. Their
+                    // DNS hold and VPN drop roles follow the WFP commit, not
+                    // this observation of the missing settings row.
                 }
                 // Routing needs connections; a deny does not.
                 return self.compute_deny_filters_without_policy(
@@ -1505,6 +1497,7 @@ impl PerSidApplyOrchestrator {
         );
         Ok(ComputedFilterSet::Install(ComputedPlan {
             filters,
+            without_route_policy: false,
             unresolved_apps,
         }))
     }

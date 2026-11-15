@@ -35,6 +35,9 @@ use super::*;
 /// depends on, which exists whether or not a tunnel is up.
 /// The `no server exemptions` / `no protocol selected` safety valves are the
 /// planner's concern (it emits no flows), so they need no handling here.
+/// A policy-based IPsec exemption is not expressible on the outbound transport
+/// layer used here. The neutral contract requires an unsupported match to emit
+/// nothing; dropping the condition would instead permit plaintext traffic.
 pub fn lower_catch_all_kill_switch(
     plan: &EnforcementPlan,
     secondary_luid: u64,
@@ -46,6 +49,7 @@ pub fn lower_catch_all_kill_switch(
             PrecedenceClass::CatchAllExempt | PrecedenceClass::CatchAllBlock
         ) || is_foreign_permit(flow)
             || is_vpn_handshake(flow)
+            || matches!(flow.egress, EgressConstraint::UnderIpsecPolicy)
         {
             continue;
         }
