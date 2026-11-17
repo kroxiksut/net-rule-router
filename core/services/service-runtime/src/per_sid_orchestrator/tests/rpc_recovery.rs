@@ -154,8 +154,21 @@ fn a_skipped_permit_during_recovery_remains_retryable_until_the_desired_set_chan
         // Removing the still-unmaterializable permit settles the new desired
         // set; recovery must not block the remaining permitted address.
         rules.set(rules_with_n_primary_ips(1));
+        let ComputedFilterSet::Install(plan) = orch
+            .compute_filters_for_sid(sid, false, None, ComputeIntent::Preview)
+            .unwrap()
+        else {
+            panic!("the remaining primary address must still have a permit");
+        };
+        assert_eq!(plan.filters.len(), 1);
         orch.reconcile_secondary_coverage(sid).unwrap();
-        assert_eq!(live_ids(&api), HashSet::from([kept.raw]));
+        let live = api.wfp_filters.lock().unwrap();
+        assert_eq!(live.len(), 1, "the removed address must not keep a filter");
+        assert_eq!(live[0].id, plan.filters[0].id);
+        assert_eq!(live[0].action, WfpAction::Permit);
+        assert!(live[0].covers_v4(Ipv4Addr::new(10, 0, 0, 0)));
+        assert!(!live[0].covers_v4(Ipv4Addr::new(10, 0, 0, 1)));
+        drop(live);
         api.set_fail_add_unmaterializable(&[]);
         api.record_wfp_history();
         orch.reconcile_secondary_coverage(sid).unwrap();

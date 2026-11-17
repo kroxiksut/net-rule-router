@@ -721,7 +721,7 @@ ColumnLayout {
                 onClicked: section.showServedByMainLink = checked
                 ToolTip.visible: hovered
                 ToolTip.text: root.tr("rules.suggestions.inbox.show-served-by-main-link-tooltip",
-                    "These addresses answer over your main connection, so sending them through the additional one changes nothing. They are listed for completeness, not as work.")
+                    "These hosts have positive evidence on the main connection and are hidden from pending work. That does not certify the browser page. Check the specific site if it still fails.")
                 Accessible.role: Accessible.CheckBox
                 Accessible.name: text
                 Accessible.description: ToolTip.text

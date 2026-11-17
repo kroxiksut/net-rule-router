@@ -14,5 +14,8 @@ nrr-shared = { path = "../../shared/contracts" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 
+[target.'cfg(windows)'.dependencies]
+nrr-platform-windows = { path = "../../core/platform/windows" }
+
 [lints]
 workspace = true

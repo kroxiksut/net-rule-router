@@ -355,18 +355,21 @@ pub fn offered_for_role(row: &InterfaceRowDto, role: Route) -> bool {
     !is_own_fake_ip_tun(row) && held_other_role(row, role).is_none()
 }
 
-/// The row `binding` names (`boundWireRowIndex`): its current or an earlier id
-/// against the row's id or OS adapter name, ASCII case-insensitive. The first
-/// match wins. This is how a client fills the `selected_role` the service
-/// leaves empty.
+/// The row `binding` names (`boundWireRowIndex`): the current id takes priority
+/// over earlier ids, regardless of row order. Compare against the row's id or
+/// OS adapter name, ASCII case-insensitive.
 pub fn bound_row_index(rows: &[InterfaceRowDto], binding: &RouteBindingDto) -> Option<usize> {
-    let names = |id: &str| {
-        std::iter::once(binding.stable_id.as_str())
-            .chain(binding.known_stable_ids.iter().map(String::as_str))
-            .any(|known| !known.is_empty() && known.eq_ignore_ascii_case(id))
+    let matches = |row: &InterfaceRowDto, id: &str| {
+        !id.is_empty()
+            && (id.eq_ignore_ascii_case(&row.persistent_id)
+                || id.eq_ignore_ascii_case(&row.adapter_name))
     };
     rows.iter()
-        .position(|row| names(&row.persistent_id) || names(&row.adapter_name))
+        .position(|row| matches(row, &binding.stable_id))
+        .or_else(|| {
+            rows.iter()
+                .position(|row| binding.known_stable_ids.iter().any(|id| matches(row, id)))
+        })
 }
 
 /// The main-connection binding a confirmed suggestion writes

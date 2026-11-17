@@ -14,7 +14,7 @@ path = "src/lib.rs"
 
 [dependencies]
 # `hooks` for the progress handler that bounds a browser-history read.
-rusqlite = { version = "0.32", features = ["bundled", "hooks"] }
+rusqlite = { version = "0.41", features = ["bundled", "hooks"] }
 
 [dev-dependencies]
 tempfile = "3"

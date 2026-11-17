@@ -1,7 +1,7 @@
 #![no_main]
-//! The payload of a request envelope, handed to every typed request shape a
-//! handler deserialises it into. A new `*Request` in `nrr_shared::ipc_payloads`
-//! is added to the list below.
+//! Envelope payloads handed to typed request decoders and the client's typed
+//! negotiation response decoder. A new `*Request` in
+//! `nrr_shared::ipc_payloads` is added to the list below.
 
 use libfuzzer_sys::fuzz_target;
 use nrr_shared::ipc_payloads::*;
@@ -22,6 +22,7 @@ fuzz_target!(|data: &[u8]| {
     };
     try_every!(value;
         ContractNegotiateRequest,
+        ContractNegotiateResponse,
         ServiceHealthRequest,
         SnapshotInterfacesRequest,
         SnapshotDiagnosticsRequest,

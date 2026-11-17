@@ -31,14 +31,13 @@ pub fn runtime_boot_role_message(component: &str) -> String {
     }
 }
 
-/// A short string identifying the shape of the wire contracts this build
-/// speaks: crate version plus the two schema numbers that gate decoding.
+/// A cache discriminator combining the crate version and rules-file schema.
 ///
 /// Anything that persists decoded payloads (the GUI's snapshot cache) stores it
-/// alongside the data and refuses what does not match. A hand-maintained
-/// "cache schema version" was the alternative, and it is the kind of number
-/// that is only ever bumped after the bug: nothing forces it to move when a DTO
-/// gains a field.
+/// alongside the data and refuses what does not match. This is not a DTO
+/// schema hash or IPC negotiation: changing a DTO alone does not change it.
+/// Wire compatibility is gated separately by the IPC protocol and contract
+/// revision. Cache-affecting changes must consider invalidation explicitly.
 pub fn contract_fingerprint() -> String {
     format!(
         "{}/rules-{}",

@@ -104,7 +104,9 @@ jobs:
       # one thread, because the tests share the machine-wide filter engine and
       # route table. `--tests` keeps rustdoc out: under `--ignored` it would
       # compile `ignore` doc examples. Skipped: ICMP does not leave a
-      # GitHub-hosted runner, and the pump cost is a measurement, not a check.
+      # GitHub-hosted runner, the pump cost is a measurement, and the real WFP
+      # replacement test needs a dedicated external listener and capture on the
+      # Windows test laptop.
       - name: Run privileged tests
         shell: bash
         run: >-
@@ -112,6 +114,7 @@ jobs:
           --ignored --test-threads=1
           --skip a_hop_limit_of_one_is_answered_by_the_first_router
           --skip the_pump_cost_at_scale
+          --skip a_failed_replacement_keeps_the_previous_block_on_real_wfp
 
   # The C++ Qt host and the whole Windows package, installers included, exactly
   # as release.yml builds them: a script or C++ break otherwise shows only on

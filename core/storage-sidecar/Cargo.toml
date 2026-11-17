@@ -28,7 +28,7 @@ path = "src/lib.rs"
 
 [dependencies]
 nrr-sqlite-support = { path = "../sqlite-support" }
-rusqlite = { version = "0.32", features = ["bundled"] }
+rusqlite = { version = "0.41", features = ["bundled"] }
 thiserror = "1"
 
 [dev-dependencies]

@@ -52,7 +52,7 @@ tracing = "0.1"
 # Arc<Mutex<Connection>> so the storage repos can borrow it across
 # Phase 1 / Phase 3 transactions. nrr-storage already re-exports the
 # pieces we need but the Connection type itself comes from rusqlite.
-rusqlite = { version = "0.32", features = ["bundled"] }
+rusqlite = { version = "0.41", features = ["bundled"] }
 # ProductionPresetExporter computes SHA-256 over the
 # unwrapped canonical txt bytes (`PresetExportGetResponse::content_hash`).
 # `sha2` is already a transitive dep via nrr-diagnostics and

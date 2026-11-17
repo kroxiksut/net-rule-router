@@ -141,15 +141,20 @@ impl BoundCandidate for nrr_shared::ipc_payloads::AdapterEntry {
     }
 }
 
-/// The first live adapter answering to a binding's current or a prior id.
+/// Resolve the current id before considering earlier ids, regardless of the
+/// enumeration order. A present but unavailable current adapter must not be
+/// hidden by an unrelated adapter matching an older id.
 pub fn bound_adapter<'a, T: BoundCandidate>(
     live: &'a [T],
     stable_id: &str,
     known_ids: &[String],
 ) -> Option<&'a T> {
-    live.iter().find(|candidate| {
-        candidate.answers_to(stable_id) || known_ids.iter().any(|id| candidate.answers_to(id))
-    })
+    live.iter()
+        .find(|candidate| candidate.answers_to(stable_id))
+        .or_else(|| {
+            live.iter()
+                .find(|candidate| known_ids.iter().any(|id| candidate.answers_to(id)))
+        })
 }
 
 /// Whether the adapter a binding names carries traffic now — the one answer
@@ -161,6 +166,64 @@ pub fn bound_adapter_usable<T: BoundCandidate>(
     known_ids: &[String],
 ) -> bool {
     bound_adapter(live, stable_id, known_ids).is_some_and(BoundCandidate::usable)
+}
+
+#[cfg(test)]
+mod current_identity_tests {
+    use super::{bound_adapter, bound_adapter_usable, BoundCandidate};
+
+    struct Adapter {
+        id: &'static str,
+        up: bool,
+    }
+
+    impl BoundCandidate for Adapter {
+        fn answers_to(&self, id: &str) -> bool {
+            self.id == id
+        }
+
+        fn usable(&self) -> bool {
+            self.up
+        }
+    }
+
+    #[test]
+    fn a_previous_adapter_cannot_hide_the_current_adapter_or_its_outage() {
+        let known = vec!["old".to_owned()];
+        let live = [
+            Adapter {
+                id: "old",
+                up: false,
+            },
+            Adapter {
+                id: "current",
+                up: true,
+            },
+        ];
+        assert_eq!(
+            bound_adapter(&live, "current", &known).map(|a| a.id),
+            Some("current")
+        );
+        assert!(bound_adapter_usable(&live, "current", &known));
+
+        let live = [
+            Adapter {
+                id: "old",
+                up: true,
+            },
+            Adapter {
+                id: "current",
+                up: false,
+            },
+        ];
+        assert!(!bound_adapter_usable(&live, "current", &known));
+
+        let live = [Adapter {
+            id: "old",
+            up: true,
+        }];
+        assert!(bound_adapter_usable(&live, "current", &known));
+    }
 }
 
 /// `true` when a whitespace token of an adapter friendly name is purely a

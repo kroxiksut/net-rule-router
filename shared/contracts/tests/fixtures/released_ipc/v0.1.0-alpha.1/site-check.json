@@ -1,0 +1,19 @@
+{
+  "state": "done",
+  "host": "fixture.example",
+  "report": {
+    "site": "fixture.example",
+    "verdict": "unclear",
+    "site-route": "primary",
+    "names": [
+      {
+        "name": "fixture.example",
+        "role": "site",
+        "address": "192.0.2.10",
+        "route": "primary",
+        "answer": "silent"
+      }
+    ],
+    "reads-answer": false
+  }
+}

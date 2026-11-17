@@ -409,12 +409,6 @@ const THREADS: &[(&str, &str, usize, Verdict)] = &[
         Verdict::Bounded("one probe pass"),
     ),
     (
-        "service-runtime/src/discovery_observation.rs",
-        "nrr-close-confirm",
-        1,
-        Verdict::Bounded("at most two confirmation workers, with a deadline on each TLS exchange"),
-    ),
-    (
         "service-runtime/src/discovery_observation/dispatch.rs",
         "nrr-discovery-confirm",
         1,

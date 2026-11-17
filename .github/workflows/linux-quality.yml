@@ -20,6 +20,13 @@ jobs:
     # NOT cover rather than relying on a fallback.
     env:
       NRR_SKIP_QT_HOST: "1"
+      # Fixed absolute path: sccache keys depend on the target directory.
+      CARGO_TARGET_DIR: /tmp/nrr-ci-target
+      CARGO_INCREMENTAL: "0"
+      RUSTC_WRAPPER: sccache
+      SCCACHE_GHA_ENABLED: "true"
+      # Bound the local fallback if the GHA cache is unavailable.
+      SCCACHE_CACHE_SIZE: 2G
 
     steps:
       - name: Checkout
@@ -38,8 +45,15 @@ jobs:
           components: rustfmt, clippy
           targets: x86_64-unknown-linux-gnu
 
-      - name: Cache Rust artifacts
+      - name: Install sccache
+        uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
+        with:
+          version: "v0.13.0"
+
+      - name: Cache Cargo dependencies
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          cache-targets: false
 
       # Prebuilt binaries. check.sh runs the tests through nextest when present.
       - name: Install cargo-deny and cargo-nextest
@@ -78,6 +92,11 @@ jobs:
 
     env:
       NRR_SKIP_QT_HOST: "1"
+      CARGO_TARGET_DIR: /tmp/nrr-ci-target
+      CARGO_INCREMENTAL: "0"
+      RUSTC_WRAPPER: sccache
+      SCCACHE_GHA_ENABLED: "true"
+      SCCACHE_CACHE_SIZE: 2G
       # Only the test binaries run as root; cargo, the build and its cache stay
       # with the runner user, so no root-owned file lands in `target`.
       CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER: "sudo -E"
@@ -97,8 +116,15 @@ jobs:
           toolchain: ${{ steps.toolchain.outputs.channel }}
           targets: x86_64-unknown-linux-gnu
 
-      - name: Cache Rust artifacts
+      - name: Install sccache
+        uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
+        with:
+          version: "v0.13.0"
+
+      - name: Cache Cargo dependencies
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          cache-targets: false
 
       - name: Install nftables
         env:

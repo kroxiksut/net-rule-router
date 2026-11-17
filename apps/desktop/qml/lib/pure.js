@@ -1609,9 +1609,9 @@ function _asciiLower(s) {
     return s.replace(/[A-Z]/g, function(c) { return c.toLowerCase() })
 }
 
-// Index of the wire row a wire route binding names: its current or an earlier
-// id against the row's id or OS adapter name, ASCII case-insensitive; first
-// match wins, -1 for none. How a client fills the `selected-role` the service
+// Index of the wire row a wire route binding names: its current id takes
+// priority over earlier ids regardless of row order, ASCII case-insensitive.
+// Returns -1 for none. How a client fills the `selected-role` the service
 // leaves empty.
 // Lists from the C++ bridge are Qt sequences, which `Array.isArray` rejects.
 function _isList(value) {
@@ -1620,20 +1620,28 @@ function _isList(value) {
 
 function boundWireRowIndex(rows, binding) {
     if (!_isList(rows) || !binding || typeof binding !== "object") return -1
-    var ids = []
     var id = binding["stable-id"]
-    if (typeof id === "string" && id !== "") ids.push(_asciiLower(id))
+    var current = typeof id === "string" ? _asciiLower(id) : ""
+    function matches(row, wanted) {
+        if (wanted === "") return false
+        row = row || {}
+        return _asciiLower(String(row["persistent-id"] || "")) === wanted ||
+               _asciiLower(String(row["adapter-name"] || "")) === wanted
+    }
+    for (var i = 0; i < rows.length; i += 1) {
+        if (matches(rows[i], current)) return i
+    }
+    var ids = []
     var known = binding["known-stable-ids"]
     if (_isList(known)) {
         for (var k = 0; k < known.length; k += 1) {
             if (typeof known[k] === "string" && known[k] !== "") ids.push(_asciiLower(known[k]))
         }
     }
-    for (var i = 0; i < rows.length; i += 1) {
-        var row = rows[i] || {}
-        var rid = _asciiLower(String(row["persistent-id"] || ""))
-        var rname = _asciiLower(String(row["adapter-name"] || ""))
-        if (ids.indexOf(rid) >= 0 || ids.indexOf(rname) >= 0) return i
+    for (var j = 0; j < rows.length; j += 1) {
+        for (var n = 0; n < ids.length; n += 1) {
+            if (matches(rows[j], ids[n])) return j
+        }
     }
     return -1
 }

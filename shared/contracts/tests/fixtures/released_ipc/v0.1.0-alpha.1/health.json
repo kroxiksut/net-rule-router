@@ -1,0 +1,6 @@
+{
+  "service-state": "running",
+  "worst-severity": "degraded",
+  "components": [],
+  "fake-ip-datapath": { "desired": true, "running": false, "zombies": 0 }
+}

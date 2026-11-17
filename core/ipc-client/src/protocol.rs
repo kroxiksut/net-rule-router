@@ -15,8 +15,12 @@
 
 use serde_json::Value;
 
-use nrr_shared::ipc::{ContractSkew, IpcOperationName, IPC_CONTRACT_REVISION_UNSTATED};
-use nrr_shared::ipc_payloads::{ContractNegotiateClientKind, ContractNegotiateRequest};
+#[cfg(test)]
+use nrr_shared::ipc::IPC_CONTRACT_REVISION_UNSTATED;
+use nrr_shared::ipc::{ContractSkew, IpcOperationName};
+use nrr_shared::ipc_payloads::{
+    ContractNegotiateClientKind, ContractNegotiateRequest, ContractNegotiateResponse,
+};
 use nrr_shared::ipc_transport::IpcOperationClass;
 
 use crate::connection::{IpcClientError, NegotiateInfo};
@@ -161,51 +165,33 @@ fn build_contract_negotiate_as(client_version: u32, kind: ContractNegotiateClien
 /// Pure: the caller does the transport I/O and hands the decoded frame here.
 pub(crate) fn interpret_negotiate_response(response: &Value) -> NegotiateParse {
     if response.get("ok").and_then(|v| v.as_bool()) == Some(true) {
-        // Extract the contract.negotiate body so the GUI's compatibility
-        // banner has the protocol/semver pair without a second probe.
-        // Best-effort: missing fields collapse to defaults.
+        // Classify a different protocol before decoding its remaining body:
+        // an incompatible peer need not speak our session/payload schema.
+        // Decode numbers as u32, never narrow a larger integer into version 1.
         let payload = response.get("payload").cloned().unwrap_or(Value::Null);
-        let server_protocol = payload
-            .get("server-version")
-            .and_then(|v| v.as_u64())
-            .unwrap_or(0) as u32;
-        let service_version = payload
-            .get("service-version")
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .to_string();
-        let session_id = payload
-            .get("session-id")
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .to_string();
-        // A service that predates the field states none, and that is the
-        // revision it speaks.
-        let contract_revision = payload
-            .get("contract-revision")
-            .and_then(|v| v.as_u64())
-            .and_then(|v| u32::try_from(v).ok())
-            .unwrap_or(IPC_CONTRACT_REVISION_UNSTATED);
-        // An `ok` handshake still has to agree on a protocol. The field that
-        // says so is `negotiated-protocol` — the server may run a newer
-        // version and still agree to speak ours, which is the whole point of
-        // negotiating. Disagreement (or a missing field, which decodes as 0)
-        // is what raises the "update one of the two" banner, instead of a
-        // silent stream of failures later.
-        let negotiated = payload
-            .get("negotiated-protocol")
-            .and_then(|v| v.as_u64())
-            .unwrap_or(0) as u32;
+        let server_protocol = serde_json::from_value::<u32>(payload["server-version"].clone());
+        let negotiated = serde_json::from_value::<u32>(payload["negotiated-protocol"].clone());
+        let (Ok(server_protocol), Ok(negotiated)) = (server_protocol, negotiated) else {
+            return NegotiateParse::Unexpected("invalid negotiation protocol numbers".into());
+        };
         if negotiated != CLIENT_PROTOCOL_VERSION {
             return NegotiateParse::ProtocolMismatch {
                 server_version: server_protocol,
             };
         }
+        // For our protocol use the same typed body the service writes. Only
+        // absent legacy fields get defaults; malformed present values fail.
+        let payload = match serde_json::from_value::<ContractNegotiateResponse>(payload) {
+            Ok(payload) => payload,
+            Err(error) => {
+                return NegotiateParse::Unexpected(format!("invalid negotiation payload: {error}"));
+            }
+        };
         return NegotiateParse::Ok(NegotiateInfo {
             server_protocol,
-            service_version,
-            session_id,
-            contract_revision,
+            service_version: payload.service_version,
+            session_id: payload.session_id,
+            contract_revision: payload.contract_revision,
         });
     }
     // Server may have responded with an InvalidVersion error; surface that.
@@ -512,6 +498,62 @@ mod tests {
             }
             _ => panic!("expected Ok"),
         }
+    }
+
+    #[test]
+    fn malformed_handshake_numbers_cannot_alias_a_supported_protocol() {
+        for key in ["server-version", "negotiated-protocol", "contract-revision"] {
+            for bad in [
+                serde_json::json!(u64::from(u32::MAX) + 2),
+                serde_json::json!("1"),
+                serde_json::Value::Null,
+            ] {
+                let mut response = serde_json::json!({
+                    "ok": true,
+                    "payload": {
+                        "server-version": 1,
+                        "negotiated-protocol": CLIENT_PROTOCOL_VERSION,
+                        "contract-revision": CLIENT_CONTRACT_REVISION,
+                        "session-id": "test-session",
+                    }
+                });
+                response["payload"][key] = bad.clone();
+                assert!(
+                    !matches!(
+                        interpret_negotiate_response(&response),
+                        NegotiateParse::Ok(_)
+                    ),
+                    "{key}={bad} must not become a valid handshake by narrowing or defaulting"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn release_handshake_keeps_its_revision_and_write_guard() {
+        let payload: Value = serde_json::from_str(include_str!(
+            "../../../shared/contracts/tests/fixtures/released_ipc/v0.1.0-alpha.1/negotiate.json"
+        ))
+        .expect("source-reconstructed release payload");
+        let response = serde_json::json!({"ok": true, "payload": payload});
+        let NegotiateParse::Ok(info) = interpret_negotiate_response(&response) else {
+            panic!("released protocol-1 response must negotiate");
+        };
+        assert_eq!(info.server_protocol, 1);
+        assert_eq!(info.contract_revision, 3);
+        assert_eq!(info.service_version, "0.1.0-alpha.1");
+        assert!(contract_write_refusal(
+            IpcOperationName::ServiceHealthGet,
+            &Value::Null,
+            Some(&info)
+        )
+        .is_none());
+        assert_eq!(
+            contract_write_refusal(IpcOperationName::MutationSubmit, &Value::Null, Some(&info))
+                .is_some(),
+            CLIENT_CONTRACT_REVISION != 3,
+            "release fixture does not authorize writes across a future revision skew"
+        );
     }
 
     #[test]

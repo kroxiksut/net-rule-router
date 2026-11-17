@@ -2,6 +2,28 @@
   "description": "pure.js boundWireRowIndex: which interfaces.snapshot row a route binding names, by its current or an earlier id against the row's id or OS adapter name; -1 for none. Rows carry only the two ids; the test lays them over the adapters base row.",
   "cases": [
     {
+      "name": "current binding beats an earlier adapter listed first",
+      "input": {
+        "rows": [
+          { "persistent-id": "old-tap", "adapter-name": "old-tap" },
+          { "persistent-id": "current-vpn", "adapter-name": "current-vpn" }
+        ],
+        "binding": { "stable-id": "current-vpn", "display-name": "VPN", "user-confirmed": true, "known-stable-ids": ["old-tap"] }
+      },
+      "expected": 1
+    },
+    {
+      "name": "current adapter name beats an earlier persistent id",
+      "input": {
+        "rows": [
+          { "persistent-id": "old-id", "adapter-name": "old-name" },
+          { "persistent-id": "new-id", "adapter-name": "VPN0" }
+        ],
+        "binding": { "stable-id": "vpn0", "display-name": "VPN", "user-confirmed": true, "known-stable-ids": ["old-id"] }
+      },
+      "expected": 1
+    },
+    {
       "name": "current id names the row id",
       "input": {
         "rows": [

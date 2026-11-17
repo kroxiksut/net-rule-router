@@ -43,7 +43,7 @@ nrr-platform-api = { path = "../../platform/api" }
 # runtime_deps opens a shared `Arc<Mutex<Connection>>`
 # for the settings IPC handlers and emits operational tracing on
 # autostart-probe failures.
-rusqlite = "0.32"
+rusqlite = "0.41"
 tracing = "0.1"
 # Wire-format codec uses serde_json for length-prefixed JSON frames.
 serde      = { version = "1", features = ["derive"] }

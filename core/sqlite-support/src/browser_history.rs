@@ -78,12 +78,12 @@ pub fn read_hostnames_from_db(
     query: HistoryQuery,
     host_of: HostOf,
 ) -> Result<HistoryHosts, String> {
-    let conn = Connection::open_with_flags(
+    let mut conn = Connection::open_with_flags(
         db_uri(db, "?mode=ro&immutable=1"),
         OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_URI,
     )
     .map_err(|e| format!("open: {e}"))?;
-    hostnames_within(&conn, query, READ_BUDGET, host_of)
+    hostnames_within(&mut conn, query, READ_BUDGET, host_of)
 }
 
 /// SQLite first replays the WAL and rolls back a hot journal found beside
@@ -94,7 +94,7 @@ fn read_hostnames_replaying_journals(
     query: HistoryQuery,
     host_of: HostOf,
 ) -> Result<HistoryHosts, String> {
-    let conn = Connection::open_with_flags(
+    let mut conn = Connection::open_with_flags(
         db_uri(copy, ""),
         OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_URI,
     )
@@ -104,7 +104,7 @@ fn read_hostnames_replaying_journals(
         .map_err(|e| format!("harden: {e}"))?;
     conn.execute_batch("PRAGMA query_only = ON;")
         .map_err(|e| format!("harden: {e}"))?;
-    hostnames_within(&conn, query, READ_BUDGET, host_of)
+    hostnames_within(&mut conn, query, READ_BUDGET, host_of)
 }
 
 /// `%`, `?` and `#` are URI syntax: left raw, a profile path holding one would
@@ -119,7 +119,7 @@ fn db_uri(db: &Path, params: &str) -> String {
 }
 
 fn hostnames_within(
-    conn: &Connection,
+    conn: &mut Connection,
     query: HistoryQuery,
     budget: Duration,
     host_of: HostOf,
@@ -130,7 +130,8 @@ fn hostnames_within(
         .map_err(|e| format!("harden: {e}"))?;
     // Interrupts any statement past the deadline, the schema parse included.
     let deadline = Instant::now() + budget;
-    conn.progress_handler(10_000, Some(move || Instant::now() >= deadline));
+    conn.progress_handler(10_000, Some(move || Instant::now() >= deadline))
+        .map_err(|e| format!("install progress handler: {e}"))?;
     require_plain_table(conn, query.table)?;
     let mut stmt = conn
         .prepare(query.sql)
@@ -320,12 +321,12 @@ mod tests {
         drop(conn);
         let open = || Connection::open(&db).expect("open");
 
-        let all = hostnames_within(&open(), CHROMIUM_QUERY, Duration::from_secs(60), host_of)
+        let all = hostnames_within(&mut open(), CHROMIUM_QUERY, Duration::from_secs(60), host_of)
             .expect("unbounded read");
         assert_eq!(all.hosts.len(), 50_000, "positive control: the whole table");
         assert!(!all.cut_short);
 
-        let cut = hostnames_within(&open(), CHROMIUM_QUERY, Duration::ZERO, host_of);
+        let cut = hostnames_within(&mut open(), CHROMIUM_QUERY, Duration::ZERO, host_of);
         assert!(
             !matches!(&cut, Ok(read) if read.hosts.len() == 50_000),
             "a spent budget did not stop the read"

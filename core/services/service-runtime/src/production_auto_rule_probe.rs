@@ -532,6 +532,12 @@ impl AutoRuleProbeRunner for ProductionAutoRuleProbe {
                     if !matches!(answer, HttpProbeVerdict::Unavailable | HttpProbeVerdict::Unconfirmed) {
                         engine_for_http.note_measured_http_primary(&http_sid, hostname, matches!(answer, HttpProbeVerdict::Answered(_)), std::time::SystemTime::now());
                     }
+                    if matches!(answer, HttpProbeVerdict::Answered(_)) {
+                        // A confirmed page response supersedes an older verified
+                        // failure for this owner, including standalone offers.
+                        crate::primary_stall_registry::global_primary_stalls()
+                            .note_verified_tls(&http_sid, hostname, true, 0);
+                    }
                     if matches!(answer, HttpProbeVerdict::Answered(_) | HttpProbeVerdict::ClientError(_) | HttpProbeVerdict::ServerError(_) | HttpProbeVerdict::Untrusted) {
                         engine_for_http.withdraw_http_path_reachability(&http_sid, hostname, std::time::SystemTime::now());
                     }

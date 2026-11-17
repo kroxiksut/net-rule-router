@@ -1,4 +1,5 @@
 use std::net::Ipv4Addr;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -25,7 +26,7 @@ impl SiteRoutes for Rules {
         true
     }
 }
-struct HttpsNeverAnswers;
+struct HttpsNeverAnswers(Arc<AtomicUsize>);
 impl HttpsHead for HttpsNeverAnswers {
     fn fetch(
         &self,
@@ -35,12 +36,14 @@ impl HttpsHead for HttpsNeverAnswers {
         _: &[u8],
         _: Duration,
     ) -> Result<Vec<u8>, HeadFailure> {
+        self.0.fetch_add(1, Ordering::Relaxed);
         Err(HeadFailure::NoAnswer)
     }
 }
 
 #[test]
 fn a_tls_response_does_not_claim_that_a_silent_https_site_loaded() {
+    let https_attempts = Arc::new(AtomicUsize::new(0));
     let cache = Arc::new(MockFqdnCacheLookup::new());
     cache.set_ips("https-silent.example", vec![Ipv4Addr::new(203, 0, 113, 31)]);
     let checker = SiteChecker::new(SiteCheckWiring {
@@ -50,7 +53,7 @@ fn a_tls_response_does_not_claim_that_a_silent_https_site_loaded() {
         routes: Arc::new(Rules),
         engine: None,
         trace: None,
-        https: Some(Arc::new(HttpsNeverAnswers)),
+        https: Some(Arc::new(HttpsNeverAnswers(Arc::clone(&https_attempts)))),
         traffic_held: None,
     });
     let report = checker.check("S-1-5-21-3212-1001", "https-silent.example");
@@ -58,5 +61,6 @@ fn a_tls_response_does_not_claim_that_a_silent_https_site_loaded() {
         report.verdict, SITE_CHECK_VERDICT_NOT_ANSWERING,
         "TCP/TLS connectivity is not an HTTPS response"
     );
-    assert!(report.reads_answer);
+    assert_eq!(https_attempts.load(Ordering::Relaxed), 1);
+    assert!(!report.reads_answer, "no HTTP status or Location was read");
 }

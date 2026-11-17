@@ -1,0 +1,7 @@
+{
+  "server-version": 1,
+  "negotiated-protocol": 1,
+  "session-id": "fixture-session",
+  "contract-revision": 3,
+  "service-version": "0.1.0-alpha.1"
+}

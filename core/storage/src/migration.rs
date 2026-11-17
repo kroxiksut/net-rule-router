@@ -852,7 +852,7 @@ pub(crate) const BUSY_TIMEOUT: Duration = Duration::from_millis(5_000);
 /// Opens a file-based SQLite connection with the baseline both local
 /// databases share: [`BUSY_TIMEOUT`], WAL (verified), foreign keys.
 pub fn open_connection(path: &Path) -> StorageResult<Connection> {
-    let conn = Connection::open(path)
+    let mut conn = Connection::open(path)
         .map_err(|e| StorageError::StorageUnavailable(format!("open {}: {e}", path.display())))?;
 
     nrr_sqlite_support::configure_connection(&conn, BUSY_TIMEOUT).map_err(|e| match e {
@@ -875,7 +875,8 @@ pub fn open_connection(path: &Path) -> StorageResult<Connection> {
     // an intact-looking database behind. Best-effort by design: with another
     // connection open, SQLite refuses to truncate and the next open retries.
     let _ = checkpoint_wal_truncate(&conn);
-    crate::write_ledger::watch(&conn, path);
+    crate::write_ledger::watch(&mut conn, path)
+        .map_err(|e| StorageError::Internal(format!("write ledger hooks: {e}")))?;
 
     Ok(conn)
 }

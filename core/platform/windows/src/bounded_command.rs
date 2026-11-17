@@ -89,11 +89,11 @@ mod tests {
     #[test]
     fn a_tool_that_never_answers_is_killed_at_the_budget() {
         let started = Instant::now();
-        // `ping -n 30` waits about thirty seconds and reads no input.
-        let result = output_within(
-            &mut cmd(&["/c", "ping", "-n", "30", "127.0.0.1"]),
-            Duration::from_millis(300),
-        );
+        // Run ping directly: the timeout must kill the process whose pipes are
+        // being drained, without leaving a shell-spawned grandchild behind.
+        let mut ping = Command::new(crate::system_shell::system32_exe("ping.exe"));
+        ping.args(["-n", "30", "127.0.0.1"]);
+        let result = output_within(&mut ping, Duration::from_millis(300));
         assert_eq!(
             result.map(|_| ()).map_err(|e| e.kind()),
             Err(std::io::ErrorKind::TimedOut)

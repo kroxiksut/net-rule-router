@@ -22,11 +22,11 @@
 //!
 //! ## Schema versioning
 //!
-//! Every cache entry carries the wire-contract fingerprint of the build
+//! Every cache entry carries the cache fingerprint of the build
 //! that wrote it (`nrr_shared::contract_fingerprint`). On read, a
 //! mismatch (or unparseable JSON) deletes the file rather than
-//! returning bad data — the fingerprint moves with the contracts crate,
-//! so nobody has to remember to bump anything.
+//! returning bad data. The fingerprint combines the crate version and rules
+//! schema; DTO-only changes still need an explicit invalidation review.
 //!
 //! ## Atomicity
 //!
@@ -68,14 +68,9 @@ impl std::fmt::Display for CacheError {
 
 impl std::error::Error for CacheError {}
 
-/// Entries written by a build that speaks a different wire contract are
-/// deleted on read rather than returned.
-///
-/// This used to be a hand-maintained `CACHE_SCHEMA_VERSION`, which is exactly
-/// the number nobody remembers to bump: 127 fields in `ipc_payloads` carry
-/// `serde(default)`, so a DTO can gain a field, decode "successfully", and hand
-/// the GUI a silently wrong value. The fingerprint moves on its own with the
-/// contracts crate, and the typed read in the facade catches the rest.
+/// Entries with a different crate-version/rules-schema fingerprint are deleted
+/// on read. This is not a complete wire-schema hash: a successful typed read
+/// cannot detect every semantically wrong default after a DTO-only change.
 fn contract_fingerprint() -> String {
     nrr_shared::contract_fingerprint()
 }

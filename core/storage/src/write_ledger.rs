@@ -27,11 +27,11 @@ fn key(path: &Path) -> Arc<str> {
 }
 
 /// Count every row `conn` changes against the database at `path`.
-pub fn watch(conn: &Connection, path: &Path) {
+pub fn watch(conn: &mut Connection, path: &Path) -> rusqlite::Result<()> {
     // A `DELETE` with no `WHERE` takes SQLite's truncate shortcut, which skips
     // the update hook: a cleared table would never move the ledger. `Ignore`
     // on a row delete makes it go row by row (and is a no-op otherwise).
-    conn.authorizer(Some(row_by_row_deletes()));
+    conn.authorizer(Some(row_by_row_deletes()))?;
     let db = key(path);
     conn.update_hook(Some(
         move |_: rusqlite::hooks::Action, _: &str, table: &str, _: i64| {
@@ -44,7 +44,8 @@ pub fn watch(conn: &Connection, path: &Path) {
                 }
             }
         },
-    ));
+    ))?;
+    Ok(())
 }
 
 /// `DROP TABLE t` asks for `DropTable(t)` and then `Delete(t)` — the same
@@ -109,16 +110,16 @@ mod tests {
     fn every_watched_connection_is_counted_and_ignored_tables_are_not() {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("w.db");
-        let first = Connection::open(&path).expect("open");
+        let mut first = Connection::open(&path).expect("open");
         first
             .execute_batch(
                 "PRAGMA journal_mode = WAL; \
                  CREATE TABLE plan (x INTEGER); CREATE TABLE journal (x INTEGER);",
             )
             .expect("schema");
-        let second = Connection::open(&path).expect("open second");
-        watch(&first, &path);
-        watch(&second, &path);
+        let mut second = Connection::open(&path).expect("open second");
+        watch(&mut first, &path).expect("watch first");
+        watch(&mut second, &path).expect("watch second");
 
         let start = changes_outside(&path, &["journal"]);
         second
@@ -144,10 +145,10 @@ mod tests {
     fn clearing_a_whole_table_is_counted() {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("t.db");
-        let conn = Connection::open(&path).expect("open");
+        let mut conn = Connection::open(&path).expect("open");
         conn.execute_batch("CREATE TABLE list (x INTEGER); INSERT INTO list VALUES (1), (2);")
             .expect("schema");
-        watch(&conn, &path);
+        watch(&mut conn, &path).expect("watch connection");
 
         // Positive control: a filtered delete always reached the hook.
         conn.execute("DELETE FROM list WHERE x = 1", [])
