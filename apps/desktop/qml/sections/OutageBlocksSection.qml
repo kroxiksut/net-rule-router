@@ -148,7 +148,7 @@ ColumnLayout {
               warn: false },
             { show: !!section._answer && !section._streamEnabled,
               text: root.tr("diag.conn-trace.gui-stream-off",
-                "Showing the connection trace is switched off in Settings → Diagnostics and logs. Observation itself keeps running."),
+                "Showing the connection trace is switched off in Settings → Logs and diagnostics. Observation itself keeps running."),
               warn: false },
             { show: !!section._episode && section._observerActive && section._streamEnabled
                     && section._rows.length === 0,
@@ -175,6 +175,15 @@ ColumnLayout {
             Accessible.role: Accessible.StaticText
             Accessible.name: text
         }
+    }
+    ThemedButton {
+        theme: root.uiTheme
+        visible: !!section._answer && !section._streamEnabled
+        text: root.tr("action.open-logs-diagnostics-settings",
+            "Open Logs and diagnostics settings")
+        Accessible.role: Accessible.Button
+        Accessible.name: text
+        onClicked: root.openSettingsCategory("diagnostics")
     }
 
     ThemedTextField {

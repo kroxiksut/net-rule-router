@@ -8,8 +8,8 @@
     "changed-fields": []
   },
   "cases": [
-    { "name": "nothing changed", "input": { "patch": {} },
-      "expected": { "empty": true, "refusal": null, "outcome": "" } },
+    { "name": "unchanged stored rules do not prove OS application", "input": { "patch": {} },
+      "expected": { "empty": true, "refusal": null, "outcome": "application-unconfirmed" } },
     { "name": "one rule added", "input": { "patch": { "rules-added": [{ "id": "R-0001", "display": "example.com", "route": "primary" }] } },
       "expected": { "empty": false, "refusal": null, "outcome": "unknown" } },
     { "name": "one rule removed", "input": { "patch": { "rules-removed": [{ "id": "R-0002", "display": "192.0.2.1", "route": "block" }] } },

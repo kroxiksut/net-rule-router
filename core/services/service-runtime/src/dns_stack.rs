@@ -121,9 +121,6 @@ pub fn egress_rule_hosts(
     Arc::new(oracle)
 }
 
-/// How long one reading of the tunnel's address serves the queries after it.
-const TUNNEL_SOURCE_TTL: Duration = Duration::from_secs(3);
-
 /// The egress policy where no route coordinator names the tunnel's address:
 /// the routing user's bound additional link, from `links`.
 pub fn stored_binding_egress_policy(
@@ -134,9 +131,7 @@ pub fn stored_binding_egress_policy(
     links: Arc<dyn crate::production_auto_rule_probe::EgressSources>,
 ) -> Arc<dyn crate::dns_egress::DnsEgressPolicy> {
     let rule_hosts = egress_rule_hosts(settings_conn, Arc::clone(&active_sid), served, paused);
-    let source = crate::dns_egress::MemoizedSecondarySource::new(TUNNEL_SOURCE_TTL, move || {
-        active_sid().and_then(|sid| links.egress_source_ips(&sid).1)
-    });
+    let source = move || active_sid().and_then(|sid| links.secondary_dns_source(&sid));
     Arc::new(
         crate::dns_egress::SecondaryPreferredEgress::new(
             crate::dns_egress::global_dns_via_secondary(),

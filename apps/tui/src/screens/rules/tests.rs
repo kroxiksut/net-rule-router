@@ -22,6 +22,71 @@ fn every_key_is_in_both_locale_files() {
     assert!(missing.is_empty(), "{missing:?}");
 }
 
+#[test]
+fn a_partial_apply_is_not_announced_as_full_success_or_auto_quit() {
+    let fake = service(vec![rule("r1", "domain", "example.test", "secondary")]);
+    fake.answer(
+        IpcOperationName::MutationSubmit,
+        json!({ "operation-id": "op-partial" }),
+    );
+    fake.answer(
+        IpcOperationName::OperationStatusGet,
+        json!({
+            "state": "completed",
+            "result": {
+                "outcome": "applied-with-drift",
+                "base-revision": "saved-revision",
+                "succeeded-sids": ["user-a"],
+                "failed-sids": [["user-b", "synthetic failure"]]
+            }
+        }),
+    );
+    let mut app = on_rules(&fake);
+    app.rules.table.rows[0].rule.enabled = false;
+    assert!(app.rules.table.is_dirty());
+    app.rules.quit_after_apply = true;
+    let pending = apply::pending_from(&app.rules.table, false, None).expect("pending rules");
+    let reply = apply::confirm_job(pending, "token".into())(&fake);
+    (reply.0)(&mut app);
+    assert_eq!(
+        app.rules.note.as_ref().expect("notice").key.id,
+        "errors.applied-with-drift"
+    );
+    assert!(!app.quit, "partial application needs attention before exit");
+    assert_eq!(app.rules.base_revision.as_deref(), Some("saved-revision"));
+    assert!(app.snapshot_refresh_due);
+    drain(&mut app, &fake);
+    assert!(
+        fake.sent(IpcOperationName::RulesList).len() >= 2,
+        "saved rules must be read back"
+    );
+    assert_eq!(
+        app.rules.note.as_ref().expect("persistent notice").key.id,
+        "errors.applied-with-drift"
+    );
+}
+
+#[test]
+fn an_unchanged_preview_after_a_lost_status_does_not_announce_full_application() {
+    let fake = service(Vec::new());
+    fake.answer(
+        IpcOperationName::MutationSubmit,
+        json!({ "review-summary": {
+        "diff-summary": "unchanged", "provenance": "synthetic-control",
+        "risk-level": "low", "requires-review": false, "changed-fields": []
+    } }),
+    );
+    let mut app = on_rules(&fake);
+    let pending = apply::pending_from(&app.rules.table, false, None).expect("pending rules");
+    let reply = apply::confirm_job(pending, "token".into())(&fake);
+    (reply.0)(&mut app);
+    assert_eq!(
+        app.rules.note.as_ref().expect("notice").key.id,
+        "errors.application-unconfirmed"
+    );
+    assert!(app.snapshot_refresh_due);
+}
+
 /// Under `sudo` the screen writes the administrator's baseline and says so;
 /// otherwise the caller's own rules, unmarked.
 #[test]

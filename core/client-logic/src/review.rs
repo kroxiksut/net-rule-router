@@ -29,6 +29,8 @@ pub struct RefusalDetail {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Outcome {
     Applied,
+    /// A terminal result that does not confirm full application.
+    Incomplete(String),
     /// The failure code; never empty.
     Failed(String),
 }
@@ -124,12 +126,11 @@ pub fn refusal_detail(code: &str, args: &BTreeMap<String, String>) -> Option<Ref
     None
 }
 
-/// What an `operation.status.get` answer settles (`operationOutcome`); `None`
-/// while the record does not say, and the caller settles by preview instead.
+/// Completion and full application are separate promises.
 pub fn operation_outcome(status: Option<&OperationStatusResponse>) -> Option<Outcome> {
     let status = status?;
     match status.state.as_str() {
-        "completed" => Some(Outcome::Applied),
+        "completed" => Some(completed_outcome(status)),
         "failed" => Some(Outcome::Failed(non_empty_or_unknown(
             status.error.as_ref().map_or("", |e| e.code.as_str()),
         ))),
@@ -137,8 +138,26 @@ pub fn operation_outcome(status: Option<&OperationStatusResponse>) -> Option<Out
     }
 }
 
-/// A preview of the confirmed payload, read as its outcome (`previewOutcome`):
-/// the change took effect exactly when it now previews as `unchanged`.
+fn completed_outcome(status: &OperationStatusResponse) -> Outcome {
+    let Some(outcome) = status.result.as_ref().and_then(|r| r.get("outcome")) else {
+        return Outcome::Applied;
+    };
+    match outcome.as_str() {
+        Some("applied-with-drift") => Outcome::Incomplete("applied-with-drift".to_owned()),
+        Some(
+            "activated"
+            | "safe-disabled"
+            | "already-safe-disabled"
+            | "audit-chain-restarted"
+            | "alert-acknowledged"
+            | "alert-resolved"
+            | "alert-unchanged",
+        ) => Outcome::Applied,
+        _ => Outcome::Incomplete("application-unconfirmed".to_owned()),
+    }
+}
+
+/// A preview confirms stored intent, never the installed network policy.
 pub fn preview_outcome(
     summary: &ReviewSummaryResponse,
     unchanged: impl Fn(&ReviewSummaryResponse) -> bool,
@@ -147,7 +166,7 @@ pub fn preview_outcome(
         return Outcome::Failed(refusal.code);
     }
     if unchanged(summary) {
-        Outcome::Applied
+        Outcome::Incomplete("application-unconfirmed".to_owned())
     } else {
         Outcome::Failed("unknown".to_owned())
     }

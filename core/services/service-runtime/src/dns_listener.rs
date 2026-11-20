@@ -34,6 +34,7 @@ use crate::dns_resolver::{
     QueryOutcome, ResolveError, RuleHostOracle, SecondaryOwnedIps, SyncReconciler,
     UnresolvedRuleHostObserver, UpstreamResolver,
 };
+use crate::dns_tcp_io::DeadlineStream;
 use crate::dns_wire::{
     build_a_response, build_error_response, build_negative_response, only_v4,
     parse_address_response, parse_question, AddressResponseOutcome, ParsedQuestion, QTYPE_A,
@@ -801,8 +802,7 @@ impl DnsInterceptListener {
             target: "nrr::dns",
             msg_key = "dns-listener-rule-host-ipv6-uncovered",
             host = %qname,
-            "a rule host was asked for over IPv6 and IPv4 cannot carry it — its \
-             v6 traffic leaves outside the rule",
+            "IPv6 DNS for a rule host was withheld because the assigned connection cannot carry it",
         );
     }
 
@@ -850,31 +850,15 @@ impl DnsInterceptListener {
             // Nothing pins the family and the tunnel is gone: a forward asks
             // the main link for the name, and its CNAME chain hands the A
             // lookup a target no rule names.
-            Some(Ipv6Guard::Off) if self.leak_guard.blocking_for_host(qname) => {
-                self.withheld(query)
-            }
             Some(Ipv6Guard::Off) => {
                 // A hole, not a routine forward: the user wrote a rule for
                 // this host and its IPv6 traffic is about to ignore it. Said
                 // once per name — silence is what makes "the rule did not
                 // work" undiagnosable.
                 self.report_aaaa_outside_policy(qname);
-                ListenerAction::Forward
+                self.withheld(query)
             }
         }
-    }
-
-    /// Whether an HTTPS record's address hints for `qname` would name addresses
-    /// its A/AAAA answers do not: a virtual address stands in for its IPv4, or
-    /// its AAAA is suppressed. No allocation, no upstream.
-    fn hints_bypass_rule_answers(&self, qname: &str) -> bool {
-        use crate::enforcement_planner::Ipv6Guard;
-        self.oracle.is_rule_host(qname)
-            && (self.fake_ip.carries_on_v4(qname)
-                || matches!(
-                    (self.ipv6_disposition)(),
-                    None | Some(Ipv6Guard::FiltersOnly)
-                ))
     }
 
     /// The tunnel carries IPv6: resolve, enforce, then answer.
@@ -991,7 +975,7 @@ impl DnsInterceptListener {
                 build_error_response(query, RCODE_SERVFAIL)
                     .map_or(ListenerAction::Drop, ListenerAction::Respond)
             }
-            AaaaOutcome::Upstream(ResolveError::Unavailable(_)) => ListenerAction::Forward,
+            AaaaOutcome::Upstream(ResolveError::Unavailable(_)) => self.withheld(query),
         }
     }
 
@@ -1033,12 +1017,12 @@ impl DnsInterceptListener {
         if q.qtype != QTYPE_A {
             // An HTTPS record carries address hints; while the guard holds, a
             // rule host's name is not asked of the main link in any type.
-            if self.oracle.is_rule_host(&q.qname) && self.leak_guard.blocking_for_host(&q.qname) {
+            if self.oracle.is_rule_host(&q.qname) {
+                if q.qtype == QTYPE_HTTPS {
+                    return build_negative_response(query, RCODE_NOERROR, self.response_ttl)
+                        .map_or(ListenerAction::Drop, ListenerAction::Respond);
+                }
                 return self.withheld(query);
-            }
-            if q.qtype == QTYPE_HTTPS && self.hints_bypass_rule_answers(&q.qname) {
-                return build_negative_response(query, RCODE_NOERROR, self.response_ttl)
-                    .map_or(ListenerAction::Forward, ListenerAction::Respond);
             }
             return ListenerAction::Forward;
         }
@@ -1079,7 +1063,7 @@ impl DnsInterceptListener {
                 .map(ListenerAction::Respond)
                 // Empty answer set (nothing to route) → NXDOMAIN, else forward.
                 .unwrap_or_else(|| {
-                    negative_answer(query).map_or(ListenerAction::Forward, ListenerAction::Respond)
+                    negative_answer(query).map_or(ListenerAction::Drop, ListenerAction::Respond)
                 }),
             // Withheld deliberately: SERVFAIL, never a forward. Forwarding here
             // would hand the caller the very addresses the guard is holding
@@ -1090,28 +1074,14 @@ impl DnsInterceptListener {
                     .map_or(ListenerAction::Drop, ListenerAction::Respond)
             }
             QueryOutcome::Upstream(ResolveError::NoRecords) => {
-                negative_answer(query).map_or(ListenerAction::Forward, ListenerAction::Respond)
+                negative_answer(query).map_or(ListenerAction::Drop, ListenerAction::Respond)
             }
             // The guard is blocking: a raw forward would carry this rule host's
             // name over the main link, the very thing it holds back.
-            QueryOutcome::Upstream(ResolveError::Unavailable(_))
-                if self.leak_guard.blocking_for_host(&q.qname) =>
-            {
+            QueryOutcome::Upstream(ResolveError::Unavailable(_)) => {
                 self.unresolved.note_unresolved(&q.qname);
                 build_error_response(query, RCODE_SERVFAIL)
                     .map_or(ListenerAction::Drop, ListenerAction::Respond)
-            }
-            // Our resolver could not reach upstream — fail open by forwarding the
-            // raw query (the OS's configured server may still answer). No
-            // enforcement installed this round, but general DNS keeps working.
-            QueryOutcome::Upstream(ResolveError::Unavailable(reason)) => {
-                tracing::debug!(
-                    target: "nrr::dns-resolver",
-                    host = %q.qname,
-                    reason = %reason,
-                    "Mode B: rule host upstream unavailable — forwarding raw query (fail-open, no enforcement this round)",
-                );
-                ListenerAction::Forward
             }
         }
     }
@@ -1380,7 +1350,9 @@ impl DnsInterceptListener {
         lane_wait: Duration,
     ) {
         if let Some(reply) = self.answer_bytes_within(query, Transport::Udp, lane_wait) {
-            let _ = socket.send_to(&reply, src);
+            if let Some(reply) = crate::dns_wire::fit_udp_reply(query, reply) {
+                let _ = socket.send_to(&reply, src);
+            }
         }
     }
 
@@ -1927,52 +1899,6 @@ impl DnsInterceptListener {
         write_tcp_message(&mut stream, query).ok()?;
         let reply = read_tcp_message(&mut stream, DNS_TCP_MAX_MESSAGE).ok()??;
         reply_answers_query(query, &reply).then_some(reply)
-    }
-}
-
-/// A stream whose every read and write ends by one deadline, however the peer
-/// paces it. A timeout set once bounds each call, not the exchange: a peer
-/// sending one byte per timeout held a thread for hours.
-struct DeadlineStream<'a> {
-    stream: &'a mut TcpStream,
-    deadline: Instant,
-    idle: Duration,
-}
-
-impl<'a> DeadlineStream<'a> {
-    fn new(stream: &'a mut TcpStream, within: Duration, idle: Duration) -> Self {
-        Self {
-            stream,
-            deadline: Instant::now() + within,
-            idle,
-        }
-    }
-
-    /// What is left before the deadline, capped by the idle bound.
-    fn window(&self) -> std::io::Result<Duration> {
-        let left = self.deadline.saturating_duration_since(Instant::now());
-        if left.is_zero() {
-            return Err(std::io::ErrorKind::TimedOut.into());
-        }
-        Ok(left.min(self.idle))
-    }
-}
-
-impl std::io::Read for DeadlineStream<'_> {
-    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-        self.stream.set_read_timeout(Some(self.window()?))?;
-        std::io::Read::read(self.stream, buf)
-    }
-}
-
-impl std::io::Write for DeadlineStream<'_> {
-    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        self.stream.set_write_timeout(Some(self.window()?))?;
-        std::io::Write::write(self.stream, buf)
-    }
-
-    fn flush(&mut self) -> std::io::Result<()> {
-        std::io::Write::flush(self.stream)
     }
 }
 

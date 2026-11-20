@@ -819,7 +819,7 @@ ScrollView {
                     Layout.fillWidth: true
                     visible: section._connIsHistory
                     text: root.tr("diag.conn-history.subtitle",
-                        "Connections your programs made over the chosen period, kept by the service on this computer: one line per program and destination, with how many times it connected. Only you can see your history, and it is never part of the diagnostic archive. Switch it off or clear it in Settings → Diagnostics and logs.")
+                        "Connections your programs made over the chosen period, kept by the service on this computer: one line per program and destination, with how many times it connected. Only you can see your history, and it is never part of the diagnostic archive. Switch it off or clear it in Settings → Logs and diagnostics.")
                     color: root.mutedTextColor
                     wrapMode: Text.WordWrap
                     font.pixelSize: root.uiTheme.baseFontSizePx - 1
@@ -1099,12 +1099,12 @@ ScrollView {
                                 "The connection history cannot be kept right now. The service log says why.")
                             : !section._connHistoryEnabled
                                 ? root.tr("diag.conn-history.off",
-                                    "Your connection history is switched off in Settings → Diagnostics and logs.")
+                                    "Your connection history is switched off in Settings → Logs and diagnostics.")
                                 : root.tr("diag.conn-history.empty",
                                     "No connections in this period"))
                         : !section._connGuiStreamEnabled
                         ? root.tr("diag.conn-trace.gui-stream-off",
-                            "Showing the connection trace is switched off in Settings → Diagnostics and logs. Observation itself keeps running.")
+                            "Showing the connection trace is switched off in Settings → Logs and diagnostics. Observation itself keeps running.")
                         : section._connObserverActive
                             ? root.tr("diag.conn-trace.entries-empty",
                                 "No connections observed yet")
@@ -1112,6 +1112,15 @@ ScrollView {
                                 "The service is not observing connections right now, so this list stays empty. The service log says why.")
                     color: root.mutedTextColor
                     wrapMode: Text.WordWrap
+                }
+                ThemedButton {
+                    theme: root.uiTheme
+                    visible: !section._connIsHistory && !section._connGuiStreamEnabled
+                    text: root.tr("action.open-logs-diagnostics-settings",
+                        "Open Logs and diagnostics settings")
+                    Accessible.role: Accessible.Button
+                    Accessible.name: text
+                    onClicked: root.openSettingsCategory("diagnostics")
                 }
                 // The history is honest about what it could not keep.
                 Label {

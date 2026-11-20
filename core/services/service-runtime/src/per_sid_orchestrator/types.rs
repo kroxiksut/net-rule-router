@@ -99,15 +99,13 @@ pub struct PerSidBinding {
     pub stable_id: String,
     /// User-facing adapter name stored with the binding (e.g.
     /// "examplevpn VPN OpenVPN Adapter"). Used by the route coordinator to
-    /// auto-heal when `stable_id` (a GUID) goes stale after a secondary adapter reinstall —
-    /// the friendly name survives the GUID change.
+    /// suggest an adapter when the selected Secondary id is unavailable.
     pub display_name: String,
     pub user_confirmed: bool,
     /// every stable adapter id this binding has been matched
     /// to (current `stable_id` + historical GUIDs the auto-heal folded in). The
-    /// coordinator matches a live adapter against ANY of these before falling
-    /// back to friendly-name heal, so a secondary adapter whose GUID rotated is recognised
-    /// directly. Empty is fine — matching then relies on `stable_id` + name.
+    /// coordinator may use these for Primary, but does not trust historical
+    /// ids as proof that another live adapter is the selected Secondary.
     pub known_stable_ids: Vec<String>,
 }
 

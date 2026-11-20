@@ -1451,7 +1451,7 @@ fn outcome_json(outcome: Option<Outcome>) -> Value {
     match outcome {
         None => Value::Null,
         Some(Outcome::Applied) => Value::from(""),
-        Some(Outcome::Failed(code)) => Value::from(code),
+        Some(Outcome::Failed(code) | Outcome::Incomplete(code)) => Value::from(code),
     }
 }
 

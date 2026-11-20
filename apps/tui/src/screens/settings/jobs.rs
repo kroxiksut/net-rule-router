@@ -855,7 +855,7 @@ pub fn rollback_run(token: String, target: RollbackTargetDto) -> Job {
             operation_outcome(status.as_ref())
         });
         Reply::new(move |app| match result {
-            Ok(Some(Outcome::Failed(code))) => {
+            Ok(Some(Outcome::Failed(code) | Outcome::Incomplete(code))) => {
                 let failure = Failure {
                     slug: code,
                     elevation: false,

@@ -541,11 +541,10 @@ fn a_pass_loads_the_users_policy_once() {
     );
 }
 
-/// A transient unreadable table must not turn the link a binding resolved to
-/// into somebody else's tunnel: the stale id heals to it again. A tunnel the
-/// binding never resolved to is still not adopted on a guess.
+/// An unreadable table and a formerly resolved interface do not authorize
+/// choosing that interface for a binding whose identity has changed.
 #[test]
-fn an_unreadable_table_keeps_the_last_resolved_link_through_a_rename() {
+fn an_unreadable_table_does_not_adopt_the_last_resolved_link_for_a_new_binding() {
     const NAME: &str = "TAP-Windows Adapter V9";
     let api = Arc::new(MockWindowsApi::new());
     let mut tap = adapter("tap", 2, true, true, Some([10, 9, 0, 1]));
@@ -573,8 +572,8 @@ fn an_unreadable_table_keeps_the_last_resolved_link_through_a_rename() {
             .resolve("S-RENAME")
             .secondary
             .map(|t| t.interface_index),
-        Some(2),
-        "the link it resolved to is still the user's"
+        None,
+        "the old resolved link does not prove the new binding's identity"
     );
 
     let stranger = coordinator_with_policy(api, Arc::new(FakeRules::new()), policy);

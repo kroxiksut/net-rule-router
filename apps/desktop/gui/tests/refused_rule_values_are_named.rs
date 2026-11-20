@@ -286,7 +286,7 @@ fn the_outcome_is_read_in_one_place() {
 fn a_failure_is_worded_with_its_own_values() {
     let transport = repo_file("apps/desktop/qml/flows/RpcTransport.qml");
     assert!(
-        transport.contains("else done(failure, Pure.operationFailureArgs(status))"),
+        transport.contains("else done(failure, Pure.operationFailureArgs(status),"),
         "RpcTransport.qml: the outcome read hands the failure's values to `done`"
     );
     // The rules apply words its failures in the submitter the tray shares.
@@ -486,8 +486,8 @@ fn the_window_reads_the_refusals_the_service_sends() {
             "control-character",
             "null",
             "null",
-            // A re-preview after a record this account cannot read.
-            r#""""#,
+            // Stored intent does not confirm installed enforcement.
+            r#""application-unconfirmed""#,
             "unsupported-rule-shape",
             "unknown",
             // A refused network names itself and what it covers.

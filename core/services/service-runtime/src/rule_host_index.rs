@@ -51,6 +51,52 @@ impl RuleHostIndex {
         !self.by_name.is_empty() || !self.any_zone.is_empty()
     }
 
+    /// A query that could belong to a secondary rule may take the primary path
+    /// only when a primary route wins for the name. DNS has no app identity.
+    pub(crate) fn requires_secondary(
+        &self,
+        hostname: &str,
+        book: &nrr_domain::canonical::CanonicalRuleBook,
+        primary: &Self,
+    ) -> bool {
+        use crate::dns_observation_consumer::{any_rule_covers, rule_covers};
+        use nrr_domain::canonical::CanonicalRuleBook;
+        use nrr_domain::decision_matching::{RequestedRouteDecision, ZonePriorityPolicy};
+        use nrr_domain::{RouteBehaviorMode, RouteRole, RuleAction};
+
+        let secondary = || self.candidates(hostname, &book.secondary);
+        if !any_rule_covers(hostname, secondary()) {
+            return false;
+        }
+        let main = || primary.candidates(hostname, &book.primary);
+        if !any_rule_covers(hostname, main()) {
+            return true;
+        }
+
+        // A query carries no process identity. A possible app-scoped secondary
+        // rule must stay protected until we can establish who owns the query.
+        if secondary().any(|rule| rule.app_match.is_some() && rule_covers(rule, hostname)) {
+            return true;
+        }
+        let candidates = CanonicalRuleBook {
+            primary: CanonicalRuleSet::from_rules(main().cloned().collect()),
+            secondary: CanonicalRuleSet::from_rules(secondary().cloned().collect()),
+        };
+        let winner = nrr_domain::decision_engine_input::match_sample(
+            &candidates,
+            Some(hostname),
+            None,
+            None,
+            ZonePriorityPolicy::default(),
+            RouteBehaviorMode::PreferPrimary,
+        );
+        !matches!(
+            winner,
+            RequestedRouteDecision::MatchedRoute { candidate }
+                if candidate.route_role == RouteRole::Primary && candidate.action == RuleAction::Route
+        )
+    }
+
     /// The rules of `set`, the set this index was built from, that may cover
     /// `hostname`; every other rule cannot.
     pub(crate) fn candidates<'s>(
@@ -89,6 +135,42 @@ mod tests {
             action: nrr_domain::RuleAction::Route,
             origin: None,
         }
+    }
+
+    #[test]
+    fn a_primary_exception_inside_a_secondary_zone_keeps_its_own_dns_path() {
+        use crate::dns_resolver::RuleHostOracle;
+        use crate::dns_resolver_ports::ActiveRuleHostOracle;
+        use crate::per_sid_orchestrator::{ActiveRulesSnapshot, RulesProvider};
+        use nrr_domain::canonical::CanonicalRuleBook;
+        use std::sync::Arc;
+
+        struct Rules(CanonicalRuleBook);
+        impl RulesProvider for Rules {
+            fn active_rules(&self) -> Option<ActiveRulesSnapshot> {
+                Some(ActiveRulesSnapshot {
+                    rule_book: self.0.clone(),
+                })
+            }
+        }
+
+        use CanonicalAddressMatch::{ExactFqdn, SuffixDomain, Zone};
+        let book = CanonicalRuleBook {
+            primary: CanonicalRuleSet::from_rules(vec![
+                rule(1, Some(ExactFqdn("login.example.test".into())), true),
+                rule(2, Some(SuffixDomain("corp.example.test".into())), true),
+            ]),
+            secondary: CanonicalRuleSet::from_rules(vec![
+                rule(3, Some(Zone("test".into())), true),
+                rule(4, Some(ExactFqdn("vpn.corp.example.test".into())), true),
+            ]),
+        };
+        let oracle =
+            ActiveRuleHostOracle::new(Arc::new(Rules(book)), Arc::new(|| Some("test".into())));
+        assert!(oracle.is_rule_host("other.example.test"));
+        assert!(oracle.is_rule_host("vpn.corp.example.test"));
+        assert!(!oracle.is_rule_host("login.example.test"));
+        assert!(!oracle.is_rule_host("host.corp.example.test"));
     }
 
     /// Names a hostile or careless writer can put in a rule or a query: case,

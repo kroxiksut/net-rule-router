@@ -13,9 +13,7 @@
 //! - `Idempotent` (e.g. ERROR_NOT_FOUND on delete) → treat as success,
 //!   push no compensating action (nothing to undo). On an ADD the same code
 //!   is the interface having gone (`MutationIntent::Add` → `Fatal`).
-//! - `Conflict` (e.g. route already exists on add) → treat as success for
-//!   AddRoute; for UpdateRoute a conflict means the current state may be
-//!   stale — surface as `Fatal` so the orchestrator re-snapshots.
+//! - `Conflict` on add → keep the existing entry without claiming ownership.
 //! - `Retryable` → propagated; caller may retry the whole plan.
 //! - `Fatal` / `PrivilegeRequired` → propagated; caller triggers rollback.
 //!
@@ -85,9 +83,8 @@ impl RoutingTransaction {
 
     /// Apply `actions` in order, building the compensating journal.
     ///
-    /// Returns `Err` on the first non-idempotent failure.  The journal is
-    /// populated up to (but not including) the failed action, so `rollback()`
-    /// can undo exactly the mutations that succeeded.
+    /// Stops at the first failure; the journal includes successful mutations
+    /// within an update that failed halfway through.
     pub fn execute(&mut self, actions: &[RoutingAction]) -> Result<(), PlatformError> {
         for action in actions {
             self.execute_one(action)?;
@@ -135,47 +132,32 @@ impl RoutingTransaction {
             }
 
             RoutingAction::UpdateRoute { old, new } => {
-                // Step 1: delete the old entry. An entry that is already gone is
-                // success here for the same reason it is under `DeleteRoute` —
-                // the desired end state is "the old route is not there" — and a
-                // bare `?` failed the WHOLE apply over a route somebody else had
-                // already removed.
-                match self.api.delete_ip_forward_entry(old) {
-                    Ok(()) => {}
-                    Err(e) if e.classify() == ErrorClass::Idempotent => {}
+                let removed_old = match self.api.delete_ip_forward_entry(old) {
+                    Ok(()) => true,
+                    Err(e) if e.classify() == ErrorClass::Idempotent => false,
                     Err(e) => return Err(e),
+                };
+                // Preserve the successful deletion even if the add fails.
+                if removed_old {
+                    self.compensating
+                        .push(CompensatingAction::AddRoute(old.clone()));
                 }
-                // The undo is journalled BEFORE the add is attempted. Recorded
-                // only on success, a failure between the two left the old route
-                // deleted with nothing in the journal that could put it back:
-                // `rollback()` knew nothing about it, and the inline restore
-                // below was the only chance — one that itself could fail, with
-                // the route then lost for good.
-                self.compensating.push(CompensatingAction::SwapRoute {
-                    delete_new: new.clone(),
-                    restore_old: old.clone(),
-                });
-                // Step 2: add the new entry.
                 match self.api.create_ip_forward_entry(new) {
-                    Ok(()) => {}
-                    // A pre-existing entry under this key is the same
-                    // "somebody else's overlay" case `AddRoute` treats as
-                    // success, and for the same reason: we neither own nor undo
-                    // it, and a more specific prefix still wins.
-                    Err(e) if e.classify_for(MutationIntent::Add) == ErrorClass::Conflict => {}
-                    Err(e) => {
-                        // The add failed, so there is no new route to delete on
-                        // the way back — only the old one to restore. Narrow the
-                        // journalled undo to that, then let `rollback()` run it
-                        // along with everything else, in order.
-                        if let Some(CompensatingAction::SwapRoute { restore_old, .. }) =
-                            self.compensating.pop()
-                        {
+                    Ok(()) => {
+                        if removed_old {
+                            let _ = self.compensating.pop();
+                            self.compensating.push(CompensatingAction::SwapRoute {
+                                delete_new: new.clone(),
+                                restore_old: old.clone(),
+                            });
+                        } else {
                             self.compensating
-                                .push(CompensatingAction::AddRoute(restore_old));
+                                .push(CompensatingAction::DeleteRoute(new.clone()));
                         }
-                        return Err(e);
                     }
+                    // A conflict confirms no mutation of the existing route.
+                    Err(e) if e.classify_for(MutationIntent::Add) == ErrorClass::Conflict => {}
+                    Err(e) => return Err(e),
                 }
             }
         }
@@ -213,7 +195,8 @@ impl RoutingTransaction {
                     delete_new,
                     restore_old,
                 } => {
-                    if self.delete_tolerant(&delete_new).is_err() {
+                    if let Err(e) = self.delete_tolerant(&delete_new) {
+                        residue.errors.push(e);
                         residue.still_added.push(delete_new);
                     }
                     if let Err(e) = self.create_tolerant(&restore_old) {
@@ -635,5 +618,112 @@ mod tests {
             1,
             "the old route must be restorable from the journal, not only inline",
         );
+    }
+
+    #[test]
+    fn update_conflict_rollback_keeps_the_preexisting_foreign_route() {
+        let api = api();
+        let old = route([10, 0, 1, 0], [192, 0, 2, 1], 5, true);
+        let foreign = route([10, 0, 2, 0], [192, 0, 2, 2], 6, false);
+        api.set_route_table(vec![old.clone(), foreign.clone()]);
+        let mut tx = RoutingTransaction::new(Arc::clone(&api) as Arc<dyn RouteTablePort>);
+        api.set_route_create_error(Some(PlatformError::Win32 {
+            operation: "CreateIpForwardEntry2",
+            code: 0x1392,
+            message: "foreign route exists".into(),
+        }));
+        tx.execute(&[RoutingAction::UpdateRoute {
+            old: old.clone(),
+            new: foreign.clone(),
+        }])
+        .unwrap();
+        assert!(
+            tx.added_routes().is_empty(),
+            "a conflict does not establish ownership"
+        );
+        api.set_route_create_error(None);
+        assert!(tx.rollback().is_empty());
+        let table = api.get_ip_forward_table().unwrap();
+        assert!(table.contains(&old), "our removal must be undone");
+        assert!(
+            table.contains(&foreign),
+            "the foreign route must survive rollback"
+        );
+    }
+
+    struct MissingOldRoute {
+        api: Arc<MockWindowsApi>,
+        old: RouteEntry,
+    }
+
+    impl RouteTablePort for MissingOldRoute {
+        fn get_ip_forward_table(&self) -> Result<Vec<RouteEntry>, PlatformError> {
+            self.api.get_ip_forward_table()
+        }
+        fn create_ip_forward_entry(&self, entry: &RouteEntry) -> Result<(), PlatformError> {
+            self.api.create_ip_forward_entry(entry)
+        }
+        fn delete_ip_forward_entry(&self, entry: &RouteEntry) -> Result<(), PlatformError> {
+            if entry == &self.old {
+                return Err(PlatformError::Win32 {
+                    operation: "DeleteIpForwardEntry2",
+                    code: 0x490,
+                    message: "already removed".into(),
+                });
+            }
+            self.api.delete_ip_forward_entry(entry)
+        }
+        fn get_adapter_infos(&self) -> Result<Vec<crate::adapters::AdapterInfo>, PlatformError> {
+            self.api.get_adapter_infos()
+        }
+        fn interface_luid_for_index(&self, ifindex: u32) -> Result<u64, PlatformError> {
+            self.api.interface_luid_for_index(ifindex)
+        }
+    }
+
+    #[test]
+    fn update_rollback_does_not_resurrect_an_old_route_that_was_already_missing() {
+        let api = api();
+        let old = route([10, 0, 1, 0], [192, 0, 2, 1], 5, true);
+        let new = route([10, 0, 2, 0], [192, 0, 2, 2], 6, true);
+        let port = Arc::new(MissingOldRoute {
+            api: Arc::clone(&api),
+            old: old.clone(),
+        });
+        let mut tx = RoutingTransaction::new(port);
+        tx.execute(&[RoutingAction::UpdateRoute { old, new }])
+            .unwrap();
+        assert!(tx.rollback().is_empty());
+        assert!(
+            api.get_ip_forward_table().unwrap().is_empty(),
+            "rollback must preserve the original absence"
+        );
+    }
+
+    #[test]
+    fn update_rollback_reports_both_failed_compensations() {
+        let api = api();
+        let old = route([10, 0, 1, 0], [192, 0, 2, 1], 5, true);
+        let new = route([10, 0, 2, 0], [192, 0, 2, 2], 6, true);
+        api.set_route_table(vec![old.clone()]);
+        let mut tx = RoutingTransaction::new(Arc::clone(&api) as Arc<dyn RouteTablePort>);
+        tx.execute(&[RoutingAction::UpdateRoute {
+            old: old.clone(),
+            new: new.clone(),
+        }])
+        .unwrap();
+        api.set_force_error(Some(PlatformError::Win32 {
+            operation: "route rollback",
+            code: 5,
+            message: "access denied".into(),
+        }));
+        let residue = tx.rollback_with_residue();
+        assert_eq!(
+            residue.errors.len(),
+            2,
+            "neither rollback failure may be hidden"
+        );
+        assert_eq!(residue.still_added, vec![new]);
+        assert_eq!(residue.still_removed, vec![old]);
     }
 }

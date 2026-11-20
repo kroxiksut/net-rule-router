@@ -170,12 +170,8 @@ QtObject {
         pendingLongRpc = longs
     }
 
-    // A confirmed mutation's `ok` only says it was accepted; the verdict is on
-    // its operation record. `done("", null, result)` once it completed (the
-    // record's `result`, null when settled without it), `done(code, args)`
-    // when it failed, `args` being that failure's own values (or null). A record this account cannot read (another administrator
-    // confirmed it) is judged by `settleByState(done)` from what the service
-    // holds now.
+    // Acceptance is not full application. Keep terminal result details even
+    // when they describe partial application.
     function readMutationOutcome(confirmAnswer, settleByState, done) {
         var operationId = String((confirmAnswer && confirmAnswer["operation-id"]) || "")
         var corr = (operationId !== "" && bridgeAvailable
@@ -190,14 +186,12 @@ QtObject {
             transport._settleRefusal(failure === transport.securityAlertGateCode, function() {
                 if (failure === null) settleByState(done)
                 else if (failure === "") done("", null, (status && status.result) || null)
-                else done(failure, Pure.operationFailureArgs(status))
+                else done(failure, Pure.operationFailureArgs(status), (status && status.result) || null)
             })
         })
     }
 
-    // `settleByState` for a mutation the preview describes: it took effect
-    // exactly when the same payload now previews as unchanged —
-    // `unchanged(summary)`, an empty diff unless given.
+    // A preview can confirm stored intent, not installed enforcement.
     function settleByPreview(kind, payload, unchanged) {
         var isUnchanged = (typeof unchanged === "function") ? unchanged : Pure.reviewSummaryIsEmpty
         return function(done) {

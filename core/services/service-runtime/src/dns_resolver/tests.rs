@@ -323,6 +323,15 @@ impl UpstreamResolver for SlowUpstream {
         std::thread::sleep(self.spends.min(budget));
         self.answer.clone()
     }
+
+    fn resolve_tunnel_only_within(
+        &self,
+        hostname: &str,
+        family: AddressFamily,
+        budget: Duration,
+    ) -> Result<ResolvedAddresses, ResolveError> {
+        self.resolve_within(hostname, family, budget)
+    }
 }
 
 /// Remembers every deadline a reconcile was given. The first-contact install
@@ -1554,4 +1563,56 @@ fn upstream_failure_propagates_without_enforcement() {
     );
     // No fact recorded, no reconcile: nothing to enforce on a failed resolve.
     assert!(log.snapshot().is_empty());
+}
+
+#[test]
+fn a_withheld_dns_answer_does_not_claim_which_interface_carried_the_query() {
+    use tracing_subscriber::layer::SubscriberExt;
+
+    let log = CallLog::default();
+    let dir = tempfile::TempDir::new().expect("temp log directory");
+    let writer = std::sync::Arc::new(nrr_diagnostics::LogWriter::open(
+        nrr_diagnostics::LogWriterConfig::new(dir.path()),
+    ));
+    let subscriber =
+        tracing_subscriber::registry().with(nrr_diagnostics::NdjsonTracingLayer::new(writer));
+    let outcome = tracing::subscriber::with_default(subscriber, || {
+        handle_a_query(
+            "routed.example",
+            aaaa_hold(),
+            &oracle(&["routed.example"]),
+            &FakeUpstream {
+                answer: Err(ResolveError::Unavailable("timeout".into())),
+            },
+            &FakeSink(&log),
+            &FakeReconciler {
+                log: &log,
+                outcome: ReconcileOutcome::Installed,
+            },
+            &NoopFakeIpAnswerer,
+            &|| true,
+            &NoEnforcement,
+        )
+    });
+    assert_eq!(outcome, QueryOutcome::Withheld);
+    assert!(log.snapshot().is_empty());
+
+    let event = std::fs::read_dir(dir.path())
+        .expect("log directory")
+        .map(|entry| std::fs::read_to_string(entry.expect("log file").path()).expect("read log"))
+        .flat_map(|data| {
+            data.lines()
+                .map(|line| serde_json::from_str::<serde_json::Value>(line).expect("valid NDJSON"))
+                .collect::<Vec<_>>()
+        })
+        .find(|event| event["message_key"] == "diag.event.dns-resolver-withheld-name-leak-guard")
+        .expect("withholding event");
+    let payload = &event["payload"];
+    assert_eq!(payload["reason"], "timeout");
+    let message = payload["message"].as_str().expect("event message");
+    assert!(message.contains("withholding the answer"), "{message}");
+    assert!(
+        !message.contains("over the main link"),
+        "A timeout cannot establish the outgoing interface: {message}"
+    );
 }

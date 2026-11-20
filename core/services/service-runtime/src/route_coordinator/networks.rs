@@ -482,7 +482,14 @@ impl SecondaryRouteCoordinator {
         // adopt a live same-name SIBLING. If the bound adapter is genuinely down with
         // no live sibling, the heal finds nothing and we still fail closed (correct).
         // The same check the leak-protection banner makes (`bound_adapter_usable`).
-        let by_id = bound_adapter(infos, &binding.stable_id, &binding.known_stable_ids);
+        // Historical ids may have been recorded by an older heuristic that
+        // adopted an unrelated VPN. Only the selected secondary is trusted.
+        let known_ids = if role == "secondary" {
+            &[][..]
+        } else {
+            &binding.known_stable_ids
+        };
+        let by_id = bound_adapter(infos, &binding.stable_id, known_ids);
         let info = match by_id.filter(|i| BoundCandidate::usable(*i)) {
             Some(i) => {
                 self.refresh_renamed_binding(sid, role, binding, i);
@@ -556,6 +563,17 @@ impl SecondaryRouteCoordinator {
                 // Already asked above when names answered; a second status for
                 // the role would take turns with that one on every pass.
                 let mut asked = ambiguous || refused_only;
+                // A matching name is not an adapter identity. Another VPN can
+                // use the same name even when it is the only live match.
+                if let (true, Some(candidate)) = (role == "secondary" && !asked, first) {
+                    self.publish_enforcement_status(
+                        sid,
+                        "adapter-choice-needed",
+                        role,
+                        vec![preferred_display_name(candidate).to_string()],
+                    );
+                    asked = true;
+                }
                 let other_routes_link = |i: &AdapterInfo| {
                     other_role
                         .is_some_and(|b| binding_matches_live(i, &b.stable_id, &b.known_stable_ids))
@@ -569,24 +587,21 @@ impl SecondaryRouteCoordinator {
                     }
                     _ => None,
                 };
-                // Failing that, the additional connection follows the VPN to
-                // the one live tunnel that is nobody else's, whatever driver
-                // it runs on; two leave the choice to the user. Only with the
-                // route table read: without it the uplink cannot be told apart.
+                // A live tunnel or a copy of the same driver is only a
+                // candidate: neither proves it belongs to this binding.
                 let tunnels = match (first, copy, routes.as_deref()) {
                     (None, None, Some(routes)) if role == "secondary" && !asked => {
                         adoptable_tunnels(infos, &foreign, routes, other_routes_link)
                     }
                     _ => Vec::new(),
                 };
-                let tunnel = match tunnels.as_slice() {
-                    [only] => Some(*only),
-                    [] => None,
-                    several => {
-                        let candidates = several
-                            .iter()
-                            .map(|i| preferred_display_name(i).to_string())
-                            .collect();
+                if role == "secondary" && !asked {
+                    let candidates: Vec<String> = copy
+                        .into_iter()
+                        .chain(tunnels.iter().copied())
+                        .map(|i| preferred_display_name(i).to_string())
+                        .collect();
+                    if !candidates.is_empty() {
                         self.publish_enforcement_status(
                             sid,
                             "adapter-choice-needed",
@@ -594,15 +609,17 @@ impl SecondaryRouteCoordinator {
                             candidates,
                         );
                         asked = true;
-                        None
                     }
-                };
-                match (first, copy.or(tunnel)) {
+                }
+                // Preserve the existing primary recovery; Secondary must wait
+                // for an explicit choice instead of adopting another tunnel.
+                let moved = if role == "secondary" { None } else { copy };
+                match (first, moved) {
                     (_, Some(moved)) => {
                         self.follow_vpn(sid, role, binding, moved, copy.is_some());
                         moved
                     }
-                    (Some(only), None) if !ambiguous => {
+                    (Some(only), None) if !ambiguous && role != "secondary" => {
                         let healed_id = format!(
                             "win-adapter:{}",
                             only.adapter_name.trim().to_ascii_lowercase()

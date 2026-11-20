@@ -95,6 +95,8 @@ if kill -0 "$cargo_pid" 2>/dev/null; then
   fi
 fi
 (
+  # The monitor and its sleep child must not outlive the runner's lock.
+  exec {lock_fd}>&-
   while kill -0 "$cargo_pid" 2>/dev/null; do
     free=$(df -Pk -- "$root" | awk 'NR == 2 {print $4}') || free=0
     if [ "${free:-0}" -lt 7340032 ]; then

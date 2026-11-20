@@ -128,6 +128,9 @@ pub fn run() -> ExitCode {
     nrr_platform_api::source_link::install_source_link_pinner(Box::new(
         nrr_platform_linux::source_link::BindToSourceDevice,
     ));
+    nrr_platform_api::source_link::install_interface_pinner(Box::new(
+        nrr_platform_linux::source_link::BindToSourceDevice,
+    ));
 
     tracing::info!(
         target: "nrr::lifecycle",

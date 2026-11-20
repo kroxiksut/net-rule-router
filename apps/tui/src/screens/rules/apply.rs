@@ -294,6 +294,10 @@ pub enum Finished {
     Applied {
         base: Option<String>,
     },
+    Incomplete {
+        code: String,
+        base: Option<String>,
+    },
     /// The token died before the confirm: the review is out of date.
     Expired,
     UacDeclined,
@@ -427,12 +431,20 @@ fn confirm(client: &dyn IpcClient, pending: &Pending, token: &str) -> Finished {
                 .map(|e| e.args)
                 .unwrap_or_default(),
         }),
+        Some(Outcome::Incomplete(code)) => Finished::Incomplete {
+            code,
+            base: status
+                .as_ref()
+                .and_then(|s| s.result.as_ref())
+                .and_then(|r| r.get(BASE_REVISION_KEY))
+                .and_then(Value::as_str)
+                .map(str::to_owned),
+        },
         None => settle_by_preview(client, pending),
     }
 }
 
-/// The change took effect exactly when the same payload now previews as
-/// unchanged (`settleByPreview`).
+/// Stored intent cannot prove installed enforcement.
 fn settle_by_preview(client: &dyn IpcClient, pending: &Pending) -> Finished {
     let again = Pending {
         correlation_id: correlation_id("outcome"),
@@ -447,6 +459,7 @@ fn settle_by_preview(client: &dyn IpcClient, pending: &Pending) -> Finished {
         Ok((summary, _)) => match preview_outcome(&summary, |s| nothing_to_do(pending, s)) {
             Outcome::Applied => Finished::Applied { base: None },
             Outcome::Failed(code) => Finished::Failed(Failure::code(&code)),
+            Outcome::Incomplete(code) => Finished::Incomplete { code, base: None },
         },
     }
 }

@@ -414,6 +414,11 @@ pub struct LinuxApi;
 
 impl RouteTablePort for LinuxApi {
     #[cfg(target_os = "linux")]
+    fn matches_persistent_id(&self, adapter: &AdapterInfo, id: &str) -> bool {
+        crate::interface_rows::matches_persistent_id(adapter, id)
+    }
+
+    #[cfg(target_os = "linux")]
     fn get_ip_forward_table(&self) -> Result<Vec<RouteEntry>, PlatformError> {
         crate::route_table::get_ipv4_routes()
     }

@@ -347,6 +347,14 @@ QtObject {
             }
             var failure = r.failure
             var failureArgs = r.failureArgs
+            if (r.incomplete) {
+                _forgetMergeInFlight()
+                _resolveGuardRulesApply(false)
+                root._refreshRulesFromService({ silent: true })
+                root.refreshBackendStatus()
+                root.statusLine = submitter.describeFailure(r, root.tr)
+                return
+            }
             if (failure !== "") {
                 console.log("review-flow: activation refused:", failure)
                 // Nothing was activated: the edits stay unsaved and the
@@ -612,6 +620,12 @@ QtObject {
             root.rpc.readMutationOutcome(p, settle, function(failure) {
                 if (failure === "") {
                     _completeResetToBaseline(p)
+                    return
+                }
+                if (failure === "applied-with-drift" || failure === "application-unconfirmed") {
+                    root._refreshRulesFromService({ silent: true })
+                    root.refreshBackendStatus()
+                    root.statusLine = root.ipcErrorLabel(failure)
                     return
                 }
                 console.log("reset-flow: reset refused:", failure)

@@ -313,8 +313,8 @@ fn win_ifindex_mac_scheme_binding_matches_live_mac_adapter() {
 
 /// The banner says traffic is held exactly when the service holds it: the
 /// bound adapter is judged by the same check, prior ids and IPv4 included.
-/// A tunnel recognised by the id it had before a reinstall carries traffic,
-/// so no banner; an adapter that is up with no IPv4 carries none, so a banner.
+/// An old automatically recorded ID cannot establish the selected tunnel's
+/// availability. The banner must agree with the coordinator.
 #[test]
 fn the_banner_judges_the_bound_adapter_as_the_service_does() {
     use nrr_platform_api::adapters::{AdapterInfo, IfOperStatus, InterfaceType};
@@ -339,7 +339,7 @@ fn the_banner_judges_the_bound_adapter_as_the_service_does() {
     let before = "win-adapter:{11111111-0000-0000-0000-000000000001}".to_string();
 
     for (stable_id, known, ipv4, held) in [
-        (before.clone(), vec![now_id.clone()], true, false),
+        (before.clone(), vec![now_id.clone()], true, true),
         (before.clone(), vec![now_id.clone()], false, true),
         (now_id.clone(), vec![], true, false),
         (now_id.clone(), vec![], false, true),
@@ -365,7 +365,7 @@ fn the_banner_judges_the_bound_adapter_as_the_service_does() {
         }
         let infos = vec![live(ipv4)];
         let service_carries =
-            crate::route_coordinator::bound_adapter_usable(&infos, &stable_id, &known);
+            crate::route_coordinator::bound_adapter_usable(&infos, &stable_id, &[]);
         let entries: Vec<AdapterEntry> = infos.into_iter().map(adapter_to_entry).collect();
         let state = ProductionFailClosedProbe::new(conn)
             .probe(TEST_SID, &entries)

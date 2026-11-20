@@ -30,6 +30,9 @@ target
 !docs/**/*_RU.md
 !docs/**/*_ru.md
 TASKS.md
+# Local FerrisETW maintenance backlog. This is working coordination material,
+# not NetRuleRouter documentation.
+TASKS_FERRISETW.md
 
 # AI-facing and internal working docs — kept local, never published
 AI_CONTEXT*

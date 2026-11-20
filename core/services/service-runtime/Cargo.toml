@@ -20,6 +20,9 @@ license = "MPL-2.0"
 # reading this Cargo.toml via include_str! and rejecting forbidden crate
 # names — see the test for the canonical list.
 
+[features]
+fuzzing = []
+
 [dependencies]
 # NOTE: `nrr-application` is deliberately absent. It was declared here and used
 # nowhere, and through it `nrr-ui-support` and `nrr-mock-backend` reached the

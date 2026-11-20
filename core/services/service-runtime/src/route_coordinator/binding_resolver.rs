@@ -29,6 +29,11 @@ use crate::route_codegen::SecondaryRouteTarget;
 /// "secondary adapter not found" for a live, working VPN and route nothing.
 /// Reconstruct the persistent id here (keep in sync with `build_persistent_id`).
 pub fn adapter_binding_matches(info: &AdapterInfo, bound_id: &str) -> bool {
+    matches_by_index(info.index, bound_id) || durable_adapter_binding_matches(info, bound_id)
+}
+
+/// A socket can safely keep this identity through index reuse.
+pub(super) fn durable_adapter_binding_matches(info: &AdapterInfo, bound_id: &str) -> bool {
     identity_matches(
         &info.adapter_name,
         info.index,
@@ -55,13 +60,14 @@ pub fn adapter_entry_binding_matches(
         .physical_address
         .as_deref()
         .map(|mac| mac.replace(':', "-"));
-    identity_matches(
-        &entry.adapter_name,
-        entry.ipv6_if_index,
-        mac_dash.as_deref(),
-        &entry.persistent_id,
-        bound_id,
-    )
+    matches_by_index(entry.ipv6_if_index, bound_id)
+        || identity_matches(
+            &entry.adapter_name,
+            entry.ipv6_if_index,
+            mac_dash.as_deref(),
+            &entry.persistent_id,
+            bound_id,
+        )
 }
 
 /// Core identity-matching rules, parametrized over the fields both adapter
@@ -93,11 +99,12 @@ pub(super) fn identity_matches(
             return true;
         }
     }
-    if bound_id.eq_ignore_ascii_case(&format!("win-ifindex:{index}")) {
-        return true;
-    }
     // Back-compat: a binding stored with the low-level stable_id scheme.
-    bound_id.eq_ignore_ascii_case(stable_id_fallback)
+    !bound_id.is_empty() && bound_id.eq_ignore_ascii_case(stable_id_fallback)
+}
+
+fn matches_by_index(index: u32, bound_id: &str) -> bool {
+    bound_id.eq_ignore_ascii_case(&format!("win-ifindex:{index}"))
 }
 
 /// match a live adapter against a binding's current

@@ -24,7 +24,7 @@ pub fn handle_a_query(
     // may leave only through the tunnel, and a query over the main link would
     // hand the provider exactly the name the guard withholds the address of.
     let rule_host = oracle.is_rule_host(hostname);
-    let resolve = if rule_host && leak_guard.blocking_for_host(hostname) {
+    let resolve = if rule_host {
         upstream.resolve_tunnel_only_within(hostname, AddressFamily::Ipv4, hold.budget)
     } else {
         upstream.resolve_within(hostname, AddressFamily::Ipv4, hold.budget)
@@ -46,7 +46,7 @@ pub fn handle_a_query(
                 msg_key = "dns-resolver-withheld-name-leak-guard",
                 host = %hostname,
                 reason = %reason,
-                "leak guard is blocking: this rule host's name was not asked over the main link — withholding the answer",
+                "leak guard is blocking: upstream DNS resolution failed — withholding the answer",
             );
             return QueryOutcome::Withheld;
         }
@@ -342,11 +342,7 @@ pub fn handle_aaaa_query(
     let started = std::time::Instant::now();
     // Every caller here holds a rule host; the same tunnel-only rule as the A
     // path applies while the guard blocks.
-    let resolve = if leak_guard.blocking_for_host(hostname) {
-        upstream.resolve_tunnel_only_within(hostname, AddressFamily::Ipv6, hold.budget)
-    } else {
-        upstream.resolve_within(hostname, AddressFamily::Ipv6, hold.budget)
-    };
+    let resolve = upstream.resolve_tunnel_only_within(hostname, AddressFamily::Ipv6, hold.budget);
     let resolved = match resolve {
         Ok(r) => r,
         Err(ResolveError::Unavailable(_)) if leak_guard.blocking_for_host(hostname) => {

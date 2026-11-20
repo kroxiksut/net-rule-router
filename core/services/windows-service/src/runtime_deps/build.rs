@@ -27,6 +27,9 @@ pub(crate) fn build_supervised_runtime_deps(
     // "Verbose service logging" Save takes effect live, no service restart.
     verbosity_handle: Option<TracingVerbosityHandle>,
 ) -> SupervisedRuntimeDeps {
+    nrr_platform_api::source_link::install_interface_pinner(Box::new(
+        nrr_platform_windows::source_link::UnicastInterface,
+    ));
     // Bound here, not inline at the IPC surface, so the housekeeping tick can
     // collect expired dry-run tokens: a dry-run needs no elevation, skips the
     // mutation queue and parks its payload here until confirmed or expired.

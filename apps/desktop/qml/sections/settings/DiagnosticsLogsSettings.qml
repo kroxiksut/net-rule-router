@@ -440,7 +440,7 @@ GroupBox {
         _stabilityDraftBackoffBaseMs = 100
         _stabilityDraftBackoffCapSec = 5
         // The log windows are live, not drafted: Reset leaves them alone.
-        _stabilityDraftConnTraceGui = false
+        _stabilityDraftConnTraceGui = true
         _markStabilityDirty()
     }
 

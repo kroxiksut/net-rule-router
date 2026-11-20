@@ -4,9 +4,12 @@
 
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use nrr_client_logic::review::{operation_outcome, Outcome};
 use nrr_ipc_client::{ipc_error_to_wire, ipc_operation_timeout, IpcClient};
 use nrr_shared::ipc::IpcOperationName;
-use nrr_shared::ipc_payloads::{MutationKind, MutationSubmitRequest, PresetImportPayload};
+use nrr_shared::ipc_payloads::{
+    MutationKind, MutationSubmitRequest, OperationStatusResponse, PresetImportPayload,
+};
 use serde_json::{json, Value};
 
 use super::presets::RulesFile;
@@ -115,23 +118,17 @@ fn apply(client: &dyn IpcClient, payload: &Value, token: &str) -> Result<(), Str
         ) else {
             break;
         };
-        match status.get("state").and_then(Value::as_str) {
-            Some("completed") => return Ok(()),
-            Some("failed") => {
-                return Err(status
-                    .pointer("/error/code")
-                    .and_then(Value::as_str)
-                    .unwrap_or("unknown")
-                    .to_string())
-            }
-            _ => std::thread::sleep(OUTCOME_POLL),
+        let record = serde_json::from_value::<OperationStatusResponse>(status).ok();
+        match operation_outcome(record.as_ref()) {
+            Some(Outcome::Applied) => return Ok(()),
+            Some(Outcome::Failed(code) | Outcome::Incomplete(code)) => return Err(code),
+            None => std::thread::sleep(OUTCOME_POLL),
         }
     }
     settle_by_preview(client, payload)
 }
 
-/// The import took effect exactly when the same rules now preview as no
-/// change — the GUI's fallback when the operation's record says nothing.
+/// Stored intent cannot prove installed enforcement.
 fn settle_by_preview(client: &dyn IpcClient, payload: &Value) -> Result<(), String> {
     let mut again = payload.clone();
     if let Some(fields) = again.as_object_mut() {
@@ -143,7 +140,7 @@ fn settle_by_preview(client: &dyn IpcClient, payload: &Value) -> Result<(), Stri
     let preview = read_preview(&submit(client, &again, None)?);
     match preview.refused {
         Some(code) => Err(code),
-        None if preview.empty => Ok(()),
+        None if preview.empty => Err("application-unconfirmed".into()),
         None => Err("unknown".into()),
     }
 }

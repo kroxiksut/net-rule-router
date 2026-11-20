@@ -13,13 +13,11 @@
 //! so the answers come back over the tunnel and the primary provider never sees
 //! or shapes them.
 //!
-//! ## Availability over purity
+//! ## Availability when the tunnel is down
 //!
-//! The policy falls back to the primary path whenever the secondary link has no
-//! usable IPv4 source (tunnel down, still connecting, adapter unbound). Name
-//! resolution failing outright would take the whole product down with it, so a
-//! degraded-but-working answer wins; the caller can see which path was used in
-//! the trace.
+//! A name assigned to the secondary link stays on that link through an outage
+//! and recovery. Other names can use the caller's upstream while the tunnel
+//! is down, still connecting or in cooldown.
 //!
 //! A retry stays in the tunnel, at the next operator: sent to the provider, it
 //! let anyone who could delay one tunnel packet put the provider's answer back
@@ -37,17 +35,17 @@
 //! moves nobody else's lookups there. Every other name keeps the provider.
 //! [`query_egress`] is the decision; the availability rules above apply to it.
 //!
-//! ## Source binding needs a route
+//! ## Selecting the outgoing interface
 //!
-//! Binding a UDP socket to the tunnel's address is not by itself enough on
-//! Windows: the route table still picks the outgoing interface by destination,
-//! and a packet leaving the primary link with a tunnel source address is
-//! spoofed traffic that the ISP drops. The route half — a `/32` via the
+//! Binding a socket to the tunnel's address alone lets a default route carry
+//! that address over another interface. The decision carries the live interface
+//! index for the socket as well. The route half — a `/32` via the
 //! secondary for each of [`resolvers_via_tunnel`] — is emitted by
 //! `route_codegen::dns_via_secondary_routes` and reconciled together with the
 //! rule routes. This module owns only the socket-side decision.
 
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::num::NonZeroU32;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -83,6 +81,8 @@ pub enum QueryEgress {
     PublicResolvers,
     /// [`RULE_HOST_RESOLVER`] through the tunnel.
     RuleHostResolver,
+    /// No usable tunnel for a name assigned to the additional link.
+    SecondaryUnavailable,
 }
 
 /// Where a query goes: `additional_link_rule_host` is whether an enabled rule
@@ -95,7 +95,8 @@ pub fn query_egress(
     tunnel_usable: bool,
 ) -> QueryEgress {
     match (tunnel_usable, setting_on, additional_link_rule_host) {
-        (false, _, _) => QueryEgress::CallerUpstream,
+        (false, _, true) => QueryEgress::SecondaryUnavailable,
+        (false, _, false) => QueryEgress::CallerUpstream,
         (true, true, _) => QueryEgress::PublicResolvers,
         (true, false, true) => QueryEgress::RuleHostResolver,
         (true, false, false) => QueryEgress::CallerUpstream,
@@ -142,8 +143,9 @@ pub struct DnsEgress {
     /// Local address to bind the socket to before sending, or `None` to let
     /// the routing table pick.
     pub bind: Option<IpAddr>,
-    /// `true` when this decision routes over the secondary link. Purely
-    /// informational — used for tracing and tests.
+    /// Current OS interface of the selected secondary connection.
+    pub interface_index: Option<NonZeroU32>,
+    /// Whether this attempt requires a socket pinned to the secondary link.
     pub via_secondary: bool,
 }
 
@@ -153,9 +155,18 @@ impl DnsEgress {
         Self {
             server,
             bind: None,
+            interface_index: None,
             via_secondary: false,
         }
     }
+}
+
+/// A name's routing decision, including a protected name that cannot leave.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NamedDnsEgress {
+    CallerUpstream,
+    Secondary(DnsEgress),
+    SecondaryUnavailable,
 }
 
 /// Live decision source, consulted per query so a tunnel that comes up or
@@ -176,8 +187,17 @@ pub trait DnsEgressPolicy: Send + Sync {
 
     /// [`Self::decide`] for a query about `hostname`, for a policy that tells
     /// names apart. The default does not.
-    fn decide_for(&self, _hostname: &str, attempt: u32) -> Option<DnsEgress> {
-        self.decide(attempt)
+    fn decide_for(&self, hostname: &str, attempt: u32) -> NamedDnsEgress {
+        match self.decide(attempt) {
+            Some(egress) => NamedDnsEgress::Secondary(egress),
+            None if self.requires_secondary(hostname) => NamedDnsEgress::SecondaryUnavailable,
+            None => NamedDnsEgress::CallerUpstream,
+        }
+    }
+
+    /// Whether a name is assigned to the additional link even while it is down.
+    fn requires_secondary(&self, _hostname: &str) -> bool {
+        false
     }
 
     /// Report how an attempt this policy chose actually went.
@@ -189,61 +209,45 @@ pub trait DnsEgressPolicy: Send + Sync {
     fn note_outcome(&self, _via_secondary: bool, _ok: bool) {}
 }
 
-/// Resolves the secondary link's current IPv4 source address, or `None` when
+/// Source address and interface from the same resolved secondary adapter.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SecondarySource {
+    pub address: Ipv4Addr,
+    pub interface_index: NonZeroU32,
+}
+
+impl SecondarySource {
+    pub(crate) fn from_adapter(adapter: &nrr_platform_api::adapters::AdapterInfo) -> Option<Self> {
+        if !adapter.oper_status.is_up() {
+            return None;
+        }
+        Some(Self {
+            address: adapter
+                .ipv4_addresses
+                .iter()
+                .copied()
+                .find(|ip| !ip.is_unspecified())?,
+            interface_index: NonZeroU32::new(adapter.index)?,
+        })
+    }
+}
+
+/// Resolves the secondary link's current IPv4 source and interface, or `None` when
 /// the link is down / unbound / has no usable address.
 ///
 /// Kept as its own trait (rather than taking the route coordinator directly) so
 /// the decision logic stays testable without a live adapter table, and so the
 /// non-Windows composition roots can supply their own resolver.
 pub trait SecondarySourceAddr: Send + Sync {
-    fn current(&self) -> Option<Ipv4Addr>;
+    fn current(&self) -> Option<SecondarySource>;
 }
 
 impl<F> SecondarySourceAddr for F
 where
-    F: Fn() -> Option<Ipv4Addr> + Send + Sync,
+    F: Fn() -> Option<SecondarySource> + Send + Sync,
 {
-    fn current(&self) -> Option<Ipv4Addr> {
+    fn current(&self) -> Option<SecondarySource> {
         self()
-    }
-}
-
-/// A [`SecondarySourceAddr`] read at most once per `ttl`: a reading walks the
-/// links, and every query of a rule host asks.
-pub struct MemoizedSecondarySource<F> {
-    read: F,
-    ttl: Duration,
-    memo: Mutex<Option<(Instant, Option<Ipv4Addr>)>>,
-}
-
-impl<F> MemoizedSecondarySource<F>
-where
-    F: Fn() -> Option<Ipv4Addr> + Send + Sync,
-{
-    pub fn new(ttl: Duration, read: F) -> Self {
-        Self {
-            read,
-            ttl,
-            memo: Mutex::new(None),
-        }
-    }
-}
-
-impl<F> SecondarySourceAddr for MemoizedSecondarySource<F>
-where
-    F: Fn() -> Option<Ipv4Addr> + Send + Sync,
-{
-    fn current(&self) -> Option<Ipv4Addr> {
-        // Held across the reading: a burst of queries costs one.
-        let mut memo = self.memo.lock().unwrap_or_else(|p| p.into_inner());
-        if let Some((read_at, address)) = *memo {
-            if read_at.elapsed() < self.ttl {
-                return address;
-            }
-        }
-        let address = (self.read)();
-        *memo = Some((Instant::now(), address));
-        address
     }
 }
 
@@ -342,17 +346,12 @@ impl SecondaryPreferredEgress {
     }
 
     /// [`query_egress`] for a query about `hostname` (`None`: about no name).
-    fn route(&self, hostname: Option<&str>) -> Option<DnsEgress> {
+    fn route(&self, hostname: Option<&str>) -> NamedDnsEgress {
         let setting_on = self.enabled.load(Ordering::Relaxed) && !self.servers.is_empty();
-        // With the setting on every name rides the tunnel: the books are not
-        // asked.
-        let rule_host = !setting_on
-            && hostname
-                .zip(self.rule_hosts.as_deref())
-                .is_some_and(|(name, oracle)| oracle.is_rule_host(name));
+        let rule_host = hostname.is_some_and(|name| self.requires_secondary(name));
         // Nothing would ride the tunnel, so neither the latch nor the link is read.
         if !setting_on && !rule_host {
-            return None;
+            return NamedDnsEgress::CallerUpstream;
         }
         // Tunnel down / no address — the query would leave over the primary
         // link anyway (defeating the point) or fail to bind.
@@ -362,16 +361,21 @@ impl SecondaryPreferredEgress {
             self.source.current()
         };
         let server = match query_egress(rule_host, setting_on, src.is_some()) {
-            QueryEgress::CallerUpstream => return None,
+            QueryEgress::CallerUpstream => return NamedDnsEgress::CallerUpstream,
+            QueryEgress::SecondaryUnavailable => return NamedDnsEgress::SecondaryUnavailable,
             QueryEgress::PublicResolvers => {
                 let slot = self.rotation.fetch_add(1, Ordering::Relaxed);
                 SocketAddr::from((self.servers[(slot as usize) % self.servers.len()], DNS_PORT))
             }
             QueryEgress::RuleHostResolver => self.rule_host_server,
         };
-        Some(DnsEgress {
+        let Some(source) = src else {
+            return NamedDnsEgress::SecondaryUnavailable;
+        };
+        NamedDnsEgress::Secondary(DnsEgress {
             server,
-            bind: src.map(IpAddr::V4),
+            bind: Some(IpAddr::V4(source.address)),
+            interface_index: Some(source.interface_index),
             via_secondary: true,
         })
     }
@@ -379,11 +383,20 @@ impl SecondaryPreferredEgress {
 
 impl DnsEgressPolicy for SecondaryPreferredEgress {
     fn decide(&self, _attempt: u32) -> Option<DnsEgress> {
-        self.route(None)
+        match self.route(None) {
+            NamedDnsEgress::Secondary(egress) => Some(egress),
+            NamedDnsEgress::CallerUpstream | NamedDnsEgress::SecondaryUnavailable => None,
+        }
     }
 
-    fn decide_for(&self, hostname: &str, _attempt: u32) -> Option<DnsEgress> {
+    fn decide_for(&self, hostname: &str, _attempt: u32) -> NamedDnsEgress {
         self.route(Some(hostname))
+    }
+
+    fn requires_secondary(&self, hostname: &str) -> bool {
+        self.rule_hosts
+            .as_ref()
+            .is_some_and(|oracle| oracle.is_rule_host(hostname))
     }
 
     fn note_outcome(&self, via_secondary: bool, ok: bool) {
@@ -406,7 +419,7 @@ impl DnsEgressPolicy for SecondaryPreferredEgress {
                 msg_key = "dnsegress-tunnel-cooldown",
                 failures,
                 cooldown_secs = self.cooldown.as_secs(),
-                "DNS-over-secondary: the tunnel stopped answering — sending queries straight to the captured upstream for now. They already fell back there after a timeout; this only drops the wait",
+                "DNS queries over the additional link are paused after repeated failures. Names assigned to that link must wait. Other names may use the regular resolver.",
             );
         }
         *open = Some(Instant::now() + self.cooldown);
@@ -431,8 +444,18 @@ pub fn global_dns_via_secondary() -> Arc<AtomicBool> {
 mod tests {
     use super::*;
 
+    fn source(address: Ipv4Addr) -> SecondarySource {
+        SecondarySource {
+            address,
+            interface_index: NonZeroU32::MIN,
+        }
+    }
+
     fn policy(enabled: bool, src: Option<Ipv4Addr>) -> SecondaryPreferredEgress {
-        SecondaryPreferredEgress::new(Arc::new(AtomicBool::new(enabled)), Arc::new(move || src))
+        SecondaryPreferredEgress::new(
+            Arc::new(AtomicBool::new(enabled)),
+            Arc::new(move || src.map(source)),
+        )
     }
 
     fn fail(p: &SecondaryPreferredEgress, times: u32) {
@@ -589,7 +612,8 @@ mod tests {
         use QueryEgress::*;
         assert_eq!(query_egress(true, false, true), RuleHostResolver);
         assert_eq!(query_egress(false, false, true), CallerUpstream);
-        assert_eq!(query_egress(true, false, false), CallerUpstream);
+        assert_eq!(query_egress(true, false, false), SecondaryUnavailable);
+        assert_eq!(query_egress(true, true, false), SecondaryUnavailable);
         assert_eq!(query_egress(true, true, true), PublicResolvers);
         assert_eq!(query_egress(false, true, true), PublicResolvers);
         assert_eq!(query_egress(false, true, false), CallerUpstream);
@@ -610,9 +634,10 @@ mod tests {
     fn with_the_setting_off_a_rule_host_is_asked_of_its_resolver_through_the_tunnel() {
         let src = Ipv4Addr::new(10, 0, 0, 2);
         let p = rule_host_policy(false, Some(src));
-        let expected = Some(DnsEgress {
+        let expected = NamedDnsEgress::Secondary(DnsEgress {
             server: SocketAddr::from((RULE_HOST_RESOLVER, DNS_PORT)),
             bind: Some(IpAddr::V4(src)),
+            interface_index: Some(NonZeroU32::MIN),
             via_secondary: true,
         });
         assert_eq!(p.decide_for("rule.example", 0), expected);
@@ -623,56 +648,38 @@ mod tests {
         );
         assert_eq!(
             p.decide_for("other.example", 0),
-            None,
+            NamedDnsEgress::CallerUpstream,
             "a name no rule names keeps the provider"
         );
         assert_eq!(p.decide(0), None, "a query with no name keeps the provider");
     }
 
     #[test]
-    fn a_rule_host_falls_back_to_the_caller_when_the_tunnel_cannot_carry_it() {
-        assert_eq!(
-            rule_host_policy(false, None).decide_for("rule.example", 0),
-            None,
-            "no tunnel address"
-        );
-        let p = rule_host_policy(false, Some(Ipv4Addr::new(10, 0, 0, 2)));
-        fail(&p, SECONDARY_FAILURE_THRESHOLD);
-        assert_eq!(
-            p.decide_for("rule.example", 0),
-            None,
-            "a tunnel judged dead"
-        );
-    }
-
-    /// A reading walks the links: per query it would sit on every rule host's
-    /// answer. A tunnel that came back is still seen once the memo is old.
-    #[test]
-    fn a_burst_of_queries_reads_the_tunnel_address_once() {
-        let reads = Arc::new(AtomicU32::new(0));
-        let counted = Arc::clone(&reads);
-        let source = MemoizedSecondarySource::new(Duration::from_millis(30), move || {
-            counted.fetch_add(1, Ordering::Relaxed);
-            Some(Ipv4Addr::new(10, 0, 0, 2))
-        });
-        for _ in 0..100 {
-            assert_eq!(source.current(), Some(Ipv4Addr::new(10, 0, 0, 2)));
+    fn a_rule_host_stays_off_the_primary_while_down_and_during_cooldown() {
+        for enabled in [false, true] {
+            assert_eq!(
+                rule_host_policy(enabled, None).decide_for("rule.example", 0),
+                NamedDnsEgress::SecondaryUnavailable
+            );
+            let p = rule_host_policy(enabled, Some(Ipv4Addr::new(10, 0, 0, 2)));
+            fail(&p, SECONDARY_FAILURE_THRESHOLD);
+            assert_eq!(
+                p.decide_for("rule.example", 1),
+                NamedDnsEgress::SecondaryUnavailable
+            );
+            assert_eq!(
+                p.decide_for("other.example", 1),
+                NamedDnsEgress::CallerUpstream
+            );
         }
-        assert_eq!(reads.load(Ordering::Relaxed), 1);
-        std::thread::sleep(Duration::from_millis(60));
-        let _ = source.current();
-        assert_eq!(
-            reads.load(Ordering::Relaxed),
-            2,
-            "an old memo is read again"
-        );
     }
 
     #[test]
     fn live_toggle_is_observed_between_queries() {
         let flag = Arc::new(AtomicBool::new(false));
         let src = Ipv4Addr::new(10, 0, 0, 2);
-        let p = SecondaryPreferredEgress::new(Arc::clone(&flag), Arc::new(move || Some(src)));
+        let p =
+            SecondaryPreferredEgress::new(Arc::clone(&flag), Arc::new(move || Some(source(src))));
         assert_eq!(p.decide(0), None);
         flag.store(true, Ordering::Relaxed);
         assert!(p.decide(0).is_some_and(|d| d.via_secondary));

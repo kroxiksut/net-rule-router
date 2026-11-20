@@ -118,10 +118,7 @@ fn row_for(
     forwarding: Option<&HashSet<u32>>,
     kinds: &HashMap<String, LinkKind>,
 ) -> InterfaceRouteRow {
-    let name = match adapter.friendly_name.trim() {
-        "" => adapter.adapter_name.trim(),
-        named => named,
-    };
+    let name = binding_name(adapter);
     let link = kinds
         .get(&adapter.adapter_name)
         .copied()
@@ -209,6 +206,19 @@ fn persistent_id(name: &str, adapter: &AdapterInfo) -> String {
         ),
         None => format!("linux-ifindex:{}", adapter.index),
     }
+}
+
+fn binding_name(adapter: &AdapterInfo) -> &str {
+    match adapter.friendly_name.trim() {
+        "" => adapter.adapter_name.trim(),
+        named => named,
+    }
+}
+
+pub(crate) fn matches_persistent_id(adapter: &AdapterInfo, id: &str) -> bool {
+    let name = binding_name(adapter);
+    // An index alone can belong to another link after a disconnect.
+    (!name.is_empty() || adapter.mac.is_some()) && persistent_id(name, adapter) == id
 }
 
 fn availability_of(status: IfOperStatus) -> BasicAvailabilityStatus {

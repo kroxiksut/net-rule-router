@@ -48,11 +48,20 @@ const RULE_CHECK_WORKERS: usize = 4;
 /// one is bound, its additional link — each as the IPv4 address it carries.
 pub trait EgressSources: Send + Sync {
     fn egress_source_ips(&self, sid: &str) -> (Option<Ipv4Addr>, Option<Ipv4Addr>);
+
+    /// DNS needs both the address and the confirmed interface in one reading.
+    fn secondary_dns_source(&self, _sid: &str) -> Option<crate::dns_egress::SecondarySource> {
+        None
+    }
 }
 
 pub use crate::path_probe::PrimaryProbeGuard;
 
 impl EgressSources for SecondaryRouteCoordinator {
+    fn secondary_dns_source(&self, sid: &str) -> Option<crate::dns_egress::SecondarySource> {
+        self.resolve_secondary_dns_source(sid)
+    }
+
     fn egress_source_ips(&self, sid: &str) -> (Option<Ipv4Addr>, Option<Ipv4Addr>) {
         self.resolve_egress_source_ips(sid)
     }
@@ -658,6 +667,19 @@ impl StoredBindingEgress {
 }
 
 impl EgressSources for StoredBindingEgress {
+    fn secondary_dns_source(&self, sid: &str) -> Option<crate::dns_egress::SecondarySource> {
+        let binding = self.policy.load_for_sid(sid)?.secondary?;
+        let links = self.api.get_adapter_infos().ok()?;
+        let mut matching = links
+            .iter()
+            .filter(|link| self.api.matches_persistent_id(link, &binding.stable_id));
+        let link = matching.next()?;
+        if matching.next().is_some() {
+            return None;
+        }
+        crate::dns_egress::SecondarySource::from_adapter(link)
+    }
+
     fn egress_source_ips(&self, sid: &str) -> (Option<Ipv4Addr>, Option<Ipv4Addr>) {
         let Some(policy) = self.policy.load_for_sid(sid) else {
             return (None, None);

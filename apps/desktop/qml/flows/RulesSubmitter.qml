@@ -91,16 +91,12 @@ QtObject {
         return state
     }
 
-    /// Confirm a previewed `state` with its confirmation `token`. Returns false
-    /// when nothing was sent — `done` is then never called. `done(ok, r)` with
-    /// r = `{ payload, code, message, failure, failureArgs }`: `ok` only once
-    /// the operation record says the change took effect. `code` is set when the
-    /// confirm itself was refused, `failure` (with its own values in
-    /// `failureArgs`) when the operation failed afterwards.
+    // `done(ok, r)` confirms full application; partial results carry
+    // `incomplete` and their warning code. False return means nothing was sent.
     function commit(state, token, done) {
         if (!bridgeReady || !rpc) return false
         var st = state || {}
-        var r = { payload: null, code: "", message: "", failure: "", failureArgs: null }
+        var r = { payload: null, code: "", message: "", failure: "", failureArgs: null, incomplete: false }
         var payload = {
             "rules-json": st.rulesJson,
             "content-hash": st.contentHash,
@@ -126,10 +122,13 @@ QtObject {
             // operation record.
             rpc.readMutationOutcome(p, rpc.settleByPreview("rules-update", payload),
                 function(failure, failureArgs, result) {
-                    if (failure === "") {
+                    r.incomplete = failure === "applied-with-drift" || failure === "application-unconfirmed"
+                    if (failure === "" || r.incomplete) {
                         var moved = (result && result["base-revision"] !== undefined)
                             ? String(result["base-revision"]) : null
                         submitter.baseRevisionMoved(moved)
+                    }
+                    if (failure === "") {
                         done(true, r)
                         return
                     }
@@ -198,6 +197,7 @@ QtObject {
                         message: c.message,
                         failure: c.failure,
                         failureArgs: c.failureArgs,
+                        incomplete: c.incomplete,
                         payload: c.payload
                     })
                 })
@@ -242,6 +242,8 @@ QtObject {
         // A refusal of the confirm itself carries no outcome values.
         var code = failure !== "" ? failure : String(res.code || "")
         var args = failure !== "" ? (res.failureArgs || null) : null
+        if (code === "applied-with-drift" || code === "application-unconfirmed")
+            return Pure.ipcErrorLabel(code, null, tr)
         return prefix + Pure.ipcErrorLabel(String(code || "unknown"), args, tr)
     }
 }

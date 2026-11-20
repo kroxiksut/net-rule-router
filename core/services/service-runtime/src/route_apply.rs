@@ -23,10 +23,12 @@ use std::sync::Arc;
 
 use nrr_platform_api::adapters::{AdapterEventSource, AdapterInfo, IfOperStatus};
 use nrr_platform_api::enforcement::{
-    EgressBindingSource, EnforcementPlan, RouteTableRef, UserPrincipal,
+    DstMatch, EgressBindingSource, EnforcementPlan, RouteTableRef, UserPrincipal,
 };
 use nrr_platform_api::error::PlatformError;
+use nrr_platform_api::interface_rows::derive_forwarding_next_hop_v6;
 use nrr_platform_api::route_lowering::{lower_routes, RouteTarget};
+use nrr_platform_api::route_signature::is_owned_route;
 use nrr_platform_api::route_table::{
     PrincipalRoutingPort, RouteTablePort, SelectorPlan, TableSelector,
 };
@@ -39,9 +41,8 @@ use crate::route_reconciler::SecondaryRouteReconciler;
 pub struct RouteApplyReport {
     pub added: usize,
     pub removed: usize,
-    /// Plans whose egress could not be resolved to a live interface, so their
-    /// routes were not installed. Named rather than counted: the user needs to
-    /// know WHOSE traffic is not being steered.
+    /// Plans with routes that could not be installed because the selected
+    /// interface or its IPv6 forwarding path was unavailable.
     pub unresolved: Vec<String>,
     /// Why the pass could not run at all. Carried in the report rather than
     /// returned as an error, so a route failure is visible beside a successful
@@ -67,6 +68,7 @@ pub struct RoutePass<'a> {
 /// they no longer ask for.
 pub struct PlannedRouteApplier {
     reconciler: SecondaryRouteReconciler,
+    api: Arc<dyn RouteTablePort>,
     adapters: Arc<dyn AdapterEventSource>,
     bindings: Arc<dyn EgressBindingSource>,
     /// Whether a previous run's routes have been taken over yet.
@@ -84,7 +86,8 @@ impl PlannedRouteApplier {
         bindings: Arc<dyn EgressBindingSource>,
     ) -> Self {
         Self {
-            reconciler: SecondaryRouteReconciler::new(api),
+            reconciler: SecondaryRouteReconciler::new(Arc::clone(&api)),
+            api,
             adapters,
             bindings,
             leftovers_adopted: AtomicBool::new(false),
@@ -154,10 +157,11 @@ impl PlannedRouteApplier {
     ) -> Result<RouteApplyReport, String> {
         let adapters = self.read_adapters()?;
         self.adopt_leftovers();
+        let forwarding = self.read_ipv6_forwarding(plans);
         let mut desired = Vec::new();
         let mut unresolved = Vec::new();
         for plan in plans {
-            desired.extend(self.lowered(plan, &adapters, &mut unresolved));
+            desired.extend(self.lowered(plan, &adapters, &forwarding, &mut unresolved));
         }
         self.reconcile(&desired, unresolved, planned_at)
     }
@@ -180,6 +184,7 @@ impl PlannedRouteApplier {
 
         let adapters = self.read_adapters()?;
         self.adopt_leftovers();
+        let forwarding = self.read_ipv6_forwarding(pass.plans);
         let mut desired = Vec::new();
         let mut unresolved = Vec::new();
         let mut selectors = SelectorPlan::default();
@@ -189,7 +194,7 @@ impl PlannedRouteApplier {
                 .plans
                 .iter()
                 .find(|p| &p.principal == principal)
-                .map(|plan| self.lowered(plan, &adapters, &mut unresolved))
+                .map(|plan| self.lowered(plan, &adapters, &forwarding, &mut unresolved))
                 .unwrap_or_default();
             let selector = TableSelector {
                 overlay_prefix_v4: overlay_prefix(&routes),
@@ -249,8 +254,9 @@ impl PlannedRouteApplier {
     pub fn install_ahead(&self, plan: &EnforcementPlan, owner: bool) -> Result<usize, String> {
         let adapters = self.read_adapters()?;
         self.adopt_leftovers();
+        let forwarding = self.read_ipv6_forwarding(std::slice::from_ref(plan));
         let mut unresolved = Vec::new();
-        let routes = self.lowered(plan, &adapters, &mut unresolved);
+        let routes = self.lowered(plan, &adapters, &forwarding, &mut unresolved);
         let port = self
             .principal_routing
             .as_deref()
@@ -283,6 +289,30 @@ impl PlannedRouteApplier {
             .map_err(|e| format!("adapters could not be read: {e}"))
     }
 
+    fn read_ipv6_forwarding(&self, plans: &[EnforcementPlan]) -> Vec<RouteEntry> {
+        if !plans
+            .iter()
+            .flat_map(|plan| &plan.routes)
+            .any(|intent| matches!(intent.dst, DstMatch::HostV6(_) | DstMatch::SubnetV6 { .. }))
+        {
+            return Vec::new();
+        }
+        let port = self.principal_routing.as_deref();
+        // A route we installed using the old gateway cannot establish that
+        // the interface still has a native forwarding path.
+        self.api
+            .get_ip_forward_table()
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|r| {
+                r.destination.is_ipv6()
+                    && !r.is_ours
+                    && !is_owned_route(r)
+                    && !port.is_some_and(|p| p.is_principal_table(&r.table))
+            })
+            .collect()
+    }
+
     /// One plan's routes against the live links. No live secondary means
     /// every intent that names it is unroutable: installing the primary half
     /// alone would leave the policy half-applied while looking installed.
@@ -290,6 +320,7 @@ impl PlannedRouteApplier {
         &self,
         plan: &EnforcementPlan,
         adapters: &[AdapterInfo],
+        forwarding: &[RouteEntry],
         unresolved: &mut Vec<String>,
     ) -> Vec<RouteEntry> {
         let binding = self.bindings.bindings_for(&plan.principal);
@@ -307,7 +338,34 @@ impl PlannedRouteApplier {
             }
             return Vec::new();
         };
-        lower_routes(plan, secondary, primary)
+        let with_ipv6 = |target: RouteTarget| {
+            derive_forwarding_next_hop_v6(forwarding, target.interface_index).map(|gateway_v6| {
+                RouteTarget {
+                    gateway_v6,
+                    ..target
+                }
+            })
+        };
+        let secondary_v6 = with_ipv6(secondary);
+        let primary_v6 = primary.and_then(with_ipv6);
+        let mut routes = lower_routes(
+            plan,
+            secondary_v6.unwrap_or(secondary),
+            primary_v6.or(primary),
+        );
+        let ipv6_targets = [secondary_v6, primary_v6];
+        let count = routes.len();
+        routes.retain(|route| {
+            route.destination.is_ipv4()
+                || ipv6_targets
+                    .iter()
+                    .flatten()
+                    .any(|target| target.interface_index == route.interface_index)
+        });
+        if routes.len() < count {
+            unresolved.push(plan.principal.as_stored().to_owned());
+        }
+        routes
     }
 
     fn reconcile(
@@ -415,10 +473,7 @@ fn target_for(adapters: &[AdapterInfo], name: &str) -> Option<RouteTarget> {
             .first()
             .copied()
             .unwrap_or(Ipv4Addr::UNSPECIFIED),
-        // No v6 gateway is modelled on an adapter yet, and a tunnel commonly
-        // carries no v6 address at all — so a v6 route out of this egress is
-        // on-link, addressed by interface alone. The same shape the
-        // gateway-less v4 tunnel already uses.
+        // IPv6 forwarding is resolved separately from the live route table.
         gateway_v6: Ipv6Addr::UNSPECIFIED,
         interface_index: adapter.index,
     })
@@ -935,6 +990,75 @@ mod tests {
                 "the pass redid what was already in place"
             );
             assert_eq!(tables.links_of(table_of(1000)), vec![TUN]);
+        }
+
+        #[test]
+        fn ipv6_host_routes_follow_the_live_ipv6_next_hop() {
+            let (applier, tables, _) = rig(false);
+            let host: Ipv6Addr = "2001:db8:2::81".parse().expect("host address");
+            let gateway: Ipv6Addr = "fd00:92:1::2".parse().expect("gateway address");
+            let secondary_default = RouteEntry {
+                destination: Ipv6Addr::UNSPECIFIED.into(),
+                prefix_length: 0,
+                next_hop: gateway.into(),
+                interface_index: TUN,
+                metric: 7000,
+                is_ours: false,
+                table: RouteTableRef::Main,
+            };
+            let primary_default = RouteEntry {
+                next_hop: IpAddr::V6("fe80::1".parse().expect("primary gateway address")),
+                interface_index: ETH,
+                metric: 100,
+                ..secondary_default.clone()
+            };
+            tables
+                .0
+                .lock()
+                .expect("lock")
+                .extend([primary_default, secondary_default.clone()]);
+            let mut owner = plan(1000);
+            owner.routes = vec![intent(DstMatch::HostV6(host), EgressRef::Secondary)];
+            let present = users(&[1000]);
+            let host_routes = || {
+                tables
+                    .rows()
+                    .into_iter()
+                    .filter(|r| r.destination == IpAddr::V6(host))
+                    .collect::<Vec<_>>()
+            };
+
+            assert_eq!(applier.install_ahead(&owner, true).expect("ahead"), 2);
+            let installed = host_routes();
+            for table in [table_of(1000), RouteTableRef::Tagged(SYSTEM)] {
+                let route = installed.iter().find(|r| r.table == table).expect("route");
+                assert_eq!(route.prefix_length, 128);
+                assert_eq!(route.interface_index, TUN);
+                assert_eq!(route.next_hop, IpAddr::V6(gateway));
+            }
+            let plans = [owner];
+            let report = applier.apply_pass(pass(&plans, &present, 0)).expect("pass");
+            assert_eq!((report.added, report.removed), (0, 0), "{report:?}");
+
+            tables
+                .0
+                .lock()
+                .expect("lock")
+                .retain(|r| r != &secondary_default);
+            applier.apply_pass(pass(&plans, &present, 0)).expect("pass");
+            assert!(host_routes().is_empty(), "an old host route is no gateway");
+            assert_eq!(applier.install_ahead(&plans[0], true).expect("ahead"), 0);
+
+            tables.0.lock().expect("lock").push(RouteEntry {
+                next_hop: Ipv6Addr::UNSPECIFIED.into(),
+                ..secondary_default
+            });
+            applier.apply_pass(pass(&plans, &present, 0)).expect("pass");
+            let recovered = host_routes();
+            assert_eq!(recovered.len(), 2);
+            assert!(recovered.iter().all(|r| {
+                r.interface_index == TUN && r.next_hop == IpAddr::V6(Ipv6Addr::UNSPECIFIED)
+            }));
         }
 
         /// A pass already planned when the DNS answer installs a route ahead

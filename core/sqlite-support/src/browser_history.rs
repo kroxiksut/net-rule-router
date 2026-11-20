@@ -321,8 +321,13 @@ mod tests {
         drop(conn);
         let open = || Connection::open(&db).expect("open");
 
-        let all = hostnames_within(&mut open(), CHROMIUM_QUERY, Duration::from_secs(60), host_of)
-            .expect("unbounded read");
+        let all = hostnames_within(
+            &mut open(),
+            CHROMIUM_QUERY,
+            Duration::from_secs(60),
+            host_of,
+        )
+        .expect("unbounded read");
         assert_eq!(all.hosts.len(), 50_000, "positive control: the whole table");
         assert!(!all.cut_short);
 

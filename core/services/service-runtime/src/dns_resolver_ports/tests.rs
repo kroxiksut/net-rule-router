@@ -24,7 +24,8 @@ fn query_ids_are_not_a_counter() {
 fn the_query_socket_only_accepts_the_server_it_asked() {
     let server: std::net::SocketAddr = "127.0.0.1:5353".parse().expect("addr");
     let egress = crate::dns_egress::DnsEgress::primary(server);
-    let sock = DirectUdpUpstreamResolver::open_socket(&egress).expect("socket");
+    let resolver = DirectUdpUpstreamResolver::new(server, Duration::from_millis(50), 1);
+    let sock = resolver.open_socket(&egress).expect("socket");
     assert_eq!(
         sock.peer_addr().expect("connected socket has a peer"),
         server,
@@ -160,6 +161,7 @@ fn the_port_adapter_passes_a_real_answer_through() {
     assert_eq!(record.addresses, vec![ip(100, 64, 0, 157)]);
 }
 
+#[cfg(any(target_os = "linux", windows))]
 #[test]
 fn the_confirming_query_follows_the_egress_policy() {
     // On the primary link the interception that produced the placeholder
@@ -174,7 +176,8 @@ fn the_confirming_query_follows_the_egress_policy() {
         fn decide(&self, _attempt: u32) -> Option<crate::dns_egress::DnsEgress> {
             Some(crate::dns_egress::DnsEgress {
                 server: self.0,
-                bind: None,
+                bind: Some(Ipv4Addr::LOCALHOST.into()),
+                interface_index: Some(loopback_index()),
                 via_secondary: true,
             })
         }
@@ -183,7 +186,10 @@ fn the_confirming_query_follows_the_egress_policy() {
     // Documentation space standing in for the name.
     let inner = FixedUpstream::ok(vec![ip(192, 0, 2, 1), ip(203, 0, 113, 7)]);
     let r = PoisonFallbackUpstreamResolver::new(Arc::clone(&inner) as Arc<dyn UpstreamResolver>)
-        .with_egress(Arc::new(ViaTunnel(tunnel_resolver)));
+        .with_fallbacks(PoisonFallbackUpstreamResolver::public_fallbacks(
+            Some(Arc::new(ViaTunnel(tunnel_resolver))),
+            pin_test_interface,
+        ));
 
     assert_eq!(
         r.resolve("www.social.example", AddressFamily::Ipv4)
@@ -2131,9 +2137,94 @@ impl crate::dns_egress::DnsEgressPolicy for FixedTunnel {
     }
 }
 
+#[cfg(target_os = "linux")]
+fn loopback_index() -> std::num::NonZeroU32 {
+    std::fs::read_to_string("/sys/class/net/lo/ifindex")
+        .expect("loopback index")
+        .trim()
+        .parse()
+        .expect("nonzero loopback interface index")
+}
+
+#[cfg(windows)]
+fn loopback_index() -> std::num::NonZeroU32 {
+    use nrr_platform_windows::windows_api::{ProductionWindowsApi, RouteTablePort};
+    ProductionWindowsApi
+        .get_adapter_infos()
+        .expect("IPv4 adapters")
+        .iter()
+        .find(|adapter| adapter.ipv4_addresses.contains(&Ipv4Addr::LOCALHOST))
+        .and_then(|adapter| std::num::NonZeroU32::new(adapter.index))
+        .expect("loopback interface index")
+}
+
+#[cfg(any(target_os = "linux", windows))]
+fn pin_test_interface(socket: SocketHandle<'_>, index: NonZeroU32) -> Result<(), PlatformError> {
+    use nrr_platform_api::source_link::InterfacePinner;
+    #[cfg(target_os = "linux")]
+    let pinner = nrr_platform_linux::source_link::BindToSourceDevice;
+    #[cfg(windows)]
+    let pinner = nrr_platform_windows::source_link::UnicastInterface;
+    pinner.pin_ipv4(socket, index)
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn secondary_udp_socket_is_constrained_to_loopback_ifindex() {
+    let server = (Ipv4Addr::LOCALHOST, 5353).into();
+    let index = loopback_index();
+    let egress = crate::dns_egress::DnsEgress {
+        server,
+        bind: Some(Ipv4Addr::LOCALHOST.into()),
+        interface_index: Some(index),
+        via_secondary: true,
+    };
+    let mut resolver = DirectUdpUpstreamResolver::new(server, Duration::from_millis(50), 1);
+    resolver.pin_interface = pin_test_interface;
+    let socket = resolver.open_socket(&egress).expect("socket");
+    // Older supported kernels expose the bound interface by name only.
+    let actual = socket2::SockRef::from(&socket).device().expect("socket interface");
+    assert_eq!(actual.as_deref(), Some(b"lo".as_slice()), "a source IP alone does not constrain the socket to the assigned interface");
+}
+
+#[test]
+fn rejected_secondary_binding_sends_no_udp_query_or_tcp_handshake() {
+    let (provider, provider_addr) = listening_dns();
+    let (secondary, secondary_addr) = listening_dns();
+    let tcp = std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).expect("secondary TCP server");
+    tcp.set_nonblocking(true).expect("nonblocking TCP listener");
+    let egress = crate::dns_egress::DnsEgress {
+        server: secondary_addr,
+        bind: Some(Ipv4Addr::LOCALHOST.into()),
+        interface_index: Some(NonZeroU32::MIN),
+        via_secondary: true,
+    };
+    let mut resolver = DirectUdpUpstreamResolver::new(provider_addr, Duration::from_millis(50), 2)
+        .with_egress(Arc::new(FixedTunnel(Some(egress))));
+    resolver.pin_interface = |_, _| Err(PlatformError::NotSupported { reason: "test binding refused" });
+    let host = "protected.example";
+    assert!(resolver.resolve(host, AddressFamily::Ipv4).is_err());
+    let tcp_egress = crate::dns_egress::DnsEgress {
+        server: tcp.local_addr().expect("TCP server address"),
+        ..egress
+    };
+    assert!(resolver.attempt_tcp(&[], 1, host, 1, &tcp_egress, Duration::from_millis(50)).is_err());
+    let tcp_connected = match tcp.accept() {
+        Ok(_) => true,
+        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => false,
+        Err(e) => panic!("TCP listener unavailable: {e}"),
+    };
+    assert_eq!(
+        (heard_a_query(&provider), heard_a_query(&secondary), tcp_connected),
+        (false, false, false),
+        "refusing the interface must stop the provider retry, secondary UDP and TCP handshake"
+    );
+}
+
 /// With "DNS through the tunnel" off, the provider still never answers for a
 /// name an additional-link rule names: a stub it handed back would be pinned
 /// into the tunnel. A main-link rule host and any other name ask it as before.
+#[cfg(any(target_os = "linux", windows))]
 #[test]
 fn with_the_setting_off_only_additional_link_rule_hosts_skip_the_provider() {
     let (provider, provider_addr) = listening_dns();
@@ -2148,12 +2239,16 @@ fn with_the_setting_off_only_additional_link_rule_hosts_skip_the_provider() {
     ));
     let policy = crate::dns_egress::SecondaryPreferredEgress::new(
         Arc::new(std::sync::atomic::AtomicBool::new(false)),
-        Arc::new(|| Some(Ipv4Addr::LOCALHOST)),
+        Arc::new(|| Some(crate::dns_egress::SecondarySource {
+            address: Ipv4Addr::LOCALHOST,
+            interface_index: loopback_index(),
+        })),
     )
     .with_rule_hosts(oracle)
     .with_rule_host_server(rule_host_addr);
-    let resolver = DirectUdpUpstreamResolver::new(provider_addr, Duration::from_millis(50), 1)
+    let mut resolver = DirectUdpUpstreamResolver::new(provider_addr, Duration::from_millis(50), 1)
         .with_egress(Arc::new(policy));
+    resolver.pin_interface = pin_test_interface;
     let asked = |host: &str| {
         let _ = resolver.resolve(host, AddressFamily::Ipv4);
         std::thread::sleep(Duration::from_millis(50));
@@ -2180,6 +2275,7 @@ fn with_the_setting_off_only_additional_link_rule_hosts_skip_the_provider() {
 /// With "DNS through the tunnel" on, the reverse lookup of a dropped address
 /// and its forward check never go to the provider's resolver: through the
 /// tunnel when it is up, not at all while it is down.
+#[cfg(any(target_os = "linux", windows))]
 #[test]
 fn reverse_lookups_follow_dns_through_the_tunnel() {
     let (provider, provider_addr) = listening_dns();
@@ -2198,15 +2294,17 @@ fn reverse_lookups_follow_dns_through_the_tunnel() {
         "tunnel down: the provider hears nothing"
     );
 
-    let up = FcrdnsUpstreamResolver::new(Arc::clone(&upstream), Duration::from_millis(50))
+    let mut up = FcrdnsUpstreamResolver::new(Arc::clone(&upstream), Duration::from_millis(50))
         .with_tunnel_policy(
             Arc::new(FixedTunnel(Some(crate::dns_egress::DnsEgress {
                 server: public_addr,
                 bind: Some(std::net::IpAddr::V4(Ipv4Addr::LOCALHOST)),
+                interface_index: Some(loopback_index()),
                 via_secondary: true,
             }))),
             Arc::clone(&setting_on),
         );
+    up.pin_interface = pin_test_interface;
     let _ = up.resolve_ptr(ip(203, 0, 113, 9));
     std::thread::sleep(Duration::from_millis(50));
     assert!(
@@ -2221,5 +2319,70 @@ fn reverse_lookups_follow_dns_through_the_tunnel() {
     assert!(
         heard_a_query(&provider),
         "setting off: the provider is asked as before"
+    );
+}
+
+#[test]
+fn secondary_rule_host_never_uses_system_dns_when_background_dns_cannot_use_secondary() {
+    let (_silent, addr) = listening_dns();
+    let routed = "routed.example";
+    let ordinary = "ordinary.example";
+    let mut violations = Vec::new();
+    for (case, bypass, captured, source) in [
+        ("bypass disabled", false, Some(addr), None),
+        ("upstream missing", true, None, None),
+        ("direct query timeout", true, Some(addr), Some(Ipv4Addr::LOCALHOST)),
+    ] {
+        let system = Arc::new(MockDnsResolver::new());
+        for hostname in [routed, ordinary] {
+            system.set_response(
+                hostname,
+                ResolvedRecord {
+                    canonical_hostname: hostname.into(),
+                    addresses: vec![ip(198, 51, 100, 7).into()],
+                    ttl_seconds: Some(300),
+                },
+            );
+        }
+        let oracle = Arc::new(ActiveRuleHostOracle::new(
+            Arc::new(FakeRules {
+                primary: CanonicalRuleSet::from_rules(Vec::new()),
+                secondary: CanonicalRuleSet::from_rules(vec![exact_rule("r-s", routed)]),
+            }),
+            Arc::new(|| Some("S-1-5-21-1".into())),
+        ));
+        let policy = crate::dns_egress::SecondaryPreferredEgress::new(
+            Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            Arc::new(move || source.map(|address| crate::dns_egress::SecondarySource {
+                address,
+                interface_index: std::num::NonZeroU32::MIN,
+            })),
+        )
+        .with_rule_hosts(oracle)
+        .with_rule_host_server(addr);
+        let resolver = HostsBypassDnsResolver::new(
+            Arc::clone(&system) as Arc<dyn DnsResolverPort>,
+            Arc::new(move || bypass),
+            Arc::new(move || captured),
+            Duration::from_millis(30),
+        )
+        .with_egress(Arc::new(policy));
+
+        let answer = resolver.resolve(routed, AddressFamily::Ipv4);
+        assert_eq!(
+            resolver
+                .resolve(ordinary, AddressFamily::Ipv4)
+                .expect("ordinary name must retain system DNS")
+                .addresses,
+            vec![IpAddr::V4(ip(198, 51, 100, 7))],
+        );
+        let system_queries = system.observed_queries();
+        if answer.is_ok() || system_queries != [ordinary] {
+            violations.push((case, answer, system_queries));
+        }
+    }
+    assert!(
+        violations.is_empty(),
+        "secondary rule names must never reach the system resolver: {violations:?}"
     );
 }

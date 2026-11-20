@@ -1077,7 +1077,16 @@ fn finished(app: &mut AppState, finished: Finished) {
             }
             Note::new(text::ACTIVATED)
         }
-        // The edits stay on screen: nothing was applied.
+        Finished::Incomplete { code, base } => {
+            rules.base_revision = base;
+            if code == "applied-with-drift" {
+                rules.table.mark_applied();
+            }
+            rules.reread_due = true;
+            rules.verdicts.rewrite_files = false;
+            app.snapshot_refresh_due = true;
+            Note::new(text::incomplete(&code))
+        }
         Finished::Expired => Note::new(text::EXPIRED),
         Finished::UacDeclined => Note::new(text::UAC_DECLINED),
         Finished::Failed(failure) => {
@@ -1109,6 +1118,7 @@ fn reset_finished(app: &mut AppState, finished: Finished) {
     rules.busy = None;
     rules.quit_after_apply = false;
     let applied = matches!(finished, Finished::Applied { .. });
+    let incomplete = matches!(finished, Finished::Incomplete { .. });
     rules.note = Some(match finished {
         Finished::Applied { base } => {
             rules.base_revision = base;
@@ -1118,9 +1128,17 @@ fn reset_finished(app: &mut AppState, finished: Finished) {
         Finished::Expired => Note::new(text::EXPIRED),
         Finished::UacDeclined => Note::new(text::UAC_DECLINED),
         Finished::Failed(failure) => Note::failed(text::RESET_FAILED, failure),
+        Finished::Incomplete { code, base } => {
+            rules.base_revision = base;
+            rules.verdicts.rewrite_files = false;
+            app.snapshot_refresh_due = true;
+            Note::new(text::incomplete(&code))
+        }
     });
     if applied {
         app.rules.verdicts.rewrite_files = true;
+        load(app);
+    } else if incomplete {
         load(app);
     }
 }

@@ -24,7 +24,7 @@ nrr-diagnostics = { path = "../core/diagnostics", features = ["fuzzing"] }
 nrr-domain = { path = "../core/domain" }
 nrr-platform-api = { path = "../core/platform/api", features = ["fuzzing"] }
 nrr-platform-linux = { path = "../core/platform/linux", features = ["fuzzing"] }
-nrr-service-runtime = { path = "../core/services/service-runtime" }
+nrr-service-runtime = { path = "../core/services/service-runtime", features = ["fuzzing"] }
 
 # A fuzz run wants the production optimisation level; debug assertions stay on
 # so an overflow in a parser is a finding, not silent wraparound.
@@ -85,6 +85,13 @@ bench = false
 [[bin]]
 name = "dns_wire_reply"
 path = "fuzz_targets/dns_wire_reply.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "dns_udp_reply"
+path = "fuzz_targets/dns_udp_reply.rs"
 test = false
 doc = false
 bench = false

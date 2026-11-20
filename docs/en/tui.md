@@ -13,6 +13,8 @@ It is the same product, not a second one: it talks to the same background servic
 
 `nrr-tui` runs only in a live terminal. Started from a script, through a pipe or with its output redirected, it does not start: it says so and exits with code `3`. For reading and diagnostics from scripts, use the [`nrr-cli` console](cli.md) — that is its job, and its exit codes are what a script can rely on.
 
+For interactive testing in a virtual machine, a pseudoterminal can supply the required terminal. In `--plain` mode, a test driver should wait for the expected screen and prompt before each input, stop on an unexpected screen or timeout, and verify the resulting service state. Screen text and ordering are not a stable machine interface; do not use blind keystroke sequences to change routing or security settings.
+
 ## Starting it
 
 On Windows, `nrr-tui.exe` sits next to `NetRuleRouter.exe`. In PowerShell, prefix it with `.\` when you are in that folder, as with the console:

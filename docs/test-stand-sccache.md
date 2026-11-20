@@ -1,6 +1,6 @@
 # Optional sccache runner for test laptops
 
-**Experimental; not yet accepted for routine use.** A Windows test-laptop run with sccache 0.13.0 completed a Cargo build and reported 14 cache hits and 21 misses. Earlier tests with a simulated server checked exit codes and a simulated low-disk condition. The Linux runner has not been run on the test laptop. A matched cold/warm comparison, interrupted runs, long-running disk monitoring and incremental-artifact cleanup still need end-to-end validation. Do not treat this runner as a substitute for the existing gate until those checks pass.
+**Experimental; not yet accepted for routine use.** Test-laptop builds with sccache 0.19.0 restored an isolated target on the same path: Windows reported 25 hits and 10 misses, Linux 35 hits and no misses. On Linux, an immediate repeated run exposed an inherited lock; a regression test failed before the fix and passed afterward. Earlier Windows tests with a simulated server checked exit codes and a simulated low-disk condition. Interrupted runs, long-running disk monitoring, incremental-artifact cleanup and the GitHub Actions backend still need end-to-end validation. Do not treat this runner as a substitute for the existing gate until those checks pass.
 
 The runners in `scripts/test-stand-cargo.sh` and `scripts/test-stand-cargo.ps1` are opt-in and intended for designated test laptops. Ordinary Cargo and the development incremental cache are unchanged. Install Cargo and sccache separately; the scripts do not install tools or change the user's permanent Cargo configuration.
 

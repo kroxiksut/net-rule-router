@@ -291,9 +291,8 @@ pub struct RouteBindingRecord {
     pub user_confirmed: bool,
     /// Every stable adapter id this binding has been matched to (the
     /// current `stable_id` plus historical GUIDs the auto-heal folded
-    /// in). The route coordinator matches a live adapter against ANY of these,
-    /// so a secondary adapter whose GUID rotated across a reinstall/version
-    /// bump is still recognised without waiting for a friendly-name heal. Populated on load;
+    /// in). The route coordinator does not use this history to select a
+    /// Secondary because older heuristics may have recorded an unrelated VPN. Populated on load;
     /// **ignored on write** — `update_for_sid` derives the set from the DB
     /// (carry forward on an unchanged binding, reset on a genuine re-bind) and
     /// [`RouteBindingsRepository::heal_binding_identity`] unions healed ids.

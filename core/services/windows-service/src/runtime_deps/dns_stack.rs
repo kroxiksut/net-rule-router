@@ -149,16 +149,6 @@ impl CoordinatorRelaySourceAddrs {
     }
 }
 
-/// The same 3 s-memoized adapter resolution the relay dialer uses, reused as
-/// the DNS-over-secondary source: the query sockets and the relay must agree on
-/// what "the secondary link right now" means, and a second resolver would
-/// double the adapter enumeration for no benefit.
-impl nrr_service_runtime::dns_egress::SecondarySourceAddr for CoordinatorRelaySourceAddrs {
-    fn current(&self) -> Option<std::net::Ipv4Addr> {
-        CoordinatorRelaySourceAddrs::current(self).1
-    }
-}
-
 /// Build the live DNS-egress policy: public resolvers over the secondary link
 /// while the toggle is on and the tunnel has a source address, the caller's own
 /// captured upstream otherwise; with the toggle off, the additional link's
@@ -169,11 +159,9 @@ pub(super) fn build_dns_egress_policy(
     active_sid: nrr_service_runtime::supervised_runtime::ActiveRoutingSidFn,
     rule_hosts: Option<Arc<dyn nrr_service_runtime::dns_resolver::RuleHostOracle>>,
 ) -> Arc<dyn nrr_service_runtime::dns_egress::DnsEgressPolicy> {
-    let source = Arc::new(CoordinatorRelaySourceAddrs {
-        coordinator: Arc::clone(coordinator),
-        active_sid,
-        cache: Mutex::new(None),
-        owner_cache: Mutex::default(),
+    let coordinator = Arc::clone(coordinator);
+    let source = Arc::new(move || {
+        active_sid().and_then(|sid| coordinator.resolve_secondary_dns_source(&sid))
     });
     let mut policy = nrr_service_runtime::dns_egress::SecondaryPreferredEgress::new(
         nrr_service_runtime::dns_egress::global_dns_via_secondary(),

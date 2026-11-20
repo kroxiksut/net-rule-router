@@ -16,6 +16,37 @@ pub(super) enum MachineMemo {
 }
 
 impl SecondaryRouteCoordinator {
+    /// Bind a DNS attempt to the currently resolved adapter. An index and
+    /// address cached before a VPN reconnect can now belong to another link.
+    pub fn resolve_secondary_dns_source(
+        &self,
+        sid: &str,
+    ) -> Option<crate::dns_egress::SecondarySource> {
+        let policy = self.route_source.load_for_sid(sid)?;
+        let binding = policy.secondary.as_ref()?;
+        let links = self.api.get_adapter_infos().ok()?;
+        let mut matching = links.iter().filter(|link| {
+            super::binding_resolver::durable_adapter_binding_matches(link, &binding.stable_id)
+        });
+        let link = matching.next()?;
+        if matching.next().is_some() {
+            return None;
+        }
+        let target = self.resolve_binding_target(
+            sid,
+            binding,
+            policy.primary.as_ref(),
+            &links,
+            "secondary",
+            None,
+        );
+        let target = self.gate_secondary_on_liveness(sid, target)?;
+        if link.index != target.interface_index {
+            return None;
+        }
+        crate::dns_egress::SecondarySource::from_adapter(link)
+    }
+
     /// resolve the secondary (VPN)
     /// interface LUID for `sid`, or `None` when there is no usable secondary
     /// target right now or its LUID cannot be resolved.

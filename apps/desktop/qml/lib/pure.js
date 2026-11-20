@@ -2731,13 +2731,25 @@ function updateOfferShown(offer, dismissedVersion) {
     return String(offer.latestVersion) !== String(dismissedVersion || "")
 }
 
-// The verdict of an `operation.status.get` answer: "" when the operation
-// completed, its error code when it failed, null when the answer says neither
-// (the record is not readable here, or not finished).
+// Completion and full application are separate promises.
 function operationOutcome(ok, status) {
     if (!ok || !status) return null
     var state = String(status.state || "")
-    if (state === "completed") return ""
+    if (state === "completed") {
+        var result = status.result
+        if (!result || result.outcome === undefined) return ""
+        switch (result.outcome) {
+        case "applied-with-drift": return "applied-with-drift"
+        case "activated":
+        case "safe-disabled":
+        case "already-safe-disabled":
+        case "audit-chain-restarted":
+        case "alert-acknowledged":
+        case "alert-resolved":
+        case "alert-unchanged": return ""
+        default: return "application-unconfirmed"
+        }
+    }
     if (state === "failed") return String((status.error && status.error.code) || "unknown")
     return null
 }
@@ -2917,13 +2929,11 @@ function diagnosticsStorageView(snapshot) {
     }
 }
 
-// The verdict of re-previewing a confirmed change: "" when it took effect
-// (`unchanged(summary)` holds), the refusal code when the service refuses it,
-// "unknown" otherwise.
+// A preview confirms stored intent, never the installed network policy.
 function previewOutcome(summary, unchanged) {
     var refusal = previewRefusal(summary)
     if (refusal) return refusal.code
-    return unchanged(summary) ? "" : "unknown"
+    return unchanged(summary) ? "application-unconfirmed" : "unknown"
 }
 
 // True when a dry-run review summary carries no rule changes and no

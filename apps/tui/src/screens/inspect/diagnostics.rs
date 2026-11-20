@@ -598,7 +598,7 @@ fn confirm(
     let result = match recorded {
         Err(slug) => Err(slug),
         Ok(Some(Outcome::Applied)) => Ok(()),
-        Ok(Some(Outcome::Failed(code))) => Err(code),
+        Ok(Some(Outcome::Failed(code) | Outcome::Incomplete(code))) => Err(code),
         Ok(None) => {
             let (status, code) = match &read.status {
                 Ok(status) => (status.clone(), ""),

@@ -144,7 +144,7 @@ fn confirm(client: &dyn IpcClient, digest: &str) -> Confirmed {
         Ok(Some(Outcome::Failed(code))) if code == "audit-chain-changed" => {
             Confirmed::Changed(preview(client, json!({})).map(|(verdict, _)| verdict))
         }
-        Ok(Some(Outcome::Failed(code))) => Confirmed::Failed(code),
+        Ok(Some(Outcome::Failed(code) | Outcome::Incomplete(code))) => Confirmed::Failed(code),
         // A record this account cannot read: judge by what the chain says now.
         Ok(None) => match preview(client, json!({})) {
             Ok((Preview::Intact, _)) => Confirmed::Done,

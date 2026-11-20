@@ -260,6 +260,22 @@ pub const NOTHING_TO_APPLY: Key = key(
     "Nothing to apply: the rules on screen are already in use.",
 );
 pub const ACTIVATED: Key = key("status.rules-activate-completed", "Rules activated.");
+const PARTIAL_APPLY: Key = key(
+    "errors.applied-with-drift",
+    "The change was saved but was only partially applied. Check service diagnostics before applying it again.",
+);
+const APPLICATION_UNCONFIRMED: Key = key(
+    "errors.application-unconfirmed",
+    "Full application of the change could not be confirmed. Refresh the service status and check diagnostics before trying again.",
+);
+
+pub fn incomplete(code: &str) -> Key {
+    if code == "applied-with-drift" {
+        PARTIAL_APPLY
+    } else {
+        APPLICATION_UNCONFIRMED
+    }
+}
 pub const ACTIVATE_FAILED: Key = key("status.rules-activate-failed", "Failed to activate rules: ");
 pub const UAC_DECLINED: Key = key(
     "status.activate-uac-declined",
@@ -1677,6 +1693,8 @@ pub const ALL: &[Key] = &[
     INVALID_VALUES,
     NOTHING_TO_APPLY,
     ACTIVATED,
+    PARTIAL_APPLY,
+    APPLICATION_UNCONFIRMED,
     ACTIVATE_FAILED,
     UAC_DECLINED,
     ERROR_UNKNOWN,

@@ -1893,13 +1893,10 @@ impl crate::ipc_handlers::providers::FailClosedStateProbe for ProductionFailClos
         // always misses, which makes `secondary_offline` permanently
         // `true` — reuse the same matching rules the route coordinator
         // uses for the live adapter list.
-        // The coordinator's own check, prior ids and IPv4 included: the banner
-        // must say what the service does.
-        let secondary_offline = !crate::route_coordinator::bound_adapter_usable(
-            adapters,
-            &secondary.stable_id,
-            &secondary.known_stable_ids,
-        );
+        // The coordinator trusts only the selected Secondary identity: old ids
+        // could have been learned from an unrelated tunnel by older versions.
+        let secondary_offline =
+            !crate::route_coordinator::bound_adapter_usable(adapters, &secondary.stable_id, &[]);
         // The banner mirrors the actual blocking: with protection off nothing
         // blocks, and the ordinary secondary-down notice is the warning.
         let fail_closed_active = policy.leak_protection.is_on() && secondary_offline;

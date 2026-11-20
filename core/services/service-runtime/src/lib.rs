@@ -98,6 +98,7 @@ pub mod dns_resolver_ports;
 pub mod dns_resolver_service;
 pub mod dns_stack;
 pub mod dns_tamper_summary;
+mod dns_tcp_io;
 pub mod dns_upstream;
 mod dns_upstream_sockets;
 pub mod dns_wire;

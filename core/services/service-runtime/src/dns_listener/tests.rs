@@ -152,36 +152,43 @@ fn aaaa_for_a_rule_host_is_answered_nodata_when_ipv4_can_carry_it() {
     }
 }
 
-/// The whole point of the condition: a name IPv4 cannot carry keeps its
-/// AAAA. Suppressing it would make a v6-only destination unreachable, which
-/// the user reads as a broken network rather than as protection.
+fn assert_empty_response(action: ListenerAction, rcode: u8) {
+    let ListenerAction::Respond(bytes) = action else {
+        panic!("expected a local DNS response, got {action:?}");
+    };
+    assert_eq!(bytes[3] & 0x0f, rcode);
+    assert_eq!(&bytes[6..8], &[0, 0], "unexpected answer records");
+}
+
+/// Without an IPv6 route for this rule host, sending even its question over
+/// the main link exposes which site the user asked about.
 #[test]
-fn aaaa_is_forwarded_when_ipv4_cannot_carry_the_name() {
+fn aaaa_is_withheld_when_neither_the_relay_nor_an_ipv6_route_carries_the_name() {
     let l = listener(
         &["assistant.example"],
         Ok(resolved(&[Ipv4Addr::new(100, 64, 1, 4)])),
     )
     .with_fake_ip(std::sync::Arc::new(CarriesOnV4(false)));
-    assert_eq!(
+    assert_empty_response(
         l.answer_query(&query("assistant.example", QTYPE_AAAA)),
-        ListenerAction::Forward
+        RCODE_SERVFAIL,
     );
 }
 
-/// The hole is reported ONCE per name, not on every lookup: a browser asks
+/// Missing IPv6 routing is reported once per name: a browser asks
 /// for the same host many times a minute, and a warning that repeats that
 /// often is a warning nobody reads.
 #[test]
-fn a_rule_host_leaving_over_ipv6_is_reported_once() {
+fn a_rule_host_with_ipv6_withheld_is_reported_once() {
     let l = listener(
         &["assistant.example"],
         Ok(resolved(&[Ipv4Addr::new(100, 64, 1, 4)])),
     )
     .with_fake_ip(std::sync::Arc::new(CarriesOnV4(false)));
     for _ in 0..3 {
-        assert_eq!(
+        assert_empty_response(
             l.answer_query(&query("assistant.example", QTYPE_AAAA)),
-            ListenerAction::Forward
+            RCODE_SERVFAIL,
         );
     }
     let seen = l
@@ -195,10 +202,8 @@ fn a_rule_host_leaving_over_ipv6_is_reported_once() {
     );
 }
 
-/// While the guard holds, no record type of a rule host is asked of the main
-/// link: a forwarded AAAA brings back the CNAME chain, whose target no rule
-/// names, and an HTTPS record carries address hints. Other names, and the same
-/// names once the tunnel is back, are relayed as before.
+/// A guard transition cannot release a protected name to the main-link
+/// resolver. Other names keep their AAAA, HTTPS and TXT records.
 #[test]
 fn a_held_rule_host_is_not_asked_of_the_main_link_in_any_record_type() {
     let holding = Arc::new(AtomicBool::new(true));
@@ -210,27 +215,17 @@ fn a_held_rule_host_is_not_asked_of_the_main_link_in_any_record_type() {
     .with_fake_ip(std::sync::Arc::new(CarriesOnV4(false)))
     .with_leak_guard_posture(Arc::new(move || posture.load(Ordering::Relaxed)));
 
-    for qtype in [QTYPE_AAAA, QTYPE_HTTPS] {
-        match l.answer_query(&query("assistant.example", qtype)) {
-            ListenerAction::Respond(bytes) => {
-                assert_eq!(bytes[3] & 0x0F, RCODE_SERVFAIL, "qtype {qtype}: SERVFAIL");
-            }
-            other => panic!("qtype {qtype}: expected SERVFAIL, got {other:?}"),
+    const QTYPE_TXT: u16 = 16;
+    for blocking in [true, false] {
+        holding.store(blocking, Ordering::Relaxed);
+        for (qtype, rcode) in [(QTYPE_AAAA, RCODE_SERVFAIL), (QTYPE_HTTPS, RCODE_NOERROR), (QTYPE_TXT, RCODE_SERVFAIL)] {
+            assert_empty_response(l.answer_query(&query("assistant.example", qtype)), rcode);
+            assert_eq!(
+                l.answer_query(&query("vk.example", qtype)),
+                ListenerAction::Forward,
+                "qtype {qtype}, blocking={blocking}: a name no rule claims is relayed"
+            );
         }
-        assert_eq!(
-            l.answer_query(&query("vk.example", qtype)),
-            ListenerAction::Forward,
-            "qtype {qtype}: a name no rule claims is relayed"
-        );
-    }
-
-    holding.store(false, Ordering::Relaxed);
-    for qtype in [QTYPE_AAAA, QTYPE_HTTPS] {
-        assert_eq!(
-            l.answer_query(&query("assistant.example", qtype)),
-            ListenerAction::Forward,
-            "qtype {qtype}: relayed again once the guard lets go"
-        );
     }
 }
 
@@ -392,16 +387,17 @@ fn intercepts_a_rule_host_and_builds_answer() {
 }
 
 #[test]
-fn forwards_aaaa_and_steers_non_rule_a() {
+fn withholds_secondary_aaaa_and_steers_ordinary_a() {
     let l = listener(
         &["assistant.example"],
         Ok(resolved(&[Ipv4Addr::new(100, 64, 1, 4)])),
     );
-    // AAAA for a rule host with the default fake-IP port: `carries_on_v4`
-    // is false, so IPv4 cannot carry the name and its AAAA is forwarded
-    // untouched. Suppression is asserted separately, where v4 CAN carry it.
+    assert_empty_response(
+        l.answer_query(&query("assistant.example", QTYPE_AAAA)),
+        RCODE_SERVFAIL,
+    );
     assert_eq!(
-        l.answer_query(&query("assistant.example", 28)),
+        l.answer_query(&query("example.com", QTYPE_AAAA)),
         ListenerAction::Forward
     );
     // A for a non-rule host → forward WITH direct-answer steering.
@@ -457,17 +453,14 @@ fn an_https_record_does_not_hand_out_addresses_the_rule_host_is_not_answered_wit
 }
 
 #[test]
-fn https_rr_is_forwarded_raw_for_rule_and_direct_hosts() {
-    // Real A answers and a v6 the tunnel carries (or nothing pins): the hints
-    // name the addresses the routes already follow.
+fn an_https_question_for_a_secondary_rule_stays_local_even_without_fake_ip() {
     let l = listener(
         &["assistant.example"],
         Ok(resolved(&[Ipv4Addr::new(100, 64, 1, 4)])),
     );
-    assert_eq!(
+    assert_empty_response(
         l.answer_query(&query("assistant.example", QTYPE_HTTPS)),
-        ListenerAction::Forward,
-        "rule host: not intercepted"
+        RCODE_NOERROR,
     );
     assert_eq!(
         l.answer_query(&query("example.com", QTYPE_HTTPS)),
@@ -686,15 +679,14 @@ fn rule_host_no_records_returns_nxdomain() {
 }
 
 #[test]
-fn rule_host_upstream_unavailable_fails_open_to_forward() {
+fn a_secondary_rule_host_with_an_unavailable_upstream_returns_servfail() {
     let l = listener(
         &["assistant.example"],
         Err(ResolveError::Unavailable("timeout".into())),
     );
-    // Our resolver failed — forward raw so the OS server can still answer.
-    assert_eq!(
+    assert_empty_response(
         l.answer_query(&query("assistant.example", QTYPE_A)),
-        ListenerAction::Forward
+        RCODE_SERVFAIL,
     );
 }
 
@@ -1376,18 +1368,38 @@ impl UpstreamResolver for NeverAnswers {
     ) -> Result<ResolvedAddresses, ResolveError> {
         panic!("a saturated rule-host lane must not reach the upstream")
     }
+
+    fn resolve_tunnel_only_within(
+        &self,
+        _h: &str,
+        _f: AddressFamily,
+        _budget: Duration,
+    ) -> Result<ResolvedAddresses, ResolveError> {
+        panic!("a saturated rule-host lane must not reach the tunnel upstream")
+    }
 }
 
 /// An upstream that takes everything it is allowed to, as a resolver waiting
 /// on a server that has stopped answering does.
-struct SpendsTheBudget;
+#[derive(Default)]
+struct SpendsTheBudget(Mutex<Option<Duration>>);
 impl UpstreamResolver for SpendsTheBudget {
     fn resolve_within(
         &self,
         _h: &str,
         _f: AddressFamily,
+        _budget: Duration,
+    ) -> Result<ResolvedAddresses, ResolveError> {
+        panic!("a secondary rule host must use the tunnel resolver")
+    }
+
+    fn resolve_tunnel_only_within(
+        &self,
+        _h: &str,
+        _f: AddressFamily,
         budget: Duration,
     ) -> Result<ResolvedAddresses, ResolveError> {
+        *self.0.lock().expect("record the upstream budget") = Some(budget);
         std::thread::sleep(budget.min(Duration::from_secs(5)));
         Err(ResolveError::Unavailable("nothing answered".into()))
     }
@@ -1399,9 +1411,10 @@ impl UpstreamResolver for SpendsTheBudget {
 /// after one and re-asked, which is what the `client port closed` storm counted.
 #[test]
 fn the_rule_host_branch_answers_inside_the_budget_it_was_given() {
+    let upstream = Arc::new(SpendsTheBudget::default());
     let l = DnsInterceptListener::new(
         Arc::new(Oracle(vec!["routed.example".to_string()])),
-        Arc::new(SpendsTheBudget),
+        Arc::clone(&upstream) as Arc<dyn UpstreamResolver>,
         Arc::new(CachedSink(Vec::new())),
         Arc::new(OkReconciler),
         "192.0.2.1:53".parse().unwrap(),
@@ -1417,8 +1430,9 @@ fn the_rule_host_branch_answers_inside_the_budget_it_was_given() {
         Duration::from_millis(200),
     );
     let spent = started.elapsed();
-    // Upstream unavailable is the fail-open forward; what is asserted is when.
-    assert_eq!(action, ListenerAction::Forward);
+    assert_empty_response(action, RCODE_SERVFAIL);
+    let budget_seen = upstream.0.lock().expect("recorded upstream budget").expect("tunnel lookup");
+    assert!(!budget_seen.is_zero() && budget_seen <= Duration::from_millis(200));
     assert!(
         spent < Duration::from_millis(600),
         "the branch spent {spent:?} of a 200ms budget",
@@ -1640,6 +1654,15 @@ impl UpstreamResolver for FamilyUpstream {
     fn resolve_within(
         &self,
         _h: &str,
+        _family: AddressFamily,
+        _budget: Duration,
+    ) -> Result<ResolvedAddresses, ResolveError> {
+        panic!("the secondary resolver chain must not request a primary lookup")
+    }
+
+    fn resolve_tunnel_only_within(
+        &self,
+        _h: &str,
         family: AddressFamily,
         _budget: Duration,
     ) -> Result<ResolvedAddresses, ResolveError> {
@@ -1849,10 +1872,10 @@ fn only_a_rule_host_left_without_an_address_is_reported() {
     assert_eq!(noted.names(), ["routed.example"]);
 }
 
-/// Our resolve could not reach upstream and the raw forward failed too: the
-/// client got SERVFAIL, and only a rule host's `A` is reported.
+/// A failed protected address lookup is reported. HTTPS receives a local
+/// empty answer so the client can request the addresses through their rules.
 #[test]
-fn a_rule_host_whose_forward_also_failed_is_reported() {
+fn an_unavailable_rule_host_is_reported_only_for_its_failed_address_lookup() {
     let noted = Arc::new(NotedNames::default());
     let l = listener(
         &["routed.example"],
@@ -1865,15 +1888,14 @@ fn a_rule_host_whose_forward_also_failed_is_reported() {
         .set_read_timeout(Some(Duration::from_secs(2)))
         .expect("client timeout");
     let to = client.local_addr().expect("client addr");
-    for q in [
-        query("routed.example", QTYPE_A),
-        query("routed.example", QTYPE_HTTPS),
-    ] {
+    for (qtype, rcode) in [(QTYPE_A, RCODE_SERVFAIL), (QTYPE_HTTPS, RCODE_NOERROR)] {
+        let q = query("routed.example", qtype);
         l.handle_datagram(&server, &q, to, RULE_HOST_LANE_WAIT);
         let mut buf = [0u8; 512];
         let n = client.recv(&mut buf).expect("a reply, not silence");
         assert!(n >= 12);
-        assert_eq!(buf[3] & 0x0F, RCODE_SERVFAIL);
+        assert_eq!(buf[3] & 0x0F, rcode, "qtype {qtype}");
+        assert_eq!(buf[6..8], [0, 0], "qtype {qtype}: empty answer section");
     }
     assert_eq!(noted.names(), ["routed.example"], "the A question only");
 }
@@ -1901,6 +1923,78 @@ fn ask(client: &UdpSocket, to: SocketAddr, packet: &[u8]) -> Vec<u8> {
     let mut buf = [0u8; 4096];
     let n = client.recv(&mut buf).expect("a reply, not silence");
     buf[..n].to_vec()
+}
+
+/// A complete upstream TCP answer must not overflow a stub's UDP receive
+/// budget. The stub must be able to retry the same protected name over TCP.
+#[test]
+fn oversized_udp_answer_respects_the_client_budget_and_tcp_stays_complete() {
+    use crate::dns_wire::{is_truncated, read_tcp_message, write_tcp_message};
+    let ips: Vec<_> = (1..=32).map(|n| Ipv4Addr::new(192, 0, 2, n)).collect();
+    let l = Arc::new(listener(&["large.example"], Ok(resolved(&ips))));
+    let (socket, tcp) = udp_and_tcp_on_one_port();
+    let addr = socket.local_addr().expect("listener addr");
+    let stop = Arc::new(AtomicBool::new(false));
+    let thread = std::thread::spawn({
+        let stop = Arc::clone(&stop);
+        move || {
+            let _ = l.serve_observed(&socket, Some(&tcp), &stop, &|| {}, &|| {});
+        }
+    });
+    let client = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).expect("client socket");
+    client
+        .set_read_timeout(Some(Duration::from_secs(3)))
+        .expect("timeout");
+    let base = query("large.example", QTYPE_A);
+    for (advertised, budget, truncated) in [
+        (None, 512, true),
+        (Some(128u16), 512, true),
+        (Some(512), 512, true),
+        (Some(1232), 1232, false),
+    ] {
+        let mut request = base.clone();
+        if let Some(size) = advertised {
+            request[10..12].copy_from_slice(&1u16.to_be_bytes());
+            request.extend_from_slice(&[0, 0, 41]); // root owner, OPT
+            request.extend_from_slice(&size.to_be_bytes());
+            request.extend_from_slice(&[0; 6]); // EDNS0, no flags/options
+        }
+        let reply = ask(&client, addr, &request);
+        assert!(
+            reply.len() <= budget,
+            "advertised={advertised:?}, reply={}B",
+            reply.len()
+        );
+        assert_eq!(is_truncated(&reply), truncated, "advertised={advertised:?}");
+        assert_eq!(&reply[..2], &base[..2], "same transaction");
+        assert_eq!(question(&reply), question(&base), "same question");
+        if truncated {
+            assert_eq!(
+                &reply[6..10],
+                &[0; 4],
+                "no partial answer or authority RRsets"
+            );
+        } else {
+            assert_eq!(&reply[6..8], &[0, 32], "all addresses fit EDNS budget");
+        }
+    }
+    let mut stream = TcpStream::connect_timeout(&addr, Duration::from_secs(3)).expect("TCP retry");
+    stream
+        .set_read_timeout(Some(Duration::from_secs(3)))
+        .expect("TCP timeout");
+    write_tcp_message(&mut stream, &base).expect("TCP query");
+    let reply = read_tcp_message(&mut stream, 65_535)
+        .expect("TCP read")
+        .expect("TCP answer");
+    assert!(
+        reply.len() > 512,
+        "complete response needs TCP without EDNS"
+    );
+    assert!(!is_truncated(&reply));
+    assert_eq!(&reply[6..8], &[0, 32]);
+    drop(stream);
+    stop.store(true, Ordering::SeqCst);
+    thread.join().expect("listener stopped");
 }
 
 /// An oracle that panics on one name: the shape of any bug in one handler.
@@ -2343,4 +2437,48 @@ fn spare_query_buffers_stay_small_and_few() {
         buffers.give_back(Vec::with_capacity(512));
     }
     assert!(buffers.spare.lock().map_or(0, |s| s.len()) <= SPARE_QUERY_BUFFERS);
+}
+
+#[test]
+fn secondary_rule_host_never_forwards_raw_a_after_upstream_timeout() {
+    let listener = listener(
+        &["routed.example"],
+        Err(ResolveError::Unavailable("timeout".into())),
+    )
+    .with_leak_guard_posture(Arc::new(|| false));
+    assert_eq!(
+        listener.answer_query(&query("ordinary.example", QTYPE_A)),
+        ListenerAction::ForwardFiltered,
+        "ordinary A still uses the system resolver"
+    );
+    let outcome = listener.answer_query(&query("routed.example", QTYPE_A));
+    assert!(
+        matches!(&outcome, ListenerAction::Respond(bytes) if bytes[3] & 0x0f == RCODE_SERVFAIL),
+        "a failed additional-channel lookup must answer SERVFAIL without sending the name to the main link: {outcome:?}"
+    );
+}
+
+#[test]
+fn secondary_rule_host_never_forwards_raw_aaaa_without_an_ipv6_plan() {
+    let listener = listener(
+        &["routed.example"],
+        Err(ResolveError::Unavailable("timeout".into())),
+    )
+    .with_ipv6_disposition(carried(crate::enforcement_planner::Ipv6Guard::Off))
+    .with_leak_guard_posture(Arc::new(|| false));
+    assert_eq!(
+        listener.answer_query(&query("ordinary.example", QTYPE_AAAA)),
+        ListenerAction::Forward,
+        "ordinary AAAA still uses the system resolver"
+    );
+    let outcome = listener.answer_query(&query("routed.example", QTYPE_AAAA));
+    assert!(
+        matches!(
+            &outcome,
+            ListenerAction::Respond(bytes)
+                if matches!(bytes[3] & 0x0f, RCODE_NOERROR | RCODE_SERVFAIL)
+                    && bytes[6..8] == [0, 0]
+        ),
+        "the rule still applies to the DNS name while IPv6 routing is off: {outcome:?}"
+    );
 }

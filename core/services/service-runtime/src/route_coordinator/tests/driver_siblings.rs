@@ -1,6 +1,5 @@
-//! A VPN client on a stock driver brings up whichever copy of it it likes; a
-//! route bound to the copy left dead must not stay dead without a word, and
-//! must not be moved behind the user's back either.
+//! A dead bound adapter must not cause the additional connection to move to
+//! another VPN merely because it uses the same driver or is the only tunnel.
 
 use super::*;
 use crate::ipc_handlers::event_bus::EventBus;
@@ -94,37 +93,103 @@ fn bound_to_tap3(policy: &FakePolicy) {
 }
 
 #[test]
-fn a_vpn_that_came_up_on_another_copy_of_the_bound_tap_is_followed_there() {
+fn unrelated_live_tunnel_does_not_replace_a_down_secondary() {
     let (notices, healed, routed) = secondary_notices(
-        vec![tap("tap3", 3, false, 3), nic(), tap("tap5", 5, true, 5)],
+        vec![tap("tap3", 3, false, 3), nic(), vendor("vendor", 52, true)],
         bound_to_tap3,
     );
-    assert!(routed, "the rules go through the copy the VPN brought up");
-    assert_eq!(
-        healed,
-        vec!["secondary|win-adapter:tap5".to_string()],
-        "the move is saved once, so the next start binds the live copy",
+    assert!(!routed, "an unrelated tunnel must not become Secondary");
+    assert!(
+        healed.is_empty(),
+        "the chosen binding must not change: {healed:?}"
     );
     assert!(
         notices
             .iter()
-            .all(|(status, _)| status != "adapter-choice-needed" && status != "secondary-down"),
-        "nothing is left for the user to fix: {notices:?}",
+            .any(|(status, _)| status == "adapter-choice-needed"),
+        "the user must be offered a choice: {notices:?}",
+    );
+}
+
+#[test]
+fn another_vpn_on_the_same_driver_does_not_replace_a_down_secondary() {
+    let (notices, healed, routed) = secondary_notices(
+        vec![tap("tap3", 3, false, 3), nic(), tap("tap5", 5, true, 5)],
+        bound_to_tap3,
+    );
+    assert!(
+        !routed,
+        "sharing a driver does not establish tunnel ownership"
+    );
+    assert!(
+        healed.is_empty(),
+        "the chosen binding must not change: {healed:?}"
+    );
+    assert!(
+        notices
+            .iter()
+            .any(|(status, _)| status == "adapter-choice-needed"),
+        "the user must be offered a choice: {notices:?}",
+    );
+}
+
+#[test]
+fn a_namesake_vpn_does_not_replace_a_down_secondary() {
+    let (notices, healed, routed) = secondary_notices(
+        vec![vendor("old", 3, false), nic(), vendor("other", 52, true)],
+        |policy| {
+            policy.bind_secondary_named("S-TAP", "win-adapter:old", "Example VPN OpenVPN Adapter");
+        },
+    );
+    assert!(
+        !routed,
+        "a matching name does not establish tunnel ownership"
+    );
+    assert!(
+        healed.is_empty(),
+        "the chosen binding must not change: {healed:?}"
+    );
+    assert!(
+        notices
+            .iter()
+            .any(|(status, _)| status == "adapter-choice-needed"),
+        "the user must be offered a choice: {notices:?}",
+    );
+}
+
+#[test]
+fn historical_guessed_tunnel_is_not_used_when_current_secondary_is_missing() {
+    let api = Arc::new(MockWindowsApi::new());
+    let infos = vec![vendor("other", 52, true), nic()];
+    api.set_adapter_infos(infos.clone());
+    let coord =
+        coordinator_with_policy(api, Arc::new(FakeRules::new()), Arc::new(FakePolicy::new()));
+    let binding = crate::per_sid_orchestrator::PerSidBinding {
+        stable_id: "win-adapter:missing".into(),
+        display_name: "Ethernet 3".into(),
+        user_confirmed: true,
+        known_stable_ids: vec!["win-adapter:other".into()],
+    };
+    assert!(
+        coord
+            .resolve_binding_target("S-TAP", &binding, None, &infos, "secondary", None)
+            .is_none(),
+        "an automatically recorded historical adapter must not replace the current binding"
     );
 }
 
 /// Forty idle copies of one driver, the VPN up on one of them: the same answer
 /// however many dead copies surround the live one.
 #[test]
-fn a_bound_copy_among_many_dead_ones_follows_the_one_the_vpn_uses() {
+fn a_bound_copy_among_many_dead_ones_does_not_adopt_the_live_copy() {
     let mut infos: Vec<_> = (2..=40)
         .map(|n| tap(&format!("tap{n}"), n, false, n))
         .collect();
     infos[20] = tap("tap22", 22, true, 22);
     infos.push(nic());
     let (_, healed, routed) = secondary_notices(infos, bound_to_tap3);
-    assert!(routed);
-    assert_eq!(healed, vec!["secondary|win-adapter:tap22".to_string()]);
+    assert!(!routed);
+    assert!(healed.is_empty());
 }
 
 /// Two live copies: which of them is the user's is not ours to guess, so the
@@ -156,49 +221,38 @@ fn two_live_copies_of_the_driver_are_not_guessed_between() {
 
 /// The field machine: forty dead copies of the stock driver, the route bound
 /// to one of them, and the VPN up on its vendor's own adapter — another
-/// driver. The additional connection follows the VPN there, the move is
-/// saved, and the user is told where it went.
+/// driver. The user chooses whether that adapter is the intended connection.
 #[test]
-fn a_vpn_that_came_up_on_its_own_adapter_is_followed_from_a_dead_tap() {
+fn another_driver_is_offered_but_not_adopted_from_a_dead_tap() {
     let mut infos: Vec<_> = (2..=40)
         .map(|n| tap(&format!("tap{n}"), n, false, n))
         .collect();
     infos.push(nic());
     infos.push(vendor("vendor", 52, true));
     let (notices, healed, routed) = secondary_notices(infos, bound_to_tap3);
-    assert!(
-        routed,
-        "the rules go through the adapter the VPN came up on"
-    );
-    assert_eq!(healed, vec!["secondary|win-adapter:vendor".to_string()]);
-    let moved = (
-        "additional-connection-moved".to_string(),
+    assert!(!routed);
+    assert!(healed.is_empty());
+    let choice = (
+        "adapter-choice-needed".to_string(),
         vec!["Example VPN OpenVPN Adapter".to_string()],
     );
-    assert!(notices.contains(&moved), "{notices:?}");
-    assert!(
-        notices
-            .iter()
-            .all(|(status, _)| status != "adapter-choice-needed" && status != "secondary-down"),
-        "nothing is left for the user to fix: {notices:?}",
-    );
+    assert!(notices.contains(&choice), "{notices:?}");
 }
 
 /// The bound adapter is not merely down but gone from the machine, and the
-/// VPN is up on another: the route follows it rather than wait out the grace
-/// for a replacement nobody can name.
+/// another tunnel is up: the user decides whether it is a replacement.
 #[test]
-fn a_vpn_up_elsewhere_is_followed_from_a_binding_that_is_gone() {
+fn another_tunnel_is_offered_but_not_adopted_when_binding_is_gone() {
     let (notices, healed, routed) =
         secondary_notices(vec![nic(), vendor("vendor", 52, true)], |policy| {
             policy.bind_secondary_named("S-TAP", "win-adapter:{gone}", "Ethernet 3");
         });
-    assert!(routed);
-    assert_eq!(healed, vec!["secondary|win-adapter:vendor".to_string()]);
+    assert!(!routed);
+    assert!(healed.is_empty());
     assert!(
         notices
             .iter()
-            .any(|(status, _)| status == "additional-connection-moved"),
+            .any(|(status, _)| status == "adapter-choice-needed"),
         "{notices:?}"
     );
 }

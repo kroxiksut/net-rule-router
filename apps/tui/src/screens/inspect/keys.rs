@@ -57,7 +57,7 @@ pub const TRACE_NOT_OBSERVING: Key = key(
 );
 pub const TRACE_STREAM_OFF: Key = key(
     "diag.conn-trace.gui-stream-off",
-    "Showing the connection trace is switched off in Settings → Diagnostics and logs. Observation itself keeps running.",
+    "Showing the connection trace is switched off in Settings → Logs and diagnostics. Observation itself keeps running.",
 );
 pub const TRACE_NO_MATCH: Key = key(
     "diag.conn-trace.entries-no-match",
@@ -201,7 +201,7 @@ pub const HISTORY_WEEK: Key = key("diag.conn-history.period-week", "Last 7 days"
 pub const HISTORY_EMPTY: Key = key("diag.conn-history.empty", "No connections in this period");
 pub const HISTORY_OFF: Key = key(
     "diag.conn-history.off",
-    "Your connection history is switched off in Settings → Diagnostics and logs.",
+    "Your connection history is switched off in Settings → Logs and diagnostics.",
 );
 pub const HISTORY_UNAVAILABLE: Key = key(
     "diag.conn-history.unavailable",

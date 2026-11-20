@@ -235,10 +235,8 @@ fn note_derived_next_hop_speaks_only_when_the_answer_changes() {
 }
 
 #[test]
-fn auto_heal_persists_corrected_binding_once() {
-    // The stored secondary id is stale (adapter reinstalled → new GUID) but
-    // the saved name still matches exactly one live adapter → auto-heal +
-    // persist the corrected id, ONCE per distinct mapping.
+fn secondary_name_match_does_not_persist_a_replacement_on_repeated_resolves() {
+    // A unique name match cannot authorize a replacement secondary.
     let api = Arc::new(MockWindowsApi::new());
     // Live adapter: new name/GUID "newguid", description "desc newguid",
     // up + IPv4 + gateway → Available and usable.
@@ -265,23 +263,10 @@ fn auto_heal_persists_corrected_binding_once() {
             .push(format!("{sid}|{role}|{id}|{name}"));
     }));
 
-    // First resolution heals and persists exactly once.
+    // Neither the first nor a repeated resolution may save the candidate.
     let r1 = coord.resolve("S-HEAL");
-    assert!(r1.secondary.is_some(), "heal should yield a usable target");
-    {
-        let c = captured.lock().unwrap();
-        assert_eq!(c.len(), 1, "persist fires once on first heal");
-        assert_eq!(
-            c[0], "S-HEAL|secondary|win-adapter:newguid|desc newguid",
-            "healed id + name persisted for the secondary role"
-        );
-    }
-    // Re-resolving the SAME stale→healed mapping must NOT persist again
-    // (note_heal_once dedup) — no per-reconcile write storm.
+    assert!(r1.secondary.is_none());
+    assert!(captured.lock().unwrap().is_empty());
     let _ = coord.resolve("S-HEAL");
-    assert_eq!(
-        captured.lock().unwrap().len(),
-        1,
-        "repeated heal of the same mapping does not re-persist"
-    );
+    assert!(captured.lock().unwrap().is_empty());
 }

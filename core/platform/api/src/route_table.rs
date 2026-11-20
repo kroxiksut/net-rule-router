@@ -44,6 +44,12 @@ pub trait RouteTablePort: Send + Sync {
     /// Callers filter via `is_virtual_adapter()` and `classify_availability()`.
     fn get_adapter_infos(&self) -> Result<Vec<AdapterInfo>, PlatformError>;
 
+    /// Whether this adapter carries the durable identity in a stored binding.
+    /// Platforms that cannot establish identity decline the match.
+    fn matches_persistent_id(&self, _adapter: &AdapterInfo, _id: &str) -> bool {
+        false
+    }
+
     /// All local unicast addresses (IPv4 **and** IPv6) paired with the interface
     /// index that owns each. The connection-egress trace maps a connection's
     /// local (source) address to its egress interface; unlike

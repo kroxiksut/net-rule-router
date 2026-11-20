@@ -1,12 +1,9 @@
-//! A probe socket held to the link that owns its source address.
-//!
-//! Binding to an adapter's address picks the way out on Windows. On Linux the
-//! routing tables still choose, and a full-tunnel VPN rule sends the datagram
-//! into the tunnel with a foreign source, where it is dropped. The service
-//! installs a pinner where the OS needs one; with none installed the source
-//! address alone decides.
+//! The output interface of the service's own sockets. Probes can request the
+//! link that owns a source address. DNS that requires a specific secondary
+//! adapter must use the strict interface-index port and propagate its errors.
 
 use std::net::Ipv4Addr;
+use std::num::NonZeroU32;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::OnceLock;
 
@@ -47,6 +44,36 @@ pub fn pin_to_source_link(socket: &impl AsSocketHandle, source: Ipv4Addr) {
             );
         }
     }
+}
+
+/// Restrict an IPv4 socket to the current OS interface index before connecting
+/// it. A successful call is required before the caller can send any bytes.
+/// An index identifies the current adapter in this network namespace, not a
+/// connection across reconnects. Resolve it afresh for a new attempt; an
+/// adapter removed and replaced with the same index cannot be distinguished
+/// from the old one by this socket option alone.
+pub trait InterfacePinner: Send + Sync {
+    fn pin_ipv4(&self, socket: SocketHandle<'_>, index: NonZeroU32) -> Result<(), PlatformError>;
+}
+
+static INTERFACE_PINNER: OnceLock<Box<dyn InterfacePinner>> = OnceLock::new();
+
+/// Install the service's strict socket mechanism before DNS starts.
+pub fn install_interface_pinner(pinner: Box<dyn InterfacePinner>) -> bool {
+    INTERFACE_PINNER.set(pinner).is_ok()
+}
+
+/// An absent mechanism or a rejected socket option fails the DNS attempt.
+pub fn pin_ipv4_to_interface(
+    socket: SocketHandle<'_>,
+    index: NonZeroU32,
+) -> Result<(), PlatformError> {
+    INTERFACE_PINNER
+        .get()
+        .ok_or(PlatformError::NotSupported {
+            reason: "IPv4 socket interface binding is unavailable",
+        })?
+        .pin_ipv4(socket, index)
 }
 
 #[cfg(test)]

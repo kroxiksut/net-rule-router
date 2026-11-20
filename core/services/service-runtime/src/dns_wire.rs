@@ -18,6 +18,9 @@
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
+mod udp;
+pub(crate) use udp::fit_reply as fit_udp_reply;
+
 /// Fixed DNS header length (RFC 1035 §4.1.1).
 pub const DNS_HEADER_LEN: usize = 12;
 /// `QTYPE`/`TYPE` value for an `A` record.
@@ -172,7 +175,7 @@ where
         resp.extend_from_slice(&(octets.len() as u16).to_be_bytes()); // RDLENGTH
         resp.extend_from_slice(octets); // RDATA
     }
-    Some(resp)
+    Some(udp::synthesized_reply(query, resp))
 }
 
 /// Build an `A` response for `query` answering with `ips` at `ttl` seconds.
@@ -190,7 +193,10 @@ pub fn build_aaaa_response(query: &[u8], ips: &[Ipv6Addr], ttl: u32) -> Option<V
 /// `query` has no parseable question.
 pub fn build_error_response(query: &[u8], rcode: u8) -> Option<Vec<u8>> {
     let q = parse_question(query)?;
-    Some(response_prefix(query, q.question_end, rcode, 0))
+    Some(udp::synthesized_reply(
+        query,
+        response_prefix(query, q.question_end, rcode, 0),
+    ))
 }
 
 /// How long a client may remember one of our synthetic "no such name" answers.
@@ -237,7 +243,13 @@ pub fn build_negative_response(query: &[u8], rcode: u8, negative_ttl: u32) -> Op
     resp.extend_from_slice(&600u32.to_be_bytes()); // RETRY
     resp.extend_from_slice(&86400u32.to_be_bytes()); // EXPIRE
     resp.extend_from_slice(&negative_ttl.to_be_bytes()); // MINIMUM — the negative TTL
-    Some(resp)
+    Some(udp::synthesized_reply(query, resp))
+}
+
+/// Exercise the private UDP boundary with both client- and upstream-shaped bytes.
+#[cfg(feature = "fuzzing")]
+pub fn fuzz_udp_reply(query: &[u8], reply: Vec<u8>) -> Option<Vec<u8>> {
+    fit_udp_reply(query, reply)
 }
 
 // ── Client side: raw-UDP upstream pin ────────────────────────────────────────
@@ -796,6 +808,27 @@ pub fn write_tcp_message<W: std::io::Write>(writer: &mut W, message: &[u8]) -> s
 
 #[cfg(test)]
 mod tests {
+    /// Stripping OPT from a synthesized answer makes an EDNS-capable stub
+    /// believe this resolver cannot negotiate its larger UDP receive buffer.
+    #[test]
+    fn synthesized_edns_answers_acknowledge_the_client_opt() {
+        let mut query = super::build_address_query(7, "large.example", QTYPE_A).expect("query");
+        query[10..12].copy_from_slice(&1u16.to_be_bytes());
+        query.extend_from_slice(&[0, 0, 41, 4, 208, 0, 0, 0x80, 0, 0, 0]); // 1232, DO
+        for reply in [
+            super::build_a_response(&query, &[Ipv4Addr::new(192, 0, 2, 1)], 60),
+            super::build_aaaa_response(&query, &[Ipv6Addr::LOCALHOST], 60),
+            super::build_error_response(&query, super::RCODE_SERVFAIL),
+            super::build_negative_response(&query, super::RCODE_NOERROR, 60),
+        ] {
+            let reply = reply.expect("synthesized reply");
+            assert_eq!(&reply[10..12], &[0, 1], "one response OPT");
+            let opt = &reply[reply.len() - 11..];
+            assert_eq!(&opt[..3], &[0, 0, 41], "root owner and OPT type");
+            assert_eq!(&opt[5..], &[0, 0, 0x80, 0, 0, 0], "EDNS0, DO, no options");
+        }
+    }
+
     /// A server may compress the question it echoes; the reply still has to
     /// read as an answer to the same question, or every gate behind
     /// `parse_question` is bypassed by one pointer.

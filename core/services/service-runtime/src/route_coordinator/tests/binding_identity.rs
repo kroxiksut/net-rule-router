@@ -231,7 +231,7 @@ fn a_bound_adapter_that_no_longer_exists_asks_the_user_instead_of_going_quiet() 
     nic.friendly_name = "Ethernet".into();
     // The hard case: the replacement carries NOTHING of the vendor's name,
     // so no amount of token matching can tie it to the binding. A vendor
-    // that keeps its brand (`acme_VPN`) is healed automatically instead —
+    // that keeps its brand (`acme_VPN`) is also offered for confirmation —
     // see the control test below.
     // No way out yet (its client has installed no route), so it cannot be
     // followed by itself and the choice goes back to the user.
@@ -392,11 +392,10 @@ fn a_bound_adapter_whose_driver_will_not_start_is_reported_as_broken_not_gone() 
 }
 
 /// Control for the test above, and the field case as it actually stands: the
-/// vendor kept its brand in the connection name when it swapped transport, so
-/// the binding heals itself and the user is asked nothing. This is what makes
-/// the "gone" branch above a genuine last resort rather than the normal path.
+/// vendor kept its brand in the connection name when it swapped transport.
+/// The shared name is a suggestion, not proof that it is the same VPN.
 #[test]
-fn a_vendor_that_keeps_its_brand_across_a_transport_change_heals_without_asking() {
+fn a_vendor_that_keeps_its_brand_across_a_transport_change_requires_confirmation() {
     use crate::ipc_handlers::event_bus::EventBus;
     use nrr_shared::ipc_payloads::StatusUpdateEvent;
 
@@ -429,8 +428,8 @@ fn a_vendor_that_keeps_its_brand_across_a_transport_change_heals_without_asking(
     .with_event_bus(Arc::clone(&bus));
 
     assert!(
-        coord.resolve("S-BRAND").secondary.is_some(),
-        "the tunnel that kept the brand is adopted",
+        coord.resolve("S-BRAND").secondary.is_none(),
+        "the tunnel that kept the brand must not be adopted without confirmation",
     );
     // Only the role under test: the fixture binds no primary, and that
     // notice is a separate, correct statement about a different role.
@@ -446,7 +445,7 @@ fn a_vendor_that_keeps_its_brand_across_a_transport_change_heals_without_asking(
             _ => None,
         })
         .collect();
-    assert_eq!(statuses, vec!["ok".to_string()], "nothing to ask about");
+    assert_eq!(statuses, vec!["adapter-choice-needed".to_string()]);
 }
 
 #[test]
@@ -608,11 +607,10 @@ fn a_policy_that_appears_ends_the_machine_wide_no_policy_report() {
 }
 
 #[test]
-fn found_but_down_bound_adapter_heals_to_available_same_name_sibling() {
+fn found_but_down_bound_adapter_does_not_heal_to_same_name_sibling() {
     // the bound GUID is still ENUMERATED but DOWN (a GUID-churning
     // VPN can leave a stale/down TAP instance visible while the freshly-connected
-    // one carries traffic). The resolver must heal to the live same-name SIBLING
-    // instead of failing closed on the down instance.
+    // one carries traffic). A matching name does not establish ownership.
     let api = Arc::new(MockWindowsApi::new());
     // `down` = the bound (present-but-down) instance; `sibling` = a live
     // same-family adapter whose version token differs.
@@ -642,15 +640,11 @@ fn found_but_down_bound_adapter_heals_to_available_same_name_sibling() {
 
     let r = coord.resolve("S-DOWN");
     assert!(
-        r.secondary.is_some(),
-        "a present-but-down bound adapter must heal to the live same-name sibling, not fail closed"
+        r.secondary.is_none(),
+        "a present-but-down binding must not move to a same-name sibling"
     );
     let c = captured.lock().unwrap();
-    assert_eq!(c.len(), 1, "the healed sibling id is persisted once");
-    assert_eq!(
-        c[0],
-        "S-DOWN|secondary|win-adapter:newtap|examplevpn vpn adapter"
-    );
+    assert!(c.is_empty(), "the sibling id must not be persisted");
 }
 
 /// The GUI decides "adapter not found" with its own copy of the name matcher,
@@ -780,11 +774,10 @@ fn a_stock_driver_only_match_asks_the_user_instead_of_failing_closed_silently() 
 }
 
 /// A connection the user renamed keeps its binding by id, and the stored name
-/// follows the rename: when the id later changes (a driver reinstall), the
-/// adapter is found again by the name it carries now, not the one it had when
-/// it was bound. Persisted once, not every reconcile.
+/// follows the rename. If the id later changes, the name can suggest a
+/// replacement but cannot authorize switching to it without the user.
 #[test]
-fn a_renamed_adapter_is_found_by_its_new_name_after_its_id_changes() {
+fn a_renamed_adapter_needs_confirmation_after_its_id_changes() {
     let api = Arc::new(MockWindowsApi::new());
     let renamed = |seed: &str, idx: u32| {
         let mut info = adapter(seed, idx, true, true, Some([10, 0, 0, 1]));
@@ -822,7 +815,7 @@ fn a_renamed_adapter_is_found_by_its_new_name_after_its_id_changes() {
     // Reinstalled: a new id, the same connection name.
     api.set_adapter_infos(vec![renamed("bbb", 4)]);
     assert!(
-        coord.resolve("S-REN").secondary.is_some(),
-        "found again by the name it carries now"
+        coord.resolve("S-REN").secondary.is_none(),
+        "the same name does not authorize a different adapter"
     );
 }
