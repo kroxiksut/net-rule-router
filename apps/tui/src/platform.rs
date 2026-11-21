@@ -3,9 +3,21 @@
 
 use nrr_platform_api::authorization::TerminalPromptAgent;
 use nrr_platform_api::installer_agreement::InstallerAgreementPort;
+use nrr_platform_api::local_time::LocalTimeZonePort;
 use nrr_platform_api::path_registration::PathRegistrationPort;
 use nrr_platform_api::service_control::ServiceControlPort;
 use nrr_platform_api::system_locale::SystemLocalePort;
+
+pub fn local_time_zone() -> &'static dyn LocalTimeZonePort {
+    #[cfg(windows)]
+    {
+        &nrr_platform_windows::local_time::WindowsTimeZone
+    }
+    #[cfg(not(windows))]
+    {
+        &nrr_platform_api::local_time::DatabaseTimeZone
+    }
+}
 
 /// Keeps a DLL planted in the current directory or on `PATH` out of this
 /// process. Called first in `main`.

@@ -55,7 +55,7 @@ fn read(file: &Path) -> Option<UserSettings> {
 }
 
 fn now_ms() -> i64 {
-    chrono::Utc::now().timestamp_millis()
+    crate::timestamps::now_ms()
 }
 
 /// The window drops what it parked past its age limit; so does this line.

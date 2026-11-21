@@ -1393,7 +1393,7 @@ fn take_hand_edited(app: &mut AppState, held: &[(nrr_client_logic::Route, PathBu
 
 /// "Replace the file": the rows on screen, the rules in force, are written.
 fn replace_hand_edited(app: &mut AppState, held: &[(nrr_client_logic::Route, PathBuf)]) {
-    let exported_at = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+    let exported_at = crate::timestamps::export_stamp();
     let mut written = Vec::new();
     for (route, path) in held {
         files::take_passthrough_from(&mut app.rules.table, *route, path);
@@ -1766,7 +1766,7 @@ fn bind_imported(
 /// Writes both files, then binds them as the user's rules files, as the GUI
 /// does after every write.
 fn export(app: &mut AppState, path: &Path) {
-    let exported_at = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+    let exported_at = crate::timestamps::export_stamp();
     let written = files::write_set(path, &app.rules.table, &app.rules.file_hint, &exported_at);
     if let Err((file, error)) = written {
         let file = file.display().to_string();
@@ -1827,7 +1827,7 @@ fn export_route(app: &mut AppState, route: nrr_client_logic::Route, file: &Path)
             return;
         }
     }
-    let exported_at = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+    let exported_at = crate::timestamps::export_stamp();
     let written = files::write_route(
         file,
         route,

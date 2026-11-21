@@ -195,7 +195,7 @@ fn converge(app: &mut AppState, added: &[String]) {
         return;
     };
     let bound = [settings.rules_files.primary, settings.rules_files.secondary];
-    let exported_at = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+    let exported_at = crate::timestamps::export_stamp();
     let mut written = Vec::new();
     let mut held = Vec::new();
     for (route, path) in Route::ALL.into_iter().zip(&bound) {

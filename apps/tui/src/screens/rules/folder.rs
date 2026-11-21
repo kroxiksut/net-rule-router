@@ -146,7 +146,7 @@ fn adopt(app: &mut AppState, file: &Path, folder: &Path) -> Note {
         }
     }
 
-    let exported_at = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+    let exported_at = crate::timestamps::export_stamp();
     let written = files::write_set(&dir, &app.rules.table, &app.rules.file_hint, &exported_at);
     if let Err((path, error)) = written {
         let path = path.display().to_string();

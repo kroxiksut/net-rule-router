@@ -332,6 +332,13 @@ fn copy_error(e: &PlatformError) -> PlatformError {
             code: *code,
             message: message.clone(),
         },
+        PlatformError::IncompleteRollback {
+            original,
+            rollback_errors,
+        } => PlatformError::IncompleteRollback {
+            original: Box::new(copy_error(original)),
+            rollback_errors: rollback_errors.iter().map(copy_error).collect(),
+        },
     }
 }
 

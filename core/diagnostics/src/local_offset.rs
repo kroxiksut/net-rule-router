@@ -8,7 +8,26 @@ use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::OnceLock;
 use std::time::Instant;
 
-use chrono::{Local, Offset};
+use jiff::{civil::DateTime, tz::Offset, Timestamp};
+use nrr_platform_api::local_time::{DatabaseTimeZone, LocalTimeZonePort};
+
+static SYSTEM_ZONE: OnceLock<&'static dyn LocalTimeZonePort> = OnceLock::new();
+
+/// Supplies the OS's own time-zone rules before the process starts logging.
+pub fn install_system_time_zone(zone: &'static dyn LocalTimeZonePort) {
+    let _ = SYSTEM_ZONE.set(zone);
+}
+
+fn zone() -> &'static dyn LocalTimeZonePort {
+    SYSTEM_ZONE.get().copied().unwrap_or(&DatabaseTimeZone)
+}
+
+pub(crate) fn civil_at(at: Timestamp) -> DateTime {
+    let offset = zone().utc_offset_seconds(at.as_millisecond());
+    Offset::from_seconds(offset)
+        .unwrap_or(Offset::UTC)
+        .to_datetime(at)
+}
 
 /// How long a read offset is reused. Short enough that a DST switch shows up
 /// within the minute, long enough that a busy log never queries the OS twice.
@@ -27,7 +46,8 @@ pub fn seconds() -> i32 {
     let now_ms =
         i64::try_from(EPOCH.get_or_init(Instant::now).elapsed().as_millis()).unwrap_or(i64::MAX);
     cached_or_read(&CACHE, now_ms, || {
-        Local::now().offset().fix().local_minus_utc()
+        Timestamp::try_from(std::time::SystemTime::now())
+            .map_or(0, |at| zone().utc_offset_seconds(at.as_millisecond()))
     })
 }
 

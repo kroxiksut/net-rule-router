@@ -659,12 +659,12 @@ fn build_failure_does_not_leave_orphan_temp_files() {
 fn zip_entries_are_stamped_with_local_wall_clock_time() {
     // Captured before/after the build call so the assertion can't flake
     // near a wall-clock rollover (second, minute, midnight, ...).
-    let before = chrono::Local::now();
+    let before = jiff::ZonedDateTime::now().datetime();
     let dir = tempfile::tempdir().expect("temp");
     let dest = dir.path().join("diag.zip");
     let req = DiagnosticArchiveRequest::default_export("0.1.0-test");
     ArchiveBuilder::build(sample_input(req), &dest).expect("build");
-    let after = chrono::Local::now();
+    let after = jiff::ZonedDateTime::now().datetime();
 
     let file = std::fs::File::open(&dest).expect("open zip");
     let mut zip = zip::ZipArchive::new(file).expect("parse zip");
@@ -673,27 +673,24 @@ fn zip_entries_are_stamped_with_local_wall_clock_time() {
         .last_modified()
         .expect("entry carries a modified time");
 
-    let entry_naive = chrono::NaiveDate::from_ymd_opt(
-        mtime.year() as i32,
-        mtime.month() as u32,
-        mtime.day() as u32,
+    let entry_naive = jiff::civil::DateTime::new(
+        mtime.year() as i16,
+        mtime.month() as i8,
+        mtime.day() as i8,
+        mtime.hour() as i8,
+        mtime.minute() as i8,
+        mtime.second() as i8,
+        0,
     )
-    .and_then(|date| {
-        date.and_hms_opt(
-            mtime.hour() as u32,
-            mtime.minute() as u32,
-            mtime.second() as u32,
-        )
-    })
     .expect("zip entry stores a valid calendar date/time");
 
     // DOS timestamps have 2-second resolution and drop odd seconds, so
     // widen the [before, after] window by a few seconds on both ends.
     // Under the old UTC-"now" behavior this assertion fails on any
     // machine whose local offset from UTC is nonzero.
-    let tolerance = chrono::Duration::seconds(3);
-    let lower = before.naive_local() - tolerance;
-    let upper = after.naive_local() + tolerance;
+    let tolerance = jiff::SignedDuration::from_secs(3);
+    let lower = before - tolerance;
+    let upper = after + tolerance;
     assert!(
         entry_naive >= lower && entry_naive <= upper,
         "expected entry mtime {entry_naive:?} within [{lower:?}, {upper:?}] \

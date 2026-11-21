@@ -4068,6 +4068,8 @@
       "hosts-file-entries-capped": "The OS hosts file names more hosts than are kept; the first {kept} are used and the rest are ignored.",
       "principal-routes-apply-failed": "System routes could not be applied ({reason}); traffic is filtered but not steered correctly.",
       "principal-routes-unresolved-no-link": "No live additional connection is available to route through; some users' routes were not installed.",
+      "principal-routes-unresolved-ipv6": "The selected connection has no usable IPv6 forwarding path; some routes were not installed.",
+      "principal-routes-unresolved-table": "A user's routing table is unavailable; some routes were not installed.",
       "principal-blanket-block-not-armed": "The full traffic block these settings request could not be armed; traffic outside the routing rules is not being blocked.",
       "principal-plan-held-back-unreadable": "The rules or settings of {principals} could not be read; their last applied policy is kept while everyone else was applied.",
       "principal-rule-not-enforced-as-written": "A rule could not be enforced exactly as written: {note}.",

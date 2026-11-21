@@ -126,6 +126,11 @@ pub enum PlatformError {
         code: i32,
         message: String,
     },
+    /// A platform mutation failed and at least one compensating operation failed.
+    IncompleteRollback {
+        original: Box<PlatformError>,
+        rollback_errors: Vec<PlatformError>,
+    },
 }
 
 impl fmt::Display for PlatformError {
@@ -163,11 +168,28 @@ impl fmt::Display for PlatformError {
             Self::NotSupported { reason } => {
                 write!(f, "not supported: {reason}")
             }
+            Self::IncompleteRollback {
+                original,
+                rollback_errors,
+            } => {
+                write!(f, "{original}. Incomplete rollback:")?;
+                for error in rollback_errors {
+                    write!(f, " [{error}]")?;
+                }
+                Ok(())
+            }
         }
     }
 }
 
-impl std::error::Error for PlatformError {}
+impl std::error::Error for PlatformError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::IncompleteRollback { original, .. } => Some(original.as_ref()),
+            _ => None,
+        }
+    }
+}
 
 /// How the apply layer should handle a `PlatformError`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -197,6 +219,18 @@ pub enum MutationIntent {
 }
 
 impl PlatformError {
+    /// Keep the original error unchanged when all compensating operations succeed.
+    pub fn with_rollback_errors(self, rollback_errors: Vec<Self>) -> Self {
+        if rollback_errors.is_empty() {
+            self
+        } else {
+            Self::IncompleteRollback {
+                original: Box::new(self),
+                rollback_errors,
+            }
+        }
+    }
+
     /// True when this error means "the app rule's executable is not installed
     /// on this host" — `FwpmGetAppIdFromFileName0` returning
     /// `ERROR_FILE_NOT_FOUND` (2) or `ERROR_PATH_NOT_FOUND` (3). A block/route
@@ -313,6 +347,7 @@ impl PlatformError {
             Self::StateCorrupted { .. } => ErrorClass::Fatal,
             Self::NotSupported { .. } => ErrorClass::Fatal,
             Self::Errno { code, .. } => classify_errno(*code),
+            Self::IncompleteRollback { .. } => ErrorClass::Fatal,
         };
         match (intent, class) {
             (MutationIntent::Add, ErrorClass::Idempotent) => ErrorClass::Fatal,

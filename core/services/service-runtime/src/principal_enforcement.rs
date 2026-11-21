@@ -175,7 +175,7 @@ impl CycleOutcome {
     pub fn landed(&self) -> Result<(), String> {
         match self {
             Self::Applied { routes, .. } => {
-                match routes.as_ref().and_then(|r| r.failure.as_deref()) {
+                match routes.as_ref().and_then(|r| r.incomplete_reason()) {
                     Some(why) => Err(format!("filters applied but routes were not: {why}")),
                     None => Ok(()),
                 }
@@ -803,6 +803,7 @@ impl PrincipalEnforcementCycle {
                 });
                 timings.mark("routes");
                 let routes_failed = routes.as_ref().is_some_and(|r| r.failure.is_some());
+                let routes_incomplete = routes.as_ref().is_some_and(|r| r.is_incomplete());
 
                 if let Some(flow_reset) = self.flow_reset.as_ref() {
                     if routes_failed {
@@ -840,7 +841,7 @@ impl PrincipalEnforcementCycle {
                 // neither does a book that did not read.
                 if let Some(inputs) = self.inputs.as_ref() {
                     match fingerprint {
-                        Some(fp) if !routes_failed && held_back.is_empty() => inputs.settle(fp),
+                        Some(fp) if !routes_incomplete && held_back.is_empty() => inputs.settle(fp),
                         _ => inputs.unsettle(),
                     }
                 }
@@ -1122,13 +1123,29 @@ pub fn log_outcome(outcome: &CycleOutcome, trigger: &'static str, authority: &'s
                     );
                 }
                 if !routes.unresolved.is_empty() {
-                    tracing::warn!(
-                        target: "nrr::routes",
-                        msg_key = "principal-routes-unresolved-no-link",
-                        trigger,
-                        principals = ?routes.unresolved,
-                        "no live secondary link to steer through; their routes were not installed",
-                    );
+                    use crate::route_apply::RouteResolutionReason;
+                    for reason in &routes.unresolved_reasons {
+                        match reason {
+                            RouteResolutionReason::SecondaryUnavailable => tracing::warn!(
+                                target: "nrr::routes",
+                                msg_key = "principal-routes-unresolved-no-link",
+                                trigger,
+                                "no live additional interface to steer through; some routes were not installed",
+                            ),
+                            RouteResolutionReason::Ipv6ForwardingUnavailable => tracing::warn!(
+                                target: "nrr::routes",
+                                msg_key = "principal-routes-unresolved-ipv6",
+                                trigger,
+                                "the selected interface has no usable IPv6 forwarding path; some routes were not installed",
+                            ),
+                            RouteResolutionReason::PrincipalTableUnavailable => tracing::warn!(
+                                target: "nrr::routes",
+                                msg_key = "principal-routes-unresolved-table",
+                                trigger,
+                                "a user's routing table is unavailable; some routes were not installed",
+                            ),
+                        }
+                    }
                 }
                 if routes.added > 0 || routes.removed > 0 {
                     tracing::info!(
@@ -1256,6 +1273,27 @@ impl PrincipalEnforcementCycle {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn unresolved_routes_are_not_reported_as_landed() {
+        let outcome = CycleOutcome::Applied {
+            principals: Vec::new(),
+            report: nrr_platform_api::enforcement::ApplyReport::default(),
+            changed: true,
+            delta: None,
+            unprotected: Vec::new(),
+            guarded: 0,
+            routes: Some(crate::route_apply::RouteApplyReport {
+                unresolved: vec!["private-principal-1001".into()],
+                ..Default::default()
+            }),
+            held_back: Vec::new(),
+        };
+        let reason = outcome
+            .landed()
+            .expect_err("filters alone are not a complete policy");
+        assert!(!reason.contains("private-principal-1001"), "{reason}");
+    }
 
     #[test]
     fn a_pass_with_failed_routes_does_not_land() {
@@ -1911,6 +1949,104 @@ mod tests {
     /// Filters landing while the routes fail is not a settled pass: a failed
     /// route apply usually leaves the table as it was, so no input moves to
     /// bring the retry back before the periodic full pass.
+    #[test]
+    fn unresolved_routes_retry_on_the_next_tick_and_settle_only_after_recovery() {
+        use nrr_platform_api::adapters::{AdapterInfo, IfOperStatus, InterfaceType};
+        use nrr_platform_api::enforcement::{
+            EgressBinding, EgressBindingSource, EgressRef, RouteIntent,
+        };
+        use std::sync::atomic::AtomicBool;
+
+        struct OneRoute;
+        impl PrincipalPlanSource for OneRoute {
+            fn plan_for(
+                &self,
+                principal: &UserPrincipal,
+                _: ChannelAvailability,
+            ) -> Option<PlannedPolicy> {
+                Some(PlannedPolicy {
+                    plan: EnforcementPlan {
+                        principal: principal.clone(),
+                        flows: Vec::new(),
+                        routes: vec![RouteIntent {
+                            dst: nrr_platform_api::enforcement::DstMatch::HostV4(
+                                [198, 51, 100, 4].into(),
+                            ),
+                            egress: EgressRef::Secondary,
+                            metric: crate::route_codegen::SECONDARY_ROUTE_METRIC,
+                            table: nrr_platform_api::RouteTableRef::Main,
+                        }],
+                        policy_rules: Vec::new(),
+                    },
+                    protection_complete: true,
+                    fail_closed_blocks: 0,
+                    guard_holding: false,
+                })
+            }
+        }
+        struct Binding(Arc<AtomicBool>);
+        impl EgressBindingSource for Binding {
+            fn bindings_for(&self, _: &UserPrincipal) -> EgressBinding {
+                EgressBinding {
+                    primary: None,
+                    secondary: self.0.load(Ordering::Acquire).then(|| "tun-test".into()),
+                }
+            }
+        }
+        let recovered = Arc::new(AtomicBool::new(false));
+        let adapters = Arc::new(nrr_platform_api::adapters::MockAdapterEventSource::new());
+        adapters
+            .adapters
+            .lock()
+            .expect("adapters")
+            .push(AdapterInfo {
+                index: 7,
+                adapter_name: "tun-test".into(),
+                description: String::new(),
+                friendly_name: "tun-test".into(),
+                mac: None,
+                interface_type: InterfaceType::Ethernet,
+                oper_status: IfOperStatus::Up,
+                ipv4_addresses: Vec::new(),
+                ipv6_addresses: Vec::new(),
+                gateways: Vec::new(),
+            });
+        let c = PrincipalEnforcementCycle::new(
+            Arc::new(ScriptedPrincipals {
+                answer: Some(vec![uid(1000)]),
+            }),
+            Arc::new(OneRoute),
+            Arc::new(RecordingEnforcer::new(false)),
+        )
+        .with_routes(Arc::new(crate::route_apply::PlannedRouteApplier::new(
+            Arc::new(nrr_platform_api::MockWindowsApi::new()),
+            adapters,
+            Arc::new(Binding(Arc::clone(&recovered))),
+        )))
+        .with_pass_inputs(
+            crate::pass_inputs::PassInputs::new().with_source("test", Arc::new(|| Some(7))),
+        );
+
+        for _ in 0..2 {
+            assert!(
+                matches!(
+                    c.tick_if_changed_logged("timer"),
+                    CycleOutcome::Applied { routes: Some(ref r), .. } if !r.unresolved.is_empty()
+                ),
+                "a missing route must not be remembered as fully applied"
+            );
+        }
+        recovered.store(true, Ordering::Release);
+        assert!(matches!(
+            c.tick_if_changed_logged("timer"),
+            CycleOutcome::Applied { routes: Some(ref r), .. } if r.unresolved.is_empty() && r.failure.is_none()
+        ));
+        assert!(matches!(
+            c.tick_if_changed_logged("timer"),
+            CycleOutcome::Unchanged
+        ));
+    }
+
     #[test]
     fn a_pass_whose_routes_failed_is_not_remembered_as_settled() {
         use nrr_platform_api::adapters::{AdapterEventSource, AdapterInfo};

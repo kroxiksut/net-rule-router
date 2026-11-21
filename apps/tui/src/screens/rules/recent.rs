@@ -6,7 +6,6 @@
 
 use std::collections::HashMap;
 
-use chrono::TimeZone;
 use nrr_client_logic::recent_changes::{
     recent_change_stamp, recent_change_time, recent_period_since, RecentPeriod,
 };
@@ -94,16 +93,13 @@ fn offset_at(at: i64) -> i64 {
     if cfg!(test) {
         return 0;
     }
-    chrono::Local
-        .timestamp_opt(at, 0)
-        .single()
-        .map_or(0, |moment| {
-            i64::from(moment.offset().local_minus_utc()) / 60
-        })
+    i64::from(crate::timestamps::utc_offset_seconds(
+        at.saturating_mul(1000),
+    )) / 60
 }
 
 fn now() -> i64 {
-    chrono::Utc::now().timestamp()
+    crate::timestamps::now_seconds()
 }
 
 /// `14:32`, `yesterday 14:32` or `14.10 14:32`.

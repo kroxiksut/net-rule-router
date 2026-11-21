@@ -45,9 +45,8 @@ sha2 = "0.10"
 # Rule-set bytes for the preset import, which the service takes base64-encoded.
 # The version the service already links.
 base64 = "0.22"
-# Log and trace times in the reader's local time, as the GUI shows them. The
-# same features the launcher and diagnostics already link: nothing new built.
-chrono = { version = "0.4", default-features = false, features = ["clock"] }
+# Formats UTC exports and wall-clock timestamps resolved by the platform port.
+jiff.workspace = true
 
 [target.'cfg(windows)'.dependencies]
 # Service query (is it installed / stopped), display language, DLL search order.

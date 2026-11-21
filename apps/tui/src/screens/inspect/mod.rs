@@ -95,44 +95,42 @@ fn unencodable<E>(_: E) -> String {
 
 /// `YYYY-MM-DD HH:MM` in local time (`formatTimestamp`), "—" for none.
 pub(crate) fn wall_clock(ms: i64) -> String {
-    zoned(ms, "%Y-%m-%d %H:%M")
+    crate::timestamps::display_local_time(ms).map_or_else(
+        || "—".to_owned(),
+        |at| at.strftime("%Y-%m-%d %H:%M").to_string(),
+    )
 }
 
 /// With seconds and the zone offset, as the GUI's log view shows a time.
 fn wall_clock_seconds(ms: i64) -> String {
-    zoned(ms, "%Y-%m-%d %H:%M:%S %:z")
-}
-
-fn zoned(ms: i64, format: &str) -> String {
-    local_time(ms).map_or_else(|| "—".to_owned(), |at| at.format(format).to_string())
+    crate::timestamps::display_local_time(ms).map_or_else(
+        || "—".to_owned(),
+        |at| {
+            format!(
+                "{} {}",
+                at.strftime("%Y-%m-%d %H:%M:%S"),
+                crate::timestamps::display_offset(at.offset())
+            )
+        },
+    )
 }
 
 /// `HH:MM:SS` for a time today, with the date before it otherwise.
 fn clock_time(ms: i64) -> String {
-    clock_time_at(ms, chrono::Utc::now().timestamp_millis())
+    clock_time_at(ms, crate::timestamps::now_ms())
 }
 
 fn clock_time_at(ms: i64, now_ms: i64) -> String {
-    let Some(at) = local_time(ms) else {
+    let Some(at) = crate::timestamps::display_local_time(ms) else {
         return "—".to_owned();
     };
-    let today = local_time(now_ms).map(|now| now.date_naive());
-    let format = if today == Some(at.date_naive()) {
+    let today = crate::timestamps::display_local_time(now_ms).map(|now| now.date());
+    let format = if today == Some(at.date()) {
         "%H:%M:%S"
     } else {
         "%Y-%m-%d %H:%M:%S"
     };
-    at.format(format).to_string()
-}
-
-fn local_time(ms: i64) -> Option<chrono::DateTime<chrono::FixedOffset>> {
-    let at = chrono::DateTime::from_timestamp_millis(ms).filter(|_| ms > 0)?;
-    // Snapshots must not depend on the zone of the machine running them.
-    #[cfg(test)]
-    let at = at.fixed_offset();
-    #[cfg(not(test))]
-    let at = at.with_timezone(&chrono::Local).fixed_offset();
-    Some(at)
+    at.strftime(format).to_string()
 }
 
 /// Where the reader is in a list.

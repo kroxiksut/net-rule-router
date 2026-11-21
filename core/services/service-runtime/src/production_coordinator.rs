@@ -25,6 +25,7 @@
 //!   orchestrator's existing per-SID APIs already produce the action
 //!   plan / install / remove primitives the coordinator needs.
 
+use std::io::{self, Read};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -596,9 +597,8 @@ impl ActivationAuditEmitter for ProductionActivationAuditEmitter {
 // ── ProductionApplyMarkerStore ───────────────────────────────────────────────
 
 /// File-backed `ApplyMarkerStore`. Persists a single JSON document at
-/// `marker_path`. Writes are atomic via `.tmp` + rename. Reads return
-/// `None` when the file is absent or malformed (treated as "no marker
-/// present" — bootstrap will not trigger recovery).
+/// `marker_path`. Writes are atomic via `.tmp` + rename. Reads distinguish
+/// an absent file from an unreadable or malformed marker.
 ///
 /// Format (kebab-case JSON):
 /// ```json
@@ -615,6 +615,10 @@ impl ActivationAuditEmitter for ProductionActivationAuditEmitter {
 pub struct ProductionApplyMarkerStore {
     marker_path: PathBuf,
 }
+
+// A previously stored correlation ID can occupy almost an entire IPC frame.
+// Allow room for re-encoding and the generated fields while bounding startup reads.
+const MAX_APPLY_MARKER_BYTES: usize = 2 * nrr_shared::ipc_transport::IPC_MAX_MESSAGE_BYTES;
 
 impl ProductionApplyMarkerStore {
     pub fn new(data_dir: &std::path::Path) -> Self {
@@ -653,9 +657,7 @@ impl ProductionApplyMarkerStore {
     /// Serialised by the JSON library, not by hand. The hand-rolled version
     /// escaped the quote and nothing else, so a `correlation_id` carrying a
     /// backslash — it comes from the caller — wrote a marker that
-    /// [`Self::marker_from_json`] could not read back. An unreadable marker is
-    /// not "no marker": after a crash mid-apply the recovery then read
-    /// "nothing was in flight" and proceeded normally instead of rolling back.
+    /// [`Self::marker_from_json`] could not read back.
     fn marker_to_json(marker: &ApplyAttemptMarker) -> String {
         serde_json::json!({
             "attempt-id": marker.attempt_id,
@@ -688,10 +690,32 @@ impl ProductionApplyMarkerStore {
 }
 
 impl ApplyMarkerStore for ProductionApplyMarkerStore {
-    fn read(&self) -> Option<ApplyAttemptMarker> {
-        let bytes = std::fs::read(&self.marker_path).ok()?;
-        let json = std::str::from_utf8(&bytes).ok()?;
+    fn read(&self) -> io::Result<Option<ApplyAttemptMarker>> {
+        let file = match std::fs::File::open(&self.marker_path) {
+            Ok(file) => file,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(error),
+        };
+        if !file.metadata()?.is_file() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "expected a regular file",
+            ));
+        }
+        let mut bytes = Vec::new();
+        file.take(MAX_APPLY_MARKER_BYTES as u64 + 1)
+            .read_to_end(&mut bytes)?;
+        if bytes.len() > MAX_APPLY_MARKER_BYTES {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "file exceeds the marker size limit",
+            ));
+        }
+        let json = std::str::from_utf8(&bytes)
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "invalid UTF-8"))?;
         Self::marker_from_json(json)
+            .map(Some)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "invalid marker JSON"))
     }
 
     fn write(&self, marker: &ApplyAttemptMarker) -> Result<(), String> {
@@ -1186,14 +1210,14 @@ pub fn run_crash_recovery_on_startup(
 ) -> CrashRecoveryOutcome {
     let marker_store = ProductionApplyMarkerStore::new(data_dir);
 
-    // Quick exit when no marker is present — most boots.
-    if marker_store.read().is_none() {
-        return CrashRecoveryOutcome::Clean;
-    }
-
-    let writer = match audit_writer {
-        Some(w) => w,
-        None => return CrashRecoveryOutcome::SkippedNoAudit,
+    let Some(writer) = audit_writer else {
+        return match marker_store.read() {
+            Ok(None) => CrashRecoveryOutcome::Clean,
+            Ok(Some(_)) => CrashRecoveryOutcome::SkippedNoAudit,
+            Err(error) => CrashRecoveryOutcome::ManualActionRequired {
+                reason: format!("cannot read apply marker: {error}"),
+            },
+        };
     };
     let sink = ProductionRecoveryAuditSink::new(writer, ids);
     let coordinator = StartupRecoveryCoordinator::new(marker_store, sink);
@@ -1999,7 +2023,7 @@ mod tests {
     fn marker_store_read_returns_none_when_file_absent() {
         let dir = tempfile::tempdir().expect("tempdir");
         let store = ProductionApplyMarkerStore::new(dir.path());
-        assert!(store.read().is_none());
+        assert!(store.read().expect("read marker").is_none());
     }
 
     #[test]
@@ -2016,8 +2040,7 @@ mod tests {
             correlation_id: "corr-1".into(),
         };
         store.write(&marker).expect("write");
-        let read_back = store.read().expect("read");
-        assert_eq!(read_back, marker);
+        assert_eq!(store.read().expect("read marker"), Some(marker));
     }
 
     /// The `correlation_id` comes from the caller. Hand-escaping only the quote
@@ -2044,7 +2067,7 @@ mod tests {
             correlation_id: format!("corr{bs}{quote}{newline}1"),
         };
         store.write(&marker).expect("write");
-        assert_eq!(store.read().expect("read"), marker);
+        assert_eq!(store.read().expect("read marker"), Some(marker));
     }
 
     #[test]
@@ -2061,9 +2084,9 @@ mod tests {
             correlation_id: "corr-clear".into(),
         };
         store.write(&marker).expect("write");
-        assert!(store.read().is_some());
+        assert!(store.read().expect("read marker").is_some());
         store.clear().expect("clear");
-        assert!(store.read().is_none());
+        assert!(store.read().expect("read marker").is_none());
     }
 
     #[test]
@@ -2089,6 +2112,67 @@ mod tests {
     }
 
     #[test]
+    fn crash_recovery_invalid_utf8_marker_is_not_clean() {
+        assert_unreadable_marker_is_reported(&[0xff]);
+    }
+
+    #[test]
+    fn crash_recovery_truncated_json_marker_is_not_clean() {
+        assert_unreadable_marker_is_reported(br#"{"phase":"applying"#);
+    }
+
+    #[test]
+    fn crash_recovery_oversized_marker_is_refused() {
+        let marker = ApplyAttemptMarker {
+            attempt_id: "att-oversized".into(),
+            active_revision_id: "rev-oversized".into(),
+            phase: ApplyPhase::Applying,
+            started_at_epoch_secs: 1,
+            last_step_at_epoch_secs: 1,
+            intended_rollback_to: None,
+            correlation_id: "corr-oversized".into(),
+        };
+        let mut bytes = ProductionApplyMarkerStore::marker_to_json(&marker).into_bytes();
+        bytes.resize(
+            2 * nrr_shared::ipc_transport::IPC_MAX_MESSAGE_BYTES + 1,
+            b' ',
+        );
+        assert_unreadable_marker_is_reported(&bytes);
+    }
+
+    fn assert_unreadable_marker_is_reported(bytes: &[u8]) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let marker_path = dir.path().join("apply_marker.json");
+        std::fs::write(&marker_path, bytes).expect("write marker fixture");
+        assert_marker_read_problem_is_reported(dir.path());
+        assert_eq!(std::fs::read(&marker_path).expect("marker remains"), bytes);
+    }
+
+    #[test]
+    fn crash_recovery_marker_io_error_is_not_clean() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let marker_path = dir.path().join("apply_marker.json");
+        std::fs::create_dir(&marker_path).expect("create directory in place of marker");
+        assert_marker_read_problem_is_reported(dir.path());
+        assert!(
+            marker_path.is_dir(),
+            "unexpected entry must remain in place"
+        );
+    }
+
+    fn assert_marker_read_problem_is_reported(data_dir: &std::path::Path) {
+        let outcome =
+            run_crash_recovery_on_startup(data_dir, None, Arc::new(ProductionIdGenerator::new()));
+        assert_ne!(outcome, CrashRecoveryOutcome::Clean);
+        let mut report = crate::managers::BootstrapReport::default();
+        outcome.record_in(&mut report);
+        assert!(
+            !report.phases.is_empty(),
+            "marker read failure must reach health"
+        );
+    }
+
+    #[test]
     fn crash_recovery_present_marker_without_audit_returns_skipped() {
         let dir = tempfile::tempdir().expect("tempdir");
         let store = ProductionApplyMarkerStore::new(dir.path());
@@ -2106,7 +2190,7 @@ mod tests {
             run_crash_recovery_on_startup(dir.path(), None, Arc::new(ProductionIdGenerator::new()));
         assert_eq!(outcome, CrashRecoveryOutcome::SkippedNoAudit);
         // Marker stays in place — recovery did not run.
-        assert!(store.read().is_some());
+        assert!(store.read().expect("read marker").is_some());
     }
 
     #[test]

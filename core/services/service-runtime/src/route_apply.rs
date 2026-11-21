@@ -36,6 +36,44 @@ use nrr_platform_api::RouteEntry;
 
 use crate::route_reconciler::SecondaryRouteReconciler;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RouteResolutionReason {
+    SecondaryUnavailable,
+    Ipv6ForwardingUnavailable,
+    PrincipalTableUnavailable,
+}
+
+impl RouteResolutionReason {
+    fn description(self) -> &'static str {
+        match self {
+            Self::SecondaryUnavailable => "the selected additional interface is unavailable",
+            Self::Ipv6ForwardingUnavailable => {
+                "the selected interface has no usable IPv6 forwarding path"
+            }
+            Self::PrincipalTableUnavailable => "the user's routing table is unavailable",
+        }
+    }
+}
+
+/// Keep the cause beside the missing plan as it is lowered. Reasons are
+/// aggregated independently of identities so health can safely broadcast them.
+#[derive(Default)]
+struct UnresolvedRoutes {
+    principals: Vec<String>,
+    reasons: Vec<RouteResolutionReason>,
+}
+
+impl UnresolvedRoutes {
+    fn record(&mut self, principal: &UserPrincipal, reason: RouteResolutionReason) {
+        if !self.principals.iter().any(|p| p == principal.as_stored()) {
+            self.principals.push(principal.as_stored().to_owned());
+        }
+        if !self.reasons.contains(&reason) {
+            self.reasons.push(reason);
+        }
+    }
+}
+
 /// What one route pass did.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct RouteApplyReport {
@@ -44,10 +82,44 @@ pub struct RouteApplyReport {
     /// Plans with routes that could not be installed because the selected
     /// interface or its IPv6 forwarding path was unavailable.
     pub unresolved: Vec<String>,
+    pub unresolved_reasons: Vec<RouteResolutionReason>,
     /// Why the pass could not run at all. Carried in the report rather than
     /// returned as an error, so a route failure is visible beside a successful
     /// filter apply instead of collapsing the whole pass into a failure.
     pub failure: Option<String>,
+}
+
+impl RouteApplyReport {
+    /// Filtering without steering is incomplete even if table writes did not fail.
+    pub fn is_incomplete(&self) -> bool {
+        self.failure.is_some() || !self.unresolved.is_empty()
+    }
+
+    /// Operator-grade reason shared by apply acknowledgement and health. User
+    /// identities stay in the internal report, never in a broadcast message.
+    pub fn incomplete_reason(&self) -> Option<String> {
+        let mut reasons: Vec<String> = self.failure.iter().cloned().collect();
+        if !self.unresolved.is_empty() {
+            let users = self
+                .unresolved
+                .iter()
+                .collect::<std::collections::BTreeSet<_>>()
+                .len();
+            let detail = if self.unresolved_reasons.is_empty() {
+                "a selected interface, forwarding path or routing table is unavailable".to_owned()
+            } else {
+                self.unresolved_reasons
+                    .iter()
+                    .map(|r| r.description())
+                    .collect::<Vec<_>>()
+                    .join("; ")
+            };
+            reasons.push(format!(
+                "routes for {users} user(s) were not installed: {detail}"
+            ));
+        }
+        (!reasons.is_empty()).then(|| reasons.join("; "))
+    }
 }
 
 /// Who one route pass is for.
@@ -159,7 +231,7 @@ impl PlannedRouteApplier {
         self.adopt_leftovers();
         let forwarding = self.read_ipv6_forwarding(plans);
         let mut desired = Vec::new();
-        let mut unresolved = Vec::new();
+        let mut unresolved = UnresolvedRoutes::default();
         for plan in plans {
             desired.extend(self.lowered(plan, &adapters, &forwarding, &mut unresolved));
         }
@@ -186,7 +258,7 @@ impl PlannedRouteApplier {
         self.adopt_leftovers();
         let forwarding = self.read_ipv6_forwarding(pass.plans);
         let mut desired = Vec::new();
-        let mut unresolved = Vec::new();
+        let mut unresolved = UnresolvedRoutes::default();
         let mut selectors = SelectorPlan::default();
         let mut system = TableSelector::default();
         for principal in pass.present {
@@ -204,7 +276,9 @@ impl PlannedRouteApplier {
                     desired.extend(in_table(&routes, &table));
                     selectors.users.push((principal.clone(), selector));
                 }
-                None if !routes.is_empty() => unresolved.push(principal.as_stored().to_owned()),
+                None if !routes.is_empty() => {
+                    unresolved.record(principal, RouteResolutionReason::PrincipalTableUnavailable)
+                }
                 None => {}
             }
             if pass.owner == Some(principal) {
@@ -255,7 +329,7 @@ impl PlannedRouteApplier {
         let adapters = self.read_adapters()?;
         self.adopt_leftovers();
         let forwarding = self.read_ipv6_forwarding(std::slice::from_ref(plan));
-        let mut unresolved = Vec::new();
+        let mut unresolved = UnresolvedRoutes::default();
         let routes = self.lowered(plan, &adapters, &forwarding, &mut unresolved);
         let port = self
             .principal_routing
@@ -321,7 +395,7 @@ impl PlannedRouteApplier {
         plan: &EnforcementPlan,
         adapters: &[AdapterInfo],
         forwarding: &[RouteEntry],
-        unresolved: &mut Vec<String>,
+        unresolved: &mut UnresolvedRoutes,
     ) -> Vec<RouteEntry> {
         let binding = self.bindings.bindings_for(&plan.principal);
         let secondary = binding
@@ -334,7 +408,7 @@ impl PlannedRouteApplier {
             .and_then(|name| target_for(adapters, name));
         let Some(secondary) = secondary else {
             if !plan.routes.is_empty() {
-                unresolved.push(plan.principal.as_stored().to_owned());
+                unresolved.record(&plan.principal, RouteResolutionReason::SecondaryUnavailable);
             }
             return Vec::new();
         };
@@ -363,7 +437,10 @@ impl PlannedRouteApplier {
                     .any(|target| target.interface_index == route.interface_index)
         });
         if routes.len() < count {
-            unresolved.push(plan.principal.as_stored().to_owned());
+            unresolved.record(
+                &plan.principal,
+                RouteResolutionReason::Ipv6ForwardingUnavailable,
+            );
         }
         routes
     }
@@ -371,7 +448,7 @@ impl PlannedRouteApplier {
     fn reconcile(
         &self,
         desired: &[RouteEntry],
-        unresolved: Vec<String>,
+        unresolved: UnresolvedRoutes,
         planned_at: Option<u64>,
     ) -> Result<RouteApplyReport, String> {
         let delta = match planned_at {
@@ -382,7 +459,8 @@ impl PlannedRouteApplier {
         Ok(RouteApplyReport {
             added: delta.added,
             removed: delta.removed,
-            unresolved,
+            unresolved: unresolved.principals,
+            unresolved_reasons: unresolved.reasons,
             failure: None,
         })
     }
@@ -408,6 +486,7 @@ impl PlannedRouteApplier {
             added: delta.added,
             removed: delta.removed,
             unresolved: Vec::new(),
+            unresolved_reasons: Vec::new(),
             failure: None,
         })
     }
@@ -428,6 +507,7 @@ impl PlannedRouteApplier {
             added: delta.added,
             removed: delta.removed,
             unresolved: Vec::new(),
+            unresolved_reasons: Vec::new(),
             failure: None,
         })
     }
@@ -990,6 +1070,35 @@ mod tests {
                 "the pass redid what was already in place"
             );
             assert_eq!(tables.links_of(table_of(1000)), vec![TUN]);
+        }
+
+        #[test]
+        fn unresolved_ipv6_routes_explain_the_missing_forwarding_path() {
+            let (applier, _, _) = rig(false);
+            let mut owner = plan(1000);
+            owner.routes = vec![intent(
+                DstMatch::HostV6("2001:db8:2::81".parse().expect("host")),
+                EgressRef::Secondary,
+            )];
+            let plans = [owner];
+            let present = users(&[1000]);
+            let report = applier.apply_pass(pass(&plans, &present, 0)).expect("pass");
+            assert!(!report.unresolved.is_empty());
+            let outcome = crate::principal_enforcement::CycleOutcome::Applied {
+                principals: Vec::new(),
+                report: nrr_platform_api::enforcement::ApplyReport::default(),
+                changed: true,
+                delta: None,
+                unprotected: Vec::new(),
+                guarded: 0,
+                routes: Some(report),
+                held_back: Vec::new(),
+            };
+            let reason = outcome
+                .landed()
+                .expect_err("the IPv6 route is not installed");
+            assert!(reason.contains("IPv6"), "{reason}");
+            assert!(!reason.contains("no live secondary"), "{reason}");
         }
 
         #[test]

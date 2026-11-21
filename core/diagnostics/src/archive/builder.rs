@@ -18,7 +18,7 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
-use chrono::{Datelike, Timelike};
+use jiff::Timestamp;
 use serde_json::json;
 
 use crate::archive::manifest::{
@@ -787,7 +787,7 @@ fn ser_err(e: serde_json::Error) -> DiagnosticsError {
 
 // ── ZIP packaging ─────────────────────────────────────────────────────────────
 
-/// Returns the current wall-clock time, converted to a `zip::DateTime`.
+/// Converts an instant to a `zip::DateTime` in the system time zone.
 ///
 /// The ZIP format's MS-DOS date/time fields carry no timezone: extractors
 /// render whatever value is stored as local time. Stamping entries with the
@@ -796,21 +796,22 @@ fn ser_err(e: serde_json::Error) -> DiagnosticsError {
 /// built-in default (UTC "now", or the 1980 epoch if even that is
 /// unavailable) if the local time cannot be represented in the DOS
 /// date/time range.
-fn local_zip_timestamp() -> zip::DateTime {
-    let now = chrono::Local::now();
+#[must_use]
+pub fn local_zip_timestamp(at: SystemTime) -> zip::DateTime {
+    let Ok(at) = Timestamp::try_from(at) else {
+        return zip::DateTime::default_for_write();
+    };
+    let local = crate::local_offset::civil_at(at);
+    let Ok(year) = u16::try_from(local.year()) else {
+        return zip::DateTime::default_for_write();
+    };
     zip::DateTime::from_date_and_time(
-        // `from_date_and_time` accepts years [1980, 2107]; `chrono::Datelike::year`
-        // returns `i32`, so an out-of-range value is rejected by the `u16`
-        // conversion rather than silently wrapping.
-        match u16::try_from(now.year()) {
-            Ok(year) => year,
-            Err(_) => return zip::DateTime::default_for_write(),
-        },
-        now.month() as u8,
-        now.day() as u8,
-        now.hour() as u8,
-        now.minute() as u8,
-        now.second() as u8,
+        year,
+        local.month() as u8,
+        local.day() as u8,
+        local.hour() as u8,
+        local.minute() as u8,
+        local.second() as u8,
     )
     .unwrap_or_else(|_| zip::DateTime::default_for_write())
 }
@@ -888,7 +889,7 @@ fn write_zip_into(source_dir: &Path, dest_path: &Path) -> DiagnosticsResult<()> 
     let mut zip = zip::ZipWriter::new(file);
     let options = zip::write::SimpleFileOptions::default()
         .compression_method(zip::CompressionMethod::Deflated)
-        .last_modified_time(local_zip_timestamp());
+        .last_modified_time(local_zip_timestamp(SystemTime::now()));
 
     let mut total_uncompressed = 0u64;
 

@@ -406,14 +406,10 @@ pub fn plain_prompt(stage: &Stage) -> Option<Key> {
 /// `YYYY-MM-DD HH:MM`, local time; UTC under test so views do not depend on
 /// the zone of the machine running them.
 fn stamp(ms: i64) -> String {
-    let Some(at) = chrono::DateTime::from_timestamp_millis(ms).filter(|_| ms > 0) else {
-        return "—".to_owned();
-    };
-    #[cfg(test)]
-    let at = at.fixed_offset();
-    #[cfg(not(test))]
-    let at = at.with_timezone(&chrono::Local).fixed_offset();
-    at.format("%Y-%m-%d %H:%M").to_string()
+    crate::timestamps::display_local_time(ms).map_or_else(
+        || "—".to_owned(),
+        |at| at.strftime("%Y-%m-%d %H:%M").to_string(),
+    )
 }
 
 fn marker(on: bool) -> &'static str {

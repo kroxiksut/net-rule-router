@@ -32,6 +32,7 @@ mod site_notices;
 mod state;
 #[cfg(test)]
 mod testing;
+mod timestamps;
 mod view;
 mod vpn_client_offer;
 mod vpn_gateway_trust;

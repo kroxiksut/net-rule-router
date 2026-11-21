@@ -33,7 +33,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::SystemTime;
 
-use chrono::{Datelike, Timelike};
+use nrr_diagnostics::archive::builder::local_zip_timestamp;
 use serde_json::Value;
 
 /// GUI-side log files worth attaching, resolved against the launcher's own
@@ -170,36 +170,6 @@ fn cutoff_system_time(logs_from_ms: Option<i64>) -> Option<SystemTime> {
     Some(SystemTime::UNIX_EPOCH + std::time::Duration::from_millis(ms))
 }
 
-/// Converts a source file's modification time (falling back to the current
-/// instant when unavailable) into a `zip::DateTime` carrying local wall-clock
-/// values — the ZIP MS-DOS date/time fields have no timezone, so extractors
-/// display whatever is stored as local time. Mirrors
-/// `nrr_diagnostics::archive::builder::local_zip_timestamp`'s fallback chain
-/// for the DOS year range ([1980, 2107]); falls back further to the zip
-/// crate's own UTC-now/1980-epoch default when even that can't be
-/// represented. chrono-only: `time::now_local` is unsound in a multithreaded
-/// process.
-fn local_zip_timestamp_for_source(mtime: Option<SystemTime>) -> zip::DateTime {
-    let local = match mtime {
-        Some(system_time) => {
-            chrono::DateTime::<chrono::Utc>::from(system_time).with_timezone(&chrono::Local)
-        }
-        None => chrono::Local::now(),
-    };
-    zip::DateTime::from_date_and_time(
-        match u16::try_from(local.year()) {
-            Ok(year) => year,
-            Err(_) => return zip::DateTime::default_for_write(),
-        },
-        local.month() as u8,
-        local.day() as u8,
-        local.hour() as u8,
-        local.minute() as u8,
-        local.second() as u8,
-    )
-    .unwrap_or_else(|_| zip::DateTime::default_for_write())
-}
-
 /// Zip write options for a copied-in file: same compression as the rest of
 /// the archive, stamped with `path`'s own modification time (converted to
 /// local wall-clock), not the moment the archive happens to be assembled.
@@ -207,7 +177,7 @@ fn zip_options_for_copied_file(path: &Path) -> zip::write::SimpleFileOptions {
     let mtime = fs::metadata(path).and_then(|meta| meta.modified()).ok();
     zip::write::SimpleFileOptions::default()
         .compression_method(zip::CompressionMethod::Deflated)
-        .last_modified_time(local_zip_timestamp_for_source(mtime))
+        .last_modified_time(local_zip_timestamp(mtime.unwrap_or_else(SystemTime::now)))
 }
 
 /// Append the GUI-side launcher logs into the (already-copied) zip. Returns
@@ -462,9 +432,9 @@ mod tests {
         write_source_zip(&src);
         // Captured around the log file's own write so the assertion can't
         // flake near a wall-clock rollover (second, minute, midnight, ...).
-        let before = chrono::Local::now();
+        let before = jiff::ZonedDateTime::now().datetime();
         fs::write(src_dir.join("launcher-main.log"), b"log line\n").expect("log");
-        let after = chrono::Local::now();
+        let after = jiff::ZonedDateTime::now().datetime();
 
         let resp = serde_json::json!({ "archive-path": src.to_string_lossy() });
         let out = localize_export_response_into(resp, &dest_dir, &src_dir, None);
@@ -479,25 +449,22 @@ mod tests {
             .last_modified()
             .expect("entry carries a modified time");
 
-        let entry_naive = chrono::NaiveDate::from_ymd_opt(
-            mtime.year() as i32,
-            mtime.month() as u32,
-            mtime.day() as u32,
+        let entry_naive = jiff::civil::DateTime::new(
+            mtime.year() as i16,
+            mtime.month() as i8,
+            mtime.day() as i8,
+            mtime.hour() as i8,
+            mtime.minute() as i8,
+            mtime.second() as i8,
+            0,
         )
-        .and_then(|date| {
-            date.and_hms_opt(
-                mtime.hour() as u32,
-                mtime.minute() as u32,
-                mtime.second() as u32,
-            )
-        })
         .expect("zip entry stores a valid calendar date/time");
 
         // DOS timestamps have 2-second resolution and drop odd seconds, so
         // widen the [before, after] window by a few seconds on both ends.
-        let tolerance = chrono::Duration::seconds(3);
-        let lower = before.naive_local() - tolerance;
-        let upper = after.naive_local() + tolerance;
+        let tolerance = jiff::SignedDuration::from_secs(3);
+        let lower = before - tolerance;
+        let upper = after + tolerance;
         assert!(
             entry_naive >= lower && entry_naive <= upper,
             "expected copied-entry mtime {entry_naive:?} within [{lower:?}, {upper:?}] \

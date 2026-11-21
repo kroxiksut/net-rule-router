@@ -218,7 +218,11 @@ fn a_held_rule_host_is_not_asked_of_the_main_link_in_any_record_type() {
     const QTYPE_TXT: u16 = 16;
     for blocking in [true, false] {
         holding.store(blocking, Ordering::Relaxed);
-        for (qtype, rcode) in [(QTYPE_AAAA, RCODE_SERVFAIL), (QTYPE_HTTPS, RCODE_NOERROR), (QTYPE_TXT, RCODE_SERVFAIL)] {
+        for (qtype, rcode) in [
+            (QTYPE_AAAA, RCODE_SERVFAIL),
+            (QTYPE_HTTPS, RCODE_NOERROR),
+            (QTYPE_TXT, RCODE_SERVFAIL),
+        ] {
             assert_empty_response(l.answer_query(&query("assistant.example", qtype)), rcode);
             assert_eq!(
                 l.answer_query(&query("vk.example", qtype)),
@@ -1431,7 +1435,11 @@ fn the_rule_host_branch_answers_inside_the_budget_it_was_given() {
     );
     let spent = started.elapsed();
     assert_empty_response(action, RCODE_SERVFAIL);
-    let budget_seen = upstream.0.lock().expect("recorded upstream budget").expect("tunnel lookup");
+    let budget_seen = upstream
+        .0
+        .lock()
+        .expect("recorded upstream budget")
+        .expect("tunnel lookup");
     assert!(!budget_seen.is_zero() && budget_seen <= Duration::from_millis(200));
     assert!(
         spent < Duration::from_millis(600),

@@ -813,7 +813,7 @@ impl SecondaryRouteReconciler {
                         owned.routes.push(r);
                     }
                 }
-                Err(e)
+                Err(e.with_rollback_errors(residue.errors))
             }
         }
     }
@@ -847,8 +847,9 @@ impl SecondaryRouteReconciler {
         let executed = tx.execute(&actions);
         let installed_at = self.writes.fetch_add(1, Ordering::SeqCst) + 1;
         if let Err(e) = executed {
-            owned.routes.extend(tx.rollback_with_residue().still_added);
-            return Err(e);
+            let residue = tx.rollback_with_residue();
+            owned.routes.extend(residue.still_added);
+            return Err(e.with_rollback_errors(residue.errors));
         }
         let landed = tx.added_routes();
         tx.finalize();
@@ -1046,11 +1047,11 @@ mod tests {
 
     type AddFailure = Box<dyn Fn(&RouteEntry) -> bool + Send>;
 
-    /// A route table whose adds fail on demand, for driving a reconcile into
-    /// its rollback.
+    /// A route table that can fail individual adds and rollback deletes.
     struct FlakyAddApi {
         inner: MockWindowsApi,
         fail_add: Mutex<AddFailure>,
+        fail_delete: std::sync::atomic::AtomicBool,
     }
 
     impl FlakyAddApi {
@@ -1058,6 +1059,7 @@ mod tests {
             Self {
                 inner: MockWindowsApi::new(),
                 fail_add: Mutex::new(Box::new(|_| false)),
+                fail_delete: std::sync::atomic::AtomicBool::new(false),
             }
         }
         fn fail_adds_when(&self, pred: impl Fn(&RouteEntry) -> bool + Send + 'static) {
@@ -1074,12 +1076,17 @@ mod tests {
                 return Err(PlatformError::Win32 {
                     operation: "CreateIpForwardEntry2",
                     code: 0x5,
-                    message: "simulated fatal".into(),
+                    message: format!("simulated add failure via {}", entry.next_hop),
                 });
             }
             self.inner.create_ip_forward_entry(entry)
         }
         fn delete_ip_forward_entry(&self, entry: &RouteEntry) -> Result<(), PlatformError> {
+            if self.fail_delete.load(Ordering::SeqCst) {
+                return Err(PlatformError::AccessDenied {
+                    operation: "DeleteIpForwardEntry2",
+                });
+            }
             self.inner.delete_ip_forward_entry(entry)
         }
         fn get_adapter_infos(&self) -> Result<Vec<nrr_platform_api::AdapterInfo>, PlatformError> {
@@ -1115,11 +1122,15 @@ mod tests {
 
         let failing = route([198, 51, 100, 2], new_gw, 9);
         api.fail_adds_when(move |r| r == &failing);
-        rec.reconcile(&[
-            route([198, 51, 100, 1], new_gw, 9),
-            route([198, 51, 100, 2], new_gw, 9),
-        ])
-        .expect_err("the second add fails");
+        let failure = rec
+            .reconcile(&[
+                route([198, 51, 100, 1], new_gw, 9),
+                route([198, 51, 100, 2], new_gw, 9),
+            ])
+            .expect_err("the second add fails");
+        let detail = failure.to_string();
+        assert!(detail.contains("add failure via 192.168.0.1"), "{detail}");
+        assert!(!detail.contains("rollback"), "{detail}");
         assert_eq!(
             table_gateways(&api),
             HashSet::from([IpAddr::V4(Ipv4Addr::from(old_gw))]),
@@ -1135,10 +1146,10 @@ mod tests {
         );
     }
 
-    /// Positive control for the other direction: a route the rollback failed to
-    /// put back is not claimed, so the next pass that wants it re-adds it.
+    /// The caller needs both failures, and ownership must reflect the route
+    /// that the rollback could not put back so the next pass can re-add it.
     #[test]
-    fn a_route_the_rollback_could_not_restore_is_re_added_next_pass() {
+    fn reports_route_operation_and_rollback_failures_and_retries_the_missing_route() {
         let api = Arc::new(FlakyAddApi::new());
         let rec = SecondaryRouteReconciler::new(Arc::clone(&api) as Arc<dyn RouteTablePort>);
         let old = route([198, 51, 100, 1], [10, 0, 0, 1], 7);
@@ -1146,7 +1157,8 @@ mod tests {
             .expect("first pass");
 
         api.fail_adds_when(|_| true);
-        rec.reconcile(&[route([198, 51, 100, 1], [192, 168, 0, 1], 9)])
+        let failure = rec
+            .reconcile(&[route([198, 51, 100, 1], [192, 168, 0, 1], 9)])
             .expect_err("the add and its undo both fail");
         assert!(table_dests_of(&api).is_empty());
         assert_eq!(rec.owned_count(), 0, "a route that is gone is not ours");
@@ -1155,6 +1167,37 @@ mod tests {
         let delta = rec.reconcile(std::slice::from_ref(&old)).expect("retry");
         assert_eq!(delta.added, 1);
         assert_eq!(table_dests_of(&api).len(), 1);
+
+        let detail = failure.to_string();
+        assert!(detail.contains("add failure via 192.168.0.1"), "{detail}");
+        assert!(detail.contains("rollback"), "{detail}");
+        assert!(detail.contains("add failure via 10.0.0.1"), "{detail}");
+    }
+
+    #[test]
+    fn reports_route_operation_and_rollback_failures_and_keeps_the_ahead_route_owned() {
+        let api = Arc::new(FlakyAddApi::new());
+        let rec = SecondaryRouteReconciler::new(Arc::clone(&api) as Arc<dyn RouteTablePort>);
+        let landed = route([198, 51, 100, 1], [10, 0, 0, 1], 7);
+        let rejected = route([198, 51, 100, 2], [192, 168, 0, 1], 9);
+        let rejected_for_mock = rejected.clone();
+        api.fail_adds_when(move |route| route == &rejected_for_mock);
+        api.fail_delete.store(true, Ordering::SeqCst);
+
+        let failure = rec
+            .install_additional(&[landed.clone(), rejected])
+            .expect_err("the second add and the first add's undo both fail");
+        assert_eq!(api.get_ip_forward_table().expect("read routes"), [landed]);
+        assert_eq!(rec.owned_count(), 1);
+
+        api.fail_delete.store(false, Ordering::SeqCst);
+        assert_eq!(rec.clear().expect("remove owned route").removed, 1);
+        assert!(table_dests_of(&api).is_empty());
+
+        let detail = failure.to_string();
+        assert!(detail.contains("add failure via 192.168.0.1"), "{detail}");
+        assert!(detail.contains("rollback"), "{detail}");
+        assert!(detail.contains("DeleteIpForwardEntry2"), "{detail}");
     }
 
     fn table_dests_of(api: &FlakyAddApi) -> HashSet<IpAddr> {

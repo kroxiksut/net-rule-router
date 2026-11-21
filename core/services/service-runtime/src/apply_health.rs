@@ -25,7 +25,7 @@ pub fn report_cycle_outcome(health: &HealthAggregator, outcome: &CycleOutcome) {
             routes, held_back, ..
         } => routes
             .as_ref()
-            .and_then(|r| r.failure.as_deref())
+            .and_then(|r| r.incomplete_reason())
             .map(|why| format!("filters applied but routes were not: {why}"))
             .or_else(|| {
                 // Counted, never named: the message reaches every client.
@@ -278,6 +278,21 @@ mod tests {
         let (severity, message) = apply(&health).expect("apply");
         assert_eq!(severity, ServiceHealthSeverity::Degraded);
         assert!(message.contains("no gateway"), "{message}");
+    }
+
+    #[test]
+    fn unresolved_routes_degrade_without_naming_users_until_routes_recover() {
+        let health = health();
+        let routes = RouteApplyReport {
+            unresolved: vec!["private-principal-1001".into()],
+            ..RouteApplyReport::default()
+        };
+        report_cycle_outcome(&health, &applied(Some(routes)));
+        let (severity, message) = apply(&health).expect("uninstalled routes must be visible");
+        assert_eq!(severity, ServiceHealthSeverity::Degraded);
+        assert!(!message.contains("private-principal-1001"), "{message}");
+        report_cycle_outcome(&health, &applied(Some(RouteApplyReport::default())));
+        assert_eq!(apply(&health), None);
     }
 
     #[test]

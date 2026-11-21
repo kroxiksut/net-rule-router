@@ -33,11 +33,9 @@ hmac       = "0.12"
 getrandom  = "0.3"
 tempfile   = "3"
 zip        = { version = "9", default-features = false, features = ["deflate"] }
-# Local wall-clock timestamps for zip entry mtimes. `chrono::Local::now()` is
-# used instead of the `time` crate's `OffsetDateTime::now_local()`, which is
-# gated behind an unsound "local-offset" feature that can fail
-# (`IndeterminateOffset`) in multithreaded processes such as the service.
-chrono     = { version = "0.4", default-features = false, features = ["clock"] }
+# Civil-time fields for ZIP entries, with the system offset supplied by the platform port.
+jiff.workspace = true
+nrr-platform-api = { path = "../platform/api" }
 
 [dev-dependencies]
 

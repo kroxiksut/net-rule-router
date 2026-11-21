@@ -95,11 +95,11 @@ mod tun_network_name;
 // VPN self-heal mechanism: name the process that owns a relayed TCP flow via
 // the OS connection table.
 pub mod flow_owner;
-#[cfg(windows)]
-pub mod source_link;
 pub mod hosts_file;
 pub mod interface_manager;
 pub mod interface_rows;
+#[cfg(windows)]
+pub mod source_link;
 // Windows octet-counter source over `GetIfTable2`.
 pub mod interface_traffic;
 pub mod key_store;

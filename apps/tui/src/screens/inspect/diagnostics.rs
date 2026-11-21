@@ -285,14 +285,9 @@ impl ArchiveOptions {
 }
 
 fn local_midnight(ms: i64) -> Option<i64> {
-    use chrono::TimeZone;
-    let at = chrono::DateTime::from_timestamp_millis(ms).filter(|_| ms > 0)?;
-    let day = at.with_timezone(&chrono::Local).date_naive();
-    let midnight = day.and_hms_opt(0, 0, 0)?;
-    chrono::Local
-        .from_local_datetime(&midnight)
-        .earliest()
-        .map(|local| local.timestamp_millis())
+    (ms > 0)
+        .then(|| crate::platform::local_time_zone().local_midnight_ms(ms))
+        .flatten()
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]

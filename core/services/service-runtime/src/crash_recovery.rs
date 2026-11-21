@@ -25,7 +25,7 @@
 //! | Applied / Verifying / RollbackDone | yes | `VerifyAndClearMarker` |
 //! | FailedRequiresManualAction | any | `RequireManualAction` |
 //! | any marker | no | `RequireManualAction` (audit must succeed) |
-//! | storage or audit unavailable at assessment | any | `RequireManualAction` |
+//! | marker unreadable or storage unavailable at assessment | any | `RequireManualAction` |
 //!
 //! `RollbackAndClearMarker` performs no rollback here: it audits the deferral
 //! and clears the marker, and the startup reconcile restores enforcement.
@@ -132,8 +132,8 @@ pub struct ApplyAttemptMarker {
 /// Production implements this against a file (`ProductionApplyMarkerStore`).
 /// Tests inject a fake.
 pub trait ApplyMarkerStore: Send + Sync {
-    /// Read the most recent marker, if any.
-    fn read(&self) -> Option<ApplyAttemptMarker>;
+    /// Read the most recent marker. Only a missing marker returns `Ok(None)`.
+    fn read(&self) -> std::io::Result<Option<ApplyAttemptMarker>>;
     /// Persist `marker`, replacing any existing marker atomically.
     fn write(&self, marker: &ApplyAttemptMarker) -> Result<(), String>;
     /// Remove the marker (apply fully complete or manually cleared).
@@ -211,7 +211,7 @@ pub enum StartupRecoveryState {
     /// Service was stopped without writing a clean-shutdown marker (power
     /// loss or hard kill). Marker is absent but shutdown was unclean.
     PreviousShutdownUnclean { last_known_epoch_secs: u64 },
-    /// Storage or audit layer unavailable at assessment time.
+    /// The marker is unreadable or storage is unavailable at assessment time.
     RecoveryRequired { reason: String },
     /// A previous recovery attempt left a
     /// `FailedRequiresManualAction` marker.
@@ -371,8 +371,11 @@ where
     /// Read the persisted marker and classify the startup situation.
     pub fn assess(&self) -> StartupRecoveryState {
         match self.marker_store.read() {
-            None => StartupRecoveryState::Clean,
-            Some(marker) => match &marker.phase {
+            Ok(None) => StartupRecoveryState::Clean,
+            Err(error) => StartupRecoveryState::RecoveryRequired {
+                reason: format!("cannot read apply marker: {error}"),
+            },
+            Ok(Some(marker)) => match &marker.phase {
                 ApplyPhase::FailedRequiresManualAction => {
                     StartupRecoveryState::ManualActionRequired {
                         reason: format!(
@@ -395,10 +398,11 @@ where
             RecoveryDecision::RequireManualAction { reason } => {
                 // Best effort: when the audit is the reason, this fails too, and
                 // the start is blocked either way.
-                let attempt_id = self
-                    .marker_store
-                    .read()
-                    .map_or_else(|| "none".to_owned(), |m| m.attempt_id);
+                let attempt_id = match self.marker_store.read() {
+                    Ok(Some(marker)) => marker.attempt_id,
+                    Ok(None) => "none".to_owned(),
+                    Err(_) => "unknown".to_owned(),
+                };
                 let _ = self
                     .audit_sink
                     .emit(RecoveryAuditRecord::ManualActionRequired {
@@ -620,8 +624,8 @@ mod tests {
     }
 
     impl ApplyMarkerStore for FakeMarkerStore {
-        fn read(&self) -> Option<ApplyAttemptMarker> {
-            self.marker.lock().unwrap().clone()
+        fn read(&self) -> std::io::Result<Option<ApplyAttemptMarker>> {
+            Ok(self.marker.lock().unwrap().clone())
         }
         fn write(&self, m: &ApplyAttemptMarker) -> Result<(), String> {
             *self.marker.lock().unwrap() = Some(m.clone());
@@ -640,8 +644,8 @@ mod tests {
     struct StuckMarkerStore(ApplyAttemptMarker);
 
     impl ApplyMarkerStore for StuckMarkerStore {
-        fn read(&self) -> Option<ApplyAttemptMarker> {
-            Some(self.0.clone())
+        fn read(&self) -> std::io::Result<Option<ApplyAttemptMarker>> {
+            Ok(Some(self.0.clone()))
         }
         fn write(&self, _: &ApplyAttemptMarker) -> Result<(), String> {
             Err("read-only".into())
@@ -652,8 +656,8 @@ mod tests {
     }
 
     impl ApplyMarkerStore for FailingMarkerStore {
-        fn read(&self) -> Option<ApplyAttemptMarker> {
-            None
+        fn read(&self) -> std::io::Result<Option<ApplyAttemptMarker>> {
+            Ok(None)
         }
         fn write(&self, _: &ApplyAttemptMarker) -> Result<(), String> {
             Err("disk full".into())
@@ -751,7 +755,11 @@ mod tests {
             "rollback should succeed: {result:?}"
         );
         // Marker must be cleared after rollback.
-        assert!(c.marker_store.read().is_none(), "marker not cleared");
+        assert_eq!(
+            c.marker_store.read().expect("read marker"),
+            None,
+            "marker not cleared"
+        );
     }
 
     /// The audit trail is what someone reasons from during an incident, so it
@@ -806,7 +814,7 @@ mod tests {
         );
         let result = c.execute(decision);
         assert_eq!(result, RecoveryExecutionResult::VerifiedAndCleared);
-        assert!(c.marker_store.read().is_none());
+        assert!(c.marker_store.read().expect("read marker").is_none());
     }
 
     #[test]
@@ -886,7 +894,11 @@ mod tests {
                 revision_active: None
             }
         );
-        assert!(c.marker_store.read().is_none(), "marker not cleared");
+        assert_eq!(
+            c.marker_store.read().expect("read marker"),
+            None,
+            "marker not cleared"
+        );
     }
 
     #[test]
@@ -943,7 +955,7 @@ mod tests {
         );
         // Marker MUST NOT be cleared when the audit write fails.
         assert!(
-            c.marker_store.read().is_some(),
+            c.marker_store.read().expect("read marker").is_some(),
             "marker must remain when audit write fails"
         );
     }

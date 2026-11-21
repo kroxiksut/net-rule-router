@@ -40,6 +40,7 @@ getrandom   = "0.3"
 tracing     = "0.1"
 
 [target.'cfg(windows)'.dependencies]
+jiff.workspace = true
 # Service Control Manager bindings behind the neutral `ServiceControlPort`
 # (`service_control.rs`): register/remove/start/stop/query the background
 # service. MIT/Apache, same crate and version band the service binary used

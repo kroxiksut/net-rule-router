@@ -155,7 +155,8 @@ impl RememberedBook {
 
     /// An enabled secondary rule names `hostname`, as `rule_set_matches` says.
     pub(crate) fn names(&self, hostname: &str) -> bool {
-        self.secondary_names.requires_secondary(hostname, &self.rule_book, &self.primary_names)
+        self.secondary_names
+            .requires_secondary(hostname, &self.rule_book, &self.primary_names)
     }
 
     /// The secondary rules route `hostname` only through a public zone.
@@ -663,10 +664,20 @@ impl DirectUdpUpstreamResolver {
 
     /// [`Self::egress_for`] for a question about `hostname`: the policy may
     /// send the additional link's rule hosts elsewhere.
-    fn egress_for_name(&self, hostname: &str, attempt: u32) -> Option<crate::dns_egress::DnsEgress> {
+    fn egress_for_name(
+        &self,
+        hostname: &str,
+        attempt: u32,
+    ) -> Option<crate::dns_egress::DnsEgress> {
         use crate::dns_egress::NamedDnsEgress;
-        match self.egress.as_ref().map(|policy| policy.decide_for(hostname, attempt)) {
-            None | Some(NamedDnsEgress::CallerUpstream) => Some(crate::dns_egress::DnsEgress::primary(self.primary_server())),
+        match self
+            .egress
+            .as_ref()
+            .map(|policy| policy.decide_for(hostname, attempt))
+        {
+            None | Some(NamedDnsEgress::CallerUpstream) => {
+                Some(crate::dns_egress::DnsEgress::primary(self.primary_server()))
+            }
             Some(NamedDnsEgress::Secondary(egress)) => Some(egress),
             Some(NamedDnsEgress::SecondaryUnavailable) => None,
         }
@@ -723,7 +734,9 @@ impl DirectUdpUpstreamResolver {
         egress: &crate::dns_egress::DnsEgress,
     ) -> Result<std::net::UdpSocket, ResolveError> {
         if egress.via_secondary && egress.bind.is_none() {
-            return Err(ResolveError::Unavailable("secondary source address unavailable".into()));
+            return Err(ResolveError::Unavailable(
+                "secondary source address unavailable".into(),
+            ));
         }
         let wildcard: std::net::SocketAddr = match egress.server {
             std::net::SocketAddr::V4(_) => (Ipv4Addr::UNSPECIFIED, 0).into(),
@@ -736,7 +749,9 @@ impl DirectUdpUpstreamResolver {
                 .map_err(|e| ResolveError::Unavailable(format!("bind: {e}")))?,
         };
         if egress.via_secondary {
-            let index = egress.interface_index.ok_or_else(|| ResolveError::Unavailable("secondary interface unavailable".into()))?;
+            let index = egress.interface_index.ok_or_else(|| {
+                ResolveError::Unavailable("secondary interface unavailable".into())
+            })?;
             (self.pin_interface)(sock.socket_handle(), index)
                 .map_err(|e| ResolveError::Unavailable(format!("pin secondary interface: {e}")))?;
         }
@@ -880,7 +895,9 @@ impl DirectUdpUpstreamResolver {
             return Err(ResolveError::Unavailable("timeout".into()));
         }
         if egress.via_secondary && egress.bind.is_none() {
-            return Err(ResolveError::Unavailable("secondary source address unavailable".into()));
+            return Err(ResolveError::Unavailable(
+                "secondary source address unavailable".into(),
+            ));
         }
         let deadline = Instant::now()
             .checked_add(window)
@@ -906,9 +923,12 @@ impl DirectUdpUpstreamResolver {
                     .map_err(|e| unavailable("socket", e))?;
                 nrr_platform_api::own_traffic::mark_own_socket(&socket);
                 if egress.via_secondary {
-                    let index = egress.interface_index.ok_or_else(|| ResolveError::Unavailable("secondary interface unavailable".into()))?;
-                    (self.pin_interface)(socket.socket_handle(), index)
-                        .map_err(|e| ResolveError::Unavailable(format!("pin secondary interface: {e}")))?;
+                    let index = egress.interface_index.ok_or_else(|| {
+                        ResolveError::Unavailable("secondary interface unavailable".into())
+                    })?;
+                    (self.pin_interface)(socket.socket_handle(), index).map_err(|e| {
+                        ResolveError::Unavailable(format!("pin secondary interface: {e}"))
+                    })?;
                 }
                 socket
                     .bind(&std::net::SocketAddr::from((src, 0)).into())
@@ -1078,7 +1098,9 @@ impl DirectUdpUpstreamResolver {
             }
             let epoch = self.pool.as_ref().map(|pool| pool.readiness_epoch());
             let Some(egress) = self.egress_for_name(hostname, attempt) else {
-                return Err(ResolveError::Unavailable("secondary interface unavailable for this name".into()));
+                return Err(ResolveError::Unavailable(
+                    "secondary interface unavailable for this name".into(),
+                ));
             };
             if tunnel_only && !egress.via_secondary {
                 last = ResolveError::Unavailable("tunnel not available for the query".into());
@@ -1754,14 +1776,21 @@ impl DnsResolverPort for HostsBypassDnsResolver {
         if canonical.is_empty() {
             return Err(DnsResolverError::InvalidName { name: canonical });
         }
-        let protected = self.egress.as_ref().is_some_and(|policy| policy.requires_secondary(&canonical));
+        let protected = self
+            .egress
+            .as_ref()
+            .is_some_and(|policy| policy.requires_secondary(&canonical));
         if !(self.bypass_enabled)() && !protected {
             return self.system.resolve(hostname, family);
         }
         let pinned = self.hosts_address(&canonical, family);
         if !(self.bypass_enabled)() && protected {
             if let Some(ip) = pinned {
-                return Ok(ResolvedRecord { canonical_hostname: canonical, addresses: vec![ip], ttl_seconds: None });
+                return Ok(ResolvedRecord {
+                    canonical_hostname: canonical,
+                    addresses: vec![ip],
+                    ttl_seconds: None,
+                });
             }
         }
         let server = match (self.upstream)() {
@@ -1810,7 +1839,9 @@ impl DnsResolverPort for HostsBypassDnsResolver {
             // must not zero out general rule seeding.
             Err(ResolveError::Unavailable(reason)) => {
                 if protected {
-                    return Err(DnsResolverError::Timeout { hostname: canonical });
+                    return Err(DnsResolverError::Timeout {
+                        hostname: canonical,
+                    });
                 }
                 tracing::debug!(
                     target: "nrr::dns-resolver",

@@ -100,6 +100,10 @@ impl LauncherConfig {
 
 /// Top-level launcher entry point.
 pub fn run(config: LauncherConfig) -> ExitCode {
+    #[cfg(windows)]
+    nrr_diagnostics::local_offset::install_system_time_zone(
+        &nrr_platform_windows::local_time::WindowsTimeZone,
+    );
     let cli_args: Vec<String> = env::args().skip(1).collect();
 
     // Session elevation broker mode. When the dispatcher spawns this binary

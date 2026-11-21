@@ -16,6 +16,10 @@ use nrr_platform_api::local_time::LocalTimeZonePort;
 pub struct LinuxTimeZone;
 
 impl LocalTimeZonePort for LinuxTimeZone {
+    fn local_midnight_ms(&self, at_ms: i64) -> Option<i64> {
+        nrr_platform_api::local_time::DatabaseTimeZone.local_midnight_ms(at_ms)
+    }
+
     #[cfg(target_os = "linux")]
     fn utc_offset_seconds(&self, now_ms: i64) -> i32 {
         // UTC is the honest answer when the tz database cannot be read: it is

@@ -82,11 +82,7 @@ fn contents(conn: &Connection) -> BTreeMap<String, Table> {
             let mut select = conn
                 .prepare(&format!("SELECT * FROM \"{name}\""))
                 .expect("select");
-            let columns: Vec<String> = select
-                .column_names()
-                .into_iter()
-                .map(str::to_owned)
-                .collect();
+            let columns: Vec<String> = select.column_names().map(str::to_owned).collect();
             let width = columns.len();
             let rows = select
                 .query_map([], |row| {

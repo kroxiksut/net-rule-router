@@ -464,7 +464,7 @@ fn activate_happy_path_all_or_nothing_transitions_correctly() {
     let active = fx.coordinator.current_active().expect("active");
     assert!(active.is_some());
     // Marker cleared.
-    assert!(fx.marker.read().is_none());
+    assert!(fx.marker.read().expect("read marker").is_none());
 }
 
 /// The status change and the pointer are one commit. Apart, a failure
@@ -589,7 +589,11 @@ fn a_commit_that_fails_reverts_and_closes_the_attempt() {
         vec![("S-1-A".to_string(), "{}".to_string())],
         "the SID phase 2 touched goes back to the previous rules",
     );
-    assert!(fx.marker.read().is_none(), "the attempt is closed");
+    assert_eq!(
+        fx.marker.read().expect("read marker"),
+        None,
+        "the attempt is closed"
+    );
     assert_eq!(
         fx.coordinator.load_record(&id).expect("load").status,
         RevisionStatus::Rejected,
@@ -624,7 +628,7 @@ fn an_unrecorded_activation_spends_its_token_and_a_new_review_retries() {
         fx.coordinator.load_record(&id).expect("load").status,
         RevisionStatus::Candidate,
     );
-    assert!(fx.marker.read().is_none());
+    assert!(fx.marker.read().expect("read marker").is_none());
 
     exec(&fx, ALLOW_POINTER);
     exec(&fx, "DROP TRIGGER no_reject;");
@@ -643,7 +647,7 @@ fn an_unrecorded_activation_spends_its_token_and_a_new_review_retries() {
 fn a_marker_that_will_not_clear_after_the_commit_is_not_a_failure() {
     struct StuckMarker(InMemoryMarkerStore);
     impl ApplyMarkerStore for StuckMarker {
-        fn read(&self) -> Option<ApplyAttemptMarker> {
+        fn read(&self) -> std::io::Result<Option<ApplyAttemptMarker>> {
             self.0.read()
         }
         fn write(&self, marker: &ApplyAttemptMarker) -> Result<(), String> {
@@ -806,7 +810,7 @@ fn activate_apply_failure_all_or_nothing_reverts_successful_sids() {
     // Revert was called for both.
     assert_eq!(fx.dispatcher.revert_log().len(), 2);
     // Marker cleared.
-    assert!(fx.marker.read().is_none());
+    assert!(fx.marker.read().expect("read marker").is_none());
 }
 
 /// A revert that fails is the state that matters most: the SID keeps rules
@@ -936,7 +940,7 @@ struct SignOutOnMarker {
 }
 
 impl ApplyMarkerStore for SignOutOnMarker {
-    fn read(&self) -> Option<ApplyAttemptMarker> {
+    fn read(&self) -> std::io::Result<Option<ApplyAttemptMarker>> {
         self.inner.read()
     }
 
@@ -1205,10 +1209,10 @@ fn apply_marker_is_written_during_phase2_and_cleared_on_3a() {
     let id = submit(&fx, "h-marker");
     let token = issue_token(&fx, &id);
     // Before activate — no marker.
-    assert!(fx.marker.read().is_none());
+    assert!(fx.marker.read().expect("read marker").is_none());
     let _ = fx.coordinator.activate(&id, &token, "c").expect("act");
     // After successful activate — marker cleared.
-    assert!(fx.marker.read().is_none());
+    assert!(fx.marker.read().expect("read marker").is_none());
 }
 
 #[test]
@@ -1227,7 +1231,7 @@ fn apply_marker_is_cleared_on_phase3b() {
     let token = issue_token(&fx, &id);
     let _ = fx.coordinator.activate(&id, &token, "c").expect("act");
     // Marker cleared even on rejection.
-    assert!(fx.marker.read().is_none());
+    assert!(fx.marker.read().expect("read marker").is_none());
 }
 
 // ── Partial unique index ──────────────────────────────────────────────────

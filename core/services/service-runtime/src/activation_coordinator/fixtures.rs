@@ -136,8 +136,8 @@ impl InMemoryMarkerStore {
 // Test double: lock-poisoning `unwrap()`/`expect()` is acceptable scaffolding.
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 impl ApplyMarkerStore for InMemoryMarkerStore {
-    fn read(&self) -> Option<ApplyAttemptMarker> {
-        self.inner.lock().expect("marker mutex poisoned").clone()
+    fn read(&self) -> std::io::Result<Option<ApplyAttemptMarker>> {
+        Ok(self.inner.lock().expect("marker mutex poisoned").clone())
     }
 
     fn write(&self, marker: &ApplyAttemptMarker) -> Result<(), String> {

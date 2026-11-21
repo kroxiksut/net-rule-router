@@ -191,7 +191,7 @@ fn read_service(client: &dyn IpcClient) -> Result<ServiceState, String> {
 }
 
 fn now_ms() -> i64 {
-    chrono::Utc::now().timestamp_millis()
+    crate::timestamps::now_ms()
 }
 
 fn check_job(file: PathBuf) -> Job {

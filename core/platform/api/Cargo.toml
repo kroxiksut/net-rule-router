@@ -18,6 +18,7 @@ license = "MPL-2.0"
 path = "src/lib.rs"
 
 [dependencies]
+jiff.workspace = true
 # OS CSPRNG for the DB-MAC signing key (`key_store::generate_signing_key`).
 # Cross-platform (Linux/macOS/Windows) — keeps this crate OS-neutral.
 getrandom = "0.3"

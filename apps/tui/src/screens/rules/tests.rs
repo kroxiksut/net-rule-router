@@ -2848,7 +2848,7 @@ mod recent {
     }
 
     fn changes() -> Value {
-        let now = chrono::Utc::now().timestamp();
+        let now = crate::timestamps::now_seconds();
         json!({
             "changes": [
                 { "kind": "added", "at": now - 60, "rule": entry("new.example", "secondary") },
@@ -2966,7 +2966,7 @@ mod recent {
 
         answer(&mut app, &["U"]);
         assert!(matches!(app.rules.mode, Mode::Choice(_)));
-        let now = chrono::Utc::now().timestamp();
+        let now = crate::timestamps::now_seconds();
         fake.answer(
             IpcOperationName::RulesRecentChangesList,
             json!({ "changes": [

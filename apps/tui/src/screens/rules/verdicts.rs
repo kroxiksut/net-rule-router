@@ -261,7 +261,7 @@ pub fn write_bound_files_now(app: &mut AppState) {
     let Ok(settings) = own_settings::read(file) else {
         return;
     };
-    let exported_at = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+    let exported_at = crate::timestamps::export_stamp();
     let bound = [settings.rules_files.primary, settings.rules_files.secondary];
     let mut written = Vec::new();
     let mut held = Vec::new();

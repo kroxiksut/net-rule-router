@@ -1,8 +1,6 @@
 //! The wall clock and the local time zone, behind function pointers so the
 //! screen's tests run on a fixed instant.
 
-use std::time::{SystemTime, UNIX_EPOCH};
-
 #[derive(Clone, Copy, Debug)]
 pub struct Clock {
     /// Milliseconds since the Unix epoch.
@@ -14,25 +12,10 @@ pub struct Clock {
 impl Default for Clock {
     fn default() -> Self {
         Self {
-            now_ms: system_now_ms,
-            utc_offset: system_utc_offset,
+            now_ms: crate::timestamps::now_ms,
+            utc_offset: crate::timestamps::utc_offset_seconds,
         }
     }
-}
-
-fn system_now_ms() -> i64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_or(0, |d| i64::try_from(d.as_millis()).unwrap_or(i64::MAX))
-}
-
-fn system_utc_offset(ms: i64) -> i32 {
-    use chrono::TimeZone;
-    chrono::DateTime::from_timestamp_millis(ms).map_or(0, |utc| {
-        chrono::Local
-            .offset_from_utc_datetime(&utc.naive_utc())
-            .local_minus_utc()
-    })
 }
 
 impl Clock {

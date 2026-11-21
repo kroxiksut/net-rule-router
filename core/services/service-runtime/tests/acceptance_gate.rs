@@ -73,8 +73,8 @@ impl FakeMarkerStore {
     }
 }
 impl ApplyMarkerStore for FakeMarkerStore {
-    fn read(&self) -> Option<ApplyAttemptMarker> {
-        self.marker.lock().unwrap().clone()
+    fn read(&self) -> std::io::Result<Option<ApplyAttemptMarker>> {
+        Ok(self.marker.lock().unwrap().clone())
     }
     fn write(&self, m: &ApplyAttemptMarker) -> Result<(), String> {
         *self.marker.lock().unwrap() = Some(m.clone());

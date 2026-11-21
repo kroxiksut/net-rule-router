@@ -50,7 +50,7 @@ fn the_status_screen_says_what_the_window_still_holds() {
         .update(|s| {
             s.window_parked = blob(json!({
                 "route-policy": { "mode": "prefer-secondary" },
-                "parked-at-ms": chrono::Utc::now().timestamp_millis()
+                "parked-at-ms": crate::timestamps::now_ms()
             }));
         })
         .expect("seed");
@@ -95,7 +95,7 @@ fn work_parked_after_the_terminal_started_is_shown_without_a_reconnect() {
         .update(|s| {
             s.window_parked = blob(json!({
                 "stability": { "verbose-logging": true },
-                "parked-at-ms": chrono::Utc::now().timestamp_millis()
+                "parked-at-ms": crate::timestamps::now_ms()
             }));
         })
         .expect("the window parks");

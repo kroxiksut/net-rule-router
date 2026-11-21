@@ -108,6 +108,10 @@ fn main() -> std::process::ExitCode {
     if let Err(err) = nrr_platform_windows::dll_search::restrict_dll_search() {
         eprintln!("{err}");
     }
+    #[cfg(windows)]
+    nrr_diagnostics::local_offset::install_system_time_zone(
+        &nrr_platform_windows::local_time::WindowsTimeZone,
+    );
     // Publish this binary's semver to the ContractNegotiate handler so
     // the GUI's compatibility banner can render "Service X.Y.Z" in its
     // diagnostic line. Called BEFORE any handler runs so the first

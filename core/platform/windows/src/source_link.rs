@@ -28,7 +28,8 @@ impl InterfacePinner for UnicastInterface {
         let handle = SOCKET(socket.as_raw_socket() as usize);
         // SAFETY: the socket remains borrowed through the call. The option
         // takes one DWORD in network byte order, supplied by the live array.
-        if unsafe { setsockopt(handle, IPPROTO_IP.0, IP_UNICAST_IF, Some(&value)) } == SOCKET_ERROR {
+        if unsafe { setsockopt(handle, IPPROTO_IP.0, IP_UNICAST_IF, Some(&value)) } == SOCKET_ERROR
+        {
             // SAFETY: WSAGetLastError reads this thread's socket error.
             let code = unsafe { WSAGetLastError() }.0;
             return Err(PlatformError::Win32 {

@@ -2183,8 +2183,14 @@ fn secondary_udp_socket_is_constrained_to_loopback_ifindex() {
     resolver.pin_interface = pin_test_interface;
     let socket = resolver.open_socket(&egress).expect("socket");
     // Older supported kernels expose the bound interface by name only.
-    let actual = socket2::SockRef::from(&socket).device().expect("socket interface");
-    assert_eq!(actual.as_deref(), Some(b"lo".as_slice()), "a source IP alone does not constrain the socket to the assigned interface");
+    let actual = socket2::SockRef::from(&socket)
+        .device()
+        .expect("socket interface");
+    assert_eq!(
+        actual.as_deref(),
+        Some(b"lo".as_slice()),
+        "a source IP alone does not constrain the socket to the assigned interface"
+    );
 }
 
 #[test]
@@ -2201,21 +2207,31 @@ fn rejected_secondary_binding_sends_no_udp_query_or_tcp_handshake() {
     };
     let mut resolver = DirectUdpUpstreamResolver::new(provider_addr, Duration::from_millis(50), 2)
         .with_egress(Arc::new(FixedTunnel(Some(egress))));
-    resolver.pin_interface = |_, _| Err(PlatformError::NotSupported { reason: "test binding refused" });
+    resolver.pin_interface = |_, _| {
+        Err(PlatformError::NotSupported {
+            reason: "test binding refused",
+        })
+    };
     let host = "protected.example";
     assert!(resolver.resolve(host, AddressFamily::Ipv4).is_err());
     let tcp_egress = crate::dns_egress::DnsEgress {
         server: tcp.local_addr().expect("TCP server address"),
         ..egress
     };
-    assert!(resolver.attempt_tcp(&[], 1, host, 1, &tcp_egress, Duration::from_millis(50)).is_err());
+    assert!(resolver
+        .attempt_tcp(&[], 1, host, 1, &tcp_egress, Duration::from_millis(50))
+        .is_err());
     let tcp_connected = match tcp.accept() {
         Ok(_) => true,
         Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => false,
         Err(e) => panic!("TCP listener unavailable: {e}"),
     };
     assert_eq!(
-        (heard_a_query(&provider), heard_a_query(&secondary), tcp_connected),
+        (
+            heard_a_query(&provider),
+            heard_a_query(&secondary),
+            tcp_connected
+        ),
         (false, false, false),
         "refusing the interface must stop the provider retry, secondary UDP and TCP handshake"
     );
@@ -2239,10 +2255,12 @@ fn with_the_setting_off_only_additional_link_rule_hosts_skip_the_provider() {
     ));
     let policy = crate::dns_egress::SecondaryPreferredEgress::new(
         Arc::new(std::sync::atomic::AtomicBool::new(false)),
-        Arc::new(|| Some(crate::dns_egress::SecondarySource {
-            address: Ipv4Addr::LOCALHOST,
-            interface_index: loopback_index(),
-        })),
+        Arc::new(|| {
+            Some(crate::dns_egress::SecondarySource {
+                address: Ipv4Addr::LOCALHOST,
+                interface_index: loopback_index(),
+            })
+        }),
     )
     .with_rule_hosts(oracle)
     .with_rule_host_server(rule_host_addr);
@@ -2331,7 +2349,12 @@ fn secondary_rule_host_never_uses_system_dns_when_background_dns_cannot_use_seco
     for (case, bypass, captured, source) in [
         ("bypass disabled", false, Some(addr), None),
         ("upstream missing", true, None, None),
-        ("direct query timeout", true, Some(addr), Some(Ipv4Addr::LOCALHOST)),
+        (
+            "direct query timeout",
+            true,
+            Some(addr),
+            Some(Ipv4Addr::LOCALHOST),
+        ),
     ] {
         let system = Arc::new(MockDnsResolver::new());
         for hostname in [routed, ordinary] {
@@ -2353,10 +2376,12 @@ fn secondary_rule_host_never_uses_system_dns_when_background_dns_cannot_use_seco
         ));
         let policy = crate::dns_egress::SecondaryPreferredEgress::new(
             Arc::new(std::sync::atomic::AtomicBool::new(false)),
-            Arc::new(move || source.map(|address| crate::dns_egress::SecondarySource {
-                address,
-                interface_index: std::num::NonZeroU32::MIN,
-            })),
+            Arc::new(move || {
+                source.map(|address| crate::dns_egress::SecondarySource {
+                    address,
+                    interface_index: std::num::NonZeroU32::MIN,
+                })
+            }),
         )
         .with_rule_hosts(oracle)
         .with_rule_host_server(addr);

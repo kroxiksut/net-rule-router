@@ -141,7 +141,8 @@ fn rows(app: &AppState) -> Vec<InterfaceRowDto> {
 
 /// Note the external addresses a read brought, for when the service is gone.
 fn remember_external(app: &mut AppState) {
-    let at = chrono::Local::now().format("%H:%M").to_string();
+    let at = crate::timestamps::local_time(crate::timestamps::now_ms())
+        .map_or_else(|| "—".to_owned(), |now| now.strftime("%H:%M").to_string());
     let seen: Vec<(String, String)> = adapters(app, true)
         .iter()
         .filter_map(|row| {
